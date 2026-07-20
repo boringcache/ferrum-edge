@@ -1,6 +1,9 @@
 use bytes::Bytes;
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
-use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, PluginResult, create_plugin, priority};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ai_tool_governor::AiToolGovernor,
+    create_plugin, priority,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -5065,4 +5068,193 @@ async fn aggregate_initialize_echoes_requested_supported_version() {
     assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
     assert!(!ctx.metadata.contains_key("mcp.protocol_version_negotiated"));
     assert!(response_headers.contains_key("mcp-session-id"));
+}
+
+/// Drive production `ai_tool_governor` then `mcp_gateway` in real priority order
+/// on the same MCP `tools/call` context (#2260 composition acceptance).
+///
+/// Covers omitted `params.arguments` and explicit `arguments: {}` through both
+/// layers for permissive object schemas and for schemas/required_args that need
+/// a missing property. Provider-response non-normalization remains covered by
+/// the direct governor unit test.
+#[tokio::test]
+async fn composed_governor_and_mcp_gateway_normalize_omitted_mcp_arguments() {
+    assert!(
+        priority::AI_TOOL_GOVERNOR < priority::MCP_GATEWAY,
+        "composition must run ai_tool_governor before mcp_gateway"
+    );
+
+    // --- Permissive object schema: omitted and {} accepted by both layers ---
+    let server = start_mcp_zero_arg_tool_server().await;
+    let mut mcp_config = aggregate_config(&format!("{}/mcp", server.uri()));
+    mcp_config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    mcp_config["discovery"]["aggregate_resources"] = json!(false);
+    mcp_config["discovery"]["aggregate_prompts"] = json!(false);
+    mcp_config["discovery"]["on_new_tool"] = json!("allow");
+    mcp_config["servers"]["github"]["expose_resources"] = json!(false);
+    mcp_config["servers"]["github"]["expose_prompts"] = json!(false);
+    mcp_config["policy"] = json!({"default_action": "allow"});
+    let mcp = create_plugin("mcp_gateway", &mcp_config).unwrap().unwrap();
+    assert_eq!(mcp.priority(), priority::MCP_GATEWAY);
+
+    let governor = Arc::new(
+        AiToolGovernor::new(
+            &json!({
+                "default_action": "deny",
+                "tools": {
+                    "github.ping_tool": {
+                        "action": "allow",
+                        "json_schema": {
+                            "type": "object",
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("permissive governor"),
+    );
+    assert_eq!(governor.priority(), priority::AI_TOOL_GOVERNOR);
+
+    let session_id = initialize(&mcp).await;
+    let _ = aggregate_tool_names(&mcp, &session_id, 28).await;
+
+    for (request_id, params) in [
+        (29i64, json!({ "name": "github.ping_tool" })),
+        (30i64, json!({ "name": "github.ping_tool", "arguments": {} })),
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": params
+        }));
+        headers.insert("mcp-session-id".to_string(), session_id.clone());
+
+        let governor_result = governor.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(governor_result, PluginResult::Continue),
+            "governor must accept permissive zero-arg form {request_id}: {governor_result:?}"
+        );
+        let mcp_result = mcp.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(mcp_result, PluginResult::Continue),
+            "mcp_gateway must accept permissive zero-arg form {request_id}: {mcp_result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mcp.schema_validation")
+                .map(String::as_str),
+            Some("pass"),
+            "composed permissive call {request_id} must pass mcp schema validation"
+        );
+    }
+
+    // --- Required property: both layers reject omitted and {} ---
+    let required_governor = Arc::new(
+        AiToolGovernor::new(
+            &json!({
+                "default_action": "deny",
+                "tools": {
+                    "github.ping_tool": {
+                        "action": "allow",
+                        "required_args": ["repo"],
+                        "json_schema": {
+                            "type": "object",
+                            "required": ["repo"],
+                            "additionalProperties": false,
+                            "properties": { "repo": { "type": "string" } }
+                        }
+                    }
+                },
+                "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("required-args governor"),
+    );
+
+    for (request_id, params) in [
+        (31i64, json!({ "name": "github.ping_tool" })),
+        (32i64, json!({ "name": "github.ping_tool", "arguments": {} })),
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": params
+        }));
+        headers.insert("mcp-session-id".to_string(), session_id.clone());
+
+        let governor_result = required_governor
+            .before_proxy(&mut ctx, &mut headers)
+            .await;
+        let (status, _, _) = reject_raw(governor_result);
+        assert_eq!(
+            status, 403,
+            "governor must reject missing required property for form {request_id}"
+        );
+        // Enforce-mode composition stops before mcp_gateway once the earlier
+        // priority plugin rejects; parity for the gateway's required-schema
+        // path is covered below with an allowlisted governor.
+    }
+
+    // Governor allows; mcp_gateway required inputSchema rejects both forms.
+    let catalog = start_mcp_catalog_server().await;
+    let mcp_required = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", catalog.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let allow_governor = Arc::new(
+        AiToolGovernor::new(
+            &json!({
+                "default_action": "deny",
+                "tools": {
+                    "github.create_pr": { "action": "allow" }
+                },
+                "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("allow governor"),
+    );
+    let required_session = initialize(&mcp_required).await;
+    let _ = aggregate_tool_names(&mcp_required, &required_session, 2).await;
+
+    for (request_id, params) in [
+        (4i64, json!({ "name": "github.create_pr" })),
+        (5i64, json!({ "name": "github.create_pr", "arguments": {} })),
+    ] {
+        let (mut ctx, mut headers) = mcp_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": params
+        }));
+        headers.insert("mcp-session-id".to_string(), required_session.clone());
+
+        assert!(
+            matches!(
+                allow_governor.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "allowlisted governor must continue for form {request_id}"
+        );
+        let mcp_result = mcp_required.before_proxy(&mut ctx, &mut headers).await;
+        let (status, body, _) = reject_json(mcp_result);
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], request_id);
+        assert_eq!(body["error"]["code"], -32602);
+        assert_eq!(
+            ctx.metadata
+                .get("mcp.schema_validation")
+                .map(String::as_str),
+            Some("fail"),
+            "composed required-schema call {request_id} must fail mcp validation"
+        );
+    }
 }

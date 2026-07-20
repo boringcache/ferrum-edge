@@ -4,9 +4,9 @@ use ferrum_edge::{
     _test_support::clone_log_metadata,
     config::{BackendAllowIps, BackendEgressPolicy},
     plugins::{
-        Plugin, PluginFailurePolicy, PluginHttpClient, RequestContext, ResponseStreamAction,
-        ResponseStreamInspector, ai_tool_governor::AiToolGovernor, available_plugins,
-        correlation_id::CorrelationId, create_plugin_with_http_client,
+        Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
+        ResponseStreamAction, ResponseStreamInspector, ai_tool_governor::AiToolGovernor,
+        available_plugins, correlation_id::CorrelationId, create_plugin_with_http_client,
         create_response_stream_inspector, plugin_failure_policy, priority, validate_plugin_config,
     },
     proxy::deferred_log::BodyOutcome,
@@ -8529,6 +8529,100 @@ async fn approval_stops_fanout_after_enforce_block() {
             .await,
         Some(403),
     );
+}
+
+/// Sequential unique approvals share one cumulative 30s batch budget
+/// (GHSA-pcv8-f48c-mppw). Later webhook calls must not dispatch after the
+/// budget is exhausted. The test-only approval clock advances by the
+/// production ceiling on the first webhook response so hosted CI never sleeps
+/// 30 seconds; public config / OpenAPI stay unchanged.
+#[tokio::test]
+async fn approval_batch_deadline_stops_later_webhook_fanout() {
+    let server = MockServer::start().await;
+    let plugin = std::sync::Arc::new(make(json!({
+        "default_action": "require_approval",
+        "tools": {},
+        "approval": {
+            "endpoint_url": format!("{}/approve", server.uri()),
+            "cache_ttl_seconds": 0,
+            "timeout_ms": 5000
+        }
+    })));
+    assert_eq!(
+        AiToolGovernor::max_approval_batch_deadline(),
+        std::time::Duration::from_secs(30),
+        "production approval batch ceiling must remain exactly 30s"
+    );
+
+    let clock = std::sync::Arc::clone(&plugin);
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(move |_req: &wiremock::Request| {
+            // Simulate the first unique approval consuming the whole batch
+            // budget. Subsequent unique calls must fail closed without another
+            // webhook dispatch.
+            clock.advance_approval_clock_for_tests(AiToolGovernor::max_approval_batch_deadline());
+            ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tool_calls: Vec<Value> = (0..3)
+        .map(|i| {
+            json!({
+                "id": format!("call_{i}"),
+                "type": "function",
+                "function": {
+                    "name": "deploy",
+                    "arguments": format!(r#"{{"n":{i}}}"#)
+                }
+            })
+        })
+        .collect();
+    let body = serde_json::to_vec(&json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": tool_calls
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    match plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502, "deadline exhaustion is fail-closed");
+            assert!(
+                body.contains("approval batch deadline exceeded"),
+                "unexpected reject body: {body}"
+            );
+            assert!(
+                body.contains("approval_denied"),
+                "unexpected reject body: {body}"
+            );
+        }
+        other => panic!("expected reject after batch deadline, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("approval_denied")
+    );
+    server.verify().await;
 }
 
 /// Duplicate streamed indexes with distinct ids must fail closed instead of

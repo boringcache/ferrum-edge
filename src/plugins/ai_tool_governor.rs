@@ -85,7 +85,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use url::Url;
@@ -426,6 +426,10 @@ struct GovernorEngine {
     /// completed), NOT the per-request proxy hot path, so the hot-path
     /// no-locks invariant does not apply.
     approval_cache_insert_lock: std::sync::Mutex<()>,
+    /// Test-only monotonic offset applied to approval-batch deadline arithmetic.
+    /// Production construction leaves this at zero so the ceiling stays exactly
+    /// [`MAX_APPROVAL_BATCH_DEADLINE`]. Cache TTLs continue to use wall time.
+    approval_clock_offset_ms: AtomicU64,
 }
 
 /// A concrete tool call to evaluate (name + arguments).
@@ -613,6 +617,16 @@ fn set_ranked_risk_metadata(
 }
 
 impl GovernorEngine {
+    /// Instant used for the whole-batch approval deadline. Production offset is
+    /// zero; tests may advance it without sleeping the real 30s ceiling.
+    fn approval_now(&self) -> Instant {
+        let offset =
+            Duration::from_millis(self.approval_clock_offset_ms.load(Ordering::Relaxed));
+        Instant::now()
+            .checked_add(offset)
+            .unwrap_or_else(Instant::now)
+    }
+
     /// Deterministic evaluation of one tool call. Returns the outcome, whether
     /// an explicit policy matched, and the call's risk.
     fn evaluate(
@@ -845,7 +859,10 @@ impl GovernorEngine {
             }) || redaction_amplification.iter().any(|failed| *failed));
         // Whole-batch approval deadline: sequential webhook waits cannot exceed
         // this ceiling even when every call misses the cache.
-        let approval_deadline = Instant::now() + MAX_APPROVAL_BATCH_DEADLINE;
+        let approval_deadline = self
+            .approval_now()
+            .checked_add(MAX_APPROVAL_BATCH_DEADLINE)
+            .unwrap_or_else(|| self.approval_now());
 
         for ((call, (outcome, matched, risk)), amplification) in
             calls.iter().zip(evaluations).zip(redaction_amplification)
@@ -995,7 +1012,7 @@ impl GovernorEngine {
             return;
         };
 
-        let remaining = approval_deadline.saturating_duration_since(Instant::now());
+        let remaining = approval_deadline.saturating_duration_since(self.approval_now());
         if remaining.is_zero() {
             cd.label = "approval_denied";
             cd.blocks = true;
@@ -1277,6 +1294,7 @@ impl AiToolGovernor {
                 http_client,
                 approval_cache: DashMap::with_shard_amount(approval_cache_shard_amount),
                 approval_cache_insert_lock: std::sync::Mutex::new(()),
+                approval_clock_offset_ms: AtomicU64::new(0),
             };
             return Ok(Self {
                 instance_id,
@@ -1412,6 +1430,7 @@ impl AiToolGovernor {
             http_client,
             approval_cache: DashMap::with_shard_amount(approval_cache_shard_amount),
             approval_cache_insert_lock: std::sync::Mutex::new(()),
+            approval_clock_offset_ms: AtomicU64::new(0),
         };
 
         Ok(Self {
@@ -3366,6 +3385,23 @@ impl AiToolGovernor {
 
     pub fn pending_stream_metadata_len(&self) -> usize {
         self.pending_stream_metadata.len()
+    }
+
+    /// Production whole-batch approval deadline ceiling (exactly 30s).
+    pub fn max_approval_batch_deadline() -> Duration {
+        MAX_APPROVAL_BATCH_DEADLINE
+    }
+
+    /// Advance the approval-batch deadline clock without sleeping. Used to
+    /// prove cumulative budget exhaustion deterministically while the
+    /// production ceiling remains [`MAX_APPROVAL_BATCH_DEADLINE`].
+    pub fn advance_approval_clock_for_tests(&self, duration: Duration) {
+        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let _ = self.engine.approval_clock_offset_ms.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(millis)),
+        );
     }
 }
 
