@@ -2201,12 +2201,10 @@ pub mod _test_support {
         crate::plugins::udp_logging::validate_dtls_file_dependencies(config)
     }
 
-    pub fn udp_logging_reset_dtls_materialize_calls_for_test() {
-        crate::plugins::udp_logging::reset_dtls_materialize_calls_for_test()
-    }
-
-    pub fn udp_logging_dtls_materialize_calls_for_test() -> u64 {
-        crate::plugins::udp_logging::dtls_materialize_calls_for_test()
+    pub fn udp_logging_duplicate_dtls_materialization_probe_for_test(
+        config: &serde_json::Map<String, serde_json::Value>,
+    ) -> (Result<(), String>, Result<(), String>, usize, usize) {
+        crate::plugins::udp_logging::duplicate_dtls_materialization_probe_for_test(config)
     }
 
     pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {

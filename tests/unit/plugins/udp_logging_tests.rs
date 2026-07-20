@@ -62,9 +62,15 @@ async fn spawn_dtls_server() -> (Arc<ferrum_edge::dtls::DtlsServer>, SocketAddr)
     let acceptor = server.clone();
     tokio::spawn(async move {
         loop {
-            if acceptor.accept().await.is_err() {
+            let Ok((connection, _peer)) = acceptor.accept().await else {
                 break;
-            }
+            };
+            // Retain and drain each accepted association. Dropping the handle
+            // here would close the server side immediately after handshake and
+            // turn DNS-rollover coverage into a race against teardown.
+            tokio::spawn(async move {
+                while connection.recv().await.is_ok() {}
+            });
         }
     });
     (server, addr)
@@ -900,7 +906,6 @@ fn test_udp_logging_file_dependency_phase_reports_bad_dtls_material() {
 
 #[test]
 fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
-    ferrum_edge::_test_support::udp_logging_reset_dtls_materialize_calls_for_test();
     let shared = json!({
         "host": "127.0.0.1",
         "port": 9514,
@@ -909,6 +914,15 @@ fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
         "dtls_key_path": "/missing/shared-udp-key.pem",
         "dtls_no_verify": true
     });
+    let (first, second, materialize_calls, cache_entries) =
+        ferrum_edge::_test_support::udp_logging_duplicate_dtls_materialization_probe_for_test(
+            shared.as_object().expect("shared config object"),
+        );
+    assert!(first.is_err(), "first missing-source validation must fail");
+    assert_eq!(second, first, "cached failure must be replayed exactly");
+    assert_eq!(materialize_calls, 1, "identical inputs materialize once");
+    assert_eq!(cache_entries, 1, "identical inputs occupy one cache entry");
+
     let config = GatewayConfig {
         plugin_configs: vec![
             PluginConfig {
@@ -941,11 +955,6 @@ fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
         ..GatewayConfig::default()
     };
     let errors = config.validate_plugin_file_dependencies();
-    assert_eq!(
-        ferrum_edge::_test_support::udp_logging_dtls_materialize_calls_for_test(),
-        1,
-        "identical DTLS validation inputs must materialize once"
-    );
     assert!(
         errors
             .iter()
@@ -1308,10 +1317,17 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
     // Connection close must propagate as a send failure (not hang).
     server_conn.close().await;
     client.close().await;
-    let closed_err = client
-        .send(b"after-close")
-        .await
-        .expect_err("send after close must fail");
+    let close_deadline = Instant::now() + Duration::from_secs(1);
+    let closed_err = loop {
+        match tokio::time::timeout(Duration::from_millis(100), client.send(b"after-close")).await {
+            Ok(Err(error)) => break error,
+            Ok(Ok(())) | Err(_) if Instant::now() < close_deadline => {
+                tokio::task::yield_now().await;
+            }
+            Ok(Ok(())) => panic!("send kept succeeding after local close"),
+            Err(_) => panic!("send did not observe local close within 1s"),
+        }
+    };
     assert!(
         closed_err.to_string().contains("closed") || closed_err.to_string().contains("DTLS"),
         "close/cancel failure must propagate: {closed_err}"

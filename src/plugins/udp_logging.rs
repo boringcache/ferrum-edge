@@ -87,9 +87,6 @@ const DTLS_ONLY_CONFIG_KEYS: &[&str] = &[
     "dtls_no_verify",
 ];
 
-/// Test-only counter of DTLS materialization attempts (admission + file-deps).
-static DTLS_MATERIALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
-
 /// Pre-materialized DTLS client identity and verifier for one plugin generation.
 #[derive(Clone)]
 pub(crate) struct CachedDtlsMaterial {
@@ -315,7 +312,6 @@ pub(crate) fn materialize_dtls_material(
     no_verify: bool,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<CachedDtlsMaterial, String> {
-    DTLS_MATERIALIZE_CALLS.fetch_add(1, Ordering::Relaxed);
     let certificate = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
         crate::dtls::load_dtls_certificate(cert_path, key_path).map_err(|error| {
             format!("udp_logging: DTLS cert/key materialization failed: {error}")
@@ -453,23 +449,63 @@ pub(crate) fn validate_dtls_file_dependencies_cached(
     config: &Map<String, Value>,
     cache: &mut std::collections::HashMap<DtlsFileDependencyCacheKey, Result<(), String>>,
 ) -> Result<(), String> {
+    let mut materialize = |key: &DtlsFileDependencyCacheKey| {
+        materialize_dtls_material(
+            &key.host,
+            key.cert_path.as_deref(),
+            key.key_path.as_deref(),
+            key.ca_path.as_deref(),
+            key.no_verify,
+            &[],
+        )
+        .map(|_| ())
+    };
+    validate_dtls_file_dependencies_cached_with(config, cache, &mut materialize)
+}
+
+fn validate_dtls_file_dependencies_cached_with<F>(
+    config: &Map<String, Value>,
+    cache: &mut std::collections::HashMap<DtlsFileDependencyCacheKey, Result<(), String>>,
+    materialize: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&DtlsFileDependencyCacheKey) -> Result<(), String>,
+{
     let Some(key) = dtls_file_dependency_cache_key(config)? else {
         return Ok(());
     };
     if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
-    let result = materialize_dtls_material(
-        &key.host,
-        key.cert_path.as_deref(),
-        key.key_path.as_deref(),
-        key.ca_path.as_deref(),
-        key.no_verify,
-        &[],
-    )
-    .map(|_| ());
+    let result = materialize(&key);
     cache.insert(key, result.clone());
     result
+}
+
+/// Deterministic duplicate-input probe for external tests. The counter is
+/// scoped to this call, so parallel plugin tests cannot perturb it.
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
+pub(crate) fn duplicate_dtls_materialization_probe_for_test(
+    config: &Map<String, Value>,
+) -> (Result<(), String>, Result<(), String>, usize, usize) {
+    let mut cache = std::collections::HashMap::new();
+    let mut materialize_calls = 0usize;
+    let mut materialize = |key: &DtlsFileDependencyCacheKey| {
+        materialize_calls = materialize_calls.saturating_add(1);
+        materialize_dtls_material(
+            &key.host,
+            key.cert_path.as_deref(),
+            key.key_path.as_deref(),
+            key.ca_path.as_deref(),
+            key.no_verify,
+            &[],
+        )
+        .map(|_| ())
+    };
+    let first = validate_dtls_file_dependencies_cached_with(config, &mut cache, &mut materialize);
+    let second = validate_dtls_file_dependencies_cached_with(config, &mut cache, &mut materialize);
+    drop(materialize);
+    (first, second, materialize_calls, cache.len())
 }
 
 fn reject_dtls_only_fields_unless_enabled(
@@ -1021,14 +1057,4 @@ impl UdpLogging {
             .map(|state| state.sender_generation)
             .unwrap_or(0)
     }
-}
-
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
-pub(crate) fn reset_dtls_materialize_calls_for_test() {
-    DTLS_MATERIALIZE_CALLS.store(0, Ordering::Relaxed);
-}
-
-#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
-pub(crate) fn dtls_materialize_calls_for_test() -> u64 {
-    DTLS_MATERIALIZE_CALLS.load(Ordering::Relaxed)
 }
