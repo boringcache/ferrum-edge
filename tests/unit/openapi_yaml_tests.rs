@@ -4360,6 +4360,98 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
 }
 
 #[test]
+fn ws_frame_logging_schema_matches_runtime_admission_contract() {
+    use ferrum_edge::plugins::ws_frame_logging::{
+        DEFAULT_LOG_LEVEL, MAX_PAYLOAD_PREVIEW_BYTES, WS_FRAME_LOGGING_CONFIG_KEYS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/WsFrameLoggingConfig")
+        .expect("WsFrameLoggingConfig exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["log_level"]["default"],
+        json!(DEFAULT_LOG_LEVEL)
+    );
+    assert_eq!(
+        schema["properties"]["log_level"]["enum"],
+        json!(["trace", "debug", "info", "warn"])
+    );
+    assert_eq!(
+        schema["properties"]["payload_preview_bytes"]["maximum"],
+        json!(MAX_PAYLOAD_PREVIEW_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["payload_preview_bytes"]["minimum"],
+        json!(0)
+    );
+
+    let documented: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime: BTreeSet<_> = WS_FRAME_LOGGING_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(documented, runtime, "OpenAPI/runtime key drift");
+
+    let description = schema["description"]
+        .as_str()
+        .expect("WsFrameLoggingConfig description");
+    for contract in [
+        "OptionalFailOpen",
+        "FERRUM_LOG_LEVEL=warn",
+        "not clamped",
+        "requires_ws_frame_hooks",
+        "raw-copy tunnel",
+    ] {
+        assert!(
+            description.contains(contract),
+            "description missing `{contract}`"
+        );
+    }
+
+    for valid in [
+        json!({}),
+        json!({"log_level": "warn"}),
+        json!({"log_level": "info"}),
+        json!({
+            "include_payload_preview": true,
+            "payload_preview_bytes": MAX_PAYLOAD_PREVIEW_BYTES
+        }),
+        json!({
+            "include_payload_preview": false,
+            "payload_preview_bytes": 0
+        }),
+    ] {
+        assert_component_validity(&spec, "WsFrameLoggingConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"log_levle": "debug"}),
+        json!({"log_level": "error"}),
+        json!({"log_level": null}),
+        json!({"payload_preview_bytes": MAX_PAYLOAD_PREVIEW_BYTES + 1}),
+        json!({"include_payload_preview": true, "payload_preview_bytes": 0}),
+        json!({"include_payload_preview": null}),
+    ] {
+        assert_component_validity(&spec, "WsFrameLoggingConfig", &invalid, false);
+    }
+
+    let plugin_config_desc = spec
+        .pointer("/components/schemas/PluginConfig/properties/config/description")
+        .and_then(|v| v.as_str())
+        .expect("PluginConfig.config description");
+    assert!(
+        plugin_config_desc.contains("OptionalFailOpen"),
+        "generic PluginConfig.config must document OptionalFailOpen omission"
+    );
+    assert!(plugin_config_desc.contains("ws_frame_logging"));
+}
+
+#[test]
 fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

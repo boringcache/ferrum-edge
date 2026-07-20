@@ -1410,6 +1410,85 @@ fn test_optional_custom_plugin_validation_failure_is_omitted() {
 }
 
 #[test]
+fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("ws_frame_logging"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::OptionalFailOpen)
+    );
+
+    let invalid = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ws-log"])],
+        vec![make_plugin_config_with_json(
+            "ws-log",
+            "ws_frame_logging",
+            json!({"log_levle": "debug"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache =
+        PluginCache::new(&invalid).expect("OptionalFailOpen must admit snapshot despite bad config");
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "invalid ws_frame_logging must be omitted from published cache"
+    );
+    assert!(
+        !cache.requires_ws_frame_hooks("p1"),
+        "omitted logger must not force frame-hook selection"
+    );
+
+    let valid = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ws-log"])],
+        vec![make_plugin_config_with_json(
+            "ws-log",
+            "ws_frame_logging",
+            json!({}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("empty ws_frame_logging config is valid");
+    assert_eq!(
+        cache
+            .get_plugins("p1")
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["ws_frame_logging"]
+    );
+    assert!(cache.requires_ws_frame_hooks("p1"));
+
+    let oversize = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ws-log"])],
+        vec![make_plugin_config_with_json(
+            "ws-log",
+            "ws_frame_logging",
+            json!({
+                "include_payload_preview": true,
+                "payload_preview_bytes": 999999999
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let delta = ConfigDelta::compute(&valid, &oversize);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&valid, &oversize);
+    cache
+        .apply_delta(
+            &oversize,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("OptionalFailOpen reload must publish by omitting the bad instance");
+    assert!(
+        cache.get_plugins("p1").is_empty(),
+        "reload must omit oversized payload_preview_bytes rather than clamp"
+    );
+    assert!(!cache.requires_ws_frame_hooks("p1"));
+}
+
+#[test]
 fn test_unknown_enabled_plugin_rejects_initial_cache() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec![])],

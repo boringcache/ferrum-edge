@@ -4,13 +4,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ferrum_edge::plugins::correlation_id::CorrelationId;
-use ferrum_edge::plugins::ws_frame_logging::WsFrameLogging;
+use ferrum_edge::plugins::ws_frame_logging::{
+    DEFAULT_LOG_LEVEL, MAX_PAYLOAD_PREVIEW_BYTES, WS_FRAME_LOGGING_CONFIG_KEYS, WsFrameLogging,
+};
 use ferrum_edge::plugins::{
     Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection, WsDisconnectContext,
+    plugin_failure_policy, validate_plugin_config, PluginFailurePolicy,
 };
 use serde_json::json;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{Event, Subscriber};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
@@ -110,6 +115,20 @@ fn install_ws_log_capture(capture: &WsLogCapture) -> tracing::subscriber::Defaul
     tracing::subscriber::set_default(subscriber)
 }
 
+/// Install a capture subscriber filtered like the gateway EnvFilter
+/// (`FERRUM_LOG_LEVEL` / `RUST_LOG` directive, default `warn`).
+fn install_filtered_ws_log_capture(
+    directive: &str,
+    capture: &WsLogCapture,
+) -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::registry().with(
+        capture
+            .layer()
+            .with_filter(EnvFilter::new(directive)),
+    );
+    tracing::subscriber::set_default(subscriber)
+}
+
 fn disconnect_context(metadata: HashMap<String, String>) -> WsDisconnectContext {
     WsDisconnectContext {
         namespace: "ferrum".to_string(),
@@ -167,17 +186,58 @@ fn test_creation_defaults() {
     let plugin = WsFrameLogging::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ws_frame_logging");
     assert_eq!(plugin.priority(), 9050);
+    assert_eq!(plugin.configured_log_level(), DEFAULT_LOG_LEVEL);
+    assert_eq!(plugin.configured_log_level(), "warn");
+    assert_eq!(plugin.payload_preview_bytes(), 128);
+    assert!(plugin.requires_ws_frame_hooks());
+    assert_eq!(
+        plugin_failure_policy("ws_frame_logging"),
+        Some(PluginFailurePolicy::OptionalFailOpen)
+    );
 }
 
 // === Config validation ===
 
 #[test]
 fn test_creation_rejects_unknown_log_level() {
-    let result = WsFrameLogging::new(&json!({"log_level": "warn"}));
+    let result = WsFrameLogging::new(&json!({"log_level": "error"}));
     assert!(result.is_err());
     let msg = result.err().unwrap();
     assert!(msg.contains("log_level"), "msg: {msg}");
-    assert!(msg.contains("warn"), "msg: {msg}");
+    assert!(msg.contains("error"), "msg: {msg}");
+}
+
+#[test]
+fn test_creation_rejects_unknown_config_keys() {
+    let err = WsFrameLogging::new(&json!({"log_levle": "debug"}))
+        .err()
+        .expect("typo keys must be rejected");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
+    assert!(err.contains("log_levle"), "got: {err}");
+    for key in WS_FRAME_LOGGING_CONFIG_KEYS {
+        assert!(err.contains(key), "allowed-key list missing {key}: {err}");
+    }
+
+    let err = validate_plugin_config("ws_frame_logging", &json!({"payload_preview_byte": 64}))
+        .err()
+        .expect("shared validation must reject unknown keys");
+    assert!(err.contains("payload_preview_byte"), "got: {err}");
+}
+
+#[test]
+fn test_creation_rejects_null_field_values() {
+    for (config, field) in [
+        (json!({"log_level": null}), "log_level"),
+        (json!({"include_payload_preview": null}), "include_payload_preview"),
+        (json!({"payload_preview_bytes": null}), "payload_preview_bytes"),
+        (json!({"log_ping_pong": null}), "log_ping_pong"),
+    ] {
+        let err = WsFrameLogging::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("null {field} must be rejected"));
+        assert!(err.contains(field), "got: {err}");
+        assert!(err.contains("null"), "got: {err}");
+    }
 }
 
 #[test]
@@ -203,10 +263,11 @@ fn test_creation_rejects_non_string_log_level() {
 
 #[test]
 fn test_creation_accepts_valid_log_levels() {
-    for level in ["trace", "debug", "info"] {
-        WsFrameLogging::new(&json!({"log_level": level})).unwrap_or_else(|e| {
+    for level in ["trace", "debug", "info", "warn"] {
+        let plugin = WsFrameLogging::new(&json!({"log_level": level})).unwrap_or_else(|e| {
             panic!("expected '{level}' to be accepted but got: {e}");
         });
+        assert_eq!(plugin.configured_log_level(), level);
     }
 }
 
@@ -591,23 +652,42 @@ fn test_payload_preview_bytes_zero_rejected_when_preview_enabled() {
     assert!(err.contains("payload_preview_bytes"), "got: {err}");
 }
 
-#[tokio::test]
-async fn test_payload_preview_bytes_clamped_to_max() {
-    // Very large payload_preview_bytes should be clamped (not cause OOM)
-    let plugin = WsFrameLogging::new(
-        &json!({"include_payload_preview": true, "payload_preview_bytes": 999999999}),
-    )
-    .unwrap();
-    let msg = Message::Binary(vec![0xAB; 100].into());
-    let result = plugin
-        .on_ws_frame(
-            "test-proxy",
-            1,
-            WebSocketFrameDirection::ClientToBackend,
-            &msg,
+#[test]
+fn test_payload_preview_bytes_accepts_exact_maximum() {
+    let plugin = WsFrameLogging::new(&json!({
+        "include_payload_preview": true,
+        "payload_preview_bytes": MAX_PAYLOAD_PREVIEW_BYTES,
+    }))
+    .expect("exact OpenAPI maximum must be accepted");
+    assert_eq!(
+        plugin.payload_preview_bytes(),
+        MAX_PAYLOAD_PREVIEW_BYTES as usize
+    );
+}
+
+#[test]
+fn test_payload_preview_bytes_rejects_above_maximum() {
+    for oversize in [MAX_PAYLOAD_PREVIEW_BYTES + 1, 999_999_999] {
+        let err = WsFrameLogging::new(&json!({
+            "include_payload_preview": true,
+            "payload_preview_bytes": oversize,
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("{oversize} must be rejected, not clamped"));
+        assert!(err.contains("payload_preview_bytes"), "got: {err}");
+        assert!(err.contains(&oversize.to_string()), "got: {err}");
+
+        let err = validate_plugin_config(
+            "ws_frame_logging",
+            &json!({
+                "include_payload_preview": true,
+                "payload_preview_bytes": oversize,
+            }),
         )
-        .await;
-    assert!(result.is_none());
+        .err()
+        .unwrap_or_else(|| panic!("shared validation must reject {oversize}"));
+        assert!(err.contains("payload_preview_bytes"), "got: {err}");
+    }
 }
 
 #[tokio::test]
@@ -805,4 +885,67 @@ async fn test_payload_preview_omitted_when_disabled_or_control_frame() {
         events.iter().all(|event| event.preview.is_none()),
         "preview should be omitted for disabled previews and control frames: {events:?}"
     );
+}
+
+// === Default gateway filter visibility (#2617) ===
+
+#[tokio::test(flavor = "current_thread")]
+async fn default_empty_config_emits_under_default_gateway_filter() {
+    let capture = WsLogCapture::default();
+    let _guard = install_filtered_ws_log_capture("warn", &capture);
+    let plugin = WsFrameLogging::new(&json!({})).expect("empty config");
+    assert_eq!(plugin.configured_log_level(), "warn");
+    assert!(
+        plugin.requires_ws_frame_hooks(),
+        "enabled plugin must keep the parsed/frame-hook path (H1 raw tunnel unavailable)"
+    );
+
+    log_frame(&plugin, 1, &Message::Text("hello".into())).await;
+    plugin
+        .on_ws_disconnect(&disconnect_context(HashMap::new()))
+        .await;
+
+    let events = capture.events();
+    assert!(
+        events.len() >= 2,
+        "default warn/warn combination must emit frame and disconnect records, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event.as_deref() == Some("disconnect")),
+        "missing disconnect record: {events:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_levels_respect_gateway_filter_combinations() {
+    for (plugin_level, filter, expect_visible) in [
+        ("trace", "warn", false),
+        ("debug", "warn", false),
+        ("info", "warn", false),
+        ("warn", "warn", true),
+        ("trace", "trace", true),
+        ("debug", "debug", true),
+        ("info", "info", true),
+        ("warn", "error", false),
+    ] {
+        // Construct before installing the filtered subscriber so construction
+        // diagnostics cannot contaminate per-frame visibility assertions.
+        let plugin = WsFrameLogging::new(&json!({"log_level": plugin_level}))
+            .unwrap_or_else(|e| panic!("level {plugin_level}: {e}"));
+        assert!(
+            plugin.requires_ws_frame_hooks(),
+            "frame-hook selection must remain true even when records are filtered"
+        );
+
+        let capture = WsLogCapture::default();
+        let _guard = install_filtered_ws_log_capture(filter, &capture);
+        log_frame(&plugin, 1, &Message::Text("frame".into())).await;
+        let visible = !capture.events().is_empty();
+        assert_eq!(
+            visible, expect_visible,
+            "plugin={plugin_level} filter={filter}: visibility={visible}, expected={expect_visible}"
+        );
+    }
 }

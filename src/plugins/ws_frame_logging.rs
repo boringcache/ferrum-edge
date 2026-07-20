@@ -25,7 +25,7 @@
 //! Config:
 //! ```json
 //! {
-//!   "log_level": "info",
+//!   "log_level": "warn",
 //!   "include_payload_preview": false,
 //!   "payload_preview_bytes": 128,
 //!   "log_ping_pong": false
@@ -34,13 +34,30 @@
 
 use async_trait::async_trait;
 use ring::rand::SecureRandom;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tracing::warn;
 
 use super::{
     Direction, Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
     WsDisconnectContext,
 };
+
+/// Allowed configuration keys for `ws_frame_logging`.
+pub const WS_FRAME_LOGGING_CONFIG_KEYS: &[&str] = &[
+    "log_level",
+    "include_payload_preview",
+    "payload_preview_bytes",
+    "log_ping_pong",
+];
+
+/// Maximum leading payload bytes folded into a fingerprint digest.
+pub const MAX_PAYLOAD_PREVIEW_BYTES: u64 = 65_536;
+
+/// Default `log_level` when omitted. Matches the gateway default
+/// `FERRUM_LOG_LEVEL=warn` so an enabled empty config emits under the default
+/// EnvFilter.
+pub const DEFAULT_LOG_LEVEL: &str = "warn";
 
 /// Log level for frame logging output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +65,27 @@ enum LogLevel {
     Trace,
     Debug,
     Info,
+    Warn,
+}
+
+impl LogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        match self {
+            Self::Trace => tracing::enabled!(target: "ws_frame_log", tracing::Level::TRACE),
+            Self::Debug => tracing::enabled!(target: "ws_frame_log", tracing::Level::DEBUG),
+            Self::Info => tracing::enabled!(target: "ws_frame_log", tracing::Level::INFO),
+            Self::Warn => tracing::enabled!(target: "ws_frame_log", tracing::Level::WARN),
+        }
+    }
 }
 
 pub struct WsFrameLogging {
@@ -60,53 +98,80 @@ pub struct WsFrameLogging {
 
 impl WsFrameLogging {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(object) = config.as_object() else {
             return Err("ws_frame_logging: config must be a JSON object".to_string());
-        }
+        };
+        reject_unknown_keys(object)?;
 
         // Validate log_level explicitly — unknown values are rejected per the
-        // plugin-validation rules so misspellings (e.g. "info " or "warn") are
-        // caught at config-load time rather than silently downgraded to "info".
-        let log_level = match config.get("log_level") {
+        // plugin-validation rules so misspellings (e.g. "info " or "INFO") are
+        // caught at config-load time rather than silently downgraded.
+        // Default is `warn` so an empty config remains visible under the
+        // gateway's default `FERRUM_LOG_LEVEL=warn` EnvFilter.
+        let log_level = match object.get("log_level") {
+            Some(Value::Null) => {
+                return Err(
+                    "ws_frame_logging: 'log_level' must be a string ('trace', 'debug', 'info', or 'warn'); null is not allowed"
+                        .to_string(),
+                );
+            }
             Some(v) => match v.as_str() {
                 Some("trace") => LogLevel::Trace,
                 Some("debug") => LogLevel::Debug,
                 Some("info") => LogLevel::Info,
+                Some("warn") => LogLevel::Warn,
                 Some(other) => {
                     return Err(format!(
                         "ws_frame_logging: invalid 'log_level' value '{other}' \
-                         (expected 'trace', 'debug', or 'info')"
+                         (expected 'trace', 'debug', 'info', or 'warn')"
                     ));
                 }
                 None => {
                     return Err(
-                        "ws_frame_logging: 'log_level' must be a string ('trace', 'debug', or 'info')"
+                        "ws_frame_logging: 'log_level' must be a string ('trace', 'debug', 'info', or 'warn')"
                             .to_string(),
                     );
                 }
             },
-            None => LogLevel::Info,
+            None => LogLevel::Warn,
         };
 
-        let include_payload_preview = match config.get("include_payload_preview") {
+        let include_payload_preview = match object.get("include_payload_preview") {
+            Some(Value::Null) => {
+                return Err(
+                    "ws_frame_logging: 'include_payload_preview' must be a boolean; null is not allowed"
+                        .to_string(),
+                );
+            }
             Some(v) => v.as_bool().ok_or_else(|| {
                 "ws_frame_logging: 'include_payload_preview' must be a boolean".to_string()
             })?,
             None => false,
         };
 
-        // Clamp to 64 KiB to bound the per-frame hashing work on the WS hot path.
-        // This is the number of leading payload bytes folded into the fingerprint
-        // digest; the raw bytes are never logged.
-        const MAX_PREVIEW_BYTES: usize = 65_536;
-        let payload_preview_bytes = match config.get("payload_preview_bytes") {
-            Some(v) => v.as_u64().ok_or_else(|| {
-                "ws_frame_logging: 'payload_preview_bytes' must be a non-negative integer"
-                    .to_string()
-            })?,
+        // Reject out-of-range preview budgets instead of silently clamping so
+        // OpenAPI `maximum: 65536`, docs, and runtime admission stay identical.
+        let payload_preview_bytes = match object.get("payload_preview_bytes") {
+            Some(Value::Null) => {
+                return Err(
+                    "ws_frame_logging: 'payload_preview_bytes' must be a non-negative integer; null is not allowed"
+                        .to_string(),
+                );
+            }
+            Some(v) => {
+                let raw = v.as_u64().ok_or_else(|| {
+                    "ws_frame_logging: 'payload_preview_bytes' must be a non-negative integer"
+                        .to_string()
+                })?;
+                if raw > MAX_PAYLOAD_PREVIEW_BYTES {
+                    return Err(format!(
+                        "ws_frame_logging: 'payload_preview_bytes' must be <= {MAX_PAYLOAD_PREVIEW_BYTES} (got {raw})"
+                    ));
+                }
+                raw as usize
+            }
             None => 128,
-        }
-        .min(MAX_PREVIEW_BYTES as u64) as usize;
+        };
         if include_payload_preview && payload_preview_bytes == 0 {
             return Err(
                 "ws_frame_logging: 'payload_preview_bytes' must be greater than zero when payload previews are enabled"
@@ -125,12 +190,32 @@ impl WsFrameLogging {
             None
         };
 
-        let log_ping_pong = match config.get("log_ping_pong") {
+        let log_ping_pong = match object.get("log_ping_pong") {
+            Some(Value::Null) => {
+                return Err(
+                    "ws_frame_logging: 'log_ping_pong' must be a boolean; null is not allowed"
+                        .to_string(),
+                );
+            }
             Some(v) => v
                 .as_bool()
                 .ok_or_else(|| "ws_frame_logging: 'log_ping_pong' must be a boolean".to_string())?,
             None => false,
         };
+
+        // Surface a construction-time warning when a live tracing subscriber is
+        // already filtering the configured level. Skip when no subscriber is
+        // installed (unit tests constructing plugins before init_logging).
+        if tracing::dispatcher::has_been_set() && !log_level.is_enabled() {
+            warn!(
+                target: "ws_frame_log",
+                configured_level = log_level.as_str(),
+                "ws_frame_logging is enabled but its configured log_level is filtered by the active tracing EnvFilter \
+                 (gateway default FERRUM_LOG_LEVEL=warn). Frame parsing, plugin selection, and on_ws_frame dispatch \
+                 still occur; fingerprint/event construction is skipped. Raise FERRUM_LOG_LEVEL or set log_level to \
+                 a level admitted by the filter (default plugin log_level is warn)."
+            );
+        }
 
         Ok(Self {
             log_level,
@@ -139,6 +224,16 @@ impl WsFrameLogging {
             payload_fingerprint_key,
             log_ping_pong,
         })
+    }
+
+    /// Configured tracing level label (`trace`/`debug`/`info`/`warn`).
+    pub fn configured_log_level(&self) -> &'static str {
+        self.log_level.as_str()
+    }
+
+    /// Leading payload bytes folded into fingerprints when previews are enabled.
+    pub fn payload_preview_bytes(&self) -> usize {
+        self.payload_preview_bytes
     }
 
     fn frame_type_label(message: &Message) -> &'static str {
@@ -204,6 +299,23 @@ impl WsFrameLogging {
     }
 }
 
+fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .filter(|key| !WS_FRAME_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "ws_frame_logging: unknown configuration key(s): {}; allowed keys: {}",
+        unknown.join(", "),
+        WS_FRAME_LOGGING_CONFIG_KEYS.join(", ")
+    ))
+}
+
 /// Render a keyed, non-reversible payload fingerprint string.
 ///
 /// `key` is generated on the plugin construction path and intentionally never
@@ -224,7 +336,7 @@ fn payload_fingerprint(key: &[u8; 32], hashed: &[u8], full_len: usize, truncated
 /// Emit a structured log at the given tracing level.
 ///
 /// tracing macros require the level as a compile-time token, so we use a macro
-/// to deduplicate the field list across Trace/Debug/Info without 6x copy-paste.
+/// to deduplicate the field list across Trace/Debug/Info/Warn without copy-paste.
 macro_rules! emit_ws_frame_log {
     ($level:ident, $proxy_id:expr, $conn_id:expr, $dir:expr, $ftype:expr, $size:expr, $preview:expr) => {
         if let Some(ref p) = $preview {
@@ -267,6 +379,9 @@ impl Plugin for WsFrameLogging {
     }
 
     fn requires_ws_frame_hooks(&self) -> bool {
+        // Always true while enabled: selection/framing cost is paid even when
+        // the active EnvFilter suppresses emission. Filtering skips only
+        // fingerprint computation and tracing event construction.
         true
     }
 
@@ -291,7 +406,8 @@ impl Plugin for WsFrameLogging {
 
         // Defer preview computation — only allocate if the tracing level is active.
         // tracing macros short-circuit when the level is filtered, so we compute
-        // the preview inside the macro guard to avoid wasted work.
+        // the preview inside the macro guard to avoid wasted work. Frame parsing
+        // and this hook dispatch have already occurred by the time we get here.
         match self.log_level {
             LogLevel::Trace => {
                 if tracing::enabled!(target: "ws_frame_log", tracing::Level::TRACE) {
@@ -326,6 +442,20 @@ impl Plugin for WsFrameLogging {
                     let preview = self.payload_preview(message);
                     emit_ws_frame_log!(
                         info,
+                        proxy_id,
+                        connection_id,
+                        dir_label,
+                        frame_type,
+                        size,
+                        preview
+                    );
+                }
+            }
+            LogLevel::Warn => {
+                if tracing::enabled!(target: "ws_frame_log", tracing::Level::WARN) {
+                    let preview = self.payload_preview(message);
+                    emit_ws_frame_log!(
+                        warn,
                         proxy_id,
                         connection_id,
                         dir_label,
@@ -410,6 +540,25 @@ impl Plugin for WsFrameLogging {
                 "WebSocket session ended"
             ),
             LogLevel::Info => tracing::info!(
+                target: "ws_frame_log",
+                namespace = %ctx.namespace,
+                proxy_id = %ctx.proxy_id,
+                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
+                client_ip = %ctx.client_ip,
+                backend_target = %ctx.backend_target,
+                listen_port = ctx.listen_port,
+                duration_ms = ctx.duration_ms,
+                frames_c2b = ctx.frames_client_to_backend,
+                frames_b2c = ctx.frames_backend_to_client,
+                direction = direction_label,
+                error_class = %error_class_label,
+                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                auth_method = ctx.auth_method.unwrap_or("-"),
+                correlation_id = %correlation_id,
+                event = "disconnect",
+                "WebSocket session ended"
+            ),
+            LogLevel::Warn => tracing::warn!(
                 target: "ws_frame_log",
                 namespace = %ctx.namespace,
                 proxy_id = %ctx.proxy_id,

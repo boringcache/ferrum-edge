@@ -1022,6 +1022,35 @@ plugin_configs:
 }
 
 #[test]
+fn test_ws_frame_logging_optional_fail_open_admission_in_file_mode() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs:
+  - id: "plugin-ws-frame-bad-keys"
+    plugin_name: "ws_frame_logging"
+    config:
+      log_levle: debug
+      payload_preview_bytes: 999999999
+    scope: global
+    enabled: true
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("ws_frame_logging OptionalFailOpen must not reject file-mode load");
+
+    assert_eq!(config.plugin_configs.len(), 1);
+    assert_eq!(config.plugin_configs[0].plugin_name, "ws_frame_logging");
+}
+
+#[test]
 fn test_plugin_config_proxy_scope() {
     let yaml = r#"
 version: "1"

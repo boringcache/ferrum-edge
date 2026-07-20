@@ -7485,19 +7485,23 @@ components:
             Plugin-specific JSON configuration. Resource-level size and depth
             constraints are always validated. Plugin-specific construction is
             performed on create/update and config reload only when `enabled` is
-            true. Enabled plugin configs are validation-fatal when the plugin
-            cache is built: unknown plugin names or invalid plugin-specific
-            config block gateway startup in file mode, and on DB/CP polling the
-            new config snapshot is rejected as a whole (the gateway keeps
-            serving the prior good config). Disabled plugin configs are stored
-            without construction, allowing secret-dependent plugins such as
-            `basic_auth` to be staged before their runtime secret is provisioned.
-            Enabling performs full validation. See `PluginConfigs` section for
-            per-plugin schema definitions. Viewer/operator responses use the
-            audit-safe projection while admin responses remain raw. For
-            loki_logging, that projection preserves only endpoint
-            scheme/host/port and redacts the path, query, authorization, and
-            every custom-header value.
+            true. For plugins registered FailClosed or KeepLastKnownGood,
+            unknown plugin names or invalid enabled plugin-specific config are
+            validation-fatal when the plugin cache is built: they block gateway
+            startup in file mode, and on DB/CP polling the new config snapshot
+            is rejected as a whole (the gateway keeps serving the prior good
+            config). Plugins registered OptionalFailOpen (including
+            `ws_frame_logging` and other observability sinks) instead emit a
+            validation/construction warning and omit that plugin instance from
+            the published cache while admitting the surrounding snapshot.
+            Disabled plugin configs are stored without construction, allowing
+            secret-dependent plugins such as `basic_auth` to be staged before
+            their runtime secret is provisioned. Enabling performs full
+            validation. See `PluginConfigs` section for per-plugin schema
+            definitions. Viewer/operator responses use the audit-safe
+            projection while admin responses remain raw. For loki_logging, that
+            projection preserves only endpoint scheme/host/port and redacts the
+            path, query, authorization, and every custom-header value.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -8387,12 +8391,30 @@ components:
 
     WsFrameLoggingConfig:
       type: object
+      additionalProperties: false
       description: |
         Configuration for the `ws_frame_logging` plugin. Logs WebSocket frame
         metadata (direction, frame type, payload size, optional payload
         fingerprint) under the `ws_frame_log` tracing target. Logs Text and
         Binary frames by default; Ping/Pong are opt-in via `log_ping_pong`. The
         plugin never transforms or drops frames — it is purely observational.
+
+        Default `log_level` is `warn` so an enabled empty config emits under the
+        gateway's default `FERRUM_LOG_LEVEL=warn` EnvFilter. Explicit `trace`,
+        `debug`, or `info` require a matching (or more verbose) runtime filter;
+        when a live subscriber filters the configured level, construction emits
+        an actionable warning. Filtering skips fingerprint computation and
+        tracing event construction only — frame parsing, plugin selection
+        (`requires_ws_frame_hooks`), and `on_ws_frame` dispatch still occur, so
+        H1 raw-copy tunnel mode remains unavailable while this plugin is
+        attached.
+
+        Admission contract: only the keys below are allowed; unknown keys and
+        explicit `null` field values are rejected. `payload_preview_bytes`
+        values above 65536 are rejected (not clamped). The plugin is registered
+        OptionalFailOpen: invalid enabled configs produce a validation/
+        construction warning and omit this instance from the published plugin
+        cache rather than rejecting the surrounding snapshot.
 
         Raw frame contents are never logged: WebSocket payloads routinely carry
         credentials (bearer tokens, cookies, API keys), so when
@@ -8405,18 +8427,19 @@ components:
       properties:
         log_level:
           type: string
-          enum: [trace, debug, info]
-          default: info
+          enum: [trace, debug, info, warn]
+          default: warn
           description: >-
             Tracing level for frame log output. Case-sensitive; unknown values
-            (e.g., `"warn"`, `"INFO"`) are rejected at config load time.
+            (e.g., `"error"`, `"INFO"`) and explicit `null` are rejected at
+            config load time. Defaults to `warn` to match `FERRUM_LOG_LEVEL`.
         include_payload_preview:
           type: boolean
           default: false
           description: >-
             Emit a keyed, non-reversible payload fingerprint
             (`hmac-sha256:<prefix> len=<n>`) in the `preview` field. Raw frame
-            bytes are never logged.
+            bytes are never logged. Explicit `null` is rejected.
         payload_preview_bytes:
           type: integer
           default: 128
@@ -8424,13 +8447,16 @@ components:
           maximum: 65536
           description: >-
             Maximum number of leading payload bytes folded into the fingerprint
-            digest. Clamped to 65 536 to bound per-frame hashing on the WebSocket
-            hot path. Must be greater than zero when `include_payload_preview`
-            is true; zero is accepted only when previews are disabled.
+            digest. Values above 65536 are rejected (not clamped). Must be
+            greater than zero when `include_payload_preview` is true; zero is
+            accepted only when previews are disabled. Explicit `null` is
+            rejected.
         log_ping_pong:
           type: boolean
           default: false
-          description: Whether to log ping/pong frames in addition to text/binary frames.
+          description: >-
+            Whether to log ping/pong frames in addition to text/binary frames.
+            Explicit `null` is rejected.
       allOf:
         - if:
             required: [include_payload_preview]
