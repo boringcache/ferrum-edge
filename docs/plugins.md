@@ -3269,6 +3269,9 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 
 **Priority:** 3500
 **Protocol:** HTTP only
+**Failure policy:** `KeepLastKnownGood` — invalid enabled configs (including unknown top-level keys) fail admission on admin/validate/file startup paths, and reload/rebuild retains the previously published cache generation instead of applying a silently weakened default policy.
+
+Configuration must be a top-level object. The only accepted keys are `ttl_seconds`, `max_entries`, `max_entry_size_bytes`, `max_total_size_bytes`, `cacheable_methods`, `cacheable_status_codes`, `respect_cache_control`, `respect_no_cache`, `vary_by_headers`, `cache_key_include_query`, `cache_key_include_consumer`, `add_cache_status_header`, and `invalidate_on_unsafe_methods`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions instead of falling back to defaults, so a typo such as `vary_by_header` cannot silently remove a reviewed cache-isolation boundary. Optional scalar fields may be omitted or set to `null` to select their documented defaults; list fields remain non-null arrays.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -3644,6 +3647,8 @@ Controlled AI payload capture for compliance review, incident response, customer
 
 **Sampling.** `sampling.rate` (0.0–1.0) is the fraction of eligible AI transactions emitted as full records; `always_capture_on_guardrail` / `always_capture_on_error` override the roll so guardrail trips and error responses are always captured. `max_records_per_minute` caps sink volume (0 = unlimited); over the cap, records are dropped and never reject traffic. With `capture.streaming_response: "sampled"`, only requests that win the sampling roll — or whose **request-side** guardrail fired (`ai_prompt_shield`, `ai_semantic_firewall`, `ai_request_guard`) when `always_capture_on_guardrail` is set — are teed onto the stream-inspection path; the tee decision is evaluated at dispatch time, after those guardrails ran, so an un-sampled request a guardrail flagged still captures response evidence. Error statuses and **response-side** guardrail hits are only known after that decision, so on un-sampled streaming requests those overrides still emit a record via the log fallback, just without a response body/hash. Buffered responses are unaffected: their overrides always capture the body.
 
+**Strict configuration.** Unknown keys are rejected at the root and inside every fixed nested object (`capture`, `sampling`, `redaction`, each `redaction.custom_patterns[]` entry, `limits`, `privacy`, and `sink`) with path-qualified errors and spelling suggestions when the typo is close. `sink.custom_headers` is the only intentional free-form string map. Nested objects may be omitted or set to `null` to keep defaults. Misspellings such as `privacy.include_consumer_usernme`, `capture.respose`, `sink.on_sink_eror`, or `sink.on_buffer_ful` fail admission instead of silently leaving privacy-on or fail-open sink defaults. Registration policy is `KeepLastKnownGood`: Admin create/update still returns HTTP 400 for invalid enabled configs, and file/DB/CP-DP reload rejects the candidate generation so the previous audit instance remains published.
+
 **Async HTTP sink.** Records batch through the shared `BatchingLogger` + `PluginHttpClient` framework: a bounded queue, batch-by-size/interval, and retry on transient (5xx/408/429) failures. The `endpoint_url` is SSRF-screened against the backend egress policy (literal IPs at construction, resolved hostnames at send time), matching every other logger sink. `sink.custom_headers` values support `${ENV_VAR}` expansion resolved lazily at send time, so a token is referenced by env and never stored in config:
 
 ```yaml
@@ -3666,6 +3671,7 @@ config:
     flush_interval_ms: 1000
     buffer_capacity: 10000
     max_retries: 3
+    retry_delay_ms: 1000
     on_buffer_full: drop   # drop | reject (reject fails selected audit records 503 when the queue is full)
     on_sink_error: warn    # warn | reject (reject fails selected audit records 503 while the sink is unhealthy)
   privacy: { include_consumer_username: true, include_client_ip: false, include_raw_headers: false }

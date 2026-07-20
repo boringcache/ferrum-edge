@@ -7070,12 +7070,15 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ai_stream_router", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_federation", PluginFailurePolicy::KeepLastKnownGood),
-    // Observability sink family (http/tcp/udp_logging, prometheus_metrics):
-    // a construction/validation failure logs and omits the plugin rather than
-    // rejecting startup/reload. Runtime fail-closed capture is the explicit
-    // `sink.on_sink_error` / `sink.on_buffer_full` = `reject` config, not
-    // registration policy.
-    builtin_plugin("ai_transcript_audit", PluginFailurePolicy::OptionalFailOpen),
+    // Privacy/fail-closed sink policy typos must not silently drop the audit
+    // instance (OptionalFailOpen) or publish an incomplete cache. Reject the
+    // candidate generation so callers keep the last-known-good plugin cache.
+    // Runtime fail-closed capture remains the explicit
+    // `sink.on_sink_error` / `sink.on_buffer_full` = `reject` config.
+    builtin_plugin(
+        "ai_transcript_audit",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
     builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("ws_message_size_limiting", PluginFailurePolicy::FailClosed),

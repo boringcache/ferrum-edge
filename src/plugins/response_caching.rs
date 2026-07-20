@@ -20,7 +20,32 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use crate::util::unknown_keys::reject_unknown_keys;
+
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Authoritative closed set of top-level `response_caching` configuration keys.
+///
+/// Constructor admission, OpenAPI `ResponseCachingConfig`, and operator docs must
+/// stay in lockstep with this list. Unknown root properties fail closed so a
+/// misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or
+/// invalidation field cannot silently fall back to a weaker default partition
+/// or retention policy.
+pub const RESPONSE_CACHING_CONFIG_KEYS: &[&str] = &[
+    "add_cache_status_header",
+    "cache_key_include_consumer",
+    "cache_key_include_query",
+    "cacheable_methods",
+    "cacheable_status_codes",
+    "invalidate_on_unsafe_methods",
+    "max_entries",
+    "max_entry_size_bytes",
+    "max_total_size_bytes",
+    "respect_cache_control",
+    "respect_no_cache",
+    "ttl_seconds",
+    "vary_by_headers",
+];
 
 /// Maximum cache entries before triggering eviction of expired entries.
 const DEFAULT_MAX_ENTRIES: usize = 10_000;
@@ -342,9 +367,15 @@ struct ResponseCachingConfig {
 
 impl ResponseCachingConfig {
     fn from_json(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("response_caching: config must be an object".to_string());
-        }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "response_caching: config must be an object".to_string())?;
+        reject_unknown_keys(
+            object,
+            "config",
+            RESPONSE_CACHING_CONFIG_KEYS,
+            "response_caching: ",
+        )?;
 
         let cacheable_methods = parse_method_list(config, "cacheable_methods")?
             .unwrap_or_else(|| vec!["GET".to_string(), "HEAD".to_string()]);

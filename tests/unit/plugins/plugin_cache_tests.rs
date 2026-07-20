@@ -1597,6 +1597,66 @@ fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance
 }
 
 #[test]
+fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec!["rc-1"])],
+        vec![make_plugin_config_with_json(
+            "rc-1",
+            "response_caching",
+            json!({
+                "ttl_seconds": 60,
+                "vary_by_headers": ["x-tenant"],
+                "cache_key_include_consumer": true
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid response_caching must admit");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "response_caching");
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec!["rc-1"])],
+        vec![make_plugin_config_with_json(
+            "rc-1",
+            "response_caching",
+            json!({
+                "ttl_seconds": 60,
+                "vary_by_header": ["x-tenant"],
+                "cache_key_include_consumr": true
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("unknown response_caching keys must reject reload");
+    assert!(
+        error.contains("unknown configuration key"),
+        "unexpected reload error: {error}"
+    );
+    assert!(
+        error.contains("'config.vary_by_header'"),
+        "reload error must path-qualify Vary typo: {error}"
+    );
+    assert!(
+        error.contains("'config.cache_key_include_consumr'"),
+        "reload error must path-qualify consumer typo: {error}"
+    );
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].name(), "response_caching");
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted response_caching instance"
+    );
+}
+
+#[test]
 fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
     let valid = make_config(
         vec![make_proxy("p1", "/api", vec![])],
@@ -3078,6 +3138,66 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
             "{label}: rejected candidate must retain last-known-good ai_stream_router"
         );
     }
+}
+
+#[test]
+fn test_apply_delta_rejects_unknown_ai_tool_governor_keys_and_keeps_last_known_good() {
+    let good_governor = json!({
+        "default_action": "deny",
+        "tools": {
+            "github.create_pr": {
+                "action": "allow",
+                "required_args": ["ticket_id"]
+            }
+        }
+    });
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc-gov"])],
+        vec![make_plugin_config_with_json(
+            "pc-gov",
+            "ai_tool_governor",
+            good_governor.clone(),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config1).expect("valid governor config constructs");
+
+    let mut bad_governor = good_governor.clone();
+    bad_governor["tools"]["github.create_pr"]
+        .as_object_mut()
+        .unwrap()
+        .insert("required_arg".into(), json!(["ticket_id"]));
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc-gov"])],
+        vec![make_plugin_config_with_json(
+            "pc-gov",
+            "ai_tool_governor",
+            bad_governor,
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+    let error = cache
+        .apply_delta(&config2, &proxy_ids, &[], false)
+        .expect_err("unknown ai_tool_governor key must reject the reload");
+    let message = error.to_string();
+    assert!(
+        message.contains("unknown configuration key")
+            && message.contains("config.tools.github.create_pr.required_arg"),
+        "unexpected reload error: {message}"
+    );
+
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "ai_tool_governor");
+    assert_eq!(
+        config1.plugin_configs[0].config["tools"]["github.create_pr"]["required_args"],
+        json!(["ticket_id"]),
+        "last-known-good required_args policy must remain installed"
+    );
 }
 
 #[test]
