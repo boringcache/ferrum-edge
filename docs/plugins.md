@@ -4121,6 +4121,8 @@ config:
 
 Caches LLM responses keyed by normalized prompts to reduce redundant API calls and latency. The default path uses exact-match normalization: prompts are lowercased, whitespace is collapsed, and the result is SHA-256 hashed to produce the cache key. Optional semantic similarity can be enabled to compute prompt embeddings through a configured embedding provider and search a local HNSW vector index (`instant-distance`) before forwarding exact misses to the backend. Exact response storage supports local in-memory (DashMap) and centralized Redis backends.
 
+**Admission.** Every root configuration key is closed: unknown retention, multimodal, consumer-scope, size, semantic-policy, and Redis sync properties are rejected with deterministic path-qualified diagnostics and spelling suggestions. There are no intentionally open maps. Registration policy is `KeepLastKnownGood` — invalid reloads keep the previously admitted generation rather than silently falling back to defaults that would retain or share cache content contrary to operator intent. On successful admission the gateway logs the effective retention and storage posture (TTL, size caps, consumer scoping, multimodal mode, semantic enabled/disabled, and `local`/`redis` sync mode) at debug level without logging cached bodies, Redis passwords, or embedding API keys.
+
 **Priority:** 2980
 
 | Parameter | Type | Default | Description |

@@ -17561,7 +17561,15 @@ components:
 
     AiSemanticCacheConfig:
       type: object
-      description: "Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized prompts. Exact-match normalization is enabled by default; optional semantic similarity uses a configured embedding provider and a local HNSW vector index. Supports local DashMap and Redis exact-response storage."
+      additionalProperties: false
+      description: >-
+        Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized
+        prompts. Exact-match normalization is enabled by default; optional
+        semantic similarity uses a configured embedding provider and a local
+        HNSW vector index. Supports local DashMap and Redis exact-response
+        storage. Unknown root, semantic-policy, and Redis sync keys are
+        rejected at admission with path-qualified diagnostics (registration
+        policy KeepLastKnownGood). There are no intentionally open maps.
       properties:
         ttl_seconds:
           type: integer

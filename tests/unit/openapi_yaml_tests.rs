@@ -5492,3 +5492,82 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         "protocol matrix must mark WebSocket support for response_mock"
     );
 }
+
+#[test]
+fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ai_semantic_cache::{
+        AI_SEMANTIC_CACHE_CONFIG_KEYS, AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS,
+        AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS, AiSemanticCache,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiSemanticCacheConfig")
+        .expect("AiSemanticCacheConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("AiSemanticCacheConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime: BTreeSet<_> = AI_SEMANTIC_CACHE_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(documented, runtime, "OpenAPI/runtime key drift");
+
+    let grouped: BTreeSet<_> = AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS
+        .iter()
+        .chain(AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS.iter())
+        .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+        .copied()
+        .collect();
+    assert_eq!(
+        grouped, runtime,
+        "documented key groups must equal the closed root allowlist"
+    );
+
+    let description = schema["description"]
+        .as_str()
+        .expect("AiSemanticCacheConfig description");
+    assert!(description.contains("Unknown root"));
+    assert!(description.contains("KeepLastKnownGood"));
+
+    assert_component_validity(
+        &spec,
+        "AiSemanticCacheConfig",
+        &json!({"ttl_seconds": 60, "cache_multimodal": "reject"}),
+        true,
+    );
+    for invalid in [
+        json!({"ttl_second": 60}),
+        json!({"cache_multimoda": "reject"}),
+        json!({"scope_by_consumr": false}),
+        json!({"semantic_similarity_enable": true}),
+        json!({"sync_mod": "redis"}),
+        json!({"redis_ur": "redis://127.0.0.1:6379/0"}),
+    ] {
+        assert_component_validity(&spec, "AiSemanticCacheConfig", &invalid, false);
+        assert!(
+            AiSemanticCache::new(&invalid, PluginHttpClient::default()).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_semantic_cache`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_semantic_cache docs section");
+    for key in AI_SEMANTIC_CACHE_CONFIG_KEYS {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "docs/plugins.md ai_semantic_cache section missing `{key}`"
+        );
+    }
+    assert!(section.contains("KeepLastKnownGood"));
+    assert!(section.contains("unknown retention"));
+}
