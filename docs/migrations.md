@@ -242,10 +242,14 @@ Dialect transactionality for custom-plugin migrations:
 - **MySQL:** DDL implicitly commits
   ([MySQL manual](https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html)),
   so multi-statement migrations are **not** atomic with the tracking insert.
-  The runner treats MySQL duplicate-key error `1061` on `CREATE INDEX` /
-  `CREATE UNIQUE INDEX` as success so a retry after partial DDL can finish
-  and record tracking. Authors should still prefer idempotent table DDL
-  (`CREATE TABLE IF NOT EXISTS`) and plugin-prefixed names.
+  For a plugin-owned index that must recover across every statement boundary,
+  pair `DROP INDEX name ON table` immediately with the exact `CREATE INDEX`
+  definition. The runner tolerates only structured MySQL error `1091` (missing
+  key) on the `DROP INDEX`; every creation failure remains fatal. A retry then
+  either removes the prior definition or observes a missing index before
+  reconstructing the intended one. Prefer idempotent table DDL (`CREATE TABLE
+  IF NOT EXISTS`) and plugin-prefixed names, and do not use this pattern to
+  replace indexes owned by another plugin or by the gateway core.
 
 ### Checksum Validation
 
@@ -477,9 +481,10 @@ If a migration fails partway through:
 2. Inspect the database to see what state it's in
 3. For **MySQL custom-plugin** migrations, remember DDL auto-commits: indexes
    may already exist without a `_ferrum_plugin_migrations` row. Re-running
-   `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` is the supported recovery;
-   the runner treats duplicate index name errors (`1061`) as success so
-   tracking can complete
+   `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` is the supported recovery.
+   Migrations using the documented paired `DROP INDEX` / exact `CREATE INDEX`
+   pattern rebuild their plugin-owned definitions; the runner tolerates only a
+   structured missing-key error (`1091`) on the drop before continuing
 4. Fix any remaining underlying issue (e.g., data that violates a new constraint)
 5. Re-run the migration — it will skip already-applied migrations and retry the failed one
 

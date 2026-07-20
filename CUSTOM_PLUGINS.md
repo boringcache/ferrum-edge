@@ -1239,7 +1239,9 @@ Custom plugins that need their own database tables can declare migrations that r
 1. Export a `plugin_migrations()` function from your plugin file
 2. The build script detects it automatically (no registration needed)
 3. Run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` to apply pending migrations
-4. Plugin migrations run after core migrations in the same database transaction
+4. Plugin migrations run after core migrations under the same cross-process
+   migration lock, using the dialect-specific transaction contract documented
+   in [Database Migrations](docs/migrations.md#multi-statement-migrations)
 
 ### Declaring Migrations
 
@@ -1422,7 +1424,7 @@ See `custom_plugins/examples/example_audit_plugin.rs` (build with
 demonstrates:
 - Multi-version migrations (V1: create table + indexes, V2: add composite index)
 - PostgreSQL overrides (`TIMESTAMPTZ`, `JSONB`)
-- MySQL overrides (`DATETIME(3)`, `JSON`, `VARCHAR`) with duplicate-index retry safety
+- MySQL overrides (`DATETIME(3)`, `JSON`, `VARCHAR`) with exact drop/recreate index reconciliation
 - Multi-statement SQL (CREATE TABLE + CREATE INDEX in one migration)
 - Runtime persistence via a bounded queue into the gateway configuration database
 

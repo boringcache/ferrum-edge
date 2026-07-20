@@ -523,14 +523,15 @@ pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
 /// - The `sql` field is the default SQL used for all databases
 /// - Use `sql_postgres` / `sql_mysql` for database-specific overrides
 /// - Multi-statement SQL is supported (separate statements with `;`)
-/// - MySQL index creation is retry-safe: the migration runner ignores
-///   duplicate-key (1061) errors on `CREATE INDEX` after partial DDL
+/// - MySQL index reconciliation is retry-safe: pair `DROP INDEX` with
+///   `CREATE INDEX`; the runner tolerates only a structured missing-key (1091)
+///   error on the drop so every retry reconstructs the intended definition
 pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
     vec![
         CustomPluginMigration {
             version: 1,
             name: "create_example_audit_log",
-            checksum: "v1_create_example_audit_log_a9c2f1",
+            checksum: "v1_create_example_audit_log_5f7d32",
             sql: r#"
                 CREATE TABLE IF NOT EXISTS example_audit_log (
                     id TEXT PRIMARY KEY,
@@ -569,9 +570,9 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
                 CREATE INDEX IF NOT EXISTS idx_example_audit_log_client_ip ON example_audit_log (client_ip)
             "#,
             ),
-            // MySQL: CREATE INDEX without IF NOT EXISTS. The plugin migration
-            // runner treats duplicate-key error 1061 as success so a retry
-            // after an implicit-commit partial failure can finish tracking.
+            // MySQL index DDL implicitly commits. Rebuild these plugin-owned
+            // indexes from their intended definitions on every retry; the
+            // runner tolerates only missing-key 1091 on each DROP INDEX.
             sql_mysql: Some(
                 r#"
                 CREATE TABLE IF NOT EXISTS example_audit_log (
@@ -588,7 +589,9 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
                     request_context JSON,
                     connection_error TEXT
                 );
+                DROP INDEX idx_example_audit_log_timestamp ON example_audit_log;
                 CREATE INDEX idx_example_audit_log_timestamp ON example_audit_log (timestamp);
+                DROP INDEX idx_example_audit_log_client_ip ON example_audit_log;
                 CREATE INDEX idx_example_audit_log_client_ip ON example_audit_log (client_ip)
             "#,
             ),
@@ -596,11 +599,12 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
         CustomPluginMigration {
             version: 2,
             name: "add_status_timestamp_index",
-            checksum: "v2_example_audit_status_ts_c3e8b4",
+            checksum: "v2_example_audit_status_ts_91e4c6",
             sql: "CREATE INDEX IF NOT EXISTS idx_example_audit_log_status_ts ON example_audit_log (response_status, timestamp)",
             sql_postgres: None,
             sql_mysql: Some(
-                "CREATE INDEX idx_example_audit_log_status_ts ON example_audit_log (response_status, timestamp)",
+                "DROP INDEX idx_example_audit_log_status_ts ON example_audit_log; \
+                 CREATE INDEX idx_example_audit_log_status_ts ON example_audit_log (response_status, timestamp)",
             ),
         },
     ]
