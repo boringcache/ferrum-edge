@@ -92,7 +92,8 @@ use crate::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, build_batch_config, validate_batch_config,
 };
 use crate::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginHttpClient, StreamTransactionSummary, TransactionSummary,
+    ALL_PROTOCOLS, Plugin, PluginHttpClient, ProxyProtocol, StreamTransactionSummary,
+    TransactionSummary,
 };
 
 const TABLE_NAME: &str = "example_audit_log";
