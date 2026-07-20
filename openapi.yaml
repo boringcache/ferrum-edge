@@ -11401,7 +11401,7 @@ components:
     KafkaLoggingConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload."
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload."
       required:
         - broker_list
         - topic
@@ -11496,7 +11496,7 @@ components:
           default: 5
           minimum: 1
           maximum: 300
-          description: Bounded seconds to await librdkafka flush during graceful shutdown and reload disposal after Ferrum admission is closed. Zero is rejected. Hard maximum 300.
+          description: Total bounded seconds for blocking-pool scheduling and librdkafka flush during graceful shutdown and reload disposal after Ferrum admission is closed. Zero is rejected. Hard maximum 300.
         acks:
           type: string
           enum: ["0", "1", "all", "-1"]

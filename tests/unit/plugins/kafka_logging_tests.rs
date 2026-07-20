@@ -682,6 +682,64 @@ async fn test_kafka_logging_finalize_is_exact_once() {
     assert!(plugin.snapshot().finalized);
 }
 
+#[test]
+fn test_kafka_logging_finalize_budget_includes_blocking_pool_queue() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build constrained Kafka finalize test runtime");
+
+    runtime.block_on(async {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).expect("announce occupied blocking slot");
+            release_rx.recv().expect("release occupied blocking slot");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking-pool fixture must start");
+
+        let plugin = KafkaLogging::new(
+            &json!({
+                "broker_list": "localhost:19092",
+                "topic": "test",
+                "flush_timeout_seconds": 1
+            }),
+            &default_http_client(),
+        )
+        .expect("construct Kafka logger for blocking-pool budget test");
+        plugin.log(&create_test_transaction_summary()).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while plugin.snapshot().admitted_total == 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("record must reach librdkafka before finalize");
+
+        let started = std::time::Instant::now();
+        plugin.finalize().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "finalize must not wait indefinitely for a saturated blocking pool"
+        );
+        let snapshot = plugin.snapshot();
+        assert!(snapshot.finalized);
+        assert_eq!(snapshot.flush_timeouts_total, 1);
+        assert_eq!(snapshot.flush_failures_total, 1);
+        assert_eq!(
+            snapshot.last_failure.as_ref().map(|failure| failure.error_kind.as_str()),
+            Some("flush_task_timed_out")
+        );
+
+        release_tx.send(()).expect("release blocking-pool fixture");
+        blocker.await.expect("blocking-pool fixture joins");
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_kafka_logging_snapshot_counters_start_at_zero() {
     let plugin = KafkaLogging::new(

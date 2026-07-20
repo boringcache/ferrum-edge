@@ -350,13 +350,6 @@ impl KafkaDeliveryMetrics {
         self.warn_saturation(reason, "ferrum_channel");
     }
 
-    fn record_producer_task_join_failure(&self) {
-        self.ferrum_dropped.fetch_add(1, Ordering::Relaxed);
-        self.healthy.store(false, Ordering::Relaxed);
-        self.store_failure("queue", "producer_task_join_failed");
-        self.warn_saturation("producer task join failed", "producer_task_join_failed");
-    }
-
     fn record_entry_oversize(&self) {
         self.entry_oversize.fetch_add(1, Ordering::Relaxed);
         self.ferrum_dropped.fetch_add(1, Ordering::Relaxed);
@@ -681,7 +674,7 @@ impl KafkaProducerState {
         )
     }
 
-    fn flush_once(&self) -> Result<(), KafkaError> {
+    fn flush_once(&self, timeout: Duration) -> Result<(), KafkaError> {
         if self.finalized.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -691,25 +684,7 @@ impl KafkaProducerState {
         let result = if pending_before == 0 && admitted == 0 {
             Ok(())
         } else {
-            self.producer
-                .flush(self.flush_timeout)
-                .inspect_err(|error| {
-                    let remaining = self.producer.in_flight_count().max(0) as u64;
-                    let timed_out = matches!(
-                        error,
-                        KafkaError::Flush(RDKafkaErrorCode::OperationTimedOut)
-                    );
-                    let incomplete = if remaining > 0 {
-                        remaining
-                    } else {
-                        pending_before
-                    };
-                    self.metrics.record_flush_failure(
-                        safe_kafka_error_kind(error),
-                        timed_out,
-                        incomplete,
-                    );
-                })
+            self.producer.flush(timeout)
         };
         // This flag means the one owned flush attempt completed, not merely
         // that it started. Callers waiting on the lifecycle lock therefore do
@@ -902,16 +877,65 @@ impl KafkaGeneration {
             self.state.metrics.record_shutdown_incomplete(incomplete);
         }
         let state = Arc::clone(&self.state);
-        let flush_state = Arc::clone(&state);
-        if spawn_blocking(move || flush_state.flush_once())
-            .await
-            .is_err()
-        {
-            let incomplete = state.producer.in_flight_count().max(0) as u64;
-            state
-                .metrics
-                .record_flush_failure("flush_task_join_failed", false, incomplete.max(1));
+        let configured_timeout = state.flush_timeout;
+        let pending_before = state.producer.in_flight_count().max(0) as u64;
+        let admitted = state.metrics.admitted.load(Ordering::Relaxed);
+        if pending_before == 0 && admitted == 0 {
             state.finalized.store(true, Ordering::Release);
+            return;
+        }
+        let flush_deadline = Instant::now() + configured_timeout;
+        let flush_state = Arc::clone(&state);
+        let mut flush_task = spawn_blocking(move || {
+            // Include blocking-pool queueing in the documented budget. If the
+            // task starts late, librdkafka receives only the time still left;
+            // if it never starts, the outer timeout below cancels it while it
+            // is still queued instead of detaching shutdown work.
+            let remaining = flush_deadline.saturating_duration_since(Instant::now());
+            flush_state.flush_once(remaining)
+        });
+        match tokio::time::timeout(configured_timeout, &mut flush_task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                let remaining = state.producer.in_flight_count().max(0) as u64;
+                let timed_out = matches!(
+                    error,
+                    KafkaError::Flush(RDKafkaErrorCode::OperationTimedOut)
+                );
+                let incomplete = if remaining > 0 {
+                    remaining
+                } else {
+                    pending_before
+                };
+                state.metrics.record_flush_failure(
+                    safe_kafka_error_kind(&error),
+                    timed_out,
+                    incomplete,
+                );
+            }
+            Ok(Err(_join_error)) => {
+                let incomplete = state.producer.in_flight_count().max(0) as u64;
+                state.metrics.record_flush_failure(
+                    "flush_task_join_failed",
+                    false,
+                    incomplete.max(1),
+                );
+                state.finalized.store(true, Ordering::Release);
+            }
+            Err(_) => {
+                // `abort` prevents a still-queued blocking task from starting.
+                // A task that raced into execution computes its librdkafka
+                // timeout from the same deadline above, so it cannot begin a
+                // fresh full-duration flush after this owner stops waiting.
+                flush_task.abort();
+                let incomplete = state.producer.in_flight_count().max(0) as u64;
+                state.metrics.record_flush_failure(
+                    "flush_task_timed_out",
+                    true,
+                    incomplete.max(pending_before).max(1),
+                );
+                state.finalized.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -946,6 +970,11 @@ impl KafkaGeneration {
         if incomplete > 0 {
             self.state.metrics.record_shutdown_incomplete(incomplete);
         }
+        // This generation is terminal even though the non-async disposal
+        // path cannot perform an ordered producer flush. Mark it finalized so
+        // diagnostics distinguish a deliberately aborted generation from one
+        // that is still live.
+        self.state.finalized.store(true, Ordering::Release);
     }
 }
 
@@ -1353,9 +1382,8 @@ impl KafkaLogging {
         };
         let logger = BatchingLogger::spawn_with_hooks(
             BatchConfig {
-                // Kafka flushes one userspace message at a time here. Larger
-                // batches would still serialize one spawn_blocking send per
-                // entry while librdkafka owns the real batching underneath.
+                // Kafka admits one userspace message at a time here while
+                // librdkafka owns the real batching underneath.
                 batch_size: 1,
                 flush_interval: Duration::from_millis(1000),
                 buffer_capacity,
@@ -1370,7 +1398,7 @@ impl KafkaLogging {
                 move |batch| {
                     let state = Arc::clone(&state);
                     let topic = topic.clone();
-                    async move { send_batch(&state, &topic, batch).await }
+                    async move { send_batch(&state, &topic, batch) }
                 }
             },
         );
@@ -1858,58 +1886,50 @@ impl Plugin for KafkaLogging {
     }
 }
 
-async fn send_batch(
+fn send_batch(
     state: &Arc<KafkaProducerState>,
     topic: &str,
     batch: Vec<KafkaRecord>,
 ) -> Result<(), String> {
     for mut record in batch {
-        let payload = Arc::clone(&record.payload);
-        let key = record.key.clone();
-        let state = Arc::clone(state);
-        let metrics = Arc::clone(&state.metrics);
-        let topic = topic.to_string();
+        // `ThreadedProducer::send` is the non-blocking local-queue admission
+        // API; broker I/O and delivery callbacks run on librdkafka's own
+        // thread. Calling it directly avoids queueing one Tokio blocking task
+        // per record and leaves that pool available for the single owned final
+        // flush below.
+        let enqueue_error = match record.key.as_deref() {
+            Some(key) => state
+                .producer
+                .send(
+                    BaseRecord::<str, str>::to(topic)
+                        .payload(record.payload.as_ref())
+                        .key(key),
+                )
+                .err()
+                .map(|(error, _)| error),
+            None => state
+                .producer
+                .send(BaseRecord::<(), str>::to(topic).payload(record.payload.as_ref()))
+                .err()
+                .map(|(error, _)| error),
+        };
 
-        let join_result = spawn_blocking(move || {
-            let enqueue_error = match key.as_deref() {
-                Some(key) => state
-                    .producer
-                    .send(
-                        BaseRecord::<str, str>::to(&topic)
-                            .payload(payload.as_ref())
-                            .key(key),
-                    )
-                    .err()
-                    .map(|(error, _)| error),
-                None => state
-                    .producer
-                    .send(BaseRecord::<(), str>::to(&topic).payload(payload.as_ref()))
-                    .err()
-                    .map(|(error, _)| error),
-            };
-
-            match enqueue_error {
-                Some(error) => {
-                    state.metrics.record_queue_rejected(&error);
-                    // The instance-scoped metric and rate-limited safe
-                    // classification above are the terminal accounting. Do not
-                    // feed the raw librdkafka error into the generic per-batch
-                    // warning path or a second retry loop.
-                }
-                None => {
-                    state.metrics.record_admitted();
-                }
+        match enqueue_error {
+            Some(error) => {
+                state.metrics.record_queue_rejected(&error);
+                // The instance-scoped metric and rate-limited safe
+                // classification above are the terminal accounting. Do not
+                // feed the raw librdkafka error into the generic per-batch
+                // warning path or a second retry loop.
             }
-        })
-        .await;
+            None => {
+                state.metrics.record_admitted();
+            }
+        }
 
         // librdkafka has copied/assumed ownership (or rejected). Release the
         // Ferrum retained-byte lease on every path, including errors.
         drop(record.lease.take());
-        if let Err(error) = join_result {
-            metrics.record_producer_task_join_failure();
-            return Err(format!("kafka_logging: producer task join failed: {error}"));
-        }
     }
 
     Ok(())
