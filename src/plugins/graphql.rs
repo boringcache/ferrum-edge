@@ -138,12 +138,18 @@ impl GraphqlPlugin {
         );
         reject_unknown_keys(object, "config", GRAPHQL_CONFIG_KEYS, "graphql: ")?;
 
-        if let Some(Value::String(sync_mode)) = config.get("sync_mode")
-            && !matches!(sync_mode.as_str(), "local" | "redis")
-        {
-            return Err(format!(
-                "graphql: 'sync_mode' must be exactly 'local' or 'redis', got: {sync_mode:?}"
-            ));
+        match config.get("sync_mode") {
+            None => {}
+            Some(Value::String(sync_mode))
+                if matches!(sync_mode.as_str(), "local" | "redis") => {}
+            Some(Value::String(sync_mode)) => {
+                return Err(format!(
+                    "graphql: 'sync_mode' must be exactly 'local' or 'redis', got: {sync_mode:?}"
+                ));
+            }
+            Some(_) => {
+                return Err("graphql: 'sync_mode' must be a string".to_string());
+            }
         }
 
         let max_depth = optional_u32(config, "max_depth")?;
@@ -153,7 +159,7 @@ impl GraphqlPlugin {
         // limit_by must be a recognized policy — silently treating "user" as "ip"
         // would be a security misconfiguration footgun.
         let limit_by = match config.get("limit_by") {
-            None | Some(Value::Null) => "ip".to_string(),
+            None => "ip".to_string(),
             Some(Value::String(s)) => {
                 if !matches!(s.as_str(), "ip" | "consumer") {
                     return Err(format!(
@@ -182,7 +188,8 @@ impl GraphqlPlugin {
         if !has_any_config {
             return Err(
                 "graphql: no protection rules configured — set 'max_depth', 'max_complexity', \
-                 'max_aliases', 'introspection_allowed', 'type_rate_limits', or 'operation_rate_limits'"
+                 'max_aliases', 'introspection_allowed: false', 'type_rate_limits', or \
+                 'operation_rate_limits'"
                     .to_string(),
             );
         }

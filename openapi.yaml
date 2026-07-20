@@ -16882,9 +16882,13 @@ components:
         not an effective rule. Unknown top-level keys are rejected. Rate-limit
         counter storage supports only local memory and Redis; database-backed
         counters are intentionally unsupported. When `sync_mode` is `redis`,
-        `redis_url` is required. Runtime also rejects invalid Redis URL shapes and
-        non-positive Redis pool/timeout values that JSON Schema cannot fully
-        cross-validate with every authoring tool.
+        `redis_url` is required. Explicit Redis fields are validated even in
+        local mode so latent configuration cannot become invalid only when the
+        mode is changed. Runtime numeric fields require integer JSON encoding
+        (for example `2`, not `2.0`); JSON Schema treats those two encodings as
+        the same mathematical integer. Runtime also rejects invalid Redis URL
+        shapes that JSON Schema cannot fully cross-validate with every authoring
+        tool.
       allOf:
         - anyOf:
             - required: [max_depth]

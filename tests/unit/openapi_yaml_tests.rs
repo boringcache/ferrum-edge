@@ -1689,6 +1689,8 @@ fn graphql_config_schema_matches_runtime_validation() {
     }
     assert!(docs.contains("Unknown top-level keys are rejected"));
     assert!(docs.contains("valid GraphQL Names"));
+    assert!(docs.contains("`2`, not `2.0`"));
+    assert!(docs.contains("validated even while `sync_mode` is `local`"));
 
     let validator_schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1722,6 +1724,13 @@ fn graphql_config_schema_matches_runtime_validation() {
             "redis_connect_timeout_seconds": 1,
             "redis_health_check_interval_seconds": 1
         }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "local",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_tls": false,
+            "redis_pool_size": 1
+        }),
     ];
     for config in &accepted {
         assert!(
@@ -1747,7 +1756,13 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({"operation_rate_limits": {}}),
         json!({"type_rate_limits": {"Query": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"max_depth": 5, "limit_by": "IP"}),
+        json!({"max_depth": 5, "limit_by": null}),
         json!({"max_depth": 5, "sync_mode": "REDIS", "redis_url": "redis://localhost:6379"}),
+        json!({"max_depth": 5, "sync_mode": null}),
+        json!({"max_depth": 5, "sync_mode": 1}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_url": "garbage"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_tls": "yes"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_pool_size": 0}),
         json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
         json!({"max_depth": 5, "introspection_allowd": false}),

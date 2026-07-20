@@ -62,6 +62,7 @@ fn test_graphql_empty_config_returns_error() {
     assert!(result.is_err(), "Empty config should return Err");
     let err = result.err().unwrap();
     assert!(err.contains("no protection rules configured"));
+    assert!(err.contains("introspection_allowed: false"));
 }
 
 #[test]
@@ -78,10 +79,21 @@ fn test_graphql_rejects_invalid_scalar_config_types() {
         json!({"max_complexity": "100"}),
         json!({"max_aliases": "3"}),
         json!({"introspection_allowed": "false"}),
+        json!({"limit_by": null}),
+        json!({"sync_mode": null}),
+        json!({"sync_mode": 1}),
     ] {
         let result = create_plugin("graphql", &config);
         assert!(result.is_err(), "config should be rejected: {config:?}");
     }
+
+    let sync_mode_error = create_plugin("graphql", &json!({"max_depth": 5, "sync_mode": null}))
+        .err()
+        .expect("null sync_mode must be rejected");
+    assert!(
+        sync_mode_error.starts_with("graphql: 'sync_mode' must be a string"),
+        "GraphQL must own the sync_mode admission error: {sync_mode_error}"
+    );
 }
 
 #[test]
@@ -104,6 +116,9 @@ fn test_graphql_rejects_invalid_rate_limit_shapes() {
         json!({"max_depth": 5, "sync_mode": "REDIS", "redis_url": "redis://localhost:6379"}),
         json!({"max_depth": 5, "sync_mode": "database"}),
         json!({"max_depth": 5, "sync_mode": "redis"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_url": "garbage"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_tls": "yes"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_pool_size": 0}),
     ] {
         let result = create_plugin("graphql", &config);
         assert!(result.is_err(), "config should be rejected: {config:?}");
@@ -148,6 +163,13 @@ fn test_graphql_accepts_closed_redis_and_named_operation_shapes() {
             "redis_pool_size": 1,
             "redis_connect_timeout_seconds": 1,
             "redis_health_check_interval_seconds": 1
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "local",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_tls": false,
+            "redis_pool_size": 1
         }),
     ] {
         create_plugin("graphql", &config)

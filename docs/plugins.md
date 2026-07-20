@@ -3414,13 +3414,13 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
 
 The plugin requires at least one effective rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, a non-empty `type_rate_limits`, or a non-empty `operation_rate_limits`) — an empty or no-op config is rejected. Unknown top-level keys are rejected so misspelled introspection, identity, rate-map, or Redis synchronization fields cannot silently fall back to defaults.
 
 Populates `ctx.metadata` with `graphql_operation_type`, `graphql_operation_name`, `graphql_depth`, and `graphql_complexity`.
 
-**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically.
+**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Explicit `redis_*` fields are validated even while `sync_mode` is `local`, so a later mode switch cannot activate malformed latent settings. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically.
 
 ```yaml
 plugin_name: graphql
