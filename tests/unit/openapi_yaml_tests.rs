@@ -6117,8 +6117,17 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     let status_desc = schema["properties"]["status_code"]["description"]
         .as_str()
         .unwrap_or_default();
+    // Contract: out-of-range/informational statuses are rejected (not silently
+    // coerced); 204/205/304 intentionally coerce the body to empty.
     assert!(status_desc.contains("rejected"));
-    assert!(!status_desc.contains("coerced"));
+    assert!(status_desc.contains("rather than coerced"));
+    assert!(
+        status_desc.contains("204")
+            && status_desc.contains("205")
+            && status_desc.contains("304")
+            && status_desc.contains("empty body"),
+        "status_code description must document no-body status empty-body coercion: {status_desc}"
+    );
     let content_desc = schema["properties"]["content_type"]["description"]
         .as_str()
         .unwrap_or_default();

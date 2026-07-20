@@ -32,23 +32,21 @@ pub fn prepare_synthetic_response_wire<'a>(
     headers: &mut HashMap<String, String>,
     body: &'a [u8],
 ) -> Cow<'a, [u8]> {
-    if method.eq_ignore_ascii_case("HEAD") {
-        if status_forbids_response_body(status) {
-            remove_content_length(headers);
-        } else {
-            headers
-                .entry("content-length".to_string())
-                .or_insert_with(|| body.len().to_string());
-        }
-        return Cow::Borrowed(&[]);
+    if !synthetic_response_omits_body(method, status) {
+        return Cow::Borrowed(body);
     }
 
-    if status_forbids_response_body(status) {
+    // HEAD keeps representation metadata unless the status itself forbids a
+    // body; 204/205/304 (including HEAD+those statuses) strip Content-Length.
+    if method.eq_ignore_ascii_case("HEAD") && !status_forbids_response_body(status) {
+        headers
+            .entry("content-length".to_string())
+            .or_insert_with(|| body.len().to_string());
+    } else {
         remove_content_length(headers);
-        return Cow::Borrowed(&[]);
     }
 
-    Cow::Borrowed(body)
+    Cow::Borrowed(&[])
 }
 
 fn remove_content_length(headers: &mut HashMap<String, String>) {
