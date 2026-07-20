@@ -5457,6 +5457,10 @@ pub(crate) async fn dispatch_grpc_streaming(
     let grpc_connection_proxy =
         crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());
     let grpc_dispatch_proxy = grpc_connection_proxy.as_ref();
+    // Retain an unread channel upload across pre-wire dispatch failures so the
+    // H3 Trailers-Only error is written before the upload side is dropped
+    // (#2057 ordering contract, mirrored from the H2 streaming path).
+    let mut held_frontend_grpc_upload = None;
     let result = grpc_proxy::proxy_grpc_request_streaming_channel(
         hyper_method,
         hmap,
@@ -5469,6 +5473,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         Arc::clone(&body_size_exceeded),
         None,
         ctx.grpc_deadline_at(),
+        &mut held_frontend_grpc_upload,
     )
     .await;
 
@@ -5625,7 +5630,9 @@ pub(crate) async fn dispatch_grpc_streaming(
                 Some(error_class),
                 backend_admission_start.elapsed(),
             );
-            write_grpc_error_send_with_policy(
+            // Drop the held upload only after the Trailers-Only error is queued
+            // on the H3 send half (#2057).
+            let grpc_error_write = write_grpc_error_send_with_policy(
                 &mut send_half,
                 grpc_status_code,
                 grpc_message,
@@ -5640,7 +5647,9 @@ pub(crate) async fn dispatch_grpc_streaming(
                 outcome.error_class = Some(error_class);
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
                 outcome
-            })
+            });
+            drop(held_frontend_grpc_upload.take());
+            grpc_error_write
         }
     };
 
@@ -8734,6 +8743,10 @@ mod tests {
                  \x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
             ),
             "dispatch_grpc_streaming must pass the selected-target effective proxy to the gRPC pool"
+        );
+        assert!(
+            body.contains("&mut held_frontend_grpc_upload"),
+            "dispatch_grpc_streaming must retain unread uploads across pre-wire failures (#2057)"
         );
         assert!(
             body.contains("stream.split()"),

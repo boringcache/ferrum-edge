@@ -322,6 +322,77 @@ fn test_grpc_error_response_unavailable() {
 }
 
 #[test]
+fn trailers_only_error_can_retain_unread_frontend_upload() {
+    // #2057: a pre-wire backend failure must keep the unread frontend upload
+    // coupled to the synthesized Trailers-Only response lifecycle. This is an
+    // H2 defense-in-depth ownership guarantee; raw clients still handle the
+    // permitted post-response NO_ERROR reset.
+    use http_body_util::Full;
+
+    let held = grpc_proxy::GrpcBody::Buffered(Full::new(bytes::Bytes::from_static(b"pending")));
+    let resp = grpc_proxy::attach_held_frontend_grpc_upload(
+        grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::UNAVAILABLE,
+            "Backend unavailable",
+        ),
+        Some(held),
+    );
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("grpc-status").unwrap(), "14");
+    assert!(
+        http_body::Body::is_end_stream(resp.body()),
+        "Trailers-Only error body must still report end-of-stream at header time"
+    );
+}
+
+#[test]
+fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
+    // Source-order guard for #2057: connect/handshake failure must be able to
+    // return the unread frontend upload. That requires get_sender before
+    // Request::new(grpc_body).
+    let src = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let start = src
+        .find("async fn proxy_grpc_streaming_dispatch(")
+        .expect("proxy_grpc_streaming_dispatch not found");
+    let body = &src[start..];
+    let end = body
+        .find("\npub(crate) async fn collect_grpc_request_body(")
+        .expect("collect_grpc_request_body anchor not found");
+    let body = &body[..end];
+    let sender_pos = body
+        .find("grpc_pool.get_sender(proxy)")
+        .expect("streaming dispatch must call get_sender");
+    let request_pos = body
+        .find("Request::new(grpc_body)")
+        .expect("streaming dispatch must build backend request from grpc_body");
+    assert!(
+        sender_pos < request_pos,
+        "get_sender must run before Request::new(grpc_body) so pre-wire failures \
+         can retain the frontend upload (#2057); sender@{sender_pos} request@{request_pos}"
+    );
+    assert!(
+        body.contains("*held_frontend_upload = Some(grpc_body)"),
+        "pre-wire failures must stash the unread frontend upload for the caller"
+    );
+
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        proxy_src
+            .matches("grpc_proxy::attach_held_frontend_grpc_upload(")
+            .count(),
+        3,
+        "all three terminal native/gRPC-Web error shapes must attach the held upload"
+    );
+    assert_eq!(
+        proxy_src
+            .matches("held_frontend_grpc_upload.take()")
+            .count(),
+        3,
+        "each terminal error attachment must consume the held upload exactly once"
+    );
+}
+
+#[test]
 fn test_grpc_error_response_deadline_exceeded() {
     let resp = grpc_proxy::build_grpc_error_response(
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED,

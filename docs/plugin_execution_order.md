@@ -853,7 +853,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |
 | `load_testing` | ✓ | | | | | On-demand load testing via header trigger with multi-node fan-out |
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
-| `response_mock` | ✓ | ✓ | | | | Returns mock responses for API testing before backends are ready |
+| `response_mock` | ✓ | ✓ | ✓ | | | Short-circuits HTTP/gRPC and WebSocket upgrade handshakes with a synthetic response; does not mock upgraded frame streams |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `openapi_validator` | ✓ | | | | | Validates bodies against generated OpenAPI operation schemas |
 | `spec_expose` | ✓ | | | | | HTTP-only; requires prefix listen_path |

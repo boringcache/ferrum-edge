@@ -20325,6 +20325,12 @@ async fn handle_proxy_request_inner(
         // CLOSED state, or the buffered-request streaming path) records the
         // outcome at response-header time as before.
         let mut grpc_streaming_probe_recorder: Option<Arc<GrpcStreamingProbeRecorder>> = None;
+        // Unread frontend upload retained across a synthesized Trailers-Only
+        // error on the fully-streaming H2 path. The pinned h2 transport already
+        // orders response HEADERS before its permitted NO_ERROR cancellation;
+        // coupling ownership to the response lifecycle is defense-in-depth,
+        // while the raw client still handles the legal residual reset (#2057).
+        let mut held_frontend_grpc_upload: Option<grpc_proxy::GrpcBody> = None;
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
             let request = match client_request_body {
@@ -20700,6 +20706,7 @@ async fn handle_proxy_request_inner(
                     body_size_exceeded,
                     upload_observer,
                     ctx.grpc_deadline_at(),
+                    &mut held_frontend_grpc_upload,
                 )
                 .await;
                 (result, Bytes::new())
@@ -22682,13 +22689,16 @@ async fn handle_proxy_request_inner(
                 // intermittent `200 + application/grpc` a gRPC-Web caller saw when
                 // a backend read/connect blipped under load (issue #2041).
                 if let Some(content_type) = grpc_web_response_content_type {
-                    return Ok(build_grpc_web_error_response(
-                        content_type,
-                        grpc_code,
-                        msg,
-                        plugin_cache_view
-                            .initial_response_header_policy_plugins()
-                            .as_ref(),
+                    return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
+                        build_grpc_web_error_response(
+                            content_type,
+                            grpc_code,
+                            msg,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        ),
+                        held_frontend_grpc_upload.take(),
                     ));
                 }
                 if grpc_request_is_web_translated
@@ -22701,12 +22711,18 @@ async fn handle_proxy_request_inner(
                             .as_ref(),
                     )
                 {
-                    return Ok(response);
+                    return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
+                        response,
+                        held_frontend_grpc_upload.take(),
+                    ));
                 }
-                return Ok(grpc_proxy::build_grpc_error_response_with_policy(
-                    grpc_code,
-                    msg,
-                    initial_response_header_policy_plugins.as_ref(),
+                return Ok(grpc_proxy::attach_held_frontend_grpc_upload(
+                    grpc_proxy::build_grpc_error_response_with_policy(
+                        grpc_code,
+                        msg,
+                        initial_response_header_policy_plugins.as_ref(),
+                    ),
+                    held_frontend_grpc_upload.take(),
                 ));
             }
         }

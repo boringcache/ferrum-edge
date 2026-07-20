@@ -2525,11 +2525,13 @@ Istio `VirtualService` resources are translated at the Kubernetes translation la
 
 ### Retries
 
-VirtualService `retries` are translated to Ferrum `RetryConfig`:
+VirtualService `retries` populate the emitted proxy's retry policy and are also projected onto each emitted `mesh_route_dispatch` rule as route-local `retry` (Ferrum `RetryConfig` after strict admission):
 
-- `attempts` -> `retry_count`
+- `attempts` -> `max_retries`
 - `retryOn` tokens: `5xx`, `gateway-error`, `connect-failure`, `reset`, `retriable-4xx`, and numeric status codes (e.g., `503`).
 - `perTryTimeout` -> per-attempt timeout.
+
+Route-local `retry` and destination `backend_tls` objects reject unknown keys at plugin admission (same fail-closed contract as `reject_unmatched` / `requires_node_waypoint_authz`). Shared proxy/upstream `RetryConfig` and `BackendTlsConfig` deserialization paths are unchanged; only the mesh-route wire shapes are strict.
 
 ### Timeout
 

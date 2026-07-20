@@ -3021,6 +3021,109 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     }
 }
 
+#[tokio::test]
+async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::statsd_logging::{STATSD_LOGGING_CONFIG_KEYS, StatsdLogging};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/StatsdLoggingConfig")
+        .expect("StatsdLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["global_tags"]["additionalProperties"]["type"], "string",
+        "global_tags must remain an intentionally open string map"
+    );
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("Statsd properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = STATSD_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "StatsD runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let statsd_docs = plugin_docs
+        .split("### `statsd_logging`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("statsd_logging docs section");
+    for key in STATSD_LOGGING_CONFIG_KEYS {
+        assert!(
+            statsd_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md statsd section missing `{key}`"
+        );
+    }
+    assert!(statsd_docs.contains("OptionalFailOpen"));
+    assert!(statsd_docs.contains("max_retries"));
+    assert!(statsd_docs.contains("retry_delay_ms"));
+
+    let valid = json!({
+        "host": "statsd.example.test",
+        "port": 9125,
+        "prefix": "edge.prod",
+        "global_tags": {"env": "prod", "region": "us-east-1"},
+        "flush_interval_ms": 500,
+        "buffer_capacity": 10000,
+        "max_batch_lines": 50,
+        "max_retries": 0,
+        "retry_delay_ms": 0,
+        "schema": {
+            "summary_type": "both",
+            "rename": {"proxy_id": "route_id"}
+        }
+    });
+    assert_component_validity(&spec, "StatsdLoggingConfig", &valid, true);
+    assert!(StatsdLogging::new(&valid, PluginHttpClient::default()).is_ok());
+
+    let valid_minima = json!({"host": "127.0.0.1"});
+    assert_component_validity(&spec, "StatsdLoggingConfig", &valid_minima, true);
+    assert!(StatsdLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let runtime_and_schema_invalid = [
+        json!({"host": "statsd.example.test", "prot": 9125}),
+        json!({"host": "statsd.example.test", "prefx": "edge.prod"}),
+        json!({"host": "statsd.example.test", "global_tgas": {"env": "prod"}}),
+        json!({"host": "statsd.example.test", "schema_reff": "redacted-summary"}),
+        json!({"host": "statsd.example.test", "max_retrie": 5}),
+        json!({"host": "statsd.example.test", "aaa_extra": 1, "zzz_extra": 2}),
+        json!({}),
+        json!({"host": "statsd.example.test", "port": 0}),
+        json!({"host": "statsd.example.test", "port": 65536}),
+        json!({"host": "statsd.example.test", "global_tags": {"env": true}}),
+        json!({"host": "statsd.example.test", "prefix": null}),
+        json!({"host": "statsd.example.test", "global_tags": null}),
+        json!({"host": "statsd.example.test", "schema": null}),
+        json!({"host": null}),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+        assert!(
+            StatsdLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid StatsD config: {config}"
+        );
+    }
+
+    // OpenAPI rejects typed nulls on every declared property. Shared batch-builder
+    // defaults still absorb some null numerics (#2562); unknown-key closure is the
+    // #2620 contract under test here.
+    for key in STATSD_LOGGING_CONFIG_KEYS {
+        let mut config = json!({"host": "statsd.example.test"});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+    }
+}
+
 #[test]
 fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     use ferrum_edge::plugins::ip_restriction::IpRestriction;
@@ -4064,6 +4167,16 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         json!({
             "rules": [{
                 "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "api.internal",
+                    "backend_port": 443,
+                    "backend_tls": {"verify_server_certificate": false}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
                 "destination": {"upstream_id": "api"},
                 "retry": {"max_retry": 2}
             }]
@@ -4072,7 +4185,36 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             "rules": [{
                 "match": {"methods": ["GET"]},
                 "destination": {"upstream_id": "api"},
+                "retry": {"retry_on_connect_failur": false}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
                 "retry": {"backoff": {"fixed": {"delay_ms": 25, "delay_millis": 25}}}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {
+                    "backoff": {
+                        "exponential": {"base_ms": 10, "max_ms": 100, "max_millis": 100}
+                    }
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {
+                    "backoff": {
+                        "exponentiall": {"base_ms": 10, "max_ms": 100}
+                    }
+                }
             }]
         }),
     ] {
@@ -4084,6 +4226,41 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         );
         assert!(MeshRouteDispatch::new(&invalid_route_policy).is_err());
     }
+
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteRetryConfig/additionalProperties"),
+        Some(&json!(false)),
+        "MeshRouteRetryConfig must stay closed"
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteBackendTlsConfig/additionalProperties"),
+        Some(&json!(false)),
+        "MeshRouteBackendTlsConfig must stay closed"
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteBackoffStrategy/oneOf/0/additionalProperties"),
+        Some(&json!(false)),
+        "fixed backoff wrapper must stay closed"
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/MeshRouteBackoffStrategy/oneOf/1/additionalProperties"),
+        Some(&json!(false)),
+        "exponential backoff wrapper must stay closed"
+    );
+    assert_eq!(
+        spec.pointer(
+            "/components/schemas/MeshRouteBackoffStrategy/oneOf/0/properties/fixed/additionalProperties"
+        ),
+        Some(&json!(false)),
+        "fixed backoff payload must stay closed"
+    );
+    assert_eq!(
+        spec.pointer(
+            "/components/schemas/MeshRouteBackoffStrategy/oneOf/1/properties/exponential/additionalProperties"
+        ),
+        Some(&json!(false)),
+        "exponential backoff payload must stay closed"
+    );
 
     let status_only_redirect = json!({
         "rules": [{
@@ -4727,4 +4904,139 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
     assert!(guide.contains("Only 400–599 is accepted"));
     assert!(guide.contains("never reflect the client-controlled User-Agent"));
     assert!(guide.contains("Native gRPC rejections instead use an empty-body HTTP 200"));
+}
+
+#[test]
+fn response_mock_schema_matches_strict_runtime_contract() {
+    use ferrum_edge::plugins::response_mock::{
+        RESPONSE_MOCK_CONFIG_KEYS, RESPONSE_MOCK_RULE_KEYS, ResponseMock,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/ResponseMockConfig")
+        .expect("ResponseMockConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["rules"]));
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("ResponseMockConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = RESPONSE_MOCK_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(schema_fields, runtime_fields);
+
+    let rule = &schema["properties"]["rules"]["items"];
+    assert_eq!(rule["additionalProperties"], false);
+    assert_eq!(rule["required"], json!(["path"]));
+    let rule_fields: BTreeSet<_> = rule["properties"]
+        .as_object()
+        .expect("ResponseMock rule properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_rule_fields: BTreeSet<_> = RESPONSE_MOCK_RULE_KEYS.iter().copied().collect();
+    assert_eq!(rule_fields, runtime_rule_fields);
+
+    assert_eq!(rule["properties"]["path"]["minLength"], 1);
+    assert_eq!(rule["properties"]["method"]["minLength"], 1);
+    assert_eq!(rule["properties"]["status_code"]["minimum"], 100);
+    assert_eq!(rule["properties"]["status_code"]["maximum"], 599);
+    assert_eq!(
+        rule["properties"]["headers"]["additionalProperties"]["type"],
+        "string"
+    );
+
+    let description = schema["description"].as_str().expect("description");
+    assert!(description.contains("exact (`=`)"));
+    assert!(description.contains("host-only"));
+    assert!(description.contains("WebSocket"));
+    assert!(description.contains("frame stream"));
+    assert!(
+        rule["properties"]["path"]["description"]
+            .as_str()
+            .expect("path description")
+            .contains("exact (`=`)")
+    );
+    assert!(
+        rule["properties"]["method"]["description"]
+            .as_str()
+            .expect("method description")
+            .contains("HTTP method token")
+    );
+
+    for valid in [
+        json!({"rules": [{"path": "/health", "body": "ok"}]}),
+        json!({
+            "passthrough_on_no_match": true,
+            "rules": [{
+                "method": "GET",
+                "path": "/users",
+                "status_code": 100,
+                "headers": {"x-mock": "true", "content-type": "text/plain"},
+                "body": "ok",
+                "delay_ms": 0
+            }]
+        }),
+        json!({
+            "rules": [{
+                "path": "/api/v1",
+                "status_code": 599,
+                "body": "exact-listen-path"
+            }]
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseMockConfig", &valid, true);
+        assert!(
+            ResponseMock::new(&valid).is_ok(),
+            "schema-valid config unexpectedly failed runtime: {valid}"
+        );
+    }
+
+    for invalid in [
+        json!({
+            "passthrough_on_no_mach": true,
+            "rules": [{"path": "/health", "body": "ok"}]
+        }),
+        json!({
+            "rules": [{"path": "/health", "status_cod": 503, "body": "unavailable"}]
+        }),
+        json!({"rules": [{"path": "", "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "method": "", "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 99, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
+        json!({"rules": [{"body": "missing-path"}]}),
+        json!({"rules": []}),
+        json!({}),
+        json!({
+            "rules": [{
+                "path": "/health",
+                "headers": {"x-mock": 42}
+            }]
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseMockConfig", &invalid, false);
+        assert!(
+            ResponseMock::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("Exact (`=/api/v1`)"));
+    assert!(guide.contains("Host-only"));
+    assert!(guide.contains("WebSocket handshake contract"));
+    assert!(guide.contains("never establishes an upgraded frame stream"));
+    assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+
+    let matrix = include_str!("../../docs/plugin_execution_order.md");
+    assert!(
+        matrix.contains(
+            "| `response_mock` | ✓ | ✓ | ✓ | | | Short-circuits HTTP/gRPC and WebSocket upgrade handshakes"
+        ),
+        "protocol matrix must mark WebSocket support for response_mock"
+    );
 }

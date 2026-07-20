@@ -9083,7 +9083,11 @@ components:
     MeshRouteBackendTlsConfig:
       type: object
       additionalProperties: false
-      description: Strict route-local backend TLS override for mesh_route_dispatch.
+      description: |
+        Strict route-local backend TLS override for mesh_route_dispatch.
+        Unknown keys (for example `client_certpath` or
+        `verify_server_certificate`) fail admission instead of silently
+        disabling intended mTLS materials or verification.
       properties:
         client_cert_path:
           type: [string, "null"]
@@ -9111,7 +9115,10 @@ components:
     MeshRouteRetryConfig:
       type: object
       additionalProperties: false
-      description: Strict route-local retry policy for mesh_route_dispatch.
+      description: |
+        Strict route-local retry policy for mesh_route_dispatch. Unknown keys
+        (for example `max_retry` or `retry_on_connect_failur`) fail admission
+        instead of silently falling back to defaults.
       properties:
         max_retries:
           type: integer
@@ -11579,7 +11586,14 @@ components:
 
     StatsdLoggingConfig:
       type: object
-      description: "Plugin: statsd_logging — Sends transaction metrics to a StatsD-compatible server over UDP."
+      additionalProperties: false
+      description: >-
+        Plugin: statsd_logging — Sends transaction metrics to a StatsD-compatible
+        server over UDP. Unknown top-level keys are rejected at construction /
+        Admin validation. Nested `global_tags` remains an intentionally open
+        string map. Registration policy is OptionalFailOpen (invalid enabled
+        configs warn and omit the plugin on file-mode load / cache rebuild
+        rather than aborting the gateway). See docs/plugins.md.
       required:
         - host
       properties:
@@ -11614,6 +11628,20 @@ components:
           type: integer
           default: 50
           description: Max metric entries to batch before flushing
+        max_retries:
+          type: integer
+          default: 0
+          minimum: 0
+          description: >-
+            Retry attempts after the initial UDP send fails. Defaults to 0
+            (no retries). Consumed by the shared batching logger.
+        retry_delay_ms:
+          type: integer
+          default: 0
+          minimum: 0
+          description: >-
+            Delay in milliseconds between retry attempts. Defaults to 0.
+            Consumed by the shared batching logger when `max_retries` > 0.
         schema:
           allOf:
             - $ref: "#/components/schemas/SummaryLogSchema"
@@ -13309,6 +13337,13 @@ components:
         set by earlier instances. Per-rule `backend_tls` is direct-backend
         only (`upstream_id` destinations inherit TLS from the referenced
         Upstream).
+
+        Unknown keys are rejected at every owned nesting level, including
+        route-local `retry` / backoff and destination `backend_tls`
+        (`additionalProperties: false` / serde `deny_unknown_fields`). Shared
+        gateway `RetryConfig` and `BackendTlsConfig` schemas remain open for
+        other consumers; mesh routes use `MeshRouteRetryConfig` and
+        `MeshRouteBackendTlsConfig`.
       required: [rules]
       properties:
         rules:
@@ -16213,7 +16248,17 @@ components:
 
     ResponseMockConfig:
       type: object
-      description: "Plugin: response_mock — Returns mock responses for API testing before backends are ready. Rule paths are relative to the proxy's listen_path."
+      additionalProperties: false
+      description: >-
+        Plugin: response_mock — Returns mock responses for API testing before
+        backends are ready. Rule paths are relative to a prefix listen_path;
+        exact (`=`), regex (`~`), root (`/`), and host-only scopes match the
+        full request path. Supports HTTP, gRPC, and WebSocket upgrade
+        handshakes: a match short-circuits only the HTTP handshake response and
+        does not establish or mock an upgraded WebSocket frame stream. Unknown
+        top-level and per-rule keys are rejected; the free-form headers map
+        remains open for string-valued response headers. Runtime construction
+        is the authoritative final boundary.
       required:
         - rules
       properties:
@@ -16223,19 +16268,38 @@ components:
           minItems: 1
           items:
             type: object
+            additionalProperties: false
             required:
               - path
             properties:
               method:
                 type: string
-                description: HTTP method to match (omit to match all methods)
+                minLength: 1
+                description: >-
+                  HTTP method token to match (omit to match all methods). When
+                  supplied it must be non-empty and parse as an HTTP method
+                  token (runtime validates via http::Method). The configured
+                  method is normalized to uppercase and compared exactly with
+                  the request method.
               path:
                 type: string
-                description: "Path relative to the proxy's listen_path (e.g., /users for a proxy with listen_path /api/v1). Regex supported with ~ prefix (auto-anchored). For root or regex listen_paths, uses full request path."
+                minLength: 1
+                description: >-
+                  Non-empty rule path. Relative to a prefix listen_path
+                  (e.g., /users for listen_path /api/v1). For exact (`=`),
+                  regex (`~`), root (`/`), and host-only proxies, use the full
+                  request path. Regex rule paths use a ~ prefix (auto-anchored).
               status_code:
                 type: integer
                 format: uint16
-                description: HTTP status code to return (default 200)
+                minimum: 100
+                maximum: 599
+                description: >-
+                  HTTP status code to return (default 200). Values outside
+                  100–599 are rejected. Status 101 on an HTTP/1.1 WebSocket
+                  upgrade, or a success-like 200 on HTTP/2 / HTTP/3 Extended
+                  CONNECT, is still only a synthetic HTTP handshake response;
+                  it does not create an upgraded frame stream.
               headers:
                 type: object
                 additionalProperties:
@@ -16251,7 +16315,9 @@ components:
                 description: "Simulated latency in milliseconds (default 0). Capped at 3600000 (1 hour); larger values are rejected at config validation."
         passthrough_on_no_match:
           type: boolean
-          description: "If true, unmatched requests continue to the backend. If false (default), returns 404."
+          description: >-
+            If true, unmatched requests (including WebSocket upgrades) continue
+            to the backend. If false (default), returns 404.
 
     SpecExposeConfig:
       type: object
