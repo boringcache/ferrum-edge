@@ -1747,6 +1747,19 @@ SHELL_SOURCE_PARAMETER_REFERENCE = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
     r"(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
 )
+# Generated-program variables can be assigned anywhere a shell command begins,
+# including after control keywords and group openers. Keeping this on the same
+# command-start vocabulary as the executable scanners prevents
+# `if ...; then source="$(./generator)"; fi; eval "$source"` from dropping the
+# generator's full-digest provenance. Matches are additionally filtered through
+# `shell_quote_at()` at their use sites so assignment-shaped quoted data does
+# not become a synthetic binding.
+SHELL_SOURCE_ASSIGNMENT = re.compile(
+    COMMAND_START_CONTEXT
+    + r"(?:(?:export|readonly|local|declare|typeset)"
+    r"(?:\s+--?[A-Za-z]+)*\s+)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+)
 SHELL_ASSIGNMENT_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=.*", re.DOTALL)
 WHOLE_SHELL_PARAMETER = re.compile(r"\s*\$[A-Za-z_][A-Za-z0-9_]*\s*")
 _shell_assigned_names: frozenset[str] = frozenset()
@@ -3445,18 +3458,15 @@ def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
 
     evaluated: set[str] = set()
     assignments: list[tuple[str, str]] = []
-    assignment = re.compile(
-        r"(?:^|(?<=[;&|]))\s*(?:(?:export|readonly|local|declare)\s+)?"
-        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.*)$"
-    )
     for line in lines:
         for opaque in OPAQUE_INLINE_SHELL.finditer(line):
             for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(
                 opaque.group(0)
             ):
                 evaluated.add(parameter.group("braced") or parameter.group("bare"))
-        for bound in assignment.finditer(line):
-            assignments.append((bound.group("name"), bound.group("value")))
+        for bound in SHELL_SOURCE_ASSIGNMENT.finditer(line):
+            if shell_quote_at(line, bound.start("name")) is None:
+                assignments.append((bound.group("name"), line[bound.end() :]))
 
     changed = True
     while changed:
@@ -3482,12 +3492,9 @@ def generated_shell_assignment_spans(
         return ()
     assignments = tuple(
         match
-        for match in re.finditer(
-            r"(?:^|(?<=[;&|]))\s*(?:(?:export|readonly|local|declare)\s+)?"
-            r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=",
-            line,
-        )
+        for match in SHELL_SOURCE_ASSIGNMENT.finditer(line)
         if match.group("name") in evaluated_variables
+        and shell_quote_at(line, match.start("name")) is None
     )
     if not assignments:
         return ()
@@ -18561,6 +18568,11 @@ pre_build = []
             "./scripts/build",
             'generated="$(./scripts/build)"; eval "$generated"',
         ),
+        "eval through a control-flow assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            'if true; then generated="$(./scripts/build)"; fi; '
+            'eval "$generated"',
+        ),
         "shell -c through assignment aliases": extensionless_workflow.replace(
             "./scripts/build",
             "|-\n"
@@ -18621,6 +18633,11 @@ pre_build = []
         "non-interpreter pipeline": extensionless_workflow.replace(
             "./scripts/build",
             "./scripts/build | cat >/dev/null",
+        ),
+        "assignment-shaped quoted data": extensionless_workflow.replace(
+            "./scripts/build",
+            "printf '%s\\n' \"then evaluated=$(./scripts/build)\"; "
+            "evaluated='echo safe'; eval \"$evaluated\"",
         ),
     }
     for data_label, data_workflow in extensionless_data_substitution_workflows.items():
