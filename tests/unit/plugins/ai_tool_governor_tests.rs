@@ -8635,12 +8635,7 @@ async fn stream_late_id_introduction_fails_closed_but_missing_continuation_id_is
     let mut buffered_ctx = create_test_context();
     assert_reject(
         buffered
-            .on_response_body(
-                &mut buffered_ctx,
-                200,
-                &sse_headers(),
-                ambiguous.as_bytes(),
-            )
+            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), ambiguous.as_bytes())
             .await,
         Some(502),
     );

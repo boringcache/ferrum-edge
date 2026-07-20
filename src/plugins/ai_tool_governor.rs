@@ -827,15 +827,14 @@ impl GovernorEngine {
                     outcome,
                     PolicyOutcome::Redact(patterns)
                         if !redaction_unavailable && !patterns.is_empty()
-                )
-                    && self.tools.get(&call.name).is_some_and(|policy| {
-                        redact_arguments(
-                            &call.raw_args,
-                            &policy.blocked_arg_patterns,
-                            &self.response.redaction_placeholder,
-                        )
-                        .is_err()
-                    })
+                ) && self.tools.get(&call.name).is_some_and(|policy| {
+                    redact_arguments(
+                        &call.raw_args,
+                        &policy.blocked_arg_patterns,
+                        &self.response.redaction_placeholder,
+                    )
+                    .is_err()
+                })
             })
             .collect();
         let mut skip_approvals = self.mode == Mode::Enforce
@@ -848,10 +847,8 @@ impl GovernorEngine {
         // this ceiling even when every call misses the cache.
         let approval_deadline = Instant::now() + MAX_APPROVAL_BATCH_DEADLINE;
 
-        for ((call, (outcome, matched, risk)), amplification) in calls
-            .iter()
-            .zip(evaluations)
-            .zip(redaction_amplification)
+        for ((call, (outcome, matched, risk)), amplification) in
+            calls.iter().zip(evaluations).zip(redaction_amplification)
         {
             let arguments_hash = self
                 .observability
