@@ -5416,6 +5416,91 @@ def shell_quote_at(value: str, position: int) -> str | None:
     return quote
 
 
+def separate_unquoted_shell_newlines(value: str) -> str:
+    """Preserve multiline words while making real new commands explicit.
+
+    `shlex` retains a newline inside a quoted inline program, which lets the
+    language-specific reader inspect `python -c '\n...\n'` as one operand. It
+    otherwise treats an unquoted newline as ordinary whitespace and can merge
+    the next physical command into the preceding argv. Append a separator only
+    after newlines outside shell-data quotes; retaining the newline itself also
+    keeps shell-comment termination intact.
+    """
+
+    rendered: list[str] = []
+    quote: str | None = None
+    escaped = False
+    comment = False
+    pending: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        rendered.append(character)
+        if comment:
+            if character == "\n":
+                rendered.append(";")
+                comment = False
+            index += 1
+            continue
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote != "'" and value.startswith("$(", index):
+            rendered.append("(")
+            pending.append((")", quote))
+            quote = None
+            index += 2
+            continue
+        if quote != "'" and character == "`":
+            if pending and pending[-1][0] == "`":
+                _, quote = pending.pop()
+            else:
+                pending.append(("`", quote))
+                quote = None
+            index += 1
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if character == "#" and (
+            index == 0
+            or value[index - 1].isspace()
+            or value[index - 1] in ";&|()<>"
+        ):
+            comment = True
+            index += 1
+            continue
+        if pending and character == pending[-1][0]:
+            _, quote = pending.pop()
+            index += 1
+            continue
+        if character == "(" or (
+            character in "<>" and value.startswith("(", index + 1)
+        ):
+            pending.append((")", quote))
+            if character in "<>":
+                rendered.append("(")
+                index += 2
+            else:
+                index += 1
+            continue
+        if character == "\n":
+            rendered.append(";")
+        index += 1
+    return "".join(rendered)
+
+
 def has_cross_command_context(
     candidate: str,
     *,
@@ -7688,7 +7773,13 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
         # Inline foreign interpreters can dispatch Cross or evaluate generated
         # code without putting a Cross word in the surrounding shell command.
         # Reuse their token model here so reached trusted shell scripts enforce
-        # the same boundary as workflow `run:` fields.
+        # the same boundary as workflow `run:` fields. The full program pass
+        # retains quoted inline operands that span physical lines; explicit
+        # separators on every unquoted newline keep adjacent shell commands
+        # from being combined into one synthetic interpreter argv.
+        or shell_inline_interpreter_has_cross(
+            separate_unquoted_shell_newlines(command_text)
+        )
         or any(
             shell_inline_interpreter_has_cross(line)
             for line, shell_evaluated, _ in logical_scan_lines(command_text)
@@ -7877,6 +7968,15 @@ def automation_file_cross_surfaces(
         if shell_reading
         else []
     )
+    # Python and PowerShell source is intentionally not interpreted as POSIX
+    # shell, but its language-specific process readers do not represent
+    # standalone Cross environment/configuration inputs. Preserve that policy
+    # surface with the same full-file digest used for shell-sensitive files so
+    # a pull request cannot add, remove, or alter one while keeping an otherwise
+    # benign process command.
+    if not shell_reading and CROSS_ENVIRONMENT.search(contents):
+        digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        surfaces.append(f"cross-environment:{digest}")
     # Nested heredocs belong to this reading too. A suffixless file only needs
     # the fallback shell interpretation when its own contents name no language;
     # an explicit Python/PowerShell shebang remains authoritative unless the
@@ -13827,6 +13927,150 @@ pre_build = []
         ):
             failures.append(f"{label} was not rejected by tree validation")
 
+    def automation_surface_change_is_rejected(
+        label: str,
+        workflow: str,
+        baseline: dict[str, str],
+        proposed: dict[str, str],
+    ) -> None:
+        if not compare_pr_automation_collection(
+            {"ci.yml": workflow},
+            {"ci.yml": workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            baseline,
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was not rejected by PR comparison")
+
+    def automation_surface_change_is_accepted(
+        label: str,
+        workflow: str,
+        baseline: dict[str, str],
+        proposed: dict[str, str],
+    ) -> None:
+        errors = compare_pr_automation_collection(
+            {"ci.yml": workflow},
+            {"ci.yml": workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            baseline,
+            proposed,
+            "self-test automation directory",
+        )
+        if errors:
+            failures.append(f"{label} was rejected: {errors!r}")
+
+    powershell_file_workflow = referenced_workflow.replace(
+        "bash scripts/safe.sh",
+        "pwsh scripts/safe.ps1",
+    )
+    powershell_file_baseline = {
+        "scripts/safe.ps1": "#!/usr/bin/env pwsh\nWrite-Output 'safe'\n"
+    }
+    cross_configuration_names = (
+        "CROSS_CONTAINER_IN_CONTAINER",
+        "DOCKER_OPTS",
+        "QEMU_STRACE",
+        "CARGO_BUILD_TARGET",
+    )
+    for configuration_name in cross_configuration_names:
+        automation_surface_change_is_rejected(
+            f"Python {configuration_name} assignment",
+            python_workflow,
+            python_baseline,
+            {
+                "scripts/safe.py": (
+                    "import os\n"
+                    f"os.environ[{configuration_name!r}] = 'proposed'\n"
+                    "print('safe')\n"
+                )
+            },
+        )
+        automation_surface_change_is_rejected(
+            f"PowerShell {configuration_name} assignment",
+            powershell_file_workflow,
+            powershell_file_baseline,
+            {
+                "scripts/safe.ps1": (
+                    "#!/usr/bin/env pwsh\n"
+                    f"$env:{configuration_name} = 'proposed'\n"
+                    "Write-Output 'safe'\n"
+                )
+            },
+        )
+
+    # Once a configuration surface exists, changing its value must also move
+    # the protected digest. This distinguishes the intended freeze from an
+    # add-only check.
+    automation_surface_change_is_rejected(
+        "existing Python Cross configuration value change",
+        python_workflow,
+        {
+            "scripts/safe.py": (
+                "import os\n"
+                "os.environ['CROSS_BUILD_OPTS'] = 'baseline'\n"
+            )
+        },
+        {
+            "scripts/safe.py": (
+                "import os\n"
+                "os.environ['CROSS_BUILD_OPTS'] = 'proposed'\n"
+            )
+        },
+    )
+    automation_surface_change_is_rejected(
+        "existing PowerShell Cross configuration value change",
+        powershell_file_workflow,
+        {
+            "scripts/safe.ps1": (
+                "#!/usr/bin/env pwsh\n"
+                "$env:CROSS_BUILD_OPTS = 'baseline'\n"
+            )
+        },
+        {
+            "scripts/safe.ps1": (
+                "#!/usr/bin/env pwsh\n"
+                "$env:CROSS_BUILD_OPTS = 'proposed'\n"
+            )
+        },
+    )
+
+    # Identifier boundaries remain significant: adjacent names are ordinary
+    # application configuration, not Cross policy inputs.
+    benign_configuration_names = (
+        "CROSSWALK_MODE",
+        "DOCKER_OPTS_EXTRA",
+        "QEMU_STRACE_LOG",
+        "CARGO_BUILD_TARGET_DIR",
+    )
+    for configuration_name in benign_configuration_names:
+        automation_surface_change_is_accepted(
+            f"benign Python {configuration_name} assignment",
+            python_workflow,
+            python_baseline,
+            {
+                "scripts/safe.py": (
+                    "import os\n"
+                    f"os.environ[{configuration_name!r}] = 'safe'\n"
+                    "print('safe')\n"
+                )
+            },
+        )
+        automation_surface_change_is_accepted(
+            f"benign PowerShell {configuration_name} assignment",
+            powershell_file_workflow,
+            powershell_file_baseline,
+            {
+                "scripts/safe.ps1": (
+                    "#!/usr/bin/env pwsh\n"
+                    f"$env:{configuration_name} = 'safe'\n"
+                    "Write-Output 'safe'\n"
+                )
+            },
+        )
+
     arm_arguments = "'build', '--target', 'aarch64-unknown-linux-gnu'"
     python_automation_escapes(
         "dynamic __import__ process dispatch",
@@ -17526,6 +17770,43 @@ pre_build = []
             "quoted heredoc data was reported as a generated inline shell "
             "surface"
         )
+    # An inline interpreter operand may itself span physical shell lines. The
+    # full-program token pass must retain that quoted operand for its real
+    # language reader, while treating unquoted physical newlines as statement
+    # boundaries so unrelated commands are never appended to its argv.
+    multiline_inline_interpreters = {
+        "Ruby": "ruby -e '\nsystem(\"cross build\")\n'\n",
+        "Python": (
+            "python3 -c '\n"
+            "import subprocess\n"
+            "subprocess.run([\"cross\", \"build\"])\n"
+            "'\n"
+        ),
+    }
+    for label, program in multiline_inline_interpreters.items():
+        if not contains_direct_trusted_shell_cross_surface(program):
+            failures.append(
+                f"a multiline {label} inline interpreter Cross surface was missed"
+            )
+    for label, program in {
+        "separate Python and prose commands": (
+            "python3 -c 'print(\"safe\")'\n"
+            "printf '%s\\n' 'cross build documentation'\n"
+        ),
+        "inline option on a later command": (
+            "python3 --version\n"
+            "-c 'cross build is not a Python operand'\n"
+        ),
+        "quote marker inside a shell comment": (
+            "python3 -c 'print(\"safe\")' # unmatched ' is comment data\n"
+            "printf '%s\\n' 'cross build documentation'\n"
+        ),
+    }.items():
+        if contains_direct_trusted_shell_cross_surface(program):
+            failures.append(
+                f"benign multiline boundary {label!r} was read as one inline "
+                "interpreter command"
+            )
     # The discriminating control puts the identical words on a real command
     # line, where the inline shell really is generated and must fail closed.
     if not contains_direct_trusted_shell_cross_surface('bash -c "$(render)"\n'):
@@ -17841,6 +18122,36 @@ pre_build = []
     ):
         failures.append(
             "heredoc-looking extensionless Python data changed the PR Cross surface"
+        )
+    # The Python template stays data when the file is executed normally. If a
+    # caller evaluates that stdout as shell, the caller is the opaque execution
+    # boundary and must fail closed; interpreting all suffixless Python source
+    # as POSIX shell would instead reject the benign direct invocation above.
+    extensionless_eval_workflow = extensionless_workflow.replace(
+        "./scripts/build",
+        'eval "$(./scripts/build)"',
+    )
+    if not validate_automation_collection(
+        {"ci.yml": extensionless_eval_workflow},
+        {"setup/action.yml": safe_action},
+        extensionless_python_template,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "dynamic evaluation of extensionless Python output was accepted"
+        )
+    if not compare_pr_automation_collection(
+        {"ci.yml": extensionless_workflow},
+        {"ci.yml": extensionless_eval_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        extensionless_python_template,
+        extensionless_python_template,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "a newly added dynamic evaluation of extensionless Python output "
+            "did not change the PR Cross surface"
         )
     for label, proposed in (
         ("extensionless Python", extensionless_python_cross),
