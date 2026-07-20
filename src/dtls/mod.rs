@@ -482,24 +482,22 @@ impl DtlsConnection {
                 let mut wrote_ciphertext_datagram = false;
                 for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                     match dtls.poll_output(&mut out_buf) {
-                        Output::Packet(data) => {
-                            match socket.send(data).await {
-                                Ok(written) if written == data.len() => {
-                                    wrote_ciphertext_datagram = true;
-                                }
-                                Ok(written) => {
-                                    socket_send_error = Some(format!(
-                                        "DTLS UDP send was incomplete: wrote {written} of {} bytes",
-                                        data.len()
-                                    ));
-                                    break;
-                                }
-                                Err(e) => {
-                                    socket_send_error = Some(format!("DTLS UDP send error: {e}"));
-                                    break;
-                                }
+                        Output::Packet(data) => match socket.send(data).await {
+                            Ok(written) if written == data.len() => {
+                                wrote_ciphertext_datagram = true;
                             }
-                        }
+                            Ok(written) => {
+                                socket_send_error = Some(format!(
+                                    "DTLS UDP send was incomplete: wrote {written} of {} bytes",
+                                    data.len()
+                                ));
+                                break;
+                            }
+                            Err(e) => {
+                                socket_send_error = Some(format!("DTLS UDP send error: {e}"));
+                                break;
+                            }
+                        },
                         Output::Timeout(t) => {
                             next_timeout = Some(t);
                             break;

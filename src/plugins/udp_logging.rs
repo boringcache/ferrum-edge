@@ -285,9 +285,8 @@ pub(crate) fn materialize_dtls_material(
     // source must not pass admission and become a latent rollout defect.
     let configured_root_store = match ca_path {
         Some(ca_path) => Some(
-            crate::dtls::load_root_store_from_pem(ca_path).map_err(|error| {
-                format!("udp_logging: DTLS CA materialization failed: {error}")
-            })?,
+            crate::dtls::load_root_store_from_pem(ca_path)
+                .map_err(|error| format!("udp_logging: DTLS CA materialization failed: {error}"))?,
         ),
         None => None,
     };
@@ -492,7 +491,9 @@ impl UdpDeliveryError {
 }
 
 fn record_local_record_drop(error: &UdpDeliveryError) {
-    let total = LOCAL_RECORD_DROPS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    let total = LOCAL_RECORD_DROPS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
     if total == 1 || total % LOCAL_RECORD_DROP_WARN_EVERY == 0 {
         warn!(
             dropped_records = total,
