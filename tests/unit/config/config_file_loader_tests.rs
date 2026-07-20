@@ -867,10 +867,7 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 #[test]
 fn test_file_config_rejects_unknown_ai_semantic_cache_keys() {
     for (id, config) in [
-        (
-            "ai-cache-ttl-typo",
-            serde_json::json!({"ttl_second": 60}),
-        ),
+        ("ai-cache-ttl-typo", serde_json::json!({"ttl_second": 60})),
         (
             "ai-cache-multimodal-typo",
             serde_json::json!({"cache_multimoda": "reject"}),
