@@ -296,10 +296,6 @@ impl LoadTesting {
         Self::with_shared_state(config, http_client, Arc::clone(&self.state))
     }
 
-    pub(crate) fn shared_state(&self) -> Arc<LoadTestingState> {
-        Arc::clone(&self.state)
-    }
-
     /// Whether a cohort is currently admitted on this plugin identity.
     pub fn is_running(&self) -> bool {
         self.state.is_running.load(Ordering::Acquire)
