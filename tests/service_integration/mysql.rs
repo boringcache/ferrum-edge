@@ -203,13 +203,13 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
     .execute(pool)
     .await
     .expect("runtime text bindings must be accepted by MySQL through sqlx::Any");
-    let context: String = sqlx::query_scalar(
+    let context: Vec<u8> = sqlx::query_scalar(
         "SELECT request_context FROM example_audit_log WHERE id = 'runtime-row'",
     )
     .fetch_one(pool)
     .await
     .expect("read runtime text binding");
-    assert_eq!(context, "{\"redacted\":true}");
+    assert_eq!(context.as_slice(), b"{\"redacted\":true}");
 
     // Simulate V2 CREATE INDEX committing before its tracker insert.
     sqlx::query(

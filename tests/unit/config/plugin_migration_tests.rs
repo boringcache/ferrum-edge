@@ -1,7 +1,6 @@
 //! Tests for custom plugin database migration support
 
 use ferrum_edge::config::migrations::{CustomPluginMigration, MigrationRunner};
-use sqlx::Row;
 
 /// Create a single-connection SQLite in-memory pool for testing.
 async fn test_pool() -> sqlx::AnyPool {
