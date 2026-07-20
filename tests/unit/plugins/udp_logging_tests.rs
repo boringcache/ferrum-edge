@@ -1272,11 +1272,7 @@ fn test_dtls_client_send_drain_continues_past_a_full_application_data_round() {
     ] {
         assert!(
             !ferrum_edge::_test_support::dtls_client_send_output_drain_needs_another_round_for_test(
-                terminal.0,
-                terminal.1,
-                terminal.2,
-                terminal.3,
-                terminal.4,
+                terminal.0, terminal.1, terminal.2, terminal.3, terminal.4,
             ),
             "terminal or completed state must not spin another drain round: {terminal:?}"
         );
