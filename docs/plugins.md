@@ -3921,6 +3921,8 @@ config:
 
 **Fail-closed defaults.** A streaming request that lacks a top-level string `model` is rejected with an OpenAI-shaped `400`; one whose `model` matches no provider is rejected with a `404`. Set `fail_on_missing_model: false` / `fail_on_no_matching_provider: false` to pass such requests through instead.
 
+**Strict configuration admission.** Root, each `providers[]` object, and the nested `fallback` object are fixed-shape: unknown keys are rejected with path-qualified diagnostics and spelling suggestions (for example `config.enabeld` → did you mean `enabled`?). There are no intentional free-form maps in this plugin. The same constructor contract is shared by `ferrum-edge validate` / file startup, Admin and database writes, and CP/DP snapshot or reload publication. Registration policy is `FailClosed`: an invalid enabled config rejects publication so the gateway retains the last-known-good instance instead of silently omitting streaming routing controls or applying typo'd defaults.
+
 **Limitations (MVP):**
 
 - **Fallback cannot switch providers after the first downstream byte.** Once response bytes have streamed to the client the provider is fixed; `ai_stream_router.fallback_attempts` is always `0`. The nested `fallback` block is parsed and validated for forward-compatibility but has no runtime effect yet.

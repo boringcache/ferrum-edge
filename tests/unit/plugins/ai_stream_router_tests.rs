@@ -325,6 +325,122 @@ fn test_config_rejects_ambiguous_federation_fields() {
     }
 }
 
+fn valid_provider() -> Value {
+    json!({
+        "name": "p",
+        "provider_type": "openai",
+        "endpoint": "https://a.example.com/v1/chat/completions",
+        "api_key": "k",
+        "model_patterns": ["gpt-*"]
+    })
+}
+
+#[test]
+fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
+    let mut cfg = json!({
+        "enabeld": false,
+        "providers": [valid_provider()]
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(
+        err.contains("unknown configuration key")
+            && err.contains("'config.enabeld'")
+            && err.contains("did you mean 'enabled'"),
+        "{err}"
+    );
+
+    // Misspelled enablement must not silently leave the router enabled.
+    assert!(
+        validate_plugin_config("ai_stream_router", &cfg).is_err(),
+        "shared admission must reject enablement typos"
+    );
+
+    cfg = json!({
+        "fail_on_missing_mode": false,
+        "inject_usage_option": false,
+        "normalize_response_strem": false,
+        "providers": [valid_provider()]
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(err.contains("'config.fail_on_missing_mode'"), "{err}");
+    assert!(err.contains("'config.inject_usage_option'"), "{err}");
+    assert!(err.contains("'config.normalize_response_strem'"), "{err}");
+    assert!(
+        err.contains("did you mean 'fail_on_missing_model'")
+            || err.contains("did you mean 'inject_usage_options'")
+            || err.contains("did you mean 'normalize_response_stream'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_config_rejects_unknown_provider_and_fallback_keys() {
+    let cfg = json!({
+        "providers": [{
+            "name": "p",
+            "provider_type": "openai",
+            "endpoint": "https://a.example.com/v1/chat/completions",
+            "api_key": "k",
+            "model_patterns": ["gpt-*"],
+            "inherit_backend_tl": true,
+            "allow_plaintex": true
+        }]
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(
+        err.contains("'config.providers[0].allow_plaintex'"),
+        "{err}"
+    );
+    assert!(
+        err.contains("'config.providers[0].inherit_backend_tl'"),
+        "{err}"
+    );
+    assert!(
+        err.contains("did you mean 'allow_plaintext'")
+            || err.contains("did you mean 'inherit_backend_tls'"),
+        "{err}"
+    );
+
+    let cfg = json!({
+        "providers": [valid_provider()],
+        "fallback": {
+            "enabled": true,
+            "on_connect_erro": false,
+            "max_attemps": 3
+        }
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(err.contains("'config.fallback.on_connect_erro'"), "{err}");
+    assert!(err.contains("'config.fallback.max_attemps'"), "{err}");
+    assert!(
+        err.contains("did you mean 'on_connect_error'")
+            || err.contains("did you mean 'max_attempts'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_shared_admission_and_failure_policy_for_unknown_keys() {
+    use ferrum_edge::plugins::{PluginFailurePolicy, plugin_failure_policy};
+
+    let err = validate_plugin_config(
+        "ai_stream_router",
+        &json!({
+            "enabeld": false,
+            "providers": [valid_provider()]
+        }),
+    )
+    .expect_err("shared plugin validation must reject unknown keys");
+    assert!(
+        err.contains("'config.enabeld'") && err.contains("did you mean 'enabled'"),
+        "{err}"
+    );
+    assert_eq!(
+        plugin_failure_policy("ai_stream_router"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
+}
+
 #[test]
 fn test_disabled_plugin_does_not_wire_hooks() {
     let mut cfg = openai_and_anthropic_config();
