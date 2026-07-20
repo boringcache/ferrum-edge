@@ -1743,10 +1743,11 @@ _inline_program_depth = 0
 SHELL_PARAMETER_REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 # Match the variable name at the start of a braced parameter expansion without
 # consuming the rest of that expansion. The evaluated source may use default,
-# slicing, removal, replacement, array, case, or indirect operators, and nested
-# references inside the operator word must remain visible to the same scan.
+# length, slicing, removal, replacement, array, case, or indirect operators,
+# and nested references inside the operator word must remain visible to the
+# same scan.
 SHELL_SOURCE_PARAMETER_REFERENCE = re.compile(
-    r"\$(?:\{!?(?P<braced>[A-Za-z_][A-Za-z0-9_]*)|"
+    r"\$(?:\{[!#]?(?P<braced>[A-Za-z_][A-Za-z0-9_]*)|"
     r"(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
 )
 # Generated-program variables can be assigned anywhere a shell command begins,
@@ -18834,6 +18835,12 @@ pre_build = []
                 "./scripts/build",
                 'generated="$(./scripts/build)"; '
                 'eval "${generated:-echo safe}"',
+            )
+        ),
+        "eval through a parameter-length assignment": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'generated="$(./scripts/build)"; eval "${#generated}"',
             )
         ),
         "eval through a control-flow assignment": extensionless_workflow.replace(
