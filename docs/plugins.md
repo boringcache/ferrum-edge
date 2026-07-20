@@ -548,8 +548,8 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-| `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (min: 100). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
-| `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (min: 100). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
+| `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
+| `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
 | `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 

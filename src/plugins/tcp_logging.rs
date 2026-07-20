@@ -41,6 +41,9 @@ use crate::dns::DnsCache;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
 
+const MIN_TIMEOUT_MS: u64 = 100;
+const MAX_TIMEOUT_MS: u64 = 60_000;
+
 /// Authoritative closed set of top-level `tcp_logging` configuration keys.
 ///
 /// Constructor admission, OpenAPI `TcpLoggingConfig`, and operator docs must
@@ -230,9 +233,9 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
 
 fn bounded_timeout_ms(config: &Value, key: &str, default_ms: u64) -> Result<u64, String> {
     let value = optional_u64(config, key)?.unwrap_or(default_ms);
-    if value < 100 {
+    if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&value) {
         return Err(format!(
-            "tcp_logging: '{key}' must be at least 100 milliseconds (got {value})"
+            "tcp_logging: '{key}' must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} milliseconds (got {value})"
         ));
     }
     Ok(value)

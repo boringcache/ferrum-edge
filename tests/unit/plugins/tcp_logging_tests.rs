@@ -561,3 +561,21 @@ async fn test_tcp_logging_rejects_invalid_write_timeout_shape() {
     );
     assert!(result.is_err(), "non-integer write_timeout_ms must fail");
 }
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_timeouts_above_recovery_bound() {
+    for key in ["connect_timeout_ms", "write_timeout_ms"] {
+        let mut config = json!({"host": "localhost", "port": 5140});
+        config
+            .as_object_mut()
+            .expect("object config")
+            .insert(key.to_string(), json!(60_001));
+        let error = TcpLogging::new(&config, default_client())
+            .err()
+            .expect("excessive timeout must fail admission");
+        assert!(
+            error.contains(key) && error.contains("60000"),
+            "unexpected {key} error: {error}"
+        );
+    }
+}

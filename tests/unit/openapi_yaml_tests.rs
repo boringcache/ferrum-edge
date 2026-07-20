@@ -3406,7 +3406,9 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
         .expect("TcpLoggingConfig exists");
     assert_eq!(schema["additionalProperties"], json!(false));
     assert_eq!(schema["properties"]["connect_timeout_ms"]["minimum"], 100);
+    assert_eq!(schema["properties"]["connect_timeout_ms"]["maximum"], 60000);
     assert_eq!(schema["properties"]["write_timeout_ms"]["minimum"], 100);
+    assert_eq!(schema["properties"]["write_timeout_ms"]["maximum"], 60000);
     assert_eq!(schema["properties"]["write_timeout_ms"]["default"], 5000);
     assert_eq!(schema["properties"]["tls_server_name"]["pattern"], r"^\S+$");
     let connect_desc = schema["properties"]["connect_timeout_ms"]["description"]
@@ -3475,6 +3477,8 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
         json!({"host": "logs.example.com", "port": 6514, "tls": null}),
         json!({"host": "logs.example.com", "port": 6514, "write_timeout_ms": 50}),
         json!({"host": "logs.example.com", "port": 6514, "connect_timeout_ms": 50}),
+        json!({"host": "logs.example.com", "port": 6514, "write_timeout_ms": 60001}),
+        json!({"host": "logs.example.com", "port": 6514, "connect_timeout_ms": 60001}),
         json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": " logs.example.com"}),
         json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": "logs.example.com "}),
     ];
