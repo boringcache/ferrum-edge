@@ -1071,7 +1071,8 @@ pub async fn run(
             // A config-VALIDATION rejection (issue #2158) means the backend is
             // reachable but returned a semantically-invalid snapshot: it is
             // recoverable via in-band admin repair, so it stays backup-eligible
-            // (serve backup, keep admin writes enabled, publish config_rejected)
+            // (serve backup, publish config_rejected, and enable writes after
+            // the recovery migration gate)
             // and is left unclassified so no "refusing to bootstrap" wrapper
             // clouds the rejection log. Every OTHER non-transient failure
             // (schema drift, bad rows, decode, query, auth) is classified and
@@ -1100,8 +1101,9 @@ pub async fn run(
                         if startup_config_rejected {
                             error!(
                                 "Initial database snapshot was rejected by runtime validation; \
-                                 starting with backup config, keeping admin writes enabled for \
-                                 in-band repair, and publishing config_rejected immediately: {}",
+                                 starting with backup config, enabling admin writes for in-band \
+                                 repair after the recovery migration gate, and publishing \
+                                 config_rejected immediately: {}",
                                 e
                             );
                         }
@@ -1640,13 +1642,28 @@ pub async fn run(
     // backup file because every DB URL was down at startup, initialize to
     // `false` so `/health` and the admin API report the true state
     // immediately — before the first polling tick runs. A typed validation
-    // rejection instead proves reachability, so keep writes enabled even if
-    // startup previously entered the offline-bootstrap path.
+    // rejection proves reachability, but an offline-bootstrap path must still
+    // reconcile the custom-plugin migration policy before writes are enabled.
     let startup_ready = Arc::new(AtomicBool::new(false));
     let db_available = Arc::new(AtomicBool::new(initial_db_available(
         bootstrap_from_backup,
         startup_config_rejected,
+        plugin_migration_reconcile_state.load(Ordering::Acquire),
     )));
+    if bootstrap_from_backup && startup_config_rejected {
+        // The database recovered after the eager startup probe but returned an
+        // invalid full snapshot. Preserve in-band repair from issue #2158 only
+        // after the custom-plugin migration probe/auto-apply policy skipped by
+        // offline bootstrap has completed (issue #2630).
+        let _ = mark_db_available_after_successful_poll_load(
+            &db,
+            &db_available,
+            "initial validation-rejected snapshot",
+            env_config.auto_apply_plugin_migrations,
+            &plugin_migration_reconcile_state,
+        )
+        .await;
+    }
     // Raised by the poll loop when a full load is rejected by the runtime-config
     // validation contract (reachable backend, invalid snapshot). Distinct from
     // `db_available`: admin stays writable so the offending resource can be
@@ -2550,8 +2567,14 @@ fn commit_full_reload_poll_state(
     }
 }
 
-fn initial_db_available(bootstrap_from_backup: bool, config_rejected: bool) -> bool {
-    !bootstrap_from_backup || config_rejected
+fn initial_db_available(
+    bootstrap_from_backup: bool,
+    config_rejected: bool,
+    plugin_migration_reconcile_state: u8,
+) -> bool {
+    !bootstrap_from_backup
+        || (config_rejected
+            && plugin_migration_reconcile_state == PLUGIN_MIGRATIONS_RECONCILED)
 }
 
 async fn mark_db_available_after_successful_poll_load(
@@ -3003,17 +3026,21 @@ mod tests {
     }
 
     #[test]
-    fn startup_validation_rejection_keeps_writes_enabled() {
+    fn startup_validation_rejection_respects_migration_gate() {
         assert!(
-            initial_db_available(false, true),
+            initial_db_available(false, true, PLUGIN_MIGRATIONS_RECONCILED),
             "a reachable validation rejection must keep admin writes enabled"
         );
         assert!(
-            initial_db_available(true, true),
-            "validation proof of reachability must override an earlier offline bootstrap state"
+            initial_db_available(true, true, PLUGIN_MIGRATIONS_RECONCILED),
+            "validation proof of reachability may enable writes after migration reconciliation"
         );
         assert!(
-            !initial_db_available(true, false),
+            !initial_db_available(true, true, PLUGIN_MIGRATIONS_NEED_RECONCILE),
+            "validation proof of reachability must not bypass a pending migration gate"
+        );
+        assert!(
+            !initial_db_available(true, false, PLUGIN_MIGRATIONS_RECONCILED),
             "a connectivity-only backup bootstrap must keep admin writes blocked"
         );
     }
@@ -3030,6 +3057,11 @@ mod tests {
         assert!(
             source.contains("AtomicBool::new(startup_config_rejected)"),
             "backup startup must expose config_rejected before the poll loop starts"
+        );
+        assert!(
+            source.contains("if bootstrap_from_backup && startup_config_rejected")
+                && source.contains("initial validation-rejected snapshot"),
+            "a validation-rejected offline bootstrap must run the recovery migration gate"
         );
     }
 
