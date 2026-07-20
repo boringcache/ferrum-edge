@@ -17,7 +17,8 @@ fn make_valid_config() -> serde_json::Value {
     json!({
         "key": VALID_KEY,
         "concurrent_clients": 5,
-        "duration_seconds": 10
+        "duration_seconds": 10,
+        "gateway_port": 8000
     })
 }
 
@@ -58,6 +59,7 @@ fn validate_plugin_config_with_policy_screens_denied_gateway_address() {
         "key": VALID_KEY,
         "concurrent_clients": 5,
         "duration_seconds": 10,
+        "gateway_port": 8000,
         "gateway_addresses": ["http://169.254.169.254:8000"]
     });
     assert!(
@@ -69,6 +71,7 @@ fn validate_plugin_config_with_policy_screens_denied_gateway_address() {
         "key": VALID_KEY,
         "concurrent_clients": 5,
         "duration_seconds": 10,
+        "gateway_port": 8000,
         "gateway_addresses": ["http://10.0.0.2:8000"]
     });
     assert!(
@@ -103,7 +106,8 @@ fn test_valid_config_with_ramp() {
         "key": VALID_KEY,
         "concurrent_clients": 10,
         "duration_seconds": 30,
-        "ramp": true
+        "ramp": true,
+        "gateway_port": 8000
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 }
@@ -125,7 +129,8 @@ fn test_valid_config_with_gateway_tls() {
         "key": VALID_KEY,
         "concurrent_clients": 10,
         "duration_seconds": 30,
-        "gateway_tls": true
+        "gateway_tls": true,
+        "gateway_port": 8443
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 }
@@ -136,6 +141,7 @@ fn test_valid_config_with_gateway_addresses() {
         "key": VALID_KEY,
         "concurrent_clients": 10,
         "duration_seconds": 30,
+        "gateway_port": 8000,
         "gateway_addresses": ["https://node1:8443", "https://node2:8443"]
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
@@ -146,14 +152,16 @@ fn test_valid_config_boundary_values() {
     let config = json!({
         "key": "sixteen-char-key",
         "concurrent_clients": 1,
-        "duration_seconds": 1
+        "duration_seconds": 1,
+        "gateway_port": 8000
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 
     let config = json!({
         "key": "sixteen-char-key",
         "concurrent_clients": 10000,
-        "duration_seconds": 3600
+        "duration_seconds": 3600,
+        "gateway_port": 8000
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 }
@@ -190,7 +198,7 @@ fn test_optional_null_fields_still_select_defaults() {
         "ramp": null,
         "request_timeout_ms": null,
         "max_response_body_bytes": null,
-        "gateway_port": null,
+        "gateway_port": 8000,
         "gateway_tls": null,
         "gateway_tls_no_verify": null,
         "gateway_addresses": null
@@ -314,6 +322,7 @@ fn test_gateway_address_userinfo_is_rejected() {
         "key": VALID_KEY,
         "concurrent_clients": 1,
         "duration_seconds": 1,
+        "gateway_port": 8000,
         "gateway_addresses": ["https://user:password@node2:8443"]
     });
     let err = LoadTesting::new(&config, PluginHttpClient::default())
@@ -328,6 +337,7 @@ fn test_gateway_addresses_shape_validation() {
         "key": VALID_KEY,
         "concurrent_clients": 1,
         "duration_seconds": 1,
+        "gateway_port": 8000,
         "gateway_addresses": []
     });
     let err = LoadTesting::new(&empty, PluginHttpClient::default())
@@ -342,6 +352,7 @@ fn test_gateway_addresses_shape_validation() {
         "key": VALID_KEY,
         "concurrent_clients": 1,
         "duration_seconds": 1,
+        "gateway_port": 8000,
         "gateway_addresses": [123]
     });
     let err = LoadTesting::new(&non_string, PluginHttpClient::default())
@@ -356,6 +367,7 @@ fn test_gateway_addresses_shape_validation() {
         "key": VALID_KEY,
         "concurrent_clients": 1,
         "duration_seconds": 1,
+        "gateway_port": 8000,
         "gateway_addresses": [""]
     });
     let err = LoadTesting::new(&empty_entry, PluginHttpClient::default())
@@ -367,6 +379,7 @@ fn test_gateway_addresses_shape_validation() {
         "key": VALID_KEY,
         "concurrent_clients": 1,
         "duration_seconds": 1,
+        "gateway_port": 8000,
         "gateway_addresses": "https://node2:8443"
     });
     let err = LoadTesting::new(&not_array, PluginHttpClient::default())
@@ -384,6 +397,7 @@ fn test_duplicate_gateway_addresses_are_rejected() {
         "key": VALID_KEY,
         "concurrent_clients": 1,
         "duration_seconds": 1,
+        "gateway_port": 8000,
         "gateway_addresses": ["https://node2:8443/", "https://node2:8443"]
     });
     let err = LoadTesting::new(&config, PluginHttpClient::default())
@@ -800,6 +814,7 @@ fn test_gateway_address_query_fragment_still_rejected() {
             "key": VALID_KEY,
             "concurrent_clients": 1,
             "duration_seconds": 1,
+            "gateway_port": 8000,
             "gateway_addresses": [address]
         });
         assert!(
