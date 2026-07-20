@@ -251,10 +251,7 @@ pub struct CustomPluginMigration {
 /// plugin-owned index definition on every retry. Only the structured server
 /// code for a missing key is tolerated, and only on the drop half of that
 /// pair; creation failures remain fatal rather than blessing an unknown index.
-pub fn mysql_drop_index_missing_is_benign(
-    statement: &str,
-    error_number: Option<u16>,
-) -> bool {
+pub fn mysql_drop_index_missing_is_benign(statement: &str, error_number: Option<u16>) -> bool {
     let mut words = statement.split_whitespace();
     let is_drop_index = matches!(
         (words.next(), words.next()),
@@ -276,12 +273,10 @@ fn map_plugin_statement_result<T>(
                 let error_number = e
                     .as_database_error()
                     .and_then(|database_error| {
-                        database_error
-                            .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                        database_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
                     })
                     .map(sqlx::mysql::MySqlDatabaseError::number);
-                db_type == "mysql"
-                    && mysql_drop_index_missing_is_benign(statement, error_number)
+                db_type == "mysql" && mysql_drop_index_missing_is_benign(statement, error_number)
             };
             if missing_index_is_benign {
                 Ok(())

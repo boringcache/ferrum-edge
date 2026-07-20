@@ -183,7 +183,21 @@ pub(crate) async fn handle_startup_plugin_migrations(
     mode: &str,
 ) -> Result<(), anyhow::Error> {
     let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
-    handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations).await
+    handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations, false)
+        .await
+}
+
+/// Recovery variant of [`handle_startup_plugin_migrations`]. A pending-state
+/// probe failure must be retried before the recovered configuration is
+/// published, even in warn-only mode; ordinary startup retains its historical
+/// warn-and-continue behavior when auto-apply is disabled.
+pub(crate) async fn handle_recovery_plugin_migrations(
+    db: &Arc<dyn DatabaseBackend>,
+    auto_apply: bool,
+    mode: &str,
+) -> Result<(), anyhow::Error> {
+    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+    handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations, true).await
 }
 
 pub(crate) fn start_acme_renewal_scheduler(
@@ -237,6 +251,7 @@ async fn handle_startup_plugin_migrations_with_list(
     auto_apply: bool,
     mode: &str,
     plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    strict_probe: bool,
 ) -> Result<(), anyhow::Error> {
     if plugin_migrations.is_empty() {
         return Ok(());
@@ -245,12 +260,19 @@ async fn handle_startup_plugin_migrations_with_list(
     let pending = match db.pending_plugin_migrations(plugin_migrations).await {
         Ok(p) => p,
         Err(e) => {
-            if auto_apply {
+            if auto_apply || strict_probe {
                 return Err(e).with_context(|| {
-                    format!(
-                        "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true but pending \
-                         custom-plugin migrations could not be determined (mode={mode})"
-                    )
+                    if auto_apply {
+                        format!(
+                            "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true but pending \
+                             custom-plugin migrations could not be determined (mode={mode})"
+                        )
+                    } else {
+                        format!(
+                            "recovery cannot publish configuration until pending \
+                             custom-plugin migrations are determined (mode={mode})"
+                        )
+                    }
                 });
             }
 
@@ -270,31 +292,50 @@ async fn handle_startup_plugin_migrations_with_list(
         return Ok(());
     }
 
+    const MAX_MIGRATIONS_IN_LOG: usize = 20;
     let pending_summary: Vec<String> = pending
         .iter()
+        .take(MAX_MIGRATIONS_IN_LOG)
         .map(|m| format!("[{}] V{}: {}", m.plugin_name, m.version, m.name))
         .collect();
+    let omitted_pending = pending.len().saturating_sub(pending_summary.len());
+    let pending_suffix = if omitted_pending == 0 {
+        String::new()
+    } else {
+        format!(", ... (+{omitted_pending} more)")
+    };
+    let pending_description = format!("{}{}", pending_summary.join(", "), pending_suffix);
 
     if auto_apply {
         info!(
             "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true and {} pending custom-plugin migration(s) \
              detected ({}). Applying now (mode={}).",
-            pending_summary.len(),
-            pending_summary.join(", "),
+            pending.len(),
+            pending_description,
             mode
         );
         let applied = db.apply_plugin_migrations(plugin_migrations).await?;
+        let applied_summary: Vec<String> = applied
+            .iter()
+            .take(MAX_MIGRATIONS_IN_LOG)
+            .map(|m| {
+                format!(
+                    "[{}] V{}: {} ({}ms)",
+                    m.plugin_name, m.version, m.name, m.execution_time_ms
+                )
+            })
+            .collect();
+        let omitted_applied = applied.len().saturating_sub(applied_summary.len());
+        let applied_suffix = if omitted_applied == 0 {
+            String::new()
+        } else {
+            format!(", ... (+{omitted_applied} more)")
+        };
+        let applied_description = format!("{}{}", applied_summary.join(", "), applied_suffix);
         info!(
             "Applied {} custom-plugin migration(s) at startup: {}",
             applied.len(),
-            applied
-                .iter()
-                .map(|m| format!(
-                    "[{}] V{}: {} ({}ms)",
-                    m.plugin_name, m.version, m.name, m.execution_time_ms
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
+            applied_description
         );
     } else {
         warn!(
@@ -303,8 +344,8 @@ async fn handle_startup_plugin_migrations_with_list(
              Pending: {}. Run FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up before serving \
              traffic that depends on the new schema, or set \
              FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true to auto-apply at startup.",
-            pending_summary.len(),
-            pending_summary.join(", ")
+            pending.len(),
+            pending_description
         );
     }
 
@@ -497,7 +538,7 @@ mod tests {
         let pending_before = db.pending_plugin_migrations(&migrations).await.unwrap();
         assert_eq!(pending_before.len(), 1);
 
-        handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations)
+        handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations, false)
             .await
             .expect("auto-apply path should not error");
 
@@ -528,7 +569,7 @@ mod tests {
         let pending_before = db.pending_plugin_migrations(&migrations).await.unwrap();
         assert_eq!(pending_before.len(), 1);
 
-        handle_startup_plugin_migrations_with_list(&db, false, "database", &migrations)
+        handle_startup_plugin_migrations_with_list(&db, false, "database", &migrations, false)
             .await
             .expect("warn-only path should not error");
 
@@ -550,9 +591,15 @@ mod tests {
         let db: Arc<dyn DatabaseBackend> = store;
         let migrations = synthetic_pending_migration();
 
-        let err = handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations)
-            .await
-            .expect_err("auto-apply must fail startup when pending probe fails");
+        let err = handle_startup_plugin_migrations_with_list(
+            &db,
+            true,
+            "database",
+            &migrations,
+            false,
+        )
+        .await
+        .expect_err("auto-apply must fail startup when pending probe fails");
 
         assert!(
             err.to_string().contains(
@@ -570,9 +617,50 @@ mod tests {
         let db: Arc<dyn DatabaseBackend> = store;
         let migrations = synthetic_pending_migration();
 
-        handle_startup_plugin_migrations_with_list(&db, false, "database", &migrations)
+        handle_startup_plugin_migrations_with_list(&db, false, "database", &migrations, false)
             .await
             .expect("warn-only path should swallow pending probe failures");
+    }
+
+    #[tokio::test]
+    async fn recovery_warn_only_retries_a_failed_probe_before_succeeding() {
+        let (store, _tmp) = fresh_database_store().await;
+        create_malformed_plugin_tracking_table(&store).await;
+        let db: Arc<dyn DatabaseBackend> = store.clone();
+        let migrations = synthetic_pending_migration();
+
+        let first = handle_startup_plugin_migrations_with_list(
+            &db,
+            false,
+            "database-recovery",
+            &migrations,
+            true,
+        )
+        .await
+        .expect_err("recovery must not clear its reconcile state after a failed probe");
+        assert!(
+            first
+                .to_string()
+                .contains("recovery cannot publish configuration"),
+            "unexpected recovery error: {first:#}"
+        );
+
+        sqlx::query("DROP TABLE _ferrum_plugin_migrations")
+            .execute(&store.pool())
+            .await
+            .expect("repair malformed tracking table");
+        handle_startup_plugin_migrations_with_list(
+            &db,
+            false,
+            "database-recovery",
+            &migrations,
+            true,
+        )
+        .await
+        .expect("warn-only recovery should succeed once the probe recovers");
+
+        let pending = db.pending_plugin_migrations(&migrations).await.unwrap();
+        assert_eq!(pending.len(), 1, "warn-only recovery must not mutate schema");
     }
 
     #[tokio::test]
@@ -580,10 +668,10 @@ mod tests {
         let (db, _tmp) = fresh_store().await;
         let empty: Vec<(&str, Vec<CustomPluginMigration>)> = vec![];
 
-        handle_startup_plugin_migrations_with_list(&db, false, "database", &empty)
+        handle_startup_plugin_migrations_with_list(&db, false, "database", &empty, false)
             .await
             .expect("warn-only with empty list is a no-op");
-        handle_startup_plugin_migrations_with_list(&db, true, "cp", &empty)
+        handle_startup_plugin_migrations_with_list(&db, true, "cp", &empty, false)
             .await
             .expect("auto-apply with empty list is a no-op");
     }
@@ -595,10 +683,10 @@ mod tests {
         let (db, _tmp) = fresh_store().await;
         let migrations = synthetic_pending_migration();
 
-        handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations)
+        handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations, false)
             .await
             .unwrap();
-        handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations)
+        handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations, false)
             .await
             .expect("second startup with auto-apply should be a no-op");
 

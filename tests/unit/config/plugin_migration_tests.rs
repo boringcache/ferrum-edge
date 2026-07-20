@@ -1106,10 +1106,17 @@ fn example_audit_plugin_mysql_overrides_rebuild_exact_indexes() {
 
     let v1 = example.iter().find(|m| m.version == 1).expect("v1");
     let mysql = v1.sql_mysql.expect("mysql override");
+    let postgres = v1.sql_postgres.expect("postgres override");
+    assert!(postgres.contains("timestamp TEXT NOT NULL"));
+    assert!(postgres.contains("request_context TEXT"));
+    assert!(postgres.contains("grpc_status BIGINT"));
     assert!(
         mysql.contains("CREATE TABLE IF NOT EXISTS example_audit_log"),
         "table DDL should stay idempotent"
     );
+    assert!(mysql.contains("timestamp VARCHAR(32) NOT NULL"));
+    assert!(mysql.contains("request_context TEXT"));
+    assert!(mysql.contains("grpc_status BIGINT"));
     assert!(
         !mysql.to_ascii_uppercase().contains("IF NOT EXISTS IDX_"),
         "MySQL index DDL must not rely on IF NOT EXISTS"
@@ -1184,152 +1191,4 @@ async fn example_audit_plugin_migrations_apply_idempotently_on_sqlite() {
     .execute(&pool)
     .await
     .expect("example_audit_log must exist after migrations");
-}
-
-async fn mysql_index_definition(
-    pool: &sqlx::AnyPool,
-    index_name: &str,
-) -> Vec<(String, i64)> {
-    sqlx::query(
-        "SELECT COLUMN_NAME, CAST(NON_UNIQUE AS SIGNED) \
-         FROM information_schema.statistics \
-         WHERE table_schema = DATABASE() AND table_name = 'example_audit_log' \
-           AND index_name = ? \
-         ORDER BY SEQ_IN_INDEX",
-    )
-    .bind(index_name)
-    .fetch_all(pool)
-    .await
-    .expect("inspect example_audit_log index definition")
-    .into_iter()
-    .map(|row| {
-        (
-            row.try_get(0).expect("index column name"),
-            row.try_get(1).expect("index uniqueness"),
-        )
-    })
-    .collect()
-}
-
-/// Live MySQL recovery: start with wrongly-defined V1 indexes and no tracking,
-/// verify exact reconstruction, then simulate a V2 index/tracking-row gap.
-/// Requires `FERRUM_TEST_MYSQL_URL`.
-#[tokio::test]
-async fn example_audit_mysql_partial_ddl_recovers_on_retry() {
-    let Ok(mysql_url) = std::env::var("FERRUM_TEST_MYSQL_URL") else {
-        return;
-    };
-    let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
-    let Some((_, example)) = migrations
-        .into_iter()
-        .find(|(name, _)| *name == "example_audit_plugin")
-    else {
-        return;
-    };
-
-    sqlx::any::install_default_drivers();
-    let pool = sqlx::any::AnyPoolOptions::new()
-        .max_connections(2)
-        .connect(&mysql_url)
-        .await
-        .expect("connect FERRUM_TEST_MYSQL_URL");
-
-    // Clean slate for this suite.
-    let _ = sqlx::query("DROP TABLE IF EXISTS example_audit_log")
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("DROP TABLE IF EXISTS _ferrum_plugin_migrations")
-        .execute(&pool)
-        .await;
-
-    // Force a partial V1 with the expected names but wrong column definitions,
-    // then skip tracking. Name-only duplicate tolerance would incorrectly bless
-    // this schema; DROP/CREATE reconciliation must repair it.
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS example_audit_log (
-            id VARCHAR(255) PRIMARY KEY,
-            timestamp DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-            client_ip VARCHAR(255) NOT NULL,
-            protocol VARCHAR(32) NOT NULL,
-            http_method VARCHAR(20),
-            request_path TEXT,
-            response_status INTEGER,
-            latency_ms DOUBLE NOT NULL,
-            consumer_username VARCHAR(255),
-            proxy_id VARCHAR(255),
-            request_context JSON,
-            connection_error TEXT
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("CREATE INDEX idx_example_audit_log_timestamp ON example_audit_log (client_ip)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("CREATE INDEX idx_example_audit_log_client_ip ON example_audit_log (timestamp)")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let runner = MigrationRunner::new(pool.clone(), "mysql".to_string());
-    let list = vec![("example_audit_plugin", example)];
-    let applied = runner
-        .run_plugin_pending(&list)
-        .await
-        .expect("MySQL retry after partial DDL must succeed");
-    assert!(
-        applied.iter().any(|r| r.version == 1),
-        "V1 tracking must be recorded on recovery"
-    );
-    assert!(
-        applied.iter().any(|r| r.version == 2),
-        "V2 tracking must be recorded"
-    );
-    assert_eq!(
-        mysql_index_definition(&pool, "idx_example_audit_log_timestamp").await,
-        [("timestamp".to_string(), 1)]
-    );
-    assert_eq!(
-        mysql_index_definition(&pool, "idx_example_audit_log_client_ip").await,
-        [("client_ip".to_string(), 1)]
-    );
-    assert_eq!(
-        mysql_index_definition(&pool, "idx_example_audit_log_status_ts").await,
-        [
-            ("response_status".to_string(), 1),
-            ("timestamp".to_string(), 1),
-        ]
-    );
-
-    // Simulate an implicit-commit gap after V2 CREATE INDEX but before its
-    // tracking insert. The retry must rebuild the exact definition and track V2.
-    sqlx::query(
-        "DELETE FROM _ferrum_plugin_migrations \
-         WHERE plugin_name = ? AND version = 2",
-    )
-    .bind("example_audit_plugin")
-    .execute(&pool)
-    .await
-    .unwrap();
-    let recovered_v2 = runner
-        .run_plugin_pending(&list)
-        .await
-        .expect("MySQL V2 tracking-gap recovery must succeed");
-    assert_eq!(recovered_v2.len(), 1);
-    assert_eq!(recovered_v2[0].version, 2);
-    assert_eq!(
-        mysql_index_definition(&pool, "idx_example_audit_log_status_ts").await,
-        [
-            ("response_status".to_string(), 1),
-            ("timestamp".to_string(), 1),
-        ]
-    );
-
-    // A fully tracked third run is a no-op.
-    let again = runner.run_plugin_pending(&list).await.unwrap();
-    assert!(again.is_empty());
 }

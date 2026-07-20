@@ -238,7 +238,7 @@ To include only specific custom plugins, set `FERRUM_CUSTOM_PLUGINS` at **build 
 FERRUM_CUSTOM_PLUGINS=my_header_injector,my_auth cargo build --release
 ```
 
-If unset, all non-example `.rs` files in `custom_plugins/` are included.
+If unset, all `.rs` files directly in `custom_plugins/` are included.
 Pedagogical examples under `custom_plugins/examples/` are **never** part of
 the default discovery set; list them explicitly to compile them:
 
@@ -1423,10 +1423,12 @@ See `custom_plugins/examples/example_audit_plugin.rs` (build with
 `FERRUM_CUSTOM_PLUGINS=example_audit_plugin`) for a full working example that
 demonstrates:
 - Multi-version migrations (V1: create table + indexes, V2: add composite index)
-- PostgreSQL overrides (`TIMESTAMPTZ`, `JSONB`)
-- MySQL overrides (`DATETIME(3)`, `JSON`, `VARCHAR`) with exact drop/recreate index reconciliation
+- PostgreSQL overrides (including `DOUBLE PRECISION`)
+- MySQL overrides (`VARCHAR` sizing) with exact drop/recreate index reconciliation
 - Multi-statement SQL (CREATE TABLE + CREATE INDEX in one migration)
-- Runtime persistence via a bounded queue into the gateway configuration database
+- Atomic batch persistence via a bounded queue into the gateway configuration database
+- Separate HTTP transport and terminal gRPC status fields; WebSocket upgrade transactions without frame capture
+- Lifecycle-owned hourly retention and documented best-effort storage-failure recovery
 
 ## Adding Dependencies
 

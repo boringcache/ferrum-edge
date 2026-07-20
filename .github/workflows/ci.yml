@@ -406,10 +406,10 @@ jobs:
           tool: cargo-nextest
 
       - name: Run service-integration tests
-        # Both suites run real third-party software through testcontainers.
+        # These suites run real third-party software through testcontainers.
         # Nextest reports each test independently and keeps running after a
         # Consul or LDAP failure so one middleware cannot mask the other.
-        run: cargo nextest run --test service_integration --no-fail-fast consul ldap
+        run: cargo nextest run --test service_integration --no-fail-fast consul ldap mysql
         env:
           RUST_BACKTRACE: 1
 

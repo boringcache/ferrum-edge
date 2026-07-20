@@ -36,8 +36,8 @@
 //! # Filtering (optional)
 //!
 //! Set `FERRUM_CUSTOM_PLUGINS=plugin_a,plugin_b` at **build time** to
-//! include only specific plugins. If unset, all non-example `.rs` files in
-//! this directory are included. Example plugins under `examples/` require an
+//! include only specific plugins. If unset, all `.rs` files directly in this
+//! directory are included. Example plugins under `examples/` require an
 //! explicit listing (for example
 //! `FERRUM_CUSTOM_PLUGINS=example_audit_plugin`).
 //!

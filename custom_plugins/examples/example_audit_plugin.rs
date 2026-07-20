@@ -23,7 +23,13 @@
 //! This is a best-effort audit example (`OptionalFailOpen` at construction).
 //! Queue-full and flush failures are logged and dropped — not a compliance
 //! or durable-audit guarantee. Do not treat an empty table as proof that no
-//! traffic occurred when the sink was unavailable.
+//! traffic occurred when the sink was unavailable. Batch writes are
+//! transactional so a retry never encounters rows partially committed by its
+//! own previous attempt. The hourly retention task is aborted with the plugin
+//! generation, so repeated configuration reloads do not accumulate workers.
+//! Native and translated gRPC transactions retain their terminal gRPC status
+//! separately from the HTTP transport status. WebSocket uses its HTTP upgrade
+//! transaction; this example deliberately does not capture frame payloads.
 //!
 //! ## Features Demonstrated
 //!
@@ -31,7 +37,7 @@
 //! - Bounded queue + lifecycle-owned worker (`start_background_tasks`)
 //! - `ALL_PROTOCOLS` coverage with HTTP `log` and stream disconnect hooks
 //! - PostgreSQL-specific and MySQL-specific SQL overrides
-//! - Multi-statement migrations with MySQL duplicate-index recovery
+//! - Multi-statement migrations with exact MySQL index reconciliation
 //!
 //! ## Configuration
 //!
@@ -49,6 +55,8 @@
 //! `log_request_headers` includes a redacted metadata / user-agent snapshot
 //! when true. Full request headers are not available on the terminal log
 //! hook; this field does not capture `Authorization` / cookie values.
+//! `retention_days` accepts 1 through 36,500. Configure only one of
+//! `queue_capacity` or its shared batching alias `buffer_capacity`.
 //!
 //! ## Running Migrations
 //!
@@ -61,7 +69,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::AnyPool;
 use sqlx::any::AnyPoolOptions;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::warn;
@@ -78,6 +85,11 @@ use crate::plugins::{
 
 const TABLE_NAME: &str = "example_audit_log";
 const PLUGIN_NAME: &str = "example_audit_plugin";
+const MAX_RETENTION_DAYS: u64 = 36_500;
+const MAX_METADATA_ENTRIES: usize = 64;
+const MAX_METADATA_KEY_CHARS: usize = 128;
+const MAX_METADATA_VALUE_CHARS: usize = 512;
+const MAX_CONTEXT_BYTES: usize = 4096;
 
 #[derive(Clone)]
 struct AuditRecord {
@@ -88,6 +100,7 @@ struct AuditRecord {
     http_method: Option<String>,
     request_path: Option<String>,
     response_status: Option<i32>,
+    grpc_status: Option<i64>,
     latency_ms: f64,
     consumer_username: Option<String>,
     proxy_id: Option<String>,
@@ -100,7 +113,7 @@ pub struct ExampleAuditPlugin {
     retention_days: u64,
     batch_config: BatchConfig,
     logger: Mutex<Option<BatchingLogger<AuditRecord>>>,
-    retention_started: AtomicBool,
+    retention_task: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl ExampleAuditPlugin {
@@ -147,12 +160,36 @@ impl ExampleAuditPlugin {
                 if days == 0 {
                     return Err("retention_days must be greater than zero".to_string());
                 }
+                if days > MAX_RETENTION_DAYS {
+                    return Err(format!(
+                        "retention_days must not exceed {MAX_RETENTION_DAYS}"
+                    ));
+                }
                 days
             }
         };
 
-        let queue_capacity = match config.get("queue_capacity").or_else(|| config.get("buffer_capacity"))
-        {
+        let queue_capacity_configured = config
+            .get("queue_capacity")
+            .is_some_and(|value| !value.is_null());
+        let buffer_capacity_configured = config
+            .get("buffer_capacity")
+            .is_some_and(|value| !value.is_null());
+        if queue_capacity_configured && buffer_capacity_configured {
+            return Err(
+                "example_audit_plugin: configure only one of queue_capacity or buffer_capacity"
+                    .to_string(),
+            );
+        }
+
+        let queue_capacity = match config
+            .get("queue_capacity")
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                config
+                    .get("buffer_capacity")
+                    .filter(|value| !value.is_null())
+            }) {
             None | Some(Value::Null) => 10_000u64,
             Some(value) => {
                 let capacity = value
@@ -188,7 +225,7 @@ impl ExampleAuditPlugin {
             retention_days,
             batch_config,
             logger: Mutex::new(None),
-            retention_started: AtomicBool::new(false),
+            retention_task: Mutex::new(None),
         })
     }
 
@@ -220,14 +257,20 @@ impl ExampleAuditPlugin {
         } else {
             None
         };
+        let grpc_status = summary.grpc_status().map(i64::from);
         AuditRecord {
             id: Uuid::new_v4().to_string(),
-            timestamp: summary.timestamp_received.clone(),
+            timestamp: canonical_timestamp(&summary.timestamp_received),
             client_ip: summary.client_ip.clone(),
-            protocol: "http".to_string(),
+            protocol: if grpc_status.is_some() {
+                "grpc".to_string()
+            } else {
+                "http".to_string()
+            },
             http_method: Some(summary.http_method.clone()),
             request_path: Some(truncate_chars(&summary.request_path, 2048)),
             response_status: Some(i32::from(summary.response_status_code)),
+            grpc_status,
             latency_ms: summary.latency_total_ms,
             consumer_username: summary.consumer_username.clone(),
             proxy_id: summary.proxy_id.clone(),
@@ -253,12 +296,13 @@ impl ExampleAuditPlugin {
         };
         AuditRecord {
             id: Uuid::new_v4().to_string(),
-            timestamp: summary.timestamp_disconnected.clone(),
+            timestamp: canonical_timestamp(&summary.timestamp_disconnected),
             client_ip: summary.client_ip.clone(),
             protocol: summary.protocol.clone(),
             http_method: None,
             request_path: None,
             response_status: None,
+            grpc_status: None,
             latency_ms: summary.duration_ms,
             consumer_username: summary.consumer_username.clone(),
             proxy_id: Some(summary.proxy_id.clone()),
@@ -279,11 +323,11 @@ fn bounded_http_context(summary: &TransactionSummary) -> String {
     if let Some(auth) = summary.auth_method {
         map.insert("auth_method".to_string(), Value::String(auth.to_string()));
     }
-    // Metadata is redacted at serialize time for sensitive keys.
-    let metadata = serde_json::to_value(&RedactedMetadata(&summary.metadata)).unwrap_or(Value::Null);
-    map.insert("metadata".to_string(), metadata);
-    let encoded = Value::Object(map).to_string();
-    truncate_chars(&encoded, 4096)
+    map.insert(
+        "metadata".to_string(),
+        bounded_redacted_metadata(&summary.metadata),
+    );
+    encode_bounded_context(map)
 }
 
 fn bounded_stream_context(summary: &StreamTransactionSummary) -> String {
@@ -297,21 +341,52 @@ fn bounded_stream_context(summary: &StreamTransactionSummary) -> String {
             Value::String(truncate_chars(sni, 256)),
         );
     }
-    let metadata = serde_json::to_value(&RedactedMetadata(&summary.metadata)).unwrap_or(Value::Null);
-    map.insert("metadata".to_string(), metadata);
-    let encoded = Value::Object(map).to_string();
-    truncate_chars(&encoded, 4096)
+    map.insert(
+        "metadata".to_string(),
+        bounded_redacted_metadata(&summary.metadata),
+    );
+    encode_bounded_context(map)
 }
 
-struct RedactedMetadata<'a>(&'a std::collections::HashMap<String, String>);
-
-impl serde::Serialize for RedactedMetadata<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        crate::plugins::utils::metadata_redaction::serialize_redacted_metadata(self.0, serializer)
+fn encode_bounded_context(map: serde_json::Map<String, Value>) -> String {
+    let encoded = Value::Object(map).to_string();
+    if encoded.len() <= MAX_CONTEXT_BYTES {
+        encoded
+    } else {
+        // Never byte/character-slice serialized JSON: doing so can leave an
+        // invalid document or split an escape sequence. Oversized context is
+        // represented by a small valid marker instead.
+        serde_json::json!({
+            "metadata": {
+                "__ferrum_context_truncated": true
+            }
+        })
+        .to_string()
     }
+}
+
+fn bounded_redacted_metadata(metadata: &std::collections::HashMap<String, String>) -> Value {
+    use crate::plugins::utils::metadata_redaction::{
+        REDACTED_PLACEHOLDER, is_sensitive_metadata_key,
+    };
+
+    let mut bounded = serde_json::Map::new();
+    for (key, value) in metadata.iter().take(MAX_METADATA_ENTRIES) {
+        let value = if is_sensitive_metadata_key(key) {
+            REDACTED_PLACEHOLDER.to_string()
+        } else {
+            truncate_chars(value, MAX_METADATA_VALUE_CHARS)
+        };
+        bounded.insert(truncate_chars(key, MAX_METADATA_KEY_CHARS), Value::String(value));
+    }
+    let omitted = metadata.len().saturating_sub(MAX_METADATA_ENTRIES);
+    if omitted > 0 {
+        bounded.insert(
+            "__ferrum_omitted_metadata_entries".to_string(),
+            Value::from(omitted as u64),
+        );
+    }
+    Value::Object(bounded)
 }
 
 fn truncate_chars(input: &str, max_chars: usize) -> String {
@@ -319,6 +394,22 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
         return input.to_string();
     }
     input.chars().take(max_chars).collect()
+}
+
+fn canonical_timestamp(input: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(input) {
+        Ok(timestamp) => timestamp
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        Err(error) => {
+            warn!(
+                plugin = PLUGIN_NAME,
+                error = %error,
+                "example_audit_plugin: transaction summary carried an invalid timestamp; using current time"
+            );
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        }
+    }
 }
 
 fn connect_gateway_pool_lazy() -> Result<AnyPool, String> {
@@ -352,20 +443,25 @@ fn connect_gateway_pool_lazy() -> Result<AnyPool, String> {
             })
         })
         .connect_lazy(&db_url)
-        .map_err(|e| {
-            format!("example_audit_plugin: failed to create gateway database pool: {e}")
+        .map_err(|_| {
+            "example_audit_plugin: failed to create gateway database pool from FERRUM_DB_URL"
+                .to_string()
         })
 }
 
 async fn insert_batch(pool: &AnyPool, batch: Vec<AuditRecord>) -> Result<(), String> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|e| format!("example_audit_plugin batch transaction failed: {e}"))?;
     for record in batch {
         sqlx::query(
             r#"
             INSERT INTO example_audit_log (
                 id, timestamp, client_ip, protocol, http_method, request_path,
-                response_status, latency_ms, consumer_username, proxy_id,
+                response_status, grpc_status, latency_ms, consumer_username, proxy_id,
                 request_context, connection_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&record.id)
@@ -375,16 +471,20 @@ async fn insert_batch(pool: &AnyPool, batch: Vec<AuditRecord>) -> Result<(), Str
         .bind(&record.http_method)
         .bind(&record.request_path)
         .bind(record.response_status)
+        .bind(record.grpc_status)
         .bind(record.latency_ms)
         .bind(&record.consumer_username)
         .bind(&record.proxy_id)
         .bind(&record.request_context)
         .bind(&record.connection_error)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|e| format!("example_audit_plugin insert failed: {e}"))?;
     }
-    Ok(())
+    transaction
+        .commit()
+        .await
+        .map_err(|e| format!("example_audit_plugin batch commit failed: {e}"))
 }
 
 async fn run_retention(pool: AnyPool, retention_days: u64) {
@@ -423,6 +523,18 @@ async fn run_retention(pool: AnyPool, retention_days: u64) {
     }
 }
 
+impl Drop for ExampleAuditPlugin {
+    fn drop(&mut self) {
+        let retention_task = match self.retention_task.get_mut() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = retention_task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[async_trait]
 impl Plugin for ExampleAuditPlugin {
     fn name(&self) -> &str {
@@ -439,15 +551,17 @@ impl Plugin for ExampleAuditPlugin {
     }
 
     fn start_background_tasks(&self) -> Result<(), String> {
-        {
-            let guard = self
-                .logger
-                .lock()
-                .map_err(|_| "example_audit_plugin: logger lock poisoned".to_string())?;
-            if guard.is_some() {
-                return Ok(());
-            }
+        let mut logger_guard = self
+            .logger
+            .lock()
+            .map_err(|_| "example_audit_plugin: logger lock poisoned".to_string())?;
+        if logger_guard.is_some() {
+            return Ok(());
         }
+        let mut retention_guard = self
+            .retention_task
+            .lock()
+            .map_err(|_| "example_audit_plugin: retention lock poisoned".to_string())?;
 
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             "example_audit_plugin: start_background_tasks requires a Tokio runtime".to_string()
@@ -460,21 +574,15 @@ impl Plugin for ExampleAuditPlugin {
             async move { insert_batch(&pool, batch).await }
         });
 
-        {
-            let mut guard = self
-                .logger
-                .lock()
-                .map_err(|_| "example_audit_plugin: logger lock poisoned".to_string())?;
-            *guard = Some(logger);
-        }
-
-        if !self.retention_started.swap(true, Ordering::SeqCst) {
-            let retention_pool = pool.clone();
-            let retention_days = self.retention_days;
-            runtime.spawn(async move {
+        let retention_pool = pool.clone();
+        let retention_days = self.retention_days;
+        let retention_task = runtime
+            .spawn(async move {
                 run_retention(retention_pool, retention_days).await;
-            });
-        }
+            })
+            .abort_handle();
+        *logger_guard = Some(logger);
+        *retention_guard = Some(retention_task);
 
         Ok(())
     }
@@ -531,7 +639,7 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
         CustomPluginMigration {
             version: 1,
             name: "create_example_audit_log",
-            checksum: "v1_create_example_audit_log_5f7d32",
+            checksum: "v1_create_example_audit_log_f4a72b",
             sql: r#"
                 CREATE TABLE IF NOT EXISTS example_audit_log (
                     id TEXT PRIMARY KEY,
@@ -541,6 +649,7 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
                     http_method TEXT,
                     request_path TEXT,
                     response_status INTEGER,
+                    grpc_status INTEGER,
                     latency_ms REAL NOT NULL,
                     consumer_username TEXT,
                     proxy_id TEXT,
@@ -554,16 +663,17 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
                 r#"
                 CREATE TABLE IF NOT EXISTS example_audit_log (
                     id TEXT PRIMARY KEY,
-                    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    timestamp TEXT NOT NULL,
                     client_ip TEXT NOT NULL,
                     protocol TEXT NOT NULL,
                     http_method TEXT,
                     request_path TEXT,
                     response_status INTEGER,
+                    grpc_status BIGINT,
                     latency_ms DOUBLE PRECISION NOT NULL,
                     consumer_username TEXT,
                     proxy_id TEXT,
-                    request_context JSONB,
+                    request_context TEXT,
                     connection_error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_example_audit_log_timestamp ON example_audit_log (timestamp);
@@ -577,16 +687,17 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
                 r#"
                 CREATE TABLE IF NOT EXISTS example_audit_log (
                     id VARCHAR(255) PRIMARY KEY,
-                    timestamp DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                    timestamp VARCHAR(32) NOT NULL,
                     client_ip VARCHAR(255) NOT NULL,
                     protocol VARCHAR(32) NOT NULL,
                     http_method VARCHAR(20),
                     request_path TEXT,
                     response_status INTEGER,
+                    grpc_status BIGINT,
                     latency_ms DOUBLE NOT NULL,
                     consumer_username VARCHAR(255),
                     proxy_id VARCHAR(255),
-                    request_context JSON,
+                    request_context TEXT,
                     connection_error TEXT
                 );
                 DROP INDEX idx_example_audit_log_timestamp ON example_audit_log;

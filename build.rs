@@ -53,8 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pedagogical examples live under `custom_plugins/examples/` and are
     // compiled only when explicitly listed in `FERRUM_CUSTOM_PLUGINS`.
     //
-    // When `FERRUM_CUSTOM_PLUGINS` is unset, every non-example production
-    // file is included. When set, only the listed stems are included
+    // When `FERRUM_CUSTOM_PLUGINS` is unset, every production-directory file
+    // is included. When set, only the listed stems are included
     // (resolved from the production directory first, then examples/).
 
     let custom_dir = Path::new("custom_plugins");
@@ -81,17 +81,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or("")
                     .to_string();
                 if stem == "mod" {
-                    continue;
-                }
-                // Pedagogical examples must not live in the production scan
-                // directory. If someone drops one there anyway, ignore it
-                // unless it was explicitly opted in via FERRUM_CUSTOM_PLUGINS.
-                if stem.starts_with("example_") {
-                    if let Some(ref allowed) = filter
-                        && allowed.contains(&stem)
-                    {
-                        plugin_sources.push((stem, path));
-                    }
                     continue;
                 }
                 if let Some(ref allowed) = filter

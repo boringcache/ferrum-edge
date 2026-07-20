@@ -40,8 +40,8 @@ fn build_script_requires_explicit_opt_in_for_examples() {
         "build.rs must honor FERRUM_CUSTOM_PLUGINS"
     );
     assert!(
-        build.contains("example_"),
-        "build.rs must special-case pedagogical example_ stems"
+        build.contains("example_path") && build.contains("examples_dir.join"),
+        "build.rs must resolve opted-in names from the examples directory"
     );
 }
 

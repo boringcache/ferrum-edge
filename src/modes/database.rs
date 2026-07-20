@@ -68,6 +68,9 @@ pub const DATABASE_DELTA_RESOURCE_CATEGORY_LABELS: [&str; 6] = [
 ];
 pub const DATABASE_DELTA_BACKOFF_BUCKET_LABELS: [&str; 6] =
     ["none", "lt_5s", "lt_30s", "lt_5m", "gte_5m", "max"];
+const PLUGIN_MIGRATIONS_RECONCILED: u8 = 0;
+const PLUGIN_MIGRATIONS_NEED_RECONCILE: u8 = 1;
+const PLUGIN_MIGRATIONS_RECONCILING: u8 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct DatabaseDeltaPollDegraded {
@@ -1029,13 +1032,14 @@ pub async fn run(
 
     // Custom-plugin migrations: warn on pending, opt-in auto-apply.
     // Skipped when bootstrap_from_backup is still true — the database is
-    // unreachable so we can't probe migration state. `plugin_migrations_need_reconcile`
-    // stays set in that case so `mark_db_available_after_successful_poll_load`
+    // unreachable so we can't probe migration state. The reconcile state
+    // starts pending in that case so `mark_db_available_after_successful_poll_load`
     // runs the same policy after deferred core migrations succeed on recovery.
-    let plugin_migrations_need_reconcile = Arc::new(AtomicBool::new(false));
-    if bootstrap_from_backup {
-        plugin_migrations_need_reconcile.store(true, Ordering::Release);
-    }
+    let plugin_migration_reconcile_state = Arc::new(AtomicU8::new(if bootstrap_from_backup {
+        PLUGIN_MIGRATIONS_NEED_RECONCILE
+    } else {
+        PLUGIN_MIGRATIONS_RECONCILED
+    }));
     if !bootstrap_from_backup {
         crate::modes::handle_startup_plugin_migrations(
             &db,
@@ -1043,7 +1047,6 @@ pub async fn run(
             "database",
         )
         .await?;
-        plugin_migrations_need_reconcile.store(false, Ordering::Release);
     }
 
     // Load initial config from database, falling back to backup file if configured.
@@ -1922,7 +1925,7 @@ pub async fn run(
     let proxy_state_poll = proxy_state.clone();
     let db_available_poll = db_available.clone();
     let config_rejected_poll = config_rejected.clone();
-    let plugin_migrations_need_reconcile_poll = plugin_migrations_need_reconcile.clone();
+    let plugin_migration_reconcile_state_poll = plugin_migration_reconcile_state.clone();
     let auto_apply_plugin_migrations_poll = env_config.auto_apply_plugin_migrations;
     let database_delta_poll_metrics_for_poll = database_delta_poll_metrics.clone();
     let rejected_delta_initial_backoff =
@@ -2007,14 +2010,17 @@ pub async fn run(
                     if force_full_reload {
                         match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
                             Ok((new_config, sequence)) => {
-                                mark_db_available_after_successful_poll_load(
+                                if !mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
                                     "full reload after DB DNS reconnect",
                                     auto_apply_plugin_migrations_poll,
-                                    &plugin_migrations_need_reconcile_poll,
+                                    &plugin_migration_reconcile_state_poll,
                                 )
-                                .await;
+                                .await
+                                {
+                                    continue;
+                                }
                                 let outcome = proxy_state_poll.update_config(new_config);
                                 if commit_full_reload_poll_state(
                                     "after DB DNS reconnect",
@@ -2054,14 +2060,17 @@ pub async fn run(
                             .await
                         {
                             Ok(result) => {
-                                mark_db_available_after_successful_poll_load(
+                                if !mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
                                     "incremental poll",
                                     auto_apply_plugin_migrations_poll,
-                                    &plugin_migrations_need_reconcile_poll,
+                                    &plugin_migration_reconcile_state_poll,
                                 )
-                                .await;
+                                .await
+                                {
+                                    continue;
+                                }
                                 let next_sequence = result.sequence_cursor;
                                 let rejected_delta_identity =
                                     RejectedDeltaIdentity::from_incremental(after_sequence, &result);
@@ -2095,14 +2104,17 @@ pub async fn run(
                                             .await
                                             {
                                                 Ok((new_config, sequence)) => {
-                                                    mark_db_available_after_successful_poll_load(
+                                                    if !mark_db_available_after_successful_poll_load(
                                                         &db_poll,
                                                         &db_available_poll,
                                                         "rejected-delta escalation full reload",
                                                         auto_apply_plugin_migrations_poll,
-                                                        &plugin_migrations_need_reconcile_poll,
+                                                        &plugin_migration_reconcile_state_poll,
                                                     )
-                                                    .await;
+                                                    .await
+                                                    {
+                                                        continue;
+                                                    }
                                                     let outcome =
                                                         proxy_state_poll.update_config(new_config);
                                                     if commit_full_reload_poll_state(
@@ -2155,14 +2167,17 @@ pub async fn run(
                                                                 .await
                                                                 {
                                                                     Ok((new_config, sequence)) => {
-                                                                        mark_db_available_after_successful_poll_load(
+                                                                        if !mark_db_available_after_successful_poll_load(
                                                                             &db_poll,
                                                                             &db_available_poll,
                                                                             "rejected-delta escalation failover reload",
                                                                             auto_apply_plugin_migrations_poll,
-                                                                            &plugin_migrations_need_reconcile_poll,
+                                                                            &plugin_migration_reconcile_state_poll,
                                                                         )
-                                                                        .await;
+                                                                        .await
+                                                                        {
+                                                                            continue;
+                                                                        }
                                                                         let outcome = proxy_state_poll
                                                                             .update_config(new_config);
                                                                         if commit_full_reload_poll_state(
@@ -2239,14 +2254,17 @@ pub async fn run(
                                 match load_full_config_with_sequence(&db_poll, &poll_namespace).await
                                 {
                                     Ok((new_config, sequence)) => {
-                                        mark_db_available_after_successful_poll_load(
+                                        if !mark_db_available_after_successful_poll_load(
                                             &db_poll,
                                             &db_available_poll,
                                             "full fallback reload",
                                             auto_apply_plugin_migrations_poll,
-                                            &plugin_migrations_need_reconcile_poll,
+                                            &plugin_migration_reconcile_state_poll,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            continue;
+                                        }
                                         let outcome = proxy_state_poll.update_config(new_config);
                                         if commit_full_reload_poll_state(
                                             "full fallback",
@@ -2286,14 +2304,17 @@ pub async fn run(
                                                     .await
                                                     {
                                                         Ok((new_config, sequence)) => {
-                                                            mark_db_available_after_successful_poll_load(
+                                                            if !mark_db_available_after_successful_poll_load(
                                                                 &db_poll,
                                                                 &db_available_poll,
                                                                 "failover full reload",
                                                                 auto_apply_plugin_migrations_poll,
-                                                                &plugin_migrations_need_reconcile_poll,
+                                                                &plugin_migration_reconcile_state_poll,
                                                             )
-                                                            .await;
+                                                            .await
+                                                            {
+                                                                continue;
+                                                            }
                                                             let outcome =
                                                                 proxy_state_poll.update_config(new_config);
                                                             if commit_full_reload_poll_state(
@@ -2343,14 +2364,17 @@ pub async fn run(
                     } else {
                         match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
                             Ok((new_config, sequence)) => {
-                                mark_db_available_after_successful_poll_load(
+                                if !mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
                                     "first full reload",
                                     auto_apply_plugin_migrations_poll,
-                                    &plugin_migrations_need_reconcile_poll,
+                                    &plugin_migration_reconcile_state_poll,
                                 )
-                                .await;
+                                .await
+                                {
+                                    continue;
+                                }
                                 let outcome = proxy_state_poll.update_config(new_config);
                                 if commit_full_reload_poll_state(
                                     "initial full poll",
@@ -2523,8 +2547,8 @@ async fn mark_db_available_after_successful_poll_load(
     db_available: &AtomicBool,
     context: &str,
     auto_apply_plugin_migrations: bool,
-    plugin_migrations_need_reconcile: &AtomicBool,
-) {
+    plugin_migration_reconcile_state: &AtomicU8,
+) -> bool {
     // Any load that reaches this point proved the backend is reachable, so
     // re-enable admin writes. Note this does NOT clear `config_rejected`: an
     // accepted incremental poll on top of a validation-rejected full snapshot
@@ -2535,43 +2559,70 @@ async fn mark_db_available_after_successful_poll_load(
     //
     // When offline bootstrap skipped custom-plugin migrations, reconcile the
     // same warn/auto-apply policy here after deferred core migrations succeed
-    // (issue #2630). The reconcile flag ensures one attempt per recovery
-    // generation; transient auto-apply failures keep writes blocked and leave
-    // the flag set so the next successful poll retries.
-    match db.maybe_apply_deferred_migrations().await {
+    // (issue #2630). The three-state CAS admits one reconcile attempt per
+    // recovery generation. Probe/apply failures restore NEED_RECONCILE so the
+    // next successful poll retries; callers must not publish the loaded config
+    // when this helper returns false.
+    if let Err(e) = db.maybe_apply_deferred_migrations().await {
+        warn!(
+            "Deferred migrations failed despite successful {}: {}. \
+             Admin writes remain blocked until schema is applied.",
+            context, e
+        );
+        db_available.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    match plugin_migration_reconcile_state.compare_exchange(
+        PLUGIN_MIGRATIONS_NEED_RECONCILE,
+        PLUGIN_MIGRATIONS_RECONCILING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
         Ok(_) => {
-            if plugin_migrations_need_reconcile.load(Ordering::Acquire) {
-                match crate::modes::handle_startup_plugin_migrations(
-                    db,
-                    auto_apply_plugin_migrations,
-                    "database-recovery",
-                )
-                .await
-                {
-                    Ok(()) => {
-                        plugin_migrations_need_reconcile.store(false, Ordering::Release);
-                        db_available.store(true, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Custom-plugin migration reconciliation failed after {}: {}. \
-                             Admin writes remain blocked until plugin schema is applied.",
-                            context, e
-                        );
-                        db_available.store(false, Ordering::Relaxed);
-                    }
+            match crate::modes::handle_recovery_plugin_migrations(
+                db,
+                auto_apply_plugin_migrations,
+                "database-recovery",
+            )
+            .await
+            {
+                Ok(()) => {
+                    plugin_migration_reconcile_state
+                        .store(PLUGIN_MIGRATIONS_RECONCILED, Ordering::Release);
+                    db_available.store(true, Ordering::Relaxed);
+                    true
                 }
-            } else {
-                db_available.store(true, Ordering::Relaxed);
+                Err(e) => {
+                    plugin_migration_reconcile_state
+                        .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
+                    warn!(
+                        "Custom-plugin migration reconciliation failed after {}: {}. \
+                         Admin writes and recovered config publication remain blocked until \
+                         plugin schema is reconciled.",
+                        context, e
+                    );
+                    db_available.store(false, Ordering::Relaxed);
+                    false
+                }
             }
         }
-        Err(e) => {
+        Err(PLUGIN_MIGRATIONS_RECONCILED) => {
+            db_available.store(true, Ordering::Relaxed);
+            true
+        }
+        Err(PLUGIN_MIGRATIONS_RECONCILING) => {
+            db_available.store(false, Ordering::Relaxed);
+            false
+        }
+        Err(state) => {
             warn!(
-                "Deferred migrations failed despite successful {}: {}. \
-                 Admin writes remain blocked until schema is applied.",
-                context, e
+                "Invalid custom-plugin migration reconcile state {} after {}; \
+                 keeping admin writes and config publication blocked",
+                state, context
             );
             db_available.store(false, Ordering::Relaxed);
+            false
         }
     }
 }
@@ -2605,7 +2656,7 @@ mod tests {
             .expect("availability helper must exist");
         let helper = &source[helper_start..];
         assert!(
-            helper.contains("handle_startup_plugin_migrations"),
+            helper.contains("handle_recovery_plugin_migrations"),
             "recovery path must reconcile custom-plugin migrations"
         );
         assert!(
@@ -2613,12 +2664,135 @@ mod tests {
             "recovery reconcile mode label must identify the recovery path"
         );
         assert!(
-            helper.contains("plugin_migrations_need_reconcile"),
-            "recovery must be gated by a per-generation reconcile flag"
+            helper.contains("compare_exchange(")
+                && helper.contains("PLUGIN_MIGRATIONS_RECONCILING"),
+            "recovery must admit only one reconcile attempt per generation"
         );
         assert!(
-            source.contains("plugin_migrations_need_reconcile.store(true"),
-            "offline bootstrap must set the reconcile flag when custom migrations are skipped"
+            source.contains("if bootstrap_from_backup {")
+                && source.contains("PLUGIN_MIGRATIONS_NEED_RECONCILE"),
+            "offline bootstrap must initialize the reconcile state as pending"
+        );
+        assert!(
+            source.contains("if !mark_db_available_after_successful_poll_load("),
+            "poll paths must not publish a recovered config when reconciliation fails"
+        );
+    }
+
+    fn offline_recovery_test_store() -> (DatabaseStore, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().expect("temporary recovery database");
+        let db_path = temp_dir.path().join("plugin-recovery.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let store = DatabaseStore::connect_offline_with_pool_config(
+            "sqlite",
+            &db_url,
+            &[],
+            DbPoolConfig::default(),
+        )
+        .expect("offline recovery store");
+        (store, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn offline_recovery_warn_only_retries_failed_plugin_probe_before_publication() {
+        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+        if plugin_migrations.is_empty() {
+            // Default production builds deliberately compile no pedagogical
+            // plugins. Hosted CI opts the examples in and exercises this path.
+            return;
+        }
+
+        let (store, _temp_dir) = offline_recovery_test_store();
+        let pool = store.pool();
+        sqlx::query("CREATE TABLE _ferrum_plugin_migrations (broken TEXT)")
+            .execute(&pool)
+            .await
+            .expect("malformed tracking table");
+        let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+        let db_available = AtomicBool::new(true);
+        let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
+
+        assert!(
+            !mark_db_available_after_successful_poll_load(
+                &db,
+                &db_available,
+                "test failed custom-plugin probe",
+                false,
+                &reconcile_state,
+            )
+            .await,
+            "a failed pending-state probe must block recovered config publication"
+        );
+        assert!(!db_available.load(Ordering::Relaxed));
+        assert_eq!(
+            reconcile_state.load(Ordering::Acquire),
+            PLUGIN_MIGRATIONS_NEED_RECONCILE,
+            "failed reconciliation must remain retryable"
+        );
+
+        sqlx::query("DROP TABLE _ferrum_plugin_migrations")
+            .execute(&pool)
+            .await
+            .expect("repair tracking table");
+        assert!(
+            mark_db_available_after_successful_poll_load(
+                &db,
+                &db_available,
+                "test recovered custom-plugin probe",
+                false,
+                &reconcile_state,
+            )
+            .await,
+            "warn-only recovery should publish after the probe succeeds"
+        );
+        assert!(db_available.load(Ordering::Relaxed));
+        assert_eq!(
+            reconcile_state.load(Ordering::Acquire),
+            PLUGIN_MIGRATIONS_RECONCILED
+        );
+        assert!(
+            !db.pending_plugin_migrations(&plugin_migrations)
+                .await
+                .expect("warn-only pending list")
+                .is_empty(),
+            "warn-only recovery must not mutate custom-plugin schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_recovery_auto_apply_finishes_plugin_schema_before_publication() {
+        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+        if plugin_migrations.is_empty() {
+            return;
+        }
+
+        let (store, _temp_dir) = offline_recovery_test_store();
+        let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+        let db_available = AtomicBool::new(false);
+        let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
+
+        assert!(
+            mark_db_available_after_successful_poll_load(
+                &db,
+                &db_available,
+                "test custom-plugin auto-apply",
+                true,
+                &reconcile_state,
+            )
+            .await,
+            "auto-apply recovery should publish only after migrations succeed"
+        );
+        assert!(db_available.load(Ordering::Relaxed));
+        assert_eq!(
+            reconcile_state.load(Ordering::Acquire),
+            PLUGIN_MIGRATIONS_RECONCILED
+        );
+        assert!(
+            db.pending_plugin_migrations(&plugin_migrations)
+                .await
+                .expect("post-apply pending list")
+                .is_empty(),
+            "auto-apply recovery must finish every compiled custom migration"
         );
     }
 

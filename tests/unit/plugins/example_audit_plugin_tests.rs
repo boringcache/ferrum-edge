@@ -14,6 +14,7 @@ use ferrum_edge::plugins::{
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,43 @@ fn create_example_audit_plugin(
     config: &serde_json::Value,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     create_custom_plugin("example_audit_plugin", config, PluginHttpClient::default())
+}
+
+struct ScopedEnv {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnv {
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: callers hold the repository-wide ENV_LOCK while mutating
+        // process-global variables; this guard restores the prior value.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: see `set`; the shared ENV_LOCK excludes sibling mutation.
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => {
+                // SAFETY: restoration occurs before the caller releases ENV_LOCK.
+                unsafe { std::env::set_var(self.key, value) };
+            }
+            None => {
+                // SAFETY: restoration occurs before the caller releases ENV_LOCK.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
 }
 
 #[test]
@@ -101,6 +139,22 @@ fn test_new_rejects_zero_retention_days() {
 }
 
 #[test]
+fn test_new_rejects_excessive_retention_and_conflicting_queue_aliases() {
+    if !example_audit_plugin_registered() {
+        return;
+    }
+
+    let retention_err = new_err(json!({ "retention_days": 36_501 }));
+    assert!(retention_err.contains("retention_days"), "got: {retention_err}");
+
+    let queue_err = new_err(json!({
+        "queue_capacity": 100,
+        "buffer_capacity": 100,
+    }));
+    assert!(queue_err.contains("only one"), "got: {queue_err}");
+}
+
+#[test]
 fn test_new_rejects_unknown_keys_and_legacy_db_url() {
     if !example_audit_plugin_registered() {
         return;
@@ -142,9 +196,15 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
 
     // Without FERRUM_DB_URL, start_background_tasks must fail closed rather
     // than silently claiming a durable sink.
-    let start_err = plugin
-        .start_background_tasks()
-        .expect_err("missing FERRUM_DB_URL must fail");
+    let start_err = {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _db_url = ScopedEnv::remove("FERRUM_DB_URL");
+        plugin
+            .start_background_tasks()
+            .expect_err("missing FERRUM_DB_URL must fail")
+    };
     assert!(start_err.contains("FERRUM_DB_URL"), "got: {start_err}");
 
     // Hooks remain panic-free even when the worker was not started.
@@ -217,13 +277,14 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         .await
         .expect("example migrations");
 
-    // SAFETY: temporary env for this multi-thread test; restored below.
-    let prev_url = std::env::var("FERRUM_DB_URL").ok();
-    let prev_type = std::env::var("FERRUM_DB_TYPE").ok();
-    unsafe {
-        std::env::set_var("FERRUM_DB_URL", &db_url);
-        std::env::set_var("FERRUM_DB_TYPE", "sqlite");
-    }
+    sqlx::query(
+        "INSERT INTO example_audit_log \
+         (id, timestamp, client_ip, protocol, latency_ms) \
+         VALUES ('expired-row', '2000-01-01T00:00:00.000Z', '192.0.2.99', 'http', 1.0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed expired retention row");
 
     let plugin = create_example_audit_plugin(&json!({
         "log_request_headers": true,
@@ -236,9 +297,16 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     }))
     .unwrap()
     .expect("plugin");
-    plugin
-        .start_background_tasks()
-        .expect("worker should start with FERRUM_DB_URL");
+    {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _db_url = ScopedEnv::set("FERRUM_DB_URL", &db_url);
+        let _db_type = ScopedEnv::set("FERRUM_DB_TYPE", "sqlite");
+        plugin
+            .start_background_tasks()
+            .expect("worker should start with FERRUM_DB_URL");
+    }
 
     plugin
         .log(&TransactionSummary {
@@ -250,7 +318,26 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             latency_total_ms: 3.25,
             consumer_username: Some("alice".to_string()),
             proxy_id: Some("proxy-1".to_string()),
-            metadata: HashMap::from([("cookie".to_string(), "session=1".to_string())]),
+            metadata: HashMap::from([
+                ("cookie".to_string(), "session=1".to_string()),
+                ("note".to_string(), "x".repeat(10_000)),
+            ]),
+            ..Default::default()
+        })
+        .await;
+
+    plugin
+        .log(&TransactionSummary {
+            timestamp_received: "2026-07-20T12:00:00.500Z".to_string(),
+            client_ip: "192.0.2.14".to_string(),
+            http_method: "POST".to_string(),
+            request_path: "/example.Audit/Write".to_string(),
+            response_status_code: 200,
+            latency_total_ms: 4.0,
+            metadata: HashMap::from([
+                ("request_protocol".to_string(), "grpc".to_string()),
+                ("grpc_status".to_string(), "13".to_string()),
+            ]),
             ..Default::default()
         })
         .await;
@@ -284,24 +371,37 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     // Allow the batching worker to flush.
     use sqlx::Row;
     let mut saw_http = false;
+    let mut saw_grpc = false;
     let mut saw_stream = false;
+    let mut expired_gone = false;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let rows = sqlx::query(
-            "SELECT protocol, client_ip, http_method, response_status FROM example_audit_log",
+            "SELECT id, protocol, client_ip, http_method, response_status, grpc_status \
+             FROM example_audit_log",
         )
         .fetch_all(&pool)
         .await
         .unwrap_or_default();
+        expired_gone = rows
+            .iter()
+            .all(|row| row.get::<String, _>("id") != "expired-row");
         for row in &rows {
             let protocol: String = row.get("protocol");
             let client_ip: String = row.get("client_ip");
             let method: Option<String> = row.get("http_method");
             let status: Option<i32> = row.try_get("response_status").ok().flatten();
+            let grpc_status: Option<i64> = row.try_get("grpc_status").ok().flatten();
             if protocol == "http" && client_ip == "192.0.2.10" {
                 assert_eq!(method.as_deref(), Some("POST"));
                 assert_eq!(status, Some(201));
                 saw_http = true;
+            }
+            if protocol == "grpc" && client_ip == "192.0.2.14" {
+                assert_eq!(method.as_deref(), Some("POST"));
+                assert_eq!(status, Some(200));
+                assert_eq!(grpc_status, Some(13));
+                saw_grpc = true;
             }
             if protocol == "tcp" && client_ip == "192.0.2.11" {
                 assert!(method.is_none());
@@ -309,22 +409,15 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                 saw_stream = true;
             }
         }
-        if saw_http && saw_stream {
+        if saw_http && saw_grpc && saw_stream && expired_gone {
             break;
         }
     }
 
-    match prev_url {
-        Some(v) => unsafe { std::env::set_var("FERRUM_DB_URL", v) },
-        None => unsafe { std::env::remove_var("FERRUM_DB_URL") },
-    }
-    match prev_type {
-        Some(v) => unsafe { std::env::set_var("FERRUM_DB_TYPE", v) },
-        None => unsafe { std::env::remove_var("FERRUM_DB_TYPE") },
-    }
-
     assert!(saw_http, "expected HTTP audit row");
+    assert!(saw_grpc, "expected gRPC audit row with terminal status");
     assert!(saw_stream, "expected stream audit row");
+    assert!(expired_gone, "retention worker must purge the expired row");
 
     // Redacted context must not contain the raw cookie value.
     let ctx_row = sqlx::query(
@@ -335,6 +428,8 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     .expect("http row context");
     let ctx: Option<String> = ctx_row.get("request_context");
     let ctx = ctx.as_deref().unwrap_or("");
+    assert!(ctx.len() <= 4096, "context must stay byte-bounded");
+    serde_json::from_str::<serde_json::Value>(ctx).expect("context must remain valid JSON");
     assert!(
         !ctx.contains("session=1"),
         "secret cookie must be redacted: {ctx}"
@@ -343,4 +438,62 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         ctx.contains("[REDACTED]") || ctx.contains("metadata"),
         "expected redacted metadata snapshot: {ctx}"
     );
+
+    // The documented OptionalFailOpen contract drops a failed batch and keeps
+    // the worker alive for later records. Make the table briefly unavailable,
+    // then restore it and prove a subsequent record persists.
+    sqlx::query("ALTER TABLE example_audit_log RENAME TO example_audit_log_unavailable")
+        .execute(&pool)
+        .await
+        .expect("make audit table unavailable");
+    plugin
+        .log(&TransactionSummary {
+            timestamp_received: "2026-07-20T12:00:02.000Z".to_string(),
+            client_ip: "192.0.2.12".to_string(),
+            http_method: "GET".to_string(),
+            request_path: "/dropped-during-outage".to_string(),
+            response_status_code: 200,
+            latency_total_ms: 1.0,
+            ..Default::default()
+        })
+        .await;
+    // Leave enough wall time for both immediate attempts even on a loaded
+    // hosted runner before restoring the table.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    sqlx::query("ALTER TABLE example_audit_log_unavailable RENAME TO example_audit_log")
+        .execute(&pool)
+        .await
+        .expect("restore audit table");
+    plugin
+        .log(&TransactionSummary {
+            timestamp_received: "2026-07-20T12:00:03.000Z".to_string(),
+            client_ip: "192.0.2.13".to_string(),
+            http_method: "GET".to_string(),
+            request_path: "/after-recovery".to_string(),
+            response_status_code: 200,
+            latency_total_ms: 1.0,
+            ..Default::default()
+        })
+        .await;
+
+    let mut recovered = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let paths: Vec<String> = sqlx::query("SELECT request_path FROM example_audit_log")
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.try_get("request_path").ok())
+            .collect();
+        assert!(
+            !paths.iter().any(|path| path == "/dropped-during-outage"),
+            "failed batch must not appear after its retry budget is exhausted"
+        );
+        if paths.iter().any(|path| path == "/after-recovery") {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(recovered, "batching worker must persist after storage recovery");
 }

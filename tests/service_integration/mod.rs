@@ -1,6 +1,6 @@
 //! Functional integration tests for Ferrum's external-middleware integrations
 //! that can only be validated against the REAL third-party software — a
-//! service registry and a directory server — imitated locally with free OSS
+//! service registry, directory server, and SQL database — imitated locally with free OSS
 //! containers (`testcontainers`/Docker). No managed or cloud service is ever
 //! used.
 //!
@@ -16,10 +16,13 @@
 //!     direct bind, search-then-bind, and group-membership — the `ldap3`
 //!     bind/search paths that the existing functional test (unreachable
 //!     server) never reaches.
+//!   - **mysql** — MySQL 8.4. Exercises custom-plugin migration recovery
+//!     across implicit-commit DDL boundaries and the example audit schema's
+//!     SQLx Any text bindings.
 //!
 //! Container-backed tests self-skip (with a printed notice) when Docker is
 //! unavailable, so the suite is safe to run locally without Docker. In CI the
-//! `test-service-integration` job runs both backends with `--no-fail-fast` on a
+//! `test-service-integration` job runs all backends with `--no-fail-fast` on a
 //! Docker-enabled runner where a
 //! container that fails to start is a HARD failure (see
 //! `common::containers::fail_in_ci_else_skip`).
@@ -27,8 +30,10 @@
 //! Run per backend (see also the consolidated CI job):
 //!   cargo test --test service_integration consul
 //!   cargo test --test service_integration ldap
+//!   cargo test --test service_integration mysql
 
 mod common;
 
 mod consul;
 mod ldap;
+mod mysql;
