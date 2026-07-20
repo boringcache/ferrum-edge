@@ -1,6 +1,12 @@
-use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, create_plugin, priority};
+use ferrum_edge::config::file_loader::load_config_from_file;
+use ferrum_edge::plugins::grpc_web::{GRPC_WEB_CONFIG_KEYS, GrpcWebPlugin};
+use ferrum_edge::plugins::{
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginFailurePolicy, PluginResult, create_plugin,
+    plugin_failure_policy, priority, validate_plugin_config,
+};
 use serde_json::json;
 use std::collections::HashMap;
+use tempfile::TempDir;
 
 use super::plugin_utils::create_test_context;
 
@@ -60,6 +66,139 @@ fn test_invalid_expose_headers_rejected() {
             .expect("invalid expose_headers config must be rejected");
         assert!(err.contains("expose_headers"), "got: {err}");
     }
+}
+
+#[test]
+fn test_config_must_be_an_object_for_every_json_value_class() {
+    // Explicit null is rejected (not an alias for {}). Build-out policy prefers
+    // a strict object contract over silent defaulting.
+    for config in [
+        json!(null),
+        json!([]),
+        json!("expose_headers: [x-request-id]"),
+        json!(42),
+        json!(3.14),
+        json!(true),
+        json!(false),
+    ] {
+        let err = GrpcWebPlugin::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("non-object must be rejected: {config}"));
+        assert_eq!(err, "grpc_web: config must be an object", "got: {err}");
+        let shared = validate_plugin_config("grpc_web", &config)
+            .expect_err("shared admission must reject the same non-object");
+        assert_eq!(shared, "grpc_web: config must be an object");
+    }
+}
+
+#[test]
+fn test_valid_empty_and_full_objects_are_accepted() {
+    GrpcWebPlugin::new(&json!({}))
+        .expect("empty object must preserve default expose list");
+    GrpcWebPlugin::new(&json!({
+        "expose_headers": ["custom-header-bin", "x-request-id"]
+    }))
+    .expect("full object must be accepted");
+    validate_plugin_config("grpc_web", &json!({})).expect("shared admission accepts {}");
+    validate_plugin_config(
+        "grpc_web",
+        &json!({"expose_headers": ["x-request-id"]}),
+    )
+    .expect("shared admission accepts a full object");
+    assert_eq!(
+        plugin_failure_policy("grpc_web"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+}
+
+#[test]
+fn test_unknown_keys_rejected_with_path_qualified_suggestions() {
+    let err = GrpcWebPlugin::new(&json!({"expose_header": ["x-request-id"]}))
+        .err()
+        .expect("singular/plural typo must be rejected");
+    assert_eq!(
+        err,
+        "grpc_web: unknown configuration key(s): 'config.expose_header' (did you mean 'expose_headers'?)"
+    );
+
+    let err = GrpcWebPlugin::new(&json!({
+        "z_unknown": true,
+        "expose_headers": ["x-request-id"],
+        "a_unknown": false,
+        "expose_headerz": []
+    }))
+    .err()
+    .expect("multiple unknown keys must be rejected deterministically");
+    assert_eq!(
+        err,
+        "grpc_web: unknown configuration key(s): 'config.a_unknown', 'config.expose_headerz' (did you mean 'expose_headers'?), 'config.z_unknown'"
+    );
+    assert_eq!(GRPC_WEB_CONFIG_KEYS, &["expose_headers"]);
+}
+
+#[test]
+fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
+    let typo = json!({"expose_header": ["x-request-id"]});
+    let shared = validate_plugin_config("grpc_web", &typo)
+        .expect_err("shared validate_plugin_config must reject typos");
+    assert!(shared.contains("config.expose_header"), "got: {shared}");
+    assert!(shared.contains("did you mean 'expose_headers'"), "got: {shared}");
+
+    let now = chrono::Utc::now();
+    let plugin_config = ferrum_edge::config::types::PluginConfig {
+        id: "grpc-web-admin".to_string(),
+        plugin_name: "grpc_web".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: typo.clone(),
+        scope: ferrum_edge::config::types::PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let admin = ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+        .expect_err("admin validation must reject unknown keys");
+    assert!(admin.contains("config.expose_header"), "got: {admin}");
+
+    let directory = TempDir::new().unwrap();
+    let config_path = directory.path().join("grpc-web-bad.json");
+    let file_config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "grpc",
+            "listen_path": "/",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000
+        }],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "grpc-web",
+            "plugin_name": "grpc_web",
+            "config": typo,
+            "scope": "global",
+            "enabled": true
+        }]
+    });
+    std::fs::write(&config_path, serde_json::to_vec(&file_config).unwrap()).unwrap();
+    let file_err = load_config_from_file(
+        config_path.to_str().expect("utf-8 temp path"),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file mode must reject unknown grpc_web keys");
+    assert!(
+        file_err.to_string().contains("config.expose_header"),
+        "got: {file_err}"
+    );
+
+    // Database / CP / DP snapshot admission all call validate_plugin_config
+    // through the shared constructor — pin that surface for non-object null too.
+    let null_err = validate_plugin_config("grpc_web", &json!(null))
+        .expect_err("CP-DP/database snapshot admission must reject null");
+    assert_eq!(null_err, "grpc_web: config must be an object");
 }
 
 // ── on_request_received — detection and header rewriting ──

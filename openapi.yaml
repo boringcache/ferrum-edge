@@ -17004,10 +17004,13 @@ components:
 
     GrpcWebConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_web — Translates between gRPC-Web (browser-compatible)
         and native gRPC (HTTP/2) wire formats. Supports binary
         (application/grpc-web) and text (application/grpc-web-text) encoding.
+        Config must be a JSON object (not null); `{}` and objects that only set
+        `expose_headers` are accepted. Unknown keys are rejected.
       properties:
         expose_headers:
           type: array

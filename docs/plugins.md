@@ -3383,6 +3383,8 @@ On the request path, the plugin rewrites `content-type` to `application/grpc` so
 |---|---|---|---|
 | `expose_headers` | String[] | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. |
 
+Config must be a JSON/YAML object whose only accepted key is `expose_headers`. Empty `{}` is valid and uses defaults. Explicit top-level `null`, arrays, strings, numbers, and booleans are rejected with `grpc_web: config must be an object` — `null` is not an alias for `{}`. Unknown or misspelled keys (for example `expose_header`) are rejected with path-qualified diagnostics and spelling suggestions. The shared constructor enforces this for admin API, file mode, database/CP validation, and DP snapshot application; a rejected reload keeps the last-known-good plugin generation (`KeepLastKnownGood`).
+
 ```yaml
 plugin_name: grpc_web
 config:
