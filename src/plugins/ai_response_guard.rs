@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
-use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
     SseReassembler, SseTextKind, is_text_event_stream_media_type,
@@ -1498,7 +1498,7 @@ impl Plugin for AiResponseGuard {
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        let is_sse = is_event_stream_content_type(content_type);
+        let is_sse = is_text_event_stream_media_type(content_type);
         let is_json = is_json_content_type(content_type);
 
         if body.is_empty() {
@@ -1767,7 +1767,7 @@ impl Plugin for AiResponseGuard {
         }
 
         if let Some(ct) = content_type {
-            if is_event_stream_content_type(ct) {
+            if is_text_event_stream_media_type(ct) {
                 let redacted = self.redact_sse_body(body)?;
                 return (!self.sse_body_has_residual(&redacted)).then_some(redacted);
             }

@@ -1487,6 +1487,19 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
     // asks for SSE; only the pristine response representation may release it.
     assert!(plugin.should_buffer_response_body(&ctx));
     let headers = HashMap::new();
+    let sse_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &sse_headers));
+    assert!(plugin.should_release_response_body_before_content_type_rewrite(
+        &ctx,
+        200,
+        &sse_headers,
+    ));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &headers));
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &headers)
+    );
 
     // Allowlisted content-types stay buffered (they will be scanned).
     assert!(plugin.should_buffer_response_body_for_content_type(

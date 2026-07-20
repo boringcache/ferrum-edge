@@ -758,6 +758,33 @@ fn test_requires_response_body_buffering() {
         "content-type".to_string(),
         "text/event-stream; charset=utf-8".to_string(),
     )]);
+    assert!(plugin.may_release_response_body_under_retries(&sse_accept));
+    assert!(
+        plugin.should_release_response_body_under_retries(&sse_accept, 200, &sse_headers)
+    );
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(
+            &sse_accept,
+            200,
+            &sse_headers,
+        )
+    );
+    let json_profile_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/json; profile=event-stream".to_string(),
+    )]);
+    assert!(!plugin.should_release_response_body_under_retries(
+        &sse_accept,
+        200,
+        &json_profile_headers,
+    ));
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(
+            &sse_accept,
+            200,
+            &json_profile_headers,
+        )
+    );
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &sse_accept,
         Some("text/event-stream; charset=utf-8"),
@@ -805,6 +832,56 @@ async fn test_event_stream_fails_closed_before_ai_guard_delivery() {
             .map(String::as_str),
         Some("streaming_response_requires_bounded_inspection")
     );
+}
+
+#[tokio::test]
+async fn test_json_event_stream_profile_stays_on_json_guard_path() {
+    let headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/json; profile=event-stream".to_string(),
+    )]);
+    let body = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "alice@example.com"}}]
+    }))
+    .unwrap();
+
+    let reject = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "reject"
+    }));
+    let mut reject_ctx = ctx_with_content_type("GET", "application/json");
+    assert!(matches!(
+        reject
+            .on_response_body(&mut reject_ctx, 200, &headers, &body)
+            .await,
+        PluginResult::Reject {
+            status_code: 502,
+            ..
+        }
+    ));
+
+    let redact = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let mut redact_ctx = ctx_with_content_type("GET", "application/json");
+    assert!(matches!(
+        redact
+            .on_response_body(&mut redact_ctx, 200, &headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let transformed = redact
+        .transform_response_body(
+            &body,
+            Some("application/json; profile=event-stream"),
+            &headers,
+        )
+        .await
+        .expect("profile parameter must not bypass JSON redaction");
+    let transformed = String::from_utf8(transformed).unwrap();
+    assert!(!transformed.contains("alice@example.com"));
+    assert!(transformed.contains("[REDACTED:pii:email]"));
 }
 
 #[tokio::test]
