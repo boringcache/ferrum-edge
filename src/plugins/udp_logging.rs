@@ -262,8 +262,9 @@ pub(crate) fn materialize_dtls_material(
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<CachedDtlsMaterial, String> {
     let certificate = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        crate::dtls::load_dtls_certificate(cert_path, key_path)
-            .map_err(|error| format!("udp_logging: DTLS cert/key materialization failed: {error}"))?
+        crate::dtls::load_dtls_certificate(cert_path, key_path).map_err(|error| {
+            format!("udp_logging: DTLS cert/key materialization failed: {error}")
+        })?
     } else {
         crate::dtls::generate_ephemeral_cert_public()
             .map_err(|error| format!("udp_logging: DTLS ephemeral cert failed: {error}"))?

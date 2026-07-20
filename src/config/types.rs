@@ -9087,8 +9087,7 @@ impl GatewayConfig {
             }
             if pc.plugin_name == "udp_logging"
                 && let Some(config) = pc.config.as_object()
-                && let Err(e) =
-                    crate::plugins::udp_logging::validate_dtls_file_dependencies(config)
+                && let Err(e) = crate::plugins::udp_logging::validate_dtls_file_dependencies(config)
             {
                 // Deduplicate by plugin id + error text so identical multi-
                 // instance configs still report once per PluginConfig row.

@@ -494,8 +494,8 @@ impl DtlsConnection {
                         Output::ApplicationData(data) => {
                             if driver_app_tx.send(data.to_vec()).await.is_err() {
                                 if let Some(completion) = pending_completion.take() {
-                                    let _ = completion
-                                        .send(Err("DTLS connection closed".to_string()));
+                                    let _ =
+                                        completion.send(Err("DTLS connection closed".to_string()));
                                 }
                                 fail_pending_app_sends(&mut driver_app_rx).await;
                                 return;

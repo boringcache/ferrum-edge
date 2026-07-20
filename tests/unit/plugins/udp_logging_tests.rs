@@ -29,7 +29,9 @@ fn ensure_crypto_provider() {
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 }
 
-fn mint_cert_key_pair(alg: &rcgen::SignatureAlgorithm) -> (tempfile::NamedTempFile, tempfile::NamedTempFile) {
+fn mint_cert_key_pair(
+    alg: &rcgen::SignatureAlgorithm,
+) -> (tempfile::NamedTempFile, tempfile::NamedTempFile) {
     let key_pair = KeyPair::generate_for(alg).expect("key");
     let mut params = CertificateParams::new(vec!["udp-logging-test".to_string()]).expect("params");
     let mut dn = DistinguishedName::new();
@@ -733,7 +735,9 @@ fn test_udp_logging_file_dependency_phase_reports_bad_dtls_material() {
     };
     let errors = config.validate_plugin_file_dependencies();
     assert!(
-        errors.iter().any(|e| e.contains("udp-deps") && e.contains("DTLS")),
+        errors
+            .iter()
+            .any(|e| e.contains("udp-deps") && e.contains("DTLS")),
         "file-dependency phase must surface DTLS material errors: {errors:?}"
     );
 
@@ -903,12 +907,12 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         .await
         .err()
         .expect("oversized plaintext must fail");
-    assert!(
-        err.to_string().contains("max_plaintext"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("max_plaintext"), "got: {err}");
 
-    client.send(b"ok").await.expect("in-limit send must succeed");
+    client
+        .send(b"ok")
+        .await
+        .expect("in-limit send must succeed");
 }
 
 #[test]
