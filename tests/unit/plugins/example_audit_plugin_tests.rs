@@ -142,10 +142,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
     let start_err = plugin
         .start_background_tasks()
         .expect_err("missing FERRUM_DB_URL must fail");
-    assert!(
-        start_err.contains("FERRUM_DB_URL"),
-        "got: {start_err}"
-    );
+    assert!(start_err.contains("FERRUM_DB_URL"), "got: {start_err}");
 
     // Hooks remain panic-free even when the worker was not started.
     let http = TransactionSummary {

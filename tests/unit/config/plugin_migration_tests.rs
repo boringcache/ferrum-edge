@@ -1121,7 +1121,10 @@ fn example_audit_plugin_mysql_overrides_omit_if_not_exists_on_indexes() {
 #[tokio::test]
 async fn example_audit_plugin_migrations_apply_idempotently_on_sqlite() {
     let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
-    if !migrations.iter().any(|(name, _)| *name == "example_audit_plugin") {
+    if !migrations
+        .iter()
+        .any(|(name, _)| *name == "example_audit_plugin")
+    {
         return;
     }
 
@@ -1196,12 +1199,10 @@ async fn example_audit_mysql_partial_ddl_recovers_on_retry() {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(
-        "CREATE INDEX idx_example_audit_log_timestamp ON example_audit_log (timestamp)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("CREATE INDEX idx_example_audit_log_timestamp ON example_audit_log (timestamp)")
+        .execute(&pool)
+        .await
+        .unwrap();
     // Also pre-create the second index so a naive non-tolerant runner would fail.
     sqlx::query("CREATE INDEX idx_example_audit_log_client_ip ON example_audit_log (client_ip)")
         .execute(&pool)
