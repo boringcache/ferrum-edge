@@ -224,7 +224,10 @@ fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
         ("max_entry_size_bytes", "max_entry_size_byte"),
         ("max_total_size_bytes", "max_total_size_byte"),
         ("add_cache_status_header", "add_cache_status_heade"),
-        ("invalidate_on_unsafe_methods", "invalidate_on_unsafe_method"),
+        (
+            "invalidate_on_unsafe_methods",
+            "invalidate_on_unsafe_method",
+        ),
     ];
     assert_eq!(
         typos.len(),
@@ -317,11 +320,20 @@ fn test_recognized_field_null_and_type_behavior_is_preserved() {
         (json!({"ttl_seconds": true}), "ttl_seconds"),
         (json!({"max_entries": 0}), "max_entries"),
         (json!({"max_entry_size_bytes": -1}), "max_entry_size_bytes"),
-        (json!({"respect_cache_control": "true"}), "respect_cache_control"),
+        (
+            json!({"respect_cache_control": "true"}),
+            "respect_cache_control",
+        ),
         (json!({"cacheable_methods": null}), "cacheable_methods"),
         (json!({"cacheable_methods": []}), "cacheable_methods"),
-        (json!({"cacheable_status_codes": null}), "cacheable_status_codes"),
-        (json!({"cacheable_status_codes": [700]}), "cacheable_status_codes"),
+        (
+            json!({"cacheable_status_codes": null}),
+            "cacheable_status_codes",
+        ),
+        (
+            json!({"cacheable_status_codes": [700]}),
+            "cacheable_status_codes",
+        ),
         (json!({"vary_by_headers": null}), "vary_by_headers"),
     ] {
         let err = ResponseCaching::new(&config)

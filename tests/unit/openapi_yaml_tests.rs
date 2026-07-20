@@ -5419,8 +5419,9 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         assert_component_validity(&spec, "ResponseCachingConfig", &valid, true);
         ResponseCaching::new(&valid)
             .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
-        validate_plugin_config("response_caching", &valid)
-            .unwrap_or_else(|error| panic!("shared admission rejected schema-valid {valid}: {error}"));
+        validate_plugin_config("response_caching", &valid).unwrap_or_else(|error| {
+            panic!("shared admission rejected schema-valid {valid}: {error}")
+        });
     }
 
     for invalid in [
