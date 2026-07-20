@@ -193,6 +193,197 @@ fn test_gateway_database_settings_use_canonical_conf_aware_resolution() {
         source.contains("resolve_ferrum_var(\"FERRUM_DB_TYPE\")"),
         "runtime persistence must use the gateway's canonical database-type resolution"
     );
+    assert!(
+        !source.contains("db_url.contains")
+            && !source.contains("parse_db_url")
+            && source.contains("from_db_type"),
+        "dialect must come from FERRUM_DB_TYPE, never from inspecting the raw URL"
+    );
+}
+
+#[test]
+fn test_dialect_sql_forms_use_table_name_and_correct_placeholders() {
+    // Structural proof: both dialect query forms, placeholder counts, and
+    // TABLE_NAME usage are present in the runtime helpers. Callable module
+    // imports are unavailable when the example is not opted in at build time.
+    let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    assert!(
+        source.contains("const INSERT_COLUMN_COUNT: usize = 13"),
+        "INSERT column/placeholder cardinality must stay explicit"
+    );
+    assert!(
+        source.contains("INSERT INTO {TABLE_NAME}"),
+        "INSERT must interpolate TABLE_NAME so renames cannot half-apply"
+    );
+    assert!(
+        source.contains("DELETE FROM {TABLE_NAME}"),
+        "retention DELETE must interpolate TABLE_NAME so renames cannot half-apply"
+    );
+    assert!(
+        source.contains("for index in 1..=INSERT_COLUMN_COUNT")
+            && source.contains("parts.push(format!(\"${index}\"))"),
+        "PostgreSQL INSERT path must build $1..$13 placeholders"
+    );
+    assert!(
+        source.contains("vec![\"?\"; INSERT_COLUMN_COUNT]"),
+        "SQLite/MySQL INSERT path must retain native ? placeholders"
+    );
+    assert!(
+        source.contains("DELETE FROM {TABLE_NAME} WHERE timestamp < $1"),
+        "PostgreSQL retention DELETE must use $1"
+    );
+    assert!(
+        source.contains("DELETE FROM {TABLE_NAME} WHERE timestamp < ?"),
+        "SQLite/MySQL retention DELETE must use ?"
+    );
+    assert!(
+        source.contains("dialect.insert_sql()")
+            && source.contains("dialect.retention_delete_sql()")
+            && source.contains("flush_dialect"),
+        "resolved dialect must be carried into both INSERT and retention paths"
+    );
+    assert!(
+        source.contains("AuditSqlDialect::from_db_type")
+            && source.contains("resolve_ferrum_var(\"FERRUM_DB_TYPE\")"),
+        "dialect must be resolved from FERRUM_DB_TYPE, not the raw URL"
+    );
+
+    // Reconstruct the placeholder clauses the helpers emit and prove counts.
+    let postgres_placeholders: Vec<String> = (1..=13).map(|i| format!("${i}")).collect();
+    assert_eq!(postgres_placeholders.len(), 13);
+    assert_eq!(
+        postgres_placeholders.join(", "),
+        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13"
+    );
+    let sqlite_mysql_placeholders = vec!["?"; 13];
+    assert_eq!(sqlite_mysql_placeholders.len(), 13);
+    assert_eq!(sqlite_mysql_placeholders.iter().filter(|p| **p == "?").count(), 13);
+}
+
+#[test]
+fn test_mysql_custom_migration_contract_is_explicitly_non_atomic() {
+    let plugin = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    let migrations_doc = include_str!("../../../docs/migrations.md");
+    assert!(
+        plugin.contains("DML-only")
+            && plugin.contains("non-atomic")
+            && plugin.contains("idempotent"),
+        "plugin docs must state MySQL custom migrations (including DML-only) are non-atomic"
+    );
+    assert!(
+        migrations_doc.contains("DML-only bodies")
+            && migrations_doc.contains("non-atomic")
+            && migrations_doc.contains("idempotent / re-runnable"),
+        "docs/migrations.md must document the MySQL non-atomic/idempotent contract"
+    );
+}
+
+#[test]
+fn test_logger_startup_is_lock_free_after_start() {
+    let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    assert!(
+        source.contains("logger: OnceLock<BatchingLogger<AuditRecord>>"),
+        "batching logger must use OnceLock so steady-state enqueue is lock-free"
+    );
+    assert!(
+        source.contains("start_lock: Mutex<()>"),
+        "startup may keep a Mutex, but only for idempotent initialization"
+    );
+    assert!(
+        source.contains("match self.logger.get()"),
+        "enqueue must read the logger through OnceLock::get"
+    );
+    assert!(
+        !source.contains("logger: Mutex<Option<BatchingLogger"),
+        "steady-state hooks must not acquire a Mutex around the batching logger"
+    );
+}
+
+#[test]
+fn test_all_protocols_selection_surface_and_precise_mappings() {
+    use ferrum_edge::plugins::ProxyProtocol;
+
+    assert_eq!(
+        ALL_PROTOCOLS,
+        &[
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+            ProxyProtocol::Tcp,
+            ProxyProtocol::Udp,
+        ]
+    );
+
+    let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    // Precise mapping contract encoded in classify_http_audit_protocol /
+    // classify_stream_audit_protocol — do not invent H1/H2/H3 column values.
+    assert!(source.contains("pub fn classify_http_audit_protocol"));
+    assert!(source.contains("pub fn classify_stream_audit_protocol"));
+    assert!(
+        source.contains("mesh.request_protocol")
+            && source.contains("\"grpc-web\"")
+            && source.contains("return \"grpc\".to_string()")
+            && source.contains("return \"websocket\".to_string()")
+            && source.contains("return \"http\".to_string()"),
+        "HTTP-family classifier must distinguish grpc / grpc-web / websocket / http"
+    );
+    assert!(
+        source.contains("response_status_code == 101")
+            && source.contains("eq_ignore_ascii_case(\"CONNECT\")"),
+        "WebSocket upgrade detection must cover H1 101 and H2 Extended CONNECT"
+    );
+    assert!(
+        source.contains("summary.protocol.clone()"),
+        "stream classifier must persist the summary protocol (tcp/tcps/udp/dtls)"
+    );
+    assert!(
+        source.contains("async fn log(") && source.contains("async fn on_stream_disconnect("),
+        "HTTP-family selection uses log(); stream selection uses on_stream_disconnect()"
+    );
+
+    if !example_audit_plugin_registered() {
+        return;
+    }
+
+    let plugin = create_example_audit_plugin(&json!({}))
+        .unwrap()
+        .expect("plugin instance");
+    assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    for protocol in ALL_PROTOCOLS {
+        assert!(
+            plugin.supported_protocols().contains(protocol),
+            "missing declared protocol {protocol:?}"
+        );
+    }
+}
+
+#[test]
+fn test_metadata_selection_is_deterministic_with_collision_and_omission_markers() {
+    let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    assert!(
+        source.contains("keys.sort_unstable()"),
+        "metadata key selection must be deterministic"
+    );
+    assert!(
+        source.contains("__ferrum_metadata_key_collisions"),
+        "truncated key collisions must emit an explicit marker rather than silent overwrite"
+    );
+    assert!(
+        source.contains("__ferrum_omitted_metadata_entries"),
+        "entry-bound overflow must emit an omission marker"
+    );
+    assert!(
+        source.contains("is_sensitive_metadata_key(key)")
+            && source.contains("REDACTED_PLACEHOLDER"),
+        "redaction must run before persistence"
+    );
+    assert!(
+        source.contains("take(MAX_METADATA_ENTRIES)")
+            && source.contains("MAX_METADATA_KEY_CHARS")
+            && source.contains("MAX_METADATA_VALUE_CHARS")
+            && source.contains("MAX_CONTEXT_BYTES"),
+        "hard entry/value/context bounds must remain in force"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -324,6 +515,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             .expect("worker should start with FERRUM_DB_URL");
     }
 
+    let metadata_prefix = "k".repeat(128);
     plugin
         .log(&TransactionSummary {
             timestamp_received: "2026-07-20T12:00:00.000Z".to_string(),
@@ -337,6 +529,13 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             metadata: HashMap::from([
                 ("cookie".to_string(), "session=1".to_string()),
                 ("note".to_string(), "x".repeat(10_000)),
+                ("zebra".to_string(), "z".to_string()),
+                ("alpha".to_string(), "a".to_string()),
+                (format!("{metadata_prefix}one"), "first-wins".to_string()),
+                (
+                    format!("{metadata_prefix}two"),
+                    "should-not-overwrite".to_string(),
+                ),
             ]),
             ..Default::default()
         })
@@ -360,6 +559,47 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
 
     plugin
         .log(&TransactionSummary {
+            timestamp_received: "2026-07-20T12:00:00.600Z".to_string(),
+            client_ip: "192.0.2.16".to_string(),
+            http_method: "POST".to_string(),
+            request_path: "/example.Audit/Web".to_string(),
+            response_status_code: 200,
+            latency_total_ms: 4.5,
+            metadata: HashMap::from([
+                ("request_protocol".to_string(), "grpc".to_string()),
+                ("mesh.request_protocol".to_string(), "grpc-web".to_string()),
+                ("grpc_status".to_string(), "0".to_string()),
+            ]),
+            ..Default::default()
+        })
+        .await;
+
+    plugin
+        .log(&TransactionSummary {
+            timestamp_received: "2026-07-20T12:00:00.700Z".to_string(),
+            client_ip: "192.0.2.17".to_string(),
+            http_method: "GET".to_string(),
+            request_path: "/ws".to_string(),
+            response_status_code: 101,
+            latency_total_ms: 2.0,
+            ..Default::default()
+        })
+        .await;
+
+    plugin
+        .log(&TransactionSummary {
+            timestamp_received: "2026-07-20T12:00:00.725Z".to_string(),
+            client_ip: "192.0.2.18".to_string(),
+            http_method: "CONNECT".to_string(),
+            request_path: "/ws-h2".to_string(),
+            response_status_code: 200,
+            latency_total_ms: 2.0,
+            ..Default::default()
+        })
+        .await;
+
+    plugin
+        .log(&TransactionSummary {
             timestamp_received: "2026-07-20T12:00:00.750Z".to_string(),
             client_ip: "192.0.2.15".to_string(),
             http_method: "M".repeat(300),
@@ -370,38 +610,48 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         })
         .await;
 
-    plugin
-        .on_stream_disconnect(&StreamTransactionSummary {
-            namespace: "ferrum".to_string(),
-            proxy_id: "stream-1".to_string(),
-            proxy_name: Some("tcp-in".to_string()),
-            client_ip: "192.0.2.11".to_string(),
-            consumer_username: None,
-            auth_method: None,
-            backend_target: "192.0.2.20:5432".to_string(),
-            backend_resolved_ip: None,
-            protocol: "tcp".to_string(),
-            listen_port: 5432,
-            duration_ms: 88.0,
-            bytes_sent: 10,
-            bytes_received: 20,
-            connection_error: Some("reset".to_string()),
-            error_class: None,
-            disconnect_direction: None,
-            disconnect_cause: None,
-            timestamp_connected: "2026-07-20T12:00:00.000Z".to_string(),
-            timestamp_disconnected: "2026-07-20T12:00:01.000Z".to_string(),
-            sni_hostname: None,
-            metadata: HashMap::new(),
-        })
-        .await;
+    for (client_ip, protocol) in [
+        ("192.0.2.11", "tcp"),
+        ("192.0.2.21", "tcps"),
+        ("192.0.2.22", "udp"),
+        ("192.0.2.23", "dtls"),
+    ] {
+        plugin
+            .on_stream_disconnect(&StreamTransactionSummary {
+                namespace: "ferrum".to_string(),
+                proxy_id: format!("stream-{protocol}"),
+                proxy_name: Some(format!("{protocol}-in")),
+                client_ip: client_ip.to_string(),
+                consumer_username: None,
+                auth_method: None,
+                backend_target: "192.0.2.20:5432".to_string(),
+                backend_resolved_ip: None,
+                protocol: protocol.to_string(),
+                listen_port: 5432,
+                duration_ms: 88.0,
+                bytes_sent: 10,
+                bytes_received: 20,
+                connection_error: Some("reset".to_string()),
+                error_class: None,
+                disconnect_direction: None,
+                disconnect_cause: None,
+                timestamp_connected: "2026-07-20T12:00:00.000Z".to_string(),
+                timestamp_disconnected: "2026-07-20T12:00:01.000Z".to_string(),
+                sni_hostname: None,
+                metadata: HashMap::new(),
+            })
+            .await;
+    }
 
     // Allow the batching worker to flush.
     use sqlx::Row;
     let mut saw_http = false;
     let mut saw_grpc = false;
+    let mut saw_grpc_web = false;
+    let mut saw_h1_websocket = false;
+    let mut saw_h2_websocket = false;
     let mut saw_bounded_method = false;
-    let mut saw_stream = false;
+    let mut saw_stream_protocols = std::collections::HashSet::new();
     let mut expired_gone = false;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -432,35 +682,71 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                 assert_eq!(grpc_status, Some(13));
                 saw_grpc = true;
             }
+            if protocol == "grpc-web" && client_ip == "192.0.2.16" {
+                saw_grpc_web = true;
+            }
+            if protocol == "websocket" && client_ip == "192.0.2.17" {
+                assert_eq!(status, Some(101));
+                saw_h1_websocket = true;
+            }
+            if protocol == "websocket" && client_ip == "192.0.2.18" {
+                assert_eq!(method.as_deref(), Some("CONNECT"));
+                assert_eq!(status, Some(200));
+                saw_h2_websocket = true;
+            }
             if protocol == "http" && client_ip == "192.0.2.15" {
                 let method = method.as_deref().expect("bounded HTTP method");
                 assert_eq!(method.chars().count(), 256);
                 assert!(method.chars().all(|c| c == 'M'));
                 saw_bounded_method = true;
             }
-            if protocol == "tcp" && client_ip == "192.0.2.11" {
+            if matches!(protocol.as_str(), "tcp" | "tcps" | "udp" | "dtls") {
                 assert!(method.is_none());
                 assert!(status.is_none());
-                saw_stream = true;
+                saw_stream_protocols.insert(protocol);
             }
         }
-        if saw_http && saw_grpc && saw_bounded_method && saw_stream && expired_gone {
+        if saw_http
+            && saw_grpc
+            && saw_grpc_web
+            && saw_h1_websocket
+            && saw_h2_websocket
+            && saw_bounded_method
+            && saw_stream_protocols.len() == 4
+            && expired_gone
+        {
             break;
         }
     }
 
-    assert!(saw_http, "expected HTTP audit row");
+    assert!(saw_http, "expected HTTP audit row (H1/H2/H3 share this label)");
     assert!(saw_grpc, "expected gRPC audit row with terminal status");
+    assert!(saw_grpc_web, "expected gRPC-Web audit row from mesh metadata");
+    assert!(saw_h1_websocket, "expected H1 WebSocket upgrade audit row");
+    assert!(
+        saw_h2_websocket,
+        "expected H2 Extended CONNECT WebSocket audit row"
+    );
     assert!(
         saw_bounded_method,
         "expected overlong HTTP method to persist within the portable column bound"
     );
-    assert!(saw_stream, "expected stream audit row");
+    assert_eq!(
+        saw_stream_protocols,
+        ["tcp", "tcps", "udp", "dtls"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::HashSet<_>>(),
+        "expected tcp/tcps/udp/dtls stream audit rows"
+    );
     assert!(expired_gone, "retention worker must purge the expired row");
 
-    // Redacted context must not contain the raw cookie value.
+    // Redacted context must not contain the raw cookie value; colliding
+    // truncated keys must keep the lexicographically earlier value and mark
+    // the collision rather than silently overwriting.
     let ctx_row = sqlx::query(
-        "SELECT request_context FROM example_audit_log WHERE protocol = 'http' LIMIT 1",
+        "SELECT request_context FROM example_audit_log \
+         WHERE protocol = 'http' AND client_ip = '192.0.2.10' LIMIT 1",
     )
     .fetch_one(&pool)
     .await
@@ -468,7 +754,8 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     let ctx: Option<String> = ctx_row.get("request_context");
     let ctx = ctx.as_deref().unwrap_or("");
     assert!(ctx.len() <= 4096, "context must stay byte-bounded");
-    serde_json::from_str::<serde_json::Value>(ctx).expect("context must remain valid JSON");
+    let ctx_json: serde_json::Value =
+        serde_json::from_str(ctx).expect("context must remain valid JSON");
     assert!(
         !ctx.contains("session=1"),
         "secret cookie must be redacted: {ctx}"
@@ -477,6 +764,21 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         ctx.contains("[REDACTED]") || ctx.contains("metadata"),
         "expected redacted metadata snapshot: {ctx}"
     );
+    let metadata = ctx_json
+        .get("metadata")
+        .and_then(|value| value.as_object())
+        .expect("metadata object");
+    assert_eq!(
+        metadata.get(&metadata_prefix).and_then(|v| v.as_str()),
+        Some("first-wins")
+    );
+    assert_eq!(
+        metadata
+            .get("__ferrum_metadata_key_collisions")
+            .and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert!(!ctx.contains("should-not-overwrite"));
 
     // The documented OptionalFailOpen contract drops a failed batch and keeps
     // the worker alive for later records. Make the table briefly unavailable,

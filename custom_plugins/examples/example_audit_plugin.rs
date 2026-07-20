@@ -34,6 +34,16 @@
 //! Request methods are capped at 256 Unicode characters before persistence so
 //! hostile extension methods cannot exceed the portable MySQL column contract.
 //!
+//! ## MySQL custom-migration contract
+//!
+//! The gateway runner executes every MySQL custom-plugin migration statement
+//! outside an enclosing transaction (MySQL implicitly commits around DDL, and
+//! the runner uses the same non-transactional path for all MySQL custom
+//! migrations — including DML-only bodies — so statement/tracking boundaries
+//! never become ambiguously half-transactional). **All MySQL custom
+//! migrations for this plugin, including DML-only migrations, are therefore
+//! non-atomic with the tracking insert and must be idempotent / re-runnable.**
+//!
 //! ## Features Demonstrated
 //!
 //! - Database migrations via `plugin_migrations()` with multi-DB support
@@ -72,7 +82,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::AnyPool;
 use sqlx::any::AnyPoolOptions;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::warn;
 use uuid::Uuid;
@@ -82,8 +92,7 @@ use crate::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, build_batch_config, validate_batch_config,
 };
 use crate::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginHttpClient, ProxyProtocol, StreamTransactionSummary,
-    TransactionSummary,
+    ALL_PROTOCOLS, Plugin, PluginHttpClient, StreamTransactionSummary, TransactionSummary,
 };
 
 const TABLE_NAME: &str = "example_audit_log";
@@ -94,6 +103,85 @@ const MAX_METADATA_ENTRIES: usize = 64;
 const MAX_METADATA_KEY_CHARS: usize = 128;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
 const MAX_CONTEXT_BYTES: usize = 4096;
+const INSERT_COLUMN_COUNT: usize = 13;
+
+/// Gateway SQL dialect resolved from `FERRUM_DB_TYPE` (never from the raw URL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditSqlDialect {
+    Sqlite,
+    Postgres,
+    Mysql,
+}
+
+impl AuditSqlDialect {
+    pub fn from_db_type(db_type: &str) -> Result<Self, String> {
+        match db_type {
+            "sqlite" => Ok(Self::Sqlite),
+            "postgres" => Ok(Self::Postgres),
+            "mysql" => Ok(Self::Mysql),
+            other => Err(format!(
+                "example_audit_plugin: unsupported FERRUM_DB_TYPE '{other}' \
+                 (expected sqlite, postgres, or mysql)"
+            )),
+        }
+    }
+
+    /// INSERT statement for this dialect. PostgreSQL uses `$1..$13` because
+    /// `sqlx::Any` does not rewrite `?` placeholders; SQLite/MySQL keep `?`.
+    pub fn insert_sql(self) -> String {
+        let placeholders = match self {
+            Self::Postgres => {
+                let mut parts = Vec::with_capacity(INSERT_COLUMN_COUNT);
+                for index in 1..=INSERT_COLUMN_COUNT {
+                    parts.push(format!("${index}"));
+                }
+                format!("({})", parts.join(", "))
+            }
+            Self::Sqlite | Self::Mysql => {
+                let parts = vec!["?"; INSERT_COLUMN_COUNT];
+                format!("({})", parts.join(", "))
+            }
+        };
+        format!(
+            "INSERT INTO {TABLE_NAME} (\n\
+                id, timestamp, client_ip, protocol, http_method, request_path,\n\
+                response_status, grpc_status, latency_ms, consumer_username, proxy_id,\n\
+                request_context, connection_error\n\
+            ) VALUES {placeholders}"
+        )
+    }
+
+    pub fn retention_delete_sql(self) -> String {
+        match self {
+            Self::Postgres => format!("DELETE FROM {TABLE_NAME} WHERE timestamp < $1"),
+            Self::Sqlite | Self::Mysql => {
+                format!("DELETE FROM {TABLE_NAME} WHERE timestamp < ?")
+            }
+        }
+    }
+
+    pub fn insert_placeholder_count(self) -> usize {
+        match self {
+            Self::Postgres => self
+                .insert_sql()
+                .matches('$')
+                .count(),
+            Self::Sqlite | Self::Mysql => self.insert_sql().matches('?').count(),
+        }
+    }
+
+    pub fn retention_placeholder_count(self) -> usize {
+        match self {
+            Self::Postgres => self.retention_delete_sql().matches('$').count(),
+            Self::Sqlite | Self::Mysql => self.retention_delete_sql().matches('?').count(),
+        }
+    }
+}
+
+struct GatewayAuditStore {
+    pool: AnyPool,
+    dialect: AuditSqlDialect,
+}
 
 #[derive(Clone)]
 struct AuditRecord {
@@ -116,8 +204,11 @@ pub struct ExampleAuditPlugin {
     log_request_headers: bool,
     retention_days: u64,
     batch_config: BatchConfig,
-    logger: Mutex<Option<BatchingLogger<AuditRecord>>>,
-    retention_task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Set once during `start_background_tasks`; hot-path enqueue is lock-free.
+    logger: OnceLock<BatchingLogger<AuditRecord>>,
+    retention_task: OnceLock<tokio::task::AbortHandle>,
+    /// Serializes idempotent startup only; never acquired on steady-state hooks.
+    start_lock: Mutex<()>,
 }
 
 impl ExampleAuditPlugin {
@@ -228,20 +319,14 @@ impl ExampleAuditPlugin {
             log_request_headers,
             retention_days,
             batch_config,
-            logger: Mutex::new(None),
-            retention_task: Mutex::new(None),
+            logger: OnceLock::new(),
+            retention_task: OnceLock::new(),
+            start_lock: Mutex::new(()),
         })
     }
 
     fn enqueue(&self, record: AuditRecord) {
-        let Ok(guard) = self.logger.lock() else {
-            warn!(
-                plugin = PLUGIN_NAME,
-                "example_audit_plugin: logger lock poisoned; dropping audit record"
-            );
-            return;
-        };
-        match guard.as_ref() {
+        match self.logger.get() {
             Some(logger) => {
                 let _ = logger.try_send(record);
             }
@@ -266,11 +351,7 @@ impl ExampleAuditPlugin {
             id: Uuid::new_v4().to_string(),
             timestamp: canonical_timestamp(&summary.timestamp_received),
             client_ip: summary.client_ip.clone(),
-            protocol: if grpc_status.is_some() {
-                "grpc".to_string()
-            } else {
-                "http".to_string()
-            },
+            protocol: classify_http_audit_protocol(summary),
             http_method: Some(truncate_chars(
                 &summary.http_method,
                 MAX_HTTP_METHOD_CHARS,
@@ -305,7 +386,7 @@ impl ExampleAuditPlugin {
             id: Uuid::new_v4().to_string(),
             timestamp: canonical_timestamp(&summary.timestamp_disconnected),
             client_ip: summary.client_ip.clone(),
-            protocol: summary.protocol.clone(),
+            protocol: classify_stream_audit_protocol(summary),
             http_method: None,
             request_path: None,
             response_status: None,
@@ -317,6 +398,102 @@ impl ExampleAuditPlugin {
             connection_error: summary.connection_error.clone(),
         }
     }
+}
+
+/// Classify the persisted protocol label for an HTTP-family `log()` summary.
+///
+/// Precise mapping supported by summary fields / metadata (not invented
+/// transport versions):
+/// - `mesh.request_protocol=grpc-web` → `grpc-web`
+/// - `request_protocol=grpc` or terminal `grpc_status` → `grpc`
+/// - H1 WebSocket upgrade (`101`) or H2 Extended CONNECT (`CONNECT` + `200`,
+///   excluding HBONE) → `websocket`
+/// - otherwise → `http` (H1/H2/H3 and SSE share `ProxyProtocol::Http`)
+pub fn classify_http_audit_protocol(summary: &TransactionSummary) -> String {
+    if summary
+        .metadata
+        .get("mesh.request_protocol")
+        .is_some_and(|protocol| protocol == "grpc-web")
+    {
+        return "grpc-web".to_string();
+    }
+    if let Some(protocol) = summary.metadata.get("request_protocol") {
+        match protocol.as_str() {
+            "grpc" => return "grpc".to_string(),
+            "websocket" => return "websocket".to_string(),
+            "hbone" => return "hbone".to_string(),
+            "http" | "http1" | "http2" | "http3" | "https" => return "http".to_string(),
+            other => return other.clone(),
+        }
+    }
+    if summary.grpc_status().is_some() {
+        return "grpc".to_string();
+    }
+    if summary.response_status_code == 101 {
+        return "websocket".to_string();
+    }
+    // H2 Extended CONNECT WebSocket handshake returns 200 with method CONNECT.
+    // HBONE also uses CONNECT-shaped traffic but stamps `request_protocol=hbone`
+    // (handled above), so an unstamped CONNECT+200 is the H2 WS upgrade path.
+    if summary.http_method.eq_ignore_ascii_case("CONNECT") && summary.response_status_code == 200 {
+        return "websocket".to_string();
+    }
+    "http".to_string()
+}
+
+/// Stream disconnect labels are the backend scheme strings already present on
+/// `StreamTransactionSummary.protocol` (`tcp` / `tcps` / `udp` / `dtls`).
+pub fn classify_stream_audit_protocol(summary: &StreamTransactionSummary) -> String {
+    summary.protocol.clone()
+}
+
+/// Deterministic, redacted, bounded metadata snapshot for tests and context
+/// encoding. Sensitive values are redacted before persistence; entry/value
+/// bounds are hard caps; truncation collisions and omitted entries are marked.
+pub fn bounded_redacted_metadata(metadata: &std::collections::HashMap<String, String>) -> Value {
+    use crate::plugins::utils::metadata_redaction::{
+        REDACTED_PLACEHOLDER, is_sensitive_metadata_key,
+    };
+
+    let mut keys: Vec<&str> = metadata.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+
+    let selected: Vec<&str> = keys.into_iter().take(MAX_METADATA_ENTRIES).collect();
+    let omitted = metadata.len().saturating_sub(selected.len());
+
+    let mut bounded = serde_json::Map::new();
+    let mut collision_count = 0u64;
+    for key in selected {
+        let value = if is_sensitive_metadata_key(key) {
+            REDACTED_PLACEHOLDER.to_string()
+        } else {
+            truncate_chars(
+                metadata.get(key).map(String::as_str).unwrap_or(""),
+                MAX_METADATA_VALUE_CHARS,
+            )
+        };
+        let stored_key = truncate_chars(key, MAX_METADATA_KEY_CHARS);
+        if bounded.contains_key(&stored_key) {
+            // Lexicographically earlier original key already claimed this
+            // truncated prefix; keep the first value and surface the collision.
+            collision_count += 1;
+            continue;
+        }
+        bounded.insert(stored_key, Value::String(value));
+    }
+    if omitted > 0 {
+        bounded.insert(
+            "__ferrum_omitted_metadata_entries".to_string(),
+            Value::from(omitted as u64),
+        );
+    }
+    if collision_count > 0 {
+        bounded.insert(
+            "__ferrum_metadata_key_collisions".to_string(),
+            Value::from(collision_count),
+        );
+    }
+    Value::Object(bounded)
 }
 
 fn bounded_http_context(summary: &TransactionSummary) -> String {
@@ -372,30 +549,6 @@ fn encode_bounded_context(map: serde_json::Map<String, Value>) -> String {
     }
 }
 
-fn bounded_redacted_metadata(metadata: &std::collections::HashMap<String, String>) -> Value {
-    use crate::plugins::utils::metadata_redaction::{
-        REDACTED_PLACEHOLDER, is_sensitive_metadata_key,
-    };
-
-    let mut bounded = serde_json::Map::new();
-    for (key, value) in metadata.iter().take(MAX_METADATA_ENTRIES) {
-        let value = if is_sensitive_metadata_key(key) {
-            REDACTED_PLACEHOLDER.to_string()
-        } else {
-            truncate_chars(value, MAX_METADATA_VALUE_CHARS)
-        };
-        bounded.insert(truncate_chars(key, MAX_METADATA_KEY_CHARS), Value::String(value));
-    }
-    let omitted = metadata.len().saturating_sub(MAX_METADATA_ENTRIES);
-    if omitted > 0 {
-        bounded.insert(
-            "__ferrum_omitted_metadata_entries".to_string(),
-            Value::from(omitted as u64),
-        );
-    }
-    Value::Object(bounded)
-}
-
 fn truncate_chars(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -419,24 +572,21 @@ fn canonical_timestamp(input: &str) -> String {
     }
 }
 
-fn connect_gateway_pool_lazy() -> Result<AnyPool, String> {
+fn connect_gateway_pool_lazy() -> Result<GatewayAuditStore, String> {
     let db_url = crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_URL").ok_or_else(|| {
         "example_audit_plugin requires FERRUM_DB_URL (gateway configuration database)".to_string()
     })?;
+    // Resolve dialect from FERRUM_DB_TYPE only — never infer or log the raw URL
+    // (URLs may embed credentials).
     let db_type = crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TYPE")
         .unwrap_or_else(|| "sqlite".to_string());
-    if !matches!(db_type.as_str(), "sqlite" | "postgres" | "mysql") {
-        return Err(format!(
-            "example_audit_plugin: unsupported FERRUM_DB_TYPE '{db_type}' \
-             (expected sqlite, postgres, or mysql)"
-        ));
-    }
-    // Never log the raw URL — it may embed credentials. Use a lazy pool so
-    // `start_background_tasks` stays sync-safe on the Tokio runtime; the first
-    // flush surfaces connectivity errors through the batching retry/warn path.
+    let dialect = AuditSqlDialect::from_db_type(&db_type)?;
+    // Use a lazy pool so `start_background_tasks` stays sync-safe on the Tokio
+    // runtime; the first flush surfaces connectivity errors through the
+    // batching retry/warn path.
     sqlx::any::install_default_drivers();
-    let is_sqlite = db_type == "sqlite";
-    AnyPoolOptions::new()
+    let is_sqlite = matches!(dialect, AuditSqlDialect::Sqlite);
+    let pool = AnyPoolOptions::new()
         .max_connections(2)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(5))
@@ -454,40 +604,38 @@ fn connect_gateway_pool_lazy() -> Result<AnyPool, String> {
         .map_err(|_| {
             "example_audit_plugin: failed to create gateway database pool from FERRUM_DB_URL"
                 .to_string()
-        })
+        })?;
+    Ok(GatewayAuditStore { pool, dialect })
 }
 
-async fn insert_batch(pool: &AnyPool, batch: Vec<AuditRecord>) -> Result<(), String> {
+async fn insert_batch(
+    pool: &AnyPool,
+    dialect: AuditSqlDialect,
+    batch: Vec<AuditRecord>,
+) -> Result<(), String> {
+    let insert_sql = dialect.insert_sql();
     let mut transaction = pool
         .begin()
         .await
         .map_err(|e| format!("example_audit_plugin batch transaction failed: {e}"))?;
     for record in batch {
-        sqlx::query(
-            r#"
-            INSERT INTO example_audit_log (
-                id, timestamp, client_ip, protocol, http_method, request_path,
-                response_status, grpc_status, latency_ms, consumer_username, proxy_id,
-                request_context, connection_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&record.id)
-        .bind(&record.timestamp)
-        .bind(&record.client_ip)
-        .bind(&record.protocol)
-        .bind(&record.http_method)
-        .bind(&record.request_path)
-        .bind(record.response_status)
-        .bind(record.grpc_status)
-        .bind(record.latency_ms)
-        .bind(&record.consumer_username)
-        .bind(&record.proxy_id)
-        .bind(&record.request_context)
-        .bind(&record.connection_error)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|e| format!("example_audit_plugin insert failed: {e}"))?;
+        sqlx::query(&insert_sql)
+            .bind(&record.id)
+            .bind(&record.timestamp)
+            .bind(&record.client_ip)
+            .bind(&record.protocol)
+            .bind(&record.http_method)
+            .bind(&record.request_path)
+            .bind(record.response_status)
+            .bind(record.grpc_status)
+            .bind(record.latency_ms)
+            .bind(&record.consumer_username)
+            .bind(&record.proxy_id)
+            .bind(&record.request_context)
+            .bind(&record.connection_error)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| format!("example_audit_plugin insert failed: {e}"))?;
     }
     transaction
         .commit()
@@ -495,20 +643,15 @@ async fn insert_batch(pool: &AnyPool, batch: Vec<AuditRecord>) -> Result<(), Str
         .map_err(|e| format!("example_audit_plugin batch commit failed: {e}"))
 }
 
-async fn run_retention(pool: AnyPool, retention_days: u64) {
+async fn run_retention(pool: AnyPool, dialect: AuditSqlDialect, retention_days: u64) {
+    let delete_sql = dialect.retention_delete_sql();
     let mut interval = tokio::time::interval(Duration::from_secs(3600));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        match sqlx::query(&format!(
-            "DELETE FROM {TABLE_NAME} WHERE timestamp < ?"
-        ))
-        .bind(&cutoff)
-        .execute(&pool)
-        .await
-        {
+        match sqlx::query(&delete_sql).bind(&cutoff).execute(&pool).await {
             Ok(result) => {
                 let deleted = result.rows_affected();
                 if deleted > 0 {
@@ -533,11 +676,7 @@ async fn run_retention(pool: AnyPool, retention_days: u64) {
 
 impl Drop for ExampleAuditPlugin {
     fn drop(&mut self) {
-        let retention_task = match self.retention_task.get_mut() {
-            Ok(task) => task,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(task) = retention_task.take() {
+        if let Some(task) = self.retention_task.get() {
             task.abort();
         }
     }
@@ -559,38 +698,40 @@ impl Plugin for ExampleAuditPlugin {
     }
 
     fn start_background_tasks(&self) -> Result<(), String> {
-        let mut logger_guard = self
-            .logger
-            .lock()
-            .map_err(|_| "example_audit_plugin: logger lock poisoned".to_string())?;
-        if logger_guard.is_some() {
+        if self.logger.get().is_some() {
             return Ok(());
         }
-        let mut retention_guard = self
-            .retention_task
-            .lock()
-            .map_err(|_| "example_audit_plugin: retention lock poisoned".to_string())?;
+        let _start_guard = self.start_lock.lock().map_err(|_| {
+            "example_audit_plugin: start lock poisoned; refusing to start background tasks"
+                .to_string()
+        })?;
+        if self.logger.get().is_some() {
+            return Ok(());
+        }
 
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             "example_audit_plugin: start_background_tasks requires a Tokio runtime".to_string()
         })?;
 
-        let pool = connect_gateway_pool_lazy()?;
+        let GatewayAuditStore { pool, dialect } = connect_gateway_pool_lazy()?;
         let flush_pool = pool.clone();
+        let flush_dialect = dialect;
         let logger = BatchingLogger::spawn(self.batch_config, move |batch| {
             let pool = flush_pool.clone();
-            async move { insert_batch(&pool, batch).await }
+            async move { insert_batch(&pool, flush_dialect, batch).await }
         });
 
         let retention_pool = pool.clone();
         let retention_days = self.retention_days;
         let retention_task = runtime
             .spawn(async move {
-                run_retention(retention_pool, retention_days).await;
+                run_retention(retention_pool, dialect, retention_days).await;
             })
             .abort_handle();
-        *logger_guard = Some(logger);
-        *retention_guard = Some(retention_task);
+
+        // OnceLock::set is idempotent under the start_lock double-check above.
+        let _ = self.logger.set(logger);
+        let _ = self.retention_task.set(retention_task);
 
         Ok(())
     }
@@ -642,6 +783,9 @@ pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
 /// - MySQL index reconciliation is retry-safe: pair `DROP INDEX` with
 ///   `CREATE INDEX`; the runner tolerates only a structured missing-key (1091)
 ///   error on the drop so every retry reconstructs the intended definition
+/// - **MySQL contract:** every MySQL custom migration for this plugin,
+///   including DML-only migrations, is non-atomic with the tracking insert
+///   and must be idempotent / re-runnable (see module docs)
 pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
     vec![
         CustomPluginMigration {

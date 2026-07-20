@@ -241,15 +241,19 @@ Dialect transactionality for custom-plugin migrations:
   practical.
 - **MySQL:** DDL implicitly commits
   ([MySQL manual](https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html)),
-  so multi-statement migrations are **not** atomic with the tracking insert.
-  For a plugin-owned index that must recover across every statement boundary,
-  pair `DROP INDEX name ON table` immediately with the exact `CREATE INDEX`
-  definition. The runner tolerates only structured MySQL error `1091` (missing
-  key) on the `DROP INDEX`; every creation failure remains fatal. A retry then
-  either removes the prior definition or observes a missing index before
-  reconstructing the intended one. Prefer idempotent table DDL (`CREATE TABLE
-  IF NOT EXISTS`) and plugin-prefixed names, and do not use this pattern to
-  replace indexes owned by another plugin or by the gateway core.
+  and the runner always executes MySQL custom-plugin migrations outside an
+  enclosing transaction so statement/tracking boundaries never become
+  ambiguously half-transactional. **All MySQL custom migrations — including
+  DML-only bodies — are therefore non-atomic with the tracking insert and must
+  be idempotent / re-runnable.** For a plugin-owned index that must recover
+  across every statement boundary, pair `DROP INDEX name ON table` immediately
+  with the exact `CREATE INDEX` definition. The runner tolerates only
+  structured MySQL error `1091` (missing key) on the `DROP INDEX`; every
+  creation failure remains fatal. A retry then either removes the prior
+  definition or observes a missing index before reconstructing the intended
+  one. Prefer idempotent table DDL (`CREATE TABLE IF NOT EXISTS`) and
+  plugin-prefixed names, and do not use this pattern to replace indexes owned
+  by another plugin or by the gateway core.
 
 ### Checksum Validation
 
