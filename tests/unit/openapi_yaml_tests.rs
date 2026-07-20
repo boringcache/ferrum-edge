@@ -4304,6 +4304,156 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
 }
 
 #[test]
+fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
+    use ferrum_edge::plugins::ai_transcript_audit::{
+        AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS, AI_TRANSCRIPT_AUDIT_CONFIG_KEYS,
+        AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
+        AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
+        AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
+    };
+    use ferrum_edge::plugins::utils::PluginHttpClient;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiTranscriptAuditConfig")
+        .expect("missing AiTranscriptAuditConfig schema");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    for nested in [
+        "capture",
+        "sampling",
+        "redaction",
+        "limits",
+        "privacy",
+        "sink",
+    ] {
+        assert_eq!(
+            schema["properties"][nested]["additionalProperties"],
+            json!(false),
+            "{nested} must close unknown keys"
+        );
+    }
+    assert_eq!(
+        schema["properties"]["redaction"]["properties"]["custom_patterns"]["items"]
+            ["additionalProperties"],
+        json!(false)
+    );
+    assert!(
+        schema["properties"]["sink"]["properties"]["custom_headers"]["additionalProperties"]
+            .is_object(),
+        "custom_headers must remain a free-form string map"
+    );
+
+    let documented_root = schema["properties"]
+        .as_object()
+        .expect("root properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime_root = AI_TRANSCRIPT_AUDIT_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented_root, runtime_root, "root key drift");
+
+    let nested_parity = [
+        ("capture", AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS),
+        ("sampling", AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS),
+        ("redaction", AI_TRANSCRIPT_AUDIT_REDACTION_KEYS),
+        ("limits", AI_TRANSCRIPT_AUDIT_LIMITS_KEYS),
+        ("privacy", AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS),
+        ("sink", AI_TRANSCRIPT_AUDIT_SINK_KEYS),
+    ];
+    for (nested, runtime_keys) in nested_parity {
+        let documented = schema["properties"][nested]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{nested} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let runtime = runtime_keys.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(documented, runtime, "{nested} key drift");
+    }
+    let documented_patterns = schema["properties"]["redaction"]["properties"]["custom_patterns"]
+        ["items"]["properties"]
+        .as_object()
+        .expect("custom pattern properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime_patterns = AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented_patterns, runtime_patterns, "custom_patterns key drift");
+
+    let http_client = PluginHttpClient::default();
+    let parity_cases = [
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest",
+                    "custom_headers": {"Authorization": "Bearer ${AUDIT_TOKEN}"},
+                    "retry_delay_ms": 250
+                },
+                "capture": null,
+                "privacy": null
+            }),
+            true,
+        ),
+        (
+            json!({
+                "privacy": {"include_consumer_usernme": false},
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            false,
+        ),
+        (
+            json!({
+                "capture": {"respose": false},
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            false,
+        ),
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest",
+                    "on_sink_eror": "reject"
+                }
+            }),
+            false,
+        ),
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest",
+                    "on_buffer_ful": "reject"
+                }
+            }),
+            false,
+        ),
+    ];
+    for (config, expected_valid) in parity_cases {
+        assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, expected_valid);
+        let runtime_valid = AiTranscriptAudit::new(&config, http_client.clone()).is_ok();
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "runtime/schema parity drift for {config}"
+        );
+    }
+}
+
+#[test]
 fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

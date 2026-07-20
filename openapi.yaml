@@ -17092,7 +17092,8 @@ components:
     AiTranscriptAuditConfig:
       type: object
       required: [sink]
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work."
+      additionalProperties: false
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -17104,8 +17105,9 @@ components:
           default: false
           description: "Required guardrail for mode=full_body, which captures unredacted payloads. Construction fails if full_body is set without this opt-in."
         capture:
-          type: object
-          description: "What to capture."
+          type: [object, "null"]
+          additionalProperties: false
+          description: "What to capture. Omit or null to keep defaults."
           properties:
             request:
               type: boolean
@@ -17129,7 +17131,9 @@ components:
               default: true
               description: "Extract tool/function names from the request body."
         sampling:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: "Sampling controls. Omit or null to keep defaults."
           properties:
             rate:
               type: number
@@ -17149,8 +17153,9 @@ components:
               default: 0
               description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
         redaction:
-          type: object
-          description: "PII redaction policy for captured excerpts. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
+          type: [object, "null"]
+          additionalProperties: false
+          description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
           properties:
             builtins:
               type: array
@@ -17163,6 +17168,7 @@ components:
               items:
                 type: object
                 required: [name, regex]
+                additionalProperties: false
                 properties:
                   name:
                     type: string
@@ -17181,7 +17187,9 @@ components:
               minLength: 16
               description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. When set (min 16 chars), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
         limits:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: "Capture size caps. Omit or null to keep defaults."
           properties:
             max_request_bytes:
               type: integer
@@ -17198,7 +17206,8 @@ components:
         sink:
           type: object
           required: [endpoint_url]
-          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames)."
+          additionalProperties: false
+          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Unknown sink keys are rejected; custom_headers remains an open string map."
           properties:
             type:
               type: string
@@ -17212,7 +17221,7 @@ components:
               type: object
               additionalProperties:
                 type: string
-              description: "Extra headers sent on every batch. Values support ${ENV_VAR} expansion resolved lazily at send time, so secrets are not stored in config (e.g. Authorization: 'Bearer ${AUDIT_TOKEN}')."
+              description: "Extra headers sent on every batch. Values support ${ENV_VAR} expansion resolved lazily at send time, so secrets are not stored in config (e.g. Authorization: 'Bearer ${AUDIT_TOKEN}'). Arbitrary header names are accepted; this is the only intentional free-form map in the plugin config."
             batch_size:
               type: integer
               minimum: 1
@@ -17229,6 +17238,11 @@ components:
               type: integer
               minimum: 0
               default: 3
+            retry_delay_ms:
+              type: integer
+              minimum: 0
+              default: 1000
+              description: "Fixed delay between batch send retries for transient collector failures."
             on_buffer_full:
               type: string
               enum: [drop, reject]
@@ -17240,7 +17254,9 @@ components:
               default: warn
               description: "warn: log and drop on permanent sink failure. reject: fail selected buffered or streaming audit records with 503 before response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: "Identity/header export controls. Omit or null to keep defaults."
           properties:
             include_consumer_username:
               type: boolean
