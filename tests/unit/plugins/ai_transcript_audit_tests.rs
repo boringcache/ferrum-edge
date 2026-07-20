@@ -387,7 +387,10 @@ async fn rejects_multiple_unknown_root_keys_sorted_with_suggestions() {
     let aaa = err.find("'config.aaa_unknown'").expect("aaa path");
     let allow = err.find("'config.allow_full_bod'").expect("allow path");
     let zzz = err.find("'config.zzz_unknown'").expect("zzz path");
-    assert!(aaa < allow && allow < zzz, "unknown keys must be sorted: {err}");
+    assert!(
+        aaa < allow && allow < zzz,
+        "unknown keys must be sorted: {err}"
+    );
     assert!(
         err.contains("did you mean 'allow_full_body'"),
         "typo should suggest allow_full_body: {err}"
@@ -549,7 +552,13 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
     );
     assert_eq!(
         AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS,
-        &["request", "response", "streaming_response", "headers", "tool_calls"]
+        &[
+            "request",
+            "response",
+            "streaming_response",
+            "headers",
+            "tool_calls"
+        ]
     );
     assert_eq!(
         AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS,

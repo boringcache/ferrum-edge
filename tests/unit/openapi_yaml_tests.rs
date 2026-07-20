@@ -4334,8 +4334,7 @@ fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
         );
     }
     assert_eq!(
-        schema["properties"]["redaction"]["properties"]["custom_patterns"]["items"]
-            ["additionalProperties"],
+        schema["properties"]["redaction"]["properties"]["custom_patterns"]["items"]["additionalProperties"],
         json!(false)
     );
     assert!(
@@ -4374,18 +4373,21 @@ fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
         let runtime = runtime_keys.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(documented, runtime, "{nested} key drift");
     }
-    let documented_patterns = schema["properties"]["redaction"]["properties"]["custom_patterns"]
-        ["items"]["properties"]
-        .as_object()
-        .expect("custom pattern properties")
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
+    let documented_patterns =
+        schema["properties"]["redaction"]["properties"]["custom_patterns"]["items"]["properties"]
+            .as_object()
+            .expect("custom pattern properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
     let runtime_patterns = AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    assert_eq!(documented_patterns, runtime_patterns, "custom_patterns key drift");
+    assert_eq!(
+        documented_patterns, runtime_patterns,
+        "custom_patterns key drift"
+    );
 
     let http_client = PluginHttpClient::default();
     let parity_cases = [

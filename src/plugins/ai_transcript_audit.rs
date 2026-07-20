@@ -2515,9 +2515,9 @@ fn parse_custom_patterns(obj: &Value) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let path = format!("config.redaction.custom_patterns[{index}]");
-        let map = entry.as_object().ok_or_else(|| {
-            format!("ai_transcript_audit: '{path}' must be an object")
-        })?;
+        let map = entry
+            .as_object()
+            .ok_or_else(|| format!("ai_transcript_audit: '{path}' must be an object"))?;
         reject_unknown_keys(
             map,
             &path,

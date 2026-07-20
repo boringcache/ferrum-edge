@@ -7075,7 +7075,10 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     // candidate generation so callers keep the last-known-good plugin cache.
     // Runtime fail-closed capture remains the explicit
     // `sink.on_sink_error` / `sink.on_buffer_full` = `reject` config.
-    builtin_plugin("ai_transcript_audit", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin(
+        "ai_transcript_audit",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
     builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("ws_message_size_limiting", PluginFailurePolicy::FailClosed),
