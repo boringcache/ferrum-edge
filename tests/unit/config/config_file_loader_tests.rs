@@ -865,7 +865,7 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
-fn test_file_config_rejects_invalid_proxy_alerts_configs() {
+fn test_file_config_admits_invalid_optional_proxy_alerts_configs_for_cache_omission() {
     for (id, config) in [
         (
             "proxy-alerts-enabled-typo",
@@ -991,7 +991,7 @@ fn test_file_config_rejects_invalid_proxy_alerts_configs() {
             "plugin_configs": [{
                 "id": id,
                 "plugin_name": "proxy_alerts",
-                "config": config,
+                "config": config.clone(),
                 "scope": "global",
                 "enabled": true
             }]
@@ -999,17 +999,19 @@ fn test_file_config_rejects_invalid_proxy_alerts_configs() {
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
         write!(file, "{document}").unwrap();
 
-        let err = load_config_from_file(
+        let loaded = load_config_from_file(
             file.path().to_str().unwrap(),
             30,
             &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
             "ferrum",
         )
-        .expect_err("file-mode load must reject invalid proxy_alerts config");
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("1 plugin config error(s)"),
-            "unexpected file-load error: {message}"
+        .expect("OptionalFailOpen proxy_alerts validation must not abort file-mode loading");
+        assert_eq!(loaded.plugin_configs.len(), 1);
+        assert_eq!(loaded.plugin_configs[0].id, id);
+        assert_eq!(loaded.plugin_configs[0].plugin_name, "proxy_alerts");
+        assert_eq!(
+            loaded.plugin_configs[0].config, config,
+            "file loading must preserve the invalid config for PluginCache to warn and omit"
         );
     }
 }
