@@ -8602,3 +8602,269 @@ async fn duplicate_stream_index_dry_run_releases_without_cut() {
     let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
     assert!(!terminated, "dry-run must not cut on ungovernable identity");
 }
+
+// ---------------------------------------------------------------------------
+// Coverage residuals: amplification fail-closed + admission edge cases
+// (hosted Coverage run 29753983615: 142/172 = 82.56% < 84.98%)
+// ---------------------------------------------------------------------------
+
+/// Long placeholder × many matches must fail closed in enforce before the
+/// redaction transform can emit an amplified body.
+fn amplifying_redact_config(mode: &str) -> Value {
+    json!({
+        "mode": mode,
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "a", "regex": "a" }]
+            }
+        },
+        "response": { "redaction_placeholder": "X".repeat(256) }
+    })
+}
+
+fn amplifying_argument_blob() -> String {
+    // 17_000 × 256-byte placeholder exceeds MAX_PARSE_BYTES (4 MiB).
+    "a".repeat(17_000)
+}
+
+fn response_with_function_call(name: &str, arguments: &str) -> Vec<u8> {
+    json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": Value::Null,
+                "function_call": { "name": name, "arguments": arguments }
+            },
+            "finish_reason": "function_call"
+        }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn redact_args_amplification_fails_closed_in_enforce() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    let body = response_with_tool_call("search", &amplifying_argument_blob());
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+/// Amplifying redaction must clear the governed-response hash so the final
+/// re-check cannot hash-skip an unredacted secret.
+#[tokio::test]
+async fn redact_args_amplification_clears_hash_on_transform() {
+    let plugin = make(amplifying_redact_config("dry_run"));
+    let body = response_with_tool_call("search", &amplifying_argument_blob());
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "amplifying redact must decline the rewrite"
+    );
+
+    // Hash cleared → final re-check sees redaction-unavailable and still
+    // observationally labels the call in dry-run (no cut).
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+}
+
+/// Legacy `function_call` redaction must rewrite arguments in place (not only
+/// modern `tool_calls[]`).
+#[tokio::test]
+async fn buffered_legacy_function_call_redact_args_rewrites() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+    let body = response_with_function_call(
+        "filesystem.write",
+        r#"{"token":"sk-legacysecret99","path":"/tmp"}"#,
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("legacy function_call redact must rewrite");
+    let text = String::from_utf8(rewritten).unwrap();
+    assert!(!text.contains("sk-legacysecret99"), "secret leaked: {text}");
+    assert!(text.contains("[REDACTED_TOOL_ARG:secret]"), "{text}");
+}
+
+/// Amplifying redaction on a legacy `function_call` also fails closed.
+#[tokio::test]
+async fn buffered_legacy_function_call_redact_amplification_fails_closed() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    let body = response_with_function_call("search", &amplifying_argument_blob());
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+    // Transform after a reject still hits AmplificationFailed and clears the
+    // governed hash recorded before the deny.
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none()
+    );
+}
+
+/// `{name}` expansion that itself exceeds the inspectable window fails closed.
+#[tokio::test]
+async fn redact_placeholder_name_expansion_fails_closed() {
+    let huge = "N".repeat(4 * 1024 * 1024 + 1);
+    let plugin = make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": huge, "regex": "tok" }]
+            }
+        },
+        "response": { "redaction_placeholder": "{name}" }
+    }));
+    let body = response_with_tool_call("search", r#"{"x":"tok"}"#);
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+#[test]
+fn rejects_non_positive_approval_timeout() {
+    for timeout_ms in [json!(0), json!(-1), json!("fast"), json!(1.5)] {
+        let err = try_make(json!({
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": {
+                "endpoint_url": "https://approval.example/decide",
+                "timeout_ms": timeout_ms
+            }
+        }))
+        .err()
+        .expect("non-positive timeout_ms must be rejected");
+        assert!(
+            err.contains("timeout_ms") && err.contains("positive"),
+            "unexpected error for {timeout_ms}: {err}"
+        );
+    }
+}
+
+/// Transform no-ops for shapes that are not redactable in place, without
+/// clearing a previously recorded governed hash.
+#[tokio::test]
+async fn redact_transform_leaves_non_redactable_shapes_unchanged() {
+    let plugin = make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "sk-[A-Za-z0-9]+" }]
+            },
+            "other": { "action": "allow" }
+        }
+    }));
+    // Record a governed hash via an allowlisted sibling call.
+    let seed = response_with_tool_call("other", r#"{"ok":true}"#);
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &seed)
+            .await,
+    );
+
+    let probes: &[Value] = &[
+        // No choices array.
+        json!({ "id": "x" }),
+        // Function object present but name missing.
+        json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{ "function": { "arguments": "{}" } }]
+                }
+            }]
+        }),
+        // Name not in the redact_args tool set.
+        json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "function": { "name": "other", "arguments": r#"{"token":"sk-abc"}"# }
+                    }]
+                }
+            }]
+        }),
+        // redact_args tool but arguments omitted.
+        json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{ "function": { "name": "search" } }]
+                }
+            }]
+        }),
+    ];
+    for probe in probes {
+        let body = serde_json::to_vec(probe).unwrap();
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &json_headers(),
+                )
+                .await
+                .is_none(),
+            "probe should be a no-op: {probe}"
+        );
+    }
+}
