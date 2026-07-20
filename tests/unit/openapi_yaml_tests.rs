@@ -3175,6 +3175,76 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
 }
 
 #[test]
+fn grpc_web_schema_matches_the_strict_runtime_shape() {
+    use ferrum_edge::plugins::grpc_web::{GRPC_WEB_CONFIG_KEYS, GrpcWebPlugin};
+    use std::collections::BTreeSet;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let component = &spec["components"]["schemas"]["GrpcWebConfig"];
+    assert_eq!(component["additionalProperties"], false);
+    assert_eq!(component["type"], "object");
+    assert!(
+        component.get("nullable").is_none(),
+        "GrpcWebConfig must not mark null as accepted"
+    );
+    let description = component["description"]
+        .as_str()
+        .expect("GrpcWebConfig has a description");
+    assert!(description.contains("not null"));
+    assert!(description.contains("Unknown keys are rejected"));
+
+    let documented = component["properties"]
+        .as_object()
+        .expect("GrpcWebConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = GRPC_WEB_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "grpc_web runtime/OpenAPI key drift");
+
+    for config in [
+        json!({}),
+        json!({"expose_headers": ["x-request-id"]}),
+        json!({"expose_headers": []}),
+    ] {
+        assert_component_validity(&spec, "GrpcWebConfig", &config, true);
+        assert!(
+            GrpcWebPlugin::new(&config).is_ok(),
+            "runtime rejected schema-valid grpc_web config: {config}"
+        );
+    }
+
+    for config in [
+        json!(null),
+        json!([]),
+        json!("expose_headers"),
+        json!(1),
+        json!(true),
+        json!({"expose_header": ["x-request-id"]}),
+        json!({"expose_headers": ["x-request-id"], "extra": true}),
+    ] {
+        assert_component_validity(&spec, "GrpcWebConfig", &config, false);
+        assert!(
+            GrpcWebPlugin::new(&config).is_err(),
+            "runtime accepted schema-invalid grpc_web config: {config}"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let grpc_web_docs = plugin_docs
+        .split("### `grpc_web`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("grpc_web docs section");
+    assert!(grpc_web_docs.contains("`null` is not an alias for `{}`"));
+    assert!(grpc_web_docs.contains("KeepLastKnownGood"));
+}
+
+#[test]
 fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
     use ferrum_edge::plugins::cors::CorsPlugin;
 
