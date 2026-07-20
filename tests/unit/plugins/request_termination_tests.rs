@@ -1,7 +1,10 @@
 //! Tests for request_termination plugin
 
-use ferrum_edge::plugins::request_termination::RequestTermination;
+use ferrum_edge::plugins::request_termination::{
+    REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
+};
 use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use http::HeaderMap;
 use serde_json::json;
 
 fn make_ctx(method: &str, path: &str) -> RequestContext {
@@ -14,7 +17,20 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
 
 fn make_ctx_with_header(method: &str, path: &str, header: &str, value: &str) -> RequestContext {
     let mut ctx = make_ctx(method, path);
-    ctx.headers.insert(header.to_string(), value.to_string());
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        http::HeaderName::from_bytes(header.as_bytes()).expect("header name"),
+        http::HeaderValue::from_str(value).expect("header value"),
+    );
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    ctx
+}
+
+fn make_ctx_with_raw_headers(method: &str, path: &str, raw: HeaderMap) -> RequestContext {
+    let mut ctx = make_ctx(method, path);
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
     ctx
 }
 
@@ -438,11 +454,11 @@ async fn test_header_trigger_any_value() {
 
 #[tokio::test]
 async fn test_boundary_status_codes() {
-    // Minimum valid status code
-    let plugin = RequestTermination::new(&json!({ "status_code": 100 })).unwrap();
+    // Minimum valid final status code
+    let plugin = RequestTermination::new(&json!({ "status_code": 200 })).unwrap();
     let mut ctx = make_ctx("GET", "/");
     match plugin.on_request_received(&mut ctx).await {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 100),
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 200),
         _ => panic!("Expected Reject"),
     }
 
@@ -616,4 +632,209 @@ async fn test_explicit_body_takes_precedence_over_message() {
         PluginResult::Reject { body, .. } => assert_eq!(body, "literal payload"),
         other => panic!("Expected Reject, got {:?}", other),
     }
+}
+
+#[test]
+fn test_config_requires_object_and_rejects_unknown_keys() {
+    for invalid in [
+        json!(null),
+        json!("enabled"),
+        json!([]),
+        json!({"triger": {"path_prefix": "/admin"}}),
+        json!({"status_code": 503, "extra": true}),
+        json!({"trigger": {"path_prefix": "/admin", "unknown": 1}}),
+    ] {
+        let err = RequestTermination::new(&invalid)
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection for {invalid}"));
+        assert!(
+            err.contains("request_termination"),
+            "unexpected error for {invalid}: {err}"
+        );
+    }
+
+    RequestTermination::new(&json!({}))
+        .expect("empty object remains the intentional maintenance default");
+    RequestTermination::new(&json!({
+        "status_code": 451,
+        "trigger": { "path_prefix": "/maintenance" }
+    }))
+    .expect("valid conditional config must be accepted");
+}
+
+#[test]
+fn test_informational_and_101_statuses_are_rejected() {
+    for code in [100, 101, 199] {
+        let err = RequestTermination::new(&json!({ "status_code": code }))
+            .err()
+            .expect("informational status must be rejected");
+        assert!(err.contains("200 to 599"), "status {code}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn test_no_body_statuses_force_empty_response() {
+    for code in [204u16, 205, 304] {
+        let plugin = RequestTermination::new(&json!({ "status_code": code }))
+            .unwrap_or_else(|e| panic!("status {code} with generated body must force empty: {e}"));
+        let mut ctx = make_ctx("GET", "/");
+        match plugin.on_request_received(&mut ctx).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, code);
+                assert!(body.is_empty(), "status {code} must have empty body");
+            }
+            other => panic!("Expected Reject, got {other:?}"),
+        }
+
+        let err = RequestTermination::new(&json!({
+            "status_code": code,
+            "body": "not-empty"
+        }))
+        .err()
+        .expect("explicit non-empty body on no-body status must fail");
+        assert!(err.contains("cannot carry a response body"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn test_explicit_empty_body_suppresses_message() {
+    let plugin = RequestTermination::new(&json!({
+        "body": "",
+        "message": "maintenance"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            assert_eq!(body, "");
+            assert!(!body.contains("maintenance"));
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_omitted_body_uses_message() {
+    let plugin = RequestTermination::new(&json!({
+        "message": "maintenance"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => assert!(body.contains("maintenance")),
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_connect_with_2xx_fails_closed() {
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 200,
+        "body": "{}"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("CONNECT", "/");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(body.contains("CONNECT"));
+            assert!(!body.contains("{}") || body.contains("403"));
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_header_presence_matches_non_utf8_raw_value() {
+    let plugin = RequestTermination::new(&json!({
+        "trigger": { "header": "x-block" }
+    }))
+    .unwrap();
+    let mut raw = HeaderMap::new();
+    raw.insert(
+        "x-block",
+        http::HeaderValue::from_bytes(&[0x80]).expect("obs-text"),
+    );
+    let mut ctx = make_ctx_with_raw_headers("GET", "/", raw);
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_header_exact_matches_individual_field_line_not_folded() {
+    let plugin = RequestTermination::new(&json!({
+        "trigger": {
+            "header": "x-policy",
+            "header_value": "true"
+        }
+    }))
+    .unwrap();
+    let mut raw = HeaderMap::new();
+    raw.append("x-policy", "false".parse().unwrap());
+    raw.append("x-policy", "true".parse().unwrap());
+    let mut ctx = make_ctx_with_raw_headers("GET", "/", raw);
+    assert!(
+        matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "exact match must succeed against an individual appended field line"
+    );
+
+    let mut folded_only = make_ctx("GET", "/");
+    folded_only
+        .headers
+        .insert("x-policy".to_string(), "false, true".to_string());
+    // Without raw headers the harness falls back to the materialized map, which
+    // does not equal "true" — documenting that raw evaluation is required.
+    assert!(matches!(
+        plugin.on_request_received(&mut folded_only).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_xml_message_rejects_illegal_controls_and_keeps_whitespace() {
+    for bad in ["\u{0000}null", "\u{0001}one", "\u{0008}bs"] {
+        let err = RequestTermination::new(&json!({
+            "content_type": "application/xml",
+            "message": bad
+        }))
+        .err()
+        .expect("illegal XML 1.0 control must be rejected");
+        assert!(err.contains("XML 1.0"), "{err}");
+    }
+
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/vnd.api+xml",
+        "message": "ok\tline\nwith\rbreaks & <markup>"
+    }))
+    .expect("tab/LF/CR and markup must be accepted for +xml");
+    let mut ctx = make_ctx("GET", "/");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            roxmltree::Document::parse(&body).expect("generated XML must parse");
+            assert!(body.contains("&amp;"));
+            assert!(body.contains("&lt;markup&gt;"));
+        }
+        other => panic!("Expected Reject, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_config_key_constants_match_documented_surface() {
+    assert_eq!(
+        REQUEST_TERMINATION_CONFIG_KEYS,
+        ["status_code", "content_type", "body", "message", "trigger"]
+    );
+    assert_eq!(
+        REQUEST_TERMINATION_TRIGGER_KEYS,
+        ["path_prefix", "header", "header_value"]
+    );
 }

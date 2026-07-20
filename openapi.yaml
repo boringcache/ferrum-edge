@@ -16321,6 +16321,7 @@ components:
 
     RequestTerminationConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: request_termination — Returns a canned response without
         proxying to the backend. The response body and `content-type` are
@@ -16328,43 +16329,53 @@ components:
         allocation-light. Useful for maintenance windows, mocking, or
         path/header-based short-circuiting. Runs after CORS so browser
         preflight responses are still emitted correctly. HTTP-family only.
+        Configuration must be an object; unknown top-level and trigger keys
+        are rejected. Null/scalar/array configs are rejected.
       properties:
         status_code:
           type: integer
           format: uint16
-          minimum: 100
+          minimum: 200
           maximum: 599
           default: 503
           description: >-
-            HTTP status code returned. Values outside 100–599 (or non-numeric
-            values) are coerced to 503.
+            Final HTTP status code returned. Must be an integer from 200 to 599;
+            informational statuses (including 101) and out-of-range values are
+            rejected at construction rather than coerced. Statuses 204, 205, and
+            304 force an empty body. A configured 2xx status never establishes a
+            CONNECT/Extended CONNECT tunnel — those requests fail closed with 403.
         content_type:
           type: string
           default: application/json
           description: >-
-            `Content-Type` header value. The default-body renderer uses this to
-            choose between JSON, XML, and plain-text formatting (substring
-            match for `json` / `xml`).
+            `Content-Type` header value. The default-body renderer classifies the
+            media subtype exactly as `json`/`xml` or an RFC 6838 structured
+            suffix (`+json`/`+xml`) after stripping parameters — not by arbitrary
+            substring match (so `application/notjson` is plain text).
         body:
           type: string
-          default: ""
           description: >-
-            Explicit response body. When set (non-empty) it is returned
-            verbatim and `message` is ignored.
+            Explicit response body. When the field is present — including an
+            explicit empty string — it is returned verbatim and `message` is
+            ignored. Omitting the field selects the default renderer built from
+            `message`. Must be empty or omitted for statuses 204, 205, and 304.
         message:
           type: string
           default: Service unavailable
           description: >-
-            Used to build the default body when `body` is empty. Rendered as a
+            Used to build the default body when `body` is omitted. Rendered as a
             JSON `message` field, an XML `<message>` element, or plain text
-            depending on `content_type`. JSON and XML escaping are applied
-            automatically.
+            depending on `content_type`. JSON escaping and XML 1.0 character
+            validation/escaping are applied automatically; XML-invalid control
+            characters in `message` are rejected when XML rendering is selected.
         trigger:
           type: object
+          additionalProperties: false
           description: >-
             Optional trigger condition. Without a trigger every request on the
             proxy is terminated (maintenance-mode default). Set only one of
-            `path_prefix` or `header`; configuring both is rejected.
+            `path_prefix` or `header`; configuring both is rejected. Unknown
+            nested keys are rejected.
           properties:
             path_prefix:
               type: string
@@ -16377,16 +16388,18 @@ components:
             header:
               type: string
               description: >-
-                Only terminate when this request header is present. The
-                comparison is case-insensitive on the header name. Mutually
-                exclusive with `path_prefix`.
+                Only terminate when this request header is present on any raw
+                field line (including non-UTF-8 values). The comparison is
+                case-insensitive on the header name. Mutually exclusive with
+                `path_prefix`.
             header_value:
               type: string
               default: ""
               description: >-
                 Optional exact value for `header`. Empty (default) matches
-                any value, so the trigger fires whenever the header is
-                present.
+                presence of any field line. A non-empty value matches when any
+                individual field line equals that value exactly — never against
+                a comma-folded multi-line serialization.
 
     ResponseMockConfig:
       type: object

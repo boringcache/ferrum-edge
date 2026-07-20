@@ -6073,6 +6073,116 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
 }
 
 #[test]
+fn request_termination_schema_matches_strict_runtime_contract() {
+    use ferrum_edge::plugins::request_termination::{
+        REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/RequestTerminationConfig")
+        .expect("RequestTerminationConfig component exists");
+
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("RequestTerminationConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = REQUEST_TERMINATION_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(schema_fields, runtime_fields);
+
+    assert_eq!(schema["properties"]["status_code"]["minimum"], 200);
+    assert_eq!(schema["properties"]["status_code"]["maximum"], 599);
+    assert!(
+        schema["properties"]["body"].get("default").is_none(),
+        "body must not default to empty string — omission and \"\" differ at runtime"
+    );
+    assert_eq!(
+        schema["properties"]["trigger"]["additionalProperties"],
+        false
+    );
+    let trigger_fields: BTreeSet<_> = schema["properties"]["trigger"]["properties"]
+        .as_object()
+        .expect("trigger properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_trigger: BTreeSet<_> = REQUEST_TERMINATION_TRIGGER_KEYS.iter().copied().collect();
+    assert_eq!(trigger_fields, runtime_trigger);
+
+    let status_desc = schema["properties"]["status_code"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(status_desc.contains("rejected"));
+    assert!(!status_desc.contains("coerced"));
+    let content_desc = schema["properties"]["content_type"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(content_desc.contains("+json") || content_desc.contains("structured"));
+    assert!(!content_desc.contains("substring"));
+
+    for valid in [
+        json!({}),
+        json!({"status_code": 451, "message": "unavailable"}),
+        json!({"status_code": 204}),
+        json!({"body": "", "message": "ignored"}),
+        json!({
+            "status_code": 403,
+            "content_type": "application/hal+json",
+            "trigger": {"path_prefix": "/admin"}
+        }),
+        json!({
+            "trigger": {"header": "x-maintenance", "header_value": "1"}
+        }),
+    ] {
+        assert_component_validity(&spec, "RequestTerminationConfig", &valid, true);
+        RequestTermination::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        serde_json::Value::Null,
+        json!([]),
+        json!("enabled"),
+        json!({"triger": {"path_prefix": "/admin"}}),
+        json!({"status_code": 100}),
+        json!({"status_code": 101}),
+        json!({"status_code": 700}),
+        json!({"trigger": {"path_prefix": "/a", "extra": true}}),
+        json!({"unknown": true}),
+    ] {
+        assert_component_validity(&spec, "RequestTerminationConfig", &invalid, false);
+        assert!(
+            RequestTermination::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    // Runtime contracts that JSON Schema cannot express alone.
+    for runtime_only in [
+        json!({"status_code": 204, "body": "x"}),
+        json!({"content_type": "application/xml", "message": "\u{0001}"}),
+        json!({"trigger": {"path_prefix": "/a", "header": "x"}}),
+    ] {
+        assert!(
+            RequestTermination::new(&runtime_only).is_err(),
+            "runtime must reject {runtime_only}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("Configuration must be a top-level object."));
+    assert!(guide.contains("unknown top-level or nested `trigger` keys are rejected"));
+    assert!(guide.contains("`body: \"\"`"));
+    assert!(guide.contains("XML 1.0"));
+    assert!(guide.contains("individual field line"));
+}
+
+#[test]
 fn response_caching_schema_matches_strict_runtime_contract() {
     use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
     use ferrum_edge::plugins::validate_plugin_config;

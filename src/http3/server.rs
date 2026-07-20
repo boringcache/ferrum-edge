@@ -10457,7 +10457,13 @@ async fn send_h3_finalized_reject_response(
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;
     stream.send_response(resp).await?;
-    stream.send_data(Bytes::copy_from_slice(body)).await?;
+    // Callers that flow through `apply_reject_after_proxy_and_synthetic_body_hooks`
+    // already applied shared HEAD/204/205/304 no-body preparation. Skip DATA
+    // entirely when there is nothing to send so HEAD and no-body statuses never
+    // emit an empty DATA frame before FIN.
+    if !body.is_empty() {
+        stream.send_data(Bytes::copy_from_slice(body)).await?;
+    }
     stream.finish().await?;
     crate::http3::stream_util::halt_request_body(stream);
     Ok(())

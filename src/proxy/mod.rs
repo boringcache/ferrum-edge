@@ -14610,7 +14610,7 @@ fn should_apply_synthetic_response_body_hooks(
         || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
     !is_grpc_request
         && governed_synthetic_status
-        && !matches!(status_code, 204 | 205 | 304)
+        && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
         && !response_body.is_empty()
         && plugins.iter().any(|plugin| {
             plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
@@ -14975,6 +14975,18 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             break;
         }
     }
+
+    // Final wire shape for synthetic/reject responses: HEAD keeps representation
+    // metadata (Content-Length) but omits content bytes; 204/205/304 omit both
+    // content and Content-Length. Applied here so H1/H2 finalize and every H3
+    // path that runs this shared hook cannot diverge.
+    *body = crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+        &ctx.method,
+        *status,
+        headers,
+        body,
+    )
+    .into_owned();
 }
 
 pub(crate) struct AfterProxyReject {

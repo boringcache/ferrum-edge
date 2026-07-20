@@ -2520,20 +2520,22 @@ Returns a predefined response without proxying to the backend. Useful for mainte
 
 The response body and `Content-Type` are rendered **once** at construction time — the request hot path skips `format!()`, JSON/XML escaping, and `String::replace()` chains entirely. Repeated dispatch returns identical, immutable bytes.
 
+Configuration must be a top-level object. Accepted keys are `status_code`, `content_type`, `body`, `message`, and `trigger`; unknown top-level or nested `trigger` keys are rejected instead of being ignored (a typo such as `triger` must not silently become unconditional termination). Scalar/array/`null` configs are rejected. `{}` remains the intentional maintenance-mode default.
+
 **Priority:** 125
 **Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `status_code` | u16 | `503` | HTTP status code to return. Values outside 100–599 are coerced to 503. |
-| `body` | String | `""` | Explicit response body. When set (non-empty) it is returned verbatim and `message` is ignored. |
-| `content_type` | String | `application/json` | Response `Content-Type` header. Substring match for `json` / `xml` decides how `message` is rendered. |
-| `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is empty. JSON and XML special characters are escaped automatically. |
+| `status_code` | u16 | `503` | Final HTTP status (200–599). Informational statuses including `101` and out-of-range values are rejected at construction. `204`/`205`/`304` force an empty body (explicit non-empty `body` is rejected). A configured 2xx never establishes a CONNECT/Extended CONNECT tunnel — those requests fail closed with `403`. |
+| `body` | String | _(omit)_ | Explicit response body. Field presence — including `body: ""` — is authoritative and suppresses `message`. Omitting the field selects the default renderer. |
+| `content_type` | String | `application/json` | Response `Content-Type` header. Default-body formatting uses exact subtype `json`/`xml` or RFC 6838 `+json`/`+xml` suffixes after parameter stripping — not arbitrary substrings (`application/notjson` is plain text). |
+| `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is omitted. JSON escaping is applied automatically. For XML media types, the message must contain only XML 1.0-legal characters (tab/LF/CR and the XML Char ranges); illegal controls are rejected. |
 | `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix. Must start with `/` (or be exactly `*` to match the asterisk-form target of a server-wide `OPTIONS *` request) and contain no control characters; any other value can never match a request path. Mutually exclusive with `trigger.header`. |
-| `trigger.header` | String | _(none)_ | Only terminate when this request header is present. Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
-| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches any value. |
+| `trigger.header` | String | _(none)_ | Only terminate when this request header is present on any raw field line (including non-UTF-8 values). Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
+| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches presence. A non-empty value matches any individual field line exactly — never a comma-folded multi-line serialization. |
 
-Without a trigger every request on the proxy is terminated (maintenance-mode default).
+Without a trigger every request on the proxy is terminated (maintenance-mode default). HEAD responses keep representation metadata (including `Content-Length`) but never send content bytes; H1/H2/H3 share that wire rule.
 
 ```yaml
 # Maintenance window: short-circuit every request with a JSON body
