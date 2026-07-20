@@ -11339,14 +11339,52 @@ components:
 
     UdpLoggingConfig:
       type: object
-      description: "Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in batches."
+      additionalProperties: false
+      description: >-
+        Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in
+        batches. Unknown top-level keys are rejected at construction / Admin
+        validation so transport typos (for example `dtsl`) cannot silently
+        fall back to plaintext. DTLS-only fields require `dtls: true` (omitted
+        or false rejects them) so Admin/spec admission cannot accept plaintext
+        configs that runtime would ignore. Registration policy is
+        OptionalFailOpen (invalid enabled instances are omitted from the
+        published cache).
       required:
         - host
         - port
+      allOf:
+        - if:
+            required: [dtls]
+            properties:
+              dtls:
+                const: true
+          then:
+            dependentRequired:
+              dtls_cert_path: [dtls_key_path]
+              dtls_key_path: [dtls_cert_path]
+          else:
+            not:
+              anyOf:
+                - required: [dtls_cert_path]
+                - required: [dtls_key_path]
+                - required: [dtls_ca_cert_path]
+                - required: [dtls_no_verify]
       properties:
         host:
           type: string
-          description: UDP endpoint hostname or IP address
+          minLength: 1
+          # Match runtime parse_socket_host: hostname or IP without scheme,
+          # path, query, fragment, credentials, or a single-colon host:port.
+          # Valid IPv6 literals necessarily contain at least two colons.
+          not:
+            anyOf:
+              - pattern: "://"
+              - pattern: "[/?#@\\s]"
+              - pattern: "^[^\\[\\]:]+:[^:]+$"
+          description: >-
+            UDP endpoint hostname or IP address. Must be a bare hostname or IP
+            without scheme, path, query, fragment, credentials, or port
+            (bracketed and unbracketed IPv6 literals are allowed).
         port:
           type: integer
           minimum: 1
@@ -11355,20 +11393,39 @@ components:
         dtls:
           type: boolean
           default: false
-          description: Enable DTLS encryption for log datagrams
+          description: >-
+            Enable DTLS encryption for log datagrams. Shared Admin / CP validation
+            checks configuration shape without opening node-local sources. On the
+            consuming node, certificate/key/CA sources are materialized and cached
+            for the plugin generation. When false or omitted, DTLS-only fields are
+            rejected.
         dtls_cert_path:
           type: string
-          description: PEM client certificate for DTLS mutual TLS
+          minLength: 1
+          description: >-
+            PEM client certificate for DTLS mutual TLS. Materialized during the
+            consuming node's dependency/construction phase when dtls is true; must
+            be paired with dtls_key_path. Rejected unless dtls is true.
         dtls_key_path:
           type: string
-          description: PEM private key for DTLS mutual TLS (must be paired with dtls_cert_path)
+          minLength: 1
+          description: >-
+            PEM private key for DTLS mutual TLS (ECDSA P-256 or P-384). Must be
+            paired with dtls_cert_path. Rejected unless dtls is true.
         dtls_ca_cert_path:
           type: string
-          description: PEM CA certificate for verifying the DTLS server
+          minLength: 1
+          description: >-
+            PEM CA certificate for verifying the DTLS server. Materialized on the
+            consuming node whenever set with dtls true, including when dtls_no_verify
+            is true (the source must still be valid even though verification is
+            disabled). Rejected unless dtls is true.
         dtls_no_verify:
           type: boolean
           default: false
-          description: Skip DTLS server certificate verification (testing only)
+          description: >-
+            Skip DTLS server certificate verification (testing only). Rejected
+            unless dtls is true.
         batch_size:
           type: integer
           default: 10

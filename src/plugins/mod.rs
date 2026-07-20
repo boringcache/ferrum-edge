@@ -6760,6 +6760,11 @@ pub(crate) fn validate_plugin_config_with_http_client(
     if name == "geo_restriction" {
         return geo_restriction::GeoRestriction::validate_config(config);
     }
+    if name == "udp_logging" {
+        // Shape-only: shared Admin / CP validation must not open node-local
+        // DTLS paths. Mode-aware dependency validation and construction do.
+        return udp_logging::UdpLogging::validate_config(config, http_client);
+    }
     if name == "oidc_relying_party" {
         screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
