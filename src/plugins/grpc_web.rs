@@ -27,6 +27,11 @@
 //!
 //! ## Configuration
 //!
+//! Config must be a JSON object. Explicit `null`, arrays, scalars, and booleans
+//! are rejected (`grpc_web: config must be an object`). Unknown object keys are
+//! rejected with path-qualified diagnostics (and spelling suggestions when the
+//! typo is close). Empty `{}` is valid and uses defaults.
+//!
 //! ```json
 //! {
 //!   "name": "grpc_web",
@@ -48,7 +53,12 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
+use crate::util::unknown_keys::reject_unknown_keys;
+
 use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
+
+/// Authoritative top-level keys accepted by [`GrpcWebPlugin::new`].
+pub const GRPC_WEB_CONFIG_KEYS: &[&str] = &["expose_headers"];
 
 /// Metadata key storing the original gRPC-Web mode ("text" or "binary").
 const META_GRPC_WEB_MODE: &str = "grpc_web_mode";
@@ -296,6 +306,13 @@ pub struct GrpcWebPlugin {
 
 impl GrpcWebPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
+        // Build-out policy: require an explicit object. `null` is not an alias
+        // for `{}` — omit the plugin or pass `{}` / a full object instead.
+        let object = config
+            .as_object()
+            .ok_or_else(|| "grpc_web: config must be an object".to_string())?;
+        reject_unknown_keys(object, "config", GRPC_WEB_CONFIG_KEYS, "grpc_web: ")?;
+
         let mut expose_headers = BASE_EXPOSE_HEADERS
             .iter()
             .map(|header| (*header).to_string())
