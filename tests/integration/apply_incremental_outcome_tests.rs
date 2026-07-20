@@ -1339,6 +1339,70 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("load-testing-policy", true);
+    plugin.plugin_name = "load_testing".to_string();
+    plugin.config = serde_json::json!({
+        "key": "stable-key",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "ramp": true
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "load_testing")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "key": "must-not-publish",
+        "concurrent_clients": 50,
+        "duration_seconds": 30,
+        "rmap": true,
+        "request_timeot_ms": 5000
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let outcome = state.update_config(invalid);
+    let ConfigApplyOutcome::Rejected { errors } = outcome else {
+        panic!("unknown load_testing keys must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("load_testing")
+            && error.contains("unknown configuration key")
+            && (error.contains("request_timeot_ms") || error.contains("rmap"))
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["key"],
+        "stable-key"
+    );
+    assert_eq!(state.config.load().plugin_configs[0].config["ramp"], true);
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "load_testing"),
+        "rejected reload must retain the last-known-good load_testing generation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
     let state = empty_proxy_state();
     let mut plugin = test_plugin_config("stream-router-policy", true);

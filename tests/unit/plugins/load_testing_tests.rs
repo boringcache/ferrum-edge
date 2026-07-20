@@ -1,6 +1,7 @@
-use ferrum_edge::plugins::load_testing::LoadTesting;
+use ferrum_edge::plugins::load_testing::{LOAD_TESTING_CONFIG_KEYS, LoadTesting};
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
+    RequestContext, plugin_failure_policy, priority, validate_plugin_config,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -183,6 +184,138 @@ fn test_valid_full_config() {
         "gateway_addresses": ["https://node2:8443"]
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
+}
+
+#[test]
+fn test_valid_config_with_every_supported_field() {
+    let config = json!({
+        "key": "full-surface-key",
+        "concurrent_clients": 25,
+        "duration_seconds": 45,
+        "ramp": true,
+        "request_timeout_ms": 5000,
+        "max_response_body_bytes": 2048,
+        "gateway_port": 8443,
+        "gateway_tls": true,
+        "gateway_tls_no_verify": true,
+        "gateway_addresses": ["https://127.0.0.1:8443", "https://10.0.0.2:8443"]
+    });
+    assert_eq!(
+        config.as_object().unwrap().len(),
+        LOAD_TESTING_CONFIG_KEYS.len(),
+        "fixture must exercise every accepted top-level key"
+    );
+    for key in LOAD_TESTING_CONFIG_KEYS {
+        assert!(
+            config.get(*key).is_some(),
+            "complete fixture missing supported key `{key}`"
+        );
+    }
+    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
+    assert!(validate_plugin_config("load_testing", &config).is_ok());
+}
+
+#[test]
+fn test_optional_null_fields_still_select_defaults() {
+    let config = json!({
+        "key": "null-defaults",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "ramp": null,
+        "request_timeout_ms": null,
+        "max_response_body_bytes": null,
+        "gateway_port": null,
+        "gateway_tls": null,
+        "gateway_tls_no_verify": null,
+        "gateway_addresses": null
+    });
+    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
+}
+
+#[test]
+fn test_rejects_one_typo_with_path_qualified_suggestion() {
+    let config = json!({
+        "key": "test-key",
+        "concurrent_clients": 50,
+        "duration_seconds": 30,
+        "request_timeot_ms": 5000
+    });
+    let err = LoadTesting::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("typo must be rejected");
+    assert!(
+        err.contains("unknown configuration key"),
+        "missing unknown-key wording: {err}"
+    );
+    assert!(
+        err.contains("'config.request_timeot_ms'"),
+        "error must path-qualify the typo: {err}"
+    );
+    assert!(
+        err.contains("did you mean 'request_timeout_ms'"),
+        "error must suggest the canonical spelling: {err}"
+    );
+}
+
+#[test]
+fn test_rejects_multiple_unknown_keys_sorted_with_suggestions() {
+    let config = json!({
+        "key": "test-key",
+        "concurrent_clients": 50,
+        "duration_seconds": 30,
+        "rmap": true,
+        "request_timeot_ms": 5000,
+        "gateway_adresses": ["https://node2:8443"]
+    });
+    let err = LoadTesting::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("multiple typos must be rejected");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
+    let gateway = err
+        .find("'config.gateway_adresses'")
+        .expect("gateway_adresses present");
+    let request = err
+        .find("'config.request_timeot_ms'")
+        .expect("request_timeot_ms present");
+    let ramp = err.find("'config.rmap'").expect("rmap present");
+    assert!(
+        gateway < request && request < ramp,
+        "unknown keys must be sorted lexicographically: {err}"
+    );
+    assert!(
+        err.contains("did you mean 'gateway_addresses'"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("did you mean 'request_timeout_ms'"),
+        "got: {err}"
+    );
+    assert!(err.contains("did you mean 'ramp'"), "got: {err}");
+}
+
+#[test]
+fn shared_file_admin_database_cp_dp_admission_rejects_unknown_keys() {
+    assert_eq!(
+        plugin_failure_policy("load_testing"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+
+    let config = json!({
+        "key": "test-key",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "request_timeot_ms": 5000
+    });
+    let err = validate_plugin_config("load_testing", &config)
+        .expect_err("shared admission must reject the typo for file/admin/database/CP-DP");
+    assert!(
+        err.contains("'config.request_timeot_ms'"),
+        "shared admission must path-qualify the unknown key: {err}"
+    );
+    assert!(
+        err.contains("did you mean 'request_timeout_ms'"),
+        "shared admission must retain spelling suggestions: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
