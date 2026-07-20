@@ -15390,7 +15390,8 @@ components:
 
     SseConfig:
       type: object
-      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers."
+      additionalProperties: false
+      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers. Unknown keys and non-object configs are rejected. Explicit null members are rejected; omitted keys keep defaults. wrap_non_sse_responses implies client-visible text/event-stream for wrapped responses."
       properties:
         require_get_method:
           type: boolean
@@ -15415,7 +15416,8 @@ components:
         retry_ms:
           type: integer
           format: uint64
-          description: "EventSource reconnection hint in milliseconds"
+          minimum: 1
+          description: "EventSource reconnection hint in milliseconds (must be >= 1 when set)"
         force_sse_content_type:
           type: boolean
           default: false
@@ -15423,7 +15425,7 @@ components:
         wrap_non_sse_responses:
           type: boolean
           default: false
-          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering)"
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type."
 
     RateLimitingRuleConfig:
       type: object

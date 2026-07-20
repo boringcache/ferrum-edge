@@ -349,6 +349,40 @@ pub fn is_backend_response_strip_header(name: &str) -> bool {
     )
 }
 
+/// Case-insensitive final-wire counterpart for plugin-produced response maps.
+///
+/// Keep the common lowercase path on the canonical match above. Only names
+/// containing uppercase ASCII need the slower defensive comparison because
+/// backend decoding already normalizes names while plugins may not.
+#[inline]
+fn is_client_response_hop_by_hop_header(name: &str) -> bool {
+    if is_backend_response_strip_header(name) {
+        return true;
+    }
+    if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return false;
+    }
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+}
+
+/// Whether a plugin-produced response map needs a final hop-by-hop strip.
+/// A dynamic Connection-nominated field necessarily arrives with Connection,
+/// so detecting the static field is sufficient to trigger the full pass.
+pub(crate) fn has_client_response_hop_by_hop_headers(
+    headers: &std::collections::HashMap<String, String>,
+) -> bool {
+    headers
+        .keys()
+        .any(|name| is_client_response_hop_by_hop_header(name))
+}
+
 /// In-place RFC 9110 §7.6.1 response-direction hop-by-hop trailer strip.
 ///
 /// Shared by the H2 streaming wrapper (`proxy::body::StripHopByHopTrailers`)
@@ -371,6 +405,27 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     for name in to_remove {
         trailers.remove(&name);
     }
+}
+
+/// Strip response-direction hop-by-hop names from a plugin header map.
+///
+/// Used as a final sanitation pass on HTTP/3 client-facing responses after
+/// `after_proxy` hooks (which may reintroduce connection-specific fields such
+/// as `Connection: keep-alive`) and before every H3 response writer. H1 may
+/// still carry intentional connection options; H3 must not (RFC 9114 §4.2).
+pub fn strip_client_response_hop_by_hop_headers(
+    headers: &mut std::collections::HashMap<String, String>,
+) {
+    // Snapshot Connection-nominated names before removing Connection itself.
+    // Plugins can synthesize mixed-case keys, so both the static and dynamic
+    // comparisons are case-insensitive at this final wire boundary.
+    let connection_listed = parse_connection_listed_from_str_map(headers);
+    headers.retain(|name, _| {
+        !is_client_response_hop_by_hop_header(name)
+            && !connection_listed
+                .iter()
+                .any(|listed| name.eq_ignore_ascii_case(listed))
+    });
 }
 
 /// Append a cookie to the proxy's newline-separated multi-value representation.
