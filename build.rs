@@ -87,10 +87,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // directory. If someone drops one there anyway, ignore it
                 // unless it was explicitly opted in via FERRUM_CUSTOM_PLUGINS.
                 if stem.starts_with("example_") {
-                    if let Some(ref allowed) = filter {
-                        if allowed.contains(&stem) {
-                            plugin_sources.push((stem, path));
-                        }
+                    if let Some(ref allowed) = filter
+                        && allowed.contains(&stem)
+                    {
+                        plugin_sources.push((stem, path));
                     }
                     continue;
                 }
