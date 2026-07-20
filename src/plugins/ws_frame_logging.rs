@@ -82,18 +82,6 @@ impl LogLevel {
         }
     }
 
-    /// Hot-path preview gate. Uses `tracing::enabled!` (callsite-cached); fine
-    /// under the process-global gateway subscriber where `LevelFilter::current`
-    /// matches the EnvFilter.
-    fn is_enabled(self) -> bool {
-        match self {
-            Self::Trace => tracing::enabled!(target: "ws_frame_log", Level::TRACE),
-            Self::Debug => tracing::enabled!(target: "ws_frame_log", Level::DEBUG),
-            Self::Info => tracing::enabled!(target: "ws_frame_log", Level::INFO),
-            Self::Warn => tracing::enabled!(target: "ws_frame_log", Level::WARN),
-        }
-    }
-
     /// Construction-time admission probe for the *active* dispatcher only.
     ///
     /// `tracing::enabled!` is not suitable here: it consults the process-global
