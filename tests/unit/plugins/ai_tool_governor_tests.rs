@@ -8665,13 +8665,14 @@ async fn redact_args_amplification_fails_closed_in_enforce() {
 /// re-check cannot hash-skip an unredacted secret.
 #[tokio::test]
 async fn redact_args_amplification_clears_hash_on_transform() {
-    let plugin = make(amplifying_redact_config("dry_run"));
+    let plugin = make(amplifying_redact_config("enforce"));
     let body = response_with_tool_call("search", &amplifying_argument_blob());
     let mut ctx = create_test_context();
-    assert_continue(
+    assert_reject(
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
+        Some(502),
     );
     assert!(
         plugin
@@ -8686,12 +8687,13 @@ async fn redact_args_amplification_clears_hash_on_transform() {
         "amplifying redact must decline the rewrite"
     );
 
-    // Hash cleared → final re-check sees redaction-unavailable and still
-    // observationally labels the call in dry-run (no cut).
-    assert_continue(
+    // Hash cleared: the final re-check cannot hash-skip the raw body and fails
+    // closed because redaction is no longer available on that lifecycle hook.
+    assert_reject(
         plugin
             .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
+        Some(502),
     );
 }
 
@@ -8784,15 +8786,17 @@ async fn redact_placeholder_name_expansion_fails_closed() {
 #[test]
 fn rejects_non_positive_approval_timeout() {
     for timeout_ms in [json!(0), json!(-1), json!("fast"), json!(1.5)] {
-        let err = try_make(json!({
+        let result = try_make(json!({
             "tools": { "deploy": { "action": "require_approval" } },
             "approval": {
                 "endpoint_url": "https://approval.example/decide",
-                "timeout_ms": timeout_ms
+                "timeout_ms": timeout_ms.clone()
             }
-        }))
-        .err()
-        .expect("non-positive timeout_ms must be rejected");
+        }));
+        let err = match result {
+            Ok(_) => panic!("non-positive timeout_ms must be rejected"),
+            Err(err) => err,
+        };
         assert!(
             err.contains("timeout_ms") && err.contains("positive"),
             "unexpected error for {timeout_ms}: {err}"
