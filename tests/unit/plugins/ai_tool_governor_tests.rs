@@ -9115,10 +9115,11 @@ async fn aggregate_redacted_arguments_cannot_exceed_response_limit() {
     }))
     .unwrap();
     let mut ctx = create_test_context();
-    assert_continue(
+    assert_reject(
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
+        Some(502),
     );
     assert!(
         plugin
