@@ -1156,13 +1156,14 @@ async fn test_ws_logging_binary_and_repeated_ack_generations() {
             sink.send(Message::Ping(b"gen3-alive".to_vec().into()))
                 .await
                 .expect("send Ping on gen3");
-            let mut saw_pong = false;
+            let mut pong_tx = Some(pong_tx);
             while let Some(msg) = read.next().await {
                 match msg {
-                    Ok(Message::Pong(data)) if !saw_pong => {
-                        let _ = pong_tx.send(data.to_vec());
-                        saw_pong = true;
-                        let _ = sink.send(Message::Close(None)).await;
+                    Ok(Message::Pong(data)) => {
+                        if let Some(pong_tx) = pong_tx.take() {
+                            let _ = pong_tx.send(data.to_vec());
+                            let _ = sink.send(Message::Close(None)).await;
+                        }
                     }
                     Ok(Message::Close(_)) | Err(_) => {
                         let _ = close_tx.send(());
