@@ -659,23 +659,25 @@ impl KafkaProducerState {
         let result = if pending_before == 0 && admitted == 0 {
             Ok(())
         } else {
-            self.producer.flush(self.flush_timeout).inspect_err(|error| {
-                let remaining = self.producer.in_flight_count().max(0) as u64;
-                let timed_out = matches!(
-                    error,
-                    KafkaError::Flush(RDKafkaErrorCode::OperationTimedOut)
-                );
-                let incomplete = if remaining > 0 {
-                    remaining
-                } else {
-                    pending_before
-                };
-                self.metrics.record_flush_failure(
-                    safe_kafka_error_kind(error),
-                    timed_out,
-                    incomplete,
-                );
-            })
+            self.producer
+                .flush(self.flush_timeout)
+                .inspect_err(|error| {
+                    let remaining = self.producer.in_flight_count().max(0) as u64;
+                    let timed_out = matches!(
+                        error,
+                        KafkaError::Flush(RDKafkaErrorCode::OperationTimedOut)
+                    );
+                    let incomplete = if remaining > 0 {
+                        remaining
+                    } else {
+                        pending_before
+                    };
+                    self.metrics.record_flush_failure(
+                        safe_kafka_error_kind(error),
+                        timed_out,
+                        incomplete,
+                    );
+                })
         };
         // This flag means the one owned flush attempt completed, not merely
         // that it started. Callers waiting on the lifecycle lock therefore do
@@ -857,11 +859,9 @@ impl KafkaGeneration {
             .is_err()
         {
             let incomplete = state.producer.in_flight_count().max(0) as u64;
-            state.metrics.record_flush_failure(
-                "flush_task_join_failed",
-                false,
-                incomplete.max(1),
-            );
+            state
+                .metrics
+                .record_flush_failure("flush_task_join_failed", false, incomplete.max(1));
             state.finalized.store(true, Ordering::Release);
         }
     }
@@ -948,12 +948,7 @@ pub async fn finalize_all_generations() {
     // Independent producers share no lifecycle state. Finalize them
     // concurrently so the shutdown/reload ceiling is the slowest configured
     // producer budget, rather than the sum of every live generation's budget.
-    futures::future::join_all(
-        generations
-            .iter()
-            .map(|generation| generation.finalize()),
-    )
-    .await;
+    futures::future::join_all(generations.iter().map(|generation| generation.finalize())).await;
     for generation in generations {
         unregister_generation(generation.state.metrics.generation_id);
     }

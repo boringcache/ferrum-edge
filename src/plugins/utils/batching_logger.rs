@@ -292,7 +292,11 @@ impl<T: Send + 'static> BatchingLogger<T> {
             return false;
         };
         let depth = self.queue_depth.load(Ordering::Relaxed);
-        if is_high_water(depth, self.buffer_capacity, self.hooks.high_watermark_percent) {
+        if is_high_water(
+            depth,
+            self.buffer_capacity,
+            self.hooks.high_watermark_percent,
+        ) {
             if let Some(on_high_water) = self.hooks.on_high_water.as_ref() {
                 on_high_water(depth, self.buffer_capacity);
             }
@@ -379,7 +383,11 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
     /// silently drops intermediate entries so the hot path never blocks.
     pub fn try_send(&self, item: T) -> bool {
         let depth = self.queue_depth.load(Ordering::Relaxed);
-        if is_high_water(depth, self.buffer_capacity, self.hooks.high_watermark_percent) {
+        if is_high_water(
+            depth,
+            self.buffer_capacity,
+            self.hooks.high_watermark_percent,
+        ) {
             if let Some(on_high_water) = self.hooks.on_high_water.as_ref() {
                 on_high_water(depth, self.buffer_capacity);
             }
