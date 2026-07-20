@@ -348,9 +348,16 @@ fn assert_unknown_key_error(err: &str, path_fragment: &str, typo: &str) {
     );
 }
 
+type UnknownKeyCase = (
+    &'static str,
+    fn() -> Value,
+    &'static str,
+    Option<&'static str>,
+);
+
 #[test]
 fn rejects_enforcement_relevant_unknown_keys_with_path_and_suggestion() {
-    let cases: &[(&str, fn() -> Value, &str, Option<&str>)] = &[
+    let cases: &[UnknownKeyCase] = &[
         (
             "modde",
             || {
