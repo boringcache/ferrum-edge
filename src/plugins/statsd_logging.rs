@@ -328,8 +328,14 @@ pub fn bounded_method_tag(method: &str) -> &'static str {
         .unwrap_or(OTHER_METHOD)
 }
 
-fn validate_statsd_schema_keys(schema: Option<&SummarySchema>) -> Result<(), String> {
+fn validate_statsd_schema_keys(
+    schema: Option<&SummarySchema>,
+) -> Result<HashSet<String>, String> {
     let mut seen = HashSet::new();
+    let mut runtime_keys: HashSet<String> = RESERVED_TAG_KEYS
+        .iter()
+        .map(|key| key.to_ascii_lowercase())
+        .collect();
     let mappings = [
         ("http", HTTP_TAG_NATIVE, &["method", "status", "proxy"][..]),
         (
@@ -365,12 +371,17 @@ fn validate_statsd_schema_keys(schema: Option<&SummarySchema>) -> Result<(), Str
                     "statsd_logging: schema produces duplicate {family} tag key '{validated}'"
                 ));
             }
+            runtime_keys.insert(validated.to_ascii_lowercase());
         }
     }
-    Ok(())
+    Ok(runtime_keys)
 }
 
-fn build_global_tags(config: &Value, namespace: &str) -> Result<String, String> {
+fn build_global_tags(
+    config: &Value,
+    namespace: &str,
+    runtime_tag_keys: &HashSet<String>,
+) -> Result<String, String> {
     let mut pairs = Vec::new();
     let mut seen_keys = HashSet::new();
 
@@ -383,6 +394,12 @@ fn build_global_tags(config: &Value, namespace: &str) -> Result<String, String> 
             let validated = validate_tag_key(key)?;
             validate_reserved_tag_key(validated, "global_tags")?;
             let dedupe = validated.to_ascii_lowercase();
+            if runtime_tag_keys.contains(&dedupe) {
+                return Err(format!(
+                    "statsd_logging: global_tags key '{validated}' collides with a schema-owned \
+                     runtime tag"
+                ));
+            }
             if !seen_keys.insert(dedupe) {
                 return Err(format!(
                     "statsd_logging: duplicate global_tags key '{validated}' after normalization"
@@ -528,11 +545,10 @@ impl StatsdLogging {
             ));
         }
 
-        let global_tags = build_global_tags(config, ns)?;
-
         warn_on_unsupported_inline_schema_keys(config);
         let schema = resolve_schema(config, "statsd_logging", SchemaCapabilities::BASE)?;
-        validate_statsd_schema_keys(schema.as_deref())?;
+        let runtime_tag_keys = validate_statsd_schema_keys(schema.as_deref())?;
+        let global_tags = build_global_tags(config, ns, &runtime_tag_keys)?;
 
         let flush_config = StatsdFlushConfig {
             hostname: host.clone(),

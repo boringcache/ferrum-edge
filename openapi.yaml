@@ -11632,7 +11632,7 @@ components:
         server over UDP. Unknown top-level keys are rejected at construction /
         Admin validation. Nested `global_tags` remains an intentionally open
         string map, but keys must match [A-Za-z_][A-Za-z0-9_.-]* (max 64 bytes)
-        and cannot override reserved runtime tags (namespace, method, status,
+        and cannot override reserved or schema-renamed runtime tags (namespace, method, status,
         status_class, proxy, protocol, error, cause, direction, body_outcome,
         body_error, result, io_side, error_class). The authoritative namespace
         tag is always appended and preserves the full validated Ferrum namespace
@@ -11684,7 +11684,8 @@ components:
           description: >-
             Extra DogStatsD tags appended to every metric. Keys must match
             `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 ASCII bytes) and cannot
-            override reserved runtime tags (enforced at construction).
+            override reserved runtime tags or effective schema-renamed runtime
+            keys (enforced at construction).
             Encoded global_tags (+ authoritative namespace) are capped at
             400 bytes.
         flush_interval_ms:

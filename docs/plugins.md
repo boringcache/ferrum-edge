@@ -402,14 +402,14 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 
 **Priority:** 9075
 
-**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 bytes) and must not collide with reserved runtime tags. Registration policy is `OptionalFailOpen` — Admin create/update still returns HTTP 400 for invalid enabled configs, while file-mode load and plugin-cache rebuild warn and omit the plugin rather than aborting the gateway. Disabled plugin configs skip construction validation.
+**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 bytes) and must not collide with reserved or schema-renamed runtime tags. Registration policy is `OptionalFailOpen` — Admin create/update still returns HTTP 400 for invalid enabled configs, while file-mode load and plugin-cache rebuild warn and omit the plugin rather than aborting the gateway. Disabled plugin configs skip construction validation.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | StatsD server hostname or IP address |
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
 | `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Sanitized for line-protocol safety; max 256 bytes after sanitization. |
-| `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`). Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
+| `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`) or any effective key introduced by a schema rename. Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing |
@@ -422,7 +422,7 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 
 **DNS handling.** The StatsD endpoint is resolved through the gateway's shared `DnsCache` at startup (pre-warmed via `warmup_hostnames()`) and re-resolved every 60 seconds by the background flush task. If the resolved address changes (DNS flip, service discovery update), the UDP socket is rebound to the new address without a gateway restart.
 
-**Tag sanitization and reserved identity.** Tag *values* (proxy name/id, protocol, configured global-tag values, and the authoritative namespace) replace `,` `|` `#` `:` whitespace and every Unicode control character with `_`. Empty values become the literal `none`. Request-derived values are capped at 64 bytes; the authoritative `namespace` tag preserves the full validated Ferrum namespace (up to 254 bytes) so distinct tenants cannot collide through silent truncation. Configured tag *keys* and schema rename targets are fail-closed validated (not rewritten). The gateway `namespace` tag is always appended and cannot be overridden by `global_tags`.
+**Tag sanitization and reserved identity.** Tag *values* (proxy name/id, protocol, configured global-tag values, and the authoritative namespace) replace `,` `|` `#` `:` whitespace and every Unicode control character with `_`. Empty values become the literal `none`. Request-derived values are capped at 64 bytes; the authoritative `namespace` tag preserves the full validated Ferrum namespace (up to 254 bytes) so distinct tenants cannot collide through silent truncation. Configured tag *keys* and schema rename targets are fail-closed validated (not rewritten). The gateway `namespace` tag is always appended and cannot be overridden by `global_tags`; `global_tags` also cannot duplicate an effective schema-renamed runtime key.
 
 **Mirror accounting.** Summaries with `mirror: true` are excluded from all `request.*` families. Shadow/mirror probes must not inflate client request counts, latency timers, or status-class series.
 

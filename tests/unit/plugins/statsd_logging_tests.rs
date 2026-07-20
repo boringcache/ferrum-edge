@@ -807,6 +807,19 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
             }),
             "reserved",
         ),
+        // A custom rename becomes runtime-owned for this sink and must not be
+        // duplicated by a collector-global tag with ambiguous precedence.
+        (
+            json!({
+                "host": "127.0.0.1",
+                "global_tags": {"route_id": "spoof"},
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"proxy_id": "route_id"}
+                }
+            }),
+            "runtime tag",
+        ),
     ] {
         let err = StatsdLogging::new(&config, default_client())
             .err()
