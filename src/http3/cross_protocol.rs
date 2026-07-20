@@ -2754,9 +2754,10 @@ where
                     initial_response_header_policy_plugins,
                 )
                 .await;
-                // Set once an `on_response_body` hook replaces the backend
-                // response with a gateway-authored rejection; from that point the
-                // buffered bytes are the gateway's own.
+                // Set once an earlier body phase selects a gateway-authored
+                // terminal response. Transforms still run so presentation and
+                // protocol encoding stays correct, but final-body validators
+                // must not replace the selected error.
                 let mut response_body_rejected = false;
                 for plugin in plugins {
                     let result = plugin
@@ -2801,6 +2802,10 @@ where
                     true,
                 )
                 .await;
+                response_body_rejected |= matches!(
+                    admission,
+                    crate::proxy::BufferedTransformAdmission::Rejected
+                );
                 if matches!(
                     admission,
                     crate::proxy::BufferedTransformAdmission::Proceed {
@@ -2836,29 +2841,31 @@ where
                     }
                 }
 
-                for plugin in plugins {
-                    let result = plugin
-                        .on_final_response_body(
-                            ctx,
-                            response_status,
-                            &response_headers,
-                            &response_body,
-                        )
-                        .await;
-                    match result {
-                        PluginResult::Continue => {}
-                        reject @ PluginResult::Reject { .. }
-                        | reject @ PluginResult::RejectBinary { .. } => {
-                            apply_buffered_plain_plugin_reject(
-                                plugins,
+                if !response_body_rejected {
+                    for plugin in plugins {
+                        let result = plugin
+                            .on_final_response_body(
                                 ctx,
-                                reject,
-                                &mut response_status,
-                                &mut response_headers,
-                                &mut response_body,
+                                response_status,
+                                &response_headers,
+                                &response_body,
                             )
                             .await;
-                            break;
+                        match result {
+                            PluginResult::Continue => {}
+                            reject @ PluginResult::Reject { .. }
+                            | reject @ PluginResult::RejectBinary { .. } => {
+                                apply_buffered_plain_plugin_reject(
+                                    plugins,
+                                    ctx,
+                                    reject,
+                                    &mut response_status,
+                                    &mut response_headers,
+                                    &mut response_body,
+                                )
+                                .await;
+                                break;
+                            }
                         }
                     }
                 }
@@ -4580,9 +4587,10 @@ where
                     );
                 }
             }
-            // Set once an `on_response_body` hook replaces the backend response
-            // with a gateway-authored rejection; from that point the buffered
-            // bytes are the gateway's own.
+            // Set once an earlier body phase selects a gateway-authored terminal
+            // response. Transforms still run so gRPC-Web can emit the correct
+            // client wire shape, but final-body validators must not replace the
+            // selected error.
             let mut response_body_rejected = false;
             for plugin in plugins.iter() {
                 let result = match crate::plugins::await_grpc_deadline(
@@ -4671,6 +4679,7 @@ where
                 );
                 buffered_initial_response_header_policy_state = None;
                 terminal_metadata_is_body_framed |= grpc_web_response_content_type.is_some();
+                response_body_rejected = true;
             }
             let mut representation_rewritten = matches!(
                 admission,
@@ -4715,6 +4724,7 @@ where
                             );
                             terminal_metadata_is_body_framed |=
                                 client_terminal_metadata_is_body_framed;
+                            response_body_rejected = true;
                             break;
                         }
                     };
@@ -4750,49 +4760,51 @@ where
                     &header_shadowed_trailer_keys,
                 );
             }
-            for plugin in plugins.iter() {
-                let result = match crate::plugins::await_grpc_deadline(
-                    ctx.grpc_deadline_at(),
-                    plugin.on_final_response_body(
-                        ctx,
-                        response_status,
-                        &plugin_response_headers,
-                        &response_body,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(()) => {
-                        ctx.mark_gateway_deadline_response_selected();
-                        crate::plugins::grpc_deadline_exceeded_plugin_result()
-                    }
-                };
-                match result {
-                    PluginResult::Continue => {}
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        debug!(
-                            plugin = plugin.name(),
-                            "Plugin rejected finalized buffered H3 gRPC response body"
-                        );
-                        apply_buffered_grpc_plugin_reject(
-                            plugins,
+            if !response_body_rejected {
+                for plugin in plugins.iter() {
+                    let result = match crate::plugins::await_grpc_deadline(
+                        ctx.grpc_deadline_at(),
+                        plugin.on_final_response_body(
                             ctx,
-                            reject,
-                            &mut response_status,
-                            &mut plugin_response_headers,
-                            &mut response_body,
-                            &mut response_trailers,
-                        )
-                        .await;
-                        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                            response_status,
                             &plugin_response_headers,
-                            &mut response_trailers,
-                            &mut authoritative_trailers_only_terminal_metadata,
-                        );
-                        buffered_initial_response_header_policy_state = None;
-                        break;
+                            &response_body,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(()) => {
+                            ctx.mark_gateway_deadline_response_selected();
+                            crate::plugins::grpc_deadline_exceeded_plugin_result()
+                        }
+                    };
+                    match result {
+                        PluginResult::Continue => {}
+                        reject @ PluginResult::Reject { .. }
+                        | reject @ PluginResult::RejectBinary { .. } => {
+                            debug!(
+                                plugin = plugin.name(),
+                                "Plugin rejected finalized buffered H3 gRPC response body"
+                            );
+                            apply_buffered_grpc_plugin_reject(
+                                plugins,
+                                ctx,
+                                reject,
+                                &mut response_status,
+                                &mut plugin_response_headers,
+                                &mut response_body,
+                                &mut response_trailers,
+                            )
+                            .await;
+                            crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                                &plugin_response_headers,
+                                &mut response_trailers,
+                                &mut authoritative_trailers_only_terminal_metadata,
+                            );
+                            buffered_initial_response_header_policy_state = None;
+                            break;
+                        }
                     }
                 }
             }

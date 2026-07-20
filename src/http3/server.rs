@@ -6339,10 +6339,12 @@ async fn handle_h3_request(
             );
         }
 
-        // Set once an `on_response_body` hook replaces the backend response with a
-        // gateway-authored rejection. From that point the buffered bytes are the
-        // gateway's own, so the representation gate must judge them as such
-        // instead of against the replaced backend response's snapshot.
+        // Set once an earlier body phase selects a gateway-authored terminal
+        // response. The transform phase still runs so presentation/protocol
+        // transforms can emit the correct wire shape, but final-body validators
+        // must not replace the selected error. While this is first set by
+        // `on_response_body`, it also records a representation-gate or deadline
+        // replacement below.
         let mut response_body_rejected = false;
 
         // on_response_body hooks — only for buffered responses when plugins exist.
@@ -6399,6 +6401,7 @@ async fn handle_h3_request(
                             // Synthesized error body — backend trailers no
                             // longer apply (issue #1630).
                             response_trailers = None;
+                            response_body_rejected = true;
                             break;
                         };
                         debug!(
@@ -6430,7 +6433,7 @@ async fn handle_h3_request(
         // transform_response_body hooks — only for buffered responses.
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
-            let (deadline_replaced, body_transformed) =
+            let (response_replaced, body_transformed) =
                 crate::proxy::transform_buffered_response_body_with_deadline(
                     &plugins,
                     &mut ctx,
@@ -6442,16 +6445,17 @@ async fn handle_h3_request(
                     initial_response_header_policy_plugins.as_ref(),
                 )
                 .await;
-            if deadline_replaced || body_transformed {
+            if response_replaced || body_transformed {
                 // A transform or deadline replacement changes the bytes sent to
                 // the client. Backend trailers describing the original body no
                 // longer apply (issue #1630).
                 response_trailers = None;
             }
+            response_body_rejected |= response_replaced;
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
-        if !after_proxy_rejected && !plugins.is_empty() {
+        if !after_proxy_rejected && !response_body_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
             let mut response_body_reject = None;
             for plugin in plugins.iter() {
