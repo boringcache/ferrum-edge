@@ -346,17 +346,36 @@ fn redpanda_metadata_ok(bootstrap: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Match `rpk topic describe --print-configs` rows (`KEY VALUE SOURCE`).
+fn topic_describe_has_config(describe_output: &str, key: &str, value: &str) -> bool {
+    describe_output.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        matches!(
+            (parts.next(), parts.next()),
+            (Some(k), Some(v)) if k == key && v == value
+        )
+    })
+}
+
 impl RedpandaContainer {
     /// Create a single-partition topic, optionally with broker topic configs
     /// (`max.message.bytes`, `min.insync.replicas`, …). Retries while the
     /// admin path is still warming up.
+    ///
+    /// Topic properties MUST be passed with `-c` / `--topic-config`. rpk's
+    /// global `--config` flag is a path to `rpk.yaml` / `redpanda.yaml` and
+    /// does not apply Kafka topic overrides — using it left topics on the
+    /// cluster default `kafka_batch_max_bytes` (~1 MiB), so the oversized
+    /// MESSAGE_TOO_LARGE acceptance path silently delivered instead of
+    /// rejecting.
     pub async fn create_topic(&self, name: &str, configs: &[(&str, &str)]) -> Result<(), BoxError> {
         let mut script = format!("rpk topic create {name} -p 1 -r 1");
         for (key, value) in configs {
-            script.push_str(&format!(" --config {key}={value}"));
+            script.push_str(&format!(" -c {key}={value}"));
         }
 
         let mut last = String::new();
+        let mut created = false;
         for _ in 0..40 {
             let out = self.exec_sh(&script).await?;
             let combined = out.combined();
@@ -364,12 +383,75 @@ impl RedpandaContainer {
                 || combined.contains("already exists")
                 || combined.contains("TOPIC_ALREADY_EXISTS")
             {
-                return Ok(());
+                created = true;
+                break;
             }
             last = combined;
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        Err(format!("rpk topic create never succeeded for {name}; last output: {last}").into())
+        if !created {
+            return Err(
+                format!("rpk topic create never succeeded for {name}; last output: {last}").into(),
+            );
+        }
+
+        if !configs.is_empty() {
+            self.ensure_topic_configs(name, configs).await?;
+        }
+        Ok(())
+    }
+
+    /// Reinforce and verify topic configs so ineffective setup fails before
+    /// produce assertions (create-time `-c` plus incremental alter-config).
+    async fn ensure_topic_configs(
+        &self,
+        name: &str,
+        configs: &[(&str, &str)],
+    ) -> Result<(), BoxError> {
+        let mut alter = format!("rpk topic alter-config {name}");
+        for (key, value) in configs {
+            alter.push_str(&format!(" --set {key}={value}"));
+        }
+
+        let mut last = String::new();
+        let mut altered = false;
+        for _ in 0..40 {
+            let out = self.exec_sh(&alter).await?;
+            let combined = out.combined();
+            if out.exit_code == Some(0) {
+                altered = true;
+                break;
+            }
+            last = combined;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if !altered {
+            return Err(format!(
+                "rpk topic alter-config never succeeded for {name}; last output: {last}"
+            )
+            .into());
+        }
+
+        for _ in 0..20 {
+            let out = self
+                .exec_sh(&format!("rpk topic describe {name} --print-configs"))
+                .await?;
+            let combined = out.combined();
+            if out.exit_code == Some(0)
+                && configs
+                    .iter()
+                    .all(|(key, value)| topic_describe_has_config(&combined, key, value))
+            {
+                return Ok(());
+            }
+            last = combined;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        Err(format!(
+            "topic {name} configs were not applied; expected {configs:?}; last describe:\n{last}"
+        )
+        .into())
     }
 
     /// Consume one record from `topic` (earliest), returning `(key, payload)`.

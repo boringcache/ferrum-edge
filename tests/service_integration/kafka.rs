@@ -230,11 +230,14 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
     missing.finalize().await;
 
     // --- broker-side oversized rejection (topic max < producer max) ---
+    // Topic ceiling is well under a serialized access-log with a 2 KiB path;
+    // producer message.max.bytes stays high so rejection is broker-side after
+    // local admission (create_topic verifies max.message.bytes took effect).
     let oversized_topic = "ferrum-oversized";
     broker
         .create_topic(oversized_topic, &[("max.message.bytes", "512")])
         .await
-        .expect("create oversized topic");
+        .expect("create oversized topic with verified max.message.bytes=512");
     let oversized = plugin(
         &broker.bootstrap,
         oversized_topic,
@@ -249,7 +252,9 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
     let big_path = format!("/{}", "x".repeat(2_048));
     oversized.log(&summary(&big_path, "203.0.113.52")).await;
     let oversized_snap = wait_snapshot(&oversized, Duration::from_secs(20), |snap| {
-        snap.delivery_failed_total >= 1 || snap.queue_rejected_total >= 1
+        snap.delivery_failed_total >= 1
+            || snap.queue_rejected_total >= 1
+            || snap.delivered_total >= 1
     })
     .await;
     assert!(
@@ -259,9 +264,16 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
         oversized_snap.queue_rejected_total,
         oversized_snap.delivery_failed_total
     );
+    assert_eq!(
+        oversized_snap.queue_rejected_total, 0,
+        "oversized proof must be broker delivery failure, not local queue rejection: admitted={} rejected={} failed={}",
+        oversized_snap.admitted_total,
+        oversized_snap.queue_rejected_total,
+        oversized_snap.delivery_failed_total
+    );
     assert!(
         oversized_snap.delivery_failed_total >= 1,
-        "expected broker MESSAGE_TOO_LARGE-style delivery failure, got delivered={} failed={} rejected={}",
+        "expected broker MESSAGE_TOO_LARGE-style delivery failure after local admission (topic max.message.bytes=512 < payload); got delivered={} failed={} rejected={}",
         oversized_snap.delivered_total,
         oversized_snap.delivery_failed_total,
         oversized_snap.queue_rejected_total
