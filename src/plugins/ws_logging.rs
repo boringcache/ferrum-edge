@@ -3,11 +3,13 @@
 //! Serializes `TransactionSummary`, `StreamTransactionSummary`, and WebSocket
 //! disconnect entries, then sends them to a remote WebSocket endpoint in batches.
 //! Uses an mpsc channel to decouple the proxy hot path from network I/O: hooks
-//! reserve capacity and serialize under per-entry / queued-byte budgets before
-//! enqueue, and a background task drains the channel in configurable batch sizes
-//! with a flush interval timer. The WebSocket connection is maintained
-//! persistently with automatic reconnection on failure; establishment and
-//! write/flush progress are bounded by documented timeouts.
+//! reserve a queue slot, then take a provisional aggregate byte reservation
+//! before any serialization (or disconnect-field cloning), shrink that lease to
+//! the exact retained charge after bounded serialization, and enqueue. A
+//! background task drains the channel in configurable batch sizes with a flush
+//! interval timer. The WebSocket connection is maintained persistently with
+//! automatic reconnection on failure; establishment and write/flush progress
+//! are bounded by documented timeouts.
 //!
 //! **TLS**: For `wss://` endpoints, the plugin builds a `rustls::ClientConfig`
 //! that follows the gateway's CA trust chain:
@@ -67,27 +69,32 @@ const MAX_RETRIES: u64 = 10;
 
 /// Pre-serialized log entry admitted under slot + byte budgets.
 ///
-/// The lease conservatively covers two copies of the entry plus JSON-array
-/// framing. One copy is the queued entry; the second is the contiguous batch
-/// payload allocated while entries are assembled and converted into an
-/// `Arc<str>`. Keeping that reservation with the payload bounds both the
-/// transient assembly peak and every retry, even while new records queue.
+/// Admission takes a provisional lease for the configured per-entry maximum
+/// retained charge, then shrinks to the exact charge after bounded
+/// serialization. The lease conservatively covers two copies of the entry plus
+/// JSON-array framing. One copy is the queued entry; the second is the
+/// contiguous batch payload allocated while entries are assembled and converted
+/// into an `Arc<str>`. Keeping that reservation with the payload bounds both
+/// the transient assembly peak and every retry, even while new records queue.
 struct QueuedEntry {
     json: Arc<str>,
     _lease: Arc<WsByteLease>,
 }
 
+/// Borrowed disconnect view used only for bounded admission serialization.
+/// Holds references into the caller's `WsDisconnectContext` so attacker-shaped
+/// strings/metadata are never deep-cloned before the aggregate byte gate.
 #[derive(Clone, serde::Serialize)]
-struct WsDisconnectLogEntry {
+struct WsDisconnectLogEntry<'a> {
     event: &'static str,
-    namespace: String,
-    proxy_id: String,
-    proxy_name: Option<String>,
-    client_ip: String,
-    consumer_username: Option<String>,
+    namespace: &'a str,
+    proxy_id: &'a str,
+    proxy_name: Option<&'a str>,
+    client_ip: &'a str,
+    consumer_username: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auth_method: Option<&'static str>,
-    backend_target: String,
+    backend_target: &'a str,
     protocol: &'static str,
     listen_port: u16,
     duration_ms: f64,
@@ -95,19 +102,33 @@ struct WsDisconnectLogEntry {
     frames_backend_to_client: u64,
     bytes_client_to_backend: u64,
     bytes_backend_to_client: u64,
-    timestamp_connected: String,
-    timestamp_disconnected: String,
+    timestamp_connected: &'a str,
+    timestamp_disconnected: &'a str,
     direction: Option<Direction>,
     io_side: Option<crate::proxy::tcp_proxy::StreamIoSide>,
     error_class: Option<crate::retry::ErrorClass>,
     #[serde(
-        skip_serializing_if = "HashMap::is_empty",
-        serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
+        skip_serializing_if = "borrowed_metadata_is_empty",
+        serialize_with = "serialize_borrowed_redacted_metadata"
     )]
-    metadata: HashMap<String, String>,
+    metadata: &'a HashMap<String, String>,
 }
 
-impl SchemaSerializable for WsDisconnectLogEntry {
+fn borrowed_metadata_is_empty(metadata: &&HashMap<String, String>) -> bool {
+    metadata.is_empty()
+}
+
+fn serialize_borrowed_redacted_metadata<S>(
+    metadata: &&HashMap<String, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    crate::plugins::utils::metadata_redaction::serialize_redacted_metadata(metadata, serializer)
+}
+
+impl SchemaSerializable for WsDisconnectLogEntry<'_> {
     fn owns_native(&self, source: &str) -> bool {
         super::utils::log_schema::WS_DISCONNECT_FIELDS
             .iter()
@@ -126,16 +147,16 @@ impl SchemaSerializable for WsDisconnectLogEntry {
     {
         match source {
             "event" => map.serialize_entry(out_key, self.event),
-            "namespace" => map.serialize_entry(out_key, &self.namespace),
-            "proxy_id" => map.serialize_entry(out_key, &self.proxy_id),
+            "namespace" => map.serialize_entry(out_key, self.namespace),
+            "proxy_id" => map.serialize_entry(out_key, self.proxy_id),
             "proxy_name" => map.serialize_entry(out_key, &self.proxy_name),
-            "client_ip" => map.serialize_entry(out_key, &self.client_ip),
+            "client_ip" => map.serialize_entry(out_key, self.client_ip),
             "consumer_username" => map.serialize_entry(out_key, &self.consumer_username),
             "auth_method" => match self.auth_method {
                 Some(value) => map.serialize_entry(out_key, value),
                 None => Ok(()),
             },
-            "backend_target" => map.serialize_entry(out_key, &self.backend_target),
+            "backend_target" => map.serialize_entry(out_key, self.backend_target),
             "protocol" => map.serialize_entry(out_key, self.protocol),
             "listen_port" => map.serialize_entry(out_key, &self.listen_port),
             "duration_ms" => map.serialize_entry(out_key, &self.duration_ms),
@@ -152,17 +173,17 @@ impl SchemaSerializable for WsDisconnectLogEntry {
                 map.serialize_entry(out_key, &self.bytes_backend_to_client)
             }
             "timestamp_connected" => {
-                emit_timestamp(out_key, &self.timestamp_connected, ts_format, map)
+                emit_timestamp(out_key, self.timestamp_connected, ts_format, map)
             }
             "timestamp_disconnected" => {
-                emit_timestamp(out_key, &self.timestamp_disconnected, ts_format, map)
+                emit_timestamp(out_key, self.timestamp_disconnected, ts_format, map)
             }
             "direction" => map.serialize_entry(out_key, &self.direction),
             "io_side" => map.serialize_entry(out_key, &self.io_side),
             "error_class" => map.serialize_entry(out_key, &self.error_class),
             "metadata" => {
                 if !self.metadata.is_empty() {
-                    map.serialize_entry(out_key, &MetadataNested(&self.metadata))?;
+                    map.serialize_entry(out_key, &MetadataNested(self.metadata))?;
                 }
                 Ok(())
             }
@@ -182,7 +203,7 @@ impl SchemaSerializable for WsDisconnectLogEntry {
         match kind {
             DerivedKind::StatusClass => map.serialize_entry(out_key, "none")?,
             DerivedKind::BackendHost => {
-                let Some(host) = extract_host_from_url(&self.backend_target) else {
+                let Some(host) = extract_host_from_url(self.backend_target) else {
                     return Ok(false);
                 };
                 map.serialize_entry(out_key, host)?;
@@ -211,21 +232,21 @@ impl SchemaSerializable for WsDisconnectLogEntry {
     where
         S: serde::ser::SerializeMap,
     {
-        serialize_schema_metadata(&self.metadata, policy, emitted, map)
+        serialize_schema_metadata(self.metadata, policy, emitted, map)
     }
 }
 
-impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
-    fn from(ctx: &WsDisconnectContext) -> Self {
+impl<'a> From<&'a WsDisconnectContext> for WsDisconnectLogEntry<'a> {
+    fn from(ctx: &'a WsDisconnectContext) -> Self {
         Self {
             event: "websocket_disconnect",
-            namespace: ctx.namespace.clone(),
-            proxy_id: ctx.proxy_id.clone(),
-            proxy_name: ctx.proxy_name.clone(),
-            client_ip: ctx.client_ip.clone(),
-            consumer_username: ctx.consumer_username.clone(),
+            namespace: ctx.namespace.as_str(),
+            proxy_id: ctx.proxy_id.as_str(),
+            proxy_name: ctx.proxy_name.as_deref(),
+            client_ip: ctx.client_ip.as_str(),
+            consumer_username: ctx.consumer_username.as_deref(),
             auth_method: ctx.auth_method,
-            backend_target: ctx.backend_target.clone(),
+            backend_target: ctx.backend_target.as_str(),
             protocol: "websocket",
             listen_port: ctx.listen_port,
             duration_ms: ctx.duration_ms,
@@ -233,12 +254,12 @@ impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
             frames_backend_to_client: ctx.frames_backend_to_client,
             bytes_client_to_backend: ctx.bytes_client_to_backend,
             bytes_backend_to_client: ctx.bytes_backend_to_client,
-            timestamp_connected: ctx.timestamp_connected.clone(),
-            timestamp_disconnected: ctx.timestamp_disconnected.clone(),
+            timestamp_connected: ctx.timestamp_connected.as_str(),
+            timestamp_disconnected: ctx.timestamp_disconnected.as_str(),
             direction: ctx.direction,
             io_side: ctx.io_side,
             error_class: ctx.error_class,
-            metadata: ctx.metadata.clone(),
+            metadata: &ctx.metadata,
         }
     }
 }
@@ -260,12 +281,45 @@ struct WsConfig {
 
 struct WsByteLease {
     used_bytes: Arc<AtomicUsize>,
-    bytes: usize,
+    /// Current retained charge. Atomic so a provisional reservation can shrink
+    /// race-safely against `Drop` without temporarily releasing the whole lease.
+    bytes: AtomicUsize,
+}
+
+impl WsByteLease {
+    /// Reduce this lease from its provisional charge to the exact retained
+    /// charge. Never releases-and-reacquires; only subtracts the unused delta.
+    /// No-op when `new_bytes` is not strictly smaller than the current charge.
+    fn shrink_to(&self, new_bytes: usize) {
+        let mut current = self.bytes.load(Ordering::Acquire);
+        while new_bytes < current {
+            match self.bytes.compare_exchange_weak(
+                current,
+                new_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.used_bytes
+                        .fetch_sub(current - new_bytes, Ordering::AcqRel);
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn charged_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for WsByteLease {
     fn drop(&mut self) {
-        self.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        let bytes = self.bytes.swap(0, Ordering::AcqRel);
+        if bytes != 0 {
+            self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
     }
 }
 
@@ -284,7 +338,17 @@ impl WsByteBudget {
         }
     }
 
+    fn used(&self) -> usize {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+
     fn try_acquire(&self, bytes: usize) -> Option<Arc<WsByteLease>> {
+        if bytes == 0 {
+            return Some(Arc::new(WsByteLease {
+                used_bytes: Arc::clone(&self.used_bytes),
+                bytes: AtomicUsize::new(0),
+            }));
+        }
         let reserved = self
             .used_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -298,7 +362,7 @@ impl WsByteBudget {
 
         Some(Arc::new(WsByteLease {
             used_bytes: Arc::clone(&self.used_bytes),
-            bytes,
+            bytes: AtomicUsize::new(bytes),
         }))
     }
 
@@ -314,6 +378,13 @@ impl WsByteBudget {
             );
         }
     }
+}
+
+/// Conservative retained charge for one admitted entry: queued JSON plus the
+/// contiguous batch/`Arc<str>` copy, each sized to `serialized_len`, plus two
+/// bytes of JSON-array framing budget (`+1` before `*2`).
+fn retained_charge_for_serialized_len(serialized_len: usize) -> usize {
+    serialized_len.saturating_add(1).saturating_mul(2)
 }
 
 struct BoundedJsonWriter {
@@ -541,27 +612,10 @@ impl WsLogging {
             self.byte_budget.record_drop("queue slot exhausted");
             return;
         };
-
-        let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
-        if let Err(error) = serde_json::to_writer(&mut writer, value) {
-            if writer.limit_exceeded {
-                self.byte_budget
-                    .record_drop("serialized entry exceeded max_entry_bytes");
-            } else {
-                warn!("WebSocket logging: failed to serialize {kind}: {error}");
-            }
+        let Some((json, lease)) =
+            serialize_under_byte_budget(&self.byte_budget, self.max_entry_bytes, value, kind)
+        else {
             return;
-        }
-        let retained_bytes = writer.bytes.len().saturating_add(1).saturating_mul(2);
-        let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
-            return;
-        };
-        let json = match String::from_utf8(writer.bytes) {
-            Ok(line) => Arc::<str>::from(line),
-            Err(error) => {
-                warn!("WebSocket logging: serialized {kind} was not UTF-8: {error}");
-                return;
-            }
         };
         permit.send(QueuedEntry {
             json,
@@ -588,10 +642,14 @@ impl WsLogging {
     }
 
     fn queue_websocket(&self, ctx: &WsDisconnectContext) {
-        // Reserve a slot before cloning attacker-shaped metadata into the
-        // disconnect entry and serializing it.
+        // Slot first, then provisional aggregate bytes, then a borrowed
+        // disconnect view (no deep clone of attacker-shaped strings/metadata).
         let Ok(permit) = self.sender.try_reserve() else {
             self.byte_budget.record_drop("queue slot exhausted");
+            return;
+        };
+        let provisional = retained_charge_for_serialized_len(self.max_entry_bytes);
+        let Some(lease) = self.byte_budget.try_acquire(provisional) else {
             return;
         };
         let entry = WsDisconnectLogEntry::from(ctx);
@@ -615,10 +673,8 @@ impl WsLogging {
             }
             return;
         }
-        let retained_bytes = writer.bytes.len().saturating_add(1).saturating_mul(2);
-        let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
-            return;
-        };
+        let retained_bytes = retained_charge_for_serialized_len(writer.bytes.len());
+        lease.shrink_to(retained_bytes);
         let json = match String::from_utf8(writer.bytes) {
             Ok(line) => Arc::<str>::from(line),
             Err(error) => {
@@ -632,6 +688,40 @@ impl WsLogging {
             json,
             _lease: lease,
         });
+    }
+}
+
+/// Acquire a provisional max-entry aggregate reservation, serialize under the
+/// per-entry bound, then shrink the lease to the exact retained charge.
+/// Returns `None` without invoking the serializer when the aggregate gate denies.
+fn serialize_under_byte_budget<T>(
+    byte_budget: &WsByteBudget,
+    max_entry_bytes: usize,
+    value: &T,
+    kind: &str,
+) -> Option<(Arc<str>, Arc<WsByteLease>)>
+where
+    T: serde::Serialize,
+{
+    let provisional = retained_charge_for_serialized_len(max_entry_bytes);
+    let lease = byte_budget.try_acquire(provisional)?;
+    let mut writer = BoundedJsonWriter::new(max_entry_bytes);
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        if writer.limit_exceeded {
+            byte_budget.record_drop("serialized entry exceeded max_entry_bytes");
+        } else {
+            warn!("WebSocket logging: failed to serialize {kind}: {error}");
+        }
+        return None;
+    }
+    let retained_bytes = retained_charge_for_serialized_len(writer.bytes.len());
+    lease.shrink_to(retained_bytes);
+    match String::from_utf8(writer.bytes) {
+        Ok(line) => Some((Arc::<str>::from(line), lease)),
+        Err(error) => {
+            warn!("WebSocket logging: serialized {kind} was not UTF-8: {error}");
+            None
+        }
     }
 }
 
@@ -1097,18 +1187,21 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
     use serde_json::{Value, json};
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
 
-    fn disconnect_entry() -> WsDisconnectLogEntry {
+    fn disconnect_entry<'a>(metadata: &'a HashMap<String, String>) -> WsDisconnectLogEntry<'a> {
         WsDisconnectLogEntry {
             event: "websocket_disconnect",
-            namespace: "ferrum".into(),
-            proxy_id: "p1".into(),
-            proxy_name: Some("things-ws".into()),
-            client_ip: "10.0.0.1".into(),
-            consumer_username: Some("alice".into()),
+            namespace: "ferrum",
+            proxy_id: "p1",
+            proxy_name: Some("things-ws"),
+            client_ip: "10.0.0.1",
+            consumer_username: Some("alice"),
             auth_method: None,
-            backend_target: "wss://backend.example.com:9000/ws".into(),
+            backend_target: "wss://backend.example.com:9000/ws",
             protocol: "websocket",
             listen_port: 8080,
             duration_ms: 42.0,
@@ -1116,16 +1209,16 @@ mod tests {
             frames_backend_to_client: 5,
             bytes_client_to_backend: 128,
             bytes_backend_to_client: 256,
-            timestamp_connected: "2026-01-01T00:00:00+00:00".into(),
-            timestamp_disconnected: "2026-01-01T00:00:42+00:00".into(),
+            timestamp_connected: "2026-01-01T00:00:00+00:00",
+            timestamp_disconnected: "2026-01-01T00:00:42+00:00",
             direction: None,
             io_side: None,
             error_class: None,
-            metadata: HashMap::new(),
+            metadata,
         }
     }
 
-    fn serialize_disconnect(entry: &WsDisconnectLogEntry, raw_schema: Value) -> Value {
+    fn serialize_disconnect(entry: &WsDisconnectLogEntry<'_>, raw_schema: Value) -> Value {
         let schema =
             SummarySchema::compile(&raw_schema, "ws_logging", SchemaCapabilities::WS_LOGGING)
                 .unwrap();
@@ -1145,21 +1238,14 @@ mod tests {
         // never emits. Those specs must NOT reserve the flatten output key, so
         // disconnect metadata sharing the name survives under the default
         // `on_collision: skip`.
-        let mut entry = disconnect_entry();
-        entry
-            .metadata
-            .insert("http_method".to_string(), "GET".to_string());
-        entry
-            .metadata
-            .insert("request_path".to_string(), "/live".to_string());
-        entry
-            .metadata
-            .insert("response_status_code".to_string(), "101".to_string());
+        let mut metadata = HashMap::new();
+        metadata.insert("http_method".to_string(), "GET".to_string());
+        metadata.insert("request_path".to_string(), "/live".to_string());
+        metadata.insert("response_status_code".to_string(), "101".to_string());
         // A metadata key colliding with a native the disconnect entry DOES own
         // must still yield to the native value.
-        entry
-            .metadata
-            .insert("namespace".to_string(), "shadow".to_string());
+        metadata.insert("namespace".to_string(), "shadow".to_string());
+        let entry = disconnect_entry(&metadata);
 
         let v = serialize_disconnect(
             &entry,
@@ -1199,5 +1285,179 @@ mod tests {
             redacted_endpoint_url(&url),
             "wss://collector.example/redacted"
         );
+    }
+
+    #[test]
+    fn denied_provisional_reservation_skips_serialization() {
+        struct Probe<'a>(&'a AtomicBool);
+        impl Serialize for Probe<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.store(true, Ordering::SeqCst);
+                serializer.serialize_str("probe")
+            }
+        }
+
+        let budget = WsByteBudget::new(64);
+        let _hold = budget
+            .try_acquire(64)
+            .expect("fill budget so provisional max-entry charge is denied");
+        let ran = AtomicBool::new(false);
+        let admitted = serialize_under_byte_budget(&budget, 1024, &Probe(&ran), "probe");
+        assert!(admitted.is_none(), "denied aggregate reservation must fail closed");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "serializer must not run when provisional aggregate reservation is denied"
+        );
+        assert_eq!(budget.used(), 64);
+    }
+
+    #[test]
+    fn provisional_reservation_shrinks_to_exact_charge_and_releases_on_drop() {
+        let budget = WsByteBudget::new(1_048_576);
+        let max_entry_bytes = 4096;
+        let provisional = retained_charge_for_serialized_len(max_entry_bytes);
+        let (json, lease) =
+            serialize_under_byte_budget(&budget, max_entry_bytes, &json!({"k":"v"}), "http")
+                .expect("admit small entry");
+        let exact = retained_charge_for_serialized_len(json.len());
+        assert!(exact < provisional, "exact charge must be below provisional max");
+        assert_eq!(lease.charged_bytes(), exact);
+        assert_eq!(budget.used(), exact);
+
+        drop(lease);
+        assert_eq!(budget.used(), 0, "drop must release the shrunk charge exactly");
+    }
+
+    #[test]
+    fn serialize_error_path_releases_provisional_reservation() {
+        struct AlwaysFails;
+        impl Serialize for AlwaysFails {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("forced serialize failure"))
+            }
+        }
+
+        let budget = WsByteBudget::new(1_048_576);
+        let admitted = serialize_under_byte_budget(&budget, 1024, &AlwaysFails, "broken");
+        assert!(admitted.is_none());
+        assert_eq!(
+            budget.used(),
+            0,
+            "failed serialization must release the provisional lease"
+        );
+    }
+
+    #[test]
+    fn byte_budget_cannot_oversubscribe_or_underflow_under_concurrent_shrink() {
+        const MAX_BYTES: usize = 10_000;
+        let budget = Arc::new(WsByteBudget::new(MAX_BYTES));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let budget = Arc::clone(&budget);
+            handles.push(thread::spawn(move || {
+                for _ in 0..200 {
+                    let Some(lease) = budget.try_acquire(500) else {
+                        continue;
+                    };
+                    assert!(budget.used() <= MAX_BYTES);
+                    lease.shrink_to(120);
+                    assert_eq!(lease.charged_bytes(), 120);
+                    assert!(budget.used() <= MAX_BYTES);
+                    drop(lease);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("budget worker");
+        }
+        assert_eq!(budget.used(), 0, "all leases must release without underflow wrap");
+    }
+
+    #[test]
+    fn shrink_racing_drop_never_underflows_budget() {
+        let budget = WsByteBudget::new(1_000);
+        let lease = budget.try_acquire(400).expect("lease");
+        let lease2 = Arc::clone(&lease);
+        let shrinker = thread::spawn(move || {
+            lease2.shrink_to(50);
+        });
+        drop(lease);
+        shrinker.join().expect("shrinker");
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn borrowed_disconnect_view_native_and_custom_schema_match_without_metadata_clone() {
+        let source = include_str!("ws_logging.rs");
+        // concat! keeps the forbidden needle out of the source as one literal so
+        // this assertion cannot match itself.
+        let owned_metadata_clone = concat!("metadata: ctx.metadata", ".clone()");
+        assert!(
+            !source.contains(owned_metadata_clone),
+            "queue path must not deep-clone disconnect metadata before admission"
+        );
+        assert!(
+            source.contains("metadata: &ctx.metadata"),
+            "disconnect view must borrow metadata by reference"
+        );
+
+        let mut metadata = HashMap::new();
+        metadata.insert("correlation_id".to_string(), "cid-9".to_string());
+        metadata.insert("authorization".to_string(), "Bearer secret".to_string());
+        let ctx = WsDisconnectContext {
+            namespace: "ferrum".to_string(),
+            proxy_id: "proxy-ws".to_string(),
+            proxy_name: Some("websocket-proxy".to_string()),
+            client_ip: "127.0.0.1".to_string(),
+            backend_target: "ws://backend.local/chat".to_string(),
+            listen_port: 8080,
+            duration_ms: 250.0,
+            frames_client_to_backend: 3,
+            frames_backend_to_client: 4,
+            bytes_client_to_backend: 128,
+            bytes_backend_to_client: 256,
+            timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+            timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
+            direction: Some(Direction::ClientToBackend),
+            io_side: Some(crate::proxy::tcp_proxy::StreamIoSide::Write),
+            error_class: Some(crate::retry::ErrorClass::ConnectionReset),
+            consumer_username: Some("alice".to_string()),
+            auth_method: Some("jwt_auth"),
+            metadata,
+        };
+        let entry = WsDisconnectLogEntry::from(&ctx);
+
+        let native = serde_json::to_value(&entry).expect("native serialize");
+        assert_eq!(native["event"], "websocket_disconnect");
+        assert_eq!(native["bytes_client_to_backend"], 128);
+        assert_eq!(native["bytes_backend_to_client"], 256);
+        assert_eq!(native["timestamp_connected"], "2026-01-01T00:00:00+00:00");
+        assert_eq!(native["timestamp_disconnected"], "2026-01-01T00:00:01+00:00");
+        assert_eq!(native["metadata"]["correlation_id"], "cid-9");
+        assert_eq!(native["metadata"]["authorization"], "[REDACTED]");
+        // Pointer equality proves the view still aliases the context map.
+        assert!(std::ptr::eq(entry.metadata, &ctx.metadata));
+
+        let custom = serialize_disconnect(
+            &entry,
+            json!({
+                "summary_type": "http",
+                "rename": { "event": "kind" },
+                "derived_fields": [
+                    { "name": "record_type", "kind": "summary_kind" },
+                    { "name": "outcome", "kind": "outcome" },
+                    { "name": "backend_host", "kind": "backend_host" }
+                ],
+                "metadata": { "mode": "flatten", "prefix": "meta_" }
+            }),
+        );
+        assert_eq!(custom["kind"], "websocket_disconnect");
+        assert_eq!(custom["record_type"], "websocket_disconnect");
+        assert_eq!(custom["outcome"], "error");
+        assert_eq!(custom["backend_host"], "backend.local");
+        assert_eq!(custom["meta_correlation_id"], "cid-9");
+        assert_eq!(custom["meta_authorization"], "[REDACTED]");
+        assert_eq!(custom["bytes_client_to_backend"], 128);
+        assert_eq!(custom["timestamp_connected"], "2026-01-01T00:00:00+00:00");
     }
 }
