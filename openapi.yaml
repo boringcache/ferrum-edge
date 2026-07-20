@@ -18344,7 +18344,7 @@ components:
             mcp_tool_calls:
               type: boolean
               default: false
-              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays."
+              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays. When params.arguments is omitted, the governor normalizes it to {} before required-arg / regex / hash / approval / JSON Schema evaluation (MCP zero-argument calls). Provider response shapes that omit function.arguments are not normalized."
             a2a_methods:
               type: boolean
               default: false
@@ -18391,6 +18391,7 @@ components:
                 description: "Deny when any listed key is absent from the parsed arguments object."
               blocked_arg_patterns:
                 type: array
+                maxItems: 32
                 items:
                   type: object
                   additionalProperties: false
@@ -18403,8 +18404,8 @@ components:
                     regex:
                       type: string
                       minLength: 1
-                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted."
-                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args."
+                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted. Patterns that match the empty string (zero-width) are rejected at config load because replace_all would amplify argument bytes without bound."
+                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args. At most 32 patterns per tool; redacted output is capped at the 4 MiB inspectable body limit."
               json_schema:
                 type: object
                 description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny. Intentionally open — arbitrary JSON Schema keywords are allowed; do not set additionalProperties: false here."
@@ -18423,8 +18424,9 @@ components:
             timeout_ms:
               type: integer
               minimum: 1
+              maximum: 30000
               default: 1500
-              description: "Per-request approval webhook timeout."
+              description: "Per-request approval webhook timeout (max 30000). A whole batch of approvals is also capped at 30s cumulative wait; after an enforce-mode block, further webhook calls in that batch are skipped. At most 64 concrete tool calls are governed per request/response/SSE batch. Dropping the governing future (client cancel) cancels any in-flight approval HTTP call."
             cache_ttl_seconds:
               type: integer
               minimum: 0
@@ -18452,8 +18454,9 @@ components:
               description: "HTTP error status (400-599) returned for a deterministic tool policy denial in enforce mode. Uninspectable governed bodies fail closed with 502."
             redaction_placeholder:
               type: string
+              maxLength: 256
               default: "[REDACTED_TOOL_ARG:{name}]"
-              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name."
+              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name. Capped at 256 bytes; redacted argument output is capped at the 4 MiB inspectable body limit."
             streaming_deny_event:
               type: boolean
               default: true

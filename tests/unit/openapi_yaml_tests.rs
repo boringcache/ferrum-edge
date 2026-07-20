@@ -2217,6 +2217,13 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
             "approval": {"endpoint_url": "https://approval.example/decide"}
         }),
         json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {
+                "endpoint_url": "https://approval.example/decide",
+                "timeout_ms": 30000
+            }
+        }),
+        json!({
             "tools": {
                 "custom.tool": {
                     "action": "allow",
@@ -2234,6 +2241,20 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
             "config should be valid: {config}"
         );
     }
+
+    assert_eq!(
+        enabled["properties"]["approval"]["properties"]["timeout_ms"]["maximum"],
+        json!(30000)
+    );
+    assert_eq!(
+        enabled["properties"]["response"]["properties"]["redaction_placeholder"]["maxLength"],
+        json!(256)
+    );
+    assert_eq!(
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]["blocked_arg_patterns"]
+            ["maxItems"],
+        json!(32)
+    );
 
     for config in [
         json!({
@@ -2283,6 +2304,22 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         json!({
             "tools": {"deploy": {"action": "require_approval"}},
             "approval": {"endpoint_url": "https:///decide"}
+        }),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {
+                "endpoint_url": "https://approval.example/decide",
+                "timeout_ms": 30001
+            }
+        }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{"name": "secret", "regex": "secret"}]
+                }
+            },
+            "response": { "redaction_placeholder": "X".repeat(257) }
         }),
         json!({"tools": {"search": {"action": "allow"}}, "modde": "enforce"}),
         json!({

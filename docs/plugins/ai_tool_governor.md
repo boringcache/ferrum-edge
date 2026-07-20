@@ -39,13 +39,18 @@ Each is toggled independently under `inspect`; at least one must be enabled.
 | `request_tool_definitions` | `false` | Tool definitions the client exposes to the model (`tools[].function.name`, `functions[].name`). A disallowed definition is rejected/dry-run. |
 | `response_tool_calls` | `true` | Buffered response tool calls (`choices[].message.tool_calls[]` and legacy `choices[].message.function_call`). |
 | `streaming_response_tool_calls` | `false` | OpenAI SSE `choices[].delta.tool_calls` deltas and legacy `choices[].delta.function_call` (`functions` API) deltas, reassembled across frames. |
-| `mcp_tool_calls` | `false` | MCP JSON-RPC `tools/call` request bodies (`params.name` + `params.arguments`), including calls inside JSON-RPC **batch arrays**. |
+| `mcp_tool_calls` | `false` | MCP JSON-RPC `tools/call` request bodies (`params.name` + `params.arguments`), including calls inside JSON-RPC **batch arrays**. Omitted `params.arguments` normalizes to `{}` before evaluation (MCP zero-argument calls); provider response `function.arguments` omissions are not normalized. |
 | `a2a_methods` | `false` | A2A JSON-RPC method names (governed against the `tools` map), including batch arrays. |
 
 For **streaming**, tool-call SSE frames are **held** (not forwarded) until the
 call is complete and cleared by policy/approval, then the held frames are
 released; on a block the stream is **cut with a terminal SSE error event** and
 the held frames are dropped — the disallowed call never reaches the client.
+Duplicate `tool_calls[].index` values in one frame, or conflicting /
+changing `tool_calls[].id` values for the same `(choice, index)` slot, are
+**ungovernable** and fail closed in enforce mode on both the live inspector and
+buffered-SSE extraction — they are never concatenated into a synthetic
+allowed identity.
 Ordinary content/role deltas stream through live **until a tool-call batch
 opens**; once a batch is pending, ALL subsequent events (other choices'
 content, keepalives) are held too and released in original arrival order when
@@ -186,11 +191,17 @@ Argument checks (`max_arg_bytes`, `required_args`, `json_schema`,
 `allow`/`require_approval`, and is **redacted** under `redact_args` (buffered
 path). A `redact_args` policy must configure at least one
 `blocked_arg_patterns` entry; an empty redaction policy is rejected rather than
-silently turning the tool into an allowlist entry. On paths where arguments
-cannot be redacted in place — the **streaming**
-path, the **request** body (no request-body transform), and the post-transform
-**final response** re-check — a `redact_args` match fails closed rather than
-forwarding an unredacted secret.
+silently turning the tool into an allowlist entry. Regexes that match the empty
+string (zero-width) are rejected at config load, pattern lists are capped at 32
+entries per tool, `response.redaction_placeholder` is capped at 256 bytes, and
+redacted output cannot grow past the 4 MiB inspectable body limit. On paths
+where arguments cannot be redacted in place — the **streaming** path, the
+**request** body (no request-body transform), and the post-transform **final
+response** re-check — a `redact_args` match fails closed rather than forwarding
+an unredacted secret. A successful buffered redaction rewrite invalidates
+origin representation validators / integrity headers (`ETag`, `Content-Digest`,
+`Repr-Digest`, `Digest`, `Content-MD5`, `Last-Modified`, and related checksum /
+signature fields) so clients never validate against pre-redaction bytes.
 
 A per-tool **`dry_run`** action is purely observational: it forwards the call
 and records `ai_tool_governor.decision=dry_run` for concrete calls and exposed
@@ -260,12 +271,16 @@ Request correlation prefers private canonical state from the built-in
 `correlation_id` plugin. On custom-only chains it falls back to transaction
 metadata `request_id`, then legacy `correlation_id`; canonical state always wins
 over either plugin-writable compatibility key.
-Identical calls reuse the cached decision for `cache_ttl_seconds`; the cache
-key covers consumer, proxy, model, **provider**, tool name, and arguments (every
-field the webhook receives that can change its decision). For streamed and
-buffered-SSE responses the model/provider come from request/routing metadata
-or, when absent, from the SSE frames themselves — a decision made for one
-model is never reused for another. The cache is
+`approval.timeout_ms` defaults to 1500 and may not exceed 30000. A single
+governed batch waits at most 30s cumulative for approvals, governs at most 64
+concrete calls, stops further webhook fan-out after an enforce-mode block, and
+cancels an in-flight approval HTTP call when the governing future is dropped
+(client cancel). Identical calls reuse the cached decision for
+`cache_ttl_seconds`; the cache key covers consumer, proxy, model, **provider**,
+tool name, and arguments (every field the webhook receives that can change its
+decision). For streamed and buffered-SSE responses the model/provider come from
+request/routing metadata or, when absent, from the SSE frames themselves — a
+decision made for one model is never reused for another. The cache is
 bounded at 4096 entries — at capacity expired entries are purged and new
 decisions are simply not cached. When the endpoint is unreachable,
 `fail_on_error: reject` blocks the call (`warn`/`allow` fail open).
