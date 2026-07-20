@@ -61,7 +61,8 @@ use crate::util::unknown_keys::reject_unknown_keys;
 // Strict config key sets (fixed-shape objects; no free-form maps)
 // ---------------------------------------------------------------------------
 
-const ROOT_KEYS: &[&str] = &[
+/// Accepted root keys for `ai_stream_router` config objects.
+pub const AI_STREAM_ROUTER_CONFIG_KEYS: &[&str] = &[
     "enabled",
     "fail_on_missing_model",
     "fail_on_no_matching_provider",
@@ -71,7 +72,8 @@ const ROOT_KEYS: &[&str] = &[
     "fallback",
 ];
 
-const PROVIDER_KEYS: &[&str] = &[
+/// Accepted keys for each `providers[]` entry.
+pub const AI_STREAM_ROUTER_PROVIDER_KEYS: &[&str] = &[
     "name",
     "provider_type",
     "endpoint",
@@ -83,7 +85,8 @@ const PROVIDER_KEYS: &[&str] = &[
     "inherit_backend_tls",
 ];
 
-const FALLBACK_KEYS: &[&str] = &[
+/// Accepted keys for the optional `fallback` object.
+pub const AI_STREAM_ROUTER_FALLBACK_KEYS: &[&str] = &[
     "enabled",
     "on_connect_error",
     "on_5xx_before_first_byte",
@@ -261,7 +264,12 @@ impl AiStreamRouter {
         // shape, so an operator does not silently mix a non-streaming fallback
         // config into this plugin (which uses a nested `fallback` block).
         reject_ambiguous_fields(config)?;
-        reject_unknown_keys(config_object, "config", ROOT_KEYS, "ai_stream_router: ")?;
+        reject_unknown_keys(
+            config_object,
+            "config",
+            AI_STREAM_ROUTER_CONFIG_KEYS,
+            "ai_stream_router: ",
+        )?;
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
         let fail_on_missing_model = optional_bool(config, "fail_on_missing_model")?.unwrap_or(true);
@@ -294,7 +302,7 @@ impl AiStreamRouter {
             reject_unknown_keys(
                 provider_object,
                 &provider_path,
-                PROVIDER_KEYS,
+                AI_STREAM_ROUTER_PROVIDER_KEYS,
                 "ai_stream_router: ",
             )?;
 
@@ -440,7 +448,7 @@ fn parse_fallback(config: &Value) -> Result<FallbackConfig, String> {
     reject_unknown_keys(
         fallback_object,
         "config.fallback",
-        FALLBACK_KEYS,
+        AI_STREAM_ROUTER_FALLBACK_KEYS,
         "ai_stream_router: ",
     )?;
     let defaults = FallbackConfig::default();

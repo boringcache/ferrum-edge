@@ -1857,6 +1857,10 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
 
 #[test]
 fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
+    use ferrum_edge::plugins::ai_stream_router::{
+        AI_STREAM_ROUTER_CONFIG_KEYS, AI_STREAM_ROUTER_FALLBACK_KEYS,
+        AI_STREAM_ROUTER_PROVIDER_KEYS,
+    };
     use std::collections::BTreeSet;
 
     let spec: serde_json::Value =
@@ -1880,18 +1884,11 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         .keys()
         .map(String::as_str)
         .collect();
-    assert_eq!(
-        root_fields,
-        BTreeSet::from([
-            "enabled",
-            "fail_on_missing_model",
-            "fail_on_no_matching_provider",
-            "inject_usage_options",
-            "normalize_response_stream",
-            "providers",
-            "fallback",
-        ])
-    );
+    let runtime_root_fields = AI_STREAM_ROUTER_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(root_fields, runtime_root_fields, "root key drift");
 
     let provider_fields: BTreeSet<_> = schema["properties"]["providers"]["items"]["properties"]
         .as_object()
@@ -1899,19 +1896,13 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         .keys()
         .map(String::as_str)
         .collect();
+    let runtime_provider_fields = AI_STREAM_ROUTER_PROVIDER_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        provider_fields,
-        BTreeSet::from([
-            "name",
-            "provider_type",
-            "endpoint",
-            "api_key",
-            "model_patterns",
-            "priority",
-            "allow_plaintext",
-            "anthropic_version",
-            "inherit_backend_tls",
-        ])
+        provider_fields, runtime_provider_fields,
+        "provider key drift"
     );
 
     let fallback_fields: BTreeSet<_> = schema["properties"]["fallback"]["properties"]
@@ -1920,14 +1911,13 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         .keys()
         .map(String::as_str)
         .collect();
+    let runtime_fallback_fields = AI_STREAM_ROUTER_FALLBACK_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        fallback_fields,
-        BTreeSet::from([
-            "enabled",
-            "on_connect_error",
-            "on_5xx_before_first_byte",
-            "max_attempts",
-        ])
+        fallback_fields, runtime_fallback_fields,
+        "fallback key drift"
     );
 
     let description = schema["description"].as_str().expect("description");
