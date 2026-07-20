@@ -2428,6 +2428,46 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_load_testing_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let plugin = json!({
+        "id": "load-testing-typo",
+        "plugin_name": "load_testing",
+        "scope": "global",
+        "enabled": true,
+        "config": {
+            "key": "test-key",
+            "concurrent_clients": 5,
+            "duration_seconds": 10,
+            "request_timeot_ms": 5000,
+            "gateway_adresses": ["https://127.0.0.1:8443"]
+        }
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+    assert_eq!(status, 400, "unknown load_testing key was admitted: {body}");
+    let body_text = body.to_string();
+    assert!(
+        body_text.contains("unknown configuration key"),
+        "unexpected admin validation response: {body}"
+    );
+    assert!(
+        body_text.contains("config.gateway_adresses")
+            || body_text.contains("gateway_adresses"),
+        "admin response must name gateway_adresses: {body}"
+    );
+    assert!(
+        body_text.contains("config.request_timeot_ms")
+            || body_text.contains("request_timeot_ms"),
+        "admin response must name request_timeot_ms: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

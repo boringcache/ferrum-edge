@@ -3535,6 +3535,8 @@ For multi-node deployments, `gateway_addresses` fans out the trigger (WITH the k
 
 For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
 
+**Strict config admission:** Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions when the typo is close enough (for example `request_timeot_ms` → `request_timeout_ms`). File mode, admin/database writes, and CP/DP distribution share the same constructor validation via `validate_plugin_config`. The plugin is registered as `KeepLastKnownGood`: an invalid reload or DP candidate is rejected and the previously published generation stays active. Optional recognized fields may still be omitted or set to `null` to select defaults; wrong types and out-of-range values continue to fail closed.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `key` | String | **(required)** | Value that `X-Loadtesting-Key` must match to trigger |
@@ -3542,6 +3544,7 @@ For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: tru
 | `duration_seconds` | Integer | **(required)** | How long the test runs in seconds (1–3,600) |
 | `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once (see ramp example below) |
 | `request_timeout_ms` | Integer | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll) |
+| `max_response_body_bytes` | Integer | `1048576` (1 MiB) | Maximum synthetic response bytes consumed per request; larger responses are truncated |
 | `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests. Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled) |
 | `gateway_tls` | Boolean | `false` | Use HTTPS for local loopback synthetic requests |
 | `gateway_tls_no_verify` | Boolean | `true` when `gateway_tls` on | Skip TLS cert verification for loopback only |

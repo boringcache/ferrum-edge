@@ -112,6 +112,11 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
         }
         "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "load_testing" => json!({
+            "key": "test-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
         "fault_injection" => json!({
             "abort": {"status_code": 503, "percentage": 100.0},
             "runtime_overlay_scope": "checkout"
@@ -2933,6 +2938,67 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
     let plugins = cache.get_plugins("p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[test]
+fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good() {
+    let good = json!({
+        "key": "stable-key",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "ramp": true
+    });
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc-load"])],
+        vec![make_plugin_config_with_json(
+            "pc-load",
+            "load_testing",
+            good.clone(),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config1).expect("valid load_testing must admit");
+    assert!(
+        cache
+            .get_plugins("p1")
+            .iter()
+            .any(|plugin| plugin.name() == "load_testing"),
+        "baseline cache must include load_testing"
+    );
+
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc-load"])],
+        vec![make_plugin_config_with_json(
+            "pc-load",
+            "load_testing",
+            json!({
+                "key": "must-not-publish",
+                "concurrent_clients": 50,
+                "duration_seconds": 30,
+                "request_timeot_ms": 5000
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+    let error = cache
+        .apply_delta(&config2, &proxy_ids, &[], false)
+        .expect_err("unknown load_testing key must reject the reload");
+    assert!(
+        error.to_string().contains("request_timeot_ms"),
+        "unexpected reload error: {error}"
+    );
+
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "load_testing");
+    assert!(
+        ferrum_edge::plugins::validate_plugin_config("load_testing", &good).is_ok(),
+        "baseline good config must remain valid"
+    );
 }
 
 #[test]

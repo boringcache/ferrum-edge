@@ -16457,7 +16457,16 @@ components:
 
     LoadTestingConfig:
       type: object
-      description: "Plugin: load_testing — On-demand proxy load testing triggered by X-Loadtesting-Key header. Spawns concurrent clients through the gateway's own proxy listener (HTTP only)."
+      additionalProperties: false
+      description: |
+        Plugin: load_testing — On-demand proxy load testing triggered by
+        X-Loadtesting-Key header. Spawns concurrent clients through the
+        gateway's own proxy listener (HTTP only). Unknown top-level keys are
+        rejected. File, admin/database, and CP/DP admission share the same
+        constructor validation; serving-mode publication uses KeepLastKnownGood
+        so an invalid candidate keeps the prior valid generation active.
+        Omitted optional fields select defaults; runtime also treats explicit
+        null on optional fields as omitted.
       required:
         - key
         - concurrent_clients
