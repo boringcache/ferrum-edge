@@ -773,12 +773,8 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
 }
 
 fn endpoint_authority(endpoint_url: &str) -> Option<&str> {
-    let Some((_, after_scheme)) = endpoint_url.split_once(':') else {
-        return None;
-    };
-    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
-        return None;
-    };
+    let (_, after_scheme) = endpoint_url.split_once(':')?;
+    let authority_and_path = after_scheme.strip_prefix("//")?;
     let authority_end = authority_and_path
         .find(['/', '?', '#'])
         .unwrap_or(authority_and_path.len());
