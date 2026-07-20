@@ -968,7 +968,7 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
     for needle in [
         "Both plain UDP and DTLS re-resolve",
         "fresh handshake",
-        "retains the current sender",
+        "current sender is retained",
         "local UDP socket",
         "FERRUM_DTLS_MAX_PLAINTEXT_BYTES",
         "split per entry",
