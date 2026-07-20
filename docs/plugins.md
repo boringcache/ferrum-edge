@@ -402,48 +402,75 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 
 **Priority:** 9075
 
-**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map. Registration policy is `OptionalFailOpen` — Admin create/update still returns HTTP 400 for invalid enabled configs, while file-mode load and plugin-cache rebuild warn and omit the plugin rather than aborting the gateway. Disabled plugin configs skip construction validation.
+**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 bytes) and must not collide with reserved runtime tags. Registration policy is `OptionalFailOpen` — Admin create/update still returns HTTP 400 for invalid enabled configs, while file-mode load and plugin-cache rebuild warn and omit the plugin rather than aborting the gateway. Disabled plugin configs skip construction validation.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | StatsD server hostname or IP address |
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
-| `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`) |
-| `global_tags` | Object | *(none)* | Key-value pairs appended as DogStatsD tags to every metric (open string map) |
+| `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Sanitized for line-protocol safety; max 256 bytes after sanitization. |
+| `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`). Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing |
 | `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (shared batching logger) |
 | `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts |
-| `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags |
+| `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
-Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Large payloads are automatically split across multiple UDP packets at 1472-byte MTU boundaries.
+Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Batches are packed into UDP datagrams that never exceed a **1452-byte** conservative IPv4/IPv6 payload ceiling. Multi-line batches split only on newline boundaries; an individual metric line larger than the ceiling is dropped and warned (it is never fragmented mid-line, and sibling valid lines in the same batch are still sent).
 
 **DNS handling.** The StatsD endpoint is resolved through the gateway's shared `DnsCache` at startup (pre-warmed via `warmup_hostnames()`) and re-resolved every 60 seconds by the background flush task. If the resolved address changes (DNS flip, service discovery update), the UDP socket is rebound to the new address without a gateway restart.
 
-**Tag sanitization.** Operator-controlled tag values (proxy name/id, HTTP method, protocol) are sanitized before being written to the line protocol: `,` `|` `#` `:` and whitespace are replaced with `_`. Empty values become the literal `none`. This keeps a proxy name containing delimiters from corrupting downstream parsing in StatsD / DogStatsD / Telegraf.
+**Tag sanitization and reserved identity.** Tag *values* (proxy name/id, protocol, configured global-tag values, and the authoritative namespace) replace `,` `|` `#` `:` whitespace and every Unicode control character with `_`. Empty values become the literal `none`. Request-derived values are capped at 64 bytes; the authoritative `namespace` tag preserves the full validated Ferrum namespace (up to 254 bytes) so distinct tenants cannot collide through silent truncation. Configured tag *keys* and schema rename targets are fail-closed validated (not rewritten). The gateway `namespace` tag is always appended and cannot be overridden by `global_tags`.
 
-**Metrics emitted per HTTP/gRPC request** (WebSocket upgrade handshakes currently share this HTTP formatter path; dedicated WebSocket terminal metrics are tracked separately in [#2555](https://github.com/ferrum-edge/ferrum-edge/issues/2555) and must not be assumed present here):
+**Mirror accounting.** Summaries with `mirror: true` are excluded from all `request.*` families. Shadow/mirror probes must not inflate client request counts, latency timers, or status-class series.
+
+**Timer validity.** Every timer sample must be finite and non-negative. The shared no-backend sentinel `latency_backend_ttfb_ms = -1.0` is omitted (not converted to zero). Non-finite latency/duration values are likewise omitted; request/status/stream counters are still emitted.
+
+**Metrics emitted per HTTP/gRPC request** (WebSocket upgrade handshakes also emit this short-lived HTTP series; upgraded session completion uses the dedicated `websocket.*` families below):
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `{prefix}.request.count` | Counter | Request count |
-| `{prefix}.request.latency_total_ms` | Timer | Total request latency |
-| `{prefix}.request.latency_backend_ttfb_ms` | Timer | Backend time-to-first-byte |
+| `{prefix}.request.count` | Counter | Client request count (mirrors excluded) |
+| `{prefix}.request.latency_total_ms` | Timer | Total request latency (finite, ≥ 0 only) |
+| `{prefix}.request.latency_backend_ttfb_ms` | Timer | Backend time-to-first-byte when a backend call occurred; omitted for the `-1.0` no-backend sentinel |
 | `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead |
 | `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
-| `{prefix}.request.status.{N}xx` | Counter | Status code bucket (2xx, 4xx, 5xx, etc.) |
+| `{prefix}.request.status.{N}xx` | Counter | HTTP header status-code bucket (2xx, 4xx, 5xx, etc.) — preserved even when the body later fails |
 | `{prefix}.request.client_disconnect` | Counter | Emitted only when the terminal HTTP summary records `client_disconnected: true` |
+| `{prefix}.request.body_incomplete` | Counter | Emitted when terminal body delivery did not complete (`body_outcome:incomplete`) |
 
-Tags: `method`, `status`, `status_class`, `proxy`, `namespace` (plus any `global_tags`).
+Tags: `method`, `status`, `status_class`, `proxy`, `body_outcome`, `body_error`, `namespace` (plus any `global_tags`).
+
+**`body_outcome` / `body_error` composition.** `status` / `status_class` always reflect the HTTP response headers. Terminal body state is separate:
+
+- `body_outcome=complete` when `body_completed` is true
+- `body_outcome=incomplete` when `body_error_class` is set, the client disconnected before completion, or a streamed body ended without completion
+- `body_outcome=none` when no streamed/body terminal outcome applies
+- `body_error` is the bounded `ErrorClass` snake_case label, or `none`
+
+Pre-header transport failures remain on the summary's `error_class` field (JSON loggers); StatsD exposes post-header body failures through `body_error` / `body_incomplete` so a 2xx header status cannot hide a failed delivery.
+
+**Metrics emitted per WebSocket session disconnect** (exactly once via `on_ws_disconnect`; not mixed into HTTP handshake latency families):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `{prefix}.websocket.session.count` | Counter | Completed WebSocket session |
+| `{prefix}.websocket.session.duration_ms` | Timer | Session lifetime (upgrade → close); finite, ≥ 0 only |
+| `{prefix}.websocket.bytes_client_to_backend` | Gauge | Payload bytes relayed client→backend |
+| `{prefix}.websocket.bytes_backend_to_client` | Gauge | Payload bytes relayed backend→client |
+| `{prefix}.websocket.frames_client_to_backend` | Gauge | Frames relayed client→backend |
+| `{prefix}.websocket.frames_backend_to_client` | Gauge | Frames relayed backend→client |
+
+Tags: `proxy`, `result` (`success` \| `error`), `direction`, `io_side`, `error_class`, `namespace` (plus any `global_tags`).
 
 **Metrics emitted per stream (TCP/UDP/DTLS) disconnect:**
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `{prefix}.stream.count` | Counter | Stream connection count |
-| `{prefix}.stream.duration_ms` | Timer | Connection duration |
+| `{prefix}.stream.duration_ms` | Timer | Connection duration (finite, ≥ 0 only) |
 | `{prefix}.stream.bytes_sent` | Gauge | Bytes the gateway relayed **client→backend** (same directional contract as `StreamTransactionSummary.bytes_sent`) |
 | `{prefix}.stream.bytes_received` | Gauge | Bytes the gateway relayed **backend→client** (same directional contract as `StreamTransactionSummary.bytes_received`) |
 | `{prefix}.stream.disconnect` | Counter | One disconnect event per stream summary |
@@ -483,10 +510,10 @@ config:
 
 #### DogStatsD / Datadog Integration
 
-The `global_tags` config maps directly to DogStatsD tag format (`|#key:value,key:value`). Per-request tags (method, status, proxy) are always included. To route metrics to Datadog:
+The `global_tags` config maps directly to DogStatsD tag format (`|#key:value,key:value`). Per-request tags (method, status, proxy, body outcome) and the authoritative `namespace` tag are always included. To route metrics to Datadog:
 
 1. Point `host` at your Datadog Agent or DogStatsD server
-2. Set `global_tags` with environment and service metadata
+2. Set `global_tags` with environment and service metadata (not reserved keys)
 3. Metrics appear in Datadog with full tag filtering
 
 ### `ws_logging`

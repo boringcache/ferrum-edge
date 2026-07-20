@@ -11631,9 +11631,21 @@ components:
         Plugin: statsd_logging — Sends transaction metrics to a StatsD-compatible
         server over UDP. Unknown top-level keys are rejected at construction /
         Admin validation. Nested `global_tags` remains an intentionally open
-        string map. Registration policy is OptionalFailOpen (invalid enabled
-        configs warn and omit the plugin on file-mode load / cache rebuild
-        rather than aborting the gateway). See docs/plugins.md.
+        string map, but keys must match [A-Za-z_][A-Za-z0-9_.-]* (max 64 bytes)
+        and cannot override reserved runtime tags (namespace, method, status,
+        status_class, proxy, protocol, error, cause, direction, body_outcome,
+        body_error, result, io_side, error_class). The authoritative namespace
+        tag is always appended and preserves the full validated Ferrum namespace
+        (up to 254 bytes). Metric prefixes are sanitized and capped at 256
+        bytes; encoded global_tags (+ namespace) are capped at 400 bytes.
+        UDP datagrams never exceed a 1452-byte conservative IPv4/IPv6 payload
+        ceiling; indivisible oversized lines are dropped rather than fragmented.
+        Mirror summaries are excluded from request.* families. Timers require
+        finite non-negative samples (the -1.0 no-backend TTFB sentinel is
+        omitted). WebSocket session completion emits websocket.* families via
+        on_ws_disconnect. Registration policy is OptionalFailOpen (invalid
+        enabled configs warn and omit the plugin on file-mode load / cache
+        rebuild rather than aborting the gateway). See docs/plugins.md.
       required:
         - host
       properties:
@@ -11649,12 +11661,18 @@ components:
         prefix:
           type: string
           default: "ferrum"
-          description: Metric name prefix (e.g., ferrum.request.count)
+          maxLength: 256
+          description: >-
+            Metric name prefix (e.g., ferrum.request.count). Sanitized for
+            StatsD line-protocol safety; max 256 bytes after sanitization.
         global_tags:
           type: object
           additionalProperties:
             type: string
-          description: Key-value pairs appended as DogStatsD tags to every metric
+          description: >-
+            Extra DogStatsD tags appended to every metric. Keys cannot override
+            reserved runtime tags. Encoded global_tags (+ authoritative
+            namespace) are capped at 400 bytes.
         flush_interval_ms:
           type: integer
           default: 500
@@ -11692,9 +11710,10 @@ components:
             `proxy`↔`proxy_id`.
             Stream: `protocol`↔`protocol`, `proxy`↔`proxy_id`,
             `cause`↔`disconnect_cause`, `direction`↔`disconnect_direction`.
-            `static_fields`, `derived_fields`, `metadata`, `order`, and
-            `timestamp_format` are no-ops for statsd (line protocol, not JSON).
-            See docs/log_schema.md.
+            Rename targets must match [A-Za-z_][A-Za-z0-9_.-]* and must not
+            collide with reserved runtime tags. `static_fields`,
+            `derived_fields`, `metadata`, `order`, and `timestamp_format` are
+            no-ops for statsd (line protocol, not JSON). See docs/log_schema.md.
         schema_ref:
           type: string
           description: >-
