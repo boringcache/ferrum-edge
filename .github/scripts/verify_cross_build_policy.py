@@ -1743,6 +1743,10 @@ _inline_program_depth = 0
 # shell program assigns it, so the names a program binds are tracked while that
 # program is scanned and consulted when inline interpreter source is read.
 SHELL_PARAMETER_REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+SHELL_SOURCE_PARAMETER_REFERENCE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
 SHELL_ASSIGNMENT_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=.*", re.DOTALL)
 WHOLE_SHELL_PARAMETER = re.compile(r"\s*\$[A-Za-z_][A-Za-z0-9_]*\s*")
 _shell_assigned_names: frozenset[str] = frozenset()
@@ -3423,6 +3427,119 @@ def generated_shell_expansion_spans(line: str) -> tuple[tuple[int, int], ...]:
         ):
             generated.append((start, end))
     return tuple(generated)
+
+
+def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
+    """Return shell variables whose values later become opaque program source.
+
+    Directly nested expansions are handled by
+    `generated_shell_expansion_spans()`. This bounded data-flow pass covers the
+    ordinary two-step spelling instead: `code=$(./helper); eval "$code"` (and
+    shell `-c "$code"`). Without it, an unchanged trusted evaluator froze only
+    its caller while a helper-only edit still changed the executed program.
+
+    Assignment aliases are followed to a fixed point, so `a=$(helper); b=$a;
+    eval "$b"` retains the original producer. The analysis only accumulates
+    names and therefore terminates after at most the number of assignments.
+    """
+
+    evaluated: set[str] = set()
+    assignments: list[tuple[str, str]] = []
+    assignment = re.compile(
+        r"(?:^|(?<=[;&|]))\s*(?:(?:export|readonly|local|declare)\s+)?"
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>.*)$"
+    )
+    for line in lines:
+        for opaque in OPAQUE_INLINE_SHELL.finditer(line):
+            for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(
+                opaque.group(0)
+            ):
+                evaluated.add(parameter.group("braced") or parameter.group("bare"))
+        for bound in assignment.finditer(line):
+            assignments.append((bound.group("name"), bound.group("value")))
+
+    changed = True
+    while changed:
+        changed = False
+        for name, value in assignments:
+            if name not in evaluated:
+                continue
+            for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(value):
+                source_name = parameter.group("braced") or parameter.group("bare")
+                if source_name not in evaluated:
+                    evaluated.add(source_name)
+                    changed = True
+    return frozenset(evaluated)
+
+
+def generated_shell_assignment_spans(
+    line: str,
+    evaluated_variables: frozenset[str],
+) -> tuple[tuple[int, int], ...]:
+    """Return substitutions assigned to a variable later used as source."""
+
+    if not evaluated_variables:
+        return ()
+    assignments = tuple(
+        match
+        for match in re.finditer(
+            r"(?:^|(?<=[;&|]))\s*(?:(?:export|readonly|local|declare)\s+)?"
+            r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=",
+            line,
+        )
+        if match.group("name") in evaluated_variables
+    )
+    if not assignments:
+        return ()
+    candidates = (
+        *command_substitution_spans(line),
+        *backtick_substitution_spans(line),
+        *process_substitution_spans(line),
+    )
+    return tuple(
+        (start, end)
+        for start, end in sorted(candidates)
+        if any(match.end() <= start for match in assignments)
+    )
+
+
+def generated_stdin_program_operands(line: str) -> frozenset[str]:
+    """Return path words whose stdout can become interpreter source on stdin.
+
+    The Cross scanner already treats an undecodable interpreter stdin program
+    as opaque at the caller. That protects a newly added pipeline, but it does
+    not protect a helper-only edit when the trusted caller already contains
+    `./scripts/generator | bash`: the caller surface stays byte-identical while
+    the generated program changes. Record the repository command words in every
+    contributing pipeline stage, plus an opaque interpreter segment itself for
+    process-substitution/here-string input, so reachability can freeze those
+    producers without treating ordinary data pipelines as executable source.
+
+    Tokenization is deliberately the same shell model used by
+    `shell_stdin_program()`. A line it cannot tokenize contributes no optimistic
+    classification here; the existing opaque caller checks still fail closed.
+    """
+
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return frozenset()
+    operands: set[str] = set()
+    for statement in shell_statement_segments(tokens):
+        pipeline = split_shell_pipeline(statement)
+        for position, segment in enumerate(pipeline):
+            language, _program, opaque = shell_stdin_program(segment)
+            if language is None or not opaque:
+                continue
+            # Every earlier stage contributes to the bytes the interpreter
+            # receives. The interpreter segment is included as well because a
+            # process substitution (`bash < <(./helper)`) or dynamic here-string
+            # carries its producer inside that same segment.
+            for contributing in (*pipeline[:position], segment):
+                for word in contributing:
+                    normalized = normalize_repository_path(word)
+                    if normalized is not None:
+                        operands.add(normalized)
+    return frozenset(operands)
 
 
 def flattened_command_substitutions(line: str) -> str:
@@ -10564,6 +10681,10 @@ def block_automation_references(
             errors.extend(heredoc_failures)
             pending_programs.extend(heredoc_programs)
 
+        generated_source_variables = shell_source_variable_names(
+            tuple(command_line.text for command_line in command_lines)
+        )
+
         working_directory: str | None = ""
         control_stack: list[str | None] = []
         # A substitution group runs in a subshell, so its `if`/`else` blocks open
@@ -10611,7 +10732,18 @@ def block_automation_references(
                 inside_subshell = True
                 subshell_control_stack.clear()
             normalized_line = repository_command_line(line)
-            generated_shell_spans = generated_shell_expansion_spans(
+            generated_shell_spans = tuple(
+                dict.fromkeys(
+                    (
+                        *generated_shell_expansion_spans(normalized_line),
+                        *generated_shell_assignment_spans(
+                            normalized_line,
+                            generated_source_variables,
+                        ),
+                    )
+                )
+            )
+            generated_stdin_operands = generated_stdin_program_operands(
                 normalized_line
             )
             directory_matches = list(CD_COMMAND.finditer(normalized_line))
@@ -10698,6 +10830,16 @@ def block_automation_references(
                     or match.group("direct")
                     or match.group("bare")
                 )
+                normalized_raw_command_path = normalize_repository_path(
+                    raw_command_path
+                )
+                if normalized_raw_command_path in generated_stdin_operands:
+                    # A literal repository program whose stdout enters an
+                    # interpreter stdin is an output generator just as surely
+                    # as one nested directly inside `eval "$(...)"`. Keep its
+                    # ordinary interpreter provenance too; this marker adds a
+                    # full-digest boundary and never replaces real traversal.
+                    generated_shell_output = True
                 # An explicit interpreter names the language of the file it
                 # runs, and that is the only evidence there is when the file
                 # carries neither a suffix nor a shebang. `python3 ci/unsafe`
@@ -18389,6 +18531,29 @@ pre_build = []
             "./scripts/build",
             "source <(./scripts/build)",
         ),
+        "shell interpreter pipeline": extensionless_workflow.replace(
+            "./scripts/build",
+            "./scripts/build | bash --norc",
+        ),
+        "Python interpreter pipeline": extensionless_workflow.replace(
+            "./scripts/build",
+            "./scripts/build | python3",
+        ),
+        "shell process-substitution stdin": extensionless_workflow.replace(
+            "./scripts/build",
+            "bash --norc < <(./scripts/build)",
+        ),
+        "eval through an assigned variable": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "shell -c through assignment aliases": extensionless_workflow.replace(
+            "./scripts/build",
+            "|-\n"
+            '          first="$(./scripts/build)"\n'
+            '          second="$first"\n'
+            '          bash -c "$second"',
+        ),
     }
     for generated_label, generated_workflow in generated_shell_workflows.items():
         if not compare_pr_automation_collection(
@@ -18438,6 +18603,10 @@ pre_build = []
         "backtick substitution": extensionless_workflow.replace(
             "./scripts/build",
             'generated=`./scripts/build`; printf \'%s\\n\' "$generated"',
+        ),
+        "non-interpreter pipeline": extensionless_workflow.replace(
+            "./scripts/build",
+            "./scripts/build | cat >/dev/null",
         ),
     }
     for data_label, data_workflow in extensionless_data_substitution_workflows.items():
