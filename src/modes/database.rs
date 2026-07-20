@@ -2036,10 +2036,12 @@ pub async fn run(
                             }
                             Err(e) => {
                                 if crate::modes::is_poll_validation_rejection(&e) {
-                                    crate::modes::record_config_validation_rejection(
+                                    record_config_validation_rejection_after_recovery_migration_gate(
                                         &db_poll,
                                         &db_available_poll,
                                         &config_rejected_poll,
+                                        auto_apply_plugin_migrations_poll,
+                                        &plugin_migration_reconcile_state_poll,
                                         &e,
                                         "full reload after DB DNS reconnect",
                                     )
@@ -2140,10 +2142,12 @@ pub async fn run(
                                                     // reconnect error (issue #2158). Keep
                                                     // last known-good config + admin writable.
                                                     if crate::modes::is_poll_validation_rejection(&e) {
-                                                        crate::modes::record_config_validation_rejection(
+                                                        record_config_validation_rejection_after_recovery_migration_gate(
                                                             &db_poll,
                                                             &db_available_poll,
                                                             &config_rejected_poll,
+                                                            auto_apply_plugin_migrations_poll,
+                                                            &plugin_migration_reconcile_state_poll,
                                                             &e,
                                                             "rejected-delta escalation full reload",
                                                         )
@@ -2198,10 +2202,12 @@ pub async fn run(
                                                                     }
                                                                     Err(e2) => {
                                                                         if crate::modes::is_poll_validation_rejection(&e2) {
-                                                                            crate::modes::record_config_validation_rejection(
+                                                                            record_config_validation_rejection_after_recovery_migration_gate(
                                                                                 &db_poll,
                                                                                 &db_available_poll,
                                                                                 &config_rejected_poll,
+                                                                                auto_apply_plugin_migrations_poll,
+                                                                                &plugin_migration_reconcile_state_poll,
                                                                                 &e2,
                                                                                 "rejected-delta escalation failover reload",
                                                                             )
@@ -2283,10 +2289,12 @@ pub async fn run(
                                         // known-good config + admin writable and skip
                                         // failover (issue #2158).
                                         if crate::modes::is_poll_validation_rejection(&e2) {
-                                            crate::modes::record_config_validation_rejection(
+                                            record_config_validation_rejection_after_recovery_migration_gate(
                                                 &db_poll,
                                                 &db_available_poll,
                                                 &config_rejected_poll,
+                                                auto_apply_plugin_migrations_poll,
+                                                &plugin_migration_reconcile_state_poll,
                                                 &e2,
                                                 "full fallback reload",
                                             )
@@ -2329,10 +2337,12 @@ pub async fn run(
                                                         }
                                                         Err(e3) => {
                                                             if crate::modes::is_poll_validation_rejection(&e3) {
-                                                                crate::modes::record_config_validation_rejection(
+                                                                record_config_validation_rejection_after_recovery_migration_gate(
                                                                     &db_poll,
                                                                     &db_available_poll,
                                                                     &config_rejected_poll,
+                                                                    auto_apply_plugin_migrations_poll,
+                                                                    &plugin_migration_reconcile_state_poll,
                                                                     &e3,
                                                                     "failover full reload",
                                                                 )
@@ -2388,10 +2398,12 @@ pub async fn run(
                             }
                             Err(e) => {
                                 if crate::modes::is_poll_validation_rejection(&e) {
-                                    crate::modes::record_config_validation_rejection(
+                                    record_config_validation_rejection_after_recovery_migration_gate(
                                         &db_poll,
                                         &db_available_poll,
                                         &config_rejected_poll,
+                                        auto_apply_plugin_migrations_poll,
+                                        &plugin_migration_reconcile_state_poll,
                                         &e,
                                         "initial full poll",
                                     )
@@ -2627,6 +2639,37 @@ async fn mark_db_available_after_successful_poll_load(
     }
 }
 
+/// A validation-rejected full snapshot still proves database reachability, but
+/// an offline-bootstrapped process must not use that fact to bypass the pending
+/// custom-plugin migration gate. Reconcile the same core/custom migration state
+/// as a successful poll before deciding whether in-band repair writes may be
+/// re-enabled, while always raising the config-rejected signal.
+async fn record_config_validation_rejection_after_recovery_migration_gate(
+    db: &Arc<dyn DatabaseBackend>,
+    db_available: &AtomicBool,
+    config_rejected: &AtomicBool,
+    auto_apply_plugin_migrations: bool,
+    plugin_migration_reconcile_state: &AtomicU8,
+    err: &anyhow::Error,
+    context: &str,
+) {
+    let writes_enabled = mark_db_available_after_successful_poll_load(
+        db,
+        db_available,
+        context,
+        auto_apply_plugin_migrations,
+        plugin_migration_reconcile_state,
+    )
+    .await;
+    crate::modes::apply_config_validation_rejection(
+        db_available,
+        config_rejected,
+        writes_enabled,
+        err,
+        context,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2756,6 +2799,70 @@ mod tests {
                 .expect("warn-only pending list")
                 .is_empty(),
             "warn-only recovery must not mutate custom-plugin schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_recovery_validation_rejection_cannot_bypass_plugin_probe() {
+        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+        if plugin_migrations.is_empty() {
+            return;
+        }
+
+        let (store, _temp_dir) = offline_recovery_test_store();
+        let pool = store.pool();
+        sqlx::query("CREATE TABLE _ferrum_plugin_migrations (broken TEXT)")
+            .execute(&pool)
+            .await
+            .expect("malformed tracking table");
+        let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+        let db_available = AtomicBool::new(false);
+        let config_rejected = AtomicBool::new(false);
+        let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
+        let rejection = validation_rejection_error();
+
+        record_config_validation_rejection_after_recovery_migration_gate(
+            &db,
+            &db_available,
+            &config_rejected,
+            false,
+            &reconcile_state,
+            &rejection,
+            "test rejected recovery snapshot",
+        )
+        .await;
+        assert!(config_rejected.load(Ordering::Relaxed));
+        assert!(
+            !db_available.load(Ordering::Relaxed),
+            "reachable validation rejection must not enable writes before plugin reconciliation"
+        );
+        assert_eq!(
+            reconcile_state.load(Ordering::Acquire),
+            PLUGIN_MIGRATIONS_NEED_RECONCILE
+        );
+
+        sqlx::query("DROP TABLE _ferrum_plugin_migrations")
+            .execute(&pool)
+            .await
+            .expect("repair tracking table");
+        record_config_validation_rejection_after_recovery_migration_gate(
+            &db,
+            &db_available,
+            &config_rejected,
+            false,
+            &reconcile_state,
+            &rejection,
+            "test rejected recovery snapshot after repair",
+        )
+        .await;
+        assert!(db_available.load(Ordering::Relaxed));
+        assert!(
+            config_rejected.load(Ordering::Relaxed),
+            "migration reconciliation must not clear the independent config rejection"
+        );
+        assert_eq!(
+            reconcile_state.load(Ordering::Acquire),
+            PLUGIN_MIGRATIONS_RECONCILED
         );
     }
 

@@ -30,6 +30,8 @@
 //! Native and translated gRPC transactions retain their terminal gRPC status
 //! separately from the HTTP transport status. WebSocket uses its HTTP upgrade
 //! transaction; this example deliberately does not capture frame payloads.
+//! Request methods are capped at 256 Unicode characters before persistence so
+//! hostile extension methods cannot exceed the portable MySQL column contract.
 //!
 //! ## Features Demonstrated
 //!
@@ -86,6 +88,7 @@ use crate::plugins::{
 const TABLE_NAME: &str = "example_audit_log";
 const PLUGIN_NAME: &str = "example_audit_plugin";
 const MAX_RETENTION_DAYS: u64 = 36_500;
+const MAX_HTTP_METHOD_CHARS: usize = 256;
 const MAX_METADATA_ENTRIES: usize = 64;
 const MAX_METADATA_KEY_CHARS: usize = 128;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
@@ -267,7 +270,10 @@ impl ExampleAuditPlugin {
             } else {
                 "http".to_string()
             },
-            http_method: Some(summary.http_method.clone()),
+            http_method: Some(truncate_chars(
+                &summary.http_method,
+                MAX_HTTP_METHOD_CHARS,
+            )),
             request_path: Some(truncate_chars(&summary.request_path, 2048)),
             response_status: Some(i32::from(summary.response_status_code)),
             grpc_status,
@@ -639,7 +645,7 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
         CustomPluginMigration {
             version: 1,
             name: "create_example_audit_log",
-            checksum: "v1_create_example_audit_log_f4a72b",
+            checksum: "v1_create_example_audit_log_7c2b31",
             sql: r#"
                 CREATE TABLE IF NOT EXISTS example_audit_log (
                     id TEXT PRIMARY KEY,
@@ -690,7 +696,7 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
                     timestamp VARCHAR(32) NOT NULL,
                     client_ip VARCHAR(255) NOT NULL,
                     protocol VARCHAR(32) NOT NULL,
-                    http_method VARCHAR(20),
+                    http_method VARCHAR(256),
                     request_path TEXT,
                     response_status INTEGER,
                     grpc_status BIGINT,

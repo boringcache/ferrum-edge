@@ -346,6 +346,18 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         .await;
 
     plugin
+        .log(&TransactionSummary {
+            timestamp_received: "2026-07-20T12:00:00.750Z".to_string(),
+            client_ip: "192.0.2.15".to_string(),
+            http_method: "M".repeat(300),
+            request_path: "/bounded-method".to_string(),
+            response_status_code: 200,
+            latency_total_ms: 1.0,
+            ..Default::default()
+        })
+        .await;
+
+    plugin
         .on_stream_disconnect(&StreamTransactionSummary {
             namespace: "ferrum".to_string(),
             proxy_id: "stream-1".to_string(),
@@ -375,6 +387,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     use sqlx::Row;
     let mut saw_http = false;
     let mut saw_grpc = false;
+    let mut saw_bounded_method = false;
     let mut saw_stream = false;
     let mut expired_gone = false;
     for _ in 0..50 {
@@ -406,19 +419,29 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                 assert_eq!(grpc_status, Some(13));
                 saw_grpc = true;
             }
+            if protocol == "http" && client_ip == "192.0.2.15" {
+                let method = method.as_deref().expect("bounded HTTP method");
+                assert_eq!(method.chars().count(), 256);
+                assert!(method.chars().all(|c| c == 'M'));
+                saw_bounded_method = true;
+            }
             if protocol == "tcp" && client_ip == "192.0.2.11" {
                 assert!(method.is_none());
                 assert!(status.is_none());
                 saw_stream = true;
             }
         }
-        if saw_http && saw_grpc && saw_stream && expired_gone {
+        if saw_http && saw_grpc && saw_bounded_method && saw_stream && expired_gone {
             break;
         }
     }
 
     assert!(saw_http, "expected HTTP audit row");
     assert!(saw_grpc, "expected gRPC audit row with terminal status");
+    assert!(
+        saw_bounded_method,
+        "expected overlong HTTP method to persist within the portable column bound"
+    );
     assert!(saw_stream, "expected stream audit row");
     assert!(expired_gone, "retention worker must purge the expired row");
 

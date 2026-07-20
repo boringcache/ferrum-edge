@@ -102,7 +102,7 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
             id VARCHAR(255) PRIMARY KEY,
             timestamp VARCHAR(32) NOT NULL,
             protocol VARCHAR(32) NOT NULL,
-            http_method VARCHAR(20),
+            http_method VARCHAR(256),
             request_path TEXT,
             response_status INTEGER,
             grpc_status BIGINT,
