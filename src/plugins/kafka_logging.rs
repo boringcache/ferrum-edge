@@ -760,10 +760,14 @@ impl KafkaLogging {
         })
     }
 
+    /// Snapshot lifecycle counters for external integration and unit tests.
+    #[allow(dead_code)] // public test support is unused by the binary target
     pub fn snapshot(&self) -> KafkaSinkSnapshot {
         self.generation.state.snapshot()
     }
 
+    /// Finalize this generation deterministically from external tests.
+    #[allow(dead_code)] // public test support is unused by the binary target
     pub async fn finalize(&self) {
         self.generation.finalize().await;
         unregister_generation(self.generation.state.metrics.generation_id);
