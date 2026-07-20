@@ -22,7 +22,7 @@ their *failure* path, leaving the real client logic uncovered:
 | --- | --- | --- | --- |
 | **Consul** (`src/service_discovery/consul.rs`) | `ConsulDiscoverer::discover()` — health-API JSON parsing | inline unit tests covered only `build_url()` | live Consul: Service-vs-Node address fallback, port/weight/tag extraction, `passing=true` health filter, per-tag filtering, unknown-service empty result |
 | **LDAP** (`src/plugins/ldap_auth.rs`) | `ldap3` bind / search-then-bind / group membership, via `create_plugin` → `authenticate` | functional test only pointed the plugin at an *unreachable* server (500 / 401 paths) | live OpenLDAP: valid/invalid direct bind, search-then-bind, group-membership allow (Continue) vs deny (403) |
-| **Kafka** (`src/plugins/kafka_logging.rs`) | librdkafka produce, delivery callbacks, consume-back, bounded finalize | deterministic unit tests for admission/CRL/budgets/finalize ownership; ignored optional broker harness | live Redpanda: successful ack + key/record consume, unknown-topic reject after admission, broker oversized reject, under-replicated delivery timeout, producer-queue saturation, successful and stalled finalize, multi-instance generation isolation, Drop/reload disposal with pending records |
+| **Kafka** (`src/plugins/kafka_logging.rs`) | librdkafka produce, delivery callbacks, consume-back, bounded finalize | deterministic unit tests for admission/CRL/budgets/finalize ownership; ignored optional broker harness | live Redpanda: successful ack + key/record consume, unknown-topic reject after admission, broker oversized reject, paused-broker delivery timeout, producer-queue saturation, successful and stalled finalize, multi-instance generation isolation, Drop/reload disposal with pending records |
 
 ## Running locally
 
@@ -74,14 +74,16 @@ Hosted Redpanda covers the broker-dependent acceptance contract from #2548 /
   consume-back of a known path marker
 - unknown-topic rejection after local admission
 - broker-side oversized-message rejection (`max.message.bytes` on the topic)
-- delivery timeout via `acks=all` against `min.insync.replicas=2` on a
-  single-broker cluster
+- delivery timeout via `acks=all` against a docker-paused broker (Redpanda
+  v24.2 does not materialize Kafka's topic `min.insync.replicas`; produce the
+  producer while live, then pause so ack cannot complete)
 - immediate `queue.buffering.max.messages=1` saturation while a prior record is
-  stuck
+  stuck on that paused broker
 - successful bounded finalize after delivery
-- stalled/failed bounded finalize accounting
+- stalled/failed bounded finalize accounting against a paused broker
 - generation isolation across instances and Drop-time old-generation disposal
-  while a record is pending
+  while a record is pending on a paused broker (then unpause for the next
+  healthy generation)
 
 Deterministic unit coverage remains the home for cases that do not need a
 broker (and must stay OpenSSL/librdkafka-host independent):

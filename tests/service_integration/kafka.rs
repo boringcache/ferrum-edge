@@ -282,10 +282,14 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
     assert_eq!(oversized_snap.delivered_total, 0);
     oversized.finalize().await;
 
-    // --- delivery timeout / retry exhaustion via under-replicated acks=all ---
+    // --- delivery timeout / retry exhaustion against a frozen broker ---
+    // Redpanda v24.2 does not expose Kafka's `min.insync.replicas` as a topic
+    // property, so under-replicated acks=all cannot be configured here. Build
+    // the producer while the broker is live, then docker-pause it so produce
+    // hangs until `message_timeout_ms`.
     let timeout_topic = "ferrum-timeout";
     broker
-        .create_topic(timeout_topic, &[("min.insync.replicas", "2")])
+        .create_topic(timeout_topic, &[])
         .await
         .expect("create timeout topic");
     let timed = plugin(
@@ -296,6 +300,10 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
             "flush_timeout_seconds": 3,
         }),
     );
+    broker
+        .pause_broker()
+        .await
+        .expect("pause broker for delivery-timeout path");
     timed
         .log(&summary("/kafka-si-timeout", "203.0.113.53"))
         .await;
@@ -305,7 +313,7 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
     .await;
     assert!(
         timed_snap.admitted_total >= 1,
-        "timeout path must admit locally against a reachable broker: {:?}",
+        "timeout path must admit locally after live bootstrap (broker paused before log): {:?}",
         (
             timed_snap.admitted_total,
             timed_snap.delivery_failed_total,
@@ -314,17 +322,21 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
     );
     assert!(
         timed_snap.delivery_failed_total >= 1,
-        "expected delivery timeout/retry exhaustion, got delivered={} failed={}",
+        "expected delivery timeout/retry exhaustion against paused broker, got delivered={} failed={}",
         timed_snap.delivered_total,
         timed_snap.delivery_failed_total
     );
     assert_eq!(timed_snap.delivered_total, 0);
     timed.finalize().await;
+    broker
+        .unpause_broker()
+        .await
+        .expect("unpause broker after delivery-timeout path");
 
     // --- immediate producer-queue saturation while a prior record is stuck ---
     let queue_topic = "ferrum-queue-sat";
     broker
-        .create_topic(queue_topic, &[("min.insync.replicas", "2")])
+        .create_topic(queue_topic, &[])
         .await
         .expect("create queue-sat topic");
     let saturated = plugin(
@@ -338,6 +350,10 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
             }
         }),
     );
+    broker
+        .pause_broker()
+        .await
+        .expect("pause broker for queue-saturation path");
     for idx in 0..8 {
         saturated
             .log(&summary(&format!("/kafka-si-queue-{idx}"), "203.0.113.54"))
@@ -364,11 +380,15 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
         sat_snap.ferrum_dropped_total
     );
     saturated.finalize().await;
+    broker
+        .unpause_broker()
+        .await
+        .expect("unpause broker after queue-saturation path");
 
     // --- stalled/failed bounded finalize accounting ---
     let stall_topic = "ferrum-finalize-stall";
     broker
-        .create_topic(stall_topic, &[("min.insync.replicas", "2")])
+        .create_topic(stall_topic, &[])
         .await
         .expect("create finalize-stall topic");
     let stalled = plugin(
@@ -379,6 +399,10 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
             "flush_timeout_seconds": 1,
         }),
     );
+    broker
+        .pause_broker()
+        .await
+        .expect("pause broker for finalize-stall path");
     stalled
         .log(&summary("/kafka-si-finalize-stall", "203.0.113.55"))
         .await;
@@ -462,10 +486,12 @@ async fn kafka_logging_real_broker_generation_isolation_and_reload_disposal() {
     plugin_b.finalize().await;
 
     // Reload/old-generation disposal: drop a generation with a stuck pending
-    // record on the multi-thread runtime (ordered finalize from Drop).
+    // record on the multi-thread runtime (ordered finalize from Drop). Pause
+    // the broker after producer construction — Redpanda cannot express
+    // under-replicated acks=all via topic `min.insync.replicas`.
     let pending_topic = "ferrum-reload-pending";
     broker
-        .create_topic(pending_topic, &[("min.insync.replicas", "2")])
+        .create_topic(pending_topic, &[])
         .await
         .expect("create reload-pending topic");
     let old = plugin(
@@ -477,6 +503,10 @@ async fn kafka_logging_real_broker_generation_isolation_and_reload_disposal() {
         }),
     );
     let old_gen = old.snapshot().generation_id;
+    broker
+        .pause_broker()
+        .await
+        .expect("pause broker for reload-pending disposal");
     old.log(&summary("/kafka-si-reload-old", "203.0.113.62"))
         .await;
     let pending = wait_snapshot(&old, Duration::from_secs(10), |snap| {
@@ -485,6 +515,10 @@ async fn kafka_logging_real_broker_generation_isolation_and_reload_disposal() {
     .await;
     assert!(pending.admitted_total >= 1);
     drop(old);
+    broker
+        .unpause_broker()
+        .await
+        .expect("unpause broker before reload-new delivery");
 
     let healthy_topic = "ferrum-reload-new";
     broker

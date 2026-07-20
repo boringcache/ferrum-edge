@@ -255,7 +255,7 @@ impl ExecOutput {
 /// `127.0.0.1:<host-port>` on the external Kafka listener. Readiness is polled
 /// via librdkafka metadata (not a log line).
 pub struct RedpandaContainer {
-    _container: ContainerAsync<GenericImage>,
+    container: ContainerAsync<GenericImage>,
     /// `127.0.0.1:<mapped-port>` — pass as `kafka_logging.broker_list`.
     pub bootstrap: String,
 }
@@ -306,7 +306,7 @@ pub async fn start_redpanda_container() -> Result<RedpandaContainer, BoxError> {
     wait_redpanda_ready(&bootstrap).await?;
 
     Ok(RedpandaContainer {
-        _container: container,
+        container,
         bootstrap,
     })
 }
@@ -358,9 +358,9 @@ fn topic_describe_has_config(describe_output: &str, key: &str, value: &str) -> b
 }
 
 impl RedpandaContainer {
-    /// Create a single-partition topic, optionally with broker topic configs
-    /// (`max.message.bytes`, `min.insync.replicas`, …). Retries while the
-    /// admin path is still warming up.
+    /// Create a single-partition topic, optionally with Redpanda topic configs
+    /// (e.g. `max.message.bytes`). Retries while the admin path is still
+    /// warming up.
     ///
     /// Topic properties MUST be passed with `-c` / `--topic-config`. rpk's
     /// global `--config` flag is a path to `rpk.yaml` / `redpanda.yaml` and
@@ -368,6 +368,11 @@ impl RedpandaContainer {
     /// cluster default `kafka_batch_max_bytes` (~1 MiB), so the oversized
     /// MESSAGE_TOO_LARGE acceptance path silently delivered instead of
     /// rejecting.
+    ///
+    /// Only properties Redpanda exposes as topic configs are verifiable via
+    /// `rpk topic describe --print-configs`. Kafka's `min.insync.replicas` is
+    /// **not** among them on Redpanda v24.2; stuck-produce fixtures must use
+    /// [`Self::pause_broker`] instead of an under-replicated topic.
     pub async fn create_topic(&self, name: &str, configs: &[(&str, &str)]) -> Result<(), BoxError> {
         let mut script = format!("rpk topic create {name} -p 1 -r 1");
         for (key, value) in configs {
@@ -455,6 +460,30 @@ impl RedpandaContainer {
         .into())
     }
 
+    /// Freeze the Redpanda process (`docker pause`) so in-flight produces cannot
+    /// complete. Construct the producer first (while the broker is live) so
+    /// metadata/bootstrap succeed; then pause before `log`/`finalize` paths that
+    /// must observe timeout, queue saturation, stalled flush, or Drop disposal.
+    ///
+    /// This replaces Kafka's `acks=all` + `min.insync.replicas > RF` fixture:
+    /// Redpanda v24.2 does not materialize `min.insync.replicas` as a topic
+    /// property (`rpk topic alter-config` can return OK while
+    /// `describe --print-configs` never lists the key).
+    pub async fn pause_broker(&self) -> Result<(), BoxError> {
+        self.container
+            .pause()
+            .await
+            .map_err(|error| -> BoxError { format!("pause Redpanda container: {error}").into() })
+    }
+
+    /// Resume a paused broker and wait until librdkafka metadata succeeds again.
+    pub async fn unpause_broker(&self) -> Result<(), BoxError> {
+        self.container.unpause().await.map_err(|error| -> BoxError {
+            format!("unpause Redpanda container: {error}").into()
+        })?;
+        wait_redpanda_ready(&self.bootstrap).await
+    }
+
     /// Consume one record from `topic` (earliest), returning `(key, payload)`.
     /// Payload is returned only for assertion against known test markers —
     /// callers must not log it.
@@ -472,7 +501,7 @@ impl RedpandaContainer {
 
     async fn exec_sh(&self, script: &str) -> Result<ExecOutput, BoxError> {
         let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
-        let mut result = self._container.exec(ExecCommand::new(cmd)).await?;
+        let mut result = self.container.exec(ExecCommand::new(cmd)).await?;
         let stdout = result.stdout_to_vec().await?;
         let stderr = result.stderr_to_vec().await?;
         Ok(ExecOutput {
