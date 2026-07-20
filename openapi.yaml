@@ -11685,9 +11685,21 @@ components:
         Plugin: statsd_logging — Sends transaction metrics to a StatsD-compatible
         server over UDP. Unknown top-level keys are rejected at construction /
         Admin validation. Nested `global_tags` remains an intentionally open
-        string map. Registration policy is OptionalFailOpen (invalid enabled
-        configs warn and omit the plugin on file-mode load / cache rebuild
-        rather than aborting the gateway). See docs/plugins.md.
+        string map, but keys must match [A-Za-z_][A-Za-z0-9_.-]* (max 64 bytes)
+        and cannot override reserved or schema-renamed runtime tags (namespace, method, status,
+        status_class, proxy, protocol, error, cause, direction, body_outcome,
+        body_error, result, io_side, error_class). The authoritative namespace
+        tag is always appended and preserves the full validated Ferrum namespace
+        (up to 254 bytes). Metric prefixes are sanitized and capped at 256
+        bytes; encoded global_tags (+ namespace) are capped at 400 bytes.
+        UDP datagrams never exceed a 1452-byte conservative IPv4/IPv6 payload
+        ceiling; indivisible oversized lines are dropped rather than fragmented.
+        Mirror summaries are excluded from request.* families. Timers require
+        finite non-negative samples (the -1.0 no-backend TTFB sentinel is
+        omitted). WebSocket session completion emits websocket.* families via
+        on_ws_disconnect. Registration policy is OptionalFailOpen (invalid
+        enabled configs warn and omit the plugin on file-mode load / cache
+        rebuild rather than aborting the gateway). See docs/plugins.md.
       required:
         - host
       properties:
@@ -11703,12 +11715,33 @@ components:
         prefix:
           type: string
           default: "ferrum"
-          description: Metric name prefix (e.g., ferrum.request.count)
+          maxLength: 256
+          description: >-
+            Metric name prefix (e.g., ferrum.request.count). Sanitized for
+            StatsD line-protocol safety. OpenAPI `maxLength` counts Unicode
+            characters; runtime admission separately enforces at most 256
+            UTF-8 bytes after sanitization, so multibyte prefixes may be
+            rejected below 256 characters.
         global_tags:
           type: object
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: '^[A-Za-z_][A-Za-z0-9_.-]*$'
+            description: >-
+              Tag keys are restricted to the ASCII grammar
+              `[A-Za-z_][A-Za-z0-9_.-]*`, so OpenAPI `maxLength: 64`
+              matches the runtime 64-byte key ceiling.
           additionalProperties:
             type: string
-          description: Key-value pairs appended as DogStatsD tags to every metric
+          description: >-
+            Extra DogStatsD tags appended to every metric. Keys must match
+            `[A-Za-z_][A-Za-z0-9_.-]*` (max 64 ASCII bytes) and cannot
+            override reserved runtime tags or effective schema-renamed runtime
+            keys (enforced at construction).
+            Encoded global_tags (+ authoritative namespace) are capped at
+            400 bytes.
         flush_interval_ms:
           type: integer
           default: 500
@@ -11746,9 +11779,10 @@ components:
             `proxy`↔`proxy_id`.
             Stream: `protocol`↔`protocol`, `proxy`↔`proxy_id`,
             `cause`↔`disconnect_cause`, `direction`↔`disconnect_direction`.
-            `static_fields`, `derived_fields`, `metadata`, `order`, and
-            `timestamp_format` are no-ops for statsd (line protocol, not JSON).
-            See docs/log_schema.md.
+            Rename targets must match [A-Za-z_][A-Za-z0-9_.-]* and must not
+            collide with reserved runtime tags. `static_fields`,
+            `derived_fields`, `metadata`, `order`, and `timestamp_format` are
+            no-ops for statsd (line protocol, not JSON). See docs/log_schema.md.
         schema_ref:
           type: string
           description: >-
@@ -19211,10 +19245,14 @@ components:
       type: object
       description: |
         Plugin: api_chargeback — Per-consumer API usage charge tracking across
-        three independent pricing dimensions: per-call pricing by HTTP status
-        code, per-byte bandwidth pricing (both client->backend and
+        three independent pricing dimensions: per-call pricing by billable
+        status code, per-byte bandwidth pricing (both client->backend and
         backend->client, applied to HTTP-family AND stream proxies), and
         per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS).
+        Ordinary HTTP uses the wire status. Native gRPC and translated
+        gRPC-Web use the final client-visible grpc-status mapped to the
+        canonical effective HTTP status; missing/malformed/unknown terminal
+        status fails closed to 500.
         At least one of `pricing_tiers`, `bandwidth_pricing`, or
         `stream_connection_pricing` must be configured.
       properties:
@@ -19234,16 +19272,18 @@ components:
                 minItems: 1
                 items:
                   type: integer
-                description: HTTP status codes that trigger this tier's charge. A status code must appear in exactly one tier.
+                description: Billable status codes that trigger this tier's charge. Ordinary HTTP uses the wire status. Native gRPC and translated gRPC-Web map final terminal codes as 0→200, 1→499, 2→500, 3→400, 4→504, 5→404, 6→409, 7→403, 8→429, 9→400, 10→409, 11→400, 12→501, 13→500, 14→503, 15→500, and 16→401; missing, malformed, or unknown terminal codes map to 500. A status code must appear in exactly one tier.
               price_per_call:
                 type: number
                 minimum: 0
                 description: Charge per HTTP API call (e.g. 0.00001). Must be non-negative.
           description: |
-            HTTP-family per-call pricing. Each tier maps a set of status codes
-            to a per-call price. Applies to HTTP/1.1, HTTP/2, HTTP/3, gRPC, and
-            WebSocket upgrades. Stream proxies (TCP/UDP/DTLS) have no HTTP
-            status code and use `stream_connection_pricing` instead.
+            HTTP-family per-call pricing. Each tier maps a set of billable
+            status codes to a per-call price. Ordinary HTTP uses its wire
+            status; native gRPC and translated gRPC-Web use the canonical
+            effective-HTTP mapping of the finalized terminal grpc-status.
+            Stream proxies (TCP/UDP/DTLS) have no HTTP status code and use
+            `stream_connection_pricing` instead.
         bandwidth_pricing:
           type: object
           additionalProperties: false
@@ -19301,7 +19341,11 @@ components:
         same `pricing_tiers`, `bandwidth_pricing`, `stream_connection_pricing`,
         and `currency` fields as `api_chargeback`, then exports either
         per-transaction events (`mode: per_event`) or periodic accumulator
-        deltas (`mode: snapshot`) to ClickHouse.
+        deltas (`mode: snapshot`) to ClickHouse. Ordinary HTTP uses its wire
+        status for pricing. Native gRPC and translated gRPC-Web use the final
+        normalized grpc-status mapped to the canonical effective HTTP status.
+        Durable events preserve that billable status, the raw HTTP status, and
+        the normalized gRPC status separately.
       properties:
         mode:
           type: string
@@ -19339,10 +19383,11 @@ components:
                   type: integer
                   minimum: 100
                   maximum: 599
+                description: Billable status codes. Ordinary HTTP uses the wire status; gRPC/gRPC-Web uses the canonical effective mapping of final grpc-status, with missing/malformed/unknown terminal status mapped to 500.
               price_per_call:
                 type: number
                 minimum: 0
-          description: HTTP-family per-call pricing. A status code must appear in at most one tier.
+          description: HTTP-family per-call pricing by billable status. A status code must appear in at most one tier.
         bandwidth_pricing:
           type: object
           additionalProperties: false
@@ -19501,7 +19546,12 @@ components:
 
     ChargebackResponse:
       type: object
-      description: JSON format response from the /charges endpoint.
+      description: |
+        JSON format response from the /charges endpoint. Ordinary HTTP entries
+        use their wire status. Native gRPC and translated gRPC-Web entries use
+        the final client-visible grpc-status mapped to the canonical effective
+        HTTP status; the mapping affects billing output only and does not
+        overwrite transaction-log transport status.
       properties:
         currency:
           type: string
@@ -19563,7 +19613,13 @@ components:
                       description: Per-proxy sum of HTTP calls + stream sessions.
                     by_status:
                       type: object
-                      description: HTTP per-status breakdown (empty for stream-only proxies; populated for `http` and `mixed`).
+                      description: |
+                        HTTP-family per-call breakdown by billable status (empty
+                        for stream-only proxies; populated for `http` and
+                        `mixed`). Ordinary HTTP uses the wire status. Native
+                        gRPC and translated gRPC-Web use the final terminal code
+                        mapped to its canonical effective HTTP status; missing,
+                        malformed, and unknown terminal codes use 500.
                       additionalProperties:
                         type: object
                         properties:

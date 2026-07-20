@@ -792,9 +792,20 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
             "backend_read_timeout_ms": 5000,
             "backend_write_timeout_ms": 5000,
             "backend_tls_verify_server_cert": false,
-            "plugins": [{"plugin_config_id": "grpc-web-success"}],
+            "auth_mode": "single",
+            "plugins": [
+                {"plugin_config_id": "grpc-web-success"},
+                {"plugin_config_id": "grpc-web-success-key-auth"},
+                {"plugin_config_id": "grpc-web-success-chargeback"}
+            ],
         }],
-        "consumers": [],
+        "consumers": [{
+            "id": "h3-grpc-web-chargeback-consumer",
+            "username": "h3-grpc-web-chargeback-user",
+            "credentials": {
+                "keyauth": [{"key": "h3-grpc-web-chargeback-key-99887766"}]
+            }
+        }],
         "upstreams": [],
         "plugin_configs": [
             {
@@ -804,6 +815,30 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
                 "proxy_id": "h3-grpc-web-success",
                 "enabled": true,
                 "config": {},
+            },
+            {
+                "id": "grpc-web-success-key-auth",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-success",
+                "enabled": true,
+                "config": {"key_location": "header:x-api-key"},
+            },
+            {
+                "id": "grpc-web-success-chargeback",
+                "plugin_name": "api_chargeback",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-success",
+                "enabled": true,
+                "config": {
+                    "pricing_tiers": [
+                        {"status_codes": [200], "price_per_call": 0.001},
+                        {"status_codes": [403], "price_per_call": 0.007}
+                    ],
+                    "render_cache_ttl_seconds": 0,
+                    "cache_invalidation_min_age_ms": 0,
+                    "cleanup_interval_seconds": 0,
+                },
             },
             {
                 "id": "grpc-web-errors-only",
@@ -822,6 +857,7 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         GetOptions::default()
             .method(Method::POST)
             .header("content-type", "application/grpc-web+proto")
+            .header("x-api-key", "h3-grpc-web-chargeback-key-99887766")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
     .await;
@@ -858,6 +894,7 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         GetOptions::default()
             .method(Method::POST)
             .header("content-type", "application/grpc-web+proto")
+            .header("x-api-key", "h3-grpc-web-chargeback-key-99887766")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
     .await;
@@ -887,6 +924,41 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
     );
     assert_eq!(access_logs[0]["response_status_code"], 200);
     assert_eq!(access_logs[0]["grpc_status"], 7);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let charges = loop {
+        let charges = gateway
+            .get_admin_json("/charges?format=json")
+            .await
+            .expect("fetch H3 gRPC-Web chargeback JSON");
+        let by_status = &charges["consumers"]["h3-grpc-web-chargeback-user"]["proxies"]["h3-grpc-web-success"]
+            ["by_status"];
+        if by_status["200"]["calls"].as_u64() == Some(1)
+            && by_status["403"]["calls"].as_u64() == Some(1)
+        {
+            break charges;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "H3 gRPC-Web chargeback did not settle: {charges:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let by_status = &charges["consumers"]["h3-grpc-web-chargeback-user"]["proxies"]["h3-grpc-web-success"]
+        ["by_status"];
+    let ok_charge = by_status["200"]["charges"]
+        .as_f64()
+        .expect("status 200 charge");
+    let denied_charge = by_status["403"]["charges"]
+        .as_f64()
+        .expect("status 403 charge");
+    assert!((ok_charge - 0.001).abs() < 1e-12, "{charges:#?}");
+    assert!((denied_charge - 0.007).abs() < 1e-12, "{charges:#?}");
+    assert_eq!(
+        charges["consumers"]["h3-grpc-web-chargeback-user"]["total_calls"].as_u64(),
+        Some(2),
+        "{charges:#?}"
+    );
 
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
