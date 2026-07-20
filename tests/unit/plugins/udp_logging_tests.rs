@@ -862,7 +862,10 @@ fn test_udp_logging_dtls_batch_size_gate_classifies_send_reject_and_split() {
     let max = 16_384usize;
     assert_eq!(
         ferrum_edge::_test_support::udp_logging_classify_dtls_batch_size_for_test(
-            false, max + 1, 8, max
+            false,
+            max + 1,
+            8,
+            max
         ),
         "send_as_is",
         "plain UDP must not apply the DTLS plaintext ceiling"

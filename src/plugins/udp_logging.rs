@@ -657,12 +657,7 @@ async fn deliver_batch(
     };
 
     let max_plaintext = crate::dtls::max_plaintext_bytes();
-    match classify_dtls_batch_size(
-        cfg.dtls_enabled,
-        payload.len(),
-        batch.len(),
-        max_plaintext,
-    ) {
+    match classify_dtls_batch_size(cfg.dtls_enabled, payload.len(), batch.len(), max_plaintext) {
         DtlsBatchSizeDecision::SendAsIs => sender.send(&payload).await,
         DtlsBatchSizeDecision::RejectOversizedSingle => {
             Err(oversized_dtls_batch_error(max_plaintext, payload.len()))
@@ -697,8 +692,7 @@ async fn deliver_one_entry(
     sender: &UdpSender,
     entry: &SummaryLogEntry,
 ) -> Result<(), String> {
-    let Some(payload) =
-        serialize_batch_payload(std::slice::from_ref(entry), cfg.schema.as_deref())
+    let Some(payload) = serialize_batch_payload(std::slice::from_ref(entry), cfg.schema.as_deref())
     else {
         return Ok(());
     };
@@ -711,10 +705,9 @@ async fn deliver_one_entry(
         }
         // `batch_len == 1` never selects split; keep fail-closed if the
         // classifier contract changes.
-        DtlsBatchSizeDecision::SplitPerEntry => Err(oversized_dtls_batch_error(
-            max_plaintext,
-            payload.len(),
-        )),
+        DtlsBatchSizeDecision::SplitPerEntry => {
+            Err(oversized_dtls_batch_error(max_plaintext, payload.len()))
+        }
     }
 }
 
