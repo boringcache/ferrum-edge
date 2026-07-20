@@ -39,7 +39,8 @@ use super::utils::log_schema::{
     TimestampFormat, resolve_schema,
 };
 use super::utils::{
-    BatchConfigDefaults, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config,
+    BatchConfigDefaults, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
+    validate_batch_config,
 };
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
@@ -452,8 +453,13 @@ impl WsLogging {
             1,
             MAX_RETRY_DELAY_MS,
         )?;
-        let reconnect_delay_ms =
-            bounded_u64(config, "reconnect_delay_ms", 5000, 1, MAX_RECONNECT_DELAY_MS)?;
+        let reconnect_delay_ms = bounded_u64(
+            config,
+            "reconnect_delay_ms",
+            5000,
+            1,
+            MAX_RECONNECT_DELAY_MS,
+        )?;
         let connect_timeout_ms = bounded_u64(
             config,
             "connect_timeout_ms",
@@ -557,13 +563,7 @@ impl WsLogging {
     fn queue_http(&self, summary: &TransactionSummary) {
         match self.schema.as_deref() {
             Some(schema) if schema.applies_to_http() => {
-                self.queue_value(
-                    &SchemaView {
-                        summary,
-                        schema,
-                    },
-                    "HTTP entry",
-                );
+                self.queue_value(&SchemaView { summary, schema }, "HTTP entry");
             }
             _ => self.queue_value(summary, "HTTP entry"),
         }
@@ -572,13 +572,7 @@ impl WsLogging {
     fn queue_stream(&self, summary: &StreamTransactionSummary) {
         match self.schema.as_deref() {
             Some(schema) if schema.applies_to_stream() => {
-                self.queue_value(
-                    &SchemaView {
-                        summary,
-                        schema,
-                    },
-                    "stream entry",
-                );
+                self.queue_value(&SchemaView { summary, schema }, "stream entry");
             }
             _ => self.queue_value(summary, "stream entry"),
         }
@@ -594,15 +588,13 @@ impl WsLogging {
         let entry = WsDisconnectLogEntry::from(ctx);
         let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
         let serialize_result = match self.schema.as_deref() {
-            Some(schema) if schema.applies_to_websocket_disconnect() => {
-                serde_json::to_writer(
-                    &mut writer,
-                    &SchemaView {
-                        summary: &entry,
-                        schema,
-                    },
-                )
-            }
+            Some(schema) if schema.applies_to_websocket_disconnect() => serde_json::to_writer(
+                &mut writer,
+                &SchemaView {
+                    summary: &entry,
+                    schema,
+                },
+            ),
             _ => serde_json::to_writer(&mut writer, &entry),
         };
         if let Err(error) = serialize_result {
@@ -952,8 +944,7 @@ async fn send_batch(
         }
 
         if let Some(ref mut ws) = conn {
-            let msg =
-                tokio_tungstenite::tungstenite::protocol::Message::Text((&*payload).into());
+            let msg = tokio_tungstenite::tungstenite::protocol::Message::Text((&*payload).into());
             match tokio::time::timeout(cfg.write_timeout, ws.sink.send(msg)).await {
                 Ok(Ok(())) => return conn,
                 Ok(Err(e)) => {
