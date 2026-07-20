@@ -5431,11 +5431,7 @@ fn test_priority_override_delegates_response_buffering_refinement() {
     let response_headers =
         HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     assert!(plugins[0].may_release_response_body_under_retries(&ctx));
-    assert!(plugins[0].should_release_response_body_under_retries(
-        &ctx,
-        200,
-        &response_headers
-    ));
+    assert!(plugins[0].should_release_response_body_under_retries(&ctx, 200, &response_headers));
     assert!(
         plugins[0].should_release_response_body_before_content_type_rewrite(
             &ctx,
