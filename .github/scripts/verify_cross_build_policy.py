@@ -3319,16 +3319,40 @@ def replace_github_expressions(line: str, *, literal: bool) -> str:
     return "".join(parts)
 
 
+def shell_marker_is_escaped(line: str, position: int) -> bool:
+    """Return whether one shell marker has an odd backslash prefix."""
+
+    cursor = position
+    while cursor > 0 and line[cursor - 1] == "\\":
+        cursor -= 1
+    return (position - cursor) % 2 == 1
+
+
+def shell_single_quote_end(line: str, position: int) -> int | None:
+    """Return the enclosing single quote's end, if the marker is quoted."""
+
+    if shell_quote_at(line, position) != "'":
+        return None
+    end = line.find("'", position)
+    return len(line) if end < 0 else end
+
+
 def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
     """Locate complete outer $(...) spans, including nested parentheses."""
 
     spans: list[tuple[int, int]] = []
     cursor = 0
     while (start := line.find("$(", cursor)) >= 0:
+        while start >= 0 and shell_marker_is_escaped(line, start):
+            start = line.find("$(", start + 2)
+        if start < 0:
+            break
+        quote_end = shell_single_quote_end(line, start)
+        scan_end = quote_end if quote_end is not None else len(line)
         depth = 1
         quote: str | None = None
         index = start + 2
-        while index < len(line) and depth:
+        while index < scan_end and depth:
             character = line[index]
             if quote is not None:
                 if character == "\\" and quote == '"':
@@ -3349,8 +3373,14 @@ def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
                 depth -= 1
             index += 1
 
-        # An unterminated substitution cannot execute as a valid shell word,
-        # but consume it to the line end so partial content is not trusted.
+        # An unmatched marker inside inert single-quoted data must not consume
+        # a later executable substitution after the quote. A complete marker is
+        # retained because a literal `eval '$(...)'` executes it in the nested
+        # shell reader. Outside single quotes, consume malformed input to the
+        # line end rather than trusting a partial program.
+        if depth and quote_end is not None:
+            cursor = min(quote_end + 1, len(line))
+            continue
         end = index if depth == 0 else len(line)
         spans.append((start, end))
         cursor = end
@@ -3360,23 +3390,21 @@ def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
 def backtick_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
     """Locate outer legacy command substitutions without decoding them."""
 
-    def escaped(position: int) -> bool:
-        cursor = position
-        while cursor > 0 and line[cursor - 1] == "\\":
-            cursor -= 1
-        return (position - cursor) % 2 == 1
-
     spans: list[tuple[int, int]] = []
     cursor = 0
     while True:
         start = line.find("`", cursor)
-        while start >= 0 and escaped(start):
+        while start >= 0 and shell_marker_is_escaped(line, start):
             start = line.find("`", start + 1)
         if start < 0:
             break
+        quote_end = shell_single_quote_end(line, start)
         end = line.find("`", start + 1)
-        while end >= 0 and escaped(end):
+        while end >= 0 and shell_marker_is_escaped(line, end):
             end = line.find("`", end + 1)
+        if quote_end is not None and (end < 0 or end >= quote_end):
+            cursor = min(quote_end + 1, len(line))
+            continue
         end = len(line) if end < 0 else end + 1
         spans.append((start, end))
         cursor = end
@@ -3389,18 +3417,22 @@ def process_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
     cursor = 0
     while True:
-        candidates = [
-            position
-            for marker in ("<(", ">(")
-            if (position := line.find(marker, cursor)) >= 0
-        ]
+        candidates: list[int] = []
+        for marker in ("<(", ">("):
+            position = line.find(marker, cursor)
+            while position >= 0 and shell_marker_is_escaped(line, position):
+                position = line.find(marker, position + 2)
+            if position >= 0:
+                candidates.append(position)
         if not candidates:
             break
         start = min(candidates)
+        quote_end = shell_single_quote_end(line, start)
+        scan_end = quote_end if quote_end is not None else len(line)
         depth = 1
         quote: str | None = None
         index = start + 2
-        while index < len(line) and depth:
+        while index < scan_end and depth:
             character = line[index]
             if quote is not None:
                 if character == "\\" and quote == '"':
@@ -3420,6 +3452,9 @@ def process_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
             elif character == ")":
                 depth -= 1
             index += 1
+        if depth and quote_end is not None:
+            cursor = min(quote_end + 1, len(line))
+            continue
         spans.append((start, index if depth == 0 else len(line)))
         cursor = spans[-1][1]
     return tuple(spans)
@@ -3523,6 +3558,55 @@ def shell_assignment_value_end(line: str, start: int) -> int:
     return len(line)
 
 
+def shell_source_evaluator_segments(line: str) -> tuple[str, ...]:
+    """Return individual shell commands for evaluator-variable discovery.
+
+    The opaque evaluator expression deliberately scans a complete command,
+    because every `eval` argument contributes source. Applying its greedy
+    expansion branch to a whole physical line also consumed parameters in a
+    later statement or pipeline stage and froze unrelated data producers.
+    Tokenization failure keeps the old whole-line, fail-closed fallback.
+    """
+
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return (line,)
+    commands = tuple(
+        " ".join(segment)
+        for statement in shell_statement_groups(tokens)
+        for segment in split_shell_pipeline(statement)
+    )
+    return commands or (line,)
+
+
+def shell_capture_variable_aliases(line: str) -> tuple[tuple[str, str], ...]:
+    """Return capture-target to contributing-variable provenance edges."""
+
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return ()
+    aliases: list[tuple[str, str]] = []
+    for statement in shell_statement_groups(tokens):
+        pipeline = split_shell_pipeline(statement)
+        for position, segment in enumerate(pipeline):
+            targets = shell_capture_target_names(segment)
+            if not targets:
+                continue
+            sources = {
+                parameter.group("braced") or parameter.group("bare")
+                for contributing in (*pipeline[:position], segment)
+                for word in contributing
+                for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(word)
+            }
+            aliases.extend(
+                (target, source)
+                for target in targets
+                for source in sources
+                if source != target
+            )
+    return tuple(dict.fromkeys(aliases))
+
+
 def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
     """Return shell variables whose values later become opaque program source.
 
@@ -3532,22 +3616,29 @@ def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
     shell `-c "$code"`). Without it, an unchanged trusted evaluator froze only
     its caller while a helper-only edit still changed the executed program.
 
-    Assignment aliases are followed to a fixed point, so `a=$(helper); b=$a;
-    eval "$b"` retains the original producer. The analysis only accumulates
-    names and therefore terminates after at most the number of assignments.
+    Assignment and bounded capture aliases are followed to a fixed point, so
+    both `a=$(helper); b=$a; eval "$b"` and
+    `read a < <(helper); read b <<< "$a"; eval "$b"` retain the original
+    producer. The analysis only accumulates names and therefore terminates
+    after at most the number of referenced variables.
     """
 
     evaluated: set[str] = set()
     assignments: list[tuple[str, str]] = []
+    capture_aliases: list[tuple[str, str]] = []
     for line in lines:
-        for opaque in OPAQUE_INLINE_SHELL.finditer(line):
-            for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(
-                opaque.group(0)
-            ):
-                evaluated.add(parameter.group("braced") or parameter.group("bare"))
+        for statement in shell_source_evaluator_segments(line):
+            for opaque in OPAQUE_INLINE_SHELL.finditer(statement):
+                for parameter in SHELL_SOURCE_PARAMETER_REFERENCE.finditer(
+                    opaque.group(0)
+                ):
+                    evaluated.add(
+                        parameter.group("braced") or parameter.group("bare")
+                    )
         for name, value_start in shell_source_assignments(line):
             value_end = shell_assignment_value_end(line, value_start)
             assignments.append((name, line[value_start:value_end]))
+        capture_aliases.extend(shell_capture_variable_aliases(line))
 
     changed = True
     while changed:
@@ -3560,6 +3651,10 @@ def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
                 if source_name not in evaluated:
                     evaluated.add(source_name)
                     changed = True
+        for target, source in capture_aliases:
+            if target in evaluated and source not in evaluated:
+                evaluated.add(source)
+                changed = True
     return frozenset(evaluated)
 
 
@@ -18773,8 +18868,47 @@ pre_build = []
     # later pull request changes only the helper, so the workflow digest does
     # not move. Carrying generated-output provenance to the referenced file
     # freezes that implementation without pretending its Python text is shell.
+    command_span_control = "\\$(ignored) '$(quoted' eval \"$(./scripts/build)\""
+    if tuple(
+        command_span_control[start:end]
+        for start, end in command_substitution_spans(command_span_control)
+    ) != ("$(./scripts/build)",):
+        failures.append(
+            "escaped or single-quoted command-substitution openers displaced "
+            "the later executable span"
+        )
+    process_span_control = "\\<(ignored) '<(quoted' source <(./scripts/build)"
+    if tuple(
+        process_span_control[start:end]
+        for start, end in process_substitution_spans(process_span_control)
+    ) != ("<(./scripts/build)",):
+        failures.append(
+            "escaped or single-quoted process-substitution openers displaced "
+            "the later executable span"
+        )
+    backtick_span_control = "\\`escaped\\` '`quoted' eval \"`./scripts/build`\""
+    if tuple(
+        backtick_span_control[start:end]
+        for start, end in backtick_substitution_spans(backtick_span_control)
+    ) != ("`./scripts/build`",):
+        failures.append(
+            "escaped or single-quoted backtick openers displaced the later "
+            "executable span"
+        )
     generated_shell_workflows = {
         "eval command substitution": extensionless_eval_workflow,
+        "eval single-quoted command substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval '$(./scripts/build)'",
+            )
+        ),
+        "eval command substitution after an inert opener": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf '%s\\n' '$(inert'; eval \"$(./scripts/build)\"",
+            )
+        ),
         "shell -c command substitution": extensionless_workflow.replace(
             "./scripts/build",
             'bash -c "$(./scripts/build)"',
@@ -18783,9 +18917,33 @@ pre_build = []
             "./scripts/build",
             'eval "`./scripts/build`"',
         ),
+        "eval single-quoted backtick substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval '`./scripts/build`'",
+            )
+        ),
+        "eval backtick substitution after an inert opener": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf '%s\\n' '`inert'; eval \"`./scripts/build`\"",
+            )
+        ),
         "source process substitution": extensionless_workflow.replace(
             "./scripts/build",
             "source <(./scripts/build)",
+        ),
+        "eval single-quoted process substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval 'source <(./scripts/build)'",
+            )
+        ),
+        "source process substitution after an inert opener": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf '%s\\n' '<(inert'; source <(./scripts/build)",
+            )
         ),
         "shell interpreter pipeline": extensionless_workflow.replace(
             "./scripts/build",
@@ -18806,6 +18964,13 @@ pre_build = []
         "eval through a read pipeline": extensionless_workflow.replace(
             "./scripts/build",
             './scripts/build | read generated; eval "$generated"',
+        ),
+        "eval through chained read captures": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'IFS= read -r first < <(./scripts/build); '
+                'IFS= read -r second <<< "$first"; eval "$second"',
+            )
         ),
         "eval through mapfile capture": extensionless_workflow.replace(
             "./scripts/build",
@@ -18973,6 +19138,30 @@ pre_build = []
             "./scripts/build",
             "IFS= read -r data < <(./scripts/build); "
             "evaluated='echo safe'; eval \"$evaluated\"",
+        ),
+        "capture chain into an unevaluated variable": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'IFS= read -r first < <(./scripts/build); '
+                'IFS= read -r second <<< "$first"; '
+                'evaluated=\'echo safe\'; eval "$evaluated"',
+            )
+        ),
+        "later statement variable after eval": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'unrelated="$(./scripts/build)"; '
+                'evaluated=\'echo safe\'; eval "$evaluated"; '
+                'printf \'%s\\n\' "$unrelated"',
+            )
+        ),
+        "later pipeline variable after eval": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'unrelated="$(./scripts/build)"; '
+                'evaluated=\'echo safe\'; '
+                'eval "$evaluated" | printf \'%s\\n\' "$unrelated"',
+            )
         ),
         "printf capture into an unevaluated variable": (
             extensionless_workflow.replace(
