@@ -1303,7 +1303,10 @@ mod tests {
             .expect("fill budget so provisional max-entry charge is denied");
         let ran = AtomicBool::new(false);
         let admitted = serialize_under_byte_budget(&budget, 1024, &Probe(&ran), "probe");
-        assert!(admitted.is_none(), "denied aggregate reservation must fail closed");
+        assert!(
+            admitted.is_none(),
+            "denied aggregate reservation must fail closed"
+        );
         assert!(
             !ran.load(Ordering::SeqCst),
             "serializer must not run when provisional aggregate reservation is denied"
@@ -1320,12 +1323,19 @@ mod tests {
             serialize_under_byte_budget(&budget, max_entry_bytes, &json!({"k":"v"}), "http")
                 .expect("admit small entry");
         let exact = retained_charge_for_serialized_len(json.len());
-        assert!(exact < provisional, "exact charge must be below provisional max");
+        assert!(
+            exact < provisional,
+            "exact charge must be below provisional max"
+        );
         assert_eq!(lease.charged_bytes(), exact);
         assert_eq!(budget.used(), exact);
 
         drop(lease);
-        assert_eq!(budget.used(), 0, "drop must release the shrunk charge exactly");
+        assert_eq!(
+            budget.used(),
+            0,
+            "drop must release the shrunk charge exactly"
+        );
     }
 
     #[test]
@@ -1370,7 +1380,11 @@ mod tests {
         for handle in handles {
             handle.join().expect("budget worker");
         }
-        assert_eq!(budget.used(), 0, "all leases must release without underflow wrap");
+        assert_eq!(
+            budget.used(),
+            0,
+            "all leases must release without underflow wrap"
+        );
     }
 
     #[test]
@@ -1432,7 +1446,10 @@ mod tests {
         assert_eq!(native["bytes_client_to_backend"], 128);
         assert_eq!(native["bytes_backend_to_client"], 256);
         assert_eq!(native["timestamp_connected"], "2026-01-01T00:00:00+00:00");
-        assert_eq!(native["timestamp_disconnected"], "2026-01-01T00:00:01+00:00");
+        assert_eq!(
+            native["timestamp_disconnected"],
+            "2026-01-01T00:00:01+00:00"
+        );
         assert_eq!(native["metadata"]["correlation_id"], "cid-9");
         assert_eq!(native["metadata"]["authorization"], "[REDACTED]");
         // Pointer equality proves the view still aliases the context map.
