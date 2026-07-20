@@ -2244,9 +2244,7 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
     );
 
     let h1_miss = h1_client
-        .get(format!(
-            "http://127.0.0.1:{gateway_http_port}/ws-mock/miss"
-        ))
+        .get(format!("http://127.0.0.1:{gateway_http_port}/ws-mock/miss"))
         .header("connection", "Upgrade")
         .header("upgrade", "websocket")
         .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
@@ -2306,9 +2304,7 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
 
     let h2_miss_request = http::Request::builder()
         .method(Method::CONNECT)
-        .uri(format!(
-            "http://127.0.0.1:{gateway_http_port}/ws-mock/miss"
-        ))
+        .uri(format!("http://127.0.0.1:{gateway_http_port}/ws-mock/miss"))
         .version(Version::HTTP_2)
         .header(http::header::SEC_WEBSOCKET_VERSION, "13")
         .extension(hyper::ext::Protocol::from_static("websocket"))
@@ -2343,7 +2339,10 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
         Some("ws")
     );
     assert_eq!(
-        h3_match.recv_body_text().await.expect("matching H3 mock body"),
+        h3_match
+            .recv_body_text()
+            .await
+            .expect("matching H3 mock body"),
         r#"{"mock":"ws-handshake"}"#
     );
 
