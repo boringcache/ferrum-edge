@@ -3,9 +3,9 @@
 //! Builds typed [`Rule`] / channel definitions from `serde_json::Value`,
 //! validates ranges, resolves channel-name references to channel ids, and
 //! collects parsed quiet-hours windows. All errors are surfaced as
-//! `Result<_, String>` from `ProxyAlerts::new` so file-mode startup, db-mode
-//! poll-time validation, and admin API POST/PUT all reject bad config the
-//! same way.
+//! `Result<_, String>` from `ProxyAlerts::new`: direct/Admin validation rejects
+//! them, while serving-mode publication applies the plugin's documented
+//! `OptionalFailOpen` policy and warns before omitting the invalid instance.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
