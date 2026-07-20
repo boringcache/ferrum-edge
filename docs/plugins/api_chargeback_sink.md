@@ -11,17 +11,24 @@ transaction, stream disconnect, or WebSocket disconnect. This preserves
 transaction-level provenance and is the default.
 
 `mode: snapshot` keeps a local accumulator keyed by namespace, consumer, proxy,
-and status code. Every `snapshot.interval_secs`, it emits deltas since the last
-snapshot. Use this when event volume dominates ingest cost and aggregate
-reconciliation is sufficient. Snapshot mode requires `spool.enabled: true`
-because the accumulator advances after a delta is handed to the sink queue; the
-spool is the durable path when ClickHouse or the in-memory queue is unavailable.
-Idle snapshot keys are evicted after `snapshot.stale_entry_ttl_secs` and checked
-every `snapshot.cleanup_interval_secs`.
+billable status, raw HTTP status, final gRPC status, and protocol. Every
+`snapshot.interval_secs`, it emits deltas since the last snapshot. Use this when
+event volume dominates ingest cost and aggregate reconciliation is sufficient.
+Snapshot mode requires `spool.enabled: true` because the accumulator advances
+after a delta is handed to the sink queue; the spool is the durable path when
+ClickHouse or the in-memory queue is unavailable. Idle snapshot keys are evicted
+after `snapshot.stale_entry_ttl_secs` and checked every
+`snapshot.cleanup_interval_secs`.
 
 Both modes use the same pricing fields as `api_chargeback`:
 
-- `pricing_tiers` for HTTP-family per-call pricing by status code.
+- `pricing_tiers` for HTTP-family per-call pricing by billable status. Ordinary
+  HTTP uses its wire status. Native gRPC and translated gRPC-Web use the final
+  normalized `grpc-status` mapped to Ferrum's canonical effective HTTP status:
+  `0→200`, `1→499`, `2→500`, `3→400`, `4→504`, `5→404`, `6→409`, `7→403`,
+  `8→429`, `9→400`, `10→409`, `11→400`, `12→501`, `13→500`, `14→503`,
+  `15→500`, and `16→401`. Missing, malformed, and unknown terminal statuses
+  fail closed to the `500` billing bucket.
 - `bandwidth_pricing` for client-to-backend and backend-to-client bytes.
 - `stream_connection_pricing` for TCP, TCP+TLS, UDP, and DTLS sessions.
 
@@ -37,6 +44,14 @@ The DDL creates `ferrum.charges_raw` with `ReplacingMergeTree` idempotency on
 `event_id`, plus hourly, daily, and monthly views that read from
 `charges_raw FINAL`. The views trade query cost for correctness: duplicate raw
 events are deduplicated before rollup aggregation.
+
+For HTTP-family events, `status_code` is the billable status used for pricing
+and rollups. `http_status_code` preserves the transport status, and
+`grpc_status` preserves the normalized final application code when the request
+was native gRPC or translated gRPC-Web. Stream and WebSocket-disconnect events
+leave both raw-status columns null. This keeps transport and application
+outcomes auditable even when several gRPC codes share one effective billing
+bucket.
 
 ## Example Config
 

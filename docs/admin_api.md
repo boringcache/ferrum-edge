@@ -644,7 +644,7 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges?format=json
 ```
 
 **Prometheus format** returns counter families:
-- `ferrum_api_chargeable_calls_total` — HTTP call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`, and `currency` (HTTP-family proxies only)
+- `ferrum_api_chargeable_calls_total` — HTTP-family call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`, and `currency`. Ordinary HTTP uses the wire status; native gRPC and translated gRPC-Web use the final terminal `grpc-status` mapped to Ferrum's canonical effective HTTP status (for example `0→200`, `7→403`, `14→503`).
 - `ferrum_api_charges_total` — HTTP per-call monetary charges with the same HTTP labels
 - `ferrum_api_stream_connections_total` — stream session counts (TCP/TCP+TLS/UDP/DTLS proxies) with labels `consumer`, `proxy_id`, `proxy_name`, and `currency`
 - `ferrum_api_stream_connection_charges_total` — stream per-session monetary charges with the same stream labels
@@ -707,7 +707,7 @@ All families include a `namespace` label when the plugin instance has a namespac
 }
 ```
 
-Each `api_chargeback` plugin instance owns its own `currency` and `namespace` (per global/proxy/proxy_group scope). The currency and namespace are recorded per proxy, so a process hosting multiple instances with different currencies reports each proxy under its own currency rather than a single last-writer-wins value. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree — read the per-proxy `currency` field in that case. A proxy that serves both HTTP and stream traffic under one `proxy_id` reports `"protocol_family": "mixed"` and includes both a populated `by_status` map and a `stream` sub-object, so the per-family breakdown always reconciles with the proxy totals.
+Each `api_chargeback` plugin instance owns its own `currency` and `namespace` (per global/proxy/proxy_group scope). The currency and namespace are recorded per proxy, so a process hosting multiple instances with different currencies reports each proxy under its own currency rather than a single last-writer-wins value. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree — read the per-proxy `currency` field in that case. A proxy that serves both HTTP and stream traffic under one `proxy_id` reports `"protocol_family": "mixed"` and includes both a populated `by_status` map and a `stream` sub-object, so the per-family breakdown always reconciles with the totals. For gRPC/gRPC-Web, `by_status` is the effective billing status derived from the final client-visible terminal code; it does not overwrite the wire HTTP status in transaction logs. Missing, malformed, and unknown terminal codes fail closed to the `500` bucket.
 
 **Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node with admin JWT credentials and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.
 

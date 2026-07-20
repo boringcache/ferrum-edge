@@ -4,13 +4,21 @@ use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
-    StreamTransactionSummary, plugin_failure_policy,
-    statsd_logging::{STATSD_LOGGING_CONFIG_KEYS, StatsdLogging},
+    ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
+    StreamTransactionSummary, WsDisconnectContext, plugin_failure_policy,
+    statsd_logging::{
+        MAX_UDP_PAYLOAD, STATSD_LOGGING_CONFIG_KEYS, StatsdLogging, format_http_metrics,
+        format_ws_metrics, http_body_outcome, is_valid_timer_sample, pack_udp_datagrams,
+        sanitize_namespace_tag_value, sanitize_tag_value, validate_tag_key,
+    },
     validate_plugin_config,
 };
+use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::time::timeout;
 
 use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 
@@ -552,6 +560,13 @@ fn test_statsd_metric_docs_inventory_and_byte_directions() {
 
     for needle in [
         "request.client_disconnect",
+        "request.body_incomplete",
+        "body_outcome",
+        "websocket.session.count",
+        "websocket.session.duration_ms",
+        "Mirror accounting",
+        "1452-byte",
+        "no-backend sentinel",
         "stream.disconnect",
         "client→backend",
         "backend→client",
@@ -565,7 +580,7 @@ fn test_statsd_metric_docs_inventory_and_byte_directions() {
         "max_retries",
         "retry_delay_ms",
         "OptionalFailOpen",
-        "#2555",
+        "reserved runtime tags",
     ] {
         assert!(
             statsd_section.contains(needle),
@@ -580,4 +595,378 @@ fn test_statsd_metric_docs_inventory_and_byte_directions() {
         !statsd_section.contains("Bytes received from client"),
         "reversed byte direction must not remain in the StatsD reference"
     );
+}
+
+#[test]
+fn test_statsd_mirror_summaries_excluded_from_request_metrics() {
+    let mut primary = create_test_transaction_summary();
+    primary.mirror = false;
+    primary.response_status_code = 200;
+    primary.body_completed = true;
+    primary.latency_backend_ttfb_ms = 15.0;
+
+    let mut mirror = primary.clone();
+    mirror.mirror = true;
+    mirror.response_status_code = 0;
+
+    let mut buf = String::new();
+    format_http_metrics(&primary, "ferrum", "", None, &mut buf);
+    format_http_metrics(&mirror, "ferrum", "", None, &mut buf);
+
+    assert_eq!(
+        buf.matches("ferrum.request.count:1|c").count(),
+        1,
+        "mirror must not double client request.count: {buf}"
+    );
+    assert!(
+        !buf.contains("status:0"),
+        "mirror transport failure must not export status:0: {buf}"
+    );
+}
+
+#[test]
+fn test_statsd_backend_ttfb_sentinel_and_timer_validity() {
+    assert!(!is_valid_timer_sample(-1.0));
+    assert!(!is_valid_timer_sample(f64::NAN));
+    assert!(!is_valid_timer_sample(f64::INFINITY));
+    assert!(is_valid_timer_sample(0.0));
+    assert!(is_valid_timer_sample(1.25));
+
+    let mut summary = create_test_transaction_summary();
+    summary.latency_backend_ttfb_ms = -1.0;
+    summary.latency_total_ms = 8.0;
+    summary.body_completed = true;
+    let mut buf = String::new();
+    format_http_metrics(&summary, "edge", "", None, &mut buf);
+    assert!(buf.contains("edge.request.count:1|c"), "{buf}");
+    assert!(buf.contains("edge.request.status."), "{buf}");
+    assert!(
+        !buf.contains("latency_backend_ttfb_ms"),
+        "no-backend sentinel must be omitted: {buf}"
+    );
+    assert!(buf.contains("latency_total_ms:8.00|ms"), "{buf}");
+}
+
+#[test]
+fn test_statsd_terminal_body_failure_keeps_header_status() {
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 200;
+    summary.response_streamed = true;
+    summary.body_completed = false;
+    summary.body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+    summary.latency_backend_ttfb_ms = 5.0;
+    assert_eq!(http_body_outcome(&summary), "incomplete");
+
+    let mut buf = String::new();
+    format_http_metrics(&summary, "ferrum", "", None, &mut buf);
+    assert!(buf.contains("status:200"), "{buf}");
+    assert!(buf.contains("status_class:2xx"), "{buf}");
+    assert!(buf.contains("body_outcome:incomplete"), "{buf}");
+    assert!(buf.contains("body_error:response_body_too_large"), "{buf}");
+    assert!(buf.contains("request.body_incomplete:1|c"), "{buf}");
+}
+
+#[tokio::test]
+async fn test_statsd_websocket_session_metrics_and_opt_in() {
+    let plugin = StatsdLogging::new(&json!({"host": "127.0.0.1"}), default_client()).unwrap();
+    assert!(plugin.requires_ws_disconnect_hooks());
+
+    let ctx = WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "ws-proxy".to_string(),
+        proxy_name: Some("WS Proxy".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "http://127.0.0.1:9000/".to_string(),
+        listen_port: 8080,
+        duration_ms: 2500.0,
+        frames_client_to_backend: 2,
+        frames_backend_to_client: 3,
+        bytes_client_to_backend: 20,
+        bytes_backend_to_client: 30,
+        direction: Some(Direction::BackendToClient),
+        io_side: Some(ferrum_edge::proxy::tcp_proxy::StreamIoSide::Read),
+        error_class: Some(ErrorClass::ReadWriteTimeout),
+        consumer_username: None,
+        auth_method: None,
+        metadata: HashMap::new(),
+    };
+    let mut buf = String::new();
+    format_ws_metrics(&ctx, "ferrum", "", None, &mut buf);
+    assert!(buf.contains("websocket.session.count:1|c"), "{buf}");
+    assert!(buf.contains("result:error"), "{buf}");
+    assert!(buf.contains("error_class:read_write_timeout"), "{buf}");
+    assert!(buf.contains("direction:backend_to_client"), "{buf}");
+    assert!(buf.contains("io_side:read"), "{buf}");
+    assert!(
+        !buf.contains("request.latency_total_ms"),
+        "WS session metrics must not mix into HTTP latency families: {buf}"
+    );
+}
+
+#[test]
+fn test_statsd_namespace_tag_collision_resistance_and_reserved_keys() {
+    let a = format!("{}tenant-a", "n".repeat(64));
+    let b = format!("{}tenant-b", "n".repeat(64));
+    assert_ne!(
+        sanitize_namespace_tag_value(&a),
+        sanitize_namespace_tag_value(&b)
+    );
+    assert!(sanitize_namespace_tag_value(&a).contains("tenant-a"));
+
+    assert!(validate_tag_key("env").is_ok());
+    assert!(validate_tag_key("method\nrogue").is_err());
+    assert!(validate_tag_key("bad:key").is_err());
+    assert_eq!(sanitize_tag_value("x\0y\x1bz"), "x_y_z");
+    // Representative ASCII + Unicode control values (NUL / ESC / BEL / NEL).
+    assert_eq!(sanitize_tag_value("a\0b\x1bc\x07d\u{0085}e"), "a_b_c_d_e");
+}
+
+#[tokio::test]
+async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
+    for (config, needle) in [
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"namespace": "victim"}}),
+            "reserved",
+        ),
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"status": "spoof"}}),
+            "reserved",
+        ),
+        // Case-insensitive reserved-key collision.
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"Status": "spoof"}}),
+            "reserved",
+        ),
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"NAMESPACE": "victim"}}),
+            "reserved",
+        ),
+        // Post-normalization duplicate keys (Env / env).
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"Env": "a", "env": "b"}}),
+            "duplicate",
+        ),
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"evil\nkey": "x"}}),
+            "tag key",
+        ),
+        (
+            json!({"host": "127.0.0.1", "global_tags": {" env ": "prod"}}),
+            "whitespace",
+        ),
+        (
+            json!({
+                "host": "127.0.0.1",
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"http_method": "method\nrogue.metric:1|c\nx"}
+                }
+            }),
+            "tag key",
+        ),
+        (
+            json!({
+                "host": "127.0.0.1",
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"http_method": " method "}
+                }
+            }),
+            "whitespace",
+        ),
+        // Native-field collision is fail-closed by the shared schema compiler.
+        (
+            json!({
+                "host": "127.0.0.1",
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"proxy_id": "namespace"}
+                }
+            }),
+            "duplicate",
+        ),
+        // StatsD-reserved tag that is not a native summary out_key.
+        (
+            json!({
+                "host": "127.0.0.1",
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"proxy_id": "status_class"}
+                }
+            }),
+            "reserved",
+        ),
+        // Case-insensitive reserved rename target.
+        (
+            json!({
+                "host": "127.0.0.1",
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"proxy_id": "Status_Class"}
+                }
+            }),
+            "reserved",
+        ),
+        // A custom rename becomes runtime-owned for this sink and must not be
+        // duplicated by a collector-global tag with ambiguous precedence.
+        (
+            json!({
+                "host": "127.0.0.1",
+                "global_tags": {"route_id": "spoof"},
+                "schema": {
+                    "summary_type": "http",
+                    "rename": {"proxy_id": "route_id"}
+                }
+            }),
+            "runtime tag",
+        ),
+    ] {
+        let err = StatsdLogging::new(&config, default_client())
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection for {config}"));
+        assert!(
+            err.to_lowercase().contains(needle) || err.contains("characters"),
+            "expected '{needle}' in: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
+    // Use Tokio UDP + bounded timeouts so the default single-thread test
+    // runtime cannot starve the batching task behind a blocking recv_from.
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let port = socket.local_addr().expect("local addr").port();
+
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": port,
+            "prefix": "ferrum",
+            "flush_interval_ms": 50,
+            "max_batch_lines": 1
+        }),
+        default_client(),
+    )
+    .expect("construct statsd");
+
+    let mut summary = create_test_transaction_summary();
+    summary.body_completed = true;
+    summary.latency_backend_ttfb_ms = 11.0;
+    plugin.log(&summary).await;
+
+    let mut mirror = summary.clone();
+    mirror.mirror = true;
+    plugin.log(&mirror).await;
+
+    let mut buf = [0u8; 2048];
+    let (n, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for statsd datagram")
+        .expect("receive statsd datagram");
+    assert!(n <= MAX_UDP_PAYLOAD, "datagram exceeded ceiling: {n}");
+    let payload = std::str::from_utf8(&buf[..n]).expect("utf8");
+    assert!(payload.contains("ferrum.request.count:1|c"), "{payload}");
+    assert!(
+        payload.contains("namespace:ferrum"),
+        "authoritative namespace tag must be present: {payload}"
+    );
+    // Mirror must not produce a second client datagram with ordinary request metrics.
+    // Bounded absence window; timeout (no datagram) is success.
+    let second = timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await;
+    if let Ok(Ok((n2, _))) = second {
+        let extra = std::str::from_utf8(&buf[..n2]).unwrap_or("");
+        panic!("unexpected second datagram after mirror skip: {extra}");
+    }
+
+    let over = "m".repeat(MAX_UDP_PAYLOAD + 1);
+    let (dgrams, dropped) = pack_udp_datagrams(&over, MAX_UDP_PAYLOAD);
+    assert_eq!(dropped, 1);
+    assert!(dgrams.is_empty());
+    let exact = "e".repeat(MAX_UDP_PAYLOAD);
+    let (dgrams, dropped) = pack_udp_datagrams(&exact, MAX_UDP_PAYLOAD);
+    assert_eq!(dropped, 0);
+    assert_eq!(dgrams[0].len(), MAX_UDP_PAYLOAD);
+}
+
+#[tokio::test]
+async fn test_statsd_ws_disconnect_collector_emits_session_once() {
+    // #2555 composition evidence: core H1 Upgrade, H2 Extended CONNECT, and
+    // native H3 paths already dispatch `on_ws_disconnect` exactly once to
+    // plugins that return `requires_ws_disconnect_hooks()` (gateway_core
+    // websocket tunnel / relay / http3 websocket coverage). This test proves
+    // statsd_logging opts in and formats the terminal websocket.* set into
+    // one collector-visible datagram — without duplicating those harnesses.
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let port = socket.local_addr().expect("local addr").port();
+
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": port,
+            "prefix": "ferrum",
+            "flush_interval_ms": 50,
+            "max_batch_lines": 16
+        }),
+        default_client(),
+    )
+    .expect("construct statsd");
+    assert!(
+        plugin.requires_ws_disconnect_hooks(),
+        "statsd_logging must opt into terminal WS disconnect dispatch"
+    );
+
+    let ctx = WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "ws-1".to_string(),
+        proxy_name: Some("WS".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "http://127.0.0.1:9/".to_string(),
+        listen_port: 8080,
+        duration_ms: 42.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 2,
+        bytes_client_to_backend: 10,
+        bytes_backend_to_client: 20,
+        direction: None,
+        io_side: None,
+        error_class: None,
+        consumer_username: None,
+        auth_method: None,
+        metadata: HashMap::new(),
+    };
+    plugin.on_ws_disconnect(&ctx).await;
+
+    let mut buf = [0u8; 2048];
+    let (n, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for websocket statsd datagram")
+        .expect("receive websocket statsd datagram");
+    assert!(n <= MAX_UDP_PAYLOAD, "datagram exceeded ceiling: {n}");
+    let payload = std::str::from_utf8(&buf[..n]).expect("utf8");
+    assert_eq!(
+        payload
+            .matches("ferrum.websocket.session.count:1|c")
+            .count(),
+        1,
+        "terminal WS session count must appear exactly once: {payload}"
+    );
+    assert!(
+        payload.contains("ferrum.websocket.session.duration_ms:42.00|ms"),
+        "{payload}"
+    );
+    assert!(
+        !payload.contains("request.latency_total_ms"),
+        "WS session metrics must not mix into HTTP latency families: {payload}"
+    );
+
+    let second = timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await;
+    if let Ok(Ok((n2, _))) = second {
+        let extra = std::str::from_utf8(&buf[..n2]).unwrap_or("");
+        panic!("unexpected second datagram after single WS disconnect: {extra}");
+    }
 }
