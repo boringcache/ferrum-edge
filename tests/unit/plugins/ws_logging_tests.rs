@@ -728,7 +728,7 @@ async fn test_ws_logging_reconnects_after_server_close() {
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 2,
             "retry_delay_ms": 50,
             "reconnect_delay_ms": 50,
@@ -748,7 +748,8 @@ async fn test_ws_logging_reconnects_after_server_close() {
     // budget then connects to the second listener.
     for _ in 0..5 {
         plugin.log(&create_test_transaction_summary()).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Pace above the admitted flush interval so reconnect attempts can flush.
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     await_within("second accept", second_rx)
@@ -838,7 +839,7 @@ async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "reconnect_delay_ms": 50,
             "connect_timeout_ms": 200,
@@ -854,6 +855,7 @@ async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
         .await
         .expect("peer never accepted");
     // Give the flush loop time to observe the connect timeout and return.
+    // Bound covers admitted flush_interval_ms (100) plus connect_timeout_ms (200).
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -906,7 +908,7 @@ async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 3,
             "retry_delay_ms": 50,
             "reconnect_delay_ms": 50,
@@ -923,7 +925,8 @@ async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
     summary.request_path = format!("/{}", "x".repeat(32_768));
     for _ in 0..8 {
         plugin.log(&summary).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Pace above the admitted flush interval so each enqueue can flush.
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     let payload = await_within("recovered batch after write timeout", second_rx)
@@ -985,7 +988,7 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 2,
             "retry_delay_ms": 50,
             "reconnect_delay_ms": 50,
@@ -999,7 +1002,8 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     for _ in 0..5 {
         plugin.log(&create_test_transaction_summary()).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Pace above the admitted flush interval so reconnect attempts can flush.
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     await_within("reconnect after application frame", second_rx)
@@ -1033,7 +1037,7 @@ async fn test_ws_logging_diagnostics_redact_endpoint_path_and_query() {
                 "ws://127.0.0.1:1/{path_secret}/ingest?token={query_secret}"
             ),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "reconnect_delay_ms": 50,
             "connect_timeout_ms": 100,
@@ -1043,7 +1047,8 @@ async fn test_ws_logging_diagnostics_redact_endpoint_path_and_query() {
     .expect("build plugin");
 
     plugin.log(&create_test_transaction_summary()).await;
-    for _ in 0..100 {
+    // Poll long enough for admitted flush_interval_ms plus connect_timeout_ms.
+    for _ in 0..150 {
         let logs = writer.contents();
         if logs.contains("failed to connect") || logs.contains("connect timeout") {
             break;
