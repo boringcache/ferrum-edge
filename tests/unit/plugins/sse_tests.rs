@@ -561,6 +561,27 @@ async fn test_cache_control_preserves_quoted_and_malformed() {
 }
 
 #[tokio::test]
+async fn test_cache_control_quoted_even_backslash_does_not_hide_missing_directive() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    let mut headers = sse_response_headers();
+    // The first quoted value ends with an escaped backslash (two raw
+    // backslashes before its closing quote). A parser that only checks the
+    // immediately preceding byte can lose quote state and mistake the
+    // comma-delimited text inside the second quoted value for a directive.
+    headers.insert(
+        "cache-control".to_string(),
+        r#"private, ext="slash\\", note="x,no-cache,y""#.to_string(),
+    );
+
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    let cc = headers.get("cache-control").unwrap();
+    assert!(cc.ends_with(", no-cache"), "{cc}");
+    assert!(cc.starts_with("private, ext="), "{cc}");
+}
+
+#[tokio::test]
 async fn test_h3_final_strip_removes_plugin_reintroduced_connection() {
     // Defense in depth: even if a plugin reintroduces hop-by-hop fields after
     // backend sanitation, the H3 final-field strip removes static and

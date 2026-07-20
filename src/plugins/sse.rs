@@ -65,6 +65,7 @@ use tracing::{debug, warn};
 
 use super::utils::sse::is_text_event_stream_media_type;
 use super::{PluginResult, RequestContext};
+use crate::util::http_headers::cache_control_has_directive;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Request-scoped metadata key holding the raw `Last-Event-ID` for backend
@@ -275,7 +276,7 @@ fn ensure_sse_cache_control(response_headers: &mut HashMap<String, String>) {
         None => {
             response_headers.insert("cache-control".to_string(), "no-cache".to_string());
         }
-        Some(existing) if cache_control_has_no_cache_directive(existing) => {
+        Some(existing) if cache_control_has_directive(existing, "no-cache") => {
             // Preserve the origin value verbatim (duplicates, extensions,
             // private/no-store/no-transform, quoted forms, malformed tokens).
         }
@@ -291,43 +292,6 @@ fn ensure_sse_cache_control(response_headers: &mut HashMap<String, String>) {
             response_headers.insert("cache-control".to_string(), merged);
         }
     }
-}
-
-/// True when `no-cache` appears as a Cache-Control directive name outside a
-/// quoted string. Malformed/unterminated quotes fail closed by treating the
-/// remainder as opaque (no false positive match inside quotes).
-fn cache_control_has_no_cache_directive(header_value: &str) -> bool {
-    let bytes = header_value.as_bytes();
-    let mut i = 0usize;
-    let mut in_quotes = false;
-    let mut token_start = 0usize;
-
-    while i <= bytes.len() {
-        let at_end = i == bytes.len();
-        let ch = if at_end { b',' } else { bytes[i] };
-
-        if !at_end && ch == b'"' {
-            // RFC 9110 quoted-string: backslash escapes the next octet.
-            if in_quotes && i > 0 && bytes[i - 1] == b'\\' {
-                i += 1;
-                continue;
-            }
-            in_quotes = !in_quotes;
-            i += 1;
-            continue;
-        }
-
-        if at_end || (ch == b',' && !in_quotes) {
-            let token = header_value[token_start..i].trim();
-            let name = token.split('=').next().unwrap_or(token).trim();
-            if name.eq_ignore_ascii_case("no-cache") {
-                return true;
-            }
-            token_start = i + 1;
-        }
-        i += 1;
-    }
-    false
 }
 
 #[async_trait]
