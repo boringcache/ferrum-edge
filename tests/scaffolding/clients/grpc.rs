@@ -360,8 +360,7 @@ impl GrpcClient {
                         raw_frames.push(chunk);
                     }
                     Some(Err(e)) => {
-                        stream_error_is_remote_no_error_reset =
-                            is_remote_h2_no_error_reset(&e);
+                        stream_error_is_remote_no_error_reset = is_remote_h2_no_error_reset(&e);
                         stream_error = Some(format!("body error: {e}"));
                         break;
                     }
@@ -372,8 +371,7 @@ impl GrpcClient {
                 match body_stream.trailers().await {
                     Ok(t) => t,
                     Err(e) => {
-                        stream_error_is_remote_no_error_reset =
-                            is_remote_h2_no_error_reset(&e);
+                        stream_error_is_remote_no_error_reset = is_remote_h2_no_error_reset(&e);
                         stream_error = Some(format!("trailers error: {e}"));
                         None
                     }
@@ -389,26 +387,22 @@ impl GrpcClient {
             )
         };
 
-        let (
-            raw_frames,
-            trailers,
-            stream_error,
-            stream_error_is_remote_no_error_reset,
-        ) = match tokio::time::timeout(Duration::from_secs(20), body_trailers_fut).await {
-            Ok(collected) => collected,
-            Err(_) => {
-                conn_task.abort();
-                return Ok(GrpcResponse {
-                    http_status,
-                    headers,
-                    messages: Vec::new(),
-                    raw_body_frames: Vec::new(),
-                    trailers: None,
-                    stream_error: Some("body/trailers read timed out".into()),
-                    request_send_error,
-                });
-            }
-        };
+        let (raw_frames, trailers, stream_error, stream_error_is_remote_no_error_reset) =
+            match tokio::time::timeout(Duration::from_secs(20), body_trailers_fut).await {
+                Ok(collected) => collected,
+                Err(_) => {
+                    conn_task.abort();
+                    return Ok(GrpcResponse {
+                        http_status,
+                        headers,
+                        messages: Vec::new(),
+                        raw_body_frames: Vec::new(),
+                        trailers: None,
+                        stream_error: Some("body/trailers read timed out".into()),
+                        request_send_error,
+                    });
+                }
+            };
 
         // RFC 9113 §8.1: after a complete early response, the server MAY send
         // RST_STREAM(NO_ERROR) to cancel an unread request body. Raw h2 surfaces
@@ -695,9 +689,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("grpc-status", "14".parse().unwrap());
         let kept = suppress_benign_early_response_reset(
-            Some(
-                "body error: unrelated failure mentioning not a result of an error".into(),
-            ),
+            Some("body error: unrelated failure mentioning not a result of an error".into()),
             false,
             &headers,
             None,
