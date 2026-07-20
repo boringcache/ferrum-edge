@@ -666,6 +666,12 @@ fn response_transformer_sse_policy_file_config(backend_port: u16) -> String {
             // events. Zero disables the backend read timeout for this test.
             "backend_read_timeout_ms": 0,
             "backend_write_timeout_ms": 5000,
+            // Exercise the retry-marked response decision even though both
+            // successful fixtures complete on their first attempt.
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+            },
             "plugins": [{"plugin_config_id": "redact-secret"}],
         }],
         "consumers": [],

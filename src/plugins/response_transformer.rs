@@ -707,6 +707,30 @@ impl Plugin for ResponseTransformer {
         !self.body_rules.is_empty() && self.rules_enabled()
     }
 
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        // Retry-enabled dispatch buffers responses by default so a failed
+        // attempt remains replayable. Opt into the header-first refinement only
+        // while this plugin is the reason for buffering; the confirmation hook
+        // below still releases solely a representation the body rules cannot
+        // transform. The shared retry refinement separately refuses release if
+        // any active plugin may rewrite Content-Type.
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && response_headers
+                .get("content-type")
+                .is_some_and(|content_type| {
+                    body_transform::is_event_stream_content_type(content_type)
+                })
+    }
+
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,

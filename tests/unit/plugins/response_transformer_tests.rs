@@ -757,6 +757,12 @@ async fn test_response_transformer_sse_accept_stays_buffered_until_response_head
         200,
         &json_headers,
     ));
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(!plugin.should_release_response_body_under_retries(
+        &ctx,
+        200,
+        &json_headers,
+    ));
 }
 
 #[tokio::test]
@@ -782,6 +788,12 @@ async fn test_response_transformer_backend_event_stream_releases_buffering() {
         200,
         &response_headers,
     ));
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(plugin.should_release_response_body_under_retries(
+        &ctx,
+        200,
+        &response_headers,
+    ));
 }
 
 #[tokio::test]
@@ -799,6 +811,12 @@ async fn test_response_transformer_missing_response_type_stays_fail_closed() {
     assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
         None,
+        200,
+        &HashMap::new(),
+    ));
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(!plugin.should_release_response_body_under_retries(
+        &ctx,
         200,
         &HashMap::new(),
     ));
