@@ -140,8 +140,7 @@ impl GraphqlPlugin {
 
         match config.get("sync_mode") {
             None => {}
-            Some(Value::String(sync_mode))
-                if matches!(sync_mode.as_str(), "local" | "redis") => {}
+            Some(Value::String(sync_mode)) if matches!(sync_mode.as_str(), "local" | "redis") => {}
             Some(Value::String(sync_mode)) => {
                 return Err(format!(
                     "graphql: 'sync_mode' must be exactly 'local' or 'redis', got: {sync_mode:?}"
