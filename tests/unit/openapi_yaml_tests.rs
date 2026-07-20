@@ -4303,8 +4303,8 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
     }
 }
 
-#[test]
-fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
+#[tokio::test]
+async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
     use ferrum_edge::plugins::ai_transcript_audit::{
         AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS, AI_TRANSCRIPT_AUDIT_CONFIG_KEYS,
         AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
