@@ -465,6 +465,87 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 }
 
 #[tokio::test]
+async fn nested_provider_credentials_are_recursively_redacted() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+
+    let provider_api_key = "nested-provider-api-key-canary";
+    let plugin = json!({
+        "id": "nested-provider-redaction",
+        "plugin_name": "ai_federation",
+        "scope": "global",
+        "config": {
+            "providers": [{
+                "name": "redaction-provider",
+                "provider_type": "openai",
+                "api_key": provider_api_key,
+                "model_patterns": ["gpt-*"]
+            }]
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "plugin create failed: {body:?}");
+    assert_eq!(
+        body["config"]["providers"][0]["api_key"],
+        provider_api_key
+    );
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=nested-provider-redaction",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_eq!(audit_config["providers"][0]["api_key"], "[REDACTED]");
+    assert_eq!(
+        audit_config["providers"][0]["name"],
+        "redaction-provider"
+    );
+    assert_eq!(audit_config["providers"][0]["model_patterns"][0], "gpt-*");
+
+    let (status, viewer_body) = get_json(
+        &base,
+        "/plugins/config/nested-provider-redaction",
+        &viewer,
+    )
+    .await;
+    assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
+    assert_eq!(
+        viewer_body["config"]["providers"][0]["api_key"],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        viewer_body["config"]["providers"][0]["name"],
+        "redaction-provider"
+    );
+
+    let (status, admin_body) = get_json(
+        &base,
+        "/plugins/config/nested-provider-redaction",
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
+    assert_eq!(
+        admin_body["config"]["providers"][0]["api_key"],
+        provider_api_key
+    );
+
+    let projected = format!("{audit_config:?}{viewer_body:?}");
+    assert!(
+        !projected.contains(provider_api_key),
+        "nested provider credential leaked: {projected}"
+    );
+}
+
+#[tokio::test]
 async fn serverless_config_audit_and_non_admin_reads_redact_url_credentials() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
