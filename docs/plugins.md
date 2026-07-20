@@ -562,22 +562,29 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 
 **Priority:** 9125
 
+**Failure policy:** `KeepLastKnownGood` — construction/validation failures reject the candidate plugin generation and keep the last-known-good instance.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | Hostname or IP of the TCP log receiver |
 | `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
 | `tls` | Boolean | `false` | Enable TLS encryption for the connection |
-| `tls_server_name` | String | *(none)* | SNI server name override for TLS (defaults to `host`) |
+| `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name (no URL scheme, path, query, fragment, credentials, whitespace, or host:port); invalid values fail admission. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-| `connect_timeout_ms` | Integer | `5000` | TCP connection timeout in milliseconds (min: 100) |
+| `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
+| `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
+| `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
+
+Unknown top-level configuration keys are rejected at admission with an actionable allowed-key list (for example a misspelled `tlls` cannot silently leave the sink on plaintext).
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each entry is serialized as a single JSON line followed by a newline (`\n`), making the output compatible with NDJSON/JSON Lines consumers.
 
-The TCP connection is persistent — it is reused across batches and automatically re-established on write failure or disconnect. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) and skip-verify setting (`FERRUM_TLS_NO_VERIFY`).
+The TCP connection is persistent — it is reused across batches and automatically re-established on write failure, write/flush timeout, connect/handshake timeout, or disconnect. Delivery is at-least-once: a timeout or I/O error after a partial write may cause the full batch to be retried, so collectors must tolerate duplicates. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`), skip-verify setting (`FERRUM_TLS_NO_VERIFY`), and CRL list (`FERRUM_TLS_CRL_FILE_PATH`).
 
 ```yaml
 plugin_name: tcp_logging
