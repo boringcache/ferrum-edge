@@ -874,6 +874,12 @@ async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
 #[tokio::test]
 async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    // Set this on the listener before the TCP handshake so accepted sockets
+    // inherit a small receive window. Hosted runners otherwise autotune
+    // loopback buffers into the multi-MiB range and never exert backpressure.
+    socket2::SockRef::from(&listener)
+        .set_recv_buffer_size(8 * 1024)
+        .expect("cap slow-peer SO_RCVBUF");
     let addr = listener.local_addr().expect("local_addr");
     let endpoint = format!("ws://{addr}/logs");
     let (second_tx, second_rx) = tokio::sync::oneshot::channel::<String>();
@@ -882,15 +888,6 @@ async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
         // First connection: handshake then stop reading so write buffers fill
         // and write_timeout_ms fires on the client.
         let (stream, _) = listener.accept().await.expect("accept #1");
-        // Hosted runners autotune localhost TCP buffers into the multi-MiB
-        // range. Without a tight SO_RCVBUF, a handful of large frames can still
-        // land entirely in the kernel and `write_timeout_ms` never arms -- the
-        // client never reconnects and the recovery assertion times out. Cap the
-        // slow peer's receive buffer so backpressure (and thus the production
-        // write-timeout -> invalidate -> reconnect path) engages deterministically.
-        stream
-            .set_recv_buffer_size(8 * 1024)
-            .expect("cap slow-peer SO_RCVBUF");
         let ws = tokio_tungstenite::accept_async(stream)
             .await
             .expect("handshake #1");
@@ -916,33 +913,29 @@ async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": endpoint,
-            "batch_size": 1,
+            "batch_size": 16,
             "flush_interval_ms": 100,
             "max_retries": 3,
             "retry_delay_ms": 50,
             "reconnect_delay_ms": 50,
             "write_timeout_ms": 200,
             "connect_timeout_ms": 1000,
-            "max_entry_bytes": 96_000,
+            "max_entry_bytes": 1_048_576,
             "buffer_capacity": 64,
         }),
         default_client(),
     )
     .expect("build plugin");
 
-    // Large payloads against the capped peer recv buffer fill the socket quickly.
+    // Build one roughly 14 MiB batch against the capped, non-reading peer. The
+    // frame exceeds the hosted Linux sender's kernel buffering, so the send
+    // must block long enough for the production write timeout to invalidate
+    // connection #1; the retry is the only path that can establish #2.
     let mut summary = create_test_transaction_summary();
-    summary.request_path = format!("/{}", "x".repeat(48_000));
-    for _ in 0..4 {
+    summary.request_path = format!("/{}", "x".repeat(900_000));
+    for _ in 0..16 {
         plugin.log(&summary).await;
-        // Pace above the admitted flush interval so each enqueue can flush.
-        tokio::time::sleep(Duration::from_millis(150)).await;
     }
-
-    // One more enqueue after the induced stall window: proves the logger
-    // reconnects and delivers a subsequent batch on the fresh connection.
-    summary.request_path = "/recovered-after-write-timeout".into();
-    plugin.log(&summary).await;
 
     let payload = await_within("recovered batch after write timeout", second_rx)
         .await
