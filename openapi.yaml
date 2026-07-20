@@ -11436,10 +11436,12 @@ components:
           minimum: 1
           maximum: 268435456
           description: >-
-            Aggregate Ferrum retained-content byte budget across queued
-            pre-serialized records awaiting librdkafka admission. Must be at
-            least max_entry_bytes. Bytes are released when librdkafka send
-            returns. Hard maximum 268435456.
+            Aggregate Ferrum retained-content byte budget across queued records
+            awaiting librdkafka admission and transient serializers. Admission
+            reserves max_entry_bytes before serialization and shrinks that lease
+            to the exact retained record size. Must be at least max_entry_bytes.
+            Bytes are released when librdkafka send returns. Hard maximum
+            268435456.
         compression:
           type: string
           enum: [none, gzip, snappy, lz4, zstd]

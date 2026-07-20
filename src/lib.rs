@@ -694,6 +694,14 @@ pub mod _test_support {
         crate::plugins::kafka_logging::probe_reserve_before_serialize_for_test(oversized).await
     }
 
+    /// Deterministic probe: aggregate byte-budget reservation must precede
+    /// serialization so budget denial cannot allocate an attacker-sized entry.
+    pub async fn kafka_logging_probe_byte_budget_before_serialize_for_test(
+        oversized: &crate::plugins::TransactionSummary,
+    ) -> (u64, u64) {
+        crate::plugins::kafka_logging::probe_byte_budget_before_serialize_for_test(oversized).await
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)

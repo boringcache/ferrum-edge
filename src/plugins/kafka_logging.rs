@@ -4,9 +4,10 @@
 //! retries for both HTTP and stream summaries.
 //!
 //! Hot-path admission is lock-free: a generation publishes a cloneable
-//! [`BatchingLoggerHandle`] behind `ArcSwapOption`, reserves a channel slot
-//! before cloning or serializing attacker-shaped summary fields, enforces a
-//! Ferrum retained-byte budget, then commits a purpose-built Kafka record.
+//! [`BatchingLoggerHandle`] behind `ArcSwapOption`, reserves a channel slot and
+//! worst-case Ferrum retained-byte lease before cloning or serializing
+//! attacker-shaped summary fields, then shrinks the lease to the purpose-built
+//! Kafka record's exact retained size.
 //! Local `ThreadedProducer::send` success only means the record was admitted
 //! to librdkafka's in-memory queue (Ferrum then releases its byte lease).
 //! Terminal broker delivery (including `acks: 0` local completion) is observed
@@ -548,12 +549,36 @@ impl ProducerContext for KafkaDeliveryContext {
 
 struct KafkaByteLease {
     used_bytes: Arc<AtomicUsize>,
-    bytes: usize,
+    bytes: AtomicUsize,
+}
+
+impl KafkaByteLease {
+    fn shrink_to(&self, new_bytes: usize) {
+        let mut current = self.bytes.load(Ordering::Acquire);
+        while new_bytes < current {
+            match self.bytes.compare_exchange_weak(
+                current,
+                new_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.used_bytes
+                        .fetch_sub(current - new_bytes, Ordering::AcqRel);
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
 }
 
 impl Drop for KafkaByteLease {
     fn drop(&mut self) {
-        self.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        let bytes = self.bytes.swap(0, Ordering::AcqRel);
+        if bytes != 0 {
+            self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
     }
 }
 
@@ -586,7 +611,7 @@ impl KafkaByteBudget {
         }
         Some(Arc::new(KafkaByteLease {
             used_bytes: Arc::clone(&self.used_bytes),
-            bytes,
+            bytes: AtomicUsize::new(bytes),
         }))
     }
 }
@@ -715,10 +740,14 @@ impl KafkaAdmission {
             self.metrics.record_ferrum_drop("ferrum channel full");
             return;
         };
+        let Some(lease) = self.byte_budget.try_acquire(self.max_entry_bytes) else {
+            self.metrics.record_byte_budget_exhausted();
+            return;
+        };
         let key = match self.key_field {
             KeyField::None => None,
-            KeyField::ClientIp => Some(Arc::<str>::from(summary.client_ip.as_str())),
-            KeyField::ProxyId => summary.proxy_id.as_deref().map(Arc::<str>::from),
+            KeyField::ClientIp => Some(summary.client_ip.as_str()),
+            KeyField::ProxyId => summary.proxy_id.as_deref(),
         };
         let record = match &self.schema {
             Some(schema) => self.build_record(
@@ -727,8 +756,9 @@ impl KafkaAdmission {
                     schema: schema.as_ref(),
                 },
                 key,
+                lease,
             ),
-            None => self.build_record(summary, key),
+            None => self.build_record(summary, key, lease),
         };
         let Some(record) = record else {
             return;
@@ -745,10 +775,14 @@ impl KafkaAdmission {
             self.metrics.record_ferrum_drop("ferrum channel full");
             return;
         };
+        let Some(lease) = self.byte_budget.try_acquire(self.max_entry_bytes) else {
+            self.metrics.record_byte_budget_exhausted();
+            return;
+        };
         let key = match self.key_field {
             KeyField::None => None,
-            KeyField::ClientIp => Some(Arc::<str>::from(summary.client_ip.as_str())),
-            KeyField::ProxyId => Some(Arc::<str>::from(summary.proxy_id.as_str())),
+            KeyField::ClientIp => Some(summary.client_ip.as_str()),
+            KeyField::ProxyId => Some(summary.proxy_id.as_str()),
         };
         let record = match &self.schema {
             Some(schema) => self.build_record(
@@ -757,8 +791,9 @@ impl KafkaAdmission {
                     schema: schema.as_ref(),
                 },
                 key,
+                lease,
             ),
-            None => self.build_record(summary, key),
+            None => self.build_record(summary, key, lease),
         };
         let Some(record) = record else {
             return;
@@ -766,7 +801,16 @@ impl KafkaAdmission {
         permit.send(record);
     }
 
-    fn build_record<T: Serialize>(&self, value: &T, key: Option<Arc<str>>) -> Option<KafkaRecord> {
+    fn build_record<T: Serialize>(
+        &self,
+        value: &T,
+        key: Option<&str>,
+        lease: Arc<KafkaByteLease>,
+    ) -> Option<KafkaRecord> {
+        if key.is_some_and(|value| value.len() > self.max_entry_bytes) {
+            self.metrics.record_entry_oversize();
+            return None;
+        }
         let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
         if let Err(error) = serde_json::to_writer(&mut writer, value) {
             if writer.limit_exceeded {
@@ -778,7 +822,7 @@ impl KafkaAdmission {
             return None;
         }
         let payload_bytes = writer.bytes.len();
-        let key_bytes = key.as_ref().map(|value| value.len()).unwrap_or(0);
+        let key_bytes = key.map(str::len).unwrap_or(0);
         let retained = match payload_bytes.checked_add(key_bytes) {
             Some(total) => total,
             None => {
@@ -790,10 +834,6 @@ impl KafkaAdmission {
             self.metrics.record_entry_oversize();
             return None;
         }
-        let Some(lease) = self.byte_budget.try_acquire(retained) else {
-            self.metrics.record_byte_budget_exhausted();
-            return None;
-        };
         let payload = match String::from_utf8(writer.bytes) {
             Ok(payload) => Arc::<str>::from(payload),
             Err(error) => {
@@ -802,6 +842,8 @@ impl KafkaAdmission {
                 return None;
             }
         };
+        let key = key.map(Arc::<str>::from);
+        lease.shrink_to(retained);
         Some(KafkaRecord {
             payload,
             key,
@@ -1496,6 +1538,55 @@ pub(crate) async fn probe_reserve_before_serialize_for_test(
     worker_release.add_permits(2);
     let _ = logger.close_and_await().await;
     (dropped, oversize)
+}
+
+/// Deterministic admission-order probe for external unit tests: a lease that
+/// consumes the entire aggregate byte budget must reject an oversized summary
+/// before its serializer runs. Returns
+/// `(byte_budget_exhausted_total, entry_oversize_total)`.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) async fn probe_byte_budget_before_serialize_for_test(
+    oversized: &TransactionSummary,
+) -> (u64, u64) {
+    let metrics = Arc::new(KafkaDeliveryMetrics::new(u64::MAX - 11));
+    let byte_budget = Arc::new(KafkaByteBudget::new(64));
+    let Some(held_lease) = byte_budget.try_acquire(64) else {
+        return (0, 0);
+    };
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let mut logger: BatchingLogger<KafkaRecord> = BatchingLogger::spawn(
+        BatchConfig {
+            batch_size: 1,
+            flush_interval: Duration::from_secs(3600),
+            buffer_capacity: 1,
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+            plugin_name: "kafka_logging",
+        },
+        |_batch| async { Ok(()) },
+    );
+    let Some(handle) = logger.handle() else {
+        drop(held_lease);
+        let _ = logger.close_and_await().await;
+        return (0, 0);
+    };
+    let admission = KafkaAdmission {
+        handle,
+        key_field: KeyField::None,
+        schema: None,
+        max_entry_bytes: 64,
+        byte_budget,
+        metrics: Arc::clone(&metrics),
+        in_flight,
+    };
+
+    admission.admit_http(oversized);
+
+    let exhausted = metrics.byte_budget_exhausted.load(Ordering::Relaxed);
+    let oversize = metrics.entry_oversize.load(Ordering::Relaxed);
+    drop(admission);
+    drop(held_lease);
+    let _ = logger.close_and_await().await;
+    (exhausted, oversize)
 }
 
 /// Pure producer-configuration admission used by construction and exposed to

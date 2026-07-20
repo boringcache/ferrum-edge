@@ -1,6 +1,7 @@
 //! Tests for kafka_logging plugin
 
 use ferrum_edge::_test_support::{
+    kafka_logging_probe_byte_budget_before_serialize_for_test,
     kafka_logging_probe_reserve_before_serialize_for_test,
     kafka_logging_validate_producer_admission_for_test,
 };
@@ -791,6 +792,22 @@ async fn test_kafka_logging_reserves_channel_before_oversize_serialization() {
     assert_eq!(
         oversize, 0,
         "oversize counter must stay zero when channel reservation fails first"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_kafka_logging_reserves_byte_budget_before_oversize_serialization() {
+    let mut oversized = create_test_transaction_summary();
+    oversized.request_path = format!("/{}", "b".repeat(4096));
+    let (exhausted, oversize) =
+        kafka_logging_probe_byte_budget_before_serialize_for_test(&oversized).await;
+    assert_eq!(
+        exhausted, 1,
+        "expected aggregate byte-budget rejection before serialization"
+    );
+    assert_eq!(
+        oversize, 0,
+        "oversize counter must stay zero when byte-budget reservation fails first"
     );
 }
 
