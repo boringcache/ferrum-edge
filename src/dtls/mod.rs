@@ -479,12 +479,25 @@ impl DtlsConnection {
 
                 // Drain all pending outputs (break on Timeout — it repeats forever)
                 let mut socket_send_error: Option<String> = None;
+                let mut wrote_ciphertext_datagram = false;
                 for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                     match dtls.poll_output(&mut out_buf) {
                         Output::Packet(data) => {
-                            if let Err(e) = socket.send(data).await {
-                                socket_send_error = Some(format!("DTLS UDP send error: {e}"));
-                                break;
+                            match socket.send(data).await {
+                                Ok(written) if written == data.len() => {
+                                    wrote_ciphertext_datagram = true;
+                                }
+                                Ok(written) => {
+                                    socket_send_error = Some(format!(
+                                        "DTLS UDP send was incomplete: wrote {written} of {} bytes",
+                                        data.len()
+                                    ));
+                                    break;
+                                }
+                                Err(e) => {
+                                    socket_send_error = Some(format!("DTLS UDP send error: {e}"));
+                                    break;
+                                }
                             }
                         }
                         Output::Timeout(t) => {
@@ -511,6 +524,11 @@ impl DtlsConnection {
                 if let Some(completion) = pending_completion.take() {
                     if let Some(error) = socket_send_error.as_ref() {
                         let _ = completion.send(Err(error.clone()));
+                    } else if !wrote_ciphertext_datagram {
+                        let error =
+                            "DTLS application send produced no ciphertext datagram".to_string();
+                        let _ = completion.send(Err(error.clone()));
+                        fatal_send_error = Some(error);
                     } else {
                         let _ = completion.send(Ok(()));
                     }
@@ -1368,6 +1386,19 @@ pub fn load_dtls_certificate(
         .ok_or_else(|| {
             anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
         })?;
+
+    rustls::sign::CertifiedKey::from_der(
+        vec![cert_der.clone()],
+        key_der.clone_key(),
+        &rustls::crypto::ring::default_provider(),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "DTLS certificate {} and private key {} do not form a valid pair: {error}",
+            cert_material.display_source_id,
+            key_material.display_source_id
+        )
+    })?;
 
     // dimpl only supports ECDSA P-256 / P-384. Reject unsupported algorithms at
     // materialization time so admission/config load surfaces the defect instead

@@ -21,6 +21,7 @@
 //! record cannot silently discard its co-batched neighbors.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +65,9 @@ pub const UDP_LOGGING_CONFIG_KEYS: &[&str] = &[
     "schema",
     "schema_ref",
 ];
+
+const LOCAL_RECORD_DROP_WARN_EVERY: u64 = 100;
+static LOCAL_RECORD_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Pre-materialized DTLS client identity and verifier for one plugin generation.
 #[derive(Clone)]
@@ -276,12 +280,23 @@ pub(crate) fn materialize_dtls_material(
             .map_err(|error| format!("udp_logging: DTLS ephemeral cert failed: {error}"))?
     };
 
+    // A configured CA source is still materialized under `no_verify`: although
+    // verification is intentionally disabled, a missing or malformed declared
+    // source must not pass admission and become a latent rollout defect.
+    let configured_root_store = match ca_path {
+        Some(ca_path) => Some(
+            crate::dtls::load_root_store_from_pem(ca_path).map_err(|error| {
+                format!("udp_logging: DTLS CA materialization failed: {error}")
+            })?,
+        ),
+        None => None,
+    };
+
     let (server_name, server_cert_verifier) = if no_verify {
         (None, None)
     } else {
-        let root_store = if let Some(ca_path) = ca_path {
-            crate::dtls::load_root_store_from_pem(ca_path)
-                .map_err(|error| format!("udp_logging: DTLS CA materialization failed: {error}"))?
+        let root_store = if let Some(root_store) = configured_root_store {
+            root_store
         } else {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -440,18 +455,71 @@ enum UdpSender {
     Dtls(Arc<crate::dtls::DtlsConnection>),
 }
 
+/// One local delivery failure plus whether the connected sender can still be
+/// trusted. Deterministic encoding/size rejection must participate in
+/// retry/final-loss accounting without tearing down a healthy DTLS association.
+struct UdpDeliveryError {
+    message: String,
+    reset_sender: bool,
+}
+
+impl UdpDeliveryError {
+    fn local(message: String) -> Self {
+        Self {
+            message,
+            reset_sender: false,
+        }
+    }
+
+    fn transport(message: String) -> Self {
+        Self {
+            message,
+            reset_sender: true,
+        }
+    }
+
+    fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn into_message(self) -> String {
+        self.message
+    }
+
+    fn requires_sender_reset(&self) -> bool {
+        self.reset_sender
+    }
+}
+
+fn record_local_record_drop(error: &UdpDeliveryError) {
+    let total = LOCAL_RECORD_DROPS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if total == 1 || total % LOCAL_RECORD_DROP_WARN_EVERY == 0 {
+        warn!(
+            dropped_records = total,
+            reason = %error.message(),
+            "udp_logging: discarded co-batched record after deterministic local rejection; \
+             valid siblings were preserved"
+        );
+    }
+}
+
 impl UdpSender {
-    async fn send(&self, data: &[u8]) -> Result<(), String> {
+    async fn send(&self, data: &[u8]) -> Result<(), UdpDeliveryError> {
         match self {
-            UdpSender::Plain(socket) => socket
-                .send(data)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("UDP send error: {e}")),
+            UdpSender::Plain(socket) => match socket.send(data).await {
+                Ok(written) if written == data.len() => Ok(()),
+                Ok(written) => Err(UdpDeliveryError::transport(format!(
+                    "UDP send was incomplete: wrote {written} of {} bytes",
+                    data.len()
+                ))),
+                Err(error) => Err(UdpDeliveryError::transport(format!(
+                    "UDP send error: {error}"
+                ))),
+            },
             UdpSender::Dtls(conn) => conn
                 .send(data)
                 .await
-                .map_err(|e| format!("DTLS send error: {e}")),
+                .map_err(|e| UdpDeliveryError::transport(format!("DTLS send error: {e}"))),
         }
     }
 }
@@ -576,15 +644,21 @@ async fn send_batch(
 
     let result = match sender.as_ref() {
         Some(active_sender) => deliver_batch(cfg, active_sender, &batch).await,
-        None => Err("udp_logging: sender unavailable after initialization".to_string()),
+        None => Err(UdpDeliveryError::transport(
+            "udp_logging: sender unavailable after initialization".to_string(),
+        )),
     };
 
-    // On send failure, tear down the sender so the next batch's
+    // On transport/driver failure, tear down the sender so the next batch's
     // `sender.is_none()` branch forces a fresh resolve + handshake. UDP/DTLS
     // sends frequently succeed at the socket layer even when the peer is gone,
     // so error-triggered teardown is the most robust recovery trigger and also
     // covers plain-UDP socket errors that the periodic re-resolve would miss.
-    if result.is_err() {
+    // Deterministic local encoding/size rejection keeps the healthy sender.
+    if result
+        .as_ref()
+        .is_err_and(UdpDeliveryError::requires_sender_reset)
+    {
         sender = None;
         current_addr = None;
     }
@@ -596,7 +670,7 @@ async fn send_batch(
     state.current_addr = current_addr;
     state.last_resolve = last_resolve;
 
-    result
+    result.map_err(UdpDeliveryError::into_message)
 }
 
 /// DTLS plaintext-size gate for one already-serialized batch payload.
@@ -639,35 +713,41 @@ fn oversized_dtls_batch_error(max_plaintext: usize, got: usize) -> String {
 fn serialize_batch_payload(
     batch: &[SummaryLogEntry],
     schema: Option<&SummarySchema>,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, UdpDeliveryError> {
     let view = SummaryLogEntryBatchView {
         entries: batch,
         schema,
     };
     match serde_json::to_vec(&view) {
-        Ok(payload) => Some(payload),
-        Err(error) => {
-            warn!("udp_logging: failed to serialize batch: {error}");
-            None
-        }
+        Ok(payload) => Ok(payload),
+        Err(error) => Err(UdpDeliveryError::local(format!(
+            "udp_logging: failed to serialize batch: {error}"
+        ))),
     }
+}
+
+pub(crate) fn classify_serialized_dtls_batch_for_test(
+    batch: &[SummaryLogEntry],
+    max_plaintext: usize,
+) -> Result<(DtlsBatchSizeDecision, usize), String> {
+    let payload = serialize_batch_payload(batch, None).map_err(UdpDeliveryError::into_message)?;
+    let decision = classify_dtls_batch_size(true, payload.len(), batch.len(), max_plaintext);
+    Ok((decision, payload.len()))
 }
 
 async fn deliver_batch(
     cfg: &UdpFlushConfig,
     sender: &UdpSender,
     batch: &[SummaryLogEntry],
-) -> Result<(), String> {
-    let Some(payload) = serialize_batch_payload(batch, cfg.schema.as_deref()) else {
-        return Ok(());
-    };
+) -> Result<(), UdpDeliveryError> {
+    let payload = serialize_batch_payload(batch, cfg.schema.as_deref())?;
 
     let max_plaintext = crate::dtls::max_plaintext_bytes();
     match classify_dtls_batch_size(cfg.dtls_enabled, payload.len(), batch.len(), max_plaintext) {
         DtlsBatchSizeDecision::SendAsIs => sender.send(&payload).await,
-        DtlsBatchSizeDecision::RejectOversizedSingle => {
-            Err(oversized_dtls_batch_error(max_plaintext, payload.len()))
-        }
+        DtlsBatchSizeDecision::RejectOversizedSingle => Err(UdpDeliveryError::local(
+            oversized_dtls_batch_error(max_plaintext, payload.len()),
+        )),
         DtlsBatchSizeDecision::SplitPerEntry => {
             // Fixed one-level fan-out into the non-recursive single-entry helper
             // so one oversized record cannot erase co-batched siblings. Oversized
@@ -676,11 +756,8 @@ async fn deliver_batch(
             for entry in batch {
                 match deliver_one_entry(cfg, sender, entry).await {
                     Ok(()) => {}
-                    Err(error) if error.contains("exceeds max_plaintext") => {
-                        warn!(
-                            "udp_logging: discarded oversized co-batched record with explicit \
-                             loss marker (siblings preserved): {error}"
-                        );
+                    Err(error) if !error.requires_sender_reset() => {
+                        record_local_record_drop(&error);
                     }
                     Err(error) => return Err(error),
                 }
@@ -697,23 +774,20 @@ async fn deliver_one_entry(
     cfg: &UdpFlushConfig,
     sender: &UdpSender,
     entry: &SummaryLogEntry,
-) -> Result<(), String> {
-    let Some(payload) = serialize_batch_payload(std::slice::from_ref(entry), cfg.schema.as_deref())
-    else {
-        return Ok(());
-    };
+) -> Result<(), UdpDeliveryError> {
+    let payload = serialize_batch_payload(std::slice::from_ref(entry), cfg.schema.as_deref())?;
 
     let max_plaintext = crate::dtls::max_plaintext_bytes();
     match classify_dtls_batch_size(cfg.dtls_enabled, payload.len(), 1, max_plaintext) {
         DtlsBatchSizeDecision::SendAsIs => sender.send(&payload).await,
-        DtlsBatchSizeDecision::RejectOversizedSingle => {
-            Err(oversized_dtls_batch_error(max_plaintext, payload.len()))
-        }
+        DtlsBatchSizeDecision::RejectOversizedSingle => Err(UdpDeliveryError::local(
+            oversized_dtls_batch_error(max_plaintext, payload.len()),
+        )),
         // `batch_len == 1` never selects split; keep fail-closed if the
         // classifier contract changes.
-        DtlsBatchSizeDecision::SplitPerEntry => {
-            Err(oversized_dtls_batch_error(max_plaintext, payload.len()))
-        }
+        DtlsBatchSizeDecision::SplitPerEntry => Err(UdpDeliveryError::local(
+            oversized_dtls_batch_error(max_plaintext, payload.len()),
+        )),
     }
 }
 

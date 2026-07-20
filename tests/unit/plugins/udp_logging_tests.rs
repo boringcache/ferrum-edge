@@ -631,6 +631,30 @@ async fn test_udp_logging_dtls_rejects_malformed_pem_at_admission() {
 }
 
 #[tokio::test]
+async fn test_udp_logging_dtls_rejects_mismatched_certificate_and_key_at_admission() {
+    ensure_crypto_provider();
+    let (cert, _matching_key) = mint_ecdsa_p256_pair();
+    let (_other_cert, other_key) = mint_ecdsa_p256_pair();
+    let err = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "dtls": true,
+            "dtls_cert_path": cert.path().to_str().unwrap(),
+            "dtls_key_path": other_key.path().to_str().unwrap(),
+            "dtls_no_verify": true
+        }),
+        test_client(),
+    )
+    .err()
+    .expect("mismatched DTLS certificate/key must fail admission");
+    assert!(
+        err.contains("do not form a valid pair") || err.contains("key does not match"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_udp_logging_dtls_rejects_rsa_key_at_admission() {
     let (cert, key) = mint_rsa_pair();
     let err = UdpLogging::new(
@@ -702,6 +726,27 @@ async fn test_udp_logging_dtls_rejects_malformed_ca_at_admission() {
     )
     .err()
     .expect("malformed CA must fail admission");
+    assert!(
+        err.contains("DTLS CA materialization failed") || err.contains("No valid certificates"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_udp_logging_dtls_validates_configured_ca_when_no_verify_is_true() {
+    let ca = write_temp_pem("not-a-ca");
+    let err = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9515,
+            "dtls": true,
+            "dtls_ca_cert_path": ca.path().to_str().unwrap(),
+            "dtls_no_verify": true
+        }),
+        test_client(),
+    )
+    .err()
+    .expect("a declared malformed CA must fail even when verification is disabled");
     assert!(
         err.contains("DTLS CA materialization failed") || err.contains("No valid certificates"),
         "got: {err}"
@@ -896,6 +941,35 @@ fn test_udp_logging_dtls_batch_size_gate_classifies_send_reject_and_split() {
         ),
         "split_per_entry",
         "oversized multi-entry batches fan out per entry without async recursion"
+    );
+}
+
+#[test]
+fn test_udp_logging_default_summary_remote_trigger_and_cobatch_split() {
+    let max = 16_384usize;
+    let mut oversized = create_test_transaction_summary();
+    oversized.request_user_agent = Some("x".repeat(max));
+
+    let (single_decision, single_len) =
+        ferrum_edge::_test_support::udp_logging_classify_serialized_summaries_for_test(
+            std::slice::from_ref(&oversized),
+            max,
+        )
+        .expect("serialize default summary with admitted long User-Agent");
+    assert!(single_len > max, "JSON framing must cross the DTLS ceiling");
+    assert_eq!(single_decision, "reject_oversized_single");
+
+    let ordinary = create_test_transaction_summary();
+    let (batch_decision, batch_len) =
+        ferrum_edge::_test_support::udp_logging_classify_serialized_summaries_for_test(
+            &[oversized, ordinary],
+            max,
+        )
+        .expect("serialize co-batched summaries");
+    assert!(batch_len > max);
+    assert_eq!(
+        batch_decision, "split_per_entry",
+        "one remotely oversized summary must not erase its ordinary sibling"
     );
 }
 

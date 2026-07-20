@@ -2175,6 +2175,26 @@ pub mod _test_support {
         }
     }
 
+    pub fn udp_logging_classify_serialized_summaries_for_test(
+        summaries: &[crate::plugins::TransactionSummary],
+        max_plaintext: usize,
+    ) -> Result<(&'static str, usize), String> {
+        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
+        let entries: Vec<crate::plugins::utils::SummaryLogEntry> =
+            summaries.iter().map(Into::into).collect();
+        let (decision, payload_len) =
+            crate::plugins::udp_logging::classify_serialized_dtls_batch_for_test(
+                &entries,
+                max_plaintext,
+            )?;
+        let label = match decision {
+            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
+            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+        };
+        Ok((label, payload_len))
+    }
+
     pub fn udp_logging_validate_dtls_file_dependencies_for_test(
         config: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), String> {

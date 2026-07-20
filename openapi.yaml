@@ -11334,7 +11334,9 @@ components:
           type: string
           description: >-
             PEM CA certificate for verifying the DTLS server. Materialized at
-            admission when set and dtls_no_verify is false.
+            admission whenever set with dtls true, including when dtls_no_verify
+            is true (the source must still be valid even though verification is
+            disabled).
         dtls_no_verify:
           type: boolean
           default: false
