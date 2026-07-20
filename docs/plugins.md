@@ -3551,7 +3551,7 @@ For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: tru
 | `duration_seconds` | Integer | **(required)** | How long the test runs in seconds (1–3,600) |
 | `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once (see ramp example below) |
 | `request_timeout_ms` | Integer | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll) |
-| `max_response_body_bytes` | Integer | `1048576` (1 MiB) | Maximum synthetic response bytes consumed per request; larger responses are truncated |
+| `max_response_body_bytes` | Integer | `1048576` (1 MiB) | Maximum response bytes the synthetic client consumes per request. The client stops reading at the cap; this bounds its own work and memory without changing the backend response |
 | `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests. Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled) |
 | `gateway_tls` | Boolean | `false` | Use HTTPS for local loopback synthetic requests |
 | `gateway_tls_no_verify` | Boolean | `true` when `gateway_tls` on | Skip TLS cert verification for loopback only |
