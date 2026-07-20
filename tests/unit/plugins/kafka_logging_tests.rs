@@ -942,6 +942,33 @@ async fn test_kafka_logging_diagnostics_omit_secrets() {
 }
 
 #[tokio::test]
+async fn test_kafka_logging_constructor_error_omits_rejected_property_value() {
+    let secret = "super-secret-kafka-client-config-value";
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "producer_config": {
+                "ferrum.unknown.sensitive.option": secret
+            }
+        }),
+        &default_http_client(),
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("unknown librdkafka property must fail construction"),
+    };
+    assert!(
+        error.contains("client_config_error"),
+        "constructor should retain only the safe failure class: {error}"
+    );
+    assert!(
+        !error.contains(secret),
+        "constructor error must not echo the rejected property value"
+    );
+}
+
+#[tokio::test]
 async fn test_kafka_logging_rejects_producer_config_security_aliases_case_insensitive() {
     let cases = [
         ("security.protocol", "security_protocol"),

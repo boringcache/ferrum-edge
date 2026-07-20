@@ -1300,7 +1300,19 @@ impl KafkaLogging {
         };
         let producer: ThreadedProducer<KafkaDeliveryContext> = kafka_config
             .create_with_context(context)
-            .map_err(|error| format!("kafka_logging: failed to create Kafka producer: {error}"))?;
+            // `KafkaError::ClientConfig` retains and prints the rejected
+            // property value. That value can be credential material supplied
+            // through `producer_config` (for example an OAuth setting), so do
+            // not pass librdkafka's display text across the config-admission
+            // boundary. The fixed classification is enough for operators to
+            // distinguish invalid configuration from client construction
+            // failure without echoing secrets or TLS source identities.
+            .map_err(|error| {
+                format!(
+                    "kafka_logging: failed to create Kafka producer ({})",
+                    safe_kafka_error_kind(&error)
+                )
+            })?;
 
         let broker_hostnames: Vec<String> = broker_list
             .split(',')
