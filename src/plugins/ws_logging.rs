@@ -965,9 +965,8 @@ async fn send_batch(
         }
 
         if let Some(ref mut ws) = conn {
-            let msg = tokio_tungstenite::tungstenite::protocol::Message::Text(
-                (&*payload.json).into(),
-            );
+            let msg =
+                tokio_tungstenite::tungstenite::protocol::Message::Text((&*payload.json).into());
             match tokio::time::timeout(cfg.write_timeout, ws.sink.send(msg)).await {
                 Ok(Ok(())) => return conn,
                 Ok(Err(e)) => {
