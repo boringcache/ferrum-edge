@@ -1986,7 +1986,7 @@ impl MetricsRegistry {
 
         if !self.mesh_outbound_registry_decisions.is_empty() {
             output.push_str(
-                "# HELP ferrum_mesh_outbound_registry_decisions_total Mesh outbound registry decisions by destination host.\n",
+                "# HELP ferrum_mesh_outbound_registry_decisions_total Mesh outbound registry decisions with bounded host buckets (<admit_explicit>, <admit_wildcard>, <denied>).\n",
             );
             output.push_str("# TYPE ferrum_mesh_outbound_registry_decisions_total counter\n");
             for namespace_entry in self.mesh_outbound_registry_decisions.iter() {

@@ -241,6 +241,53 @@ fn mesh_plugins_are_registered() {
 }
 
 #[test]
+fn mesh_outbound_registry_rejects_zero_listen_port_via_create_plugin() {
+    let err = create_plugin(
+        "mesh_outbound_registry",
+        &json!({
+            "registry": ["reviews.svc"],
+            "outbound_listen_ports": [0],
+        }),
+    )
+    .expect_err("port 0 must fail closed at construction");
+    assert!(
+        err.contains("outbound_listen_ports"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn mesh_outbound_registry_metric_contract_matches_docs_and_help() {
+    // Keep operator docs, OpenAPI wording, and the exported HELP text aligned
+    // on the intentional bounded host buckets (not per-destination admits).
+    let configuration = include_str!("../../../docs/configuration.md");
+    let mesh = include_str!("../../../docs/mesh.md");
+    let plugins = include_str!("../../../docs/plugins.md");
+    for doc in [configuration, mesh, plugins] {
+        assert!(doc.contains("<admit_explicit>"));
+        assert!(doc.contains("<admit_wildcard>"));
+        assert!(doc.contains("<denied>"));
+        assert!(
+            !doc.contains("actual destination only for `admit`")
+                && !doc.contains("uses the actual destination as the `host` label"),
+            "docs must not claim per-destination admit host labels"
+        );
+    }
+
+    // Force the series into the scrape output so HELP is rendered.
+    ferrum_edge::plugins::prometheus_metrics::global_registry()
+        .record_mesh_outbound_registry_decision("metric-contract-ns", "<admit_explicit>", "admit");
+    let rendered =
+        ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+    assert!(
+        rendered.contains(
+            "# HELP ferrum_mesh_outbound_registry_decisions_total Mesh outbound registry decisions with bounded host buckets (<admit_explicit>, <admit_wildcard>, <denied>)."
+        ),
+        "HELP must name the bounded host buckets; got:\n{rendered}"
+    );
+}
+
+#[test]
 fn mesh_authz_rejects_namespace_scoped_direct_policy_without_namespace() {
     let err = match MeshAuthz::new(&json!({
         "mesh_policies": [policy_with_scope(

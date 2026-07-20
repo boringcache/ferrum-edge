@@ -2138,9 +2138,9 @@ Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a
 |---|---|---|---|
 | `registry` | String[] | `[]` | Known destinations. Entries can be bare hosts (`reviews.default.svc.cluster.local`), exact host/port pairs (`reviews.default.svc.cluster.local:8080`), any-explicit-port markers (`reviews.default.svc.cluster.local:*`), or one-label wildcards (`*.example.com`, `*.example.com:443`, `*.example.com:*`). |
 | `reject_status` | u16 | `502` | HTTP 4xx/5xx status returned for unknown destinations. Use `404` when you want to mask policy details. |
-| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs. |
+| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs. Port `0` is rejected at construction; use `[]` for intentional global scope. |
 
-Bare-host registry entries match only requests whose Host header omits an explicit port. `host:port` entries match only that exact port. `host:*` entries match any explicit Host port; mesh-generated registries use this marker for services, ServiceEntries, or workload addresses with no declared ports so known destinations remain reachable when callers include `Host: service:9080`.
+Bare-host registry entries match only requests whose Host header omits an explicit port. `host:port` entries match only that exact port. `host:*` entries match any explicit Host port; mesh-generated registries use this marker for services, ServiceEntries, or workload addresses with no declared ports so known destinations remain reachable when callers include `Host: service:9080`. One-label wildcards (`*.example.com`) are indexed by suffix so lookup cost does not grow with unrelated wildcard count. Decision metrics use fixed `host` buckets (`<admit_explicit>`, `<admit_wildcard>`, `<denied>`).
 
 ### `tcp_connection_throttle`
 

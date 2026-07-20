@@ -32,7 +32,10 @@
 //!   and FQDN forms.
 //! - Wildcard ServiceEntry hosts (`*.example.com`) match one DNS label below
 //!   the suffix, following Istio mesh registry semantics. Proxy listener host
-//!   routing uses broader DNS suffix wildcard semantics.
+//!   routing uses broader DNS suffix wildcard semantics. Lookups extract the
+//!   candidate suffix after the request host's first label and probe a
+//!   precomputed `HashSet`, so cost does not grow with unrelated wildcard
+//!   count.
 //! - An empty registry is valid and fails closed: every request is rejected,
 //!   but the plugin remains installed so REGISTRY_ONLY never silently falls
 //!   back to ALLOW_ANY.
@@ -40,6 +43,8 @@
 //!   port, so inbound sidecar/ambient traffic is not gated by an outbound
 //!   policy. Operator-managed instances without `outbound_listen_ports`
 //!   preserve the historical behavior and enforce wherever the plugin runs.
+//!   Port `0` is rejected at construction; intentional global scope is only
+//!   represented by an empty `outbound_listen_ports` vector.
 //!
 //! ## Wire compatibility
 //!
@@ -85,7 +90,8 @@ pub struct OutboundRegistryConfig {
     /// Mesh auto-injection sets this to the outbound capture listener port so
     /// the global plugin does not apply to inbound listeners. Empty keeps
     /// operator-managed plugin instances backwards compatible and enforces on
-    /// every HTTP-family request that reaches this plugin.
+    /// every HTTP-family request that reaches this plugin. Entries must be
+    /// `>= 1`; port `0` is rejected (use `[]` for intentional global scope).
     #[serde(default)]
     pub outbound_listen_ports: Vec<u16>,
     /// Mesh namespace label used by the Prometheus decision counter.
@@ -116,14 +122,15 @@ pub struct OutboundRegistry {
     /// `host:*` entries from mesh-generated no-port resources. A request
     /// matches these only when its Host header carries an explicit port.
     any_port_hosts: HashSet<String>,
-    /// Suffixes from wildcard host entries such as `*.example.com`.
-    wildcard_suffixes: Vec<String>,
+    /// Suffixes from wildcard host entries such as `*.example.com`, indexed
+    /// for O(1) average one-label candidate-suffix lookup.
+    wildcard_suffixes: HashSet<String>,
     /// Port-specific wildcard host suffixes from entries like
     /// `*.example.com:443`.
-    wildcard_port_suffixes: HashMap<u16, Vec<String>>,
+    wildcard_port_suffixes: HashMap<u16, HashSet<String>>,
     /// Any-explicit-port wildcard host suffixes from entries like
     /// `*.example.com:*`.
-    wildcard_any_port_suffixes: Vec<String>,
+    wildcard_any_port_suffixes: HashSet<String>,
     outbound_listen_ports: Vec<u16>,
     reject_status: u16,
     namespace: String,
@@ -139,19 +146,26 @@ impl OutboundRegistry {
                 parsed.reject_status
             ));
         }
+        if parsed.outbound_listen_ports.iter().any(|port| *port == 0) {
+            return Err(
+                "mesh_outbound_registry: outbound_listen_ports entries must be >= 1 (got 0); \
+                 use [] for intentional global/unscoped enforcement"
+                    .to_string(),
+            );
+        }
         let mut hosts: HashSet<String> = HashSet::with_capacity(parsed.registry.len());
         let mut host_ports: HashSet<String> = HashSet::new();
         let mut any_port_hosts: HashSet<String> = HashSet::new();
-        let mut wildcard_suffixes: Vec<String> = Vec::new();
-        let mut wildcard_port_suffixes: HashMap<u16, Vec<String>> = HashMap::new();
-        let mut wildcard_any_port_suffixes: Vec<String> = Vec::new();
+        let mut wildcard_suffixes: HashSet<String> = HashSet::new();
+        let mut wildcard_port_suffixes: HashMap<u16, HashSet<String>> = HashMap::new();
+        let mut wildcard_any_port_suffixes: HashSet<String> = HashSet::new();
         for entry in parsed.registry {
             let Some(normalised) = normalise_registry_entry(&entry) else {
                 continue;
             };
             if let Some(host) = split_registry_host_any_port(&normalised) {
                 if let Some(suffix) = wildcard_suffix(host) {
-                    wildcard_any_port_suffixes.push(suffix.to_string());
+                    wildcard_any_port_suffixes.insert(suffix.to_string());
                 } else {
                     any_port_hosts.insert(host.to_string());
                 }
@@ -160,26 +174,17 @@ impl OutboundRegistry {
                     wildcard_port_suffixes
                         .entry(port)
                         .or_default()
-                        .push(suffix.to_string());
+                        .insert(suffix.to_string());
                 } else {
                     host_ports.insert(format!("{host}:{port}"));
                 }
             } else if let Some(suffix) = wildcard_suffix(&normalised) {
-                wildcard_suffixes.push(suffix.to_string());
+                wildcard_suffixes.insert(suffix.to_string());
             } else {
                 hosts.insert(normalised);
             }
         }
-        wildcard_suffixes.sort();
-        wildcard_suffixes.dedup();
-        wildcard_any_port_suffixes.sort();
-        wildcard_any_port_suffixes.dedup();
-        for suffixes in wildcard_port_suffixes.values_mut() {
-            suffixes.sort();
-            suffixes.dedup();
-        }
         let mut outbound_listen_ports = parsed.outbound_listen_ports;
-        outbound_listen_ports.retain(|port| *port != 0);
         outbound_listen_ports.sort_unstable();
         outbound_listen_ports.dedup();
         Ok(Self {
@@ -205,14 +210,16 @@ impl OutboundRegistry {
             + self
                 .wildcard_port_suffixes
                 .values()
-                .map(Vec::len)
+                .map(HashSet::len)
                 .sum::<usize>()
     }
 
     /// Per-request hot-path lookup. Uses a thread-local scratch `String` so
-    /// the steady-state cost is two `HashSet::contains` reads plus an
-    /// in-place lowercase copy (no heap allocation after the first call on
-    /// each worker thread).
+    /// the steady-state cost is hash-set probes plus an in-place lowercase
+    /// copy (no heap allocation after the first call on each worker thread).
+    /// Wildcard admission extracts the one-label candidate suffix and probes
+    /// the precomputed suffix set — cost is independent of unrelated
+    /// wildcard count.
     pub(crate) fn contains(&self, host: &str, port: Option<u16>) -> bool {
         HOST_NORMALISE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
@@ -224,17 +231,17 @@ impl OutboundRegistry {
             }
             let Some(port) = port else {
                 return self.hosts.contains(buf.as_str())
-                    || wildcard_suffix_matches_any(buf.as_str(), &self.wildcard_suffixes);
+                    || wildcard_suffix_set_matches(buf.as_str(), &self.wildcard_suffixes);
             };
             if self.any_port_hosts.contains(buf.as_str())
-                || wildcard_suffix_matches_any(buf.as_str(), &self.wildcard_any_port_suffixes)
+                || wildcard_suffix_set_matches(buf.as_str(), &self.wildcard_any_port_suffixes)
             {
                 return true;
             }
             if self
                 .wildcard_port_suffixes
                 .get(&port)
-                .is_some_and(|suffixes| wildcard_suffix_matches_any(buf.as_str(), suffixes))
+                .is_some_and(|suffixes| wildcard_suffix_set_matches(buf.as_str(), suffixes))
             {
                 return true;
             }
@@ -308,6 +315,9 @@ impl OutboundRegistry {
 /// Constant Prometheus `host` label value used for every deny decision; see
 /// [`OutboundRegistry::record_deny_decision`].
 pub(crate) const DENIED_HOST_BUCKET: &str = "<denied>";
+/// Constant Prometheus `host` label for admits matched by an exact registry
+/// entry (bare host, `host:port`, or `host:*`). Keeps admit cardinality
+/// bounded independently of registry size.
 pub(crate) const ADMITTED_WILDCARD_BUCKET: &str = "<admit_wildcard>";
 pub(crate) const EXPLICIT_HOST_BUCKET: &str = "<admit_explicit>";
 
@@ -371,22 +381,28 @@ fn wildcard_suffix(host: &str) -> Option<&str> {
     Some(suffix)
 }
 
-fn wildcard_suffix_matches_any(host: &str, suffixes: &[String]) -> bool {
-    suffixes
-        .iter()
-        .any(|suffix| single_label_wildcard_suffix_matches(host, suffix))
+/// One-label wildcard candidate: the portion of `host` after its first DNS
+/// label. Returns `None` when the host has fewer than two labels (so the base
+/// domain never matches `*.suffix`) or the first label is empty.
+#[inline]
+fn one_label_wildcard_candidate(host: &str) -> Option<&str> {
+    let (label, rest) = host.split_once('.')?;
+    if label.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some(rest)
 }
 
-fn single_label_wildcard_suffix_matches(host: &str, suffix: &str) -> bool {
-    if host == suffix {
-        return false;
-    }
-    let Some(prefix) = host.strip_suffix(suffix) else {
+#[inline]
+fn wildcard_suffix_set_matches(host: &str, suffixes: &HashSet<String>) -> bool {
+    let Some(candidate) = one_label_wildcard_candidate(host) else {
         return false;
     };
-    prefix.ends_with('.')
-        && !prefix[..prefix.len() - 1].is_empty()
-        && !prefix[..prefix.len() - 1].contains('.')
+    // Preserve exact one-label semantics: the candidate after the first label
+    // must equal a configured suffix. Multi-label hosts produce a deeper
+    // candidate (e.g. `a.b.example.com` → `b.example.com`) that misses
+    // `example.com` without scanning the set.
+    suffixes.contains(candidate)
 }
 
 fn split_registry_host_port(entry: &str) -> Option<(&str, u16)> {
@@ -541,6 +557,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_outbound_listen_port() {
+        let err = OutboundRegistry::new(&json!({
+            "registry": ["reviews.svc"],
+            "outbound_listen_ports": [0],
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("outbound_listen_ports") && err.contains("0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_zero_outbound_listen_ports() {
+        let err = OutboundRegistry::new(&json!({
+            "registry": ["reviews.svc"],
+            "outbound_listen_ports": [0, 15001],
+        }))
+        .unwrap_err();
+        assert!(err.contains("outbound_listen_ports"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_outbound_listen_ports_remain_global() {
+        let plugin = registry_plugin_with_ports(&["reviews.svc"], &[]);
+        assert!(plugin.outbound_listen_ports.is_empty());
+    }
+
+    #[test]
+    fn scoped_outbound_listen_ports_are_retained() {
+        let plugin = registry_plugin_with_ports(&["reviews.svc"], &[15001]);
+        assert_eq!(plugin.outbound_listen_ports, vec![15001]);
+    }
+
+    #[test]
     fn host_only_match() {
         let plugin = registry_plugin(&["reviews.default.svc.cluster.local"]);
         assert!(plugin.contains("reviews.default.svc.cluster.local", None));
@@ -614,6 +665,39 @@ mod tests {
         assert!(!plugin.contains("api.example.com", None));
         assert!(!plugin.contains("example.com", Some(443)));
         assert!(!plugin.contains("a.b.example.com", Some(443)));
+    }
+
+    #[test]
+    fn indexed_wildcard_lookup_independent_of_unrelated_suffix_count() {
+        // Large registry of unrelated tenant wildcards must not prevent an
+        // O(1)-style candidate-suffix hit for the matching entry, including
+        // port-specific and any-port buckets.
+        let mut entries: Vec<String> = (0..10_000)
+            .map(|i| format!("*.tenant{i:05}.example"))
+            .collect();
+        entries.push("*.match.example:443".to_string());
+        entries.push("*.anyport.example:*".to_string());
+        let plugin = OutboundRegistry::new(&json!({ "registry": entries })).expect("valid");
+        assert!(plugin.contains("x.tenant09999.example", None));
+        assert!(plugin.contains("api.match.example", Some(443)));
+        assert!(!plugin.contains("api.match.example", Some(80)));
+        assert!(plugin.contains("svc.anyport.example", Some(8443)));
+        assert!(!plugin.contains("a.b.tenant00000.example", None));
+        assert!(!plugin.contains("missing.example", None));
+    }
+
+    #[test]
+    fn one_label_wildcard_candidate_extracts_suffix_after_first_label() {
+        assert_eq!(
+            one_label_wildcard_candidate("api.example.com"),
+            Some("example.com")
+        );
+        assert_eq!(
+            one_label_wildcard_candidate("a.b.example.com"),
+            Some("b.example.com")
+        );
+        assert_eq!(one_label_wildcard_candidate("example.com"), Some("com"));
+        assert_eq!(one_label_wildcard_candidate("bare"), None);
     }
 
     #[test]
