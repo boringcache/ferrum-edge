@@ -759,9 +759,7 @@ fn test_requires_response_body_buffering() {
         "text/event-stream; charset=utf-8".to_string(),
     )]);
     assert!(plugin.may_release_response_body_under_retries(&sse_accept));
-    assert!(
-        plugin.should_release_response_body_under_retries(&sse_accept, 200, &sse_headers)
-    );
+    assert!(plugin.should_release_response_body_under_retries(&sse_accept, 200, &sse_headers));
     assert!(
         plugin.should_release_response_body_before_content_type_rewrite(
             &sse_accept,

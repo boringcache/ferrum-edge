@@ -369,17 +369,15 @@ async fn response_sse_intent_is_conservative_and_genuine_stream_fails_closed() {
     let mut response_headers = content_type_headers("text/event-stream");
     assert!(plugin.may_release_response_body_under_retries(&ctx));
     assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &response_headers));
-    assert!(plugin.should_release_response_body_before_content_type_rewrite(
-        &ctx,
-        200,
-        &response_headers,
-    ));
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(
+            &ctx,
+            200,
+            &response_headers,
+        )
+    );
     let json_profile_headers = content_type_headers("application/json; profile=event-stream");
-    assert!(!plugin.should_release_response_body_under_retries(
-        &ctx,
-        200,
-        &json_profile_headers,
-    ));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_profile_headers,));
     assert!(
         !plugin.should_release_response_body_before_content_type_rewrite(
             &ctx,

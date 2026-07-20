@@ -2373,20 +2373,18 @@ fn test_sse_request_intent_cannot_skip_response_validation_buffering() {
         HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     assert!(plugin.may_release_response_body_under_retries(&ctx));
     assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &response_headers));
-    assert!(plugin.should_release_response_body_before_content_type_rewrite(
-        &ctx,
-        200,
-        &response_headers,
-    ));
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(
+            &ctx,
+            200,
+            &response_headers,
+        )
+    );
     let json_profile_headers = HashMap::from([(
         "content-type".to_string(),
         "application/json; profile=event-stream".to_string(),
     )]);
-    assert!(!plugin.should_release_response_body_under_retries(
-        &ctx,
-        200,
-        &json_profile_headers,
-    ));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_profile_headers,));
     assert!(
         !plugin.should_release_response_body_before_content_type_rewrite(
             &ctx,
