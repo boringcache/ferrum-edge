@@ -906,6 +906,63 @@ fn test_file_config_rejects_unknown_proxy_alerts_keys() {
                 }]
             }),
         ),
+        (
+            "proxy-alerts-enabled-wrong-type",
+            serde_json::json!({
+                "enabled": "false",
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
+        (
+            "proxy-alerts-max-concurrent-zero",
+            serde_json::json!({
+                "max_concurrent_dispatches": 0,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
+        (
+            "proxy-alerts-quiet-hours-null",
+            serde_json::json!({
+                "quiet_hours_utc": null,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
     ] {
         let document = serde_json::json!({
             "version": "1",

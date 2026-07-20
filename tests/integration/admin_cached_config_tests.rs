@@ -2495,6 +2495,86 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
             }),
             "channels.ops.channel_overide",
         ),
+        (
+            "proxy-alerts-enabled-wrong-type",
+            json!({
+                "enabled": "false",
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "'enabled' must be a boolean",
+        ),
+        (
+            "proxy-alerts-max-concurrent-zero",
+            json!({
+                "max_concurrent_dispatches": 0,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "'max_concurrent_dispatches' must be >= 1",
+        ),
+        (
+            "proxy-alerts-min-request-count-wrong-type",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "min_request_count": "100",
+                    "channels": ["ops"]
+                }]
+            }),
+            "'min_request_count' must be an unsigned integer",
+        ),
+        (
+            "proxy-alerts-quiet-hours-null",
+            json!({
+                "quiet_hours_utc": null,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "'quiet_hours_utc' must be an array",
+        ),
     ] {
         let plugin = json!({
             "id": id,
@@ -2505,7 +2585,7 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
         });
         let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
 
-        assert_eq!(status, 400, "unknown proxy_alerts key was admitted: {body}");
+        assert_eq!(status, 400, "invalid proxy_alerts config was admitted: {body}");
         assert!(
             body.to_string().contains(needle),
             "unexpected admin validation response for {needle}: {body}"

@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use crate::notifications::{NotificationChannel, Severity, channels::parse_channels};
 use crate::plugins::DisconnectCause;
 use crate::retry::ErrorClass;
+use crate::util::unknown_keys::{near_miss_for_missing_key, reject_unknown_keys};
 
 use super::rules::{
     ErrorClassRule, ErrorRateRule, LatencyMetric, LatencyPercentileRule, RecoveryConfig, Rule,
@@ -44,16 +45,6 @@ const TOP_LEVEL_KEYS: &[&str] = &[
 
 const QUIET_HOUR_KEYS: &[&str] = &["from", "to", "weekdays"];
 const RECOVERY_KEYS: &[&str] = &["resolved_window_seconds"];
-const RULE_COMMON_KEYS: &[&str] = &[
-    "name",
-    "enabled",
-    "type",
-    "window_seconds",
-    "channels",
-    "cooldown_seconds",
-    "recovery",
-    "severity",
-];
 const ERROR_RATE_KEYS: &[&str] = &[
     "name",
     "enabled",
@@ -190,19 +181,21 @@ impl ProxyAlertsConfig {
         let obj = config
             .as_object()
             .ok_or_else(|| "proxy_alerts: config must be an object".to_string())?;
-        reject_unknown_keys(obj, "config", TOP_LEVEL_KEYS)?;
+        reject_unknown_keys(obj, "config", TOP_LEVEL_KEYS, "proxy_alerts: ")?;
 
-        let enabled = config
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let enabled = read_optional_bool(config, "enabled", "proxy_alerts")?.unwrap_or(true);
         let default_cooldown_seconds = read_u32_default(config, "default_cooldown_seconds", 300)?;
         let default_min_request_count = read_u64_default(config, "default_min_request_count", 50)?;
         let default_window_seconds = read_u32_default(config, "default_window_seconds", 60)?;
         let default_resolved_window_seconds =
             read_u32_default(config, "default_resolved_window_seconds", 300)?;
-        let max_concurrent_dispatches =
-            read_u32_default(config, "max_concurrent_dispatches", 8)?.max(1) as usize;
+        let max_concurrent_dispatches = {
+            let n = read_u32_default(config, "max_concurrent_dispatches", 8)?;
+            if n == 0 {
+                return Err("proxy_alerts: 'max_concurrent_dispatches' must be >= 1".to_string());
+            }
+            n as usize
+        };
 
         let quiet_hours = parse_quiet_hours(config.get("quiet_hours_utc"))?;
 
@@ -239,12 +232,15 @@ impl ProxyAlertsConfig {
         for (idx, raw_rule) in rules_array.iter().enumerate() {
             // Per-rule `enabled: false` skips the rule before validation so
             // operators can keep incomplete draft rules in config without
-            // breaking the active alert set.
-            if !raw_rule
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
-            {
+            // breaking the active alert set. Present non-boolean values fail
+            // closed rather than defaulting to active.
+            let rule_enabled = match raw_rule.get("enabled") {
+                None => true,
+                Some(v) => v.as_bool().ok_or_else(|| {
+                    format!("proxy_alerts: rules[{idx}].enabled must be a boolean")
+                })?,
+            };
+            if !rule_enabled {
                 continue;
             }
             let rule_id = idx as u32;
@@ -305,69 +301,147 @@ fn parse_rule(
     let obj = raw
         .as_object()
         .ok_or_else(|| format!("proxy_alerts: rule[{id}] must be an object"))?;
-    let name = obj
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("proxy_alerts: rule[{id}]: 'name' is required"))?
-        .to_string();
-    if name.is_empty() {
-        return Err(format!(
-            "proxy_alerts: rule[{id}]: 'name' must not be empty"
-        ));
-    }
-    let kind = obj
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("proxy_alerts: rule '{name}': 'type' is required"))?;
-    let rule_path = format!("rules[{id}]");
-    let allowed_keys = match kind {
-        "error_rate" => ERROR_RATE_KEYS,
-        "status_code_count" => STATUS_CODE_COUNT_KEYS,
-        "latency_percentile" => LATENCY_PERCENTILE_KEYS,
-        "error_class" => ERROR_CLASS_KEYS,
-        "stream_disconnect_cause" => STREAM_DISCONNECT_CAUSE_KEYS,
-        other => {
-            // Reject keys outside the common rule shape first so typos next to
-            // an unknown type still get a path-qualified admission error.
-            reject_unknown_keys(obj, &rule_path, RULE_COMMON_KEYS)?;
-            return Err(format!(
-                "proxy_alerts: rule '{name}': unknown type '{other}' (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause)"
+    let name = match obj.get("name") {
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                format!("proxy_alerts: rule[{id}]: 'name' must be a string")
+            })?;
+            if s.is_empty() {
+                return Err(format!(
+                    "proxy_alerts: rule[{id}]: 'name' must not be empty"
+                ));
+            }
+            s.to_string()
+        }
+        None => {
+            return Err(missing_required_key_error(
+                obj,
+                &format!("proxy_alerts: rule[{id}]"),
+                "name",
             ));
         }
     };
-    reject_unknown_keys(obj, &rule_path, allowed_keys)?;
+    let kind = match obj.get("type") {
+        Some(v) => v.as_str().ok_or_else(|| {
+            format!("proxy_alerts: rule '{name}': 'type' must be a string")
+        })?,
+        None => {
+            return Err(missing_required_key_error(
+                obj,
+                &format!("proxy_alerts: rule '{name}'"),
+                "type",
+            ));
+        }
+    };
+    let rule_path = format!("rules[{id}]");
 
-    let window_seconds = read_window_seconds(raw, &name, defaults.window_seconds)?;
-    let cooldown_ms = read_cooldown_ms(raw, &name, defaults.cooldown_seconds)?;
-    let recovery = read_recovery(raw, &name, id, defaults.resolved_window_seconds)?;
-    let severity = read_severity(raw, &name)?;
-    let (channel_ids, channel_names) = read_channels(raw, &name, channel_id_by_name, channels)?;
+    match kind {
+        "error_rate" => {
+            reject_unknown_keys(obj, &rule_path, ERROR_RATE_KEYS, "proxy_alerts: ")?;
+            let common = build_rule_common(
+                id,
+                &name,
+                raw,
+                channel_id_by_name,
+                channels,
+                defaults,
+            )?;
+            parse_error_rate(common, raw, defaults).map(Rule::ErrorRate)
+        }
+        "status_code_count" => {
+            reject_unknown_keys(obj, &rule_path, STATUS_CODE_COUNT_KEYS, "proxy_alerts: ")?;
+            let common = build_rule_common(
+                id,
+                &name,
+                raw,
+                channel_id_by_name,
+                channels,
+                defaults,
+            )?;
+            parse_status_code_count(common, raw).map(Rule::StatusCodeCount)
+        }
+        "latency_percentile" => {
+            reject_unknown_keys(obj, &rule_path, LATENCY_PERCENTILE_KEYS, "proxy_alerts: ")?;
+            let common = build_rule_common(
+                id,
+                &name,
+                raw,
+                channel_id_by_name,
+                channels,
+                defaults,
+            )?;
+            parse_latency_percentile(common, raw, defaults).map(Rule::LatencyPercentile)
+        }
+        "error_class" => {
+            reject_unknown_keys(obj, &rule_path, ERROR_CLASS_KEYS, "proxy_alerts: ")?;
+            let common = build_rule_common(
+                id,
+                &name,
+                raw,
+                channel_id_by_name,
+                channels,
+                defaults,
+            )?;
+            parse_error_class(common, raw).map(Rule::ErrorClass)
+        }
+        "stream_disconnect_cause" => {
+            reject_unknown_keys(
+                obj,
+                &rule_path,
+                STREAM_DISCONNECT_CAUSE_KEYS,
+                "proxy_alerts: ",
+            )?;
+            let common = build_rule_common(
+                id,
+                &name,
+                raw,
+                channel_id_by_name,
+                channels,
+                defaults,
+            )?;
+            parse_stream_disconnect_cause(common, raw).map(Rule::StreamDisconnectCause)
+        }
+        other => Err(format!(
+            "proxy_alerts: rule '{name}': unknown type '{other}' (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause)"
+        )),
+    }
+}
 
-    let common = RuleCommon {
+fn build_rule_common(
+    id: u32,
+    name: &str,
+    raw: &Value,
+    channel_id_by_name: &HashMap<String, u32>,
+    channels: &HashMap<String, Arc<NotificationChannel>>,
+    defaults: RuleDefaults,
+) -> Result<RuleCommon, String> {
+    let window_seconds = read_window_seconds(raw, name, defaults.window_seconds)?;
+    let cooldown_ms = read_cooldown_ms(raw, name, defaults.cooldown_seconds)?;
+    let recovery = read_recovery(raw, name, id, defaults.resolved_window_seconds)?;
+    let severity = read_severity(raw, name)?;
+    let (channel_ids, channel_names) = read_channels(raw, name, channel_id_by_name, channels)?;
+    Ok(RuleCommon {
         id,
-        name: Arc::from(name.as_str()),
+        name: Arc::from(name),
         window_seconds,
         cooldown_ms,
         recovery,
         severity,
         channel_ids,
         channel_names,
-    };
+    })
+}
 
-    match kind {
-        "error_rate" => parse_error_rate(common, raw, defaults).map(Rule::ErrorRate),
-        "status_code_count" => parse_status_code_count(common, raw).map(Rule::StatusCodeCount),
-        "latency_percentile" => {
-            parse_latency_percentile(common, raw, defaults).map(Rule::LatencyPercentile)
-        }
-        "error_class" => parse_error_class(common, raw).map(Rule::ErrorClass),
-        "stream_disconnect_cause" => {
-            parse_stream_disconnect_cause(common, raw).map(Rule::StreamDisconnectCause)
-        }
-        other => Err(format!(
-            "proxy_alerts: rule '{}': unknown type '{other}' (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause)",
-            common.name
-        )),
+fn missing_required_key_error(
+    object: &Map<String, Value>,
+    context: &str,
+    required: &str,
+) -> String {
+    match near_miss_for_missing_key(object, required) {
+        Some(typo) => format!(
+            "{context}: '{required}' is required (did you mean '{required}' instead of '{typo}'?)"
+        ),
+        None => format!("{context}: '{required}' is required"),
     }
 }
 
@@ -392,16 +466,8 @@ fn parse_error_rate(
             common.name
         ));
     }
-    let min_request_count = raw
-        .get("min_request_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(defaults.min_request_count);
-    if min_request_count == 0 {
-        return Err(format!(
-            "proxy_alerts: rule '{}': 'min_request_count' must be > 0",
-            common.name
-        ));
-    }
+    let min_request_count =
+        read_min_request_count(raw, &common.name, defaults.min_request_count)?;
     Ok(ErrorRateRule {
         common,
         status_codes,
@@ -482,16 +548,8 @@ fn parse_latency_percentile(
             common.name, MAX_FINITE_LATENCY_BOUND_MS
         ));
     }
-    let min_request_count = raw
-        .get("min_request_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(defaults.min_request_count);
-    if min_request_count == 0 {
-        return Err(format!(
-            "proxy_alerts: rule '{}': 'min_request_count' must be > 0",
-            common.name
-        ));
-    }
+    let min_request_count =
+        read_min_request_count(raw, &common.name, defaults.min_request_count)?;
     Ok(LatencyPercentileRule {
         common,
         metric,
@@ -499,6 +557,23 @@ fn parse_latency_percentile(
         threshold_ms,
         min_request_count,
     })
+}
+
+fn read_min_request_count(raw: &Value, rule_name: &str, default: u64) -> Result<u64, String> {
+    let min_request_count = match raw.get("min_request_count") {
+        None => default,
+        Some(v) => v.as_u64().ok_or_else(|| {
+            format!(
+                "proxy_alerts: rule '{rule_name}': 'min_request_count' must be an unsigned integer"
+            )
+        })?,
+    };
+    if min_request_count == 0 {
+        return Err(format!(
+            "proxy_alerts: rule '{rule_name}': 'min_request_count' must be > 0"
+        ));
+    }
+    Ok(min_request_count)
 }
 
 fn parse_error_class(common: RuleCommon, raw: &Value) -> Result<ErrorClassRule, String> {
@@ -669,6 +744,7 @@ fn read_recovery(
         rec_obj,
         &format!("rules[{rule_id}].recovery"),
         RECOVERY_KEYS,
+        "proxy_alerts: ",
     )?;
     let resolved_window_seconds =
         read_object_u32(rec, "resolved_window_seconds", rule_name, "recovery")?
@@ -778,9 +854,7 @@ fn parse_quiet_hours(value: Option<&Value>) -> Result<Vec<QuietHourWindow>, Stri
     let Some(v) = value else {
         return Ok(Vec::new());
     };
-    if v.is_null() {
-        return Ok(Vec::new());
-    }
+    // OpenAPI declares an array; present null is not the empty default.
     let arr = v
         .as_array()
         .ok_or_else(|| "proxy_alerts: 'quiet_hours_utc' must be an array".to_string())?;
@@ -789,7 +863,12 @@ fn parse_quiet_hours(value: Option<&Value>) -> Result<Vec<QuietHourWindow>, Stri
         let obj = item
             .as_object()
             .ok_or_else(|| format!("proxy_alerts: 'quiet_hours_utc'[{idx}] must be an object"))?;
-        reject_unknown_keys(obj, &format!("quiet_hours_utc[{idx}]"), QUIET_HOUR_KEYS)?;
+        reject_unknown_keys(
+            obj,
+            &format!("quiet_hours_utc[{idx}]"),
+            QUIET_HOUR_KEYS,
+            "proxy_alerts: ",
+        )?;
         let from_str = obj.get("from").and_then(Value::as_str).ok_or_else(|| {
             format!("proxy_alerts: 'quiet_hours_utc'[{idx}]: 'from' is required (HH:MM)")
         })?;
@@ -874,6 +953,16 @@ fn read_u64_default(config: &Value, key: &str, default: u64) -> Result<u64, Stri
     }
 }
 
+fn read_optional_bool(config: &Value, key: &str, context: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("{context}: '{key}' must be a boolean")),
+    }
+}
+
 fn error_class_from_str(s: &str) -> Option<ErrorClass> {
     match s {
         "connection_timeout" => Some(ErrorClass::ConnectionTimeout),
@@ -903,74 +992,4 @@ fn disconnect_cause_from_str(s: &str) -> Option<DisconnectCause> {
         "graceful_shutdown" => Some(DisconnectCause::GracefulShutdown),
         _ => None,
     }
-}
-
-/// Reject keys that are not in `allowed`, with a path-qualified error and a
-/// spelling suggestion when the typo is close enough to be useful.
-fn reject_unknown_keys(
-    object: &Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !allowed.contains(key))
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    let details: Vec<String> = unknown
-        .into_iter()
-        .map(|key| match suggest_key(key, allowed) {
-            Some(suggestion) => {
-                format!("'{path}.{key}' (did you mean '{suggestion}'?)")
-            }
-            None => format!("'{path}.{key}'"),
-        })
-        .collect();
-    Err(format!(
-        "proxy_alerts: unknown configuration key(s): {}",
-        details.join(", ")
-    ))
-}
-
-fn suggest_key<'a>(unknown: &str, allowed: &[&'a str]) -> Option<&'a str> {
-    let mut best: Option<(usize, &'a str)> = None;
-    for candidate in allowed {
-        let distance = levenshtein(unknown, candidate);
-        let is_better = best
-            .map(|(best_distance, _)| distance < best_distance)
-            .unwrap_or(true);
-        if is_better {
-            best = Some((distance, *candidate));
-        }
-    }
-    let threshold = if unknown.len() > 8 { 3 } else { 2 };
-    best.filter(|(distance, _)| *distance <= threshold)
-        .map(|(_, name)| name)
-}
-
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let (m, n) = (a.len(), b.len());
-    if m == 0 {
-        return n;
-    }
-    if n == 0 {
-        return m;
-    }
-    let mut prev: Vec<usize> = (0..=n).collect();
-    let mut curr = vec![0usize; n + 1];
-    for i in 1..=m {
-        curr[0] = i;
-        for j in 1..=n {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[n]
 }

@@ -196,7 +196,7 @@ fn parse_channels_accepts_all_four_kinds() {
 
 #[test]
 fn parse_channels_rejects_unknown_and_cross_variant_keys() {
-    for (def, needle) in [
+    for (def, needle, expect_suggestion) in [
         (
             json!({
                 "type": "slack",
@@ -204,6 +204,7 @@ fn parse_channels_rejects_unknown_and_cross_variant_keys() {
                 "channel_overide": "#alerts"
             }),
             "channels.ops.channel_overide",
+            true,
         ),
         (
             json!({
@@ -212,6 +213,7 @@ fn parse_channels_rejects_unknown_and_cross_variant_keys() {
                 "username": "ferrum"
             }),
             "channels.ops.username",
+            false,
         ),
         (
             json!({
@@ -220,6 +222,7 @@ fn parse_channels_rejects_unknown_and_cross_variant_keys() {
                 "icon_emoji": ":bell:"
             }),
             "channels.ops.icon_emoji",
+            false,
         ),
         (
             json!({
@@ -229,6 +232,7 @@ fn parse_channels_rejects_unknown_and_cross_variant_keys() {
                 "webhook_url": "https://hooks.slack.com/x"
             }),
             "channels.ops.webhook_url",
+            false,
         ),
     ] {
         let err = parse_channels(&json!({ "ops": def }))
@@ -241,7 +245,28 @@ fn parse_channels_rejects_unknown_and_cross_variant_keys() {
             err.contains(needle),
             "error did not identify {needle}: {err}"
         );
+        if expect_suggestion {
+            assert!(
+                err.contains("did you mean"),
+                "channel typo diagnostics should include a suggestion: {err}"
+            );
+        }
     }
+}
+
+#[test]
+fn parse_channels_rejects_type_key_typo_with_suggestion() {
+    let err = parse_channels(&json!({
+        "ops": {
+            "typee": "slack",
+            "webhook_url": "https://hooks.slack.com/x"
+        }
+    }))
+    .expect_err("type key typo must fail closed");
+    assert!(
+        err.contains("did you mean 'type' instead of 'typee'"),
+        "missing type-key suggestion: {err}"
+    );
 }
 
 #[test]

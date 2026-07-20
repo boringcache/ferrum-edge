@@ -3893,6 +3893,137 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
     ] {
         assert_component_validity(&spec, "ProxyAlertsConfig", &invalid, false);
     }
+
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsRule"]["oneOf"][0]["$ref"],
+        json!("#/components/schemas/ProxyAlertsDisabledDraftRule")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsDisabledDraftRule"]["properties"]["enabled"]
+            ["const"],
+        json!(false)
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsRuleCommon"]["properties"]["enabled"]["enum"],
+        json!([true])
+    );
+
+    // Disabled drafts may carry incomplete/unknown fields.
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "enabled": false,
+            "type": "error_rate",
+            "unknown_draft_field": 1,
+            "status_codes": "not-an-array"
+        }),
+        true,
+    );
+    // Active rules remain closed and require the selected variant shape.
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "name": "errors",
+            "type": "error_rate",
+            "status_codes": [500],
+            "threshold_percent": 5.0,
+            "channels": ["ops"],
+            "extra": true
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "enabled": true,
+            "name": "errors",
+            "type": "error_rate",
+            "status_codes": [500],
+            "threshold_percent": 5.0,
+            "channels": ["ops"]
+        }),
+        true,
+    );
+    // A complete active-shaped object with enabled:false must not be ambiguous.
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "enabled": false,
+            "name": "errors",
+            "type": "error_rate",
+            "status_codes": [500],
+            "threshold_percent": 5.0,
+            "channels": ["ops"]
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsConfig",
+        &json!({
+            "enabled": "false",
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsConfig",
+        &json!({
+            "quiet_hours_utc": null,
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsConfig",
+        &json!({
+            "max_concurrent_dispatches": 0,
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
+        false,
+    );
 }
 
 #[test]

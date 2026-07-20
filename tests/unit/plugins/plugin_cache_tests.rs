@@ -1518,6 +1518,85 @@ fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance
 }
 
 #[test]
+fn test_proxy_alerts_rebuild_rejects_malformed_optional_values_and_keeps_prior_cache() {
+    let valid_cfg = json!({
+        "channels": {
+            "ops": {
+                "type": "slack",
+                "webhook_url": "https://hooks.slack.com/x"
+            }
+        },
+        "rules": [{
+            "name": "errors",
+            "type": "error_rate",
+            "status_codes": [500],
+            "threshold_percent": 5.0,
+            "channels": ["ops"]
+        }]
+    });
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "pa-1",
+            "proxy_alerts",
+            valid_cfg,
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid proxy_alerts cache");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "proxy_alerts");
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "pa-1",
+            "proxy_alerts",
+            json!({
+                "enabled": "false",
+                "max_concurrent_dispatches": 0,
+                "quiet_hours_utc": null,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "min_request_count": "100",
+                    "channels": ["ops"]
+                }]
+            }),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("malformed proxy_alerts optional values must reject cache publication");
+    assert!(
+        error.contains("'enabled' must be a boolean")
+            || error.contains("'max_concurrent_dispatches'")
+            || error.contains("'quiet_hours_utc'")
+            || error.contains("'min_request_count'"),
+        "got: {error}"
+    );
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted proxy_alerts instance"
+    );
+}
+
+#[test]
 fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
     let config1 = make_config(
         vec![make_proxy("p1", "/api", vec!["pc1"])],
