@@ -328,9 +328,7 @@ pub fn bounded_method_tag(method: &str) -> &'static str {
         .unwrap_or(OTHER_METHOD)
 }
 
-fn validate_statsd_schema_keys(
-    schema: Option<&SummarySchema>,
-) -> Result<HashSet<String>, String> {
+fn validate_statsd_schema_keys(schema: Option<&SummarySchema>) -> Result<HashSet<String>, String> {
     let mut seen = HashSet::new();
     let mut runtime_keys: HashSet<String> = RESERVED_TAG_KEYS
         .iter()
