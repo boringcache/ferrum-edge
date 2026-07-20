@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use ring::rand::SecureRandom;
 use serde_json::{Map, Value};
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing::callsite::{Callsite, DefaultCallsite, Identifier};
+use tracing::callsite::{DefaultCallsite, Identifier};
 use tracing::field::FieldSet;
 use tracing::metadata::Kind;
 use tracing::{Level, Metadata, warn};
