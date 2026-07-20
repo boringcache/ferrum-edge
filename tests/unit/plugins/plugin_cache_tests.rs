@@ -1597,6 +1597,49 @@ fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance
 }
 
 #[test]
+fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "compression-1",
+            "compression",
+            json!({"min_content_length": 512, "gzip_level": 4}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid compression cache");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "compression");
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "compression-1",
+            "compression",
+            json!({"min_content_lenght": 4096}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("unknown compression key must reject cache publication");
+    assert!(
+        error.contains("config.min_content_lenght"),
+        "got: {error}"
+    );
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted compression instance"
+    );
+}
+
+#[test]
 fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
     let valid_cfg = json!({
         "channels": {

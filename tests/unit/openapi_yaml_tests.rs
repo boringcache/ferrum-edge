@@ -3124,6 +3124,75 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     }
 }
 
+#[tokio::test]
+async fn compression_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/CompressionConfig")
+        .expect("CompressionConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("Compression properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = COMPRESSION_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "compression runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let compression_docs = plugin_docs
+        .split("### `compression`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("compression docs section");
+    for key in COMPRESSION_CONFIG_KEYS {
+        assert!(
+            compression_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md compression section missing `{key}`"
+        );
+    }
+    assert!(compression_docs.contains("Strict config validation"));
+    assert!(compression_docs.contains("KeepLastKnownGood"));
+    assert!(compression_docs.contains("disable_on_etag"));
+
+    let valid = json!({
+        "algorithms": ["gzip", "br"],
+        "brotli_quality": 4,
+        "content_types": ["application/json"],
+        "decompress_request": false,
+        "gzip_level": 6,
+        "max_decompressed_request_size": 10_485_760,
+        "min_content_length": 256,
+        "remove_accept_encoding": true
+    });
+    assert_component_validity(&spec, "CompressionConfig", &valid, true);
+    assert!(CompressionPlugin::new(&valid).is_ok());
+    assert!(CompressionPlugin::new(&json!({})).is_ok());
+    assert_component_validity(&spec, "CompressionConfig", &json!({}), true);
+
+    for config in [
+        json!({"min_content_lenght": 4096}),
+        json!({"gzip_leveel": 1}),
+        json!({"remove_accept_encodng": false}),
+        json!({"aaa_extra": 1, "zzz_extra": 2}),
+        json!({"disable_on_etag": false}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, false);
+        assert!(
+            CompressionPlugin::new(&config).is_err(),
+            "runtime accepted OpenAPI-invalid compression config: {config}"
+        );
+    }
+}
+
 #[test]
 fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     use ferrum_edge::plugins::ip_restriction::IpRestriction;
