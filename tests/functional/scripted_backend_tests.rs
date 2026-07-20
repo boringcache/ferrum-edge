@@ -650,10 +650,7 @@ async fn wait_for_h2_downgraded_entry(
 // response_transformer — client SSE intent cannot bypass JSON body policy.
 // ────────────────────────────────────────────────────────────────────────────
 
-fn response_transformer_sse_policy_file_config(
-    backend_port: u16,
-    retries_enabled: bool,
-) -> String {
+fn response_transformer_sse_policy_file_config(backend_port: u16, retries_enabled: bool) -> String {
     let mut proxy = json!({
         "id": "response-transformer-sse-policy",
         "listen_path": "/api",
@@ -793,9 +790,7 @@ async fn response_transformer_buffers_json_when_client_accepts_sse() {
     backend.assert_no_step_errors().await;
 }
 
-async fn assert_response_transformer_releases_backend_sse_incrementally(
-    retries_enabled: bool,
-) {
+async fn assert_response_transformer_releases_backend_sse_incrementally(retries_enabled: bool) {
     const EVENT_ONE: &str = "data: {\"part\":1}\n\n";
     const EVENT_TWO: &str = "data: {\"part\":2}\n\n";
     const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
