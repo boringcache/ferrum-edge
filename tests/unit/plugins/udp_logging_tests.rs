@@ -30,7 +30,7 @@ fn ensure_crypto_provider() {
 }
 
 fn mint_cert_key_pair(
-    alg: &rcgen::SignatureAlgorithm,
+    alg: &'static rcgen::SignatureAlgorithm,
 ) -> (tempfile::NamedTempFile, tempfile::NamedTempFile) {
     let key_pair = KeyPair::generate_for(alg).expect("key");
     let mut params = CertificateParams::new(vec!["udp-logging-test".to_string()]).expect("params");

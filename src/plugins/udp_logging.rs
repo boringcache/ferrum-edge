@@ -96,7 +96,13 @@ struct UdpFlushState {
 pub struct UdpLogging {
     logger: BatchingLogger<SummaryLogEntry>,
     endpoint_hostname: Option<String>,
+    /// Shared with the flush worker; retained here so external unit tests can
+    /// inspect/age DNS state. Binary target sees no readers.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     flush_state: Arc<Mutex<UdpFlushState>>,
+    /// One-shot resolve override shared with the flush worker; written by
+    /// external unit tests. Binary target sees no readers on this field.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     next_resolve_addr: Arc<Mutex<Option<SocketAddr>>>,
 }
 
@@ -718,6 +724,7 @@ async fn deliver_one_entry(
 impl UdpLogging {
     /// Age the flush worker's last DNS resolve so the next batch exercises the
     /// periodic re-resolve path. Production code never calls this.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn age_last_resolve_for_test(&self, elapsed: Duration) {
         if let Ok(mut state) = self.flush_state.lock() {
             state.last_resolve = Instant::now()
@@ -728,6 +735,7 @@ impl UdpLogging {
 
     /// Publish a one-shot resolve override consumed by the next DNS lookup in
     /// the flush worker. Production code never calls this.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn set_next_resolve_addr_for_test(&self, addr: SocketAddr) {
         if let Ok(mut slot) = self.next_resolve_addr.lock() {
             *slot = Some(addr);
@@ -735,6 +743,7 @@ impl UdpLogging {
     }
 
     /// Snapshot of the flush worker's currently pinned destination, if any.
+    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn current_addr_for_test(&self) -> Option<SocketAddr> {
         self.flush_state
             .lock()
