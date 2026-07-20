@@ -1518,7 +1518,7 @@ fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance
 }
 
 #[test]
-fn test_proxy_alerts_rebuild_rejects_malformed_optional_values_and_keeps_prior_cache() {
+fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
     let valid_cfg = json!({
         "channels": {
             "ops": {
@@ -1577,22 +1577,14 @@ fn test_proxy_alerts_rebuild_rejects_malformed_optional_values_and_keeps_prior_c
             None,
         )],
     );
-    let error = cache
+    cache
         .rebuild(&malformed)
-        .expect_err("malformed proxy_alerts optional values must reject cache publication");
-    assert!(
-        error.contains("'enabled' must be a boolean")
-            || error.contains("'max_concurrent_dispatches'")
-            || error.contains("'quiet_hours_utc'")
-            || error.contains("'min_request_count'"),
-        "got: {error}"
-    );
+        .expect("malformed optional proxy_alerts config must not abort cache publication");
 
     let after = cache.get_plugins("p1");
-    assert_eq!(after.len(), 1);
     assert!(
-        Arc::ptr_eq(&before[0], &after[0]),
-        "KeepLastKnownGood must retain the accepted proxy_alerts instance"
+        after.is_empty(),
+        "OptionalFailOpen must omit malformed proxy_alerts instead of retaining it"
     );
 }
 

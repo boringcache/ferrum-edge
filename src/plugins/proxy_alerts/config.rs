@@ -189,6 +189,27 @@ impl ProxyAlertsConfig {
         let default_window_seconds = read_u32_default(config, "default_window_seconds", 60)?;
         let default_resolved_window_seconds =
             read_u32_default(config, "default_resolved_window_seconds", 300)?;
+        validate_top_level_u32_range(
+            "default_cooldown_seconds",
+            default_cooldown_seconds,
+            MIN_COOLDOWN_SECONDS,
+            MAX_COOLDOWN_SECONDS,
+        )?;
+        if default_min_request_count == 0 {
+            return Err("proxy_alerts: 'default_min_request_count' must be >= 1".to_string());
+        }
+        validate_top_level_u32_range(
+            "default_window_seconds",
+            default_window_seconds,
+            MIN_WINDOW_SECONDS,
+            MAX_WINDOW_SECONDS,
+        )?;
+        validate_top_level_u32_range(
+            "default_resolved_window_seconds",
+            default_resolved_window_seconds,
+            MIN_RESOLVED_WINDOW_SECONDS,
+            MAX_RESOLVED_WINDOW_SECONDS,
+        )?;
         let max_concurrent_dispatches = {
             let n = read_u32_default(config, "max_concurrent_dispatches", 8)?;
             if n == 0 {
@@ -905,6 +926,20 @@ fn read_u32_default(config: &Value, key: &str, default: u32) -> Result<u32, Stri
         }
         None => Ok(default),
     }
+}
+
+fn validate_top_level_u32_range(
+    key: &str,
+    value: u32,
+    minimum: u32,
+    maximum: u32,
+) -> Result<(), String> {
+    if !(minimum..=maximum).contains(&value) {
+        return Err(format!(
+            "proxy_alerts: '{key}' must be in [{minimum}, {maximum}] (got {value})"
+        ));
+    }
+    Ok(())
 }
 
 fn read_u64_default(config: &Value, key: &str, default: u64) -> Result<u64, String> {

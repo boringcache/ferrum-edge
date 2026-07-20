@@ -56,10 +56,10 @@ fn minimal_config() -> serde_json::Value {
 }
 
 #[test]
-fn configured_proxy_alerts_is_load_bearing() {
+fn configured_proxy_alerts_remains_optional_fail_open() {
     assert_eq!(
         plugin_failure_policy("proxy_alerts"),
-        Some(PluginFailurePolicy::KeepLastKnownGood)
+        Some(PluginFailurePolicy::OptionalFailOpen)
     );
 }
 
@@ -123,6 +123,27 @@ fn rejects_empty_rules_array() {
     )
     .unwrap_err();
     assert!(err.contains("at least one rule"), "got: {err}");
+}
+
+#[test]
+fn rejects_config_with_only_disabled_draft_rules() {
+    let err = ProxyAlerts::new(
+        &json!({
+            "channels": {
+                "ops_slack": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "enabled": false,
+                "unknown_draft_field": true
+            }]
+        }),
+        http_client(),
+    )
+    .unwrap_err();
+    assert!(err.contains("no rules left to evaluate"), "got: {err}");
 }
 
 #[test]
@@ -806,6 +827,56 @@ fn rejects_malformed_optional_proxy_alerts_scalars() {
     ] {
         let err = ProxyAlerts::new(&config, http_client())
             .expect_err("malformed optional values must fail closed");
+        assert!(err.contains(needle), "expected `{needle}` in error: {err}");
+    }
+}
+
+#[test]
+fn rejects_invalid_top_level_defaults_even_when_rules_override_them() {
+    for (key, value, needle) in [
+        (
+            "default_cooldown_seconds",
+            json!(0),
+            "'default_cooldown_seconds' must be in [1, 86400]",
+        ),
+        (
+            "default_cooldown_seconds",
+            json!(86_401),
+            "'default_cooldown_seconds' must be in [1, 86400]",
+        ),
+        (
+            "default_min_request_count",
+            json!(0),
+            "'default_min_request_count' must be >= 1",
+        ),
+        (
+            "default_window_seconds",
+            json!(4),
+            "'default_window_seconds' must be in [5, 3600]",
+        ),
+        (
+            "default_window_seconds",
+            json!(3_601),
+            "'default_window_seconds' must be in [5, 3600]",
+        ),
+        (
+            "default_resolved_window_seconds",
+            json!(4),
+            "'default_resolved_window_seconds' must be in [5, 86400]",
+        ),
+        (
+            "default_resolved_window_seconds",
+            json!(86_401),
+            "'default_resolved_window_seconds' must be in [5, 86400]",
+        ),
+    ] {
+        let mut config = minimal_config();
+        config[key] = value;
+        config["rules"][0]["cooldown_seconds"] = json!(300);
+        config["rules"][0]["recovery"] = json!({"resolved_window_seconds": 300});
+
+        let err = ProxyAlerts::new(&config, http_client())
+            .expect_err("invalid unused defaults must fail admission eagerly");
         assert!(err.contains(needle), "expected `{needle}` in error: {err}");
     }
 }

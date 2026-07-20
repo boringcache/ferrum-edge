@@ -865,7 +865,7 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
-fn test_file_config_rejects_unknown_proxy_alerts_keys() {
+fn test_file_config_rejects_invalid_proxy_alerts_configs() {
     for (id, config) in [
         (
             "proxy-alerts-enabled-typo",
@@ -963,6 +963,26 @@ fn test_file_config_rejects_unknown_proxy_alerts_keys() {
                 }]
             }),
         ),
+        (
+            "proxy-alerts-unused-default-window-out-of-range",
+            serde_json::json!({
+                "default_window_seconds": 4,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "window_seconds": 60,
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+        ),
     ] {
         let document = serde_json::json!({
             "version": "1",
@@ -985,7 +1005,7 @@ fn test_file_config_rejects_unknown_proxy_alerts_keys() {
             &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
             "ferrum",
         )
-        .expect_err("file-mode load must reject unknown proxy_alerts keys");
+        .expect_err("file-mode load must reject invalid proxy_alerts config");
         let message = format!("{err:#}");
         assert!(
             message.contains("1 plugin config error(s)"),

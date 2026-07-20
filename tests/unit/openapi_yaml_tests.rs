@@ -3809,6 +3809,20 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
     });
     assert_component_validity(&spec, "ProxyAlertsConfig", &valid, true);
 
+    for (field, value) in [
+        ("default_cooldown_seconds", json!(0)),
+        ("default_cooldown_seconds", json!(86_401)),
+        ("default_min_request_count", json!(0)),
+        ("default_window_seconds", json!(4)),
+        ("default_window_seconds", json!(3_601)),
+        ("default_resolved_window_seconds", json!(4)),
+        ("default_resolved_window_seconds", json!(86_401)),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = value;
+        assert_component_validity(&spec, "ProxyAlertsConfig", &invalid, false);
+    }
+
     for invalid in [
         json!({
             "enabledd": false,
@@ -3917,6 +3931,40 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
             "unknown_draft_field": 1,
             "status_codes": "not-an-array"
         }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsConfig",
+        &json!({
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "enabled": false,
+                "unknown_draft_field": true
+            }]
+        }),
+        false,
+    );
+    let mut valid_with_disabled_draft = valid.clone();
+    valid_with_disabled_draft["rules"]
+        .as_array_mut()
+        .expect("rules fixture is an array")
+        .insert(
+            0,
+            json!({
+                "enabled": false,
+                "unknown_draft_field": true
+            }),
+        );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsConfig",
+        &valid_with_disabled_draft,
         true,
     );
     // Active rules remain closed and require the selected variant shape.

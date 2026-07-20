@@ -2575,6 +2575,27 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
             }),
             "'quiet_hours_utc' must be an array",
         ),
+        (
+            "proxy-alerts-unused-default-resolved-window-out-of-range",
+            json!({
+                "default_resolved_window_seconds": 4,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"],
+                    "recovery": {"resolved_window_seconds": 300}
+                }]
+            }),
+            "'default_resolved_window_seconds' must be in [5, 86400]",
+        ),
     ] {
         let plugin = json!({
             "id": id,

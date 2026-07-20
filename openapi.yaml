@@ -11791,9 +11791,16 @@ components:
         rules:
           type: array
           minItems: 1
-          description: Alert rules evaluated per matched proxy.
+          description: Alert rules evaluated per matched proxy. At least one rule must be active.
           items:
             $ref: "#/components/schemas/ProxyAlertsRule"
+          contains:
+            oneOf:
+              - $ref: "#/components/schemas/ProxyAlertsErrorRateRule"
+              - $ref: "#/components/schemas/ProxyAlertsStatusCodeCountRule"
+              - $ref: "#/components/schemas/ProxyAlertsLatencyPercentileRule"
+              - $ref: "#/components/schemas/ProxyAlertsErrorClassRule"
+              - $ref: "#/components/schemas/ProxyAlertsStreamDisconnectCauseRule"
       example:
         enabled: true
         default_cooldown_seconds: 300

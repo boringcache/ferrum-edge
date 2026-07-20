@@ -69,10 +69,10 @@ Unknown properties are rejected at the top level and within quiet-hours, recover
 | Field | Default | Notes |
 |-------|---------|-------|
 | `enabled` | `true` | Master runtime switch. Must be a boolean when present; strings/null are rejected. |
-| `default_cooldown_seconds` | `300` | Per-rule fallback if `cooldown_seconds` is omitted. Applied per `(rule, proxy, channel)` so one proxy's incident does not suppress another proxy that shares a global/group rule, while each channel still throttles independently. |
-| `default_min_request_count` | `50` | Per-rule fallback for `min_request_count` (used by `error_rate` and `latency_percentile`). Avoids noisy alerts from low-traffic windows. |
-| `default_window_seconds` | `60` | Per-rule fallback for `window_seconds`. |
-| `default_resolved_window_seconds` | `300` | Per-rule fallback for `recovery.resolved_window_seconds`. |
+| `default_cooldown_seconds` | `300` | Per-rule fallback if `cooldown_seconds` is omitted; must be in `[1, 86400]`. Applied per `(rule, proxy, channel)` so one proxy's incident does not suppress another proxy that shares a global/group rule, while each channel still throttles independently. |
+| `default_min_request_count` | `50` | Per-rule fallback for `min_request_count` (used by `error_rate` and `latency_percentile`); must be at least `1`. Avoids noisy alerts from low-traffic windows. |
+| `default_window_seconds` | `60` | Per-rule fallback for `window_seconds`; must be in `[5, 3600]`. |
+| `default_resolved_window_seconds` | `300` | Per-rule fallback for `recovery.resolved_window_seconds`; must be in `[5, 86400]`. |
 | `max_concurrent_dispatches` | `8` | Bounded-concurrency semaphore for outbound notifications (`>= 1`). When exhausted, alerts are dropped with a `warn!` rather than queued. |
 | `quiet_hours_utc` | `[]` | Optional UTC time-of-day windows where `Trigger` alerts are suppressed (without consuming the cooldown). Omit the field for no quiet hours; `null` is rejected. `Resolve` events still fire so operators don't miss recovery during off hours. |
 
@@ -211,11 +211,9 @@ Use `$$` for a literal `$`. Unknown placeholders are passed through unchanged.
 
 ## Operational notes
 
-- An enabled `proxy_alerts` configuration is load-bearing. Invalid startup
-  configuration is rejected, and an invalid reload leaves the last known-good
-  configuration active instead of silently disabling alerting.
+- Shared validation and Admin/file admission reject invalid configurations. At plugin-cache construction, `proxy_alerts` remains an optional fail-open observability plugin: a construction failure is logged and that instance is omitted instead of blocking cache publication.
 - Plugin state (sliding-window counters, cooldown timestamps, recovery state machines) is per-instance and reset on config reload. Rule IDs are assigned from rule order at config load and are therefore load-local; reordering or renaming rules resets state along with the reload rather than carrying cooldown/recovery state across definitions. A reload during an active anomaly may re-fire alerts immediately — this is acceptable today; cross-reload persistence is a v2 follow-up.
-- Per-rule `enabled: false` entries are skipped before rule validation, so operators can keep draft/disabled rules in config without breaking the active alert set. Present non-boolean `enabled` values (plugin or rule scope) and wrongly typed optional scalars such as `min_request_count` are rejected rather than coerced to active defaults.
+- Per-rule `enabled: false` entries are skipped before rule validation, so operators can keep draft/disabled rules alongside at least one active rule without breaking the active alert set. Configurations with no active rules are rejected. Present non-boolean `enabled` values (plugin or rule scope) and wrongly typed optional scalars such as `min_request_count` are rejected rather than coerced to active defaults.
 - `*_env` channel fields read `std::env::var()` at construction so the gateway's secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`) handles materialization without ever placing secrets in DB/file config. Reference the unsuffixed variable in plugin config: for example set `FERRUM_ALERTS_SLACK_WEBHOOK_VAULT=secret/data/ferrum/slack#url`, then configure `"webhook_url_env": "FERRUM_ALERTS_SLACK_WEBHOOK"` after startup materializes the base env var.
 - Sensitive metadata (`Authorization`, `Cookie`, etc.) is auto-redacted at `TransactionSummary` serialize time per the standard logger redaction. Notification template variables only expose named scalars (`${observed}`, `${rule_name}`, …) — there is no raw `${metadata}` hook, so the redaction layer cannot be bypassed via a template.
 - When the dispatch semaphore (`max_concurrent_dispatches`) is exhausted, alerts are dropped with a `warn!` rather than queued, and the rule/proxy/channel cooldown is not consumed. Operators investigating a backpressure event should grep `plugin=proxy_alerts` in their logs.

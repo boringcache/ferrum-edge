@@ -7054,10 +7054,7 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
         PluginFailurePolicy::KeepLastKnownGood,
     ),
     builtin_plugin("prometheus_metrics", PluginFailurePolicy::OptionalFailOpen),
-    // A configured alerting policy is load-bearing: silently omitting it after
-    // an admission error would leave traffic unmonitored. Invalid startup
-    // config is rejected and reloads retain the last known-good generation.
-    builtin_plugin("proxy_alerts", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("proxy_alerts", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("otel_tracing", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("ai_token_metrics", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("ai_request_guard", PluginFailurePolicy::FailClosed),
