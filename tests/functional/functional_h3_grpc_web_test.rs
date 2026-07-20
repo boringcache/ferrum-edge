@@ -931,8 +931,8 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
             .get_admin_json("/charges?format=json")
             .await
             .expect("fetch H3 gRPC-Web chargeback JSON");
-        let by_status = &charges["consumers"]["h3-grpc-web-chargeback-user"]["proxies"]
-            ["h3-grpc-web-success"]["by_status"];
+        let by_status = &charges["consumers"]["h3-grpc-web-chargeback-user"]["proxies"]["h3-grpc-web-success"]
+            ["by_status"];
         if by_status["200"]["calls"].as_u64() == Some(1)
             && by_status["403"]["calls"].as_u64() == Some(1)
         {
@@ -944,8 +944,8 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let by_status = &charges["consumers"]["h3-grpc-web-chargeback-user"]["proxies"]
-        ["h3-grpc-web-success"]["by_status"];
+    let by_status = &charges["consumers"]["h3-grpc-web-chargeback-user"]["proxies"]["h3-grpc-web-success"]
+        ["by_status"];
     let ok_charge = by_status["200"]["charges"]
         .as_f64()
         .expect("status 200 charge");

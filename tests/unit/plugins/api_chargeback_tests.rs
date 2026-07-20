@@ -964,7 +964,13 @@ async fn test_log_prices_final_grpc_status_as_effective_http_status() {
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
 
     let cases = [
-        ("grpc-billing-ok", "grpc-billing-ok-user", Some("0"), 200, 0.001),
+        (
+            "grpc-billing-ok",
+            "grpc-billing-ok-user",
+            Some("0"),
+            200,
+            0.001,
+        ),
         (
             "grpc-billing-denied",
             "grpc-billing-denied-user",
@@ -979,7 +985,13 @@ async fn test_log_prices_final_grpc_status_as_effective_http_status() {
             503,
             0.009,
         ),
-        ("grpc-billing-missing", "grpc-billing-missing-user", None, 500, 0.008),
+        (
+            "grpc-billing-missing",
+            "grpc-billing-missing-user",
+            None,
+            500,
+            0.008,
+        ),
         (
             "grpc-billing-malformed",
             "grpc-billing-malformed-user",
@@ -1004,9 +1016,9 @@ async fn test_log_prices_final_grpc_status_as_effective_http_status() {
         drop(entry);
         assert!(
             effective_status == 200
-                || !registry
-                    .entries
-                    .contains_key(&make_key_with_prices(consumer, proxy_id, 200, 0.001, 0.0, 0.0)),
+                || !registry.entries.contains_key(&make_key_with_prices(
+                    consumer, proxy_id, 200, 0.001, 0.0, 0.0
+                )),
             "non-OK gRPC status must not be charged in the HTTP 200 bucket"
         );
     }

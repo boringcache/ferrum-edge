@@ -1508,8 +1508,8 @@ async fn assert_api_chargeback_uses_terminal_grpc_status(overrides: Value, case:
         &[(200, 1), (503, 1)],
     )
     .await;
-    let by_status = &charges["consumers"]["grpc-chargeback-user"]["proxies"]
-        ["grpc-chargeback"]["by_status"];
+    let by_status =
+        &charges["consumers"]["grpc-chargeback-user"]["proxies"]["grpc-chargeback"]["by_status"];
     let ok_charge = by_status["200"]["charges"]
         .as_f64()
         .expect("status 200 charge");

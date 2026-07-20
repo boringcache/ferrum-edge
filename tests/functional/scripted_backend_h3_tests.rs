@@ -3191,8 +3191,8 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_
             .get_admin_json("/charges?format=json")
             .await
             .expect("fetch native H3 chargeback JSON");
-        if charges["consumers"]["native-h3-chargeback-user"]["proxies"]["scripted-h3"]
-            ["by_status"]["403"]["calls"]
+        if charges["consumers"]["native-h3-chargeback-user"]["proxies"]["scripted-h3"]["by_status"]
+            ["403"]["calls"]
             .as_u64()
             == Some(1)
         {
@@ -3204,8 +3204,8 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let by_status = &charges["consumers"]["native-h3-chargeback-user"]["proxies"]
-        ["scripted-h3"]["by_status"];
+    let by_status =
+        &charges["consumers"]["native-h3-chargeback-user"]["proxies"]["scripted-h3"]["by_status"];
     let denied_charge = by_status["403"]["charges"]
         .as_f64()
         .expect("status 403 charge");

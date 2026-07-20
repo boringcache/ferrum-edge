@@ -1262,11 +1262,10 @@ impl Plugin for ApiChargeback {
 
         let status_code = super::chargeback::http_billing_outcome(summary).status_code;
 
-        let Some(charge) = self.pricing.compute_http(
-            status_code,
-            summary.bytes_sent,
-            summary.bytes_received,
-        ) else {
+        let Some(charge) =
+            self.pricing
+                .compute_http(status_code, summary.bytes_sent, summary.bytes_received)
+        else {
             return;
         };
 
