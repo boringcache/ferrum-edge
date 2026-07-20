@@ -160,23 +160,6 @@ impl AuditSqlDialect {
             }
         }
     }
-
-    pub fn insert_placeholder_count(self) -> usize {
-        match self {
-            Self::Postgres => self
-                .insert_sql()
-                .matches('$')
-                .count(),
-            Self::Sqlite | Self::Mysql => self.insert_sql().matches('?').count(),
-        }
-    }
-
-    pub fn retention_placeholder_count(self) -> usize {
-        match self {
-            Self::Postgres => self.retention_delete_sql().matches('$').count(),
-            Self::Sqlite | Self::Mysql => self.retention_delete_sql().matches('?').count(),
-        }
-    }
 }
 
 struct GatewayAuditStore {
