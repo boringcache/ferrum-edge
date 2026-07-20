@@ -5455,16 +5455,40 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         );
     }
 
-    // OpenAPI rejects typed nulls on declared properties. Runtime scalar helpers
-    // still treat null as "use default"; unknown-key closure is the advisory
-    // contract under test here.
-    for key in RESPONSE_CACHING_CONFIG_KEYS {
+    // Runtime scalar helpers treat null as "use default"; OpenAPI must expose
+    // the same contract. Collection fields remain strict non-null arrays.
+    for key in [
+        "ttl_seconds",
+        "max_entries",
+        "max_entry_size_bytes",
+        "max_total_size_bytes",
+        "respect_cache_control",
+        "respect_no_cache",
+        "cache_key_include_query",
+        "cache_key_include_consumer",
+        "add_cache_status_header",
+        "invalidate_on_unsafe_methods",
+    ] {
         let mut config = json!({});
         config
             .as_object_mut()
             .expect("config object")
-            .insert((*key).to_string(), serde_json::Value::Null);
+            .insert(key.to_string(), serde_json::Value::Null);
+        assert_component_validity(&spec, "ResponseCachingConfig", &config, true);
+        ResponseCaching::new(&config)
+            .unwrap_or_else(|error| panic!("nullable scalar {key} failed runtime: {error}"));
+    }
+    for key in ["cacheable_methods", "cacheable_status_codes", "vary_by_headers"] {
+        let mut config = json!({});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert(key.to_string(), serde_json::Value::Null);
         assert_component_validity(&spec, "ResponseCachingConfig", &config, false);
+        assert!(
+            ResponseCaching::new(&config).is_err(),
+            "non-null list field {key} accepted null"
+        );
     }
 }
 

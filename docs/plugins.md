@@ -3269,7 +3269,7 @@ Caches final client-visible HTTP responses in gateway memory. The cache key incl
 **Protocol:** HTTP only
 **Failure policy:** `KeepLastKnownGood` — invalid enabled configs (including unknown top-level keys) fail admission on admin/validate/file startup paths, and reload/rebuild retains the previously published cache generation instead of applying a silently weakened default policy.
 
-Configuration must be a top-level object. The only accepted keys are `ttl_seconds`, `max_entries`, `max_entry_size_bytes`, `max_total_size_bytes`, `cacheable_methods`, `cacheable_status_codes`, `respect_cache_control`, `respect_no_cache`, `vary_by_headers`, `cache_key_include_query`, `cache_key_include_consumer`, `add_cache_status_header`, and `invalidate_on_unsafe_methods`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions instead of falling back to defaults, so a typo such as `vary_by_header` cannot silently remove a reviewed cache-isolation boundary.
+Configuration must be a top-level object. The only accepted keys are `ttl_seconds`, `max_entries`, `max_entry_size_bytes`, `max_total_size_bytes`, `cacheable_methods`, `cacheable_status_codes`, `respect_cache_control`, `respect_no_cache`, `vary_by_headers`, `cache_key_include_query`, `cache_key_include_consumer`, `add_cache_status_header`, and `invalidate_on_unsafe_methods`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions instead of falling back to defaults, so a typo such as `vary_by_header` cannot silently remove a reviewed cache-isolation boundary. Optional scalar fields may be omitted or set to `null` to select their documented defaults; list fields remain non-null arrays.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
