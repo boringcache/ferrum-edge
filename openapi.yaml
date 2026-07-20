@@ -11248,7 +11248,10 @@ components:
         bounds DNS, TCP connect, and TLS handshake when enabled.
         `write_timeout_ms` bounds each batch write/flush; timeouts discard the
         writer and use the shared retry/reconnect path. Delivery is
-        at-least-once after partial-write failure.
+        at-least-once after partial-write failure. Registration policy is
+        KeepLastKnownGood: an invalid enabled candidate rejects startup or
+        reload publication instead of silently removing or downgrading the
+        previously accepted logger.
       required:
         - host
         - port

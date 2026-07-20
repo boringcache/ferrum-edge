@@ -1,6 +1,9 @@
 //! Tests for tcp_logging plugin
 
-use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, tcp_logging::TcpLogging};
+use ferrum_edge::plugins::{
+    ALL_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, plugin_failure_policy,
+    tcp_logging::TcpLogging,
+};
 use serde_json::json;
 
 use super::plugin_utils::{
@@ -9,6 +12,14 @@ use super::plugin_utils::{
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+#[test]
+fn test_tcp_logging_keeps_last_known_good_on_invalid_candidates() {
+    assert_eq!(
+        plugin_failure_policy("tcp_logging"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
 }
 
 /// `tls: true` now builds a rustls `ClientConfig` in `TcpLogging::new` (finding

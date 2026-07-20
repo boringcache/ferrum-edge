@@ -535,7 +535,7 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 
 **Priority:** 9125
 
-**Failure policy:** `OptionalFailOpen` — construction/validation failures reject the candidate plugin generation and keep the last-known-good instance.
+**Failure policy:** `KeepLastKnownGood` — construction/validation failures reject the candidate plugin generation and keep the last-known-good instance.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
