@@ -7490,7 +7490,11 @@ components:
             validation-fatal when the plugin cache is built: they block gateway
             startup in file mode, and on DB/CP polling the new config snapshot
             is rejected as a whole (the gateway keeps serving the prior good
-            config). Plugins registered OptionalFailOpen (including
+            config). Admin API create/update always performs strict construction
+            for an enabled config and returns HTTP 400 before storage when that
+            config is invalid, regardless of serving-mode failure policy.
+            During file-mode load, pre-existing DB/CP snapshot application, or
+            cache rebuild, plugins registered OptionalFailOpen (including
             `ws_frame_logging` and other observability sinks) instead emit a
             validation/construction warning and omit that plugin instance from
             the published cache while admitting the surrounding snapshot.
@@ -8401,22 +8405,29 @@ components:
 
         Default `log_level` is `info` so healthy frame traffic does not become
         warning-level noise. Under the gateway's default
-        `FERRUM_LOG_LEVEL=warn` EnvFilter, an enabled empty config emits one
-        actionable construction warning naming the filtered level while normal
-        frame records remain suppressed. Explicit `trace` or `debug` likewise
-        require a matching (or more verbose) runtime filter; `warn` is available
-        only when selected deliberately. Filtering skips fingerprint computation and
-        tracing event construction only — frame parsing, plugin selection
-        (`requires_ws_frame_hooks`), and `on_ws_frame` dispatch still occur, so
-        H1 raw-copy tunnel mode remains unavailable while this plugin is
-        attached.
+        `FERRUM_LOG_LEVEL=warn` EnvFilter, constructing an enabled empty config
+        emits an actionable construction-time warning naming the filtered level
+        while normal frame records remain suppressed. Validation and cache
+        publication can construct an instance separately, so the diagnostic can
+        repeat. A filter stricter than `warn` (or `ws_frame_log=off`) also
+        suppresses that diagnostic; operators using such a filter must
+        deliberately admit the configured target level. Explicit `trace` or
+        `debug` likewise require a matching (or more verbose) runtime filter;
+        `warn` is available only when selected deliberately. Filtering skips
+        fingerprint computation and tracing event construction only — frame
+        parsing, plugin selection (`requires_ws_frame_hooks`), and `on_ws_frame`
+        dispatch still occur, so H1 raw-copy tunnel mode remains unavailable
+        while this plugin is attached.
 
         Admission contract: only the keys below are allowed; unknown keys and
         explicit `null` field values are rejected. `payload_preview_bytes`
         values above 65536 are rejected (not clamped). The plugin is registered
-        OptionalFailOpen: invalid enabled configs produce a validation/
-        construction warning and omit this instance from the published plugin
-        cache rather than rejecting the surrounding snapshot.
+        OptionalFailOpen. Admin create/update performs strict construction and
+        returns HTTP 400 for an invalid enabled config before storing it. During
+        file-mode load, pre-existing DB/CP snapshot application, or cache
+        rebuild, invalid enabled configs produce a validation/construction
+        warning and omit this instance from the published plugin cache rather
+        than rejecting the surrounding snapshot.
 
         Raw frame contents are never logged: WebSocket payloads routinely carry
         credentials (bearer tokens, cookies, API keys), so when

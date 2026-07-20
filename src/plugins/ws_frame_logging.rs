@@ -72,6 +72,25 @@ enum LogLevel {
     Warn,
 }
 
+/// Build one distinct static probe callsite per macro expansion while keeping
+/// the metadata shape identical across configured levels.
+macro_rules! filter_probe_metadata {
+    ($level:expr) => {{
+        static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
+        static META: Metadata<'static> = Metadata::new(
+            "ws_frame_logging.filter_probe",
+            "ws_frame_log",
+            $level,
+            None,
+            None,
+            None,
+            FieldSet::new(&[], Identifier(&CALLSITE)),
+            Kind::HINT,
+        );
+        &META
+    }};
+}
+
 impl LogLevel {
     fn as_str(self) -> &'static str {
         match self {
@@ -109,62 +128,10 @@ impl LogLevel {
     /// the active dispatcher's `register_callsite`.
     fn filter_probe_metadata(self) -> &'static Metadata<'static> {
         match self {
-            Self::Trace => {
-                static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
-                static META: Metadata<'static> = Metadata::new(
-                    "ws_frame_logging.filter_probe",
-                    "ws_frame_log",
-                    Level::TRACE,
-                    None,
-                    None,
-                    None,
-                    FieldSet::new(&[], Identifier(&CALLSITE)),
-                    Kind::HINT,
-                );
-                &META
-            }
-            Self::Debug => {
-                static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
-                static META: Metadata<'static> = Metadata::new(
-                    "ws_frame_logging.filter_probe",
-                    "ws_frame_log",
-                    Level::DEBUG,
-                    None,
-                    None,
-                    None,
-                    FieldSet::new(&[], Identifier(&CALLSITE)),
-                    Kind::HINT,
-                );
-                &META
-            }
-            Self::Info => {
-                static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
-                static META: Metadata<'static> = Metadata::new(
-                    "ws_frame_logging.filter_probe",
-                    "ws_frame_log",
-                    Level::INFO,
-                    None,
-                    None,
-                    None,
-                    FieldSet::new(&[], Identifier(&CALLSITE)),
-                    Kind::HINT,
-                );
-                &META
-            }
-            Self::Warn => {
-                static CALLSITE: DefaultCallsite = DefaultCallsite::new(&META);
-                static META: Metadata<'static> = Metadata::new(
-                    "ws_frame_logging.filter_probe",
-                    "ws_frame_log",
-                    Level::WARN,
-                    None,
-                    None,
-                    None,
-                    FieldSet::new(&[], Identifier(&CALLSITE)),
-                    Kind::HINT,
-                );
-                &META
-            }
+            Self::Trace => filter_probe_metadata!(Level::TRACE),
+            Self::Debug => filter_probe_metadata!(Level::DEBUG),
+            Self::Info => filter_probe_metadata!(Level::INFO),
+            Self::Warn => filter_probe_metadata!(Level::WARN),
         }
     }
 }

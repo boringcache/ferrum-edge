@@ -4404,6 +4404,8 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
     for contract in [
         "OptionalFailOpen",
         "FERRUM_LOG_LEVEL=warn",
+        "HTTP 400",
+        "stricter than `warn`",
         "not clamped",
         "requires_ws_frame_hooks",
         "raw-copy tunnel",
@@ -4448,7 +4450,29 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
         plugin_config_desc.contains("OptionalFailOpen"),
         "generic PluginConfig.config must document OptionalFailOpen omission"
     );
+    assert!(
+        plugin_config_desc.contains("HTTP 400"),
+        "generic PluginConfig.config must distinguish strict Admin admission"
+    );
     assert!(plugin_config_desc.contains("ws_frame_logging"));
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs_section = plugin_docs
+        .split("### `ws_frame_logging`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ws_frame_logging docs section");
+    for contract in [
+        "HTTP 400",
+        "stricter than `warn`",
+        "diagnostic can repeat",
+        "OptionalFailOpen",
+    ] {
+        assert!(
+            docs_section.contains(contract),
+            "ws_frame_logging docs missing `{contract}`"
+        );
+    }
 }
 
 #[test]
