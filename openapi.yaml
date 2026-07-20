@@ -11272,6 +11272,7 @@ components:
         tls_server_name:
           type: string
           minLength: 1
+          pattern: '^\S+$'
           description: >-
             DNS or IP identity for TLS SNI/certificate verification (defaults to
             `host`). Allowed only when `tls` is true. Must be a rustls-acceptable

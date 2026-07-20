@@ -243,10 +243,14 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("tcp_logging: '{key}' must be a string"))?
-                .trim();
+                .ok_or_else(|| format!("tcp_logging: '{key}' must be a string"))?;
             if value.is_empty() {
                 return Err(format!("tcp_logging: '{key}' must not be empty"));
+            }
+            if value.trim() != value {
+                return Err(format!(
+                    "tcp_logging: '{key}' must not contain leading or trailing whitespace"
+                ));
             }
             Ok(Some(value.to_string()))
         }

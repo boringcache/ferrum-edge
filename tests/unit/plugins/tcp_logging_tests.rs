@@ -472,6 +472,8 @@ async fn test_tcp_logging_rejects_invalid_tls_server_names_at_admission() {
         "logs.example.com/path",
         "logs example.com",
         "logs.example.com:6514",
+        " logs.example.com",
+        "logs.example.com ",
     ] {
         let err = match TcpLogging::new(
             &json!({
