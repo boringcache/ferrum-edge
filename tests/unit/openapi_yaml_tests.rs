@@ -3961,12 +3961,7 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
                 "unknown_draft_field": true
             }),
         );
-    assert_component_validity(
-        &spec,
-        "ProxyAlertsConfig",
-        &valid_with_disabled_draft,
-        true,
-    );
+    assert_component_validity(&spec, "ProxyAlertsConfig", &valid_with_disabled_draft, true);
     // Active rules remain closed and require the selected variant shape.
     assert_component_validity(
         &spec,
