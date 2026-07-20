@@ -788,7 +788,7 @@ impl Plugin for MyBodyPlugin {
 }
 ```
 
-By default, `should_buffer_response_body()` returns `self.requires_response_body_buffering()` — plugins that don't override it behave as before. When `response_transformer` has body transformation rules configured (`target: "body"`), it automatically returns `true` from `requires_response_body_buffering()`, forcing buffering so the JSON body can be parsed and rewritten. When only header rules are configured, it returns `false` and works with streaming mode. See [docs/response_body_streaming.md](response_body_streaming.md) for the full streaming architecture.
+By default, `should_buffer_response_body()` returns `self.requires_response_body_buffering()` — plugins that don't override it behave as before. When `response_transformer` has body transformation rules configured (`target: "body"`), it automatically returns `true` from `requires_response_body_buffering()`, forcing conservative pre-header buffering so a client-controlled `Accept: text/event-stream` value cannot release an ordinary JSON backend response past the policy. Once backend headers arrive, the content-type refinement releases a response that actually declares `text/event-stream`; JSON, absent, and ambiguous types remain buffered. When only header rules are configured, it returns `false` and works with streaming mode. See [docs/response_body_streaming.md](response_body_streaming.md) for the full streaming architecture.
 
 Add the constant to `src/plugins/mod.rs` in the `priority` module for discoverability:
 
@@ -949,7 +949,7 @@ An **absent** `Content-Type` is treated as JSON, and the representation gate's c
 ### Performance Notes
 
 - Body rules are parsed once at config load time, not per-request.
-- When `response_transformer` has body rules, it automatically enables response body buffering for the proxy. Without body rules, responses stream through with zero overhead.
+- When `response_transformer` has body rules, it automatically enables conservative response body buffering for the proxy. Backend-declared `text/event-stream` responses are released after headers; request-side SSE intent alone never releases a JSON response. Without body rules, responses stream through with zero overhead.
 - `request_transformer` body transformation runs after the request body is collected and before it is sent to the backend (HTTP/1.1 and HTTPS paths).
 - Header, query, and body rules can be mixed in a single plugin configuration.
 

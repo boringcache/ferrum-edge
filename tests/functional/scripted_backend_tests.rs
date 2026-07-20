@@ -647,6 +647,185 @@ async fn wait_for_h2_downgraded_entry(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// response_transformer — client SSE intent cannot bypass JSON body policy.
+// ────────────────────────────────────────────────────────────────────────────
+
+fn response_transformer_sse_policy_file_config(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "response-transformer-sse-policy",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "response_body_mode": "stream",
+            "backend_connect_timeout_ms": 2000,
+            // The SSE fixture deliberately holds the response open between
+            // events. Zero disables the backend read timeout for this test.
+            "backend_read_timeout_ms": 0,
+            "backend_write_timeout_ms": 5000,
+            "plugins": [{"plugin_config_id": "redact-secret"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "redact-secret",
+            "proxy_id": "response-transformer-sse-policy",
+            "plugin_name": "response_transformer",
+            "scope": "proxy",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "operation": "remove",
+                    "target": "body",
+                    "key": "secret",
+                }],
+            },
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn response_transformer_uses_backend_representation_for_sse_buffering() {
+    const JSON_BODY: &str = r#"{"secret":"hunter2","keep":"visible"}"#;
+    const EVENT_ONE: &str = "data: {\"part\":1}\n\n";
+    const EVENT_TWO: &str = "data: {\"part\":2}\n\n";
+    const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
+    const FIRST_EVENT_DEADLINE: Duration = Duration::from_millis(2500);
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let json_script = vec![
+        HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/json")),
+        HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "application/json".into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: JSON_BODY.len().to_string(),
+        },
+        HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        },
+        HttpStep::RespondBodyChunk(JSON_BODY.as_bytes().to_vec()),
+        HttpStep::RespondBodyEnd,
+    ];
+    let sse_script = vec![
+        HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/events")),
+        HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        },
+        HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        },
+        HttpStep::RespondBodyChunk(EVENT_ONE.as_bytes().to_vec()),
+        HttpStep::Sleep(MID_STREAM_PAUSE),
+        HttpStep::RespondBodyChunk(EVENT_TWO.as_bytes().to_vec()),
+        HttpStep::RespondBodyEnd,
+    ];
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .connection_scripts([json_script, sse_script])
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = GatewayHarness::builder()
+        .file_config(response_transformer_sse_policy_file_config(backend_port))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = harness.http_client().expect("client");
+
+    // The exploit shape: client asks for SSE, backend selects ordinary JSON.
+    // The response must still be buffered and redacted before any byte crosses.
+    let json_response = client
+        .request(reqwest::Method::GET, &harness.proxy_url("/api/json"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("gateway returns JSON response");
+    assert_eq!(json_response.status(), StatusCode::OK);
+    let json_body: serde_json::Value = json_response
+        .json()
+        .await
+        .expect("transformed response is valid JSON");
+    assert!(
+        json_body.get("secret").is_none(),
+        "client SSE intent must not bypass the configured redaction"
+    );
+    assert_eq!(json_body["keep"], "visible");
+
+    // A real backend event stream remains incremental. Requiring the first
+    // event before the backend's pause elapses proves the response was released
+    // after headers rather than collected to EOF by the document transformer.
+    let started = Instant::now();
+    let (mut sse_response, first_chunk) =
+        tokio::time::timeout(FIRST_EVENT_DEADLINE, async {
+            let mut response = client
+                .request(reqwest::Method::GET, &harness.proxy_url("/api/events"))
+                .header("accept", "text/event-stream")
+                .send()
+                .await
+                .expect("gateway returns SSE response headers");
+            let first_chunk = response
+                .chunk()
+                .await
+                .expect("read first SSE chunk")
+                .expect("stream must not end before the first event");
+            (response, first_chunk)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "first SSE event did not arrive within {FIRST_EVENT_DEADLINE:?} \
+                 (elapsed {:?}) — response_transformer buffered the event stream",
+                started.elapsed()
+            )
+        });
+    assert_eq!(sse_response.status(), StatusCode::OK);
+    assert_eq!(
+        sse_response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let mut sse_body = String::from_utf8_lossy(&first_chunk).into_owned();
+    assert!(sse_body.contains("\"part\":1"));
+    assert!(
+        !sse_body.contains("\"part\":2"),
+        "terminal event arrived with the first chunk, indicating buffering"
+    );
+    tokio::time::timeout(MID_STREAM_PAUSE + Duration::from_secs(5), async {
+        while let Some(chunk) = sse_response.chunk().await.expect("read SSE chunk") {
+            sse_body.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .expect("SSE stream finishes after backend closes");
+    assert!(sse_body.contains("\"part\":2"));
+
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // a2a_gateway + retries — unexpected SSE must stream incrementally (#2169).
 // ────────────────────────────────────────────────────────────────────────────
 //

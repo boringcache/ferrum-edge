@@ -180,6 +180,7 @@ Built-in plugins with per-request refinement:
 | `ai_token_metrics` | Request is native gRPC, or the client asked for a stream (`Accept: text/event-stream` / a `stream: true` request) without `buffer_streaming_responses: true` (pre-header); additionally, after headers, when the response content type is not JSON, or is `text/event-stream` without `buffer_streaming_responses: true` |
 | `ai_rate_limiter` | Never for active HTTP/gRPC responses; response usage reconciliation needs the body. Its pre-request reservation path only buffers request bodies for JSON `POST` requests. |
 | `ai_response_guard` | Client requested SSE (`Accept: text/event-stream`) or an earlier AI request plugin marked the request as streaming; all other HTTP requests request buffering, then response status/content type determine inspection |
+| `response_transformer` body rules | Never from request-side SSE intent: `Accept: text/event-stream` is client controlled, so pre-header buffering remains conservative. After backend headers, a response that actually declares `text/event-stream` is released; JSON, missing, and ambiguous types remain buffered. |
 
 The decision in code:
 
@@ -277,7 +278,7 @@ buffering decision and may narrow that decision by request or response
 | Plugin / configuration | Modifies Response Body? | Requires Buffering? |
 |------------------------|------------------------|-------------------|
 | `response_transformer` header-only rules | No | No |
-| `response_transformer` body rules | Yes | Yes |
+| `response_transformer` body rules | Yes for JSON; genuine SSE is outside the document policy | Yes before headers; released after headers only for backend `text/event-stream` |
 | `cors` | No (headers only) | No |
 | `stdout_logging` | No | No |
 | `http_logging` | No | No |

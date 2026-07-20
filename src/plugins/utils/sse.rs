@@ -2,10 +2,12 @@
 //!
 //! SSE responses (`text/event-stream`) are inherently unbounded streams. Plugins
 //! that buffer the response body (e.g., `response_caching`, `body_validator`,
-//! `response_transformer`, `response_size_limiting`) MUST skip buffering for
-//! SSE — otherwise the buffer collects events forever and the gateway returns
-//! 502 once `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is hit, instead of streaming
-//! events to the client.
+//! `response_size_limiting`) MUST skip buffering for SSE — otherwise the buffer
+//! collects events forever and the gateway returns 502 once
+//! `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is hit, instead of streaming events to
+//! the client. A policy plugin such as `response_transformer` cannot safely use
+//! client intent for that decision: it buffers conservatively before headers,
+//! then releases only when the backend response itself declares event-stream.
 //!
 //! The proxy handler already has a response-side bypass via
 //! `is_streaming_content_type()` (checks the backend's `Content-Type`), but
@@ -14,9 +16,11 @@
 //! escape hatch never runs.
 //!
 //! These helpers operate on the request-side `Accept` header (the canonical
-//! SSE intent signal per the WHATWG EventSource spec). Plugins call
-//! `is_sse_request(ctx)` from `should_buffer_response_body()` to opt out of
-//! buffering before the response-side check happens.
+//! SSE intent signal per the WHATWG EventSource spec). Plugins whose scope is
+//! inherently streaming may call `is_sse_request(ctx)` from
+//! `should_buffer_response_body()`. Outbound body-policy plugins must instead
+//! wait for the response-header refinement; request intent alone is not proof
+//! that the backend selected an event stream.
 //!
 //! Backends may legitimately return `text/event-stream` for non-SSE-aware
 //! clients — in those cases the proxy's response-side `is_streaming_content_type`

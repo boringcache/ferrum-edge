@@ -3,7 +3,12 @@
 //!
 //! Header rules (add/remove/update/rename) execute in `after_proxy`. Body
 //! rules require `requires_response_body_buffering()` = true so the response
-//! body is collected before being forwarded to the client.
+//! body is collected before being forwarded to the client. The pre-header
+//! decision is deliberately conservative: a client `Accept: text/event-stream`
+//! value cannot release an ordinary JSON backend response. Once the backend
+//! headers arrive, a genuine `text/event-stream` response is released through
+//! `should_buffer_response_body_for_content_type()` so unbounded SSE remains
+//! streaming.
 //!
 //! Rules are validated at construction time:
 //!
@@ -682,7 +687,7 @@ impl Plugin for ResponseTransformer {
         }
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
         // Honor the RTDS runtime kill-switch here, mirroring the early
         // `return None` in `transform_response_body`. When the overlay disables
         // this scope the transform is a no-op, so we must not pin the response
@@ -693,15 +698,31 @@ impl Plugin for ResponseTransformer {
         // so it belongs in this per-request gate (not the cache-level
         // `requires_response_body_buffering` upper bound). (Finding #64.)
         //
-        // Skip body buffering for SSE requests (`Accept: text/event-stream`).
-        // Body transforms operate on the assembled response body — applying
-        // them to an unbounded event stream would buffer until the
-        // max-response-body limit is hit and then 502. SSE transforms are
-        // out of scope; operators should configure body transforms only for
-        // non-SSE proxies, or layer a frame-level plugin on top.
-        !self.body_rules.is_empty()
-            && self.rules_enabled()
-            && !super::utils::sse::is_sse_request(ctx)
+        // Do NOT key this pre-header decision off the client-controlled Accept
+        // header. A client can ask for SSE while the selected backend response
+        // is ordinary JSON; releasing here would stream that JSON past every
+        // configured body rule. Buffer conservatively until response headers
+        // arrive, then let `should_buffer_response_body_for_content_type`
+        // release a response that actually declares itself as event-stream.
+        !self.body_rules.is_empty() && self.rules_enabled()
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        // Body transforms operate on an assembled JSON document. A backend
+        // response that actually declares `text/event-stream` is outside that
+        // policy and must be released after headers rather than collected until
+        // the response-body ceiling. Missing, JSON, and every ambiguous type
+        // stay on the conservative buffered path. The shared refinement refuses
+        // this downgrade when any later hook may rewrite Content-Type, so a
+        // relabel cannot bypass the final client-visible policy decision.
+        self.should_buffer_response_body(ctx)
+            && !content_type.is_some_and(body_transform::is_event_stream_content_type)
     }
 
     fn enforces_response_body_policy(
@@ -718,24 +739,23 @@ impl Plugin for ResponseTransformer {
         //   * the RTDS kill-switch disabled this scope, mirroring the early
         //     `return None` in `transform_response_body`.
         //
-        // SSE is NOT among them, and its absence is load-bearing.
-        // `should_buffer_response_body` declines to buffer an
-        // `Accept: text/event-stream` request, but that is only *this* plugin's
-        // vote: any other response-body plugin can force the buffer, and the
-        // lifecycle then runs `transform_response_body_with_context` over the
-        // result no matter what this predicate said. Declining SSE here while
-        // the transform still ran was exactly that asymmetry — the gate answered
-        // `Unprotected`, and an encoded, `206`, or unparseable body reached the
-        // transform, returned `None`, and was forwarded with a configured
-        // redaction silently skipped.
+        // Client SSE intent is NOT among them, and its absence is load-bearing.
+        // The pre-header buffering vote cannot trust `Accept: text/event-stream`:
+        // the backend may still return ordinary JSON. Header-time refinement
+        // releases a response that genuinely declares `text/event-stream`, and
+        // the media-type condition below declines that representation. If an
+        // operator or another plugin nevertheless keeps the response buffered,
+        // the lifecycle runs `transform_response_body_with_context` over it no
+        // matter what this predicate said. Declining merely because the request
+        // asked for SSE would make the gate answer `Unprotected`; an encoded,
+        // `206`, or unparseable JSON response could then reach the transform,
+        // return `None`, and cross with the configured redaction skipped.
         //
         // Claiming it is also the direction that keeps working traffic working.
-        // A buffered SSE-accepting request whose response is a complete JSON
-        // document is fully inspectable and its redaction applies today; the
-        // media-type condition below already declines a response that genuinely
-        // IS `text/event-stream`, because that is not a JSON content type. So the
-        // only responses this widening newly claims are the ones the transform
-        // was already being run over.
+        // An SSE-accepting request whose response is a complete JSON document is
+        // fully inspectable and its redaction applies; the media-type condition
+        // below declines a response that genuinely IS `text/event-stream`,
+        // because that is not a JSON content type.
         //
         // The media-type condition mirrors `transform_response_body` EXACTLY,
         // and that symmetry is the whole point: this predicate must claim every
