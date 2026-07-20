@@ -17793,10 +17793,6 @@ pre_build = []
             "python3 -c 'print(\"safe\")'\n"
             "printf '%s\\n' 'cross build documentation'\n"
         ),
-        "inline option on a later command": (
-            "python3 --version\n"
-            "-c 'cross build is not a Python operand'\n"
-        ),
         "quote marker inside a shell comment": (
             "python3 -c 'print(\"safe\")' # unmatched ' is comment data\n"
             "printf '%s\\n' 'cross build documentation'\n"
@@ -17807,6 +17803,20 @@ pre_build = []
                 f"benign multiline boundary {label!r} was read as one inline "
                 "interpreter command"
             )
+    later_inline_option = (
+        "python3 --version\n"
+        "-c '\n"
+        "import subprocess\n"
+        "subprocess.run([\"cross\", \"build\"])\n"
+        "'\n"
+    )
+    if shell_inline_interpreter_has_cross(
+        separate_unquoted_shell_newlines(later_inline_option)
+    ):
+        failures.append(
+            "an inline-source option on a later command was appended to the "
+            "preceding interpreter argv"
+        )
     # The discriminating control puts the identical words on a real command
     # line, where the inline shell really is generated and must fail closed.
     if not contains_direct_trusted_shell_cross_surface('bash -c "$(render)"\n'):
@@ -18131,23 +18141,17 @@ pre_build = []
         "./scripts/build",
         'eval "$(./scripts/build)"',
     )
-    if not validate_automation_collection(
+    if not validate_workflow_collection(
         {"ci.yml": extensionless_eval_workflow},
-        {"setup/action.yml": safe_action},
-        extensionless_python_template,
-        "self-test automation directory",
+        "self-test workflow directory",
     ):
         failures.append(
             "dynamic evaluation of extensionless Python output was accepted"
         )
-    if not compare_pr_automation_collection(
+    if not compare_pr_workflow_collection(
         {"ci.yml": extensionless_workflow},
         {"ci.yml": extensionless_eval_workflow},
-        {"setup/action.yml": safe_action},
-        {"setup/action.yml": safe_action},
-        extensionless_python_template,
-        extensionless_python_template,
-        "self-test automation directory",
+        "self-test workflow directory",
     ):
         failures.append(
             "a newly added dynamic evaluation of extensionless Python output "
