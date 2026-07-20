@@ -409,13 +409,16 @@ pub(crate) fn dtls_file_dependency_cache_key(
 
     // Host is only needed for ServerName when verifying; fall back to a
     // syntactically valid placeholder when the shape phase has not yet run.
-    let host = config
+    let raw_host = config
         .get("host")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("udp-logging.invalid")
-        .to_string();
+        .unwrap_or("udp-logging.invalid");
+    // Match constructor admission: bracketed IPv6 is valid config input, but
+    // rustls ServerName and the dialer consume its unbracketed canonical form.
+    // Normalization also lets case-only hostname variants share one cache row.
+    let host = parse_socket_host("udp_logging", "host", raw_host)?.dial_host;
 
     Ok(Some(DtlsFileDependencyCacheKey {
         host,

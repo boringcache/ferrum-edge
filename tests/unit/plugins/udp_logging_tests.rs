@@ -903,6 +903,20 @@ fn test_udp_logging_file_dependency_phase_reports_bad_dtls_material() {
 }
 
 #[test]
+fn test_udp_logging_file_dependency_phase_normalizes_bracketed_ipv6() {
+    ensure_crypto_provider();
+    let config = json!({
+        "host": "[::1]",
+        "port": 9514,
+        "dtls": true
+    });
+    ferrum_edge::_test_support::udp_logging_validate_dtls_file_dependencies_for_test(
+        config.as_object().expect("udp config object"),
+    )
+    .expect("bracketed IPv6 must use the same canonical host as runtime admission");
+}
+
+#[test]
 fn test_udp_logging_file_dependency_duplicate_sources_materialize_once() {
     let shared = json!({
         "host": "127.0.0.1",
