@@ -849,44 +849,44 @@ impl GovernorEngine {
         // out when a later redaction already makes the batch unshippable.
         let mut redaction_memos = HashMap::new();
         let mut redacted_argument_bytes = 0usize;
-        let redaction_amplification: Vec<bool> = calls
-            .iter()
-            .zip(evaluations.iter())
-            .map(|(call, (outcome, _, _))| {
-                let PolicyOutcome::Redact(patterns) = outcome else {
-                    return false;
-                };
-                if redaction_unavailable || patterns.is_empty() {
-                    return false;
-                }
-                let Some(policy) = self.tools.get(&call.name) else {
-                    return false;
-                };
-                match redact_arguments(
-                    &call.raw_args,
-                    &policy.blocked_arg_patterns,
-                    &self.response.redaction_placeholder,
-                ) {
-                    Err(()) => true,
-                    Ok((redacted, changed)) => {
-                        if !changed {
-                            return false;
-                        }
-                        let Some(next_total) = redacted_argument_bytes.checked_add(redacted.len())
-                        else {
-                            return true;
-                        };
-                        if next_total > MAX_PARSE_BYTES {
-                            return true;
-                        }
-                        redacted_argument_bytes = next_total;
-                        redaction_memos
-                            .insert(redaction_memo_key(&call.name, &call.raw_args), redacted);
-                        false
-                    }
-                }
-            })
-            .collect();
+        let mut redaction_amplification = vec![false; calls.len()];
+        for (index, (call, (outcome, _, _))) in
+            calls.iter().zip(evaluations.iter()).enumerate()
+        {
+            let PolicyOutcome::Redact(patterns) = outcome else {
+                continue;
+            };
+            if redaction_unavailable || patterns.is_empty() {
+                continue;
+            }
+            let Some(policy) = self.tools.get(&call.name) else {
+                continue;
+            };
+            let Ok((redacted, changed)) = redact_arguments(
+                &call.raw_args,
+                &policy.blocked_arg_patterns,
+                &self.response.redaction_placeholder,
+            ) else {
+                // The enforce-mode batch is already unshippable. Mark later
+                // redactions unavailable and stop before hostile siblings can
+                // each force another bounded-but-expensive expansion.
+                redaction_amplification[index..].fill(true);
+                break;
+            };
+            if !changed {
+                continue;
+            }
+            let Some(next_total) = redacted_argument_bytes.checked_add(redacted.len()) else {
+                redaction_amplification[index..].fill(true);
+                break;
+            };
+            if next_total > MAX_PARSE_BYTES {
+                redaction_amplification[index..].fill(true);
+                break;
+            }
+            redacted_argument_bytes = next_total;
+            redaction_memos.insert(redaction_memo_key(&call.name, &call.raw_args), redacted);
+        }
         let mut skip_approvals = self.mode == Mode::Enforce
             && (evaluations.iter().any(|(outcome, _, _)| match outcome {
                 PolicyOutcome::Deny(_) => true,
@@ -5002,11 +5002,13 @@ fn redacted_approval_url(parsed: &Url) -> String {
 
 /// Stable key for staging a preflighted redaction rewrite between buffered
 /// governance and the response-body transform. Uses a digest so the map does
-/// not retain a second copy of raw hostile arguments as the key.
+/// not retain a second copy of raw hostile arguments as the key. A fixed-width
+/// name-length prefix keeps arbitrary JSON strings unambiguous (tool names and
+/// arguments may both contain NUL or any other delimiter candidate).
 fn redaction_memo_key(name: &str, raw_args: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(name.len().to_be_bytes());
     hasher.update(name.as_bytes());
-    hasher.update([0u8]);
     hasher.update(raw_args.as_bytes());
     let digest = hasher.finalize();
     let mut out = String::with_capacity(64);

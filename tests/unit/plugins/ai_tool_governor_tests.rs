@@ -943,6 +943,72 @@ async fn redacts_matched_args_and_never_leaks_secret_in_metadata() {
     );
 }
 
+/// Tool names and raw argument strings are arbitrary JSON strings, so the
+/// request-scoped redaction memo key must not rely on a delimiter that either
+/// input can contain. These two distinct pairs collided under `name + NUL +
+/// args`; each call must receive only its own preflighted rewrite.
+#[tokio::test]
+async fn redaction_memos_distinguish_embedded_nul_boundaries() {
+    let plugin = make(json!({
+        "tools": {
+            "a": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "first", "regex": "b" }]
+            },
+            "a\u{0}": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "second", "regex": "b" }]
+            }
+        }
+    }));
+    let body = serde_json::to_vec(&json!({
+        "choices": [{
+            "message": {
+                "tool_calls": [
+                    {
+                        "id": "call_first",
+                        "type": "function",
+                        "function": { "name": "a", "arguments": "\u{0}b" }
+                    },
+                    {
+                        "id": "call_second",
+                        "type": "function",
+                        "function": { "name": "a\u{0}", "arguments": "b" }
+                    }
+                ]
+            }
+        }]
+    }))
+    .expect("serialize NUL-boundary redaction response");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let transformed = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("both tool calls require redaction");
+    let json: Value = serde_json::from_slice(&transformed).expect("transformed response JSON");
+    let calls = json["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("tool call array");
+    assert_eq!(
+        calls[0]["function"]["arguments"],
+        json!("\u{0}[REDACTED_TOOL_ARG:first]")
+    );
+    assert_eq!(
+        calls[1]["function"]["arguments"],
+        json!("[REDACTED_TOOL_ARG:second]")
+    );
+}
+
 #[tokio::test]
 async fn redacts_non_string_response_arguments_before_forwarding() {
     let plugin = make(json!({
