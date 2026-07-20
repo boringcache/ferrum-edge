@@ -781,29 +781,28 @@ async fn response_transformer_uses_backend_representation_for_sse_buffering() {
     // event before the backend's pause elapses proves the response was released
     // after headers rather than collected to EOF by the document transformer.
     let started = Instant::now();
-    let (mut sse_response, first_chunk) =
-        tokio::time::timeout(FIRST_EVENT_DEADLINE, async {
-            let mut response = client
-                .request(reqwest::Method::GET, &harness.proxy_url("/api/events"))
-                .header("accept", "text/event-stream")
-                .send()
-                .await
-                .expect("gateway returns SSE response headers");
-            let first_chunk = response
-                .chunk()
-                .await
-                .expect("read first SSE chunk")
-                .expect("stream must not end before the first event");
-            (response, first_chunk)
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "first SSE event did not arrive within {FIRST_EVENT_DEADLINE:?} \
+    let (mut sse_response, first_chunk) = tokio::time::timeout(FIRST_EVENT_DEADLINE, async {
+        let mut response = client
+            .request(reqwest::Method::GET, &harness.proxy_url("/api/events"))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .expect("gateway returns SSE response headers");
+        let first_chunk = response
+            .chunk()
+            .await
+            .expect("read first SSE chunk")
+            .expect("stream must not end before the first event");
+        (response, first_chunk)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "first SSE event did not arrive within {FIRST_EVENT_DEADLINE:?} \
                  (elapsed {:?}) — response_transformer buffered the event stream",
-                started.elapsed()
-            )
-        });
+            started.elapsed()
+        )
+    });
     assert_eq!(sse_response.status(), StatusCode::OK);
     assert_eq!(
         sse_response
