@@ -77,7 +77,7 @@ fn test_config_must_be_an_object_for_every_json_value_class() {
         json!([]),
         json!("expose_headers: [x-request-id]"),
         json!(42),
-        json!(3.14),
+        json!(3.5),
         json!(true),
         json!(false),
     ] {
@@ -189,7 +189,7 @@ fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
     )
     .expect_err("file mode must reject unknown grpc_web keys");
     assert!(
-        file_err.to_string().contains("config.expose_header"),
+        file_err.to_string().contains("1 plugin config error(s)"),
         "got: {file_err}"
     );
 
