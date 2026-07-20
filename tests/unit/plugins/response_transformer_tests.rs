@@ -815,11 +815,7 @@ async fn test_response_transformer_ambiguous_event_stream_types_stay_buffered() 
         );
         assert!(plugin.may_release_response_body_under_retries(&ctx));
         assert!(
-            !plugin.should_release_response_body_under_retries(
-                &ctx,
-                200,
-                &response_headers,
-            ),
+            !plugin.should_release_response_body_under_retries(&ctx, 200, &response_headers,),
             "ambiguous media type must not release under retries: {content_type}"
         );
     }
