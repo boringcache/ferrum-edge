@@ -402,15 +402,21 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 
 **Priority:** 9075
 
+**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map. Registration policy is `OptionalFailOpen` — Admin create/update still returns HTTP 400 for invalid enabled configs, while file-mode load and plugin-cache rebuild warn and omit the plugin rather than aborting the gateway. Disabled plugin configs skip construction validation.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | StatsD server hostname or IP address |
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
 | `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`) |
-| `global_tags` | Object | *(none)* | Key-value pairs appended as DogStatsD tags to every metric |
+| `global_tags` | Object | *(none)* | Key-value pairs appended as DogStatsD tags to every metric (open string map) |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing |
+| `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (shared batching logger) |
+| `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts |
+| `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Large payloads are automatically split across multiple UDP packets at 1472-byte MTU boundaries.
 
@@ -418,7 +424,7 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 
 **Tag sanitization.** Operator-controlled tag values (proxy name/id, HTTP method, protocol) are sanitized before being written to the line protocol: `,` `|` `#` `:` and whitespace are replaced with `_`. Empty values become the literal `none`. This keeps a proxy name containing delimiters from corrupting downstream parsing in StatsD / DogStatsD / Telegraf.
 
-**Metrics emitted per HTTP/gRPC/WebSocket request:**
+**Metrics emitted per HTTP/gRPC request** (WebSocket upgrade handshakes currently share this HTTP formatter path; dedicated WebSocket terminal metrics are tracked separately in [#2555](https://github.com/ferrum-edge/ferrum-edge/issues/2555) and must not be assumed present here):
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -428,19 +434,37 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 | `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead |
 | `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
 | `{prefix}.request.status.{N}xx` | Counter | Status code bucket (2xx, 4xx, 5xx, etc.) |
+| `{prefix}.request.client_disconnect` | Counter | Emitted only when the terminal HTTP summary records `client_disconnected: true` |
 
 Tags: `method`, `status`, `status_class`, `proxy`, `namespace` (plus any `global_tags`).
 
-**Metrics emitted per stream (TCP/UDP) disconnect:**
+**Metrics emitted per stream (TCP/UDP/DTLS) disconnect:**
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `{prefix}.stream.count` | Counter | Stream connection count |
 | `{prefix}.stream.duration_ms` | Timer | Connection duration |
-| `{prefix}.stream.bytes_sent` | Gauge | Bytes sent to client |
-| `{prefix}.stream.bytes_received` | Gauge | Bytes received from client |
+| `{prefix}.stream.bytes_sent` | Gauge | Bytes the gateway relayed **client→backend** (same directional contract as `StreamTransactionSummary.bytes_sent`) |
+| `{prefix}.stream.bytes_received` | Gauge | Bytes the gateway relayed **backend→client** (same directional contract as `StreamTransactionSummary.bytes_received`) |
+| `{prefix}.stream.disconnect` | Counter | One disconnect event per stream summary |
 
-Tags: `protocol`, `proxy`, `error`, `namespace` (plus any `global_tags`).
+Stream byte families are **per-disconnect gauges with last-observation semantics**, not cumulative byte counters: each disconnect overwrites the series with that session's final byte totals.
+
+Tags: `protocol`, `proxy`, `error`, `cause`, `direction`, `namespace` (plus any `global_tags`).
+
+**`cause` tag values** (from `disconnect_cause`; when the summary field is unset the tag is the literal `unknown`):
+
+- `idle_timeout`
+- `recv_error`
+- `backend_error`
+- `graceful_shutdown`
+- `unknown` (summary `disconnect_cause` is `None`)
+
+**`direction` tag values** (from `disconnect_direction`; both `None` and explicit `Unknown` serialize as `unknown`):
+
+- `client_to_backend`
+- `backend_to_client`
+- `unknown`
 
 ```yaml
 plugin_name: statsd_logging
@@ -453,6 +477,8 @@ config:
     region: "us-east-1"
   flush_interval_ms: 500
   max_batch_lines: 50
+  max_retries: 0
+  retry_delay_ms: 0
 ```
 
 #### DogStatsD / Datadog Integration

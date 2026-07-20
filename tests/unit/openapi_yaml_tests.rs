@@ -3021,6 +3021,109 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     }
 }
 
+#[tokio::test]
+async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::statsd_logging::{STATSD_LOGGING_CONFIG_KEYS, StatsdLogging};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/StatsdLoggingConfig")
+        .expect("StatsdLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["global_tags"]["additionalProperties"]["type"], "string",
+        "global_tags must remain an intentionally open string map"
+    );
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("Statsd properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = STATSD_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "StatsD runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let statsd_docs = plugin_docs
+        .split("### `statsd_logging`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("statsd_logging docs section");
+    for key in STATSD_LOGGING_CONFIG_KEYS {
+        assert!(
+            statsd_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md statsd section missing `{key}`"
+        );
+    }
+    assert!(statsd_docs.contains("OptionalFailOpen"));
+    assert!(statsd_docs.contains("max_retries"));
+    assert!(statsd_docs.contains("retry_delay_ms"));
+
+    let valid = json!({
+        "host": "statsd.example.test",
+        "port": 9125,
+        "prefix": "edge.prod",
+        "global_tags": {"env": "prod", "region": "us-east-1"},
+        "flush_interval_ms": 500,
+        "buffer_capacity": 10000,
+        "max_batch_lines": 50,
+        "max_retries": 0,
+        "retry_delay_ms": 0,
+        "schema": {
+            "summary_type": "both",
+            "rename": {"proxy_id": "route_id"}
+        }
+    });
+    assert_component_validity(&spec, "StatsdLoggingConfig", &valid, true);
+    assert!(StatsdLogging::new(&valid, PluginHttpClient::default()).is_ok());
+
+    let valid_minima = json!({"host": "127.0.0.1"});
+    assert_component_validity(&spec, "StatsdLoggingConfig", &valid_minima, true);
+    assert!(StatsdLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let runtime_and_schema_invalid = [
+        json!({"host": "statsd.example.test", "prot": 9125}),
+        json!({"host": "statsd.example.test", "prefx": "edge.prod"}),
+        json!({"host": "statsd.example.test", "global_tgas": {"env": "prod"}}),
+        json!({"host": "statsd.example.test", "schema_reff": "redacted-summary"}),
+        json!({"host": "statsd.example.test", "max_retrie": 5}),
+        json!({"host": "statsd.example.test", "aaa_extra": 1, "zzz_extra": 2}),
+        json!({}),
+        json!({"host": "statsd.example.test", "port": 0}),
+        json!({"host": "statsd.example.test", "port": 65536}),
+        json!({"host": "statsd.example.test", "global_tags": {"env": true}}),
+        json!({"host": "statsd.example.test", "prefix": null}),
+        json!({"host": "statsd.example.test", "global_tags": null}),
+        json!({"host": "statsd.example.test", "schema": null}),
+        json!({"host": null}),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+        assert!(
+            StatsdLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid StatsD config: {config}"
+        );
+    }
+
+    // OpenAPI rejects typed nulls on every declared property. Shared batch-builder
+    // defaults still absorb some null numerics (#2562); unknown-key closure is the
+    // #2620 contract under test here.
+    for key in STATSD_LOGGING_CONFIG_KEYS {
+        let mut config = json!({"host": "statsd.example.test"});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+    }
+}
+
 #[test]
 fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     use ferrum_edge::plugins::ip_restriction::IpRestriction;
