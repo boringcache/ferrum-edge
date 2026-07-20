@@ -16506,8 +16506,9 @@ components:
           default: 1048576
           description: >-
             Maximum response bytes the synthetic client consumes per request.
-            The client stops reading at the cap, bounding its own work and
-            memory without changing the backend response.
+            Must be greater than zero. The client stops reading at the cap,
+            bounding its own work and memory without changing the backend
+            response.
         gateway_port:
           type: [integer, "null"]
           format: uint16
