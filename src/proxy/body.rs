@@ -112,7 +112,10 @@ pub struct ProxyBody {
     /// writes the error response RSTs the frontend stream and races the
     /// `grpc-status` Trailers-Only frame; holding it here defers that reset
     /// until after the empty error body completes (HEADERS + END_STREAM).
-    _held_frontend_grpc_upload: Option<crate::proxy::grpc_proxy::GrpcBody>,
+    /// Boxed so this rare error-path hold remains pointer-sized on every
+    /// ordinary response body. `GrpcBody` contains an `Incoming` or mpsc
+    /// receiver and must not inflate the proxy hot-path response envelope.
+    _held_frontend_grpc_upload: Option<Box<crate::proxy::grpc_proxy::GrpcBody>>,
 }
 
 #[derive(Clone)]
@@ -436,7 +439,7 @@ impl ProxyBody {
         mut self,
         upload: crate::proxy::grpc_proxy::GrpcBody,
     ) -> Self {
-        self._held_frontend_grpc_upload = Some(upload);
+        self._held_frontend_grpc_upload = Some(Box::new(upload));
         self
     }
 

@@ -21,7 +21,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use h2::client as h2_client;
-use http::{HeaderMap, Request, Response};
+use http::{HeaderMap, HeaderValue, Request, Response};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -352,6 +352,7 @@ impl GrpcClient {
         let body_trailers_fut = async {
             let mut raw_frames = Vec::new();
             let mut stream_error: Option<String> = None;
+            let mut stream_error_is_remote_no_error_reset = false;
             loop {
                 match body_stream.data().await {
                     Some(Ok(chunk)) => {
@@ -359,6 +360,8 @@ impl GrpcClient {
                         raw_frames.push(chunk);
                     }
                     Some(Err(e)) => {
+                        stream_error_is_remote_no_error_reset =
+                            is_remote_h2_no_error_reset(&e);
                         stream_error = Some(format!("body error: {e}"));
                         break;
                     }
@@ -369,6 +372,8 @@ impl GrpcClient {
                 match body_stream.trailers().await {
                     Ok(t) => t,
                     Err(e) => {
+                        stream_error_is_remote_no_error_reset =
+                            is_remote_h2_no_error_reset(&e);
                         stream_error = Some(format!("trailers error: {e}"));
                         None
                     }
@@ -376,34 +381,48 @@ impl GrpcClient {
             } else {
                 None
             };
-            (raw_frames, trailers, stream_error)
+            (
+                raw_frames,
+                trailers,
+                stream_error,
+                stream_error_is_remote_no_error_reset,
+            )
         };
 
-        let (raw_frames, trailers, stream_error) =
-            match tokio::time::timeout(Duration::from_secs(20), body_trailers_fut).await {
-                Ok(collected) => collected,
-                Err(_) => {
-                    conn_task.abort();
-                    return Ok(GrpcResponse {
-                        http_status,
-                        headers,
-                        messages: Vec::new(),
-                        raw_body_frames: Vec::new(),
-                        trailers: None,
-                        stream_error: Some("body/trailers read timed out".into()),
-                        request_send_error,
-                    });
-                }
-            };
+        let (
+            raw_frames,
+            trailers,
+            stream_error,
+            stream_error_is_remote_no_error_reset,
+        ) = match tokio::time::timeout(Duration::from_secs(20), body_trailers_fut).await {
+            Ok(collected) => collected,
+            Err(_) => {
+                conn_task.abort();
+                return Ok(GrpcResponse {
+                    http_status,
+                    headers,
+                    messages: Vec::new(),
+                    raw_body_frames: Vec::new(),
+                    trailers: None,
+                    stream_error: Some("body/trailers read timed out".into()),
+                    request_send_error,
+                });
+            }
+        };
 
-        // RFC 7540 §8.1: after a complete early response, the server MAY send
+        // RFC 9113 §8.1: after a complete early response, the server MAY send
         // RST_STREAM(NO_ERROR) to cancel an unread request body. Raw h2 surfaces
         // that as `stream error received: not a result of an error` on the recv
         // half even when Trailers-Only `grpc-status` already arrived in HEADERS.
-        // Clients MUST NOT discard the response; clear only that benign signal
-        // when an explicit grpc-status is already present (#2057 residual).
-        let stream_error =
-            suppress_benign_early_response_reset(stream_error, &headers, trailers.as_ref());
+        // Clients MUST NOT discard the response. Clear only a typed, remotely
+        // received h2 reset with reason NO_ERROR when a valid explicit
+        // grpc-status is already present (#2057 residual).
+        let stream_error = suppress_benign_early_response_reset(
+            stream_error,
+            stream_error_is_remote_no_error_reset,
+            &headers,
+            trailers.as_ref(),
+        );
 
         let messages = decode_grpc_messages(&raw_frames);
         // Don't care if conn_task errors; the important state is above.
@@ -421,26 +440,41 @@ impl GrpcClient {
     }
 }
 
-/// Returns `None` when `stream_error` is solely the RFC 7540 early-response
-/// `RST_STREAM(NO_ERROR)` signal and an explicit `grpc-status` is already
+/// Returns `None` when `stream_error` is solely the RFC 9113 early-response
+/// `RST_STREAM(NO_ERROR)` signal and a valid explicit `grpc-status` is already
 /// present in headers or trailers. Any other stream error is preserved.
 fn suppress_benign_early_response_reset(
     stream_error: Option<String>,
+    stream_error_is_remote_no_error_reset: bool,
     headers: &HeaderMap,
     trailers: Option<&HeaderMap>,
 ) -> Option<String> {
     let err = stream_error?;
-    let has_grpc_status = headers.get("grpc-status").is_some()
-        || trailers.is_some_and(|t| t.get("grpc-status").is_some());
-    if has_grpc_status && is_h2_no_error_stream_reset(&err) {
+    let explicit_grpc_status = trailers
+        .and_then(|map| map.get("grpc-status"))
+        .or_else(|| headers.get("grpc-status"));
+    if stream_error_is_remote_no_error_reset
+        && explicit_grpc_status.is_some_and(is_valid_explicit_grpc_status)
+    {
         return None;
     }
     Some(err)
 }
 
-fn is_h2_no_error_stream_reset(err: &str) -> bool {
-    // h2::Reason::NoError displays as "not a result of an error".
-    err.contains("not a result of an error")
+fn is_valid_explicit_grpc_status(value: &HeaderValue) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.iter().all(u8::is_ascii_digit)
+        && (bytes.len() == 1 || bytes[0] != b'0')
+        && value
+            .to_str()
+            .ok()
+            .and_then(|status| status.parse::<u32>().ok())
+            .is_some()
+}
+
+fn is_remote_h2_no_error_reset(err: &h2::Error) -> bool {
+    err.is_reset() && err.is_remote() && err.reason() == Some(h2::Reason::NO_ERROR)
 }
 
 /// Decode the length-prefixed gRPC messages out of a concatenation of DATA
@@ -646,12 +680,13 @@ mod tests {
         headers.insert("grpc-status", "14".parse().unwrap());
         let cleared = suppress_benign_early_response_reset(
             Some("body error: stream error received: not a result of an error".into()),
+            true,
             &headers,
             None,
         );
         assert!(
             cleared.is_none(),
-            "RFC 7540 early-response NO_ERROR must not override Trailers-Only grpc-status"
+            "RFC 9113 early-response NO_ERROR must not override Trailers-Only grpc-status"
         );
     }
 
@@ -660,14 +695,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("grpc-status", "14".parse().unwrap());
         let kept = suppress_benign_early_response_reset(
-            Some("body error: stream error received: cancel".into()),
+            Some(
+                "body error: unrelated failure mentioning not a result of an error".into(),
+            ),
+            false,
             &headers,
             None,
         );
         assert_eq!(
             kept.as_deref(),
-            Some("body error: stream error received: cancel"),
-            "real stream resets must still fail the RPC"
+            Some("body error: unrelated failure mentioning not a result of an error"),
+            "diagnostic text must never substitute for the typed h2 reset reason"
         );
     }
 
@@ -676,6 +714,7 @@ mod tests {
         let headers = HeaderMap::new();
         let kept = suppress_benign_early_response_reset(
             Some("body error: stream error received: not a result of an error".into()),
+            true,
             &headers,
             None,
         );
@@ -683,6 +722,30 @@ mod tests {
             kept.is_some(),
             "NO_ERROR without grpc-status is not a well-formed gateway error"
         );
+    }
+
+    #[test]
+    fn preserve_no_error_reset_with_malformed_grpc_status() {
+        for malformed in ["invalid", "+14", "014"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("grpc-status", malformed.parse().unwrap());
+            let kept = suppress_benign_early_response_reset(
+                Some("body error: stream error received: not a result of an error".into()),
+                true,
+                &headers,
+                None,
+            );
+            assert!(
+                kept.is_some(),
+                "malformed grpc-status {malformed:?} must not make an incomplete response valid"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_no_error_reason_is_not_a_remote_stream_reset() {
+        let error = h2::Error::from(h2::Reason::NO_ERROR);
+        assert!(!is_remote_h2_no_error_reset(&error));
     }
 
     #[test]

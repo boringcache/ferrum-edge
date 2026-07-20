@@ -130,7 +130,7 @@ gateway_matrix! {
 //    queued RST_STREAM(NO_ERROR) against the same stream. Production now
 //    retains that upload on the error ProxyBody until HEADERS+END_STREAM
 //    complete; the test client also ignores a lone NO_ERROR recv signal
-//    when an explicit grpc-status is already present (RFC 7540 §8.1).
+//    when an explicit grpc-status is already present (RFC 9113 §8.1).
 gateway_matrix! {
     name = backend_accepts_then_rst_returns_502,
     frontend = [H1, H2, Grpc],
