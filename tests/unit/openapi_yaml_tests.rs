@@ -4849,7 +4849,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     }
 
     let guide = include_str!("../../docs/plugins.md");
-    assert!(guide.contains("exact (`=/api/v1`)"));
+    assert!(guide.contains("Exact (`=/api/v1`)"));
     assert!(guide.contains("Host-only"));
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
