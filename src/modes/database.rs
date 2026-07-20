@@ -2968,7 +2968,7 @@ mod tests {
             .expect("incremental-success helper must exist");
         let sig_end = sig_start
             + source[sig_start..]
-                .find(") {")
+                .find('{')
                 .expect("incremental-success helper signature must terminate");
         assert!(
             !source[sig_start..sig_end].contains("config_rejected"),
