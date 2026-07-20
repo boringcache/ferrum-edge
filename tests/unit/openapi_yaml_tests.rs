@@ -3733,6 +3733,170 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsConfig"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsQuietHourWindow"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsRecovery"]["additionalProperties"],
+        json!(false)
+    );
+    for channel in [
+        "ProxyAlertsSlackChannel",
+        "ProxyAlertsTeamsChannel",
+        "ProxyAlertsDiscordChannel",
+        "ProxyAlertsWebhookChannel",
+    ] {
+        assert_eq!(
+            spec["components"]["schemas"][channel]["additionalProperties"],
+            json!(false),
+            "{channel} must be closed"
+        );
+    }
+    for rule in [
+        "ProxyAlertsErrorRateRule",
+        "ProxyAlertsStatusCodeCountRule",
+        "ProxyAlertsLatencyPercentileRule",
+        "ProxyAlertsErrorClassRule",
+        "ProxyAlertsStreamDisconnectCauseRule",
+    ] {
+        assert_eq!(
+            spec["components"]["schemas"][rule]["unevaluatedProperties"],
+            json!(false),
+            "{rule} must close composed properties"
+        );
+    }
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsChannel"]["discriminator"]["propertyName"],
+        json!("type")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsRule"]["discriminator"]["propertyName"],
+        json!("type")
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["ProxyAlertsWebhookChannel"]["properties"]["headers"]
+            ["additionalProperties"],
+        json!({"type": "string"})
+    );
+
+    let valid = json!({
+        "channels": {
+            "team-alpha_42": {
+                "type": "webhook",
+                "url": "https://example.com/hooks",
+                "headers": {
+                    "X-Custom-Trace": "abc",
+                    "X-Routing-Key": "rk"
+                },
+                "body_template": "{\"ok\":true}"
+            }
+        },
+        "rules": [{
+            "name": "errors",
+            "type": "error_rate",
+            "status_codes": [500],
+            "threshold_percent": 5.0,
+            "channels": ["team-alpha_42"]
+        }]
+    });
+    assert_component_validity(&spec, "ProxyAlertsConfig", &valid, true);
+
+    for invalid in [
+        json!({
+            "enabledd": false,
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
+        json!({
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x",
+                    "channel_overide": "#alerts"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
+        json!({
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "threshold_count": 10,
+                "channels": ["ops"]
+            }]
+        }),
+        json!({
+            "quiet_hours_utc": [{"from": "23:00", "to": "06:00", "weekdayss": [0]}],
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
+        json!({
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"],
+                "recovery": {"resolved_window_second": 300}
+            }]
+        }),
+    ] {
+        assert_component_validity(&spec, "ProxyAlertsConfig", &invalid, false);
+    }
+}
+
+#[test]
 fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::ai_prompt_compressor::AiPromptCompressor;
 

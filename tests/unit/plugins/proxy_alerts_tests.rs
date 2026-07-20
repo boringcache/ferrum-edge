@@ -312,6 +312,236 @@ fn accepts_valid_minimal_config_without_tokio_runtime() {
     assert_eq!(plugin.name(), "proxy_alerts");
 }
 
+#[test]
+fn rejects_unknown_top_level_and_nested_keys_with_paths() {
+    for (config, needle) in [
+        (
+            json!({
+                "enabledd": false,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "config.enabledd",
+        ),
+        (
+            json!({
+                "max_concurent_dispatches": 1,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "config.max_concurent_dispatches",
+        ),
+        (
+            json!({
+                "quiet_hours_utc": [{
+                    "from": "23:00",
+                    "to": "06:00",
+                    "weekdayss": [0]
+                }],
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "quiet_hours_utc[0].weekdayss",
+        ),
+        (
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x",
+                        "channel_overide": "#low-volume"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "channels.ops.channel_overide",
+        ),
+        (
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "cooldown_second": 3600,
+                    "channels": ["ops"]
+                }]
+            }),
+            "rules[0].cooldown_second",
+        ),
+        (
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"],
+                    "recovery": { "resolved_window_second": 300 }
+                }]
+            }),
+            "rules[0].recovery.resolved_window_second",
+        ),
+        (
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "threshold_count": 10,
+                    "channels": ["ops"]
+                }]
+            }),
+            "rules[0].threshold_count",
+        ),
+        (
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "teams",
+                        "webhook_url": "https://outlook.office.com/x",
+                        "channel_override": "#alerts"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "status_code_count",
+                    "status_codes": [500],
+                    "threshold_count": 10,
+                    "channels": ["ops"]
+                }]
+            }),
+            "channels.ops.channel_override",
+        ),
+    ] {
+        let err = ProxyAlerts::new(&config, http_client())
+            .expect_err("unknown configuration keys must fail closed");
+        assert!(
+            err.contains("unknown configuration key"),
+            "missing unknown-key wording: {err}"
+        );
+        assert!(
+            err.contains(needle),
+            "error did not identify {needle}: {err}"
+        );
+    }
+}
+
+#[test]
+fn shared_validator_rejects_unknown_proxy_alerts_keys() {
+    let err = ferrum_edge::plugins::validate_plugin_config(
+        "proxy_alerts",
+        &json!({
+            "enabledd": false,
+            "channels": {
+                "ops": {
+                    "type": "slack",
+                    "webhook_url": "https://hooks.slack.com/x"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
+    )
+    .expect_err("shared validation must reject unknown keys");
+    assert!(
+        err.contains("config.enabledd"),
+        "shared validator path missing: {err}"
+    );
+}
+
+#[test]
+fn accepts_arbitrary_channel_names_and_webhook_header_names() {
+    let plugin = ProxyAlerts::new(
+        &json!({
+            "channels": {
+                "team-alpha_42": {
+                    "type": "webhook",
+                    "url": "https://example.com/hooks",
+                    "headers": {
+                        "X-Custom-Trace": "abc",
+                        "X-Routing-Key": "rk"
+                    },
+                    "body_template": "{\"ok\":true}"
+                }
+            },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["team-alpha_42"]
+            }]
+        }),
+        http_client(),
+    )
+    .expect("arbitrary channel and header names must remain valid");
+    assert_eq!(plugin.name(), "proxy_alerts");
+}
+
 #[tokio::test]
 async fn accepts_all_rule_types() {
     let cfg = json!({

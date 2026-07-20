@@ -62,6 +62,8 @@ This plugin is a lightweight in-gateway alerting surface — useful when you wan
 
 See [docs/notifications.md](notifications.md#channel-json-schema) for the full per-channel field reference (including `*_env` secret-resolver forms).
 
+Unknown properties are rejected at the top level and within quiet-hours, recovery, each selected rule variant, and each selected notification channel. The `channels` map stays open for arbitrary channel names, and generic webhook `headers` stay open for arbitrary header names.
+
 ### Top-level options
 
 | Field | Default | Notes |

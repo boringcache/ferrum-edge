@@ -195,6 +195,73 @@ fn parse_channels_accepts_all_four_kinds() {
 }
 
 #[test]
+fn parse_channels_rejects_unknown_and_cross_variant_keys() {
+    for (def, needle) in [
+        (
+            json!({
+                "type": "slack",
+                "webhook_url": "https://hooks.slack.com/x",
+                "channel_overide": "#alerts"
+            }),
+            "channels.ops.channel_overide",
+        ),
+        (
+            json!({
+                "type": "teams",
+                "webhook_url": "https://outlook.office.com/x",
+                "username": "ferrum"
+            }),
+            "channels.ops.username",
+        ),
+        (
+            json!({
+                "type": "discord",
+                "webhook_url": "https://discord.com/api/webhooks/x",
+                "icon_emoji": ":bell:"
+            }),
+            "channels.ops.icon_emoji",
+        ),
+        (
+            json!({
+                "type": "webhook",
+                "url": "https://example.com/hook",
+                "body_template": "{}",
+                "webhook_url": "https://hooks.slack.com/x"
+            }),
+            "channels.ops.webhook_url",
+        ),
+    ] {
+        let err = parse_channels(&json!({ "ops": def }))
+            .expect_err("unknown/cross-variant channel keys must fail closed");
+        assert!(
+            err.contains("unknown configuration key"),
+            "missing unknown-key wording: {err}"
+        );
+        assert!(
+            err.contains(needle),
+            "error did not identify {needle}: {err}"
+        );
+    }
+}
+
+#[test]
+fn parse_channels_accepts_arbitrary_names_and_webhook_headers() {
+    let map = parse_channels(&json!({
+        "PagerDuty_v2": {
+            "type": "webhook",
+            "url": "https://events.pagerduty.com/v2/enqueue",
+            "headers": {
+                "X-Custom-Auth": "secret",
+                "X-Request-Id": "abc-123"
+            },
+            "body_template": "{}"
+        }
+    }))
+    .expect("arbitrary channel names and webhook header names must remain open");
+    assert_eq!(map["PagerDuty_v2"].kind(), "webhook");
+}
+
+#[test]
 fn notification_channels_expose_warmup_hostnames() {
     let map = parse_channels(&json!({
         "ops_slack": { "type": "slack", "webhook_url": "https://hooks.slack.com/x" },

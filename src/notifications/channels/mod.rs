@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use url::Url;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
@@ -33,6 +33,25 @@ pub mod webhook;
 /// value that has no operator-meaningful target.
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64: u64 = 1024 * 1024;
 const RESPONSE_BODY_DRAIN_LIMIT_BYTES: usize = RESPONSE_BODY_DRAIN_LIMIT_BYTES_U64 as usize;
+
+const SLACK_CHANNEL_KEYS: &[&str] = &[
+    "type",
+    "webhook_url",
+    "webhook_url_env",
+    "channel_override",
+    "username",
+    "icon_emoji",
+];
+const TEAMS_CHANNEL_KEYS: &[&str] = &["type", "webhook_url", "webhook_url_env"];
+const DISCORD_CHANNEL_KEYS: &[&str] = &["type", "webhook_url", "webhook_url_env", "username"];
+const WEBHOOK_CHANNEL_KEYS: &[&str] = &[
+    "type",
+    "url",
+    "url_env",
+    "method",
+    "headers",
+    "body_template",
+];
 
 #[allow(unused_imports)]
 pub use discord::DiscordChannel;
@@ -155,19 +174,98 @@ fn build_channel(name: &str, def: &Value) -> Result<NotificationChannel, String>
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("channel '{name}': 'type' is required"))?;
+    let path = format!("channels.{name}");
     match kind {
-        "slack" => Ok(NotificationChannel::Slack(SlackChannel::new(name, def)?)),
-        "teams" => Ok(NotificationChannel::Teams(TeamsChannel::new(name, def)?)),
-        "discord" => Ok(NotificationChannel::Discord(DiscordChannel::new(
-            name, def,
-        )?)),
-        "webhook" => Ok(NotificationChannel::Webhook(WebhookChannel::new(
-            name, def,
-        )?)),
+        "slack" => {
+            reject_unknown_channel_keys(obj, &path, SLACK_CHANNEL_KEYS)?;
+            Ok(NotificationChannel::Slack(SlackChannel::new(name, def)?))
+        }
+        "teams" => {
+            reject_unknown_channel_keys(obj, &path, TEAMS_CHANNEL_KEYS)?;
+            Ok(NotificationChannel::Teams(TeamsChannel::new(name, def)?))
+        }
+        "discord" => {
+            reject_unknown_channel_keys(obj, &path, DISCORD_CHANNEL_KEYS)?;
+            Ok(NotificationChannel::Discord(DiscordChannel::new(
+                name, def,
+            )?))
+        }
+        "webhook" => {
+            reject_unknown_channel_keys(obj, &path, WEBHOOK_CHANNEL_KEYS)?;
+            Ok(NotificationChannel::Webhook(WebhookChannel::new(
+                name, def,
+            )?))
+        }
         other => Err(format!(
             "channel '{name}': unknown 'type' '{other}' (expected one of: slack, teams, discord, webhook)"
         )),
     }
+}
+
+fn reject_unknown_channel_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let details: Vec<String> = unknown
+        .into_iter()
+        .map(|key| match suggest_channel_key(key, allowed) {
+            Some(suggestion) => format!("'{path}.{key}' (did you mean '{suggestion}'?)"),
+            None => format!("'{path}.{key}'"),
+        })
+        .collect();
+    Err(format!(
+        "unknown configuration key(s): {}",
+        details.join(", ")
+    ))
+}
+
+fn suggest_channel_key<'a>(unknown: &str, allowed: &[&'a str]) -> Option<&'a str> {
+    let mut best: Option<(usize, &'a str)> = None;
+    for candidate in allowed {
+        let distance = levenshtein(unknown, candidate);
+        if best
+            .map(|(best_distance, _)| distance < best_distance)
+            .unwrap_or(true)
+        {
+            best = Some((distance, *candidate));
+        }
+    }
+    let threshold = if unknown.len() > 8 { 3 } else { 2 };
+    best.filter(|(distance, _)| *distance <= threshold)
+        .map(|(_, name)| name)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
 }
 
 /// Helper used by every channel that accepts either an inline value or a

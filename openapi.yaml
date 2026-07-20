@@ -11728,6 +11728,11 @@ components:
         disconnect summaries, and WebSocket disconnect summaries, then sends
         Trigger/Resolve notifications to Slack, Microsoft Teams, Discord, or
         generic HTTP webhooks. See docs/proxy_alerts.md.
+
+        Unknown top-level keys are rejected. The `channels` map remains open
+        for arbitrary channel names; each channel/rule variant is closed to
+        its selected shape.
+      additionalProperties: false
       required: [channels, rules]
       properties:
         enabled:
@@ -11826,6 +11831,7 @@ components:
 
     ProxyAlertsQuietHourWindow:
       type: object
+      additionalProperties: false
       required: [from, to]
       properties:
         from:
@@ -11851,9 +11857,17 @@ components:
         - $ref: "#/components/schemas/ProxyAlertsTeamsChannel"
         - $ref: "#/components/schemas/ProxyAlertsDiscordChannel"
         - $ref: "#/components/schemas/ProxyAlertsWebhookChannel"
+      discriminator:
+        propertyName: type
+        mapping:
+          slack: "#/components/schemas/ProxyAlertsSlackChannel"
+          teams: "#/components/schemas/ProxyAlertsTeamsChannel"
+          discord: "#/components/schemas/ProxyAlertsDiscordChannel"
+          webhook: "#/components/schemas/ProxyAlertsWebhookChannel"
 
     ProxyAlertsSlackChannel:
       type: object
+      additionalProperties: false
       required: [type]
       anyOf:
         - required: [webhook_url]
@@ -11881,6 +11895,7 @@ components:
 
     ProxyAlertsTeamsChannel:
       type: object
+      additionalProperties: false
       required: [type]
       anyOf:
         - required: [webhook_url]
@@ -11899,6 +11914,7 @@ components:
 
     ProxyAlertsDiscordChannel:
       type: object
+      additionalProperties: false
       required: [type]
       anyOf:
         - required: [webhook_url]
@@ -11920,6 +11936,7 @@ components:
 
     ProxyAlertsWebhookChannel:
       type: object
+      additionalProperties: false
       required: [type, body_template]
       anyOf:
         - required: [url]
@@ -11957,9 +11974,21 @@ components:
         - $ref: "#/components/schemas/ProxyAlertsLatencyPercentileRule"
         - $ref: "#/components/schemas/ProxyAlertsErrorClassRule"
         - $ref: "#/components/schemas/ProxyAlertsStreamDisconnectCauseRule"
+      discriminator:
+        propertyName: type
+        mapping:
+          error_rate: "#/components/schemas/ProxyAlertsErrorRateRule"
+          status_code_count: "#/components/schemas/ProxyAlertsStatusCodeCountRule"
+          latency_percentile: "#/components/schemas/ProxyAlertsLatencyPercentileRule"
+          error_class: "#/components/schemas/ProxyAlertsErrorClassRule"
+          stream_disconnect_cause: "#/components/schemas/ProxyAlertsStreamDisconnectCauseRule"
 
     ProxyAlertsRuleCommon:
       type: object
+      description: >
+        Shared rule fields. Closed-object enforcement lives on each selected
+        rule variant via `unevaluatedProperties: false` so common and
+        type-specific keys compose correctly.
       properties:
         name:
           type: string
@@ -11998,6 +12027,7 @@ components:
 
     ProxyAlertsRecovery:
       type: object
+      additionalProperties: false
       properties:
         resolved_window_seconds:
           type: integer
@@ -12013,6 +12043,7 @@ components:
       default: medium
 
     ProxyAlertsErrorRateRule:
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
         - type: object
@@ -12036,6 +12067,7 @@ components:
               description: Minimum total requests in the window before the percentage can alert.
 
     ProxyAlertsStatusCodeCountRule:
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
         - type: object
@@ -12053,6 +12085,7 @@ components:
               description: Alert when at least this many matching responses occur in the window.
 
     ProxyAlertsLatencyPercentileRule:
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
         - type: object
@@ -12082,6 +12115,7 @@ components:
               description: Minimum observations in the window before the percentile can alert.
 
     ProxyAlertsErrorClassRule:
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
         - type: object
@@ -12103,6 +12137,7 @@ components:
               description: Alert when at least this many matching errors occur in the window.
 
     ProxyAlertsStreamDisconnectCauseRule:
+      unevaluatedProperties: false
       allOf:
         - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
         - type: object

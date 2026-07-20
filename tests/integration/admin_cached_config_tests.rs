@@ -2428,6 +2428,92 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, needle) in [
+        (
+            "proxy-alerts-enabled-typo",
+            json!({
+                "enabledd": false,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "config.enabledd",
+        ),
+        (
+            "proxy-alerts-rule-cross-variant",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "threshold_count": 10,
+                    "channels": ["ops"]
+                }]
+            }),
+            "rules[0].threshold_count",
+        ),
+        (
+            "proxy-alerts-channel-typo",
+            json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x",
+                        "channel_overide": "#alerts"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "channels.ops.channel_overide",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "proxy_alerts",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(status, 400, "unknown proxy_alerts key was admitted: {body}");
+        assert!(
+            body.to_string().contains(needle),
+            "unexpected admin validation response for {needle}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_malformed_correlation_id_configs() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

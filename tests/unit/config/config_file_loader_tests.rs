@@ -865,6 +865,85 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_proxy_alerts_keys() {
+    for (id, config, needle) in [
+        (
+            "proxy-alerts-enabled-typo",
+            serde_json::json!({
+                "enabledd": false,
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "channels": ["ops"]
+                }]
+            }),
+            "config.enabledd",
+        ),
+        (
+            "proxy-alerts-cross-variant",
+            serde_json::json!({
+                "channels": {
+                    "ops": {
+                        "type": "slack",
+                        "webhook_url": "https://hooks.slack.com/x",
+                        "channel_overide": "#alerts"
+                    }
+                },
+                "rules": [{
+                    "name": "errors",
+                    "type": "error_rate",
+                    "status_codes": [500],
+                    "threshold_percent": 5.0,
+                    "threshold_count": 10,
+                    "channels": ["ops"]
+                }]
+            }),
+            "unknown configuration key",
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "proxy_alerts",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file-mode load must reject unknown proxy_alerts keys");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("1 plugin config error(s)"),
+            "unexpected file-load error: {message}"
+        );
+        assert!(
+            message.contains(needle),
+            "file-load error missing {needle}: {message}"
+        );
+    }
+}
+
+#[test]
 fn test_file_config_rejects_unknown_ai_prompt_compressor_policy_keys() {
     for (id, config) in [
         (

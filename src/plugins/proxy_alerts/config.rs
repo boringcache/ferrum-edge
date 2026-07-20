@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::notifications::{NotificationChannel, Severity, channels::parse_channels};
 use crate::plugins::DisconnectCause;
@@ -29,6 +29,94 @@ const MIN_COOLDOWN_SECONDS: u32 = 1;
 const MAX_COOLDOWN_SECONDS: u32 = 86_400;
 const MIN_RESOLVED_WINDOW_SECONDS: u32 = 5;
 const MAX_RESOLVED_WINDOW_SECONDS: u32 = 86_400;
+
+const TOP_LEVEL_KEYS: &[&str] = &[
+    "enabled",
+    "default_cooldown_seconds",
+    "default_min_request_count",
+    "default_window_seconds",
+    "default_resolved_window_seconds",
+    "max_concurrent_dispatches",
+    "quiet_hours_utc",
+    "channels",
+    "rules",
+];
+
+const QUIET_HOUR_KEYS: &[&str] = &["from", "to", "weekdays"];
+const RECOVERY_KEYS: &[&str] = &["resolved_window_seconds"];
+const RULE_COMMON_KEYS: &[&str] = &[
+    "name",
+    "enabled",
+    "type",
+    "window_seconds",
+    "channels",
+    "cooldown_seconds",
+    "recovery",
+    "severity",
+];
+const ERROR_RATE_KEYS: &[&str] = &[
+    "name",
+    "enabled",
+    "type",
+    "window_seconds",
+    "channels",
+    "cooldown_seconds",
+    "recovery",
+    "severity",
+    "status_codes",
+    "threshold_percent",
+    "min_request_count",
+];
+const STATUS_CODE_COUNT_KEYS: &[&str] = &[
+    "name",
+    "enabled",
+    "type",
+    "window_seconds",
+    "channels",
+    "cooldown_seconds",
+    "recovery",
+    "severity",
+    "status_codes",
+    "threshold_count",
+];
+const LATENCY_PERCENTILE_KEYS: &[&str] = &[
+    "name",
+    "enabled",
+    "type",
+    "window_seconds",
+    "channels",
+    "cooldown_seconds",
+    "recovery",
+    "severity",
+    "metric",
+    "percentile",
+    "threshold_ms",
+    "min_request_count",
+];
+const ERROR_CLASS_KEYS: &[&str] = &[
+    "name",
+    "enabled",
+    "type",
+    "window_seconds",
+    "channels",
+    "cooldown_seconds",
+    "recovery",
+    "severity",
+    "classes",
+    "threshold_count",
+];
+const STREAM_DISCONNECT_CAUSE_KEYS: &[&str] = &[
+    "name",
+    "enabled",
+    "type",
+    "window_seconds",
+    "channels",
+    "cooldown_seconds",
+    "recovery",
+    "severity",
+    "causes",
+    "threshold_count",
+];
 
 #[derive(Debug)]
 pub struct ProxyAlertsConfig {
@@ -99,9 +187,10 @@ fn previous_weekday(day_from_sunday: u32) -> u32 {
 
 impl ProxyAlertsConfig {
     pub fn parse(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("proxy_alerts: config must be an object".to_string());
-        }
+        let obj = config
+            .as_object()
+            .ok_or_else(|| "proxy_alerts: config must be an object".to_string())?;
+        reject_unknown_keys(obj, "config", TOP_LEVEL_KEYS)?;
 
         let enabled = config
             .get("enabled")
@@ -230,9 +319,27 @@ fn parse_rule(
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("proxy_alerts: rule '{name}': 'type' is required"))?;
+    let rule_path = format!("rules[{id}]");
+    let allowed_keys = match kind {
+        "error_rate" => ERROR_RATE_KEYS,
+        "status_code_count" => STATUS_CODE_COUNT_KEYS,
+        "latency_percentile" => LATENCY_PERCENTILE_KEYS,
+        "error_class" => ERROR_CLASS_KEYS,
+        "stream_disconnect_cause" => STREAM_DISCONNECT_CAUSE_KEYS,
+        other => {
+            // Reject keys outside the common rule shape first so typos next to
+            // an unknown type still get a path-qualified admission error.
+            reject_unknown_keys(obj, &rule_path, RULE_COMMON_KEYS)?;
+            return Err(format!(
+                "proxy_alerts: rule '{name}': unknown type '{other}' (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause)"
+            ));
+        }
+    };
+    reject_unknown_keys(obj, &rule_path, allowed_keys)?;
+
     let window_seconds = read_window_seconds(raw, &name, defaults.window_seconds)?;
     let cooldown_ms = read_cooldown_ms(raw, &name, defaults.cooldown_seconds)?;
-    let recovery = read_recovery(raw, &name, defaults.resolved_window_seconds)?;
+    let recovery = read_recovery(raw, &name, id, defaults.resolved_window_seconds)?;
     let severity = read_severity(raw, &name)?;
     let (channel_ids, channel_names) = read_channels(raw, &name, channel_id_by_name, channels)?;
 
@@ -546,6 +653,7 @@ fn read_cooldown_ms(raw: &Value, rule_name: &str, default: u32) -> Result<u64, S
 fn read_recovery(
     raw: &Value,
     rule_name: &str,
+    rule_id: u32,
     default_resolved_window_seconds: u32,
 ) -> Result<Option<RecoveryConfig>, String> {
     let Some(rec) = raw.get("recovery") else {
@@ -554,8 +662,14 @@ fn read_recovery(
     if rec.is_null() {
         return Ok(None);
     }
-    rec.as_object()
-        .ok_or_else(|| format!("proxy_alerts: rule '{rule_name}': 'recovery' must be an object"))?;
+    let rec_obj = rec.as_object().ok_or_else(|| {
+        format!("proxy_alerts: rule '{rule_name}': 'recovery' must be an object")
+    })?;
+    reject_unknown_keys(
+        rec_obj,
+        &format!("rules[{rule_id}].recovery"),
+        RECOVERY_KEYS,
+    )?;
     let resolved_window_seconds =
         read_object_u32(rec, "resolved_window_seconds", rule_name, "recovery")?
             .unwrap_or(default_resolved_window_seconds);
@@ -675,6 +789,7 @@ fn parse_quiet_hours(value: Option<&Value>) -> Result<Vec<QuietHourWindow>, Stri
         let obj = item
             .as_object()
             .ok_or_else(|| format!("proxy_alerts: 'quiet_hours_utc'[{idx}] must be an object"))?;
+        reject_unknown_keys(obj, &format!("quiet_hours_utc[{idx}]"), QUIET_HOUR_KEYS)?;
         let from_str = obj.get("from").and_then(Value::as_str).ok_or_else(|| {
             format!("proxy_alerts: 'quiet_hours_utc'[{idx}]: 'from' is required (HH:MM)")
         })?;
@@ -788,4 +903,74 @@ fn disconnect_cause_from_str(s: &str) -> Option<DisconnectCause> {
         "graceful_shutdown" => Some(DisconnectCause::GracefulShutdown),
         _ => None,
     }
+}
+
+/// Reject keys that are not in `allowed`, with a path-qualified error and a
+/// spelling suggestion when the typo is close enough to be useful.
+fn reject_unknown_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let details: Vec<String> = unknown
+        .into_iter()
+        .map(|key| match suggest_key(key, allowed) {
+            Some(suggestion) => {
+                format!("'{path}.{key}' (did you mean '{suggestion}'?)")
+            }
+            None => format!("'{path}.{key}'"),
+        })
+        .collect();
+    Err(format!(
+        "proxy_alerts: unknown configuration key(s): {}",
+        details.join(", ")
+    ))
+}
+
+fn suggest_key<'a>(unknown: &str, allowed: &[&'a str]) -> Option<&'a str> {
+    let mut best: Option<(usize, &'a str)> = None;
+    for candidate in allowed {
+        let distance = levenshtein(unknown, candidate);
+        let is_better = best
+            .map(|(best_distance, _)| distance < best_distance)
+            .unwrap_or(true);
+        if is_better {
+            best = Some((distance, *candidate));
+        }
+    }
+    let threshold = if unknown.len() > 8 { 3 } else { 2 };
+    best.filter(|(distance, _)| *distance <= threshold)
+        .map(|(_, name)| name)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
 }
