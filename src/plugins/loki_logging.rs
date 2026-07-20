@@ -1163,7 +1163,7 @@ mod tests {
         assert!(matches!(
             classify_loki_response(
                 http::StatusCode::NO_CONTENT,
-                LokiDrainOutcome::TransportFailure,
+                HttpBatchDrainOutcome::TransportFailure,
             ),
             LokiAttemptOutcome::Delivered
         ));
