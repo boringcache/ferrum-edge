@@ -390,9 +390,10 @@ impl RedpandaContainer {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         if !created {
-            return Err(
-                format!("rpk topic create never succeeded for {name}; last output: {last}").into(),
-            );
+            return Err(format!(
+                "rpk topic create never succeeded for {name}; last output: {last}"
+            )
+            .into());
         }
 
         if !configs.is_empty() {

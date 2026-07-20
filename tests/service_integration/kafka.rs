@@ -265,7 +265,8 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
         oversized_snap.delivery_failed_total
     );
     assert_eq!(
-        oversized_snap.queue_rejected_total, 0,
+        oversized_snap.queue_rejected_total,
+        0,
         "oversized proof must be broker delivery failure, not local queue rejection: admitted={} rejected={} failed={}",
         oversized_snap.admitted_total,
         oversized_snap.queue_rejected_total,
