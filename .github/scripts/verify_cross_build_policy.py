@@ -3613,6 +3613,16 @@ def generated_shell_assignment_spans(
     )
 
 
+def shell_capture_target_name(target: str) -> str | None:
+    """Return the base variable name of a scalar or indexed capture target."""
+
+    matched = re.fullmatch(
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\n]*\])?",
+        target,
+    )
+    return matched.group("name") if matched is not None else None
+
+
 def shell_capture_target_names(segment: tuple[str, ...]) -> frozenset[str]:
     """Return variables populated by a bounded shell capture builtin."""
 
@@ -3633,15 +3643,15 @@ def shell_capture_target_names(segment: tuple[str, ...]) -> frozenset[str]:
                 target = argument[2:]
             else:
                 continue
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", target):
-                names.add(target)
+            if (name := shell_capture_target_name(target)) is not None:
+                names.add(name)
         return frozenset(names)
     if command not in {"mapfile", "read", "readarray"}:
         return frozenset()
     names.update(
-        argument
+        name
         for argument in arguments
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argument)
+        if (name := shell_capture_target_name(argument)) is not None
     )
     # These are the documented implicit destinations when no explicit variable
     # is supplied. Retaining them unconditionally is conservative when options
@@ -18788,6 +18798,11 @@ pre_build = []
             "./scripts/build",
             'printf -v generated \'%s\' "$(./scripts/build)"; '
             'eval "$generated"',
+        ),
+        "eval through indexed printf-v capture": extensionless_workflow.replace(
+            "./scripts/build",
+            'printf -v \'generated[0]\' \'%s\' "$(./scripts/build)"; '
+            'eval "${generated[0]}"',
         ),
         "eval through an assigned variable": extensionless_workflow.replace(
             "./scripts/build",
