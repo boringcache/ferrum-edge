@@ -1339,6 +1339,115 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("stream-router-policy", true);
+    plugin.plugin_name = "ai_stream_router".to_string();
+    plugin.config = serde_json::json!({
+        "enabled": true,
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "endpoint": "https://api.openai.com/v1/chat/completions",
+            "api_key": "sk-last-known-good",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ai_stream_router")
+    );
+
+    for (label, bad_config, needle) in [
+        (
+            "enabled-typo",
+            serde_json::json!({
+                "enabeld": false,
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-must-not-publish",
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            "config.enabeld",
+        ),
+        (
+            "provider-typo",
+            serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-must-not-publish",
+                    "model_patterns": ["gpt-*"],
+                    "inherit_backend_tl": true
+                }]
+            }),
+            "config.providers[0].inherit_backend_tl",
+        ),
+        (
+            "fallback-typo",
+            serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-must-not-publish",
+                    "model_patterns": ["gpt-*"]
+                }],
+                "fallback": {"on_connect_erro": true}
+            }),
+            "config.fallback.on_connect_erro",
+        ),
+    ] {
+        let mut invalid = valid.clone();
+        invalid.plugin_configs[0].config = bad_config;
+        invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+        let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+            panic!("{label}: unknown ai_stream_router key must reject reload");
+        };
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("ai_stream_router")
+                    && error.contains("unknown configuration key")
+                    && error.contains(needle)
+            }),
+            "{label}: unexpected rejection errors: {errors:?}"
+        );
+        assert_eq!(
+            state.config.load().plugin_configs[0].config["providers"][0]["api_key"],
+            "sk-last-known-good",
+            "{label}: rejected candidate must not replace last-known-good config"
+        );
+        assert!(
+            state
+                .plugin_cache
+                .request_view("p1", ProxyProtocol::Http)
+                .plugins()
+                .iter()
+                .any(|plugin| plugin.name() == "ai_stream_router"),
+            "{label}: rejected reload must retain last-known-good plugin cache"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation() {
     let state = empty_proxy_state();
     let mut internal = test_plugin_config("internal-request-id-policy", true);

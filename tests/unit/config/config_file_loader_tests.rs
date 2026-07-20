@@ -1137,6 +1137,82 @@ fn test_file_config_rejects_unknown_ai_prompt_compressor_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_ai_stream_router_policy_keys() {
+    for (id, config, needle) in [
+        (
+            "stream-router-enabled-typo",
+            serde_json::json!({
+                "enabeld": false,
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            "config.enabeld",
+        ),
+        (
+            "stream-router-provider-tls-typo",
+            serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"],
+                    "inherit_backend_tl": true
+                }]
+            }),
+            "config.providers[0].inherit_backend_tl",
+        ),
+        (
+            "stream-router-fallback-typo",
+            serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"]
+                }],
+                "fallback": {"on_connect_erro": true}
+            }),
+            "config.fallback.on_connect_erro",
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "ai_stream_router",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file mode must reject unknown ai_stream_router keys");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("1 plugin config error(s)"),
+            "unexpected file-load error for {id}/{needle}: {message}"
+        );
+    }
+}
+
+#[test]
 fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
     let document = serde_json::json!({
         "version": "1",

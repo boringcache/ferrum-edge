@@ -2936,6 +2936,111 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
 }
 
 #[test]
+fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_good() {
+    let good_router = json!({
+        "enabled": true,
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "endpoint": "https://api.openai.com/v1/chat/completions",
+            "api_key": "sk-good",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc-router"])],
+        vec![make_plugin_config_with_json(
+            "pc-router",
+            "ai_stream_router",
+            good_router,
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config1).expect("valid ai_stream_router must admit");
+    assert!(
+        cache
+            .get_plugins("p1")
+            .iter()
+            .any(|plugin| plugin.name() == "ai_stream_router"),
+        "baseline cache must include ai_stream_router"
+    );
+
+    for (label, bad_config, needle) in [
+        (
+            "enabled-typo",
+            json!({
+                "enabeld": false,
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-bad",
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            "config.enabeld",
+        ),
+        (
+            "provider-tls-typo",
+            json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-bad",
+                    "model_patterns": ["gpt-*"],
+                    "inherit_backend_tl": true
+                }]
+            }),
+            "config.providers[0].inherit_backend_tl",
+        ),
+        (
+            "fallback-typo",
+            json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-bad",
+                    "model_patterns": ["gpt-*"]
+                }],
+                "fallback": {"on_connect_erro": true}
+            }),
+            "config.fallback.on_connect_erro",
+        ),
+    ] {
+        let config2 = make_config(
+            vec![make_proxy("p1", "/api", vec!["pc-router"])],
+            vec![make_plugin_config_with_json(
+                "pc-router",
+                "ai_stream_router",
+                bad_config,
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+        let error = match cache.apply_delta(&config2, &proxy_ids, &[], false) {
+            Err(error) => error,
+            Ok(()) => panic!("{label}: unknown ai_stream_router key must reject reload"),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown configuration key") && message.contains(needle),
+            "{label}: unexpected reload error: {message}"
+        );
+        assert!(
+            cache
+                .get_plugins("p1")
+                .iter()
+                .any(|plugin| plugin.name() == "ai_stream_router"),
+            "{label}: rejected candidate must retain last-known-good ai_stream_router"
+        );
+    }
+}
+
+#[test]
 fn test_apply_delta_rejects_unknown_mesh_route_nested_keys_and_keeps_last_known_good() {
     let good_route = json!({
         "rules": [{

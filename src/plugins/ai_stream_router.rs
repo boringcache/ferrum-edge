@@ -55,6 +55,40 @@ use super::{
     ResponseStreamInspector, ResponseStreamInspectorStage,
 };
 use crate::config::types::{BackendScheme, BackendTlsConfig};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+// ---------------------------------------------------------------------------
+// Strict config key sets (fixed-shape objects; no free-form maps)
+// ---------------------------------------------------------------------------
+
+const ROOT_KEYS: &[&str] = &[
+    "enabled",
+    "fail_on_missing_model",
+    "fail_on_no_matching_provider",
+    "inject_usage_options",
+    "normalize_response_stream",
+    "providers",
+    "fallback",
+];
+
+const PROVIDER_KEYS: &[&str] = &[
+    "name",
+    "provider_type",
+    "endpoint",
+    "api_key",
+    "model_patterns",
+    "priority",
+    "allow_plaintext",
+    "anthropic_version",
+    "inherit_backend_tls",
+];
+
+const FALLBACK_KEYS: &[&str] = &[
+    "enabled",
+    "on_connect_error",
+    "on_5xx_before_first_byte",
+    "max_attempts",
+];
 
 // ---------------------------------------------------------------------------
 // Metadata keys
@@ -219,14 +253,15 @@ pub struct AiStreamRouter {
 
 impl AiStreamRouter {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("ai_stream_router: config must be an object".to_string());
-        }
+        let config_object = config
+            .as_object()
+            .ok_or_else(|| "ai_stream_router: config must be an object".to_string())?;
 
         // Reject ambiguous fields that belong to `ai_federation`'s flat config
         // shape, so an operator does not silently mix a non-streaming fallback
         // config into this plugin (which uses a nested `fallback` block).
         reject_ambiguous_fields(config)?;
+        reject_unknown_keys(config_object, "config", ROOT_KEYS, "ai_stream_router: ")?;
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
         let fail_on_missing_model = optional_bool(config, "fail_on_missing_model")?.unwrap_or(true);
@@ -252,9 +287,16 @@ impl AiStreamRouter {
         let mut seen_names: HashSet<String> = HashSet::with_capacity(providers_val.len());
 
         for (i, pv) in providers_val.iter().enumerate() {
-            if !pv.is_object() {
-                return Err(format!("ai_stream_router: provider[{i}] must be an object"));
-            }
+            let provider_object = pv
+                .as_object()
+                .ok_or_else(|| format!("ai_stream_router: provider[{i}] must be an object"))?;
+            let provider_path = format!("config.providers[{i}]");
+            reject_unknown_keys(
+                provider_object,
+                &provider_path,
+                PROVIDER_KEYS,
+                "ai_stream_router: ",
+            )?;
 
             let name = pv["name"]
                 .as_str()
@@ -392,9 +434,15 @@ fn parse_fallback(config: &Value) -> Result<FallbackConfig, String> {
     let Some(fb) = config.get("fallback") else {
         return Ok(FallbackConfig::default());
     };
-    if !fb.is_object() {
-        return Err("ai_stream_router: 'fallback' must be an object".to_string());
-    }
+    let fallback_object = fb
+        .as_object()
+        .ok_or_else(|| "ai_stream_router: 'fallback' must be an object".to_string())?;
+    reject_unknown_keys(
+        fallback_object,
+        "config.fallback",
+        FALLBACK_KEYS,
+        "ai_stream_router: ",
+    )?;
     let defaults = FallbackConfig::default();
     Ok(FallbackConfig {
         enabled: optional_bool(fb, "enabled")?.unwrap_or(defaults.enabled),

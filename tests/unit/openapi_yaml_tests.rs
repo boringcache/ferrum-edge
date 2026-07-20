@@ -1856,6 +1856,122 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
 }
 
 #[test]
+fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
+    use std::collections::BTreeSet;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiStreamRouterConfig")
+        .expect("missing AiStreamRouterConfig schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["properties"]["fallback"]["additionalProperties"],
+        false
+    );
+
+    let root_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("root properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        root_fields,
+        BTreeSet::from([
+            "enabled",
+            "fail_on_missing_model",
+            "fail_on_no_matching_provider",
+            "inject_usage_options",
+            "normalize_response_stream",
+            "providers",
+            "fallback",
+        ])
+    );
+
+    let provider_fields: BTreeSet<_> = schema["properties"]["providers"]["items"]["properties"]
+        .as_object()
+        .expect("provider properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        provider_fields,
+        BTreeSet::from([
+            "name",
+            "provider_type",
+            "endpoint",
+            "api_key",
+            "model_patterns",
+            "priority",
+            "allow_plaintext",
+            "anthropic_version",
+            "inherit_backend_tls",
+        ])
+    );
+
+    let fallback_fields: BTreeSet<_> = schema["properties"]["fallback"]["properties"]
+        .as_object()
+        .expect("fallback properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        fallback_fields,
+        BTreeSet::from([
+            "enabled",
+            "on_connect_error",
+            "on_5xx_before_first_byte",
+            "max_attempts",
+        ])
+    );
+
+    let description = schema["description"].as_str().expect("description");
+    assert!(description.contains("unknown root, provider, and fallback"));
+    assert!(description.contains("FailClosed"));
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("**Strict configuration admission.**"));
+    assert!(guide.contains("config.enabeld"));
+    assert!(guide.contains("FailClosed"));
+
+    assert_component_validity(
+        &spec,
+        "AiStreamRouterConfig",
+        &json!({
+            "enabled": true,
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-test",
+                "model_patterns": ["gpt-*"],
+                "priority": 1,
+                "inherit_backend_tls": false
+            }],
+            "fallback": {
+                "enabled": false,
+                "on_connect_error": true,
+                "on_5xx_before_first_byte": true,
+                "max_attempts": 2
+            }
+        }),
+        true,
+    );
+    for invalid in [
+        json!({"enabeld": false, "providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"], "inherit_backend_tl": true}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}], "fallback": {"on_connect_erro": true}}),
+    ] {
+        assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
+    }
+}
+
+#[test]
 fn ldap_dial_policy_documentation_matches_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
