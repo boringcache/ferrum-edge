@@ -8600,6 +8600,42 @@ async fn stream_id_change_within_slot_fails_closed() {
     assert!(!String::from_utf8_lossy(&out).contains("danger"));
 }
 
+#[tokio::test]
+async fn duplicate_choice_index_and_malformed_call_id_fail_closed() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+
+    let duplicate_choice = concat!(
+        "data: {\"choices\":[",
+        "{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"same\",\"function\":{\"name\":\"safe\",\"arguments\":\"{}\"}}]}},",
+        "{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"same\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}",
+        "]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[duplicate_choice.as_bytes()]).await;
+    assert!(terminated, "duplicate choice identity must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+    let malformed_id = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":42,\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}",
+        "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[malformed_id.as_bytes()]).await;
+    assert!(terminated, "non-string call id must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+}
+
 /// Dry-run still evaluates ambiguous stream identity without cutting traffic
 /// when mode is dry_run — but the held bytes of an enforce cut must not leak.
 #[tokio::test]
@@ -8712,6 +8748,89 @@ async fn redact_args_amplification_clears_hash_on_transform() {
 
     // Hash cleared: the final re-check cannot hash-skip the raw body and fails
     // closed because redaction is no longer available on that lifecycle hook.
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn aggregate_redacted_arguments_cannot_exceed_response_limit() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    // Each call expands to ~2.3 MiB and therefore passes the per-call preflight;
+    // their aggregate must still be rejected before both strings are retained.
+    let arguments = "a".repeat(9_000);
+    let body = serde_json::to_vec(&json!({
+        "id": "chatcmpl-aggregate",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": arguments.clone()}},
+                    {"id": "call_2", "type": "function", "function": {"name": "search", "arguments": arguments}}
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "aggregate redaction past 4 MiB must not be emitted"
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn serialized_redaction_overhead_cannot_exceed_response_limit() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    // 16,384 replacements produce exactly 4 MiB of argument text. JSON framing
+    // necessarily exceeds the cap, so the bounded serializer must fail closed
+    // without allocating the complete oversized representation.
+    let body = response_with_tool_call("search", &"a".repeat(16_384));
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "serialized body past 4 MiB must not be emitted"
+    );
     assert_reject(
         plugin
             .on_final_response_body(&mut ctx, 200, &json_headers(), &body)

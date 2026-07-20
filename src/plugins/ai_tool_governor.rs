@@ -1927,6 +1927,10 @@ impl AiToolGovernor {
     /// (no approval), so it runs standalone on the transform path.
     fn redact_response(&self, json: &mut Value) -> RedactTransform {
         let mut modified = false;
+        // Cap the aggregate owned strings installed into the parsed response.
+        // Per-call bounds alone would still allow 64 individually valid
+        // redactions to retain hundreds of MiB before serialization.
+        let mut redacted_argument_bytes = 0usize;
         let Some(choices) = json.get_mut("choices").and_then(Value::as_array_mut) else {
             return RedactTransform::Unchanged;
         };
@@ -1936,7 +1940,10 @@ impl AiToolGovernor {
             };
             if let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for tc in tool_calls.iter_mut() {
-                    match self.redact_tool_call_function(tc.get_mut("function")) {
+                    match self.redact_tool_call_function(
+                        tc.get_mut("function"),
+                        &mut redacted_argument_bytes,
+                    ) {
                         RedactTransform::Changed => modified = true,
                         RedactTransform::AmplificationFailed => {
                             return RedactTransform::AmplificationFailed;
@@ -1945,7 +1952,10 @@ impl AiToolGovernor {
                     }
                 }
             }
-            match self.redact_tool_call_function(message.get_mut("function_call")) {
+            match self.redact_tool_call_function(
+                message.get_mut("function_call"),
+                &mut redacted_argument_bytes,
+            ) {
                 RedactTransform::Changed => modified = true,
                 RedactTransform::AmplificationFailed => {
                     return RedactTransform::AmplificationFailed;
@@ -1961,7 +1971,11 @@ impl AiToolGovernor {
     }
 
     /// Redact one `function`/`function_call` object's `arguments` string in place.
-    fn redact_tool_call_function(&self, function: Option<&mut Value>) -> RedactTransform {
+    fn redact_tool_call_function(
+        &self,
+        function: Option<&mut Value>,
+        redacted_argument_bytes: &mut usize,
+    ) -> RedactTransform {
         let Some(function) = function else {
             return RedactTransform::Unchanged;
         };
@@ -1989,6 +2003,13 @@ impl AiToolGovernor {
             return RedactTransform::AmplificationFailed;
         };
         if changed {
+            let Some(next_total) = redacted_argument_bytes.checked_add(redacted.len()) else {
+                return RedactTransform::AmplificationFailed;
+            };
+            if next_total > MAX_PARSE_BYTES {
+                return RedactTransform::AmplificationFailed;
+            }
+            *redacted_argument_bytes = next_total;
             function["arguments"] = Value::String(redacted);
             RedactTransform::Changed
         } else {
@@ -2893,7 +2914,18 @@ impl Plugin for AiToolGovernor {
         let mut json: Value = serde_json::from_slice(strip_json_bom(body)).ok()?;
         match self.redact_response(&mut json) {
             RedactTransform::Changed => {
-                let rewritten = serde_json::to_vec(&json).ok()?;
+                let rewritten = match serialize_json_bounded(&json) {
+                    Ok(rewritten) => rewritten,
+                    Err(()) => {
+                        // A JSON string may require escaping on serialization,
+                        // so even an aggregate argument payload at the byte cap
+                        // can exceed the final body limit. Clear the skip state
+                        // and let the terminal re-check fail closed.
+                        self.clear_response_hash(ctx);
+                        ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
+                        return None;
+                    }
+                };
                 // Record the redacted body's hash so `on_final_response_body` treats
                 // this plugin's own redaction as already-governed and skips it when
                 // no later transform runs. Also re-record the redacted calls'
@@ -3374,12 +3406,16 @@ impl StreamingToolCallAccumulator {
         let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
             return;
         };
+        let mut seen_choice_indexes = HashMap::<usize, ()>::new();
         for (cpos, choice) in choices.iter().enumerate() {
             let cidx = choice
                 .get("index")
                 .and_then(Value::as_u64)
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(cpos);
+            if seen_choice_indexes.insert(cidx, ()).is_some() {
+                self.malformed = true;
+            }
             let delta = choice.get("delta");
             let tool_calls =
                 match classify_tool_calls_container(delta.and_then(|d| d.get("tool_calls"))) {
@@ -3407,7 +3443,18 @@ impl StreamingToolCallAccumulator {
                     self.malformed = true;
                 }
                 let function = tc.get("function");
-                let call_id = tc.get("id").and_then(Value::as_str);
+                let call_id = match tc.get("id") {
+                    None => None,
+                    Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+                    // A present but empty/non-string identity is not the same as
+                    // an omitted continuation fragment. Treat it as malformed
+                    // so a backend cannot hide an index reuse behind an id the
+                    // downstream runtime may interpret differently.
+                    Some(_) => {
+                        self.malformed = true;
+                        None
+                    }
+                };
                 self.push_delta(
                     cidx,
                     ToolSlot::Indexed(tidx),
@@ -4861,6 +4908,44 @@ fn push_redaction_bytes(output: &mut String, value: &str) -> Result<(), ()> {
     }
     output.push_str(value);
     Ok(())
+}
+
+/// Serialize a transformed JSON response without ever retaining more than the
+/// inspectable body limit. `serde_json::to_vec` would allocate the complete
+/// escaped representation before the caller could reject an oversized result.
+fn serialize_json_bounded(value: &Value) -> Result<Vec<u8>, ()> {
+    struct BoundedWriter {
+        output: Vec<u8>,
+    }
+
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let next_len = self
+                .output
+                .len()
+                .checked_add(bytes.len())
+                .ok_or_else(|| {
+                    std::io::Error::other("ai_tool_governor JSON output length overflow")
+                })?;
+            if next_len > MAX_PARSE_BYTES {
+                return Err(std::io::Error::other(
+                    "ai_tool_governor JSON output exceeds inspectable limit",
+                ));
+            }
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = BoundedWriter {
+        output: Vec::with_capacity(64 * 1024),
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|_| ())?;
+    Ok(writer.output)
 }
 
 /// Borrow the leading `max_bytes` bytes of `s`, snapped down to a char boundary
