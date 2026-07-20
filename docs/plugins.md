@@ -2642,12 +2642,22 @@ config:
 
 Returns configurable mock responses without proxying to the backend. Supports matching by HTTP method and path pattern (exact or regex), with configurable status codes, headers, body, and optional latency simulation. Useful for early API testing before backends are ready, contract testing, and local development.
 
-**Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family
+**Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family (HTTP, gRPC, WebSocket handshake)
 
-**Path matching is relative to the proxy's `listen_path`.** The plugin strips the proxy's prefix listen_path before matching rules. For example, if the proxy has `listen_path: /api/v1` and a request arrives at `/api/v1/users`, the mock rule path should be `/users`. For proxies with regex listen_paths (`~` prefix) or root listen_path (`/`), the full request path is used.
+Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be in range 100–599. Runtime construction is the authoritative final boundary.
+
+**Path matching by listen-path scope:**
+
+| Proxy `listen_path` | Rule `path` semantics | Example |
+|---|---|---|
+| Prefix (e.g. `/api/v1`) | Relative after stripping the prefix. A request exactly equal to that prefix matches `/`. | Request `/api/v1/users` → rule `/users` |
+| Exact (`=/api/v1`) | Full request path (no stripping). A rule of `/` does **not** match `/api/v1`. | Request `/api/v1` → rule `/api/v1` |
+| Regex (`~/api/v[0-9]+`) | Full request path (no literal prefix to strip). | Request `/api/v1/users` → rule `/api/v1/users` |
+| Root (`/`) | Full request path (stripping `/` would corrupt paths). | Request `/users` → rule `/users` |
+| Host-only (`listen_path` omitted) | Full request path (no prefix scope). | Request `/health` → rule `/health` |
 
 ```yaml
-# Proxy with listen_path: /api/v1
+# Proxy with listen_path: /api/v1  (prefix — relative rule paths)
 config:
   rules:
     - method: GET                        # optional — omit to match all methods
@@ -2667,7 +2677,17 @@ config:
   passthrough_on_no_match: true          # false (default) returns 404 for unmatched requests
 ```
 
-Rules are evaluated in order — first match wins. Regex paths use the same `~` prefix and auto-anchoring as `listen_path` patterns. A request to exactly the listen_path (e.g., `/api/v1` with no trailing path) is matched as `/`. When `passthrough_on_no_match` is `false` (default), requests that don't match any rule receive a `404` with `{"error":"no mock rule matched"}`. When `true`, unmatched requests continue to the real backend — useful for mocking only some endpoints while the rest hit the backend.
+```yaml
+# Exact listen_path: =/api/v1  — rule path must be the full request path
+config:
+  rules:
+    - path: /api/v1
+      body: exact-root-mock
+```
+
+Rules are evaluated in order — first match wins. Regex rule paths use the same `~` prefix and auto-anchoring as `listen_path` patterns. For **prefix** listen paths only, a request exactly equal to the listen path (e.g., `/api/v1` with no trailing path) is matched as `/`. When `passthrough_on_no_match` is `false` (default), requests that don't match any rule receive a `404` with `{"error":"no mock rule matched"}`. When `true`, unmatched requests continue to the real backend — useful for mocking only some endpoints while the rest hit the backend.
+
+**WebSocket handshake contract:** Upgrade requests are classified as `WebSocket` and therefore select this plugin. A matching rule returns a synthetic HTTP handshake response and never establishes an upgraded frame stream — including when `status_code` is `101`. An unmatched upgrade with `passthrough_on_no_match: false` (default) returns the same terminal `404` mock and blocks backend upgrade handling; set `passthrough_on_no_match: true` to let unmatched upgrades continue to the WebSocket backend. Frame-level mocking belongs to WebSocket frame plugins, not `response_mock`. The same handshake short-circuit applies for HTTP/1.1 Upgrade and HTTP/2 / HTTP/3 Extended CONNECT frontends because protocol selection uses `ProxyProtocol::WebSocket` for all of them.
 
 ### `spec_expose`
 

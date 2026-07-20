@@ -4,7 +4,7 @@
 //! - Compression (gzip response compression)
 //! - Response Caching (cache hit/miss, POST bypass)
 //! - GraphQL (depth limiting, introspection control)
-//! - Response Mock (mock rules, path scoping, passthrough)
+//! - Response Mock (mock rules, path scoping, passthrough, WebSocket handshake)
 //! - SOAP WS-Security (UsernameToken validation)
 //!
 //! All tests use database mode with SQLite + admin API to configure plugins.
@@ -877,6 +877,161 @@ async fn test_plugin_response_mock_path_scoping() {
         body.contains("users"),
         "Should get mock response, got: {}",
         body
+    );
+}
+
+/// Issue #2470: matching WebSocket upgrades are short-circuited as ordinary
+/// HTTP responses; the gateway must not emit a real 101 frame-stream upgrade.
+#[tokio::test]
+#[ignore]
+async fn test_plugin_response_mock_websocket_upgrade_match_short_circuits() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let harness = PluginExtTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-mock-ws-match",
+        "/ws-mock",
+        1, // Unreachable — mock must intercept the handshake
+        vec![json!({
+            "id": "plugin-mock-ws-match",
+            "plugin_name": "response_mock",
+            "scope": "proxy",
+            "proxy_id": "proxy-mock-ws-match",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "path": "/socket",
+                    "status_code": 200,
+                    "body": "{\"mock\":\"ws-handshake\"}",
+                    "headers": {
+                        "content-type": "application/json",
+                        "x-mock": "ws"
+                    }
+                }]
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let port: u16 = harness
+        .proxy_base_url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse().ok())
+        .expect("proxy port");
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to proxy");
+    let request = "GET /ws-mock/socket HTTP/1.1\r\n\
+                   Host: localhost\r\n\
+                   Upgrade: websocket\r\n\
+                   Connection: Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Version: 13\r\n\
+                   \r\n";
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .expect("read failed");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "matching upgrade must be short-circuited as HTTP 200, got: {response}"
+    );
+    assert!(
+        !response.starts_with("HTTP/1.1 101"),
+        "response_mock must not emit a real WebSocket 101 upgrade: {response}"
+    );
+    assert!(
+        response.contains("ws-handshake"),
+        "mock body missing from handshake short-circuit: {response}"
+    );
+    assert!(
+        response.to_ascii_lowercase().contains("x-mock: ws"),
+        "mock header missing from handshake short-circuit: {response}"
+    );
+}
+
+/// Issue #2470: unmatched upgrades with the default no-passthrough contract
+/// receive the terminal mock 404 before backend WebSocket handling.
+#[tokio::test]
+#[ignore]
+async fn test_plugin_response_mock_websocket_upgrade_unmatched_returns_404() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let harness = PluginExtTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-mock-ws-miss",
+        "/ws-mock2",
+        1, // Unreachable — default 404 must win before backend dial
+        vec![json!({
+            "id": "plugin-mock-ws-miss",
+            "plugin_name": "response_mock",
+            "scope": "proxy",
+            "proxy_id": "proxy-mock-ws-miss",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "path": "/health",
+                    "body": "ok"
+                }]
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let port: u16 = harness
+        .proxy_base_url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse().ok())
+        .expect("proxy port");
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to proxy");
+    let request = "GET /ws-mock2/socket HTTP/1.1\r\n\
+                   Host: localhost\r\n\
+                   Upgrade: websocket\r\n\
+                   Connection: Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Version: 13\r\n\
+                   \r\n";
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .expect("read failed");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "unmatched upgrade must return mock 404, got: {response}"
+    );
+    assert!(
+        response.contains("no mock rule matched"),
+        "default unmatched mock body missing: {response}"
     );
 }
 

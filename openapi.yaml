@@ -16213,7 +16213,17 @@ components:
 
     ResponseMockConfig:
       type: object
-      description: "Plugin: response_mock — Returns mock responses for API testing before backends are ready. Rule paths are relative to the proxy's listen_path."
+      additionalProperties: false
+      description: >-
+        Plugin: response_mock — Returns mock responses for API testing before
+        backends are ready. Rule paths are relative to a prefix listen_path;
+        exact (`=`), regex (`~`), root (`/`), and host-only scopes match the
+        full request path. Supports HTTP, gRPC, and WebSocket upgrade
+        handshakes: a match short-circuits only the HTTP handshake response and
+        does not establish or mock an upgraded WebSocket frame stream. Unknown
+        top-level and per-rule keys are rejected; the free-form headers map
+        remains open for string-valued response headers. Runtime construction
+        is the authoritative final boundary.
       required:
         - rules
       properties:
@@ -16223,19 +16233,36 @@ components:
           minItems: 1
           items:
             type: object
+            additionalProperties: false
             required:
               - path
             properties:
               method:
                 type: string
-                description: HTTP method to match (omit to match all methods)
+                minLength: 1
+                description: >-
+                  HTTP method token to match (omit to match all methods). When
+                  supplied it must be non-empty and parse as an HTTP method
+                  token (runtime validates via http::Method); matching is
+                  case-insensitive after uppercasing.
               path:
                 type: string
-                description: "Path relative to the proxy's listen_path (e.g., /users for a proxy with listen_path /api/v1). Regex supported with ~ prefix (auto-anchored). For root or regex listen_paths, uses full request path."
+                minLength: 1
+                description: >-
+                  Non-empty rule path. Relative to a prefix listen_path
+                  (e.g., /users for listen_path /api/v1). For exact (`=`),
+                  regex (`~`), root (`/`), and host-only proxies, use the full
+                  request path. Regex rule paths use a ~ prefix (auto-anchored).
               status_code:
                 type: integer
                 format: uint16
-                description: HTTP status code to return (default 200)
+                minimum: 100
+                maximum: 599
+                description: >-
+                  HTTP status code to return (default 200). Values outside
+                  100–599 are rejected. Status 101 on a WebSocket upgrade is
+                  still only a synthetic HTTP handshake response; it does not
+                  create an upgraded frame stream.
               headers:
                 type: object
                 additionalProperties:
@@ -16251,7 +16278,9 @@ components:
                 description: "Simulated latency in milliseconds (default 0). Capped at 3600000 (1 hour); larger values are rejected at config validation."
         passthrough_on_no_match:
           type: boolean
-          description: "If true, unmatched requests continue to the backend. If false (default), returns 404."
+          description: >-
+            If true, unmatched requests (including WebSocket upgrades) continue
+            to the backend. If false (default), returns 404.
 
     SpecExposeConfig:
       type: object

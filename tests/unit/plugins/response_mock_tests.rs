@@ -1,6 +1,8 @@
 //! Tests for response_mock plugin
 
-use ferrum_edge::plugins::response_mock::ResponseMock;
+use ferrum_edge::plugins::response_mock::{
+    RESPONSE_MOCK_CONFIG_KEYS, RESPONSE_MOCK_RULE_KEYS, ResponseMock,
+};
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
@@ -14,6 +16,12 @@ fn make_proxy_with_listen_path(listen_path: &str) -> Arc<ferrum_edge::config::ty
     Arc::new(proxy)
 }
 
+fn make_host_only_proxy() -> Arc<ferrum_edge::config::types::Proxy> {
+    let mut proxy = create_test_proxy();
+    proxy.listen_path = None;
+    Arc::new(proxy)
+}
+
 /// Create a context simulating a request to `full_path` matched by a proxy
 /// with the given `listen_path`.
 fn make_ctx(method: &str, full_path: &str, listen_path: &str) -> RequestContext {
@@ -23,6 +31,16 @@ fn make_ctx(method: &str, full_path: &str, listen_path: &str) -> RequestContext 
         full_path.to_string(),
     );
     ctx.matched_proxy = Some(make_proxy_with_listen_path(listen_path));
+    ctx
+}
+
+fn make_host_only_ctx(method: &str, full_path: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        full_path.to_string(),
+    );
+    ctx.matched_proxy = Some(make_host_only_proxy());
     ctx
 }
 
@@ -156,6 +174,70 @@ fn test_creation_accepts_delay_ms_at_cap() {
         "rules": [{ "path": "/test", "delay_ms": 3_600_000u64 }]
     }));
     assert!(plugin.is_ok(), "delay_ms == cap should be accepted");
+}
+
+#[test]
+fn test_creation_rejects_unknown_top_level_key() {
+    let err = ResponseMock::new(&json!({
+        "passthrough_on_no_mach": true,
+        "rules": [{ "path": "/health", "body": "ok" }]
+    }))
+    .err()
+    .expect("misspelled top-level key must be rejected");
+    assert!(
+        err.contains("unknown config key(s) under 'config'"),
+        "got: {err}"
+    );
+    assert!(err.contains("passthrough_on_no_mach"), "got: {err}");
+    assert!(
+        err.contains(RESPONSE_MOCK_CONFIG_KEYS[0]),
+        "error should list allowed keys: {err}"
+    );
+}
+
+#[test]
+fn test_creation_rejects_unknown_rule_key() {
+    let err = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/health",
+            "status_cod": 503,
+            "body": "unavailable"
+        }]
+    }))
+    .err()
+    .expect("misspelled rule key must be rejected");
+    assert!(
+        err.contains("unknown config key(s) under 'config.rules[0]'"),
+        "got: {err}"
+    );
+    assert!(err.contains("status_cod"), "got: {err}");
+    assert!(
+        err.contains(RESPONSE_MOCK_RULE_KEYS[0]),
+        "error should list allowed keys: {err}"
+    );
+}
+
+#[test]
+fn test_creation_accepts_status_code_boundaries() {
+    for status_code in [100u64, 200, 599] {
+        let plugin = ResponseMock::new(&json!({
+            "rules": [{ "path": "/test", "status_code": status_code, "body": "ok" }]
+        }));
+        assert!(
+            plugin.is_ok(),
+            "status_code {status_code} should be accepted"
+        );
+    }
+}
+
+#[test]
+fn test_creation_rejects_status_code_below_range() {
+    let err = ResponseMock::new(&json!({
+        "rules": [{ "path": "/test", "status_code": 99, "body": "ok" }]
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("'status_code' must be in range 100-599"));
 }
 
 // === Path stripping — mock rules are relative to proxy listen_path ===
@@ -297,6 +379,51 @@ async fn test_exact_listen_path_uses_full_path() {
         PluginResult::Reject { body, .. } => {
             assert_eq!(body, "full path match");
         }
+        _ => panic!("Expected Reject"),
+    }
+}
+
+#[tokio::test]
+async fn test_exact_listen_path_slash_rule_does_not_match() {
+    // Unlike prefix listen paths, exact (=) scopes do not rewrite the request
+    // to "/". A relative "/" rule therefore misses and returns the default 404.
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/",
+            "body": "should not match"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/v1", "=/api/v1");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 404);
+            assert!(body.contains("no mock rule matched"));
+        }
+        _ => panic!("Expected 404 Reject"),
+    }
+}
+
+#[tokio::test]
+async fn test_host_only_proxy_uses_full_path() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/health",
+            "body": "host-only"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_host_only_ctx("GET", "/health");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { body, .. } => assert_eq!(body, "host-only"),
         _ => panic!("Expected Reject"),
     }
 }
@@ -674,6 +801,113 @@ fn test_supported_protocols() {
         plugin.supported_protocols(),
         ferrum_edge::plugins::HTTP_FAMILY_PROTOCOLS
     );
+    assert!(
+        plugin
+            .supported_protocols()
+            .contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket),
+        "response_mock intentionally participates in WebSocket upgrade handshakes"
+    );
+}
+
+// === WebSocket handshake short-circuit (HTTP Upgrade / Extended CONNECT) ===
+//
+// Runtime classifies upgrades as ProxyProtocol::WebSocket and still selects
+// this plugin via HTTP_FAMILY_PROTOCOLS. Matching only Rejects the handshake
+// HTTP response; it never establishes a frame stream — including status 101.
+
+#[tokio::test]
+async fn test_websocket_upgrade_matching_rule_short_circuits_handshake() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/socket",
+            "status_code": 200,
+            "body": "handshake-mock",
+            "headers": { "x-mock": "ws" }
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/socket", "/api");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(body, "handshake-mock");
+            assert_eq!(headers.get("x-mock").map(String::as_str), Some("ws"));
+        }
+        _ => panic!("Expected Reject for matching WebSocket upgrade path"),
+    }
+}
+
+#[tokio::test]
+async fn test_websocket_upgrade_unmatched_default_returns_404() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{ "path": "/health", "body": "ok" }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/socket", "/api");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 404);
+            assert!(body.contains("no mock rule matched"));
+        }
+        _ => panic!("Expected default 404 for unmatched WebSocket upgrade"),
+    }
+}
+
+#[tokio::test]
+async fn test_websocket_upgrade_unmatched_passthrough_continues() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{ "path": "/health", "body": "ok" }],
+        "passthrough_on_no_match": true
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/socket", "/api");
+    let mut headers = HashMap::new();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_websocket_upgrade_status_101_is_still_synthetic_reject() {
+    // status 101 is a legal HTTP status for the synthetic handshake response,
+    // but PluginResult::Reject never upgrades the connection to a frame stream.
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/socket",
+            "status_code": 101,
+            "body": "",
+            "headers": {
+                "upgrade": "websocket",
+                "connection": "Upgrade"
+            }
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/socket", "/api");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => {
+            assert_eq!(status_code, 101);
+        }
+        _ => panic!("Expected Reject with status 101"),
+    }
 }
 
 // === Root listen_path ===
