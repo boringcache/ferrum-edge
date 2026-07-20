@@ -8,8 +8,11 @@ use ferrum_edge::_test_support::{
     response_caching_size_accounting_snapshot_for_test,
 };
 use ferrum_edge::config::types::Consumer;
-use ferrum_edge::plugins::response_caching::ResponseCaching;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
+use ferrum_edge::plugins::{
+    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
+    validate_plugin_config,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -199,6 +202,152 @@ fn test_zero_cache_size_config_rejected() {
     .err()
     .expect("zero max_entries must be rejected");
     assert!(err.contains("max_entries"), "got: {err}");
+}
+
+#[test]
+fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
+    assert_eq!(
+        plugin_failure_policy("response_caching"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+
+    let typos = [
+        ("vary_by_headers", "vary_by_header"),
+        ("cache_key_include_consumer", "cache_key_include_consumr"),
+        ("cache_key_include_query", "cache_key_include_quer"),
+        ("respect_cache_control", "respect_cache_contro"),
+        ("respect_no_cache", "respect_no_cach"),
+        ("cacheable_status_codes", "cacheable_status_code"),
+        ("cacheable_methods", "cacheable_method"),
+        ("ttl_seconds", "ttl_second"),
+        ("max_entries", "max_entrie"),
+        ("max_entry_size_bytes", "max_entry_size_byte"),
+        ("max_total_size_bytes", "max_total_size_byte"),
+        ("add_cache_status_header", "add_cache_status_heade"),
+        (
+            "invalidate_on_unsafe_methods",
+            "invalidate_on_unsafe_method",
+        ),
+    ];
+    assert_eq!(
+        typos.len(),
+        RESPONSE_CACHING_CONFIG_KEYS.len(),
+        "every recognized key needs a one-character misspelling case"
+    );
+
+    for (canonical, typo) in typos {
+        assert!(
+            RESPONSE_CACHING_CONFIG_KEYS.contains(&canonical),
+            "typo fixture must target a recognized key: {canonical}"
+        );
+        let mut config = json!({"ttl_seconds": 60});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert(typo.to_string(), json!(true));
+        let err = ResponseCaching::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("expected unknown-key rejection for {typo}"));
+        assert!(
+            err.contains("unknown configuration key"),
+            "missing unknown-key wording: {err}"
+        );
+        assert!(
+            err.contains(&format!("'config.{typo}'")),
+            "error must path-qualify the typo: {err}"
+        );
+        assert!(
+            err.contains("did you mean"),
+            "typo diagnostics should include a suggestion: {err}"
+        );
+        assert!(
+            err.contains(canonical),
+            "suggestion should name the canonical key {canonical}: {err}"
+        );
+
+        let shared = validate_plugin_config("response_caching", &config)
+            .expect_err("shared admission must reject the same typo");
+        assert!(
+            shared.contains(&format!("'config.{typo}'")),
+            "shared path must surface the same diagnostic: {shared}"
+        );
+    }
+}
+
+#[test]
+fn test_multiple_unknown_root_keys_are_sorted_and_path_qualified() {
+    let err = ResponseCaching::new(&json!({
+        "ttl_seconds": 60,
+        "zzz_extra": true,
+        "aaa_extra": false,
+        "vary_by_header": ["x-tenant"]
+    }))
+    .err()
+    .expect("multiple unknown keys must be rejected");
+    assert!(err.contains("'config.aaa_extra'"), "got: {err}");
+    assert!(err.contains("'config.vary_by_header'"), "got: {err}");
+    assert!(err.contains("'config.zzz_extra'"), "got: {err}");
+    assert!(
+        err.contains("did you mean 'vary_by_headers'?"),
+        "near-miss Vary typo should suggest the canonical key: {err}"
+    );
+    let aaa = err.find("aaa_extra").expect("aaa_extra present");
+    let vary = err.find("vary_by_header").expect("vary_by_header present");
+    let zzz = err.find("zzz_extra").expect("zzz_extra present");
+    assert!(
+        aaa < vary && vary < zzz,
+        "unknown keys should be sorted in the error: {err}"
+    );
+}
+
+#[test]
+fn test_recognized_field_null_and_type_behavior_is_preserved() {
+    ResponseCaching::new(&json!({
+        "ttl_seconds": null,
+        "max_entries": null,
+        "max_entry_size_bytes": null,
+        "max_total_size_bytes": null,
+        "respect_cache_control": null,
+        "respect_no_cache": null,
+        "cache_key_include_query": null,
+        "cache_key_include_consumer": null,
+        "add_cache_status_header": null,
+        "invalidate_on_unsafe_methods": null
+    }))
+    .expect("scalar nulls must continue to select documented defaults");
+
+    for (config, needle) in [
+        (json!({"ttl_seconds": true}), "ttl_seconds"),
+        (json!({"max_entries": 0}), "max_entries"),
+        (json!({"max_entry_size_bytes": -1}), "max_entry_size_bytes"),
+        (
+            json!({"respect_cache_control": "true"}),
+            "respect_cache_control",
+        ),
+        (json!({"cacheable_methods": null}), "cacheable_methods"),
+        (json!({"cacheable_methods": []}), "cacheable_methods"),
+        (
+            json!({"cacheable_status_codes": null}),
+            "cacheable_status_codes",
+        ),
+        (
+            json!({"cacheable_status_codes": [700]}),
+            "cacheable_status_codes",
+        ),
+        (json!({"vary_by_headers": null}), "vary_by_headers"),
+    ] {
+        let err = ResponseCaching::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("expected type/range rejection for {needle}"));
+        assert!(
+            err.contains(needle),
+            "type/range diagnostic must name {needle}: {err}"
+        );
+        assert!(
+            !err.contains("unknown configuration key"),
+            "recognized-field failures must not be mislabeled as unknown keys: {err}"
+        );
+    }
 }
 
 #[tokio::test]
