@@ -3686,9 +3686,25 @@ def generated_shell_capture_operands(
             # either position can therefore influence the evaluated bytes.
             for contributing in (*pipeline[:position], segment):
                 for word in contributing:
-                    normalized = normalize_repository_path(word)
-                    if normalized is not None:
-                        operands.add(normalized)
+                    candidates = [word]
+                    # `shlex` keeps a command substitution inside double quotes
+                    # as one word, so normalizing that whole word cannot recover
+                    # `./scripts/generator` from `"$(./scripts/generator)"`.
+                    # Reuse the command-reference boundary already responsible
+                    # for deciding which nested words are repository executions;
+                    # this is only reached for a capture target later evaluated
+                    # as program source.
+                    for reference in LOCAL_COMMAND_REFERENCE.finditer(word):
+                        candidates.append(
+                            reference.group("redirected")
+                            or reference.group("interpreted")
+                            or reference.group("direct")
+                            or reference.group("bare")
+                        )
+                    for candidate in candidates:
+                        normalized = normalize_repository_path(candidate)
+                        if normalized is not None:
+                            operands.add(normalized)
     return frozenset(operands)
 
 
@@ -18957,6 +18973,13 @@ pre_build = []
             "./scripts/build",
             "IFS= read -r data < <(./scripts/build); "
             "evaluated='echo safe'; eval \"$evaluated\"",
+        ),
+        "printf capture into an unevaluated variable": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf -v data '%s' \"$(./scripts/build)\"; "
+                "evaluated='echo safe'; eval \"$evaluated\"",
+            )
         ),
     }
     for data_label, data_workflow in extensionless_data_substitution_workflows.items():
