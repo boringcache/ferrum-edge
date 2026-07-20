@@ -31,9 +31,11 @@
 //! Native and translated gRPC transactions retain their terminal gRPC status
 //! separately from the HTTP transport status. WebSocket uses its HTTP upgrade
 //! transaction; this example deliberately does not capture frame payloads.
-//! Request methods are capped at 256 Unicode characters and consumer identities
-//! at 255 before persistence so hostile extension methods or external identity
-//! claims cannot exceed the portable MySQL column contract.
+//! Request methods are capped at 256 Unicode characters; client/proxy
+//! identities at 255; and connection diagnostics at 4,096. These bounds are
+//! applied before persistence so hostile extension methods, external identity
+//! claims, or error text cannot overrun the portable MySQL column contract or
+//! inflate queued records without limit.
 //!
 //! ## MySQL custom-migration contract
 //!
@@ -102,6 +104,9 @@ const PLUGIN_NAME: &str = "example_audit_plugin";
 const MAX_RETENTION_DAYS: u64 = 36_500;
 const MAX_HTTP_METHOD_CHARS: usize = 256;
 const MAX_CONSUMER_USERNAME_CHARS: usize = 255;
+const MAX_CLIENT_IP_CHARS: usize = 255;
+const MAX_PROXY_ID_CHARS: usize = 255;
+const MAX_CONNECTION_ERROR_CHARS: usize = 4096;
 const MAX_METADATA_ENTRIES: usize = 64;
 const MAX_METADATA_KEY_CHARS: usize = 128;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
@@ -311,10 +316,15 @@ impl ExampleAuditPlugin {
         })
     }
 
-    fn enqueue(&self, record: AuditRecord) {
+    fn enqueue_with(&self, build_record: impl FnOnce() -> AuditRecord) {
         match self.logger.get() {
             Some(logger) => {
-                let _ = logger.try_send(record);
+                // Reserve the bounded-channel slot before cloning summary
+                // strings, sorting metadata, or generating a UUID. During a
+                // database outage a full queue must remain a cheap drop path.
+                if let Some(permit) = logger.try_reserve() {
+                    permit.send(build_record());
+                }
             }
             None => {
                 warn!(
@@ -336,7 +346,7 @@ impl ExampleAuditPlugin {
         AuditRecord {
             id: Uuid::new_v4().to_string(),
             timestamp: canonical_timestamp(&summary.timestamp_received),
-            client_ip: summary.client_ip.clone(),
+            client_ip: truncate_chars(&summary.client_ip, MAX_CLIENT_IP_CHARS),
             protocol: classify_http_audit_protocol(summary),
             http_method: Some(truncate_chars(
                 &summary.http_method,
@@ -350,7 +360,10 @@ impl ExampleAuditPlugin {
                 .consumer_username
                 .as_deref()
                 .map(|username| truncate_chars(username, MAX_CONSUMER_USERNAME_CHARS)),
-            proxy_id: summary.proxy_id.clone(),
+            proxy_id: summary
+                .proxy_id
+                .as_deref()
+                .map(|proxy_id| truncate_chars(proxy_id, MAX_PROXY_ID_CHARS)),
             request_context,
             connection_error: summary
                 .error_class
@@ -361,7 +374,8 @@ impl ExampleAuditPlugin {
                         .body_error_class
                         .as_ref()
                         .map(|c| format!("{c:?}"))
-                }),
+                })
+                .map(|error| truncate_chars(&error, MAX_CONNECTION_ERROR_CHARS)),
         }
     }
 
@@ -374,7 +388,7 @@ impl ExampleAuditPlugin {
         AuditRecord {
             id: Uuid::new_v4().to_string(),
             timestamp: canonical_timestamp(&summary.timestamp_disconnected),
-            client_ip: summary.client_ip.clone(),
+            client_ip: truncate_chars(&summary.client_ip, MAX_CLIENT_IP_CHARS),
             protocol: classify_stream_audit_protocol(summary),
             http_method: None,
             request_path: None,
@@ -385,9 +399,12 @@ impl ExampleAuditPlugin {
                 .consumer_username
                 .as_deref()
                 .map(|username| truncate_chars(username, MAX_CONSUMER_USERNAME_CHARS)),
-            proxy_id: Some(summary.proxy_id.clone()),
+            proxy_id: Some(truncate_chars(&summary.proxy_id, MAX_PROXY_ID_CHARS)),
             request_context,
-            connection_error: summary.connection_error.clone(),
+            connection_error: summary
+                .connection_error
+                .as_deref()
+                .map(|error| truncate_chars(error, MAX_CONNECTION_ERROR_CHARS)),
         }
     }
 }
@@ -575,8 +592,10 @@ fn connect_gateway_pool_lazy() -> Result<GatewayAuditStore, String> {
     })?;
     // Resolve dialect from FERRUM_DB_TYPE only — never infer or log the raw URL
     // (URLs may embed credentials).
-    let db_type = crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TYPE")
-        .unwrap_or_else(|| "sqlite".to_string());
+    let db_type = crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TYPE").ok_or_else(|| {
+        "example_audit_plugin requires FERRUM_DB_TYPE for the gateway database dialect"
+            .to_string()
+    })?;
     let dialect = AuditSqlDialect::from_db_type(&db_type)?;
     // Use a lazy pool so `start_background_tasks` stays sync-safe on the Tokio
     // runtime; the first flush surfaces connectivity errors through the
@@ -737,14 +756,14 @@ impl Plugin for ExampleAuditPlugin {
     /// hyper-owned streaming bodies invoke it from a spawned terminal task;
     /// native H3 awaits it after body completion. The hot path only enqueues.
     async fn log(&self, summary: &TransactionSummary) {
-        self.enqueue(self.record_from_http(summary));
+        self.enqueue_with(|| self.record_from_http(summary));
     }
 
     /// Record TCP/TLS, UDP/DTLS, and other stream sessions at disconnect.
     /// WebSocket upgraded sessions are covered by the HTTP `log()` hook for
     /// the handshake transaction; this hook covers native stream proxies.
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.enqueue(self.record_from_stream(summary));
+        self.enqueue_with(|| self.record_from_stream(summary));
     }
 }
 

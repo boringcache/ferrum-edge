@@ -300,6 +300,11 @@ fn test_logger_startup_is_lock_free_after_start() {
         "enqueue must read the logger through OnceLock::get"
     );
     assert!(
+        source.contains("logger.try_reserve()")
+            && source.contains("permit.send(build_record())"),
+        "queue capacity must be reserved before constructing an audit record"
+    );
+    assert!(
         !source.contains("logger: Mutex<Option<BatchingLogger"),
         "steady-state hooks must not acquire a Mutex around the batching logger"
     );
@@ -419,6 +424,21 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
             .expect_err("missing FERRUM_DB_URL must fail")
     };
     assert!(start_err.contains("FERRUM_DB_URL"), "got: {start_err}");
+
+    // A URL without its explicit gateway dialect must also fail closed; the
+    // plugin must never infer placeholder syntax from a possibly credentialed
+    // raw URL.
+    let type_err = {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _db_url = ScopedEnv::set("FERRUM_DB_URL", "sqlite::memory:");
+        let _db_type = ScopedEnv::remove("FERRUM_DB_TYPE");
+        plugin
+            .start_background_tasks()
+            .expect_err("missing FERRUM_DB_TYPE must fail")
+    };
+    assert!(type_err.contains("FERRUM_DB_TYPE"), "got: {type_err}");
 
     // Hooks remain panic-free even when the worker was not started.
     let http = TransactionSummary {
@@ -641,9 +661,17 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         plugin
             .on_stream_disconnect(&StreamTransactionSummary {
                 namespace: "ferrum".to_string(),
-                proxy_id: format!("stream-{protocol}"),
+                proxy_id: if protocol == "tcp" {
+                    "P".repeat(300)
+                } else {
+                    format!("stream-{protocol}")
+                },
                 proxy_name: Some(format!("{protocol}-in")),
-                client_ip: client_ip.to_string(),
+                client_ip: if protocol == "tcp" {
+                    "I".repeat(300)
+                } else {
+                    client_ip.to_string()
+                },
                 consumer_username: None,
                 auth_method: None,
                 backend_target: "192.0.2.20:5432".to_string(),
@@ -653,7 +681,11 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                 duration_ms: 88.0,
                 bytes_sent: 10,
                 bytes_received: 20,
-                connection_error: Some("reset".to_string()),
+                connection_error: Some(if protocol == "tcp" {
+                    "E".repeat(5000)
+                } else {
+                    "reset".to_string()
+                }),
                 error_class: None,
                 disconnect_direction: None,
                 disconnect_cause: None,
@@ -699,8 +731,9 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                 assert_eq!(status, Some(201));
                 let consumer_username: Option<String> =
                     row.try_get("consumer_username").ok().flatten();
-                let consumer_username =
-                    consumer_username.as_deref().expect("bounded consumer identity");
+                let consumer_username = consumer_username
+                    .as_deref()
+                    .expect("bounded consumer identity");
                 assert_eq!(consumer_username.chars().count(), 255);
                 assert!(consumer_username.chars().all(|c| c == 'U'));
                 saw_http = true;
@@ -783,6 +816,32 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         "expected tcp/tcps/udp/dtls stream audit rows"
     );
     assert!(expired_gone, "retention worker must purge the expired row");
+
+    let bounded_stream = sqlx::query(
+        "SELECT client_ip, proxy_id, connection_error FROM example_audit_log \
+         WHERE protocol = 'tcp' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("bounded TCP audit row");
+    let bounded_client_ip: String = bounded_stream.get("client_ip");
+    let bounded_proxy_id: Option<String> = bounded_stream.try_get("proxy_id").ok().flatten();
+    let bounded_connection_error: Option<String> = bounded_stream
+        .try_get("connection_error")
+        .ok()
+        .flatten();
+    assert_eq!(bounded_client_ip.chars().count(), 255);
+    assert!(bounded_client_ip.chars().all(|c| c == 'I'));
+    assert_eq!(
+        bounded_proxy_id.as_deref().map(|value| value.chars().count()),
+        Some(255)
+    );
+    assert_eq!(
+        bounded_connection_error
+            .as_deref()
+            .map(|value| value.chars().count()),
+        Some(4096)
+    );
 
     // Redacted context must not contain the raw cookie value; colliding
     // truncated keys must keep the lexicographically earlier value and mark
