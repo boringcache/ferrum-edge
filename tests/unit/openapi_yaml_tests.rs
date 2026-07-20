@@ -6132,7 +6132,10 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         .as_str()
         .unwrap_or_default();
     assert!(content_desc.contains("+json") || content_desc.contains("structured"));
-    assert!(!content_desc.contains("substring"));
+    assert!(
+        content_desc.contains("not by arbitrary substring match"),
+        "content_type description must document exact/suffix classification (not arbitrary substring): {content_desc}"
+    );
 
     for valid in [
         json!({}),
