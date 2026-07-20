@@ -11517,11 +11517,13 @@ components:
         buffer_max_bytes:
           type: integer
           default: 16777216
-          minimum: 1024
+          minimum: 2050
           maximum: 268435456
           description: >-
-            Aggregate retained-byte budget across queued records. Must be
-            greater than or equal to max_entry_bytes.
+            Aggregate serialized-content budget across queued records,
+            contiguous batch assembly, and retries. Admission conservatively
+            reserves two copies plus JSON-array framing, so this value must be
+            greater than or equal to 2 * (max_entry_bytes + 1).
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:

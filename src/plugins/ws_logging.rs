@@ -48,13 +48,15 @@ use super::{
 };
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
-/// Default / hard maxima for per-entry serialization and aggregate queued bytes.
+/// Default / hard maxima for per-entry serialization and aggregate queued,
+/// batch-assembly, and retry bytes.
 pub const WS_DEFAULT_MAX_ENTRY_BYTES: usize = 64 * 1024;
 pub const WS_MAX_MAX_ENTRY_BYTES: usize = 1024 * 1024;
 pub const WS_DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const WS_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 const WS_MIN_RESOURCE_BYTES: usize = 1024;
+const WS_MIN_BUFFER_MAX_BYTES: usize = (WS_MIN_RESOURCE_BYTES + 1) * 2;
 const WS_DROP_WARN_EVERY: u64 = 100;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_WRITE_TIMEOUT_MS: u64 = 5_000;
@@ -64,6 +66,12 @@ const MAX_RECONNECT_DELAY_MS: u64 = 60_000;
 const MAX_RETRIES: u64 = 10;
 
 /// Pre-serialized log entry admitted under slot + byte budgets.
+///
+/// The lease conservatively covers two copies of the entry plus JSON-array
+/// framing. One copy is the queued entry; the second is the contiguous batch
+/// payload allocated while entries are assembled and converted into an
+/// `Arc<str>`. Keeping that reservation with the payload bounds both the
+/// transient assembly peak and every retry, even while new records queue.
 struct QueuedEntry {
     json: Arc<str>,
     _lease: Arc<WsByteLease>,
@@ -485,12 +493,13 @@ impl WsLogging {
             config,
             "buffer_max_bytes",
             WS_DEFAULT_BUFFER_MAX_BYTES as u64,
-            WS_MIN_RESOURCE_BYTES as u64,
+            WS_MIN_BUFFER_MAX_BYTES as u64,
             WS_MAX_BUFFER_MAX_BYTES as u64,
         )? as usize;
-        if buffer_max_bytes < max_entry_bytes {
+        let minimum_buffer_max_bytes = max_entry_bytes.saturating_add(1).saturating_mul(2);
+        if buffer_max_bytes < minimum_buffer_max_bytes {
             return Err(
-                "ws_logging: 'buffer_max_bytes' must be greater than or equal to 'max_entry_bytes'"
+                "ws_logging: 'buffer_max_bytes' must be at least twice 'max_entry_bytes' plus 2 bytes for conservative queue/batch accounting"
                     .to_string(),
             );
         }
@@ -543,7 +552,7 @@ impl WsLogging {
             }
             return;
         }
-        let retained_bytes = writer.bytes.len();
+        let retained_bytes = writer.bytes.len().saturating_add(1).saturating_mul(2);
         let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
             return;
         };
@@ -606,7 +615,7 @@ impl WsLogging {
             }
             return;
         }
-        let retained_bytes = writer.bytes.len();
+        let retained_bytes = writer.bytes.len().saturating_add(1).saturating_mul(2);
         let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
             return;
         };
@@ -884,7 +893,14 @@ impl Drop for WsConnection {
     }
 }
 
-fn build_batch_payload(entries: &[QueuedEntry]) -> Arc<str> {
+struct BatchPayload {
+    json: Arc<str>,
+    /// Keep the conservative byte reservations alive for the payload's full
+    /// send/retry lifetime after the individual queued JSON allocations drop.
+    _leases: Vec<Arc<WsByteLease>>,
+}
+
+fn build_batch_payload(entries: Vec<QueuedEntry>) -> BatchPayload {
     let mut total = 2; // `[` `]`
     for (idx, entry) in entries.iter().enumerate() {
         if idx > 0 {
@@ -893,15 +909,20 @@ fn build_batch_payload(entries: &[QueuedEntry]) -> Arc<str> {
         total += entry.json.len();
     }
     let mut out = String::with_capacity(total);
+    let mut leases = Vec::with_capacity(entries.len());
     out.push('[');
-    for (idx, entry) in entries.iter().enumerate() {
+    for (idx, entry) in entries.into_iter().enumerate() {
         if idx > 0 {
             out.push(',');
         }
         out.push_str(&entry.json);
+        leases.push(entry._lease);
     }
     out.push(']');
-    Arc::from(out)
+    BatchPayload {
+        json: Arc::from(out),
+        _leases: leases,
+    }
 }
 
 /// Attempt to send a batch over the WebSocket connection. Returns the
@@ -921,7 +942,7 @@ async fn send_batch(
 ) -> Option<WsConnection> {
     let total_attempts = cfg.max_retries.saturating_add(1);
     let entry_count = batch.len();
-    let payload = build_batch_payload(&batch);
+    let payload = build_batch_payload(batch);
 
     for attempt in 1..=total_attempts {
         if conn.as_ref().is_some_and(|c| c.drain_finished()) {
@@ -944,7 +965,9 @@ async fn send_batch(
         }
 
         if let Some(ref mut ws) = conn {
-            let msg = tokio_tungstenite::tungstenite::protocol::Message::Text((&*payload).into());
+            let msg = tokio_tungstenite::tungstenite::protocol::Message::Text(
+                (&*payload.json).into(),
+            );
             match tokio::time::timeout(cfg.write_timeout, ws.sink.send(msg)).await {
                 Ok(Ok(())) => return conn,
                 Ok(Err(e)) => {

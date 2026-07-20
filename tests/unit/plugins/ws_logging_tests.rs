@@ -164,6 +164,11 @@ async fn test_ws_logging_rejects_invalid_config_shapes() {
         json!({"endpoint_url": "ws://localhost:9300/logs", "buffer_max_bytes": 512}),
         json!({
             "endpoint_url": "ws://localhost:9300/logs",
+            "max_entry_bytes": 1024,
+            "buffer_max_bytes": 2049
+        }),
+        json!({
+            "endpoint_url": "ws://localhost:9300/logs",
             "max_entry_bytes": 4096,
             "buffer_max_bytes": 1024
         }),
