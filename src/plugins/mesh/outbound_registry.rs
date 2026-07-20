@@ -315,10 +315,13 @@ impl OutboundRegistry {
 /// Constant Prometheus `host` label value used for every deny decision; see
 /// [`OutboundRegistry::record_deny_decision`].
 pub(crate) const DENIED_HOST_BUCKET: &str = "<denied>";
+/// Constant Prometheus `host` label for admits matched by a one-label wildcard
+/// registry entry (`*.example.com`). Keeps admit cardinality bounded
+/// independently of registry size.
+pub(crate) const ADMITTED_WILDCARD_BUCKET: &str = "<admit_wildcard>";
 /// Constant Prometheus `host` label for admits matched by an exact registry
 /// entry (bare host, `host:port`, or `host:*`). Keeps admit cardinality
 /// bounded independently of registry size.
-pub(crate) const ADMITTED_WILDCARD_BUCKET: &str = "<admit_wildcard>";
 pub(crate) const EXPLICIT_HOST_BUCKET: &str = "<admit_explicit>";
 
 fn normalise_registry_entry(entry: &str) -> Option<String> {

@@ -38590,11 +38590,11 @@ mod tests {
         );
     }
 
-    /// Regression guard: outbound-capture HTTP route misses under effective
-    /// REGISTRY_ONLY must consult `http_route_miss_reject_status` before the
-    /// generic 404, so configured reject status + deny metrics stay aligned
-    /// with the auto-injected plugin path. Inbound HBONE relay synthesis must
-    /// remain earlier in the same arm (unchanged).
+    /// Complementary ordering guard for the inbound HBONE relay synthesis that
+    /// must stay ahead of the REGISTRY_ONLY route-miss gate in the same arm.
+    /// Executable request-path coverage for the gate itself lives in
+    /// `tests/integration/mesh_outbound_registry_route_miss_tests.rs`; this
+    /// fingerprint only asserts the hard-to-drive HBONE-vs-gate source order.
     #[test]
     fn registry_only_route_miss_gate_precedes_generic_not_found() {
         let src = include_str!("mod.rs");
