@@ -74,6 +74,23 @@ fn make_summary_with_bytes(
     summary
 }
 
+fn make_grpc_summary(
+    proxy_id: &str,
+    consumer: &str,
+    grpc_status: Option<&str>,
+) -> TransactionSummary {
+    let mut summary = make_summary(proxy_id, "gRPC API", Some(consumer), 200);
+    summary
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    if let Some(status) = grpc_status {
+        summary
+            .metadata
+            .insert("grpc_status".to_string(), status.to_string());
+    }
+    summary
+}
+
 fn make_stream_summary(
     proxy_id: &str,
     proxy_name: &str,
@@ -931,6 +948,80 @@ async fn test_log_charges_identified_consumer() {
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
     let key = make_key_with_prices("alice", "proxy-1", 200, 0.001, 0.0, 0.0);
     assert!(registry.entries.contains_key(&key));
+}
+
+#[tokio::test]
+async fn test_log_prices_final_grpc_status_as_effective_http_status() {
+    let config = json!({
+        "pricing_tiers": [
+            {"status_codes": [200], "price_per_call": 0.001},
+            {"status_codes": [403], "price_per_call": 0.007},
+            {"status_codes": [500], "price_per_call": 0.008},
+            {"status_codes": [503], "price_per_call": 0.009}
+        ]
+    });
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
+    let registry = ferrum_edge::plugins::api_chargeback::global_registry();
+
+    let cases = [
+        (
+            "grpc-billing-ok",
+            "grpc-billing-ok-user",
+            Some("0"),
+            200,
+            0.001,
+        ),
+        (
+            "grpc-billing-denied",
+            "grpc-billing-denied-user",
+            Some("7"),
+            403,
+            0.007,
+        ),
+        (
+            "grpc-billing-unavailable",
+            "grpc-billing-unavailable-user",
+            Some("14"),
+            503,
+            0.009,
+        ),
+        (
+            "grpc-billing-missing",
+            "grpc-billing-missing-user",
+            None,
+            500,
+            0.008,
+        ),
+        (
+            "grpc-billing-malformed",
+            "grpc-billing-malformed-user",
+            Some("invalid"),
+            500,
+            0.008,
+        ),
+    ];
+
+    for (proxy_id, consumer, grpc_status, effective_status, price) in cases {
+        plugin
+            .log(&make_grpc_summary(proxy_id, consumer, grpc_status))
+            .await;
+        let key = make_key_with_prices(consumer, proxy_id, effective_status, price, 0.0, 0.0);
+        let entry = registry
+            .entries
+            .get(&key)
+            .unwrap_or_else(|| panic!("missing effective gRPC billing entry {key}"));
+        assert_eq!(entry.status_code, effective_status);
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
+        assert!((entry.call_charge() - price).abs() < 1e-12);
+        drop(entry);
+        assert!(
+            effective_status == 200
+                || !registry.entries.contains_key(&make_key_with_prices(
+                    consumer, proxy_id, 200, 0.001, 0.0, 0.0
+                )),
+            "non-OK gRPC status must not be charged in the HTTP 200 bucket"
+        );
+    }
 }
 
 #[tokio::test]
