@@ -125,12 +125,13 @@ gateway_matrix! {
 // 1. Request-direction: a fast Trailers-Only UNAVAILABLE can close the
 //    request half before local DATA runs (`inactive stream` from
 //    `send_data`) while the response future still carries grpc-status.
-// 2. Response-direction residual (main run 29709363349): dropping the
-//    unread frontend upload before hyper writes the Trailers-Only error
-//    queued RST_STREAM(NO_ERROR) against the same stream. Production now
-//    retains that upload on the error ProxyBody until HEADERS+END_STREAM
-//    complete; the test client also ignores a lone NO_ERROR recv signal
-//    when an explicit grpc-status is already present (RFC 9113 §8.1).
+// 2. Response-direction residual (main run 29709363349): h2 delivered the
+//    complete Trailers-Only response and then the RFC 9113 §8.1-permitted
+//    RST_STREAM(NO_ERROR), which the raw client surfaced on the recv half.
+//    Production retains the unread upload with the response as H2
+//    defense-in-depth, but the primary compatibility fix is for the test
+//    client to accept only that typed remote reset after END_STREAM carried
+//    an explicit valid grpc-status.
 gateway_matrix! {
     name = backend_accepts_then_rst_returns_502,
     frontend = [H1, H2, Grpc],

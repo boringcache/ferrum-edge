@@ -2221,8 +2221,10 @@ pub fn build_grpc_error_response_with_policy(
 }
 
 /// Attach an unread frontend gRPC upload to a synthesized Trailers-Only error
-/// so the frontend stream is not reset until after hyper writes HEADERS +
-/// END_STREAM (#2057).
+/// so its ownership follows the response-body lifecycle (#2057). This is
+/// defense-in-depth on the pinned h2 0.4.x transport: h2 already writes the
+/// response HEADERS before its permitted NO_ERROR request cancellation, and a
+/// raw client can still observe that reset after the complete response.
 pub fn attach_held_frontend_grpc_upload(
     mut response: hyper::Response<super::ProxyBody>,
     held_frontend_upload: Option<GrpcBody>,
@@ -2474,8 +2476,9 @@ async fn proxy_grpc_streaming_dispatch(
     let uri: hyper::Uri = match backend_url.parse() {
         Ok(uri) => uri,
         Err(e) => {
-            // Preserve the unread frontend upload so the caller can synthesize
-            // Trailers-Only BEFORE the stream is reset (#2057).
+            // Preserve the unread frontend upload so the caller controls its
+            // termination relative to the synthesized Trailers-Only response:
+            // response-body ownership on H2 and post-HEADERS+FIN on H3 (#2057).
             *held_frontend_upload = Some(grpc_body);
             return Err(GrpcProxyError::Internal(format!(
                 "Invalid backend URL: {}",
@@ -2535,8 +2538,9 @@ async fn proxy_grpc_streaming_dispatch(
 
     // Acquire the backend sender BEFORE moving the frontend upload into the
     // outbound request. A connect/handshake failure (accept-then-RST) must
-    // return the unread Incoming/Channel body to the caller so the
-    // Trailers-Only gateway error is written before RST_STREAM (#2057).
+    // return the unread Incoming/Channel body so the caller owns termination:
+    // H2 retains it with the response as defense-in-depth, while H3 must defer
+    // channel drop/STOP_SENDING until after Trailers-Only HEADERS+FIN (#2057).
     let mut sender = if let Some(deadline) = grpc_deadline_at {
         match tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy)).await {
             Err(_) => {

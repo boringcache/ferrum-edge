@@ -324,8 +324,9 @@ fn test_grpc_error_response_unavailable() {
 #[test]
 fn trailers_only_error_can_retain_unread_frontend_upload() {
     // #2057: a pre-wire backend failure must keep the unread frontend upload
-    // alive on the synthesized Trailers-Only response so RST_STREAM cannot
-    // race the grpc-status HEADERS+END_STREAM write.
+    // coupled to the synthesized Trailers-Only response lifecycle. This is an
+    // H2 defense-in-depth ownership guarantee; raw clients still handle the
+    // permitted post-response NO_ERROR reset.
     use http_body_util::Full;
 
     let held = grpc_proxy::GrpcBody::Buffered(Full::new(bytes::Bytes::from_static(b"pending")));
@@ -356,7 +357,7 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
     let body = &src[start..];
     let end = body
         .find("\npub(crate) async fn collect_grpc_request_body(")
-        .unwrap_or(body.len().min(12_000));
+        .expect("collect_grpc_request_body anchor not found");
     let body = &body[..end];
     let sender_pos = body
         .find("grpc_pool.get_sender(proxy)")
@@ -372,6 +373,22 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
     assert!(
         body.contains("*held_frontend_upload = Some(grpc_body)"),
         "pre-wire failures must stash the unread frontend upload for the caller"
+    );
+
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        proxy_src
+            .matches("grpc_proxy::attach_held_frontend_grpc_upload(")
+            .count(),
+        3,
+        "all three terminal native/gRPC-Web error shapes must attach the held upload"
+    );
+    assert_eq!(
+        proxy_src
+            .matches("held_frontend_grpc_upload.take()")
+            .count(),
+        3,
+        "each terminal error attachment must consume the held upload exactly once"
     );
 }
 

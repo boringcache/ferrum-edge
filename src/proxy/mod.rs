@@ -20326,8 +20326,10 @@ async fn handle_proxy_request_inner(
         // outcome at response-header time as before.
         let mut grpc_streaming_probe_recorder: Option<Arc<GrpcStreamingProbeRecorder>> = None;
         // Unread frontend upload retained across a synthesized Trailers-Only
-        // error on the fully-streaming path so RST_STREAM cannot race the
-        // gateway-formatted grpc-status response (#2057).
+        // error on the fully-streaming H2 path. The pinned h2 transport already
+        // orders response HEADERS before its permitted NO_ERROR cancellation;
+        // coupling ownership to the response lifecycle is defense-in-depth,
+        // while the raw client still handles the legal residual reset (#2057).
         let mut held_frontend_grpc_upload: Option<grpc_proxy::GrpcBody> = None;
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch

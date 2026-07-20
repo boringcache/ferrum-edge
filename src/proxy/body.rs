@@ -108,10 +108,12 @@ pub struct ProxyBody {
     /// on the first poll per body, zero cost thereafter.
     polled: AtomicBool,
     /// Unread frontend gRPC upload retained across a synthesized Trailers-Only
-    /// gateway error (#2057). Dropping `hyper::body::Incoming` before hyper
-    /// writes the error response RSTs the frontend stream and races the
-    /// `grpc-status` Trailers-Only frame; holding it here defers that reset
-    /// until after the empty error body completes (HEADERS + END_STREAM).
+    /// gateway error (#2057). With the pinned h2 0.4.x transport, response
+    /// HEADERS are already serialized before the permitted NO_ERROR request
+    /// cancellation; retaining the upload couples its lifetime to the response
+    /// body as defense-in-depth rather than claiming a stronger wire-order
+    /// guarantee. Raw clients must still accept that legal residual reset after
+    /// an explicit Trailers-Only `grpc-status`.
     /// Boxed so this rare error-path hold remains pointer-sized on every
     /// ordinary response body. `GrpcBody` contains an `Incoming` or mpsc
     /// receiver and must not inflate the proxy hot-path response envelope.
@@ -433,8 +435,9 @@ impl ProxyBody {
     }
 
     /// Retain an unread frontend gRPC upload until this response body is
-    /// dropped so a synthesized Trailers-Only error is written before the
-    /// frontend stream is reset (#2057).
+    /// dropped. This keeps request ownership coupled to the synthesized
+    /// Trailers-Only response lifecycle as an H2 defense-in-depth measure;
+    /// the client still handles the legal post-response NO_ERROR reset (#2057).
     pub(crate) fn with_held_frontend_grpc_upload(
         mut self,
         upload: crate::proxy::grpc_proxy::GrpcBody,

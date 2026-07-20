@@ -343,6 +343,7 @@ impl GrpcClient {
 
         let http_status = response.status().as_u16();
         let headers = response.headers().clone();
+        let initial_headers_end_stream = response.body().is_end_stream();
         let (_parts, mut body_stream) = response.into_parts();
 
         // Bound body + trailer collection separately from `response_fut` so
@@ -415,6 +416,7 @@ impl GrpcClient {
             stream_error,
             stream_error_is_remote_no_error_reset,
             &headers,
+            initial_headers_end_stream,
             trailers.as_ref(),
         );
 
@@ -436,17 +438,23 @@ impl GrpcClient {
 
 /// Returns `None` when `stream_error` is solely the RFC 9113 early-response
 /// `RST_STREAM(NO_ERROR)` signal and a valid explicit `grpc-status` is already
-/// present in headers or trailers. Any other stream error is preserved.
+/// present in terminal headers or trailers. An initial `grpc-status` is
+/// authoritative only when that HEADERS block also ended the stream; otherwise
+/// a later reset could have truncated DATA and must remain visible.
 fn suppress_benign_early_response_reset(
     stream_error: Option<String>,
     stream_error_is_remote_no_error_reset: bool,
     headers: &HeaderMap,
+    initial_headers_end_stream: bool,
     trailers: Option<&HeaderMap>,
 ) -> Option<String> {
     let err = stream_error?;
+    let trailers_only_status = initial_headers_end_stream
+        .then(|| headers.get("grpc-status"))
+        .flatten();
     let explicit_grpc_status = trailers
         .and_then(|map| map.get("grpc-status"))
-        .or_else(|| headers.get("grpc-status"));
+        .or(trailers_only_status);
     if stream_error_is_remote_no_error_reset
         && explicit_grpc_status.is_some_and(is_valid_explicit_grpc_status)
     {
@@ -676,6 +684,7 @@ mod tests {
             Some("body error: stream error received: not a result of an error".into()),
             true,
             &headers,
+            true,
             None,
         );
         assert!(
@@ -692,6 +701,7 @@ mod tests {
             Some("body error: unrelated failure mentioning not a result of an error".into()),
             false,
             &headers,
+            true,
             None,
         );
         assert_eq!(
@@ -708,6 +718,7 @@ mod tests {
             Some("body error: stream error received: not a result of an error".into()),
             true,
             &headers,
+            true,
             None,
         );
         assert!(
@@ -725,6 +736,7 @@ mod tests {
                 Some("body error: stream error received: not a result of an error".into()),
                 true,
                 &headers,
+                true,
                 None,
             );
             assert!(
@@ -732,6 +744,23 @@ mod tests {
                 "malformed grpc-status {malformed:?} must not make an incomplete response valid"
             );
         }
+    }
+
+    #[test]
+    fn preserve_no_error_reset_when_initial_grpc_status_did_not_end_stream() {
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", "14".parse().unwrap());
+        let kept = suppress_benign_early_response_reset(
+            Some("body error: stream error received: not a result of an error".into()),
+            true,
+            &headers,
+            false,
+            None,
+        );
+        assert!(
+            kept.is_some(),
+            "non-terminal initial grpc-status must not mask truncated DATA"
+        );
     }
 
     #[test]
