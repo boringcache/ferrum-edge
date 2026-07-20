@@ -68,9 +68,7 @@ async fn spawn_dtls_server() -> (Arc<ferrum_edge::dtls::DtlsServer>, SocketAddr)
             // Retain and drain each accepted association. Dropping the handle
             // here would close the server side immediately after handshake and
             // turn DNS-rollover coverage into a race against teardown.
-            tokio::spawn(async move {
-                while connection.recv().await.is_ok() {}
-            });
+            tokio::spawn(async move { while connection.recv().await.is_ok() {} });
         }
     });
     (server, addr)
