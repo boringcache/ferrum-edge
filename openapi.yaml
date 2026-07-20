@@ -15264,7 +15264,8 @@ components:
 
     CompressionConfig:
       type: object
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression."
+      additionalProperties: false
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression. Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance."
       properties:
         algorithms:
           type: array
@@ -15289,10 +15290,10 @@ components:
           description: "Strip Accept-Encoding from backend request so backend sends uncompressed"
         gzip_level:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 9
           default: 6
-          description: "Gzip compression level (1=fastest, 9=best)"
+          description: "Gzip compression level (0=no compression, 1=fastest, 9=best)"
         brotli_quality:
           type: integer
           minimum: 0
@@ -16457,7 +16458,16 @@ components:
 
     LoadTestingConfig:
       type: object
-      description: "Plugin: load_testing — On-demand proxy load testing triggered by X-Loadtesting-Key header. Spawns concurrent clients through the gateway's own proxy listener (HTTP only)."
+      additionalProperties: false
+      description: |
+        Plugin: load_testing — On-demand proxy load testing triggered by
+        X-Loadtesting-Key header. Spawns concurrent clients through the
+        gateway's own proxy listener (HTTP only). Unknown top-level keys are
+        rejected. File, admin/database, and CP/DP admission share the same
+        constructor validation; serving-mode publication uses KeepLastKnownGood
+        so an invalid candidate keeps the prior valid generation active.
+        Omitted optional fields select defaults; runtime also treats explicit
+        null on optional fields as omitted.
       required:
         - key
         - concurrent_clients
@@ -16465,6 +16475,7 @@ components:
       properties:
         key:
           type: string
+          minLength: 1
           description: Secret value that the X-Loadtesting-Key header must match to trigger the load test
         concurrent_clients:
           type: integer
@@ -16479,36 +16490,38 @@ components:
           maximum: 3600
           description: How long the test runs in seconds
         ramp:
-          type: boolean
+          type: [boolean, "null"]
           default: false
           description: When true, clients start gradually over the duration instead of all at once
         request_timeout_ms:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           default: 30000
           minimum: 1
           description: "Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll)"
         max_response_body_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           default: 1048576
           description: >-
-            Maximum synthetic response bytes consumed per request. Larger
-            responses are truncated to bound each worker's memory use.
+            Maximum response bytes the synthetic client consumes per request.
+            Must be greater than zero. The client stops reading at the cap,
+            bounding its own work and memory without changing the backend
+            response.
         gateway_port:
-          type: integer
+          type: [integer, "null"]
           format: uint16
           description: "Local gateway port for synthetic requests. Defaults to FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT when gateway_tls is enabled) or 8000/8443"
         gateway_tls:
-          type: boolean
+          type: [boolean, "null"]
           default: false
           description: Use HTTPS for local loopback synthetic requests
         gateway_tls_no_verify:
-          type: boolean
+          type: [boolean, "null"]
           description: "Skip TLS cert verification for loopback connections. Defaults to true when gateway_tls is enabled (gateway cert typically won't match 127.0.0.1)"
         gateway_addresses:
-          type: array
+          type: [array, "null"]
           items:
             type: string
           description: "Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test"
@@ -16756,25 +16769,26 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      additionalProperties: false
       properties:
         ttl_seconds:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           default: 300
           description: "Default freshness lifetime in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true. Upstream Age and Date still reduce remaining freshness."
         max_entries:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           default: 10000
           description: Maximum number of cached entries before eviction of expired/oldest entries
         max_entry_size_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           default: 1048576
           description: Maximum size of a single cached response body (1 MiB by default). Larger responses are not cached.
         max_total_size_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           default: 104857600
           description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached.
@@ -16792,11 +16806,11 @@ components:
           default: [200, 301, 404]
           description: Response status codes eligible for caching
         respect_cache_control:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public)"
         respect_no_cache:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: "Bypass cache lookup when the client request sends Cache-Control: no-cache or no-store"
         vary_by_headers:
@@ -16806,19 +16820,19 @@ components:
           default: []
           description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header."
         cache_key_include_query:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: Include the exact raw query string in the cache key as a SHA-256 hash. The query string is not parsed, sorted, percent-decoded, or normalized.
         cache_key_include_consumer:
-          type: boolean
+          type: [boolean, "null"]
           default: false
           description: Allow caching authenticated responses under their isolated identity key even when the backend does not send Cache-Control public/s-maxage/must-revalidate; also add an _anon cache-key partition for unauthenticated requests. Authenticated requests are always partitioned by hashed effective identity regardless of this flag.
         add_cache_status_header:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses. Cache hits also emit a current Age header."
         invalidate_on_unsafe_methods:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on non-cacheable methods (POST, PUT, PATCH, DELETE)"
 
@@ -17004,10 +17018,13 @@ components:
 
     GrpcWebConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_web — Translates between gRPC-Web (browser-compatible)
         and native gRPC (HTTP/2) wire formats. Supports binary
         (application/grpc-web) and text (application/grpc-web-text) encoding.
+        Config must be a JSON object (not null); `{}` and objects that only set
+        `expose_headers` are accepted. Unknown keys are rejected.
       properties:
         expose_headers:
           type: array
@@ -17092,7 +17109,8 @@ components:
     AiTranscriptAuditConfig:
       type: object
       required: [sink]
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work."
+      additionalProperties: false
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -17104,8 +17122,9 @@ components:
           default: false
           description: "Required guardrail for mode=full_body, which captures unredacted payloads. Construction fails if full_body is set without this opt-in."
         capture:
-          type: object
-          description: "What to capture."
+          type: [object, "null"]
+          additionalProperties: false
+          description: "What to capture. Omit or null to keep defaults."
           properties:
             request:
               type: boolean
@@ -17129,7 +17148,9 @@ components:
               default: true
               description: "Extract tool/function names from the request body."
         sampling:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: "Sampling controls. Omit or null to keep defaults."
           properties:
             rate:
               type: number
@@ -17149,8 +17170,9 @@ components:
               default: 0
               description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
         redaction:
-          type: object
-          description: "PII redaction policy for captured excerpts. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
+          type: [object, "null"]
+          additionalProperties: false
+          description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
           properties:
             builtins:
               type: array
@@ -17163,6 +17185,7 @@ components:
               items:
                 type: object
                 required: [name, regex]
+                additionalProperties: false
                 properties:
                   name:
                     type: string
@@ -17181,7 +17204,9 @@ components:
               minLength: 16
               description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. When set (min 16 chars), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
         limits:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: "Capture size caps. Omit or null to keep defaults."
           properties:
             max_request_bytes:
               type: integer
@@ -17198,7 +17223,8 @@ components:
         sink:
           type: object
           required: [endpoint_url]
-          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames)."
+          additionalProperties: false
+          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Unknown sink keys are rejected; custom_headers remains an open string map."
           properties:
             type:
               type: string
@@ -17212,7 +17238,7 @@ components:
               type: object
               additionalProperties:
                 type: string
-              description: "Extra headers sent on every batch. Values support ${ENV_VAR} expansion resolved lazily at send time, so secrets are not stored in config (e.g. Authorization: 'Bearer ${AUDIT_TOKEN}')."
+              description: "Extra headers sent on every batch. Values support ${ENV_VAR} expansion resolved lazily at send time, so secrets are not stored in config (e.g. Authorization: 'Bearer ${AUDIT_TOKEN}'). Arbitrary header names are accepted; this is the only intentional free-form map in the plugin config."
             batch_size:
               type: integer
               minimum: 1
@@ -17229,6 +17255,11 @@ components:
               type: integer
               minimum: 0
               default: 3
+            retry_delay_ms:
+              type: integer
+              minimum: 0
+              default: 1000
+              description: "Fixed delay between batch send retries for transient collector failures."
             on_buffer_full:
               type: string
               enum: [drop, reject]
@@ -17240,7 +17271,9 @@ components:
               default: warn
               description: "warn: log and drop on permanent sink failure. reject: fail selected buffered or streaming audit records with 503 before response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
-          type: object
+          type: [object, "null"]
+          additionalProperties: false
+          description: "Identity/header export controls. Omit or null to keep defaults."
           properties:
             include_consumer_username:
               type: boolean
@@ -17561,7 +17594,15 @@ components:
 
     AiSemanticCacheConfig:
       type: object
-      description: "Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized prompts. Exact-match normalization is enabled by default; optional semantic similarity uses a configured embedding provider and a local HNSW vector index. Supports local DashMap and Redis exact-response storage."
+      additionalProperties: false
+      description: >-
+        Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized
+        prompts. Exact-match normalization is enabled by default; optional
+        semantic similarity uses a configured embedding provider and a local
+        HNSW vector index. Supports local DashMap and Redis exact-response
+        storage. Unknown root, semantic-policy, and Redis sync keys are
+        rejected at admission with path-qualified diagnostics (registration
+        policy KeepLastKnownGood). There are no intentionally open maps.
       properties:
         ttl_seconds:
           type: integer
@@ -18154,24 +18195,39 @@ components:
 
     AiToolGovernorConfig:
       type: object
-      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions (tools[].function.name / functions[].name), buffered response tool calls (choices[].message.tool_calls[] and legacy function_call), streaming SSE tool-call deltas (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
+      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions (tools[].function.name / functions[].name), buffered response tool calls (choices[].message.tool_calls[] and legacy function_call), streaming SSE tool-call deltas (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Configuration is strict: unknown root, inspect, tool-policy, blocked-pattern, approval, response, and observability properties are rejected (with path-qualified diagnostics). The free-form `tools` name map and arbitrary per-tool `json_schema` document remain open. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
       properties:
         enabled:
           type: boolean
           default: true
-          description: "When false the plugin is inert (no buffering, no inspection), and policy fields are ignored."
+          description: "When false the plugin is inert (no buffering, no inspection), and policy field *values* are ignored — but unknown property names are still rejected at every fixed-shape layer."
       allOf:
         - if:
             required: [enabled]
             properties:
               enabled:
                 const: false
-          then: {}
+          then:
+            # Disabled drafts may carry ignored policy fields of any value, but
+            # only the known property names — typos still fail closed.
+            type: object
+            additionalProperties: false
+            properties:
+              enabled:
+                const: false
+              mode: true
+              default_action: true
+              inspect: true
+              tools: true
+              approval: true
+              response: true
+              observability: true
           else:
             $ref: "#/components/schemas/AiToolGovernorEnabledConfig"
 
     AiToolGovernorEnabledConfig:
       type: object
+      additionalProperties: false
       allOf:
         # Runtime defaults response_tool_calls to true. The only no-surface
         # shape is therefore an explicit response_tool_calls=false with
@@ -18270,7 +18326,8 @@ components:
           description: "Action for a tool with no explicit policy entry. tools may be empty only when default_action governs (deny/require_approval)."
         inspect:
           type: object
-          description: "Independently toggled inspection surfaces. At least one must be enabled."
+          additionalProperties: false
+          description: "Independently toggled inspection surfaces. At least one must be enabled. Unknown surface switches are rejected."
           properties:
             request_tool_definitions:
               type: boolean
@@ -18296,9 +18353,10 @@ components:
           type: object
           propertyNames:
             minLength: 1
-          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name)."
+          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name). The tool-name map is intentionally free-form; each policy object is closed."
           additionalProperties:
             type: object
+            additionalProperties: false
             required: [action]
             allOf:
               - if:
@@ -18335,6 +18393,7 @@ components:
                 type: array
                 items:
                   type: object
+                  additionalProperties: false
                   required: [name, regex]
                   properties:
                     name:
@@ -18348,9 +18407,10 @@ components:
                 description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args."
               json_schema:
                 type: object
-                description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny."
+                description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny. Intentionally open — arbitrary JSON Schema keywords are allowed; do not set additionalProperties: false here."
         approval:
           type: object
+          additionalProperties: false
           description: "Approval webhook, required when any policy can reach require_approval."
           required: [endpoint_url]
           properties:
@@ -18382,6 +18442,7 @@ components:
               description: "Include the raw tool arguments in the approval request body. Off by default so secrets are not sent."
         response:
           type: object
+          additionalProperties: false
           properties:
             deny_status_code:
               type: integer
@@ -18399,6 +18460,7 @@ components:
               description: "Emit a terminal SSE error event when cutting a streamed tool call."
         observability:
           type: object
+          additionalProperties: false
           properties:
             emit_metadata:
               type: boolean
@@ -18671,7 +18733,8 @@ components:
 
     AiStreamRouterConfig:
       type: object
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (after ai_semantic_cache at 2980, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      additionalProperties: false
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (after ai_semantic_cache at 2980, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). Configuration is strict: unknown root, provider, and fallback fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
       required: [providers]
       properties:
         enabled:
@@ -18700,6 +18763,7 @@ components:
           description: One or more streaming provider definitions. The first provider (in priority order) whose model_patterns match the request `model` wins.
           items:
             type: object
+            additionalProperties: false
             required: [name, provider_type, endpoint, api_key, model_patterns]
             properties:
               name:
@@ -18743,6 +18807,7 @@ components:
                 description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints."
         fallback:
           type: object
+          additionalProperties: false
           description: "Reserved fallback policy. Parsed and validated but not yet active: ai_stream_router cannot switch providers after the first downstream byte."
           properties:
             enabled:

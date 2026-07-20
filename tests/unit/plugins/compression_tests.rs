@@ -1,5 +1,5 @@
-use ferrum_edge::plugins::compression::CompressionPlugin;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, validate_plugin_config};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -102,6 +102,94 @@ fn test_removed_disable_on_etag_config_rejected() {
         err.contains("disable_on_etag") && err.contains("removed"),
         "got: {err}"
     );
+    assert!(
+        !err.contains("unknown configuration key"),
+        "removed-key diagnostic must win over the generic unknown-key gate: {err}"
+    );
+}
+
+#[test]
+fn test_rejects_one_unknown_key_with_spelling_suggestion() {
+    let err = CompressionPlugin::new(&json!({"min_content_lenght": 4096}))
+        .err()
+        .expect("typo key must be rejected");
+    assert!(
+        err.contains("unknown configuration key"),
+        "missing unknown-key wording: {err}"
+    );
+    assert!(
+        err.contains("'config.min_content_lenght'"),
+        "path-qualified key missing: {err}"
+    );
+    assert!(
+        err.contains("did you mean 'min_content_length'?"),
+        "spelling suggestion missing: {err}"
+    );
+
+    let shared = validate_plugin_config("compression", &json!({"gzip_leveel": 1}))
+        .expect_err("shared file/admin/database/CP-DP admission must reject the typo");
+    assert!(
+        shared.contains("'config.gzip_leveel'") && shared.contains("did you mean 'gzip_level'?"),
+        "got: {shared}"
+    );
+}
+
+#[test]
+fn test_rejects_multiple_unknown_keys_deterministically() {
+    let err = CompressionPlugin::new(&json!({
+        "zzz_extra": true,
+        "remove_accept_encodng": false,
+        "aaa_extra": 1,
+        "algorithms": ["gzip"]
+    }))
+    .err()
+    .expect("multiple unknown keys must be rejected");
+    assert!(
+        err.contains("unknown configuration key(s): 'config.aaa_extra', 'config.remove_accept_encodng' (did you mean 'remove_accept_encoding'?), 'config.zzz_extra'"),
+        "unexpected multi-key diagnostic: {err}"
+    );
+
+    let shared = validate_plugin_config(
+        "compression",
+        &json!({
+            "zzz_extra": true,
+            "remove_accept_encodng": false,
+            "aaa_extra": 1
+        }),
+    )
+    .expect_err("shared admission must reject the same multi-key set");
+    assert_eq!(shared, err, "constructor and shared admission must match");
+}
+
+#[test]
+fn test_accepts_every_valid_config_field() {
+    let config = json!({
+        "algorithms": ["gzip", "br"],
+        "brotli_quality": 4,
+        "content_types": ["application/json", "text/plain"],
+        "decompress_request": true,
+        "gzip_level": 6,
+        "max_decompressed_request_size": 1_048_576,
+        "min_content_length": 512,
+        "remove_accept_encoding": false
+    });
+    let present: std::collections::BTreeSet<&str> = config
+        .as_object()
+        .expect("fixture object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected: std::collections::BTreeSet<&str> =
+        COMPRESSION_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        present, expected,
+        "fixture must exercise every accepted root field"
+    );
+
+    let plugin = CompressionPlugin::new(&config).expect("complete valid config must construct");
+    assert!(plugin.modifies_request_body());
+    assert!(plugin.requires_response_body_buffering());
+    assert!(validate_plugin_config("compression", &config).is_ok());
 }
 
 #[test]

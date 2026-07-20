@@ -865,6 +865,88 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_load_testing_keys() {
+    let document = serde_json::json!({
+        "version": "1",
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "load-testing-typo",
+            "plugin_name": "load_testing",
+            "config": {
+                "key": "test-key",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
+                "request_timeot_ms": 5000
+            },
+            "scope": "global",
+            "enabled": true
+        }]
+    });
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{document}").unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file-mode load must reject unknown load_testing config keys");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("1 plugin config error(s)"),
+        "unexpected file-load error: {message}"
+    );
+}
+
+#[test]
+fn test_file_config_rejects_unknown_ai_semantic_cache_keys() {
+    for (id, config) in [
+        ("ai-cache-ttl-typo", serde_json::json!({"ttl_second": 60})),
+        (
+            "ai-cache-multimodal-typo",
+            serde_json::json!({"cache_multimoda": "reject"}),
+        ),
+        (
+            "ai-cache-redis-typo",
+            serde_json::json!({
+                "sync_mod": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0"
+            }),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "ai_semantic_cache",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file-mode load must reject unknown ai_semantic_cache config keys");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("1 plugin config error(s)"),
+            "unexpected file-load error: {message}"
+        );
+    }
+}
+
+#[test]
 fn test_file_config_admits_invalid_optional_proxy_alerts_configs_for_cache_omission() {
     for (id, config) in [
         (
@@ -1137,6 +1219,82 @@ fn test_file_config_rejects_unknown_ai_prompt_compressor_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_ai_stream_router_policy_keys() {
+    for (id, config, needle) in [
+        (
+            "stream-router-enabled-typo",
+            serde_json::json!({
+                "enabeld": false,
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            "config.enabeld",
+        ),
+        (
+            "stream-router-provider-tls-typo",
+            serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"],
+                    "inherit_backend_tl": true
+                }]
+            }),
+            "config.providers[0].inherit_backend_tl",
+        ),
+        (
+            "stream-router-fallback-typo",
+            serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"]
+                }],
+                "fallback": {"on_connect_erro": true}
+            }),
+            "config.fallback.on_connect_erro",
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "ai_stream_router",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file mode must reject unknown ai_stream_router keys");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("1 plugin config error(s)"),
+            "unexpected file-load error for {id}/{needle}: {message}"
+        );
+    }
+}
+
+#[test]
 fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
     let document = serde_json::json!({
         "version": "1",
@@ -1165,6 +1323,52 @@ fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
         message.contains("1 plugin config error(s)"),
         "unexpected file-load error: {message}"
     );
+}
+
+#[test]
+fn test_file_config_rejects_unknown_compression_config_keys() {
+    for (id, config) in [
+        (
+            "compression-length-typo",
+            serde_json::json!({"min_content_lenght": 4096}),
+        ),
+        (
+            "compression-gzip-typo",
+            serde_json::json!({"gzip_leveel": 1}),
+        ),
+        (
+            "compression-multi-typo",
+            serde_json::json!({"zzz_extra": true, "aaa_extra": false}),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "compression",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file-mode load must reject unknown compression keys");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("1 plugin config error(s)"),
+            "unexpected file-load error: {message}"
+        );
+    }
 }
 
 #[test]

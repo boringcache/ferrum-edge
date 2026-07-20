@@ -2428,6 +2428,89 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_load_testing_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let plugin = json!({
+        "id": "load-testing-typo",
+        "plugin_name": "load_testing",
+        "scope": "global",
+        "enabled": true,
+        "config": {
+            "key": "test-key",
+            "concurrent_clients": 5,
+            "duration_seconds": 10,
+            "request_timeot_ms": 5000,
+            "gateway_adresses": ["https://127.0.0.1:8443"]
+        }
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+    assert_eq!(status, 400, "unknown load_testing key was admitted: {body}");
+    let body_text = body.to_string();
+    assert!(
+        body_text.contains("unknown configuration key"),
+        "unexpected admin validation response: {body}"
+    );
+    assert!(
+        body_text.contains("config.gateway_adresses") || body_text.contains("gateway_adresses"),
+        "admin response must name gateway_adresses: {body}"
+    );
+    assert!(
+        body_text.contains("config.request_timeot_ms") || body_text.contains("request_timeot_ms"),
+        "admin response must name request_timeot_ms: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_create_rejects_unknown_compression_config_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, needle) in [
+        (
+            "compression-length-typo",
+            json!({"min_content_lenght": 4096}),
+            "config.min_content_lenght",
+        ),
+        (
+            "compression-gzip-typo",
+            json!({"gzip_leveel": 1}),
+            "config.gzip_leveel",
+        ),
+        (
+            "compression-accept-typo",
+            json!({"remove_accept_encodng": false}),
+            "config.remove_accept_encodng",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "compression",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(status, 400, "unknown compression key was admitted: {body}");
+        assert!(
+            body.to_string().contains(needle),
+            "unexpected admin validation response: {body}"
+        );
+        assert!(
+            body.to_string().contains("unknown configuration key"),
+            "admin error must use unknown-key wording: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
@@ -2888,6 +2971,82 @@ async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
                 "ai_prompt_compressor: unknown config field(s): {unknown_key}"
             )),
             "unexpected admin validation response: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_admin_create_rejects_unknown_ai_stream_router_policy_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, needle) in [
+        (
+            "stream-router-enabled-typo",
+            json!({
+                "enabeld": false,
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            "config.enabeld",
+        ),
+        (
+            "stream-router-provider-typo",
+            json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"],
+                    "inherit_backend_tl": true
+                }]
+            }),
+            "config.providers[0].inherit_backend_tl",
+        ),
+        (
+            "stream-router-fallback-typo",
+            json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"]
+                }],
+                "fallback": {"max_attemps": 3}
+            }),
+            "config.fallback.max_attemps",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "ai_stream_router",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(
+            status, 400,
+            "unknown ai_stream_router key was admitted: {body}"
+        );
+        let body_text = body.to_string();
+        assert!(
+            body_text.contains("unknown configuration key"),
+            "unexpected admin validation response: {body_text}"
+        );
+        assert!(
+            body_text.contains(needle),
+            "admin response missing {needle}: {body_text}"
         );
     }
 }

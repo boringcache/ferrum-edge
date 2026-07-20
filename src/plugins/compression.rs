@@ -17,8 +17,24 @@ use std::io::{Read, Write};
 use tracing::{debug, error, warn};
 
 use crate::util::http_headers::{headers_have_cache_control_directive, headers_have_strong_etag};
+use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Accepted top-level `compression` config keys.
+///
+/// Constructor admission, OpenAPI `CompressionConfig` (`additionalProperties:
+/// false`), and operator docs must stay in lockstep with this list.
+pub const COMPRESSION_CONFIG_KEYS: &[&str] = &[
+    "algorithms",
+    "brotli_quality",
+    "content_types",
+    "decompress_request",
+    "gzip_level",
+    "max_decompressed_request_size",
+    "min_content_length",
+    "remove_accept_encoding",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Algorithm {
@@ -107,6 +123,25 @@ impl CompressionPlugin {
             return Err("compression: config must be an object".to_string());
         };
 
+        // Removed keys keep their dedicated diagnostic ahead of the generic
+        // unknown-key gate so operators still see an explicit migration hint.
+        if config.get("disable_on_etag").is_some() {
+            return Err(
+                "compression: 'disable_on_etag' has been removed; strong ETag responses are always preserved"
+                    .to_string(),
+            );
+        }
+
+        let config_object = config
+            .as_object()
+            .ok_or_else(|| "compression: config must be an object".to_string())?;
+        reject_unknown_keys(
+            config_object,
+            "config",
+            COMPRESSION_CONFIG_KEYS,
+            "compression: ",
+        )?;
+
         // Parse `algorithms` strictly. Unknown values are rejected (no silent
         // skip) so configuration typos surface immediately at load time
         // instead of producing a partially-functional plugin.
@@ -138,13 +173,6 @@ impl CompressionPlugin {
         let content_types = parse_content_types(config)?;
 
         let min_content_length = optional_usize(config, "min_content_length")?.unwrap_or(256);
-
-        if config.get("disable_on_etag").is_some() {
-            return Err(
-                "compression: 'disable_on_etag' has been removed; strong ETag responses are always preserved"
-                    .to_string(),
-            );
-        }
 
         let remove_accept_encoding =
             optional_bool(config, "remove_accept_encoding")?.unwrap_or(true);

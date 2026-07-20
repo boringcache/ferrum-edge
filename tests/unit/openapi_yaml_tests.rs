@@ -1856,6 +1856,112 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
 }
 
 #[test]
+fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
+    use ferrum_edge::plugins::ai_stream_router::{
+        AI_STREAM_ROUTER_CONFIG_KEYS, AI_STREAM_ROUTER_FALLBACK_KEYS,
+        AI_STREAM_ROUTER_PROVIDER_KEYS,
+    };
+    use std::collections::BTreeSet;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiStreamRouterConfig")
+        .expect("missing AiStreamRouterConfig schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["properties"]["fallback"]["additionalProperties"],
+        false
+    );
+
+    let root_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("root properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_root_fields = AI_STREAM_ROUTER_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(root_fields, runtime_root_fields, "root key drift");
+
+    let provider_fields: BTreeSet<_> = schema["properties"]["providers"]["items"]["properties"]
+        .as_object()
+        .expect("provider properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_provider_fields = AI_STREAM_ROUTER_PROVIDER_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        provider_fields, runtime_provider_fields,
+        "provider key drift"
+    );
+
+    let fallback_fields: BTreeSet<_> = schema["properties"]["fallback"]["properties"]
+        .as_object()
+        .expect("fallback properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fallback_fields = AI_STREAM_ROUTER_FALLBACK_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fallback_fields, runtime_fallback_fields,
+        "fallback key drift"
+    );
+
+    let description = schema["description"].as_str().expect("description");
+    assert!(description.contains("unknown root, provider, and fallback"));
+    assert!(description.contains("FailClosed"));
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("**Strict configuration admission.**"));
+    assert!(guide.contains("config.enabeld"));
+    assert!(guide.contains("FailClosed"));
+
+    assert_component_validity(
+        &spec,
+        "AiStreamRouterConfig",
+        &json!({
+            "enabled": true,
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-test",
+                "model_patterns": ["gpt-*"],
+                "priority": 1,
+                "inherit_backend_tls": false
+            }],
+            "fallback": {
+                "enabled": false,
+                "on_connect_error": true,
+                "on_5xx_before_first_byte": true,
+                "max_attempts": 2
+            }
+        }),
+        true,
+    );
+    for invalid in [
+        json!({"enabeld": false, "providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"], "inherit_backend_tl": true}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}], "fallback": {"on_connect_erro": true}}),
+    ] {
+        assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
+    }
+}
+
+#[test]
 fn ldap_dial_policy_documentation_matches_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1939,6 +2045,13 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
 
 #[test]
 fn ai_tool_governor_schema_matches_runtime_invariants() {
+    use ferrum_edge::plugins::ai_tool_governor::{
+        AI_TOOL_GOVERNOR_APPROVAL_KEYS, AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
+        AI_TOOL_GOVERNOR_CONFIG_KEYS, AI_TOOL_GOVERNOR_INSPECT_KEYS,
+        AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS, AI_TOOL_GOVERNOR_RESPONSE_KEYS,
+        AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS,
+    };
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let mut schema = json!({
@@ -1952,6 +2065,123 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
     let validator = jsonschema::draft202012::options()
         .build(&schema)
         .expect("AiToolGovernorConfig schema compiles");
+
+    let enabled = &spec["components"]["schemas"]["AiToolGovernorEnabledConfig"];
+    assert_eq!(enabled["additionalProperties"], json!(false));
+    assert_eq!(
+        enabled["properties"]["inspect"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        enabled["properties"]["approval"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        enabled["properties"]["response"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        enabled["properties"]["observability"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        enabled["properties"]["tools"]["additionalProperties"]["additionalProperties"],
+        json!(false),
+        "per-tool policy objects must be closed"
+    );
+    assert_eq!(
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]["blocked_arg_patterns"]
+            ["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert!(
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]["json_schema"]
+            .get("additionalProperties")
+            .is_none(),
+        "json_schema must remain an intentionally open map"
+    );
+
+    let runtime_root: BTreeSet<&str> = AI_TOOL_GOVERNOR_CONFIG_KEYS.iter().copied().collect();
+    let schema_root: BTreeSet<&str> = enabled["properties"]
+        .as_object()
+        .expect("enabled properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(runtime_root, schema_root, "root key drift");
+    assert_eq!(
+        AI_TOOL_GOVERNOR_INSPECT_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["inspect"]["properties"]
+            .as_object()
+            .expect("inspect properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]
+            .as_object()
+            .expect("tool policy properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]
+            ["blocked_arg_patterns"]["items"]["properties"]
+            .as_object()
+            .expect("blocked pattern properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_APPROVAL_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["approval"]["properties"]
+            .as_object()
+            .expect("approval properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_RESPONSE_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["response"]["properties"]
+            .as_object()
+            .expect("response properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["observability"]["properties"]
+            .as_object()
+            .expect("observability properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
 
     for config in [
         json!({
@@ -1985,6 +2215,18 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         json!({
             "tools": {"deploy": {"action": "require_approval"}},
             "approval": {"endpoint_url": "https://approval.example/decide"}
+        }),
+        json!({
+            "tools": {
+                "custom.tool": {
+                    "action": "allow",
+                    "json_schema": {
+                        "type": "object",
+                        "$comment": "open schema keywords remain allowed",
+                        "unevaluatedProperties": false
+                    }
+                }
+            }
         }),
     ] {
         assert!(
@@ -2041,6 +2283,31 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         json!({
             "tools": {"deploy": {"action": "require_approval"}},
             "approval": {"endpoint_url": "https:///decide"}
+        }),
+        json!({"tools": {"search": {"action": "allow"}}, "modde": "enforce"}),
+        json!({
+            "enabled": false,
+            "required_arg": ["ticket_id"]
+        }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "allow",
+                    "required_arg": ["q"]
+                }
+            }
+        }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "allow",
+                    "blocked_arg_patterns": [{"name": "secret", "regex": "x", "flagss": "i"}]
+                }
+            }
+        }),
+        json!({
+            "tools": {"search": {"action": "allow"}},
+            "inspect": {"response_tool_calls": true, "response_tool_call": true}
         }),
     ] {
         assert!(
@@ -3124,6 +3391,211 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     }
 }
 
+#[tokio::test]
+async fn load_testing_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::load_testing::{LOAD_TESTING_CONFIG_KEYS, LoadTesting};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LoadTestingConfig")
+        .expect("LoadTestingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("LoadTesting properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = LOAD_TESTING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        documented, runtime,
+        "load_testing runtime/OpenAPI key drift"
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let load_testing_docs = plugin_docs
+        .split("### `load_testing`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("load_testing docs section");
+    for key in LOAD_TESTING_CONFIG_KEYS {
+        assert!(
+            load_testing_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md load_testing section missing `{key}`"
+        );
+    }
+    assert!(load_testing_docs.contains("KeepLastKnownGood"));
+    assert!(load_testing_docs.contains("Unknown top-level keys"));
+
+    let valid = json!({
+        "key": "parity-key",
+        "concurrent_clients": 10,
+        "duration_seconds": 30,
+        "ramp": true,
+        "request_timeout_ms": 5000,
+        "max_response_body_bytes": 2048,
+        "gateway_port": 8443,
+        "gateway_tls": true,
+        "gateway_tls_no_verify": true,
+        "gateway_addresses": ["https://127.0.0.1:8443"]
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid, true);
+    assert!(LoadTesting::new(&valid, PluginHttpClient::default()).is_ok());
+
+    let valid_minima = json!({
+        "key": "min-key",
+        "concurrent_clients": 1,
+        "duration_seconds": 1
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid_minima, true);
+    assert!(LoadTesting::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let valid_null_defaults = json!({
+        "key": "null-defaults",
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "ramp": null,
+        "request_timeout_ms": null,
+        "max_response_body_bytes": null,
+        "gateway_port": null,
+        "gateway_tls": null,
+        "gateway_tls_no_verify": null,
+        "gateway_addresses": null
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid_null_defaults, true);
+    assert!(LoadTesting::new(&valid_null_defaults, PluginHttpClient::default()).is_ok());
+
+    let runtime_and_schema_invalid = [
+        json!({
+            "key": "k",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "request_timeot_ms": 5000
+        }),
+        json!({
+            "key": "k",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "rmap": true,
+            "gateway_adresses": ["https://127.0.0.1:8443"]
+        }),
+        json!({
+            "key": "k",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "aaa_extra": 1,
+            "zzz_extra": 2
+        }),
+        json!({}),
+        json!({
+            "key": "k",
+            "concurrent_clients": 0,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": "k",
+            "concurrent_clients": 1,
+            "duration_seconds": 0
+        }),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "LoadTestingConfig", &config, false);
+        assert!(
+            LoadTesting::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid load_testing config: {config}"
+        );
+    }
+
+    let empty_key = json!({
+        "key": "",
+        "concurrent_clients": 1,
+        "duration_seconds": 1
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &empty_key, false);
+    assert!(
+        LoadTesting::new(&empty_key, PluginHttpClient::default()).is_err(),
+        "runtime must still reject empty key"
+    );
+}
+
+#[tokio::test]
+async fn compression_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/CompressionConfig")
+        .expect("CompressionConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("Compression properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = COMPRESSION_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "compression runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let compression_docs = plugin_docs
+        .split("### `compression`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("compression docs section");
+    for key in COMPRESSION_CONFIG_KEYS {
+        assert!(
+            compression_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md compression section missing `{key}`"
+        );
+    }
+    assert!(compression_docs.contains("Strict config validation"));
+    assert!(compression_docs.contains("KeepLastKnownGood"));
+    assert!(compression_docs.contains("disable_on_etag"));
+
+    let valid = json!({
+        "algorithms": ["gzip", "br"],
+        "brotli_quality": 4,
+        "content_types": ["application/json"],
+        "decompress_request": false,
+        "gzip_level": 6,
+        "max_decompressed_request_size": 10_485_760,
+        "min_content_length": 256,
+        "remove_accept_encoding": true
+    });
+    assert_component_validity(&spec, "CompressionConfig", &valid, true);
+    assert!(CompressionPlugin::new(&valid).is_ok());
+    assert!(CompressionPlugin::new(&json!({})).is_ok());
+    assert_component_validity(&spec, "CompressionConfig", &json!({}), true);
+    let zero_gzip_level = json!({"gzip_level": 0});
+    assert_component_validity(&spec, "CompressionConfig", &zero_gzip_level, true);
+    assert!(CompressionPlugin::new(&zero_gzip_level).is_ok());
+
+    for config in [
+        json!({"min_content_lenght": 4096}),
+        json!({"gzip_leveel": 1}),
+        json!({"remove_accept_encodng": false}),
+        json!({"aaa_extra": 1, "zzz_extra": 2}),
+        json!({"disable_on_etag": false}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, false);
+        assert!(
+            CompressionPlugin::new(&config).is_err(),
+            "runtime accepted OpenAPI-invalid compression config: {config}"
+        );
+    }
+}
+
 #[test]
 fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     use ferrum_edge::plugins::ip_restriction::IpRestriction;
@@ -3172,6 +3644,76 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
             "runtime accepted schema-invalid strict config: {config}"
         );
     }
+}
+
+#[test]
+fn grpc_web_schema_matches_the_strict_runtime_shape() {
+    use ferrum_edge::plugins::grpc_web::{GRPC_WEB_CONFIG_KEYS, GrpcWebPlugin};
+    use std::collections::BTreeSet;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let component = &spec["components"]["schemas"]["GrpcWebConfig"];
+    assert_eq!(component["additionalProperties"], false);
+    assert_eq!(component["type"], "object");
+    assert!(
+        component.get("nullable").is_none(),
+        "GrpcWebConfig must not mark null as accepted"
+    );
+    let description = component["description"]
+        .as_str()
+        .expect("GrpcWebConfig has a description");
+    assert!(description.contains("not null"));
+    assert!(description.contains("Unknown keys are rejected"));
+
+    let documented = component["properties"]
+        .as_object()
+        .expect("GrpcWebConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = GRPC_WEB_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "grpc_web runtime/OpenAPI key drift");
+
+    for config in [
+        json!({}),
+        json!({"expose_headers": ["x-request-id"]}),
+        json!({"expose_headers": []}),
+    ] {
+        assert_component_validity(&spec, "GrpcWebConfig", &config, true);
+        assert!(
+            GrpcWebPlugin::new(&config).is_ok(),
+            "runtime rejected schema-valid grpc_web config: {config}"
+        );
+    }
+
+    for config in [
+        json!(null),
+        json!([]),
+        json!("expose_headers"),
+        json!(1),
+        json!(true),
+        json!({"expose_header": ["x-request-id"]}),
+        json!({"expose_headers": ["x-request-id"], "extra": true}),
+    ] {
+        assert_component_validity(&spec, "GrpcWebConfig", &config, false);
+        assert!(
+            GrpcWebPlugin::new(&config).is_err(),
+            "runtime accepted schema-invalid grpc_web config: {config}"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let grpc_web_docs = plugin_docs
+        .split("### `grpc_web`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("grpc_web docs section");
+    assert!(grpc_web_docs.contains("`null` is not an alias for `{}`"));
+    assert!(grpc_web_docs.contains("KeepLastKnownGood"));
 }
 
 #[test]
@@ -4303,6 +4845,158 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
     }
 }
 
+#[tokio::test]
+async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
+    use ferrum_edge::plugins::ai_transcript_audit::{
+        AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS, AI_TRANSCRIPT_AUDIT_CONFIG_KEYS,
+        AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
+        AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
+        AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
+    };
+    use ferrum_edge::plugins::utils::PluginHttpClient;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiTranscriptAuditConfig")
+        .expect("missing AiTranscriptAuditConfig schema");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    for nested in [
+        "capture",
+        "sampling",
+        "redaction",
+        "limits",
+        "privacy",
+        "sink",
+    ] {
+        assert_eq!(
+            schema["properties"][nested]["additionalProperties"],
+            json!(false),
+            "{nested} must close unknown keys"
+        );
+    }
+    assert_eq!(
+        schema["properties"]["redaction"]["properties"]["custom_patterns"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert!(
+        schema["properties"]["sink"]["properties"]["custom_headers"]["additionalProperties"]
+            .is_object(),
+        "custom_headers must remain a free-form string map"
+    );
+
+    let documented_root = schema["properties"]
+        .as_object()
+        .expect("root properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime_root = AI_TRANSCRIPT_AUDIT_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented_root, runtime_root, "root key drift");
+
+    let nested_parity = [
+        ("capture", AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS),
+        ("sampling", AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS),
+        ("redaction", AI_TRANSCRIPT_AUDIT_REDACTION_KEYS),
+        ("limits", AI_TRANSCRIPT_AUDIT_LIMITS_KEYS),
+        ("privacy", AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS),
+        ("sink", AI_TRANSCRIPT_AUDIT_SINK_KEYS),
+    ];
+    for (nested, runtime_keys) in nested_parity {
+        let documented = schema["properties"][nested]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{nested} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let runtime = runtime_keys.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(documented, runtime, "{nested} key drift");
+    }
+    let documented_patterns =
+        schema["properties"]["redaction"]["properties"]["custom_patterns"]["items"]["properties"]
+            .as_object()
+            .expect("custom pattern properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+    let runtime_patterns = AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        documented_patterns, runtime_patterns,
+        "custom_patterns key drift"
+    );
+
+    let http_client = PluginHttpClient::default();
+    let parity_cases = [
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest",
+                    "custom_headers": {"Authorization": "Bearer ${AUDIT_TOKEN}"},
+                    "retry_delay_ms": 250
+                },
+                "capture": null,
+                "privacy": null
+            }),
+            true,
+        ),
+        (
+            json!({
+                "privacy": {"include_consumer_usernme": false},
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            false,
+        ),
+        (
+            json!({
+                "capture": {"respose": false},
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            false,
+        ),
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest",
+                    "on_sink_eror": "reject"
+                }
+            }),
+            false,
+        ),
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest",
+                    "on_buffer_ful": "reject"
+                }
+            }),
+            false,
+        ),
+    ];
+    for (config, expected_valid) in parity_cases {
+        assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, expected_valid);
+        let runtime_valid = AiTranscriptAudit::new(&config, http_client.clone()).is_ok();
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "runtime/schema parity drift for {config}"
+        );
+    }
+}
+
 #[test]
 fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
     let spec: serde_json::Value =
@@ -5359,6 +6053,144 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
 }
 
 #[test]
+fn response_caching_schema_matches_strict_runtime_contract() {
+    use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/ResponseCachingConfig")
+        .expect("ResponseCachingConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("ResponseCachingConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = RESPONSE_CACHING_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        schema_fields, runtime_fields,
+        "response_caching OpenAPI/runtime key drift"
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs = plugin_docs
+        .split("### `response_caching`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("response_caching docs section");
+    for key in RESPONSE_CACHING_CONFIG_KEYS {
+        assert!(
+            docs.contains(&format!("`{key}`")),
+            "docs/plugins.md response_caching section missing `{key}`"
+        );
+    }
+    assert!(docs.contains("KeepLastKnownGood"));
+    assert!(docs.contains("Unknown keys are rejected"));
+
+    for valid in [
+        json!({}),
+        json!({"ttl_seconds": 60}),
+        json!({
+            "ttl_seconds": 60,
+            "max_entries": 100,
+            "max_entry_size_bytes": 1024,
+            "max_total_size_bytes": 4096,
+            "cacheable_methods": ["GET", "HEAD"],
+            "cacheable_status_codes": [200, 404],
+            "respect_cache_control": true,
+            "respect_no_cache": false,
+            "vary_by_headers": ["x-tenant"],
+            "cache_key_include_query": true,
+            "cache_key_include_consumer": true,
+            "add_cache_status_header": true,
+            "invalidate_on_unsafe_methods": false
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseCachingConfig", &valid, true);
+        ResponseCaching::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+        validate_plugin_config("response_caching", &valid).unwrap_or_else(|error| {
+            panic!("shared admission rejected schema-valid {valid}: {error}")
+        });
+    }
+
+    for invalid in [
+        json!({"vary_by_header": ["x-tenant"]}),
+        json!({"cache_key_include_consumr": true}),
+        json!({"cache_key_include_quer": false}),
+        json!({"respect_cache_contro": true}),
+        json!({"respect_no_cach": true}),
+        json!({"cacheable_status_code": [200]}),
+        json!({"cacheable_method": ["GET"]}),
+        json!({"ttl_second": 60}),
+        json!({"max_entrie": 10}),
+        json!({"max_entry_size_byte": 1024}),
+        json!({"max_total_size_byte": 4096}),
+        json!({"add_cache_status_heade": true}),
+        json!({"invalidate_on_unsafe_method": true}),
+        json!({
+            "ttl_seconds": 60,
+            "aaa_extra": true,
+            "zzz_extra": false
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseCachingConfig", &invalid, false);
+        assert!(
+            ResponseCaching::new(&invalid).is_err(),
+            "runtime accepted OpenAPI-invalid response_caching config: {invalid}"
+        );
+        assert!(
+            validate_plugin_config("response_caching", &invalid).is_err(),
+            "shared admission accepted OpenAPI-invalid response_caching config: {invalid}"
+        );
+    }
+
+    // Runtime scalar helpers treat null as "use default"; OpenAPI must expose
+    // the same contract. Collection fields remain strict non-null arrays.
+    for key in [
+        "ttl_seconds",
+        "max_entries",
+        "max_entry_size_bytes",
+        "max_total_size_bytes",
+        "respect_cache_control",
+        "respect_no_cache",
+        "cache_key_include_query",
+        "cache_key_include_consumer",
+        "add_cache_status_header",
+        "invalidate_on_unsafe_methods",
+    ] {
+        let mut config = json!({});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert(key.to_string(), serde_json::Value::Null);
+        assert_component_validity(&spec, "ResponseCachingConfig", &config, true);
+        ResponseCaching::new(&config)
+            .unwrap_or_else(|error| panic!("nullable scalar {key} failed runtime: {error}"));
+    }
+    for key in [
+        "cacheable_methods",
+        "cacheable_status_codes",
+        "vary_by_headers",
+    ] {
+        let mut config = json!({});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert(key.to_string(), serde_json::Value::Null);
+        assert_component_validity(&spec, "ResponseCachingConfig", &config, false);
+        assert!(
+            ResponseCaching::new(&config).is_err(),
+            "non-null list field {key} accepted null"
+        );
+    }
+}
+
+#[test]
 fn response_mock_schema_matches_strict_runtime_contract() {
     use ferrum_edge::plugins::response_mock::{
         RESPONSE_MOCK_CONFIG_KEYS, RESPONSE_MOCK_RULE_KEYS, ResponseMock,
@@ -5491,4 +6323,83 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         ),
         "protocol matrix must mark WebSocket support for response_mock"
     );
+}
+
+#[test]
+fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ai_semantic_cache::{
+        AI_SEMANTIC_CACHE_CONFIG_KEYS, AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS,
+        AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS, AiSemanticCache,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiSemanticCacheConfig")
+        .expect("AiSemanticCacheConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("AiSemanticCacheConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime: BTreeSet<_> = AI_SEMANTIC_CACHE_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(documented, runtime, "OpenAPI/runtime key drift");
+
+    let grouped: BTreeSet<_> = AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS
+        .iter()
+        .chain(AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS.iter())
+        .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+        .copied()
+        .collect();
+    assert_eq!(
+        grouped, runtime,
+        "documented key groups must equal the closed root allowlist"
+    );
+
+    let description = schema["description"]
+        .as_str()
+        .expect("AiSemanticCacheConfig description");
+    assert!(description.contains("Unknown root"));
+    assert!(description.contains("KeepLastKnownGood"));
+
+    assert_component_validity(
+        &spec,
+        "AiSemanticCacheConfig",
+        &json!({"ttl_seconds": 60, "cache_multimodal": "reject"}),
+        true,
+    );
+    for invalid in [
+        json!({"ttl_second": 60}),
+        json!({"cache_multimoda": "reject"}),
+        json!({"scope_by_consumr": false}),
+        json!({"semantic_similarity_enable": true}),
+        json!({"sync_mod": "redis"}),
+        json!({"redis_ur": "redis://127.0.0.1:6379/0"}),
+    ] {
+        assert_component_validity(&spec, "AiSemanticCacheConfig", &invalid, false);
+        assert!(
+            AiSemanticCache::new(&invalid, PluginHttpClient::default()).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_semantic_cache`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_semantic_cache docs section");
+    for key in AI_SEMANTIC_CACHE_CONFIG_KEYS {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "docs/plugins.md ai_semantic_cache section missing `{key}`"
+        );
+    }
+    assert!(section.contains("KeepLastKnownGood"));
+    assert!(section.contains("unknown retention"));
 }

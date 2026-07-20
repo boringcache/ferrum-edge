@@ -2292,3 +2292,120 @@ async fn test_different_seed_no_cache_hit() {
         run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(!hit, "different `seed` must NOT collapse cache keys");
 }
+
+#[test]
+fn unknown_retention_multimodal_isolation_size_semantic_and_redis_typos_are_rejected() {
+    for (typo, suggestion) in [
+        ("ttl_second", "ttl_seconds"),
+        ("cache_multimoda", "cache_multimodal"),
+        ("scope_by_consumr", "scope_by_consumer"),
+        ("max_entrie", "max_entries"),
+        ("max_entry_size_byte", "max_entry_size_bytes"),
+        ("semantic_similarity_enable", "semantic_similarity_enabled"),
+        ("sync_mod", "sync_mode"),
+        ("redis_ur", "redis_url"),
+    ] {
+        let err = AiSemanticCache::new(&json!({(typo): true}), PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("unknown key {typo} must fail closed"));
+        assert!(
+            err.contains(&format!("'config.{typo}'")),
+            "path-qualified diagnostic missing for {typo}: {err}"
+        );
+        assert!(
+            err.contains(&format!("did you mean '{suggestion}'?")),
+            "spelling suggestion missing for {typo}: {err}"
+        );
+        assert!(
+            err.starts_with("ai_semantic_cache: unknown configuration key(s):"),
+            "unexpected prefix for {typo}: {err}"
+        );
+    }
+}
+
+#[test]
+fn multiple_unknown_keys_are_reported_deterministically_with_suggestions() {
+    let err = AiSemanticCache::new(
+        &json!({
+            "ttl_second": 30,
+            "cache_multimoda": "reject",
+            "sync_mod": "redis",
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("multiple typos must fail closed");
+    assert_eq!(
+        err,
+        "ai_semantic_cache: unknown configuration key(s): \
+         'config.cache_multimoda' (did you mean 'cache_multimodal'?), \
+         'config.sync_mod' (did you mean 'sync_mode'?), \
+         'config.ttl_second' (did you mean 'ttl_seconds'?)"
+    );
+}
+
+#[test]
+fn every_documented_config_key_is_accepted_together() {
+    let plugin = AiSemanticCache::new(
+        &json!({
+            "ttl_seconds": 120,
+            "max_entries": 100,
+            "max_entry_size_bytes": 4096,
+            "max_total_size_bytes": 8192,
+            "include_model_in_key": true,
+            "include_params_in_key": true,
+            "scope_by_consumer": true,
+            "cache_multimodal": "reject",
+            "semantic_similarity_enabled": false,
+            "semantic_embedding_provider": "openai",
+            "semantic_embedding_endpoint": "https://api.openai.com/v1/embeddings",
+            "semantic_embedding_model": "text-embedding-3-small",
+            "semantic_embedding_input_type": "query",
+            "semantic_embedding_output_dimension": 512,
+            "semantic_embedding_api_key": "test-key",
+            "semantic_embedding_auth_header": "Authorization",
+            "semantic_embedding_auth_scheme": "Bearer",
+            "semantic_similarity_threshold": 0.9,
+            "semantic_vector_max_candidates": 8,
+            "semantic_embedding_timeout_ms": 1000,
+            "sync_mode": "local",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_tls": false,
+            "redis_key_prefix": "test:ai_cache",
+            "redis_pool_size": 2,
+            "redis_connect_timeout_seconds": 3,
+            "redis_health_check_interval_seconds": 4,
+            "redis_username": "cache-user",
+            "redis_password": "cache-pass",
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("every known key must remain admissible together");
+    assert_eq!(plugin.name(), "ai_semantic_cache");
+}
+
+#[test]
+fn shared_admission_rejects_unknown_keys_with_keep_last_known_good_policy() {
+    use ferrum_edge::plugins::{
+        PluginFailurePolicy, plugin_failure_policy, validate_plugin_config,
+    };
+
+    assert_eq!(
+        plugin_failure_policy("ai_semantic_cache"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+
+    let err = validate_plugin_config(
+        "ai_semantic_cache",
+        &json!({"cache_multimoda": "reject", "ttl_seconds": 60}),
+    )
+    .expect_err("shared admission must reject multimodal typos");
+    assert!(
+        err.contains("'config.cache_multimoda'"),
+        "unexpected admission error: {err}"
+    );
+    assert!(
+        err.contains("did you mean 'cache_multimodal'?"),
+        "unexpected admission error: {err}"
+    );
+}

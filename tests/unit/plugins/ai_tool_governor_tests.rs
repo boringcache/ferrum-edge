@@ -4,9 +4,10 @@ use ferrum_edge::{
     _test_support::clone_log_metadata,
     config::{BackendAllowIps, BackendEgressPolicy},
     plugins::{
-        Plugin, PluginHttpClient, RequestContext, ResponseStreamAction, ResponseStreamInspector,
-        ai_tool_governor::AiToolGovernor, available_plugins, correlation_id::CorrelationId,
-        create_plugin_with_http_client, create_response_stream_inspector, priority,
+        Plugin, PluginFailurePolicy, PluginHttpClient, RequestContext, ResponseStreamAction,
+        ResponseStreamInspector, ai_tool_governor::AiToolGovernor, available_plugins,
+        correlation_id::CorrelationId, create_plugin_with_http_client,
+        create_response_stream_inspector, plugin_failure_policy, priority, validate_plugin_config,
     },
     proxy::deferred_log::BodyOutcome,
 };
@@ -276,6 +277,8 @@ fn accepts_empty_tools_when_default_action_denies() {
 
 #[test]
 fn disabled_config_skips_policy_validation() {
+    // Known keys with invalid *values* remain ignored when disabled. Unknown
+    // key names are still rejected (see unknown-key tests below).
     assert!(
         try_make(json!({
             "enabled": false,
@@ -290,6 +293,354 @@ fn disabled_config_skips_policy_validation() {
             }
         }))
         .is_ok()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unknown-key admission (GHSA-hf5h-425j-58v5)
+// ---------------------------------------------------------------------------
+
+fn baseline_allow_policy() -> Value {
+    json!({
+        "default_action": "deny",
+        "tools": {
+            "github.create_pr": {
+                "action": "allow",
+                "required_args": ["ticket_id"],
+                "max_arg_bytes": 1024,
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "(?i)token" }],
+                "json_schema": {
+                    "type": "object",
+                    "required": ["ticket_id"],
+                    "properties": {
+                        "ticket_id": { "type": "string" },
+                        "x-custom-keyword": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        },
+        "inspect": {
+            "response_tool_calls": true,
+            "request_tool_definitions": true
+        },
+        "approval": {
+            "endpoint_url": "https://approval.example/decide",
+            "timeout_ms": 1500
+        },
+        "response": { "deny_status_code": 403 },
+        "observability": { "emit_metadata": true, "hash_arguments": true }
+    })
+}
+
+fn assert_unknown_key_error(err: &str, path_fragment: &str, typo: &str) {
+    assert!(
+        err.contains("unknown configuration key"),
+        "missing unknown-key wording: {err}"
+    );
+    assert!(
+        err.contains(typo),
+        "error must name the typo {typo:?}: {err}"
+    );
+    assert!(
+        err.contains(path_fragment),
+        "error must be path-qualified with {path_fragment:?}: {err}"
+    );
+}
+
+type UnknownKeyCase = (
+    &'static str,
+    fn() -> Value,
+    &'static str,
+    Option<&'static str>,
+);
+
+#[test]
+fn rejects_enforcement_relevant_unknown_keys_with_path_and_suggestion() {
+    let cases: &[UnknownKeyCase] = &[
+        (
+            "modde",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg.as_object_mut()
+                    .unwrap()
+                    .insert("modde".into(), json!("enforce"));
+                cfg
+            },
+            "config.modde",
+            Some("mode"),
+        ),
+        (
+            "default_acton",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg.as_object_mut()
+                    .unwrap()
+                    .insert("default_acton".into(), json!("deny"));
+                cfg
+            },
+            "config.default_acton",
+            Some("default_action"),
+        ),
+        (
+            "inspect.response_tool_call",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["inspect"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("response_tool_call".into(), json!(true));
+                cfg
+            },
+            "config.inspect.response_tool_call",
+            Some("response_tool_calls"),
+        ),
+        (
+            "tools.required_arg",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["tools"]["github.create_pr"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("required_arg".into(), json!(["ticket_id"]));
+                cfg
+            },
+            "config.tools.github.create_pr.required_arg",
+            Some("required_args"),
+        ),
+        (
+            "tools.max_arg_byte",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["tools"]["github.create_pr"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("max_arg_byte".into(), json!(1024));
+                cfg
+            },
+            "config.tools.github.create_pr.max_arg_byte",
+            Some("max_arg_bytes"),
+        ),
+        (
+            "tools.blocked_arg_pattern",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["tools"]["github.create_pr"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(
+                        "blocked_arg_pattern".into(),
+                        json!([{ "name": "secret", "regex": "x" }]),
+                    );
+                cfg
+            },
+            "config.tools.github.create_pr.blocked_arg_pattern",
+            Some("blocked_arg_patterns"),
+        ),
+        (
+            "tools.json_shema",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["tools"]["github.create_pr"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("json_shema".into(), json!({"type": "object"}));
+                cfg
+            },
+            "config.tools.github.create_pr.json_shema",
+            Some("json_schema"),
+        ),
+        (
+            "blocked_arg_patterns[0].regexx",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["tools"]["github.create_pr"]["blocked_arg_patterns"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("regexx".into(), json!("token"));
+                cfg
+            },
+            "config.tools.github.create_pr.blocked_arg_patterns[0].regexx",
+            Some("regex"),
+        ),
+        (
+            "approval.endpoint_urll",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["approval"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("endpoint_urll".into(), json!("https://x.example/y"));
+                cfg
+            },
+            "config.approval.endpoint_urll",
+            Some("endpoint_url"),
+        ),
+        (
+            "response.deny_status_cod",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["response"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("deny_status_cod".into(), json!(403));
+                cfg
+            },
+            "config.response.deny_status_cod",
+            Some("deny_status_code"),
+        ),
+        (
+            "observability.emit_metdata",
+            || {
+                let mut cfg = baseline_allow_policy();
+                cfg["observability"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("emit_metdata".into(), json!(true));
+                cfg
+            },
+            "config.observability.emit_metdata",
+            Some("emit_metadata"),
+        ),
+    ];
+
+    for (label, build, path_fragment, suggestion) in cases {
+        let config = build();
+        let err = try_make(config.clone())
+            .err()
+            .unwrap_or_else(|| panic!("expected unknown-key rejection for {label}"));
+        assert_unknown_key_error(
+            &err,
+            path_fragment,
+            path_fragment.rsplit('.').next().unwrap(),
+        );
+        if let Some(expected) = suggestion {
+            assert!(
+                err.contains(&format!("did you mean '{expected}'")),
+                "{label}: missing suggestion for {expected}: {err}"
+            );
+        }
+
+        let shared = validate_plugin_config("ai_tool_governor", &config)
+            .expect_err("shared admission must reject the same typo");
+        assert!(
+            shared.contains("unknown configuration key"),
+            "{label}: shared admission wording: {shared}"
+        );
+        assert!(
+            shared.contains(path_fragment),
+            "{label}: shared admission path: {shared}"
+        );
+    }
+}
+
+#[test]
+fn disabled_config_still_rejects_unknown_keys() {
+    let err = try_make(json!({
+        "enabled": false,
+        "required_arg": ["ticket_id"],
+        "modde": "enforce"
+    }))
+    .err()
+    .expect("unknown keys must fail even when disabled");
+    assert!(err.contains("unknown configuration key"), "{err}");
+    assert!(
+        err.contains("config.modde") || err.contains("config.required_arg"),
+        "{err}"
+    );
+}
+
+#[test]
+fn accepts_free_form_tool_names_and_open_json_schema_keywords() {
+    assert!(
+        try_make(baseline_allow_policy()).is_ok(),
+        "arbitrary tool names and JSON Schema keywords must remain accepted"
+    );
+    assert!(
+        try_make(json!({
+            "default_action": "deny",
+            "tools": {
+                "org.custom/tool-name.v2": {
+                    "action": "allow",
+                    "json_schema": {
+                        "type": "object",
+                        "$comment": "operator note",
+                        "unevaluatedProperties": false,
+                        "properties": { "q": { "type": "string" } }
+                    }
+                }
+            }
+        }))
+        .is_ok()
+    );
+}
+
+#[test]
+fn null_optional_fields_keep_existing_type_errors() {
+    // Present-but-null is not treated as absent for typed optional fields.
+    let err = try_make(json!({
+        "default_action": "deny",
+        "tools": { "x": { "action": "allow" } },
+        "mode": null
+    }))
+    .err()
+    .expect("null mode must type-error");
+    assert!(err.contains("mode"), "{err}");
+    assert!(!err.contains("unknown configuration key"), "{err}");
+}
+
+#[test]
+fn shared_admission_and_failure_policy_for_unknown_keys() {
+    let config = json!({
+        "default_action": "deny",
+        "tools": {
+            "search": {
+                "action": "allow",
+                "required_arg": ["q"]
+            }
+        }
+    });
+    let err = validate_plugin_config("ai_tool_governor", &config)
+        .expect_err("shared admission must use the strict constructor");
+    assert!(err.contains("config.tools.search.required_arg"), "{err}");
+    assert!(err.contains("did you mean 'required_args'"), "{err}");
+    assert_eq!(
+        plugin_failure_policy("ai_tool_governor"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
+}
+
+#[tokio::test]
+async fn multiple_instances_admit_independently_for_unknown_keys() {
+    let good = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let bad = try_make(json!({
+        "default_action": "deny",
+        "tools": {
+            "report.read": {
+                "action": "allow",
+                "required_arg": ["id"]
+            }
+        }
+    }));
+    assert!(
+        bad.err()
+            .map(|e| e.contains("config.tools.report.read.required_arg"))
+            .unwrap_or(false),
+        "second instance typo must fail on its own config"
+    );
+    // The good instance remains usable after a sibling config fails admission.
+    let mut ctx = create_test_context();
+    assert_continue(
+        good.on_response_body(
+            &mut ctx,
+            200,
+            &json_headers(),
+            &response_with_tool_call("report.read", "{}"),
+        )
+        .await,
     );
 }
 

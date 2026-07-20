@@ -88,6 +88,8 @@ use url::Url;
 
 use sha2::{Digest, Sha256};
 
+use crate::util::unknown_keys::reject_unknown_keys;
+
 use super::utils::ai_providers::{detect_response_provider, detect_sse_provider};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
@@ -97,6 +99,63 @@ use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector,
 };
+
+/// Accepted top-level configuration keys. Nested free-form maps (`tools` tool
+/// names, `json_schema` contents) are intentionally open and are not listed
+/// here — only the fixed-shape object that owns those maps is closed.
+pub const AI_TOOL_GOVERNOR_CONFIG_KEYS: &[&str] = &[
+    "enabled",
+    "mode",
+    "default_action",
+    "inspect",
+    "tools",
+    "approval",
+    "response",
+    "observability",
+];
+
+/// Accepted `inspect` object keys.
+pub const AI_TOOL_GOVERNOR_INSPECT_KEYS: &[&str] = &[
+    "request_tool_definitions",
+    "response_tool_calls",
+    "streaming_response_tool_calls",
+    "mcp_tool_calls",
+    "a2a_methods",
+];
+
+/// Accepted per-tool policy object keys. Tool names themselves remain a
+/// free-form map under `tools`.
+pub const AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS: &[&str] = &[
+    "action",
+    "risk",
+    "max_arg_bytes",
+    "required_args",
+    "blocked_arg_patterns",
+    "json_schema",
+];
+
+/// Accepted blocked-argument pattern entry keys.
+pub const AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS: &[&str] = &["name", "regex"];
+
+/// Accepted `approval` object keys.
+pub const AI_TOOL_GOVERNOR_APPROVAL_KEYS: &[&str] = &[
+    "endpoint_url",
+    "timeout_ms",
+    "cache_ttl_seconds",
+    "fail_on_error",
+    "include_arguments",
+];
+
+/// Accepted `response` object keys.
+pub const AI_TOOL_GOVERNOR_RESPONSE_KEYS: &[&str] = &[
+    "deny_status_code",
+    "redaction_placeholder",
+    "streaming_deny_event",
+];
+
+/// Accepted `observability` object keys.
+pub const AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS: &[&str] =
+    &["emit_metadata", "hash_arguments", "max_argument_log_bytes"];
 
 /// Default status for deterministic policy denials. Operational failures where
 /// a governed body cannot be inspected remain `502 Bad Gateway`.
@@ -1059,9 +1118,14 @@ type StreamMetadataSlot = Arc<std::sync::Mutex<HashMap<String, String>>>;
 
 impl AiToolGovernor {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_object) = config.as_object() else {
             return Err("ai_tool_governor: config must be an object".to_string());
-        }
+        };
+        // Reject unknown keys before the enabled short-circuit so a disabled
+        // draft cannot hide a misspelled enforcement field that becomes live
+        // on the next reload that flips `enabled: true`.
+        validate_config_keys(config_object)?;
+
         let instance_id =
             NEXT_GOVERNOR_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let approval_cache_shard_amount = http_client.pool_shard_amount();
@@ -4692,12 +4756,98 @@ fn sha256_hex_bytes(input: &[u8]) -> String {
 // Config parsing
 // ---------------------------------------------------------------------------
 
+/// Keep runtime admission as strict as the OpenAPI fixed-shape objects. Runs
+/// before ordinary type/value parsing (and before the `enabled: false`
+/// short-circuit) so a valid sibling field can never mask a misspelled
+/// enforcement control. The free-form `tools` name map and arbitrary
+/// `json_schema` document contents are intentionally not closed.
+fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), String> {
+    reject_unknown_keys(
+        config,
+        "config",
+        AI_TOOL_GOVERNOR_CONFIG_KEYS,
+        "ai_tool_governor: ",
+    )?;
+
+    if let Some(object) = config.get("inspect").and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.inspect",
+            AI_TOOL_GOVERNOR_INSPECT_KEYS,
+            "ai_tool_governor: ",
+        )?;
+    }
+
+    if let Some(tools) = config.get("tools").and_then(Value::as_object) {
+        for (tool_name, spec) in tools {
+            let Some(object) = spec.as_object() else {
+                continue;
+            };
+            let tool_path = format!("config.tools.{tool_name}");
+            reject_unknown_keys(
+                object,
+                &tool_path,
+                AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS,
+                "ai_tool_governor: ",
+            )?;
+            if let Some(patterns) = object.get("blocked_arg_patterns").and_then(Value::as_array) {
+                for (idx, entry) in patterns.iter().enumerate() {
+                    if let Some(entry_obj) = entry.as_object() {
+                        reject_unknown_keys(
+                            entry_obj,
+                            &format!("{tool_path}.blocked_arg_patterns[{idx}]"),
+                            AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
+                            "ai_tool_governor: ",
+                        )?;
+                    }
+                }
+            }
+            // `json_schema` remains an intentionally open JSON Schema document.
+        }
+    }
+
+    if let Some(object) = config.get("approval").and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.approval",
+            AI_TOOL_GOVERNOR_APPROVAL_KEYS,
+            "ai_tool_governor: ",
+        )?;
+    }
+    if let Some(object) = config.get("response").and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.response",
+            AI_TOOL_GOVERNOR_RESPONSE_KEYS,
+            "ai_tool_governor: ",
+        )?;
+    }
+    if let Some(object) = config.get("observability").and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.observability",
+            AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS,
+            "ai_tool_governor: ",
+        )?;
+    }
+
+    Ok(())
+}
+
 fn parse_inspect(config: &Value) -> Result<InspectConfig, String> {
     let inspect = config.get("inspect");
     if let Some(inspect) = inspect
         && !inspect.is_object()
     {
         return Err("ai_tool_governor: 'inspect' must be an object".to_string());
+    }
+    if let Some(object) = inspect.and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.inspect",
+            AI_TOOL_GOVERNOR_INSPECT_KEYS,
+            "ai_tool_governor: ",
+        )?;
     }
     let get = |key: &'static str, default: bool| -> Result<bool, String> {
         match inspect.and_then(|i| i.get(key)) {
@@ -4720,6 +4870,13 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
     let obj = spec
         .as_object()
         .ok_or_else(|| format!("ai_tool_governor: tool '{name}' policy must be an object"))?;
+    let tool_path = format!("config.tools.{name}");
+    reject_unknown_keys(
+        obj,
+        &tool_path,
+        AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS,
+        "ai_tool_governor: ",
+    )?;
 
     let action = match obj.get("action").and_then(Value::as_str) {
         Some("allow") => ToolAction::Allow,
@@ -4795,6 +4952,12 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                     "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}]' must be an object"
                 )
             })?;
+            reject_unknown_keys(
+                entry_obj,
+                &format!("{tool_path}.blocked_arg_patterns[{idx}]"),
+                AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
+                "ai_tool_governor: ",
+            )?;
             let pattern_name = entry_obj
                 .get("name")
                 .and_then(Value::as_str)
@@ -4866,6 +5029,12 @@ fn parse_approval(
     let obj = approval
         .as_object()
         .ok_or_else(|| "ai_tool_governor: 'approval' must be an object".to_string())?;
+    reject_unknown_keys(
+        obj,
+        "config.approval",
+        AI_TOOL_GOVERNOR_APPROVAL_KEYS,
+        "ai_tool_governor: ",
+    )?;
 
     let endpoint_url = obj
         .get("endpoint_url")
@@ -4951,6 +5120,14 @@ fn parse_response(config: &Value) -> Result<ResponseConfig, String> {
     {
         return Err("ai_tool_governor: 'response' must be an object".to_string());
     }
+    if let Some(object) = response.and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.response",
+            AI_TOOL_GOVERNOR_RESPONSE_KEYS,
+            "ai_tool_governor: ",
+        )?;
+    }
 
     let deny_status_code = match response.and_then(|r| r.get("deny_status_code")) {
         None => DEFAULT_DENY_STATUS,
@@ -4998,6 +5175,14 @@ fn parse_observability(config: &Value) -> Result<ObservabilityConfig, String> {
         && !obs.is_object()
     {
         return Err("ai_tool_governor: 'observability' must be an object".to_string());
+    }
+    if let Some(object) = obs.and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.observability",
+            AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS,
+            "ai_tool_governor: ",
+        )?;
     }
 
     let emit_metadata = match obs.and_then(|o| o.get("emit_metadata")) {

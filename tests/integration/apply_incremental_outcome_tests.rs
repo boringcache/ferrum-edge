@@ -1339,6 +1339,235 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("load-testing-policy", true);
+    plugin.plugin_name = "load_testing".to_string();
+    plugin.config = serde_json::json!({
+        "key": "stable-key",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "ramp": true
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "load_testing")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "key": "must-not-publish",
+        "concurrent_clients": 50,
+        "duration_seconds": 30,
+        "rmap": true,
+        "request_timeot_ms": 5000
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let outcome = state.update_config(invalid);
+    let ConfigApplyOutcome::Rejected { errors } = outcome else {
+        panic!("unknown load_testing keys must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("load_testing")
+            && error.contains("unknown configuration key")
+            && (error.contains("request_timeot_ms") || error.contains("rmap"))
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["key"],
+        "stable-key"
+    );
+    assert_eq!(state.config.load().plugin_configs[0].config["ramp"], true);
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "load_testing"),
+        "rejected reload must retain the last-known-good load_testing generation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("stream-router-policy", true);
+    plugin.plugin_name = "ai_stream_router".to_string();
+    plugin.config = serde_json::json!({
+        "enabled": true,
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "endpoint": "https://api.openai.com/v1/chat/completions",
+            "api_key": "sk-last-known-good",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ai_stream_router")
+    );
+
+    for (label, bad_config, needle) in [
+        (
+            "enabled-typo",
+            serde_json::json!({
+                "enabeld": false,
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-must-not-publish",
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            "config.enabeld",
+        ),
+        (
+            "provider-typo",
+            serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-must-not-publish",
+                    "model_patterns": ["gpt-*"],
+                    "inherit_backend_tl": true
+                }]
+            }),
+            "config.providers[0].inherit_backend_tl",
+        ),
+        (
+            "fallback-typo",
+            serde_json::json!({
+                "providers": [{
+                    "name": "openai",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-must-not-publish",
+                    "model_patterns": ["gpt-*"]
+                }],
+                "fallback": {"on_connect_erro": true}
+            }),
+            "config.fallback.on_connect_erro",
+        ),
+    ] {
+        let mut invalid = valid.clone();
+        invalid.plugin_configs[0].config = bad_config;
+        invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+        let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+            panic!("{label}: unknown ai_stream_router key must reject reload");
+        };
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("ai_stream_router")
+                    && error.contains("unknown configuration key")
+                    && error.contains(needle)
+            }),
+            "{label}: unexpected rejection errors: {errors:?}"
+        );
+        assert_eq!(
+            state.config.load().plugin_configs[0].config["providers"][0]["api_key"],
+            "sk-last-known-good",
+            "{label}: rejected candidate must not replace last-known-good config"
+        );
+        assert!(
+            state
+                .plugin_cache
+                .request_view("p1", ProxyProtocol::Http)
+                .plugins()
+                .iter()
+                .any(|plugin| plugin.name() == "ai_stream_router"),
+            "{label}: rejected reload must retain last-known-good plugin cache"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compression_unknown_key_reload_keeps_last_known_good_generation() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("compression-policy", true);
+    plugin.plugin_name = "compression".to_string();
+    plugin.config = serde_json::json!({
+        "min_content_length": 512,
+        "gzip_level": 4,
+        "remove_accept_encoding": true
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "compression")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "min_content_lenght": 4096,
+        "gzip_leveel": 1
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+        panic!("unknown compression keys must reject database/CP-DP reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("config.gzip_leveel") && error.contains("config.min_content_lenght")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["min_content_length"],
+        512
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "compression"),
+        "rejected reload must retain the last-known-good compression generation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation() {
     let state = empty_proxy_state();
     let mut internal = test_plugin_config("internal-request-id-policy", true);
@@ -1521,6 +1750,131 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ai_tool_governor_unknown_key_reload_keeps_last_known_good_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("tool-policy", true);
+    plugin.plugin_name = "ai_tool_governor".to_string();
+    plugin.config = serde_json::json!({
+        "default_action": "deny",
+        "tools": {
+            "github.create_pr": {
+                "action": "allow",
+                "required_args": ["ticket_id"]
+            }
+        }
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ai_tool_governor")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "default_action": "deny",
+        "tools": {
+            "github.create_pr": {
+                "action": "allow",
+                "required_arg": ["ticket_id"]
+            }
+        }
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+        panic!("unknown ai_tool_governor tool-policy key must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("ai_tool_governor")
+            && error.contains("unknown configuration key")
+            && error.contains("config.tools.github.create_pr.required_arg")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["tools"]["github.create_pr"]["required_args"],
+        serde_json::json!(["ticket_id"])
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ai_tool_governor"),
+        "rejected reload must retain the last-known-good plugin cache"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_typo_reload_keeps_last_known_good_expose_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("grpc-web-policy", true);
+    plugin.plugin_name = "grpc_web".to_string();
+    plugin.config = serde_json::json!({
+        "expose_headers": ["x-request-id", "custom-header-bin"]
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "grpc_web"),
+        "baseline cache must include grpc_web"
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "expose_header": ["x-must-not-publish"]
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+        panic!("misspelled grpc_web expose_headers must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("grpc_web")
+            && error.contains("config.expose_header")
+            && error.contains("did you mean 'expose_headers'")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config,
+        serde_json::json!({
+            "expose_headers": ["x-request-id", "custom-header-bin"]
+        })
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "grpc_web"),
+        "rejected reload must retain the last-known-good grpc_web generation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     let state = empty_proxy_state();
     let mut plugin = test_plugin_config("directory-policy", true);
@@ -1575,6 +1929,79 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
             .iter()
             .any(|plugin| plugin.name() == "ldap_auth"),
         "rejected LDAP reload must retain the last-known-good dial policy"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ai_transcript_audit_unknown_key_reload_keeps_last_known_good_instance() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("ai-audit-policy", true);
+    plugin.plugin_name = "ai_transcript_audit".to_string();
+    plugin.config = serde_json::json!({
+        "privacy": { "include_consumer_username": false },
+        "sink": {
+            "type": "http",
+            "endpoint_url": "https://audit.example.com/ingest",
+            "on_buffer_full": "reject",
+            "on_sink_error": "reject"
+        }
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ai_transcript_audit")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "privacy": { "include_consumer_usernme": false },
+        "sink": {
+            "type": "http",
+            "endpoint_url": "https://audit.example.com/must-not-publish",
+            "on_buffer_ful": "reject",
+            "on_sink_eror": "reject"
+        }
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let outcome = state.update_config(invalid);
+    let ConfigApplyOutcome::Rejected { errors } = outcome else {
+        panic!("unknown ai_transcript_audit keys must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("ai_transcript_audit")
+            && (error.contains("include_consumer_usernme")
+                || error.contains("on_buffer_ful")
+                || error.contains("on_sink_eror"))
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["sink"]["endpoint_url"],
+        "https://audit.example.com/ingest"
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["privacy"]["include_consumer_username"],
+        false
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ai_transcript_audit"),
+        "rejected reload must retain the last-known-good ai_transcript_audit instance"
     );
 }
 
