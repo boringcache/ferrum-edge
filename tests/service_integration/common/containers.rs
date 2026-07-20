@@ -478,9 +478,12 @@ impl RedpandaContainer {
 
     /// Resume a paused broker and wait until librdkafka metadata succeeds again.
     pub async fn unpause_broker(&self) -> Result<(), BoxError> {
-        self.container.unpause().await.map_err(|error| -> BoxError {
-            format!("unpause Redpanda container: {error}").into()
-        })?;
+        self.container
+            .unpause()
+            .await
+            .map_err(|error| -> BoxError {
+                format!("unpause Redpanda container: {error}").into()
+            })?;
         wait_redpanda_ready(&self.bootstrap).await
     }
 
