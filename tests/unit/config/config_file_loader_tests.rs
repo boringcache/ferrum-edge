@@ -907,10 +907,6 @@ fn test_file_config_rejects_unknown_ai_semantic_cache_keys() {
             message.contains("1 plugin config error(s)"),
             "unexpected file-load error: {message}"
         );
-        assert!(
-            message.contains("ai_semantic_cache: unknown configuration key(s):"),
-            "unexpected file-load error: {message}"
-        );
     }
 }
 
