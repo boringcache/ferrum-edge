@@ -1303,7 +1303,7 @@ async fn test_otel_tracing_grpc_nonzero_status_is_error() {
     assert_eq!(span["status"]["code"], 2);
     assert_eq!(
         otlp_string_attr(span, "rpc.grpc.status_code").is_none(),
-        false
+        true
     );
     assert_eq!(
         otlp_attr_value(span, "rpc.grpc.status_code")
