@@ -751,12 +751,13 @@ async fn response_transformer_buffers_json_when_client_accepts_sse() {
         .bytes()
         .await
         .expect("read transformed JSON response");
-    let json_body: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap_or_else(|error| {
-        panic!(
-            "transformed response is valid JSON: {error}; body={:?}",
-            String::from_utf8_lossy(&json_bytes)
-        )
-    });
+    let json_body: serde_json::Value =
+        serde_json::from_slice(&json_bytes).unwrap_or_else(|error| {
+            panic!(
+                "transformed response is valid JSON: {error}; body={:?}",
+                String::from_utf8_lossy(&json_bytes)
+            )
+        });
     assert!(
         json_body.get("secret").is_none(),
         "client SSE intent must not bypass the configured redaction"
