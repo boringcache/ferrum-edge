@@ -575,9 +575,13 @@ impl super::Plugin for SsePlugin {
             return None;
         }
 
+        // This is a one-shot request decision. Multiple `sse` instances can
+        // run on one proxy; only the first configured wrapper may consume the
+        // original non-SSE body. Leaving the shared marker in metadata would
+        // make every later instance wrap the already-framed event again.
         let wrap_requested = ctx
             .metadata
-            .get(WRAP_NON_SSE_METADATA_KEY)
+            .remove(WRAP_NON_SSE_METADATA_KEY)
             .is_some_and(|v| v == "1");
 
         // Don't double-wrap a genuine upstream SSE response. When after_proxy

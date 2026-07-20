@@ -785,6 +785,59 @@ async fn test_wrap_and_force_compose_through_body_transform() {
 }
 
 #[tokio::test]
+async fn test_multiple_sse_instances_wrap_once_and_merge_cache_control_idempotently() {
+    let first = make_plugin(json!({
+        "wrap_non_sse_responses": true,
+        "force_sse_content_type": true
+    }));
+    let second = make_plugin(json!({
+        "wrap_non_sse_responses": true,
+        "force_sse_content_type": true
+    }));
+    let mut ctx = make_sse_ctx();
+    let mut headers = json_response_headers();
+    headers.insert("cache-control".to_string(), "private, no-store".to_string());
+
+    first.after_proxy(&mut ctx, 200, &mut headers).await;
+    second.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    assert_eq!(
+        headers.get("cache-control").map(String::as_str),
+        Some("private, no-store, no-cache")
+    );
+    assert_eq!(headers.get("content-type").unwrap(), "text/event-stream");
+
+    let body = br#"{"message":"hello"}"#;
+    let transformed = first
+        .transform_response_body_with_context(
+            &mut ctx,
+            body,
+            Some("text/event-stream"),
+            &headers,
+        )
+        .await
+        .expect("the first wrapper must consume the original response decision");
+    assert!(
+        !ctx.metadata.contains_key("sse:wrap_non_sse"),
+        "the shared wrap decision must be consumed exactly once"
+    );
+
+    let repeated = second
+        .transform_response_body_with_context(
+            &mut ctx,
+            &transformed,
+            Some("text/event-stream"),
+            &headers,
+        )
+        .await;
+    assert!(repeated.is_none(), "a later SSE instance must not double-wrap");
+    assert_eq!(
+        String::from_utf8(transformed).unwrap(),
+        "data: {\"message\":\"hello\"}\n\n"
+    );
+}
+
+#[tokio::test]
 async fn test_genuine_sse_is_not_double_wrapped_after_lifecycle() {
     let plugin = make_plugin(json!({
         "wrap_non_sse_responses": true,
