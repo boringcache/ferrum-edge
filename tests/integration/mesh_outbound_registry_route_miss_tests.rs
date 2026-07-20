@@ -328,7 +328,7 @@ async fn empty_registry_route_miss_fails_closed_with_configured_status() {
     );
     let after = http_deny_count(NS_EMPTY_REGISTRY);
     assert!(
-        after >= before + 1,
+        after > before,
         "empty-registry deny must increment host=<denied> (before={before}, after={after})"
     );
 }
@@ -381,7 +381,7 @@ async fn outbound_capture_grpc_route_miss_normalizes_wire_contract() {
 
     let after = http_deny_count(NS_GRPC_DENY);
     assert!(
-        after >= before + 1,
+        after > before,
         "gRPC route-miss deny must increment host=<denied> (before={before}, after={after})"
     );
 }
