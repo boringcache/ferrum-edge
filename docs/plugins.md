@@ -2922,6 +2922,8 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 **Priority:** 4050
 
+**Strict config validation:** Configuration must be a top-level object (or `null`/omitted for defaults). The only accepted keys are `algorithms`, `brotli_quality`, `content_types`, `decompress_request`, `gzip_level`, `max_decompressed_request_size`, `min_content_length`, and `remove_accept_encoding`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions (for example `min_content_lenght` → `min_content_length`) instead of silently falling back to defaults. The removed `disable_on_etag` key still fails with an explicit migration message. Shared `validate_plugin_config` admission covers file, Admin, database, and CP-DP surfaces; invalid enabled configs reject the new generation while `KeepLastKnownGood` retains the last published compression instance.
+
 **Response compression** (enabled by default):
 
 | Parameter | Type | Default | Description |
@@ -2930,7 +2932,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
 | `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
-| `gzip_level` | u64 | `6` | Gzip compression level (1=fastest, 9=best) |
+| `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, 1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
 
 **Request decompression** (opt-in):

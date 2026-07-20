@@ -1214,6 +1214,52 @@ fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_compression_config_keys() {
+    for (id, config) in [
+        (
+            "compression-length-typo",
+            serde_json::json!({"min_content_lenght": 4096}),
+        ),
+        (
+            "compression-gzip-typo",
+            serde_json::json!({"gzip_leveel": 1}),
+        ),
+        (
+            "compression-multi-typo",
+            serde_json::json!({"zzz_extra": true, "aaa_extra": false}),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "compression",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file-mode load must reject unknown compression keys");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("1 plugin config error(s)"),
+            "unexpected file-load error: {message}"
+        );
+    }
+}
+
+#[test]
 fn test_file_config_rejects_ip_restriction_typos_and_null_lists() {
     for (id, config) in [
         (
