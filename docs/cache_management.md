@@ -180,7 +180,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Default limit:** 10,000 entries.
 
-**Config field:** `max_entries` (in plugin config JSON).
+**Config fields:** `ttl_seconds`, `max_entries`, `max_entry_size_bytes`, `max_total_size_bytes`, `scope_by_consumer`, `cache_multimodal`, semantic-policy keys, and shared Redis sync keys (`sync_mode`, `redis_*`). Unknown keys are rejected at admission so retention/isolation typos cannot silently activate defaults.
 
 **Cleanup mechanism:** TTL-based expiration (`ttl_seconds` config field). When the cache exceeds `max_entries`, oldest entries are evicted. The optional semantic vector snapshot is rebuilt by a detached background task after local semantic entries are inserted or evicted, at most once every 30 seconds after the first indexed semantic entry. `max_total_size_bytes` includes retained embedding vectors and semantic scope keys; the HNSW snapshot keeps an additional local vector and graph copy outside the response-entry budget.
 

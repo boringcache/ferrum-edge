@@ -2428,6 +2428,51 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_compression_config_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, needle) in [
+        (
+            "compression-length-typo",
+            json!({"min_content_lenght": 4096}),
+            "config.min_content_lenght",
+        ),
+        (
+            "compression-gzip-typo",
+            json!({"gzip_leveel": 1}),
+            "config.gzip_leveel",
+        ),
+        (
+            "compression-accept-typo",
+            json!({"remove_accept_encodng": false}),
+            "config.remove_accept_encodng",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "compression",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(status, 400, "unknown compression key was admitted: {body}");
+        assert!(
+            body.to_string().contains(needle),
+            "unexpected admin validation response: {body}"
+        );
+        assert!(
+            body.to_string().contains("unknown configuration key"),
+            "admin error must use unknown-key wording: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

@@ -3230,6 +3230,78 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     }
 }
 
+#[tokio::test]
+async fn compression_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/CompressionConfig")
+        .expect("CompressionConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("Compression properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = COMPRESSION_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "compression runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let compression_docs = plugin_docs
+        .split("### `compression`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("compression docs section");
+    for key in COMPRESSION_CONFIG_KEYS {
+        assert!(
+            compression_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md compression section missing `{key}`"
+        );
+    }
+    assert!(compression_docs.contains("Strict config validation"));
+    assert!(compression_docs.contains("KeepLastKnownGood"));
+    assert!(compression_docs.contains("disable_on_etag"));
+
+    let valid = json!({
+        "algorithms": ["gzip", "br"],
+        "brotli_quality": 4,
+        "content_types": ["application/json"],
+        "decompress_request": false,
+        "gzip_level": 6,
+        "max_decompressed_request_size": 10_485_760,
+        "min_content_length": 256,
+        "remove_accept_encoding": true
+    });
+    assert_component_validity(&spec, "CompressionConfig", &valid, true);
+    assert!(CompressionPlugin::new(&valid).is_ok());
+    assert!(CompressionPlugin::new(&json!({})).is_ok());
+    assert_component_validity(&spec, "CompressionConfig", &json!({}), true);
+    let zero_gzip_level = json!({"gzip_level": 0});
+    assert_component_validity(&spec, "CompressionConfig", &zero_gzip_level, true);
+    assert!(CompressionPlugin::new(&zero_gzip_level).is_ok());
+
+    for config in [
+        json!({"min_content_lenght": 4096}),
+        json!({"gzip_leveel": 1}),
+        json!({"remove_accept_encodng": false}),
+        json!({"aaa_extra": 1, "zzz_extra": 2}),
+        json!({"disable_on_etag": false}),
+    ] {
+        assert_component_validity(&spec, "CompressionConfig", &config, false);
+        assert!(
+            CompressionPlugin::new(&config).is_err(),
+            "runtime accepted OpenAPI-invalid compression config: {config}"
+        );
+    }
+}
+
 #[test]
 fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     use ferrum_edge::plugins::ip_restriction::IpRestriction;
@@ -3278,6 +3350,76 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
             "runtime accepted schema-invalid strict config: {config}"
         );
     }
+}
+
+#[test]
+fn grpc_web_schema_matches_the_strict_runtime_shape() {
+    use ferrum_edge::plugins::grpc_web::{GRPC_WEB_CONFIG_KEYS, GrpcWebPlugin};
+    use std::collections::BTreeSet;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let component = &spec["components"]["schemas"]["GrpcWebConfig"];
+    assert_eq!(component["additionalProperties"], false);
+    assert_eq!(component["type"], "object");
+    assert!(
+        component.get("nullable").is_none(),
+        "GrpcWebConfig must not mark null as accepted"
+    );
+    let description = component["description"]
+        .as_str()
+        .expect("GrpcWebConfig has a description");
+    assert!(description.contains("not null"));
+    assert!(description.contains("Unknown keys are rejected"));
+
+    let documented = component["properties"]
+        .as_object()
+        .expect("GrpcWebConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = GRPC_WEB_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "grpc_web runtime/OpenAPI key drift");
+
+    for config in [
+        json!({}),
+        json!({"expose_headers": ["x-request-id"]}),
+        json!({"expose_headers": []}),
+    ] {
+        assert_component_validity(&spec, "GrpcWebConfig", &config, true);
+        assert!(
+            GrpcWebPlugin::new(&config).is_ok(),
+            "runtime rejected schema-valid grpc_web config: {config}"
+        );
+    }
+
+    for config in [
+        json!(null),
+        json!([]),
+        json!("expose_headers"),
+        json!(1),
+        json!(true),
+        json!({"expose_header": ["x-request-id"]}),
+        json!({"expose_headers": ["x-request-id"], "extra": true}),
+    ] {
+        assert_component_validity(&spec, "GrpcWebConfig", &config, false);
+        assert!(
+            GrpcWebPlugin::new(&config).is_err(),
+            "runtime accepted schema-invalid grpc_web config: {config}"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let grpc_web_docs = plugin_docs
+        .split("### `grpc_web`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("grpc_web docs section");
+    assert!(grpc_web_docs.contains("`null` is not an alias for `{}`"));
+    assert!(grpc_web_docs.contains("KeepLastKnownGood"));
 }
 
 #[test]
@@ -5597,4 +5739,83 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         ),
         "protocol matrix must mark WebSocket support for response_mock"
     );
+}
+
+#[test]
+fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ai_semantic_cache::{
+        AI_SEMANTIC_CACHE_CONFIG_KEYS, AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS,
+        AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS, AiSemanticCache,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiSemanticCacheConfig")
+        .expect("AiSemanticCacheConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("AiSemanticCacheConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime: BTreeSet<_> = AI_SEMANTIC_CACHE_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(documented, runtime, "OpenAPI/runtime key drift");
+
+    let grouped: BTreeSet<_> = AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS
+        .iter()
+        .chain(AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS.iter())
+        .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+        .copied()
+        .collect();
+    assert_eq!(
+        grouped, runtime,
+        "documented key groups must equal the closed root allowlist"
+    );
+
+    let description = schema["description"]
+        .as_str()
+        .expect("AiSemanticCacheConfig description");
+    assert!(description.contains("Unknown root"));
+    assert!(description.contains("KeepLastKnownGood"));
+
+    assert_component_validity(
+        &spec,
+        "AiSemanticCacheConfig",
+        &json!({"ttl_seconds": 60, "cache_multimodal": "reject"}),
+        true,
+    );
+    for invalid in [
+        json!({"ttl_second": 60}),
+        json!({"cache_multimoda": "reject"}),
+        json!({"scope_by_consumr": false}),
+        json!({"semantic_similarity_enable": true}),
+        json!({"sync_mod": "redis"}),
+        json!({"redis_ur": "redis://127.0.0.1:6379/0"}),
+    ] {
+        assert_component_validity(&spec, "AiSemanticCacheConfig", &invalid, false);
+        assert!(
+            AiSemanticCache::new(&invalid, PluginHttpClient::default()).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_semantic_cache`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_semantic_cache docs section");
+    for key in AI_SEMANTIC_CACHE_CONFIG_KEYS {
+        assert!(
+            section.contains(&format!("`{key}`")),
+            "docs/plugins.md ai_semantic_cache section missing `{key}`"
+        );
+    }
+    assert!(section.contains("KeepLastKnownGood"));
+    assert!(section.contains("unknown retention"));
 }
