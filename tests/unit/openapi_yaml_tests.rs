@@ -3440,7 +3440,7 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
             "docs/plugins.md tcp_logging section missing `{key}`"
         );
     }
-    assert!(tcp_docs.contains("OptionalFailOpen"));
+    assert!(tcp_docs.contains("KeepLastKnownGood"));
     assert!(tcp_docs.contains("at-least-once"));
 
     let valid = json!({
