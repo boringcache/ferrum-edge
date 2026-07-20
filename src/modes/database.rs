@@ -1029,9 +1029,13 @@ pub async fn run(
 
     // Custom-plugin migrations: warn on pending, opt-in auto-apply.
     // Skipped when bootstrap_from_backup is still true — the database is
-    // unreachable so we can't probe migration state. The polling loop will
-    // reconcile when the DB recovers; until then the operator's existing
-    // schema is what matters anyway.
+    // unreachable so we can't probe migration state. `plugin_migrations_need_reconcile`
+    // stays set in that case so `mark_db_available_after_successful_poll_load`
+    // runs the same policy after deferred core migrations succeed on recovery.
+    let plugin_migrations_need_reconcile = Arc::new(AtomicBool::new(false));
+    if bootstrap_from_backup {
+        plugin_migrations_need_reconcile.store(true, Ordering::Release);
+    }
     if !bootstrap_from_backup {
         crate::modes::handle_startup_plugin_migrations(
             &db,
@@ -1039,6 +1043,7 @@ pub async fn run(
             "database",
         )
         .await?;
+        plugin_migrations_need_reconcile.store(false, Ordering::Release);
     }
 
     // Load initial config from database, falling back to backup file if configured.
@@ -1917,6 +1922,8 @@ pub async fn run(
     let proxy_state_poll = proxy_state.clone();
     let db_available_poll = db_available.clone();
     let config_rejected_poll = config_rejected.clone();
+    let plugin_migrations_need_reconcile_poll = plugin_migrations_need_reconcile.clone();
+    let auto_apply_plugin_migrations_poll = env_config.auto_apply_plugin_migrations;
     let database_delta_poll_metrics_for_poll = database_delta_poll_metrics.clone();
     let rejected_delta_initial_backoff =
         Duration::from_secs(env_config.db_rejected_delta_backoff_initial_seconds);
@@ -2004,6 +2011,8 @@ pub async fn run(
                                     &db_poll,
                                     &db_available_poll,
                                     "full reload after DB DNS reconnect",
+                                    auto_apply_plugin_migrations_poll,
+                                    &plugin_migrations_need_reconcile_poll,
                                 )
                                 .await;
                                 let outcome = proxy_state_poll.update_config(new_config);
@@ -2049,6 +2058,8 @@ pub async fn run(
                                     &db_poll,
                                     &db_available_poll,
                                     "incremental poll",
+                                    auto_apply_plugin_migrations_poll,
+                                    &plugin_migrations_need_reconcile_poll,
                                 )
                                 .await;
                                 let next_sequence = result.sequence_cursor;
@@ -2088,6 +2099,8 @@ pub async fn run(
                                                         &db_poll,
                                                         &db_available_poll,
                                                         "rejected-delta escalation full reload",
+                                                        auto_apply_plugin_migrations_poll,
+                                                        &plugin_migrations_need_reconcile_poll,
                                                     )
                                                     .await;
                                                     let outcome =
@@ -2146,6 +2159,8 @@ pub async fn run(
                                                                             &db_poll,
                                                                             &db_available_poll,
                                                                             "rejected-delta escalation failover reload",
+                                                                            auto_apply_plugin_migrations_poll,
+                                                                            &plugin_migrations_need_reconcile_poll,
                                                                         )
                                                                         .await;
                                                                         let outcome = proxy_state_poll
@@ -2228,6 +2243,8 @@ pub async fn run(
                                             &db_poll,
                                             &db_available_poll,
                                             "full fallback reload",
+                                            auto_apply_plugin_migrations_poll,
+                                            &plugin_migrations_need_reconcile_poll,
                                         )
                                         .await;
                                         let outcome = proxy_state_poll.update_config(new_config);
@@ -2273,6 +2290,8 @@ pub async fn run(
                                                                 &db_poll,
                                                                 &db_available_poll,
                                                                 "failover full reload",
+                                                                auto_apply_plugin_migrations_poll,
+                                                                &plugin_migrations_need_reconcile_poll,
                                                             )
                                                             .await;
                                                             let outcome =
@@ -2328,6 +2347,8 @@ pub async fn run(
                                     &db_poll,
                                     &db_available_poll,
                                     "first full reload",
+                                    auto_apply_plugin_migrations_poll,
+                                    &plugin_migrations_need_reconcile_poll,
                                 )
                                 .await;
                                 let outcome = proxy_state_poll.update_config(new_config);
@@ -2501,6 +2522,8 @@ async fn mark_db_available_after_successful_poll_load(
     db: &Arc<dyn DatabaseBackend>,
     db_available: &AtomicBool,
     context: &str,
+    auto_apply_plugin_migrations: bool,
+    plugin_migrations_need_reconcile: &AtomicBool,
 ) {
     // Any load that reaches this point proved the backend is reachable, so
     // re-enable admin writes. Note this does NOT clear `config_rejected`: an
@@ -2509,8 +2532,39 @@ async fn mark_db_available_after_successful_poll_load(
     // cleared only by
     // [`crate::modes::clear_config_rejected_after_accepted_full_reload`], which
     // fires exclusively from an accepted FULL reload (issue #2158).
+    //
+    // When offline bootstrap skipped custom-plugin migrations, reconcile the
+    // same warn/auto-apply policy here after deferred core migrations succeed
+    // (issue #2630). The reconcile flag ensures one attempt per recovery
+    // generation; transient auto-apply failures keep writes blocked and leave
+    // the flag set so the next successful poll retries.
     match db.maybe_apply_deferred_migrations().await {
-        Ok(_) => db_available.store(true, Ordering::Relaxed),
+        Ok(_) => {
+            if plugin_migrations_need_reconcile.load(Ordering::Acquire) {
+                match crate::modes::handle_startup_plugin_migrations(
+                    db,
+                    auto_apply_plugin_migrations,
+                    "database-recovery",
+                )
+                .await
+                {
+                    Ok(()) => {
+                        plugin_migrations_need_reconcile.store(false, Ordering::Release);
+                        db_available.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Custom-plugin migration reconciliation failed after {}: {}. \
+                             Admin writes remain blocked until plugin schema is applied.",
+                            context, e
+                        );
+                        db_available.store(false, Ordering::Relaxed);
+                    }
+                }
+            } else {
+                db_available.store(true, Ordering::Relaxed);
+            }
+        }
         Err(e) => {
             warn!(
                 "Deferred migrations failed despite successful {}: {}. \
@@ -2537,6 +2591,34 @@ mod tests {
         assert!(
             source.contains("let mut last_change_sequence: Option<u64> = initial_change_sequence;"),
             "poll loop must start from the initial full-load cursor"
+        );
+    }
+
+    #[test]
+    fn offline_recovery_reconciles_custom_plugin_migrations() {
+        // Issue #2630: after backup/offline bootstrap skips custom-plugin
+        // migrations, the poll-loop availability helper must invoke the same
+        // warn/auto-apply policy once deferred core migrations succeed.
+        let source = include_str!("database.rs");
+        let helper_start = source
+            .find("async fn mark_db_available_after_successful_poll_load(")
+            .expect("availability helper must exist");
+        let helper = &source[helper_start..];
+        assert!(
+            helper.contains("handle_startup_plugin_migrations"),
+            "recovery path must reconcile custom-plugin migrations"
+        );
+        assert!(
+            helper.contains("database-recovery"),
+            "recovery reconcile mode label must identify the recovery path"
+        );
+        assert!(
+            helper.contains("plugin_migrations_need_reconcile"),
+            "recovery must be gated by a per-generation reconcile flag"
+        );
+        assert!(
+            source.contains("plugin_migrations_need_reconcile.store(true"),
+            "offline bootstrap must set the reconcile flag when custom migrations are skipped"
         );
     }
 

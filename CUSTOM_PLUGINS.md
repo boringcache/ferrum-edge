@@ -238,7 +238,17 @@ To include only specific custom plugins, set `FERRUM_CUSTOM_PLUGINS` at **build 
 FERRUM_CUSTOM_PLUGINS=my_header_injector,my_auth cargo build --release
 ```
 
-If unset, all `.rs` files in `custom_plugins/` are included.
+If unset, all non-example `.rs` files in `custom_plugins/` are included.
+Pedagogical examples under `custom_plugins/examples/` are **never** part of
+the default discovery set; list them explicitly to compile them:
+
+```bash
+FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin cargo build
+```
+
+Default source, release, and Docker builds leave `FERRUM_CUSTOM_PLUGINS` unset
+so example plugins (and their migrations) do not alter the production registry
+or schema.
 
 ### 4. Configure
 
@@ -1208,8 +1218,10 @@ ferrum-edge/
 ├── build.rs                   # Auto-discovers plugins + migrations at compile time
 ├── custom_plugins/            # YOUR PLUGINS GO HERE — just drop .rs files
 │   ├── mod.rs                 # Thin shim (includes build-script-generated code)
-│   ├── example_plugin.rs      # Working example — protocol-scoped header/body/correlation capabilities (can be removed)
-│   ├── example_audit_plugin.rs # Working example — database migrations (can be removed)
+│   ├── examples/              # Opt-in pedagogical examples (not compiled by default)
+│   │   ├── README.md
+│   │   ├── example_plugin.rs  # Protocol-scoped header/body/correlation example
+│   │   └── example_audit_plugin.rs # DB-backed audit + migration example
 │   ├── my_header_injector.rs  # Your plugin
 │   └── my_custom_auth.rs      # Your plugin
 ├── CUSTOM_PLUGINS.md          # This guide
@@ -1394,18 +1406,25 @@ This is separate from the core `_ferrum_migrations` table, so plugin versions ne
 Prefix your tables with a short identifier related to your plugin name to avoid collisions with the gateway's core tables (`proxies`, `consumers`, `upstreams`, `plugin_configs`, `proxy_plugins`) and other custom plugins:
 
 ```
-audit_log           ← example_audit_plugin
+example_audit_log   ← example_audit_plugin (plugin-prefixed)
 my_cache_entries    ← my_cache_plugin
 acme_rate_counters  ← acme_rate_limiter
 ```
 
+Custom plugin migrations have no automatic down/uninstall path. Removing a
+plugin from a later binary leaves its tables and `_ferrum_plugin_migrations`
+rows until an operator drops them deliberately.
+
 ### Complete Example
 
-See `custom_plugins/example_audit_plugin.rs` for a full working example that demonstrates:
+See `custom_plugins/examples/example_audit_plugin.rs` (build with
+`FERRUM_CUSTOM_PLUGINS=example_audit_plugin`) for a full working example that
+demonstrates:
 - Multi-version migrations (V1: create table + indexes, V2: add composite index)
 - PostgreSQL overrides (`TIMESTAMPTZ`, `JSONB`)
-- MySQL overrides (`DATETIME(3)`, `JSON`, `VARCHAR`)
+- MySQL overrides (`DATETIME(3)`, `JSON`, `VARCHAR`) with duplicate-index retry safety
 - Multi-statement SQL (CREATE TABLE + CREATE INDEX in one migration)
+- Runtime persistence via a bounded queue into the gateway configuration database
 
 ## Adding Dependencies
 

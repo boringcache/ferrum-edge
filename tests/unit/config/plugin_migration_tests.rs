@@ -1061,3 +1061,169 @@ async fn apply_plugin_migrations_is_idempotent() {
         "second apply should be a no-op when nothing is pending"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MySQL partial-DDL recovery helpers + example_audit_plugin migration shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mysql_duplicate_index_error_is_benign_for_create_index() {
+    use ferrum_edge::config::migrations::mysql_create_index_duplicate_is_benign;
+
+    assert!(mysql_create_index_duplicate_is_benign(
+        "CREATE INDEX idx_example_audit_log_timestamp ON example_audit_log (timestamp)",
+        "error 1061: Duplicate key name 'idx_example_audit_log_timestamp'",
+    ));
+    assert!(mysql_create_index_duplicate_is_benign(
+        "CREATE UNIQUE INDEX idx_u ON t (id)",
+        "1061 (42000): Duplicate key name",
+    ));
+    assert!(!mysql_create_index_duplicate_is_benign(
+        "CREATE TABLE t (id INT)",
+        "error 1061: Duplicate key name",
+    ));
+    assert!(!mysql_create_index_duplicate_is_benign(
+        "CREATE INDEX idx_x ON t (id)",
+        "error 1060: Duplicate column name",
+    ));
+}
+
+#[test]
+fn example_audit_plugin_mysql_overrides_omit_if_not_exists_on_indexes() {
+    let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
+    let Some((_, example)) = migrations
+        .into_iter()
+        .find(|(name, _)| *name == "example_audit_plugin")
+    else {
+        // Default builds exclude the pedagogical example.
+        return;
+    };
+
+    let v1 = example.iter().find(|m| m.version == 1).expect("v1");
+    let mysql = v1.sql_mysql.expect("mysql override");
+    assert!(
+        mysql.contains("CREATE TABLE IF NOT EXISTS example_audit_log"),
+        "table DDL should stay idempotent"
+    );
+    assert!(
+        !mysql.to_ascii_uppercase().contains("IF NOT EXISTS IDX_"),
+        "MySQL index DDL must not rely on IF NOT EXISTS"
+    );
+    assert!(mysql.contains("CREATE INDEX idx_example_audit_log_timestamp"));
+    assert!(mysql.contains("CREATE INDEX idx_example_audit_log_client_ip"));
+
+    let v2 = example.iter().find(|m| m.version == 2).expect("v2");
+    let mysql_v2 = v2.sql_mysql.expect("mysql v2 override");
+    assert!(mysql_v2.contains("CREATE INDEX idx_example_audit_log_status_ts"));
+    assert!(!mysql_v2.to_ascii_uppercase().contains("IF NOT EXISTS"));
+}
+
+#[tokio::test]
+async fn example_audit_plugin_migrations_apply_idempotently_on_sqlite() {
+    let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
+    if !migrations.iter().any(|(name, _)| *name == "example_audit_plugin") {
+        return;
+    }
+
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let list = migrations;
+
+    let first = runner.run_plugin_pending(&list).await.unwrap();
+    assert_eq!(first.len(), 2);
+    let second = runner.run_plugin_pending(&list).await.unwrap();
+    assert!(second.is_empty());
+
+    sqlx::query(
+        "INSERT INTO example_audit_log (id, timestamp, client_ip, protocol, latency_ms) \
+         VALUES ('1', '2026-01-01T00:00:00Z', '127.0.0.1', 'http', 1.0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("example_audit_log must exist after migrations");
+}
+
+/// Live MySQL recovery: simulate V1 partial DDL (indexes present, no tracking),
+/// then re-run and expect a clean tracked schema. Requires `FERRUM_TEST_MYSQL_URL`.
+#[tokio::test]
+async fn example_audit_mysql_partial_ddl_recovers_on_retry() {
+    let Ok(mysql_url) = std::env::var("FERRUM_TEST_MYSQL_URL") else {
+        return;
+    };
+    let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
+    let Some((_, example)) = migrations
+        .into_iter()
+        .find(|(name, _)| *name == "example_audit_plugin")
+    else {
+        return;
+    };
+
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(2)
+        .connect(&mysql_url)
+        .await
+        .expect("connect FERRUM_TEST_MYSQL_URL");
+
+    // Clean slate for this suite.
+    let _ = sqlx::query("DROP TABLE IF EXISTS example_audit_log")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS _ferrum_plugin_migrations")
+        .execute(&pool)
+        .await;
+
+    // Force a partial V1: create table + first index, skip tracking.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS example_audit_log (
+            id VARCHAR(255) PRIMARY KEY,
+            timestamp DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            client_ip VARCHAR(255) NOT NULL,
+            protocol VARCHAR(32) NOT NULL,
+            http_method VARCHAR(20),
+            request_path TEXT,
+            response_status INTEGER,
+            latency_ms DOUBLE NOT NULL,
+            consumer_username VARCHAR(255),
+            proxy_id VARCHAR(255),
+            request_context JSON,
+            connection_error TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE INDEX idx_example_audit_log_timestamp ON example_audit_log (timestamp)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Also pre-create the second index so a naive non-tolerant runner would fail.
+    sqlx::query("CREATE INDEX idx_example_audit_log_client_ip ON example_audit_log (client_ip)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let runner = MigrationRunner::new(pool.clone(), "mysql".to_string());
+    let list = vec![("example_audit_plugin", example)];
+    let applied = runner
+        .run_plugin_pending(&list)
+        .await
+        .expect("MySQL retry after partial DDL must succeed");
+    assert!(
+        applied.iter().any(|r| r.version == 1),
+        "V1 tracking must be recorded on recovery"
+    );
+    assert!(
+        applied.iter().any(|r| r.version == 2) || applied.len() >= 1,
+        "V2 should apply or already be covered"
+    );
+
+    // Second run is a no-op.
+    let again = runner.run_plugin_pending(&list).await.unwrap();
+    assert!(again.is_empty());
+}

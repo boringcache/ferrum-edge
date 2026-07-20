@@ -4990,6 +4990,6 @@ See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for
 
 Ferrum supports drop-in custom plugins. Create a `.rs` file in the `custom_plugins/` directory, export a `create_plugin()` factory function, and rebuild — the build script auto-discovers and registers it.
 
-Optionally set `FERRUM_CUSTOM_PLUGINS=plugin_a,plugin_b` at **build time** to include only specific custom plugins.
+Optionally set `FERRUM_CUSTOM_PLUGINS=plugin_a,plugin_b` at **build time** to include only specific custom plugins. Pedagogical examples under `custom_plugins/examples/` are opt-in only (list them in `FERRUM_CUSTOM_PLUGINS`); default and Docker builds leave them out of the registry and migration collector.
 
 See [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md) for the full developer guide, trait reference, and working examples.

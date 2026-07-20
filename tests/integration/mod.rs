@@ -30,6 +30,7 @@ mod db_offline_bootstrap_tests;
 mod db_proxy_plugin_association_fail_closed_tests;
 mod deferred_log_tests;
 mod dtls_integration_tests;
+mod example_audit_plugin_opt_in_tests;
 mod example_plugin_contract_tests;
 mod frontend_tls_live_reload_tests;
 mod gateway_hbone_pool_tests;

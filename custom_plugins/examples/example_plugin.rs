@@ -9,7 +9,9 @@
 //! fields demonstrate capability metadata used by core composition validation.
 //!
 //! The `create_plugin` function at the bottom is the only required entry
-//! point — the build script discovers this file automatically.
+//! point. This file lives under `custom_plugins/examples/` and is compiled
+//! only when listed in `FERRUM_CUSTOM_PLUGINS` (or copied into
+//! `custom_plugins/`).
 
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};

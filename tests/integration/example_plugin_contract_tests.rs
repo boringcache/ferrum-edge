@@ -9,7 +9,7 @@
 const PROXY_SOURCE: &str = include_str!("../../src/proxy/mod.rs");
 const H3_SOURCE: &str = include_str!("../../src/http3/server.rs");
 const TRAIT_SOURCE: &str = include_str!("../../src/plugins/mod.rs");
-const EXAMPLE_SOURCE: &str = include_str!("../../custom_plugins/example_plugin.rs");
+const EXAMPLE_SOURCE: &str = include_str!("../../custom_plugins/examples/example_plugin.rs");
 const CUSTOM_PLUGIN_GUIDE: &str = include_str!("../../CUSTOM_PLUGINS.md");
 const EXECUTION_ORDER_GUIDE: &str = include_str!("../../docs/plugin_execution_order.md");
 

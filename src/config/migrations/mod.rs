@@ -244,6 +244,37 @@ pub struct CustomPluginMigration {
     pub sql_mysql: Option<&'static str>,
 }
 
+/// Whether a MySQL statement failure is a benign duplicate-index error (1061).
+///
+/// MySQL implicitly commits around `CREATE TABLE` / `CREATE INDEX`, so a
+/// multi-statement custom-plugin migration can leave indexes behind without a
+/// `_ferrum_plugin_migrations` tracking row. On retry the runner must treat an
+/// already-created index as success so the tracking insert can complete.
+pub fn mysql_create_index_duplicate_is_benign(statement: &str, error_message: &str) -> bool {
+    let trimmed = statement.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    let is_create_index =
+        upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX");
+    is_create_index && error_message.contains("1061")
+}
+
+fn map_plugin_statement_result<T>(
+    db_type: &str,
+    statement: &str,
+    result: Result<T, sqlx::Error>,
+) -> Result<(), sqlx::Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(e)
+            if db_type == "mysql"
+                && mysql_create_index_duplicate_is_benign(statement, &e.to_string()) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl CustomPluginMigration {
     /// Returns the SQL appropriate for the given database type.
     pub fn sql_for_db(&self, db_type: &str) -> &str {
@@ -751,7 +782,11 @@ impl MigrationRunner {
                     for statement in sql.split(';') {
                         let trimmed = statement.trim();
                         if !trimmed.is_empty() {
-                            sqlx::query(trimmed).execute(&mut *connection).await?;
+                            map_plugin_statement_result(
+                                &self.db_type,
+                                trimmed,
+                                sqlx::query(trimmed).execute(&mut *connection).await,
+                            )?;
                         }
                     }
                     now = Utc::now().to_rfc3339();
@@ -775,7 +810,40 @@ impl MigrationRunner {
                     for statement in sql.split(';') {
                         let trimmed = statement.trim();
                         if !trimmed.is_empty() {
-                            sqlx::query(trimmed).execute(&mut *connection).await?;
+                            map_plugin_statement_result(
+                                &self.db_type,
+                                trimmed,
+                                sqlx::query(trimmed).execute(&mut *connection).await,
+                            )?;
+                        }
+                    }
+                    now = Utc::now().to_rfc3339();
+                    let elapsed_ms = start.elapsed().as_millis() as i64;
+                    let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
+                    sqlx::query(&insert_sql)
+                        .bind(*plugin_name)
+                        .bind(migration.version as i32)
+                        .bind(migration.name)
+                        .bind(&now)
+                        .bind(migration.checksum)
+                        .bind(elapsed_ms as i32)
+                        .execute(&mut *connection)
+                        .await?;
+                } else if self.db_type == "mysql" {
+                    // MySQL implicitly commits around DDL
+                    // (https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html),
+                    // so statements + tracking are NOT one atomic unit. Execute
+                    // each statement with duplicate-index (1061) tolerance, then
+                    // insert the tracking row so retries after partial DDL can
+                    // finish cleanly.
+                    for statement in sql.split(';') {
+                        let trimmed = statement.trim();
+                        if !trimmed.is_empty() {
+                            map_plugin_statement_result(
+                                "mysql",
+                                trimmed,
+                                sqlx::query(trimmed).execute(&mut *connection).await,
+                            )?;
                         }
                     }
                     now = Utc::now().to_rfc3339();
@@ -791,14 +859,17 @@ impl MigrationRunner {
                         .execute(&mut *connection)
                         .await?;
                 } else {
-                    // Default path: migration statements and tracking remain
-                    // atomic in one transaction on the same session that owns
-                    // the PostgreSQL/MySQL migration lock.
+                    // PostgreSQL transactional path: statements and tracking
+                    // remain atomic in one transaction on the lock session.
                     let mut tx = connection.begin().await?;
                     for statement in sql.split(';') {
                         let trimmed = statement.trim();
                         if !trimmed.is_empty() {
-                            sqlx::query(trimmed).execute(&mut *tx).await?;
+                            map_plugin_statement_result(
+                                &self.db_type,
+                                trimmed,
+                                sqlx::query(trimmed).execute(&mut *tx).await,
+                            )?;
                         }
                     }
                     now = Utc::now().to_rfc3339();
