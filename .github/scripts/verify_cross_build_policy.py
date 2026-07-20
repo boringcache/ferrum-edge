@@ -3803,6 +3803,131 @@ def generated_shell_capture_operands(
     return frozenset(operands)
 
 
+def generated_source_output_references(
+    program: str,
+    evaluator_prefix: str,
+) -> tuple[tuple[str, str | None, str | None], ...]:
+    """Return repository producers in substitutions of generated shell source.
+
+    The raw span pass deliberately leaves an unmatched marker inside inert
+    single-quoted data behind. Adjacent quoted fragments in one evaluator word
+    are different: `eval '$(''./scripts/build)'` removes both quote boundaries
+    before `eval` parses the resulting `$(./scripts/build)`. `shlex` exposes the
+    assembled word, so replay the existing generated-source classifier over
+    that value and recover only repository commands inside the classified
+    substitution spans. The evaluator prefix retains the same decision boundary
+    as `generated_shell_expansion_spans()`; this helper does not make ordinary
+    quoted data executable.
+    """
+
+    synthetic = f"{evaluator_prefix}{program}"
+    generated_spans = generated_shell_expansion_spans(synthetic)
+    if not generated_spans:
+        return ()
+    references: list[tuple[str, str | None, str | None]] = []
+    for reference in LOCAL_COMMAND_REFERENCE.finditer(synthetic):
+        if not any(
+            start <= reference.start() < end for start, end in generated_spans
+        ):
+            continue
+        raw_path = (
+            reference.group("redirected")
+            or reference.group("interpreted")
+            or reference.group("direct")
+            or reference.group("bare")
+        )
+        normalized = normalize_repository_path(raw_path)
+        if normalized is None:
+            continue
+        interpreter_word = reference.group("interpreter") or reference.group(
+            "redirected_interpreter"
+        )
+        reference_interpreter: str | None = None
+        unsupported_interpreter: str | None = None
+        if interpreter_word:
+            interpreter_words = tuple(interpreter_word.split())
+            reference_interpreter = (
+                "shell"
+                if interpreter_words[0] in {"source", "."}
+                else interpreter_kind(interpreter_words)
+            )
+            if reference_interpreter is None:
+                unsupported_interpreter = interpreter_words[0]
+        references.append(
+            (normalized, reference_interpreter, unsupported_interpreter)
+        )
+    return tuple(dict.fromkeys(references))
+
+
+def generated_shell_evaluator_references(
+    line: str,
+) -> tuple[tuple[str, str | None, str | None], ...]:
+    """Recover generated-output producers after outer-shell quote removal."""
+
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return ()
+    references: list[tuple[str, str | None, str | None]] = []
+    for statement in shell_statement_groups(tokens):
+        for segment in split_shell_pipeline(statement):
+            index, executes = executable_index(segment)
+            if not executes or index >= len(segment):
+                continue
+            command = tool_name(segment[index])
+            if command == "builtin" and index + 1 < len(segment):
+                index += 1
+                command = tool_name(segment[index])
+            if command == "eval":
+                program = " ".join(segment[index + 1 :])
+                if program:
+                    references.extend(
+                        generated_source_output_references(program, "eval ")
+                    )
+                continue
+            if command not in SHELL_INTERPRETER_NAMES:
+                continue
+            program, _opaque_options, _stdin_mode = shell_invocation_mode(
+                segment,
+                index,
+            )
+            if program is not None:
+                references.extend(
+                    generated_source_output_references(
+                        program,
+                        f"{command} -c ",
+                    )
+                )
+    return tuple(dict.fromkeys(references))
+
+
+def generated_shell_assignment_references(
+    line: str,
+    evaluated_variables: frozenset[str],
+) -> tuple[tuple[str, str | None, str | None], ...]:
+    """Recover quoted-fragment producers assigned to evaluated variables."""
+
+    if not evaluated_variables:
+        return ()
+    references: list[tuple[str, str | None, str | None]] = []
+    for name, value_start in shell_source_assignments(line):
+        if name not in evaluated_variables:
+            continue
+        value_end = shell_assignment_value_end(line, value_start)
+        tokens = shell_tokens(line[value_start:value_end])
+        if tokens is None:
+            continue
+        # A scalar assignment normally yields one assembled word. Array and
+        # declaration spellings can expose several tokens; inspect each element
+        # and their shell-joined view so a quoted fragment cannot withdraw the
+        # producer merely by moving across an array/declaration boundary.
+        variants = tuple(dict.fromkeys((*tokens, " ".join(tokens))))
+        for program in variants:
+            references.extend(
+                generated_source_output_references(program, "eval ")
+            )
+    return tuple(dict.fromkeys(references))
+
+
 def shell_statement_groups(
     tokens: tuple[str, ...],
 ) -> tuple[tuple[str, ...], ...]:
@@ -11057,11 +11182,26 @@ def block_automation_references(
                     )
                 )
             )
+            dequoted_generated_references = tuple(
+                dict.fromkeys(
+                    (
+                        *generated_shell_evaluator_references(normalized_line),
+                        *generated_shell_assignment_references(
+                            normalized_line,
+                            generated_source_variables,
+                        ),
+                    )
+                )
+            )
             generated_output_operands = (
                 generated_stdin_program_operands(normalized_line)
                 | generated_shell_capture_operands(
                     normalized_line,
                     generated_source_variables,
+                )
+                | frozenset(
+                    raw_path
+                    for raw_path, _, _ in dequoted_generated_references
                 )
             )
             directory_matches = list(CD_COMMAND.finditer(normalized_line))
@@ -11110,6 +11250,9 @@ def block_automation_references(
                     [match for match in directory_matches if match.start() < position],
                 )
 
+            handled_dequoted_references: set[
+                tuple[str, str | None, str | None]
+            ] = set()
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
                 generated_shell_output = any(
                     # The repository-reference expression consumes the command
@@ -11170,6 +11313,7 @@ def block_automation_references(
                     "redirected_interpreter"
                 )
                 reference_interpreter: str | None = None
+                unsupported_reference_interpreter: str | None = None
                 if interpreter_word:
                     interpreter_words = tuple(interpreter_word.split())
                     reference_interpreter = (
@@ -11178,6 +11322,7 @@ def block_automation_references(
                         else interpreter_kind(interpreter_words)
                     )
                     if reference_interpreter is None:
+                        unsupported_reference_interpreter = interpreter_words[0]
                         # The edge is real but its language is outside the
                         # scanners this policy can interpret. Recording it as a
                         # bare read makes a suffixless Node/Ruby/etc. helper fall
@@ -11252,10 +11397,92 @@ def block_automation_references(
                         recorded_interpreters.add(
                             GENERATED_SHELL_OUTPUT_PROVENANCE
                         )
+                        handled_dequoted_references.update(
+                            {
+                                (
+                                    normalized_raw_command_path,
+                                    reference_interpreter,
+                                    unsupported_reference_interpreter,
+                                )
+                            }
+                            & set(dequoted_generated_references)
+                        )
                 else:
                     errors.append(
                         f"{source}:{line_number} repository command {command_path!r} "
                         "is outside the scanned automation roots"
+                    )
+
+            # A generated program can assemble a substitution and its
+            # repository operand from adjacent quoted fragments. The raw regex
+            # either sees that path as inert quoted data or cannot span the
+            # removed quote boundary at all, so record the dequoted reference
+            # directly when the ordinary pass above did not. If the original
+            # path position cannot be recovered in a line that also changes
+            # directory, fail closed rather than resolving it from the wrong
+            # directory.
+            for (
+                raw_command_path,
+                reference_interpreter,
+                unsupported_interpreter,
+            ) in dequoted_generated_references:
+                reference = (
+                    raw_command_path,
+                    reference_interpreter,
+                    unsupported_interpreter,
+                )
+                if reference in handled_dequoted_references:
+                    continue
+                if unsupported_interpreter is not None:
+                    errors.append(
+                        f"{source}:{line_number} repository command uses "
+                        f"unsupported explicit interpreter "
+                        f"{unsupported_interpreter!r}"
+                    )
+                position = normalized_line.find(raw_command_path)
+                if position < 0 and directory_matches:
+                    errors.append(
+                        f"{source}:{line_number} quote-assembled repository "
+                        "command has ambiguous working-directory state"
+                    )
+                    continue
+                effective_directory = directory_before(max(position, 0))
+                if effective_directory is None:
+                    errors.append(
+                        f"{source}:{line_number} repository command has ambiguous "
+                        "working-directory state"
+                    )
+                    continue
+                command_path = raw_command_path
+                if effective_directory:
+                    command_path = (
+                        PurePosixPath(effective_directory) / command_path
+                    ).as_posix()
+                if command_path in GENERATED_COMMAND_PATHS:
+                    continue
+                if PurePosixPath(command_path).suffix.lower() in (
+                    PYTHON_BYTECODE_SUFFIXES
+                ):
+                    errors.append(
+                        f"{source}:{line_number} runs Python bytecode "
+                        f"{command_path!r}; compiled automation cannot be scanned "
+                        "for Cross or publishing surfaces"
+                    )
+                    continue
+                if command_path.startswith(APPROVED_AUTOMATION_ROOTS):
+                    references.add(command_path)
+                    recorded_interpreters = interpreters.setdefault(
+                        command_path,
+                        set(),
+                    )
+                    recorded_interpreters.add(reference_interpreter)
+                    recorded_interpreters.add(
+                        GENERATED_SHELL_OUTPUT_PROVENANCE
+                    )
+                else:
+                    errors.append(
+                        f"{source}:{line_number} repository command "
+                        f"{command_path!r} is outside the scanned automation roots"
                     )
 
             # `python -m pkg` runs repository code chosen by module name rather
@@ -18903,6 +19130,12 @@ pre_build = []
                 "eval '$(./scripts/build)'",
             )
         ),
+        "eval quote-assembled command substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval '$(''./scripts/build)'",
+            )
+        ),
         "eval command substitution after an inert opener": (
             extensionless_workflow.replace(
                 "./scripts/build",
@@ -18913,6 +19146,12 @@ pre_build = []
             "./scripts/build",
             'bash -c "$(./scripts/build)"',
         ),
+        "shell -c quote-assembled command substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "bash -c '$(''./scripts/build)'",
+            )
+        ),
         "eval backtick substitution": extensionless_workflow.replace(
             "./scripts/build",
             'eval "`./scripts/build`"',
@@ -18921,6 +19160,12 @@ pre_build = []
             extensionless_workflow.replace(
                 "./scripts/build",
                 "eval '`./scripts/build`'",
+            )
+        ),
+        "eval quote-assembled backtick substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval '`''./scripts/build`'",
             )
         ),
         "eval backtick substitution after an inert opener": (
@@ -18937,6 +19182,12 @@ pre_build = []
             extensionless_workflow.replace(
                 "./scripts/build",
                 "eval 'source <(./scripts/build)'",
+            )
+        ),
+        "eval quote-assembled process substitution": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "eval 'source <(''./scripts/build)'",
             )
         ),
         "source process substitution after an inert opener": (
@@ -18989,6 +19240,12 @@ pre_build = []
         "eval through an assigned variable": extensionless_workflow.replace(
             "./scripts/build",
             'generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "eval through a quote-assembled assigned variable": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "generated='$(''./scripts/build)'; eval \"$generated\"",
+            )
         ),
         "eval through an append assignment": extensionless_workflow.replace(
             "./scripts/build",
@@ -19113,6 +19370,18 @@ pre_build = []
         "non-interpreter pipeline": extensionless_workflow.replace(
             "./scripts/build",
             "./scripts/build | cat >/dev/null",
+        ),
+        "quote-assembled substitution used as literal data": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "printf '%s\\n' '$(''./scripts/build)'",
+            )
+        ),
+        "quote-assembled substitution in an unevaluated assignment": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "data='$(''./scripts/build)'; printf '%s\\n' \"$data\"",
+            )
         ),
         "assignment-shaped quoted data": extensionless_workflow.replace(
             "./scripts/build",
