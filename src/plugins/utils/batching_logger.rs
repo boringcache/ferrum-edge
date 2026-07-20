@@ -463,10 +463,6 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
     pub fn queue_depth(&self) -> usize {
         self.queue_depth.load(Ordering::Relaxed)
     }
-
-    pub fn buffer_capacity(&self) -> usize {
-        self.buffer_capacity
-    }
 }
 
 fn is_high_water(depth: usize, buffer_capacity: usize, high_watermark_percent: u8) -> bool {
