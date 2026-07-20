@@ -16243,8 +16243,9 @@ components:
                 description: >-
                   HTTP method token to match (omit to match all methods). When
                   supplied it must be non-empty and parse as an HTTP method
-                  token (runtime validates via http::Method); matching is
-                  case-insensitive after uppercasing.
+                  token (runtime validates via http::Method). The configured
+                  method is normalized to uppercase and compared exactly with
+                  the request method.
               path:
                 type: string
                 minLength: 1
