@@ -145,7 +145,10 @@ fn test_new_rejects_excessive_retention_and_conflicting_queue_aliases() {
     }
 
     let retention_err = new_err(json!({ "retention_days": 36_501 }));
-    assert!(retention_err.contains("retention_days"), "got: {retention_err}");
+    assert!(
+        retention_err.contains("retention_days"),
+        "got: {retention_err}"
+    );
 
     let queue_err = new_err(json!({
         "queue_capacity": 100,
@@ -495,5 +498,8 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             break;
         }
     }
-    assert!(recovered, "batching worker must persist after storage recovery");
+    assert!(
+        recovered,
+        "batching worker must persist after storage recovery"
+    );
 }

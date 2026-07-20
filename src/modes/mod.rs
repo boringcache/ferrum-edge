@@ -591,15 +591,10 @@ mod tests {
         let db: Arc<dyn DatabaseBackend> = store;
         let migrations = synthetic_pending_migration();
 
-        let err = handle_startup_plugin_migrations_with_list(
-            &db,
-            true,
-            "database",
-            &migrations,
-            false,
-        )
-        .await
-        .expect_err("auto-apply must fail startup when pending probe fails");
+        let err =
+            handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations, false)
+                .await
+                .expect_err("auto-apply must fail startup when pending probe fails");
 
         assert!(
             err.to_string().contains(
@@ -660,7 +655,11 @@ mod tests {
         .expect("warn-only recovery should succeed once the probe recovers");
 
         let pending = db.pending_plugin_migrations(&migrations).await.unwrap();
-        assert_eq!(pending.len(), 1, "warn-only recovery must not mutate schema");
+        assert_eq!(
+            pending.len(),
+            1,
+            "warn-only recovery must not mutate schema"
+        );
     }
 
     #[tokio::test]
