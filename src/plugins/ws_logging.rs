@@ -456,7 +456,10 @@ impl WsLogging {
                 ));
             }
         }
-        if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+        if !parsed_url.username().is_empty()
+            || parsed_url.password().is_some()
+            || endpoint_authority(&endpoint_url).is_some_and(|authority| authority.contains('@'))
+        {
             return Err(
                 "ws_logging: 'endpoint_url' must not include URL user information".to_string(),
             );
@@ -766,17 +769,20 @@ fn endpoint_hostname(parsed_url: &Url) -> Result<String, String> {
 }
 
 fn has_non_empty_authority(endpoint_url: &str) -> bool {
+    endpoint_authority(endpoint_url).is_some_and(|authority| !authority.is_empty())
+}
+
+fn endpoint_authority(endpoint_url: &str) -> Option<&str> {
     let Some((_, after_scheme)) = endpoint_url.split_once(':') else {
-        return false;
+        return None;
     };
     let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
-        return false;
+        return None;
     };
     let authority_end = authority_and_path
         .find(['/', '?', '#'])
         .unwrap_or(authority_and_path.len());
-
-    authority_end > 0
+    Some(&authority_and_path[..authority_end])
 }
 
 /// Build a `tokio_tungstenite::Connector::Rustls` that follows the gateway's

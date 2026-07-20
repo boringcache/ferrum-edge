@@ -173,6 +173,7 @@ async fn test_ws_logging_rejects_invalid_config_shapes() {
             "buffer_max_bytes": 1024
         }),
         json!({"endpoint_url": "ws://user:pass@localhost:9300/logs"}),
+        json!({"endpoint_url": "ws://@localhost:9300/logs"}),
     ] {
         assert!(
             WsLogging::new(&config, default_client()).is_err(),
