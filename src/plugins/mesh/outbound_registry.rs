@@ -146,7 +146,7 @@ impl OutboundRegistry {
                 parsed.reject_status
             ));
         }
-        if parsed.outbound_listen_ports.iter().any(|port| *port == 0) {
+        if parsed.outbound_listen_ports.contains(&0) {
             return Err(
                 "mesh_outbound_registry: outbound_listen_ports entries must be >= 1 (got 0); \
                  use [] for intentional global/unscoped enforcement"

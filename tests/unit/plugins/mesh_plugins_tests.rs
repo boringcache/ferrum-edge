@@ -242,14 +242,17 @@ fn mesh_plugins_are_registered() {
 
 #[test]
 fn mesh_outbound_registry_rejects_zero_listen_port_via_create_plugin() {
-    let err = create_plugin(
+    // Match on Err so we never require Debug on `Arc<dyn Plugin>` (Ok arm).
+    let err = match create_plugin(
         "mesh_outbound_registry",
         &json!({
             "registry": ["reviews.svc"],
             "outbound_listen_ports": [0],
         }),
-    )
-    .expect_err("port 0 must fail closed at construction");
+    ) {
+        Ok(_) => panic!("port 0 must fail closed at construction"),
+        Err(err) => err,
+    };
     assert!(
         err.contains("outbound_listen_ports"),
         "unexpected error: {err}"

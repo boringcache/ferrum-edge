@@ -174,12 +174,6 @@ impl MeshOutboundEnforcement {
         &self.outbound_listen_ports
     }
 
-    /// HTTP reject status used for REGISTRY_ONLY route-miss denials.
-    #[inline]
-    pub fn reject_status(&self) -> u16 {
-        self.reject_status
-    }
-
     /// Hot-path enforcement check. `listen_port` is the local frontend
     /// port the inbound connection landed on; `host` / `port` are the
     /// resolved backend destination the proxy is about to dial.
@@ -246,8 +240,7 @@ impl MeshOutboundEnforcement {
             return None;
         }
         let denied = match host {
-            None => true,
-            Some(host) if host.is_empty() => true,
+            None | Some("") => true,
             Some(host) => !self.registry.contains(host, port),
         };
         if !denied {
