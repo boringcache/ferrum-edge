@@ -107,6 +107,12 @@ pub struct ProxyBody {
     /// will complete successfully on the next wake. Cheap — one atomic RMW
     /// on the first poll per body, zero cost thereafter.
     polled: AtomicBool,
+    /// Unread frontend gRPC upload retained across a synthesized Trailers-Only
+    /// gateway error (#2057). Dropping `hyper::body::Incoming` before hyper
+    /// writes the error response RSTs the frontend stream and races the
+    /// `grpc-status` Trailers-Only frame; holding it here defers that reset
+    /// until after the empty error body completes (HEADERS + END_STREAM).
+    _held_frontend_grpc_upload: Option<crate::proxy::grpc_proxy::GrpcBody>,
 }
 
 #[derive(Clone)]
@@ -372,6 +378,7 @@ impl ProxyBody {
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
+            _held_frontend_grpc_upload: None,
         }
     }
 
@@ -396,6 +403,7 @@ impl ProxyBody {
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
+            _held_frontend_grpc_upload: None,
         }
     }
 
@@ -418,6 +426,17 @@ impl ProxyBody {
         guard: crate::runtime_metrics::ReqwestBackendRequestGuard,
     ) -> Self {
         self._reqwest_backend_guard = Some(guard);
+        self
+    }
+
+    /// Retain an unread frontend gRPC upload until this response body is
+    /// dropped so a synthesized Trailers-Only error is written before the
+    /// frontend stream is reset (#2057).
+    pub(crate) fn with_held_frontend_grpc_upload(
+        mut self,
+        upload: crate::proxy::grpc_proxy::GrpcBody,
+    ) -> Self {
+        self._held_frontend_grpc_upload = Some(upload);
         self
     }
 
@@ -689,6 +708,7 @@ impl ProxyBody {
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
+            _held_frontend_grpc_upload: None,
         }
     }
 

@@ -396,6 +396,15 @@ impl GrpcClient {
                 }
             };
 
+        // RFC 7540 §8.1: after a complete early response, the server MAY send
+        // RST_STREAM(NO_ERROR) to cancel an unread request body. Raw h2 surfaces
+        // that as `stream error received: not a result of an error` on the recv
+        // half even when Trailers-Only `grpc-status` already arrived in HEADERS.
+        // Clients MUST NOT discard the response; clear only that benign signal
+        // when an explicit grpc-status is already present (#2057 residual).
+        let stream_error =
+            suppress_benign_early_response_reset(stream_error, &headers, trailers.as_ref());
+
         let messages = decode_grpc_messages(&raw_frames);
         // Don't care if conn_task errors; the important state is above.
         conn_task.abort();
@@ -410,6 +419,28 @@ impl GrpcClient {
             request_send_error,
         })
     }
+}
+
+/// Returns `None` when `stream_error` is solely the RFC 7540 early-response
+/// `RST_STREAM(NO_ERROR)` signal and an explicit `grpc-status` is already
+/// present in headers or trailers. Any other stream error is preserved.
+fn suppress_benign_early_response_reset(
+    stream_error: Option<String>,
+    headers: &HeaderMap,
+    trailers: Option<&HeaderMap>,
+) -> Option<String> {
+    let err = stream_error?;
+    let has_grpc_status = headers.get("grpc-status").is_some()
+        || trailers.is_some_and(|t| t.get("grpc-status").is_some());
+    if has_grpc_status && is_h2_no_error_stream_reset(&err) {
+        return None;
+    }
+    Some(err)
+}
+
+fn is_h2_no_error_stream_reset(err: &str) -> bool {
+    // h2::Reason::NoError displays as "not a result of an error".
+    err.contains("not a result of an error")
 }
 
 /// Decode the length-prefixed gRPC messages out of a concatenation of DATA
@@ -607,6 +638,51 @@ mod tests {
             stream_error: None,
             request_send_error: None,
         }
+    }
+
+    #[test]
+    fn suppress_no_error_reset_when_trailers_only_status_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", "14".parse().unwrap());
+        let cleared = suppress_benign_early_response_reset(
+            Some("body error: stream error received: not a result of an error".into()),
+            &headers,
+            None,
+        );
+        assert!(
+            cleared.is_none(),
+            "RFC 7540 early-response NO_ERROR must not override Trailers-Only grpc-status"
+        );
+    }
+
+    #[test]
+    fn preserve_non_no_error_stream_failures_even_with_grpc_status() {
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", "14".parse().unwrap());
+        let kept = suppress_benign_early_response_reset(
+            Some("body error: stream error received: cancel".into()),
+            &headers,
+            None,
+        );
+        assert_eq!(
+            kept.as_deref(),
+            Some("body error: stream error received: cancel"),
+            "real stream resets must still fail the RPC"
+        );
+    }
+
+    #[test]
+    fn preserve_no_error_reset_without_explicit_grpc_status() {
+        let headers = HeaderMap::new();
+        let kept = suppress_benign_early_response_reset(
+            Some("body error: stream error received: not a result of an error".into()),
+            &headers,
+            None,
+        );
+        assert!(
+            kept.is_some(),
+            "NO_ERROR without grpc-status is not a well-formed gateway error"
+        );
     }
 
     #[test]
