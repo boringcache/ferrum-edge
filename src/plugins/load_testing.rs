@@ -179,6 +179,8 @@ pub struct RunResult {
 }
 
 impl RunResult {
+    /// Throughput helper for operators/tests reading a completed cohort result.
+    #[allow(dead_code)] // used only by tests/; dead code in the bin target
     pub fn completed_requests_per_second(&self) -> f64 {
         if self.elapsed_ms == 0 {
             return 0.0;
@@ -276,6 +278,7 @@ impl LoadTesting {
         Self::from_parts(config, http_client, state)
     }
 
+    #[allow(dead_code)] // used only by tests/ via `share_with`; dead code in the bin target
     pub(crate) fn with_shared_state(
         config: &Value,
         http_client: PluginHttpClient,
@@ -288,6 +291,7 @@ impl LoadTesting {
     ///
     /// Used by unit tests (and mirrors plugin-cache reload sharing) so two
     /// `LoadTesting` values observe the same `is_running` guard.
+    #[allow(dead_code)] // used only by tests/; dead code in the bin target
     pub fn share_with(
         &self,
         config: &Value,
@@ -297,11 +301,13 @@ impl LoadTesting {
     }
 
     /// Whether a cohort is currently admitted on this plugin identity.
+    #[allow(dead_code)] // used only by tests/; dead code in the bin target
     pub fn is_running(&self) -> bool {
         self.state.is_running.load(Ordering::Acquire)
     }
 
     /// Most recent completed cohort result for this plugin identity, if any.
+    #[allow(dead_code)] // used only by tests/; dead code in the bin target
     pub fn last_run_result(&self) -> Option<RunResult> {
         self.state
             .last_result

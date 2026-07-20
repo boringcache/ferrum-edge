@@ -323,6 +323,65 @@ fn test_gateway_address_userinfo_is_rejected() {
 }
 
 #[test]
+fn test_gateway_addresses_shape_validation() {
+    let empty = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_addresses": []
+    });
+    let err = LoadTesting::new(&empty, PluginHttpClient::default())
+        .err()
+        .expect("empty gateway_addresses must fail");
+    assert!(
+        err.contains("must not be empty when provided"),
+        "got: {err}"
+    );
+
+    let non_string = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_addresses": [123]
+    });
+    let err = LoadTesting::new(&non_string, PluginHttpClient::default())
+        .err()
+        .expect("non-string gateway address must fail");
+    assert!(
+        err.contains("each 'gateway_addresses' entry must be a string"),
+        "got: {err}"
+    );
+
+    let empty_entry = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_addresses": [""]
+    });
+    let err = LoadTesting::new(&empty_entry, PluginHttpClient::default())
+        .err()
+        .expect("empty gateway address entry must fail");
+    assert!(
+        err.contains("entries must not be empty"),
+        "got: {err}"
+    );
+
+    let not_array = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_addresses": "https://node2:8443"
+    });
+    let err = LoadTesting::new(&not_array, PluginHttpClient::default())
+        .err()
+        .expect("non-array gateway_addresses must fail");
+    assert!(
+        err.contains("'gateway_addresses' must be an array"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn test_duplicate_gateway_addresses_are_rejected() {
     let config = json!({
         "key": VALID_KEY,
@@ -640,6 +699,14 @@ async fn test_successful_local_run_records_completed_responses() {
     assert!(run.responses_completed > 0, "expected completed responses");
     assert!(run.status_2xx > 0);
     assert_eq!(run.responses_completed, run.status_2xx);
+    assert!(
+        run.elapsed_ms > 0,
+        "successful cohort must record non-zero elapsed time"
+    );
+    assert!(
+        run.completed_requests_per_second() > 0.0,
+        "completed responses with elapsed time must yield positive RPS"
+    );
     assert!(matches!(
         run.outcome,
         RunOutcome::Success | RunOutcome::Degraded
