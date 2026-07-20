@@ -31,8 +31,9 @@
 //! Native and translated gRPC transactions retain their terminal gRPC status
 //! separately from the HTTP transport status. WebSocket uses its HTTP upgrade
 //! transaction; this example deliberately does not capture frame payloads.
-//! Request methods are capped at 256 Unicode characters before persistence so
-//! hostile extension methods cannot exceed the portable MySQL column contract.
+//! Request methods are capped at 256 Unicode characters and consumer identities
+//! at 255 before persistence so hostile extension methods or external identity
+//! claims cannot exceed the portable MySQL column contract.
 //!
 //! ## MySQL custom-migration contract
 //!
@@ -100,6 +101,7 @@ const TABLE_NAME: &str = "example_audit_log";
 const PLUGIN_NAME: &str = "example_audit_plugin";
 const MAX_RETENTION_DAYS: u64 = 36_500;
 const MAX_HTTP_METHOD_CHARS: usize = 256;
+const MAX_CONSUMER_USERNAME_CHARS: usize = 255;
 const MAX_METADATA_ENTRIES: usize = 64;
 const MAX_METADATA_KEY_CHARS: usize = 128;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
@@ -344,7 +346,10 @@ impl ExampleAuditPlugin {
             response_status: Some(i32::from(summary.response_status_code)),
             grpc_status,
             latency_ms: summary.latency_total_ms,
-            consumer_username: summary.consumer_username.clone(),
+            consumer_username: summary
+                .consumer_username
+                .as_deref()
+                .map(|username| truncate_chars(username, MAX_CONSUMER_USERNAME_CHARS)),
             proxy_id: summary.proxy_id.clone(),
             request_context,
             connection_error: summary
@@ -376,7 +381,10 @@ impl ExampleAuditPlugin {
             response_status: None,
             grpc_status: None,
             latency_ms: summary.duration_ms,
-            consumer_username: summary.consumer_username.clone(),
+            consumer_username: summary
+                .consumer_username
+                .as_deref()
+                .map(|username| truncate_chars(username, MAX_CONSUMER_USERNAME_CHARS)),
             proxy_id: Some(summary.proxy_id.clone()),
             request_context,
             connection_error: summary.connection_error.clone(),

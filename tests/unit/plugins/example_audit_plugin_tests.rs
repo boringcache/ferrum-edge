@@ -530,7 +530,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             request_path: "/v1/widgets".to_string(),
             response_status_code: 201,
             latency_total_ms: 3.25,
-            consumer_username: Some("alice".to_string()),
+            consumer_username: Some("U".repeat(300)),
             proxy_id: Some("proxy-1".to_string()),
             metadata: HashMap::from([
                 ("cookie".to_string(), "session=1".to_string()),
@@ -679,7 +679,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let rows = sqlx::query(
-            "SELECT id, protocol, client_ip, http_method, response_status, grpc_status \
+            "SELECT id, protocol, client_ip, http_method, response_status, grpc_status, consumer_username \
              FROM example_audit_log",
         )
         .fetch_all(&pool)
@@ -697,6 +697,12 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             if protocol == "http" && client_ip == "192.0.2.10" {
                 assert_eq!(method.as_deref(), Some("POST"));
                 assert_eq!(status, Some(201));
+                let consumer_username: Option<String> =
+                    row.try_get("consumer_username").ok().flatten();
+                let consumer_username =
+                    consumer_username.as_deref().expect("bounded consumer identity");
+                assert_eq!(consumer_username.chars().count(), 255);
+                assert!(consumer_username.chars().all(|c| c == 'U'));
                 saw_http = true;
             }
             if protocol == "grpc" && client_ip == "192.0.2.14" {
