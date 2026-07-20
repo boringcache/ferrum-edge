@@ -22,6 +22,13 @@ approval endpoint's answer.
 - **Protocols:** HTTP family (HTTP/1.1, HTTP/2, HTTP/3). Raw WebSocket frame
   tools are out of scope for the MVP.
 - **Failure policy:** `FailClosed`.
+- **Configuration admission:** unknown properties are rejected at every
+  fixed-shape layer (`config`, `inspect`, each `tools.<name>` policy,
+  `blocked_arg_patterns[i]`, `approval`, `response`, `observability`) with
+  path-qualified errors and close-spelling suggestions. The free-form
+  `tools` tool-name map and arbitrary per-tool `json_schema` document contents
+  stay open. Unknown keys are rejected even when `enabled: false` so a typo
+  cannot hide until the plugin is turned on.
 
 ## Inspection surfaces
 

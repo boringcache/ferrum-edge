@@ -1939,6 +1939,13 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
 
 #[test]
 fn ai_tool_governor_schema_matches_runtime_invariants() {
+    use ferrum_edge::plugins::ai_tool_governor::{
+        AI_TOOL_GOVERNOR_APPROVAL_KEYS, AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
+        AI_TOOL_GOVERNOR_CONFIG_KEYS, AI_TOOL_GOVERNOR_INSPECT_KEYS,
+        AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS, AI_TOOL_GOVERNOR_RESPONSE_KEYS,
+        AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS,
+    };
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let mut schema = json!({
@@ -1952,6 +1959,123 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
     let validator = jsonschema::draft202012::options()
         .build(&schema)
         .expect("AiToolGovernorConfig schema compiles");
+
+    let enabled = &spec["components"]["schemas"]["AiToolGovernorEnabledConfig"];
+    assert_eq!(enabled["additionalProperties"], json!(false));
+    assert_eq!(
+        enabled["properties"]["inspect"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        enabled["properties"]["approval"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        enabled["properties"]["response"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        enabled["properties"]["observability"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        enabled["properties"]["tools"]["additionalProperties"]["additionalProperties"],
+        json!(false),
+        "per-tool policy objects must be closed"
+    );
+    assert_eq!(
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]["blocked_arg_patterns"]
+            ["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert!(
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]["json_schema"]
+            .get("additionalProperties")
+            .is_none(),
+        "json_schema must remain an intentionally open map"
+    );
+
+    let runtime_root: BTreeSet<&str> = AI_TOOL_GOVERNOR_CONFIG_KEYS.iter().copied().collect();
+    let schema_root: BTreeSet<&str> = enabled["properties"]
+        .as_object()
+        .expect("enabled properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(runtime_root, schema_root, "root key drift");
+    assert_eq!(
+        AI_TOOL_GOVERNOR_INSPECT_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["inspect"]["properties"]
+            .as_object()
+            .expect("inspect properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]
+            .as_object()
+            .expect("tool policy properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]
+            ["blocked_arg_patterns"]["items"]["properties"]
+            .as_object()
+            .expect("blocked pattern properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_APPROVAL_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["approval"]["properties"]
+            .as_object()
+            .expect("approval properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_RESPONSE_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["response"]["properties"]
+            .as_object()
+            .expect("response properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        enabled["properties"]["observability"]["properties"]
+            .as_object()
+            .expect("observability properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    );
 
     for config in [
         json!({
@@ -1985,6 +2109,18 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         json!({
             "tools": {"deploy": {"action": "require_approval"}},
             "approval": {"endpoint_url": "https://approval.example/decide"}
+        }),
+        json!({
+            "tools": {
+                "custom.tool": {
+                    "action": "allow",
+                    "json_schema": {
+                        "type": "object",
+                        "$comment": "open schema keywords remain allowed",
+                        "unevaluatedProperties": false
+                    }
+                }
+            }
         }),
     ] {
         assert!(
@@ -2041,6 +2177,31 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         json!({
             "tools": {"deploy": {"action": "require_approval"}},
             "approval": {"endpoint_url": "https:///decide"}
+        }),
+        json!({"tools": {"search": {"action": "allow"}}, "modde": "enforce"}),
+        json!({
+            "enabled": false,
+            "required_arg": ["ticket_id"]
+        }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "allow",
+                    "required_arg": ["q"]
+                }
+            }
+        }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "allow",
+                    "blocked_arg_patterns": [{"name": "secret", "regex": "x", "flagss": "i"}]
+                }
+            }
+        }),
+        json!({
+            "tools": {"search": {"action": "allow"}},
+            "inspect": {"response_tool_calls": true, "response_tool_call": true}
         }),
     ] {
         assert!(
