@@ -472,7 +472,7 @@ fn is_valid_explicit_grpc_status(value: &HeaderValue) -> bool {
             .to_str()
             .ok()
             .and_then(|status| status.parse::<u32>().ok())
-            .is_some()
+            .is_some_and(|status| status <= 16)
 }
 
 fn is_remote_h2_no_error_reset(err: &h2::Error) -> bool {
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn preserve_no_error_reset_with_malformed_grpc_status() {
-        for malformed in ["invalid", "+14", "014"] {
+        for malformed in ["invalid", "+14", "014", "17", "999"] {
             let mut headers = HeaderMap::new();
             headers.insert("grpc-status", malformed.parse().unwrap());
             let kept = suppress_benign_early_response_reset(
