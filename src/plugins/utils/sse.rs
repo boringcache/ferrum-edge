@@ -51,6 +51,19 @@ pub fn headers_accept_sse(headers: &HashMap<String, String>) -> bool {
         .is_some_and(|accept| accept_includes_event_stream(accept))
 }
 
+/// Returns `true` when `value` has the exact `text/event-stream` media-type
+/// essence. Optional parameters and surrounding whitespace are ignored, while
+/// lookalike types such as `application/event-stream+json` are rejected.
+#[inline]
+pub fn is_text_event_stream_media_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
+}
+
 /// Outcome of parsing a buffered SSE body, distinguishing "no data" from "data
 /// we could not parse" so callers that promise inspection (e.g. the AI firewall
 /// `buffer` mode) can fail closed on uninspectable input rather than deliver it.
@@ -699,12 +712,7 @@ fn index_field(value: &Value, field: &str) -> Option<usize> {
 /// is rejected, but parameters (`text/event-stream; q=1.0`) are accepted.
 #[inline]
 fn accept_includes_event_stream(accept: &str) -> bool {
-    accept.split(',').any(|part| {
-        let trimmed = part.trim();
-        // Strip optional media-type parameters (`; q=...`, `; charset=...`).
-        let media_type = trimmed.split(';').next().unwrap_or(trimmed).trim_end();
-        media_type.eq_ignore_ascii_case("text/event-stream")
-    })
+    accept.split(',').any(is_text_event_stream_media_type)
 }
 
 #[cfg(test)]

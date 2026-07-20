@@ -263,6 +263,12 @@ starts as `application/octet-stream` and is relabeled to `application/json` by
 `response_transformer` stays buffered, so `on_final_response_body` evaluates it
 with the final client-visible headers.
 
+For `response_transformer` body rules, a static or route-level header rule that
+may change `Content-Type` therefore also keeps a genuine backend event stream on
+the conservative buffered path. An unbounded stream in that configuration will
+eventually reach the response-body ceiling and return 502; operators should not
+combine document body rules with `Content-Type` relabeling on an SSE route.
+
 Custom plugins that change response `Content-Type` in `after_proxy` must also
 override `may_modify_response_content_type()`. Otherwise they can recreate the
 same backend-header downgrade gap. Operators can still force conservative

@@ -650,30 +650,36 @@ async fn wait_for_h2_downgraded_entry(
 // response_transformer — client SSE intent cannot bypass JSON body policy.
 // ────────────────────────────────────────────────────────────────────────────
 
-fn response_transformer_sse_policy_file_config(backend_port: u16) -> String {
+fn response_transformer_sse_policy_file_config(
+    backend_port: u16,
+    retries_enabled: bool,
+) -> String {
+    let mut proxy = json!({
+        "id": "response-transformer-sse-policy",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "strip_listen_path": true,
+        "response_body_mode": "stream",
+        "backend_connect_timeout_ms": 2000,
+        // The SSE fixture deliberately holds the response open between
+        // events. Zero disables the backend read timeout for this test.
+        "backend_read_timeout_ms": 0,
+        "backend_write_timeout_ms": 5000,
+        "plugins": [{"plugin_config_id": "redact-secret"}],
+    });
+    if retries_enabled {
+        // Exercise the retry-marked response decision even though each
+        // successful fixture completes on its first attempt.
+        proxy["retry"] = json!({
+            "max_retries": 1,
+            "retry_on_connect_failure": true,
+        });
+    }
     let config = json!({
         "version": "1",
-        "proxies": [{
-            "id": "response-transformer-sse-policy",
-            "listen_path": "/api",
-            "backend_scheme": "http",
-            "backend_host": "127.0.0.1",
-            "backend_port": backend_port,
-            "strip_listen_path": true,
-            "response_body_mode": "stream",
-            "backend_connect_timeout_ms": 2000,
-            // The SSE fixture deliberately holds the response open between
-            // events. Zero disables the backend read timeout for this test.
-            "backend_read_timeout_ms": 0,
-            "backend_write_timeout_ms": 5000,
-            // Exercise the retry-marked response decision even though both
-            // successful fixtures complete on their first attempt.
-            "retry": {
-                "max_retries": 1,
-                "retry_on_connect_failure": true,
-            },
-            "plugins": [{"plugin_config_id": "redact-secret"}],
-        }],
+        "proxies": [proxy],
         "consumers": [],
         "upstreams": [],
         "plugin_configs": [{
@@ -736,7 +742,10 @@ async fn response_transformer_buffers_json_when_client_accepts_sse() {
         // Keep the scripted backend cold: binary-mode startup performs an
         // independent capability probe that would be counted as a request.
         .mode_in_process()
-        .file_config(response_transformer_sse_policy_file_config(backend_port))
+        .file_config(response_transformer_sse_policy_file_config(
+            backend_port,
+            true,
+        ))
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -784,9 +793,9 @@ async fn response_transformer_buffers_json_when_client_accepts_sse() {
     backend.assert_no_step_errors().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn response_transformer_releases_backend_sse_incrementally() {
+async fn assert_response_transformer_releases_backend_sse_incrementally(
+    retries_enabled: bool,
+) {
     const EVENT_ONE: &str = "data: {\"part\":1}\n\n";
     const EVENT_TWO: &str = "data: {\"part\":2}\n\n";
     const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
@@ -822,7 +831,10 @@ async fn response_transformer_releases_backend_sse_incrementally() {
         // Keep the scripted backend cold: binary-mode startup performs an
         // independent capability probe that would be counted as a request.
         .mode_in_process()
-        .file_config(response_transformer_sse_policy_file_config(backend_port))
+        .file_config(response_transformer_sse_policy_file_config(
+            backend_port,
+            retries_enabled,
+        ))
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -891,6 +903,18 @@ async fn response_transformer_releases_backend_sse_incrementally() {
     );
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn response_transformer_releases_backend_sse_incrementally() {
+    assert_response_transformer_releases_backend_sse_incrementally(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn response_transformer_releases_backend_sse_incrementally_without_retries() {
+    assert_response_transformer_releases_backend_sse_incrementally(false).await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
