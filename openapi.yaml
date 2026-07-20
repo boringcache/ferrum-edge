@@ -11239,13 +11239,23 @@ components:
 
     TcpLoggingConfig:
       type: object
-      description: "Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent TCP or TCP+TLS connection."
+      additionalProperties: false
+      description: >-
+        Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent
+        TCP or TCP+TLS connection. Only the properties below are admitted;
+        unknown keys (for example a misspelled `tlls`) are rejected so transport
+        security cannot silently default to plaintext. `connect_timeout_ms`
+        bounds DNS, TCP connect, and TLS handshake when enabled.
+        `write_timeout_ms` bounds each batch write/flush; timeouts discard the
+        writer and use the shared retry/reconnect path. Delivery is
+        at-least-once after partial-write failure.
       required:
         - host
         - port
       properties:
         host:
           type: string
+          minLength: 1
           description: Hostname or IP of the TCP log receiver
         port:
           type: integer
@@ -11258,10 +11268,16 @@ components:
           description: Enable TLS encryption for the connection
         tls_server_name:
           type: string
-          description: SNI server name override for TLS (defaults to host)
+          minLength: 1
+          description: >-
+            DNS or IP identity for TLS SNI/certificate verification (defaults to
+            `host`). Allowed only when `tls` is true. Must be a rustls-acceptable
+            server name without URL scheme, path, query, fragment, or whitespace;
+            invalid values fail plugin admission.
         batch_size:
           type: integer
           default: 50
+          minimum: 1
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11271,24 +11287,37 @@ components:
         max_retries:
           type: integer
           default: 3
+          minimum: 0
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 0
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
           description: Channel capacity — new entries are dropped when full
         connect_timeout_ms:
           type: integer
           default: 5000
           minimum: 100
-          description: TCP connection timeout in milliseconds
+          description: >-
+            Connection establishment timeout in milliseconds. Covers DNS
+            resolution, TCP connect, and the TLS handshake when `tls` is true.
+        write_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          description: >-
+            Per-batch socket write_all + flush timeout in milliseconds. On
+            timeout the persistent writer is discarded and retries reconnect.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.

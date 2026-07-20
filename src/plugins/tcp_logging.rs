@@ -9,8 +9,11 @@
 //! Supports both plaintext TCP and TLS-encrypted connections. TLS uses the
 //! gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`), skip-verify
 //! (`FERRUM_TLS_NO_VERIFY`), and CRL list (`FERRUM_TLS_CRL_FILE_PATH`) settings,
-//! with per-plugin `tls_server_name` override. Revoked log-sink certificates
-//! are rejected via `WebPkiServerVerifier`'s
+//! with per-plugin `tls_server_name` override validated at admission.
+//! `connect_timeout_ms` covers DNS, TCP connect, and TLS handshake;
+//! `write_timeout_ms` bounds each batch write/flush. Unknown config keys are
+//! rejected fail-closed. Revoked log-sink certificates are rejected via
+//! `WebPkiServerVerifier`'s
 //! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
 //! policy, matching the proxy backend / DTLS / frontend mTLS surfaces.
 //!
@@ -18,8 +21,8 @@
 //! `LogEntry` union type, matching the http_logging plugin's behavior.
 
 use async_trait::async_trait;
-use rustls::pki_types::CertificateRevocationListDer;
-use serde_json::Value;
+use rustls::pki_types::{CertificateRevocationListDer, ServerName};
+use serde_json::{Map, Value};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -36,22 +39,49 @@ use super::utils::{
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Authoritative closed set of top-level `tcp_logging` configuration keys.
+///
+/// Constructor admission, OpenAPI `TcpLoggingConfig`, and operator docs must
+/// stay in lockstep with this list. Nested `schema` objects remain validated by
+/// the shared log-schema compiler and are not flattened here.
+pub const TCP_LOGGING_CONFIG_KEYS: &[&str] = &[
+    "batch_size",
+    "buffer_capacity",
+    "connect_timeout_ms",
+    "flush_interval_ms",
+    "host",
+    "max_retries",
+    "port",
+    "retry_delay_ms",
+    "schema",
+    "schema_ref",
+    "tls",
+    "tls_server_name",
+    "write_timeout_ms",
+];
+
+/// Prebuilt TLS materials for the log sink.
+///
+/// Built once in `TcpLogging::new` so reconnects reuse the connector and the
+/// already-validated rustls `ServerName` instead of re-parsing on every batch.
+#[derive(Clone)]
+struct TcpTlsRuntime {
+    connector: tokio_rustls::TlsConnector,
+    server_name: ServerName<'static>,
+}
 
 #[derive(Clone)]
 struct TcpFlushConfig {
     host: String,
     port: u16,
-    tls_server_name: Option<String>,
-    /// Prebuilt TLS connector, or `None` when TLS is disabled.
-    ///
-    /// The CA-bundle read + PEM parse and the `WebPkiServerVerifier` build
-    /// (which applies the gateway CRL list, `FERRUM_TLS_CRL_FILE_PATH`, so
-    /// revoked log-sink certificates are rejected) all happen once in
-    /// `TcpLogging::new` — off the async flush task. Reconnects clone this
-    /// cheap `Arc<ClientConfig>`-backed connector instead of re-reading the
-    /// filesystem and re-parsing PEM synchronously on a tokio worker thread.
-    tls_connector: Option<tokio_rustls::TlsConnector>,
+    /// `Some` when `tls: true`. Absent for plaintext sinks.
+    tls: Option<TcpTlsRuntime>,
+    /// Bounds DNS resolution, TCP connect, and (when enabled) the TLS handshake.
     connect_timeout: Duration,
+    /// Bounds `write_all` + `flush` for one batch send attempt.
+    write_timeout: Duration,
     /// Gateway-shared DNS cache for endpoint resolution. Pre-warmed at startup
     /// via `Plugin::warmup_hostnames`, refreshed in the background. `None` only
     /// when the plugin was constructed via the test/fallback `PluginHttpClient`
@@ -67,9 +97,13 @@ pub struct TcpLogging {
 
 impl TcpLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("tcp_logging: config must be an object".to_string());
-        }
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "tcp_logging: config must be an object; allowed keys: {}",
+                TCP_LOGGING_CONFIG_KEYS.join(", ")
+            )
+        })?;
+        reject_unknown_tcp_logging_keys(config_obj)?;
 
         let raw_host = config
             .get("host")
@@ -96,11 +130,16 @@ impl TcpLogging {
         let port = port as u16;
 
         let tls_enabled = optional_bool(config, "tls")?.unwrap_or(false);
-        let tls_server_name = optional_non_empty_string(config, "tls_server_name")?;
+        let tls_server_name_override = optional_non_empty_string(config, "tls_server_name")?;
+        if !tls_enabled && tls_server_name_override.is_some() {
+            return Err(
+                "tcp_logging: 'tls_server_name' requires 'tls: true' — refuse plaintext sinks with a TLS identity override"
+                    .to_string(),
+            );
+        }
 
-        let connect_timeout_ms = optional_u64(config, "connect_timeout_ms")?
-            .unwrap_or(5000)
-            .max(100);
+        let connect_timeout_ms = bounded_timeout_ms(config, "connect_timeout_ms", 5000)?;
+        let write_timeout_ms = bounded_timeout_ms(config, "write_timeout_ms", 5000)?;
 
         let batch_defaults = BatchConfigDefaults {
             batch_size_key: "batch_size",
@@ -114,26 +153,35 @@ impl TcpLogging {
         validate_batch_config(config, "tcp_logging", batch_defaults)?;
 
         let schema = resolve_schema(config, "tcp_logging", SchemaCapabilities::BASE)?;
-        // Build the TLS connector once, here on the cold construction path. The
-        // CA bundle is read + PEM-parsed synchronously inside
-        // `build_tls_connector`; doing it now (rather than per reconnect inside
-        // the async flush task) keeps blocking filesystem I/O off the tokio
-        // runtime and surfaces a bad CA bundle at admission time.
-        let tls_connector = if tls_enabled {
-            Some(build_tls_connector(
+        // Build the TLS connector and parse the effective server name once on
+        // the cold construction path. A bad CA bundle or invalid SNI/IP
+        // identity fails admission instead of dropping every batch later.
+        let tls = if tls_enabled {
+            let connector = build_tls_connector(
                 http_client.tls_no_verify(),
                 http_client.tls_ca_bundle_path(),
                 http_client.tls_crls(),
-            )?)
+            )?;
+            let server_name_str = tls_server_name_override
+                .as_deref()
+                .unwrap_or(host.as_str())
+                .to_string();
+            let server_name = ServerName::try_from(server_name_str.clone()).map_err(|error| {
+                format!("tcp_logging: invalid TLS server name '{server_name_str}': {error}")
+            })?;
+            Some(TcpTlsRuntime {
+                connector,
+                server_name,
+            })
         } else {
             None
         };
         let flush_config = TcpFlushConfig {
             host: host.clone(),
             port,
-            tls_server_name,
-            tls_connector,
+            tls,
             connect_timeout: Duration::from_millis(connect_timeout_ms),
+            write_timeout: Duration::from_millis(write_timeout_ms),
             dns_cache: http_client.dns_cache().cloned(),
             schema,
         };
@@ -156,6 +204,10 @@ impl TcpLogging {
     }
 }
 
+fn reject_unknown_tcp_logging_keys(object: &Map<String, Value>) -> Result<(), String> {
+    reject_unknown_keys(object, "config", TCP_LOGGING_CONFIG_KEYS, "tcp_logging: ")
+}
+
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(value) => value
@@ -174,6 +226,16 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
             .ok_or_else(|| format!("tcp_logging: '{key}' must be an unsigned integer")),
         None => Ok(None),
     }
+}
+
+fn bounded_timeout_ms(config: &Value, key: &str, default_ms: u64) -> Result<u64, String> {
+    let value = optional_u64(config, key)?.unwrap_or(default_ms);
+    if value < 100 {
+        return Err(format!(
+            "tcp_logging: '{key}' must be at least 100 milliseconds (got {value})"
+        ));
+    }
+    Ok(value)
 }
 
 fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>, String> {
@@ -245,16 +307,14 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
     // Resolve via the gateway DNS cache so log shipping shares the same
     // pre-warmed / stale-while-revalidate behaviour as the proxy hot path.
     //
-    // Both the resolve and the TCP connect happen inside `cfg.connect_timeout`:
-    // the previous `TcpStream::connect("host:port")` form had the OS DNS
-    // lookup implicitly bounded by the connect timeout. Now that we resolve
-    // explicitly first, a cold/expired cache or stuck upstream nameserver
-    // could otherwise block the batching task well past `connect_timeout_ms`,
-    // delaying log delivery and retries — so the timeout wraps the full
-    // resolve+connect sequence.
+    // `connect_timeout_ms` bounds DNS resolution, the plaintext TCP connect,
+    // and (when TLS is enabled) the TLS handshake as one establishment budget.
+    // A collector that accepts TCP but never completes TLS must not pin the
+    // sole batching worker indefinitely — timeout returns through the normal
+    // retry/reconnect path so reload can also retire a stuck generation.
     let host_log = cfg.host.clone();
     let port = cfg.port;
-    let resolve_and_connect = async {
+    let establish = async {
         let socket_addr =
             resolve_tcp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "tcp_logging")
                 .await?;
@@ -262,29 +322,27 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
         let stream = TcpStream::connect(socket_addr)
             .await
             .map_err(|e| format!("TCP logging: failed to connect to {addr_log}: {e}"))?;
-        Ok::<(TcpStream, String), String>((stream, addr_log))
+
+        let Some(tls) = cfg.tls.as_ref() else {
+            return Ok::<TcpWriter, String>(TcpWriter::Plain(stream));
+        };
+
+        let tls_stream = tls
+            .connector
+            .connect(tls.server_name.clone(), stream)
+            .await
+            .map_err(|error| {
+                format!("TCP logging: TLS handshake failed with {addr_log}: {error}")
+            })?;
+        Ok(TcpWriter::Tls(Box::new(tls_stream)))
     };
 
-    let (stream, addr_log) = tokio::time::timeout(cfg.connect_timeout, resolve_and_connect)
-        .await
-        .map_err(|_| format!("TCP logging: connect timeout to {host_log}:{port}"))??;
-
-    let Some(connector) = cfg.tls_connector.clone() else {
-        return Ok(TcpWriter::Plain(stream));
-    };
-
-    let server_name_str = cfg.tls_server_name.as_deref().unwrap_or(&cfg.host);
-    let server_name = rustls::pki_types::ServerName::try_from(server_name_str.to_string())
-        .map_err(|error| {
-            format!("TCP logging: invalid TLS server name '{server_name_str}': {error}")
-        })?;
-
-    let tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .map_err(|error| format!("TCP logging: TLS handshake failed with {addr_log}: {error}"))?;
-
-    Ok(TcpWriter::Tls(Box::new(tls_stream)))
+    match tokio::time::timeout(cfg.connect_timeout, establish).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "TCP logging: connect timeout to {host_log}:{port} (includes TLS handshake when enabled)"
+        )),
+    }
 }
 
 /// Build the TLS connector for the TCP log sink.
@@ -442,21 +500,34 @@ async fn send_batch(
         connection = Some(connect_tcp(cfg).await?);
     }
 
+    // Delivery is at-least-once: a timeout or I/O error after a partial write
+    // discards the socket and returns through the shared retry path. Retries
+    // may re-send the full batch; collectors must tolerate duplicates.
     let mut keep_connection = true;
     let result = match connection.as_mut() {
-        Some(writer) => match writer.write_all(&payload).await {
-            Ok(()) => match writer.flush().await {
-                Ok(()) => Ok(()),
-                Err(error) => {
+        Some(writer) => {
+            let write_and_flush = async {
+                writer.write_all(&payload).await?;
+                writer.flush().await?;
+                Ok::<(), std::io::Error>(())
+            };
+            match tokio::time::timeout(cfg.write_timeout, write_and_flush).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
                     keep_connection = false;
-                    Err(format!("TCP logging: flush failed: {error}"))
+                    Err(format!("TCP logging: write failed: {error}"))
                 }
-            },
-            Err(error) => {
-                keep_connection = false;
-                Err(format!("TCP logging: write failed: {error}"))
+                Err(_) => {
+                    keep_connection = false;
+                    Err(format!(
+                        "TCP logging: write timeout to {}:{} after {}ms",
+                        cfg.host,
+                        cfg.port,
+                        cfg.write_timeout.as_millis()
+                    ))
+                }
             }
-        },
+        }
         None => Err("TCP logging: writer unavailable after reconnect".to_string()),
     };
     if !keep_connection {
@@ -692,9 +763,13 @@ mod tests {
         let cfg = TcpFlushConfig {
             host: "127.0.0.1".to_string(),
             port,
-            tls_server_name: Some("localhost".to_string()),
-            tls_connector: Some(tls_connector),
+            tls: Some(TcpTlsRuntime {
+                connector: tls_connector,
+                server_name: ServerName::try_from("localhost".to_string())
+                    .expect("localhost is a valid server name"),
+            }),
             connect_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_secs(2),
             dns_cache: None,
             schema: None,
         };
@@ -735,9 +810,13 @@ mod tests {
         let cfg = TcpFlushConfig {
             host: "127.0.0.1".to_string(),
             port,
-            tls_server_name: Some("localhost".to_string()),
-            tls_connector: Some(tls_connector),
+            tls: Some(TcpTlsRuntime {
+                connector: tls_connector,
+                server_name: ServerName::try_from("localhost".to_string())
+                    .expect("localhost is a valid server name"),
+            }),
             connect_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_secs(2),
             dns_cache: None,
             schema: None,
         };
@@ -747,5 +826,182 @@ mod tests {
             "Empty CRL must allow the unrevoked cert to connect, got: {:?}",
             result.err()
         );
+    }
+
+    /// A collector that accepts TCP but never speaks TLS must fail inside
+    /// `connect_timeout_ms` rather than pinning the flush worker forever.
+    #[tokio::test]
+    async fn test_tcp_logging_tls_handshake_honors_connect_timeout() {
+        ensure_crypto_provider();
+
+        let listener = must(TcpListener::bind("127.0.0.1:0").await, "bind silent TLS peer");
+        let port = must(listener.local_addr(), "read silent peer addr").port();
+        tokio::spawn(async move {
+            // Accept and hold the socket open without completing a handshake.
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            // Keep the accepted socket alive until the client times out.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+
+        let tls_connector = must(build_tls_connector(true, None, &[]), "build no-verify connector");
+        let cfg = TcpFlushConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: Some(TcpTlsRuntime {
+                connector: tls_connector,
+                server_name: ServerName::try_from("localhost".to_string())
+                    .expect("localhost is a valid server name"),
+            }),
+            connect_timeout: Duration::from_millis(200),
+            write_timeout: Duration::from_secs(2),
+            dns_cache: None,
+            schema: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = match connect_tcp(&cfg).await {
+            Ok(_) => panic!("handshake against a silent peer must time out"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            err.contains("connect timeout"),
+            "expected connect timeout error, got: {err}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2),
+            "timeout should land near connect_timeout_ms, elapsed={elapsed:?}"
+        );
+    }
+
+    fn shrink_plain_send_buffer(writer: &mut TcpWriter, bytes: usize) {
+        let TcpWriter::Plain(stream) = writer else {
+            panic!("expected plaintext writer for send-buffer shrink");
+        };
+        let sock_ref = socket2::SockRef::from(&*stream);
+        must(
+            sock_ref.set_send_buffer_size(bytes),
+            "shrink SO_SNDBUF so stalled writes block deterministically",
+        );
+    }
+
+    /// A collector that accepts but never reads must fail the write/flush
+    /// budget, discard the writer, and succeed after a healthy reconnect.
+    #[tokio::test]
+    async fn test_tcp_logging_write_timeout_discards_socket_and_recovers() {
+        ensure_crypto_provider();
+
+        let stalled = must(TcpListener::bind("127.0.0.1:0").await, "bind stalled reader");
+        let stalled_port = must(stalled.local_addr(), "read stalled addr").port();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = stalled.accept().await else {
+                return;
+            };
+            // Keep the receive window tiny so the sender blocks after a small
+            // write rather than absorbing megabytes into kernel buffers.
+            let sock_ref = socket2::SockRef::from(&stream);
+            let _ = sock_ref.set_recv_buffer_size(1024);
+            // Do not read — fill the sender's buffers until write times out.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+
+        let healthy = must(TcpListener::bind("127.0.0.1:0").await, "bind healthy reader");
+        let healthy_port = must(healthy.local_addr(), "read healthy addr").port();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = healthy.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match stream.read(&mut tmp).await {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+                if buf.contains(&b'\n') {
+                    let _ = tx.send(buf);
+                    break;
+                }
+            }
+        });
+
+        let stalled_cfg = TcpFlushConfig {
+            host: "127.0.0.1".to_string(),
+            port: stalled_port,
+            tls: None,
+            connect_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_millis(200),
+            dns_cache: None,
+            schema: None,
+        };
+        let mut stalled_writer = must(
+            connect_tcp(&stalled_cfg).await,
+            "connect to stalled collector",
+        );
+        shrink_plain_send_buffer(&mut stalled_writer, 1024);
+        let writer = Mutex::new(Some(stalled_writer));
+
+        // Larger than the shrunk send/recv windows so write_all blocks against
+        // a non-reading peer and hits write_timeout_ms.
+        let huge = "x".repeat(256 * 1024);
+        let batch = vec![SummaryLogEntry::Http(TransactionSummary {
+            client_ip: "127.0.0.1".to_string(),
+            http_method: "GET".to_string(),
+            request_path: format!("/{huge}"),
+            response_status_code: 200,
+            ..TransactionSummary::default()
+        })];
+
+        let started = tokio::time::Instant::now();
+        let stalled_err = match send_batch(&stalled_cfg, &writer, batch).await {
+            Ok(()) => panic!("write against a non-reading peer must time out"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            stalled_err.contains("write timeout"),
+            "expected write timeout, got: {stalled_err}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(3),
+            "write timeout should land near write_timeout_ms, elapsed={elapsed:?}"
+        );
+        assert!(
+            writer.lock().expect("writer lock").is_none(),
+            "timed-out writer must be discarded before retry/reconnect"
+        );
+
+        let healthy_cfg = TcpFlushConfig {
+            host: "127.0.0.1".to_string(),
+            port: healthy_port,
+            tls: None,
+            connect_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_secs(2),
+            dns_cache: None,
+            schema: None,
+        };
+        let small_batch = vec![SummaryLogEntry::Http(TransactionSummary {
+            client_ip: "127.0.0.1".to_string(),
+            http_method: "GET".to_string(),
+            request_path: "/ok".to_string(),
+            response_status_code: 200,
+            ..TransactionSummary::default()
+        })];
+        must(
+            send_batch(&healthy_cfg, &writer, small_batch).await,
+            "healthy collector must accept the reconnecting send",
+        );
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("healthy reader should receive a batch")
+            .expect("channel open");
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.contains("\"/ok\""), "unexpected payload: {text}");
     }
 }

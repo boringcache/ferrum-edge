@@ -3392,6 +3392,109 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
 }
 
 #[tokio::test]
+async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::tcp_logging::{TCP_LOGGING_CONFIG_KEYS, TcpLogging};
+
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/TcpLoggingConfig")
+        .expect("TcpLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(schema["properties"]["connect_timeout_ms"]["minimum"], 100);
+    assert_eq!(schema["properties"]["write_timeout_ms"]["minimum"], 100);
+    assert_eq!(schema["properties"]["write_timeout_ms"]["default"], 5000);
+    let connect_desc = schema["properties"]["connect_timeout_ms"]["description"]
+        .as_str()
+        .expect("connect_timeout_ms description");
+    assert!(
+        connect_desc.to_ascii_lowercase().contains("tls"),
+        "connect_timeout_ms must document TLS handshake coverage"
+    );
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("TcpLogging properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = TCP_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "tcp_logging runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let tcp_docs = plugin_docs
+        .split("### `tcp_logging`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("tcp_logging docs section");
+    for key in TCP_LOGGING_CONFIG_KEYS {
+        assert!(
+            tcp_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md tcp_logging section missing `{key}`"
+        );
+    }
+    assert!(tcp_docs.contains("OptionalFailOpen"));
+    assert!(tcp_docs.contains("at-least-once"));
+
+    let valid = json!({
+        "host": "logs.example.com",
+        "port": 6514,
+        "tls": true,
+        "tls_server_name": "logs.example.com",
+        "batch_size": 50,
+        "flush_interval_ms": 1000,
+        "max_retries": 3,
+        "retry_delay_ms": 1000,
+        "buffer_capacity": 10000,
+        "connect_timeout_ms": 5000,
+        "write_timeout_ms": 5000
+    });
+    assert_component_validity(&spec, "TcpLoggingConfig", &valid, true);
+    assert!(TcpLogging::new(&valid, PluginHttpClient::default()).is_ok());
+
+    let valid_minima = json!({"host": "127.0.0.1", "port": 5140});
+    assert_component_validity(&spec, "TcpLoggingConfig", &valid_minima, true);
+    assert!(TcpLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let runtime_and_schema_invalid = [
+        json!({"host": "logs.example.com", "port": 6514, "tlls": true}),
+        json!({"host": "logs.example.com", "port": 6514, "write_timeot_ms": 1000}),
+        json!({"host": "logs.example.com", "port": 6514, "aaa_extra": 1, "zzz_extra": 2}),
+        json!({"host": "logs.example.com"}),
+        json!({"port": 6514}),
+        json!({"host": "logs.example.com", "port": 0}),
+        json!({"host": "logs.example.com", "port": 65536}),
+        json!({"host": "logs.example.com", "port": 6514, "tls": null}),
+        json!({"host": "logs.example.com", "port": 6514, "write_timeout_ms": 50}),
+        json!({"host": "logs.example.com", "port": 6514, "connect_timeout_ms": 50}),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
+        assert!(
+            TcpLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid tcp_logging config: {config}"
+        );
+    }
+
+    // OpenAPI rejects typed nulls on every declared property. Unknown-key
+    // closure is the TCP portion of GHSA-7fgr-gqg5-xj6c under test here.
+    for key in TCP_LOGGING_CONFIG_KEYS {
+        let mut config = json!({"host": "logs.example.com", "port": 6514});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
+    }
+}
+
+#[tokio::test]
 async fn load_testing_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::PluginHttpClient;
     use ferrum_edge::plugins::load_testing::{LOAD_TESTING_CONFIG_KEYS, LoadTesting};
