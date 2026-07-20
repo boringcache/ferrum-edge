@@ -491,8 +491,7 @@ fn parse_gateway_addresses(
         Some(Value::Array(addresses)) => {
             if addresses.is_empty() {
                 return Err(
-                    "load_testing: 'gateway_addresses' must not be empty when provided"
-                        .to_string(),
+                    "load_testing: 'gateway_addresses' must not be empty when provided".to_string(),
                 );
             }
             let mut urls = Vec::with_capacity(addresses.len());
@@ -618,7 +617,12 @@ fn try_reserve_process_clients(count: u64) -> bool {
             return false;
         }
         if PROCESS_ACTIVE_CLIENTS
-            .compare_exchange_weak(current, current + count, Ordering::SeqCst, Ordering::Relaxed)
+            .compare_exchange_weak(
+                current,
+                current + count,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             return true;

@@ -209,10 +209,7 @@ fn test_rejects_short_trigger_key() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(
-        err.contains("at least 16 characters"),
-        "got: {err}"
-    );
+    assert!(err.contains("at least 16 characters"), "got: {err}");
 }
 
 #[test]
@@ -369,10 +366,7 @@ fn test_env_derived_disabled_http_port_is_rejected() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .expect("disabled HTTP listener must fail closed");
-    assert!(
-        err.contains("resolved gateway port is 0"),
-        "got: {err}"
-    );
+    assert!(err.contains("resolved gateway port is 0"), "got: {err}");
     assert!(err.contains("HTTP (FERRUM_PROXY_HTTP_PORT)"), "got: {err}");
     unsafe {
         std::env::remove_var("FERRUM_PROXY_HTTP_PORT");
@@ -394,10 +388,7 @@ fn test_env_derived_disabled_https_port_is_rejected() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .expect("disabled HTTPS listener must fail closed");
-    assert!(
-        err.contains("resolved gateway port is 0"),
-        "got: {err}"
-    );
+    assert!(err.contains("resolved gateway port is 0"), "got: {err}");
     assert!(
         err.contains("HTTPS (FERRUM_PROXY_HTTPS_PORT)"),
         "got: {err}"
@@ -483,7 +474,10 @@ async fn test_skips_when_key_does_not_match() {
         "/api/test".to_string(),
     );
     let mut headers = HashMap::new();
-    headers.insert("x-loadtesting-key".to_string(), "wrong-key-value!!".to_string());
+    headers.insert(
+        "x-loadtesting-key".to_string(),
+        "wrong-key-value!!".to_string(),
+    );
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -509,10 +503,7 @@ async fn test_strips_trigger_key_from_original_request() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    headers.insert(
-        "x-forwarded-for".to_string(),
-        "203.0.113.9".to_string(),
-    );
+    headers.insert("x-forwarded-for".to_string(), "203.0.113.9".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
