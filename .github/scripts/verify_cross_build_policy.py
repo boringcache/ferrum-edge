@@ -1756,16 +1756,18 @@ SHELL_SOURCE_PARAMETER_REFERENCE = re.compile(
 # generator's full-digest provenance. Matches are additionally filtered through
 # `shell_quote_at()` at their use sites so assignment-shaped quoted data does
 # not become a synthetic binding.
+SHELL_SOURCE_ASSIGNMENT_TARGET = (
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\[[^\]\n]*\])?\s*\+?=\s*"
+)
 SHELL_SOURCE_ASSIGNMENT = re.compile(
     COMMAND_START_CONTEXT
     + SUBSHELL_OPENERS
     + r"(?:(?:export|readonly|local|declare|typeset)"
-    r"(?:\s+--?[A-Za-z]+)*\s+)?"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    r"(?:\s+(?:--[A-Za-z][A-Za-z-]*|[+-][A-Za-z]+|--))*\s+)?"
+    + SHELL_SOURCE_ASSIGNMENT_TARGET
 )
-SHELL_SOURCE_NEXT_ASSIGNMENT = re.compile(
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
-)
+SHELL_SOURCE_NEXT_ASSIGNMENT = re.compile(SHELL_SOURCE_ASSIGNMENT_TARGET)
 SHELL_ASSIGNMENT_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=.*", re.DOTALL)
 WHOLE_SHELL_PARAMETER = re.compile(r"\s*\$[A-Za-z_][A-Za-z0-9_]*\s*")
 _shell_assigned_names: frozenset[str] = frozenset()
@@ -3506,7 +3508,8 @@ def shell_assignment_value_end(line: str, start: int) -> int:
             character in "<>" and line.startswith("(", index + 1)
         ):
             if not pending and character == "(":
-                return index
+                if index != start:
+                    return index
             pending.append((")", quote))
             index += 2 if character in "<>" else 1
             continue
@@ -18789,6 +18792,27 @@ pre_build = []
         "eval through an assigned variable": extensionless_workflow.replace(
             "./scripts/build",
             'generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "eval through an append assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated="echo "; generated+="$(./scripts/build)"; '
+            'eval "$generated"',
+        ),
+        "eval through an indexed assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated[0]="$(./scripts/build)"; eval "${generated[0]}"',
+        ),
+        "eval through an array assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated=("$(./scripts/build)"); eval "${generated[*]}"',
+        ),
+        "eval through a declaration option": extensionless_workflow.replace(
+            "./scripts/build",
+            'declare -- generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "eval through a plus declaration option": extensionless_workflow.replace(
+            "./scripts/build",
+            'typeset +x generated="$(./scripts/build)"; eval "$generated"',
         ),
         "eval through a parameter-default assignment": (
             extensionless_workflow.replace(
