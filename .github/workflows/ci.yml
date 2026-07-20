@@ -22,12 +22,6 @@ env:
   # Rationale and the failure mode live in .cargo/config.toml.
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
-  # Opt pedagogical examples into CI/test builds. Default/unset builds and the
-  # Dockerfile leave this unset so example plugins and their migrations are not
-  # part of production artifacts (see custom_plugins/examples/README.md).
-  # This is an allow-list: append any production custom_plugins/*.rs stems here
-  # if the repository gains operator plugins that must also compile in CI.
-  FERRUM_CUSTOM_PLUGINS: example_plugin,example_audit_plugin
 
 jobs:
   ci-plan:
@@ -600,6 +594,7 @@ jobs:
               integration::log_schema_integration_tests
               integration::log_schema_registry_tests
               integration::deferred_log_tests
+              integration::example_audit_plugin_opt_in_tests
               integration::example_plugin_contract_tests
               integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests

@@ -21,9 +21,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Opt pedagogical examples into coverage builds (matches ci.yml). Default /
-  # Docker / release artifacts leave this unset.
-  FERRUM_CUSTOM_PLUGINS: example_plugin,example_audit_plugin
   # Absolute line-coverage FLOORS (regression backstops), not targets. They sit
   # deliberately BELOW measured coverage so ordinary drift does not flap main red.
   # Every PR is measured against its own base, but many PRs land independently and
