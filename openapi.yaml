@@ -11330,16 +11330,17 @@ components:
           type: string
           minLength: 1
           # Match runtime parse_socket_host: hostname or IP without scheme,
-          # path, query, fragment, credentials, or unbracketed host:port.
+          # path, query, fragment, credentials, or a single-colon host:port.
+          # Valid IPv6 literals necessarily contain at least two colons.
           not:
             anyOf:
               - pattern: "://"
               - pattern: "[/?#@\\s]"
-              - pattern: "^(?!\\[).*:.*"
+              - pattern: "^[^\\[\\]:]+:[^:]+$"
           description: >-
             UDP endpoint hostname or IP address. Must be a bare hostname or IP
             without scheme, path, query, fragment, credentials, or port
-            (bracketed IPv6 literals are allowed).
+            (bracketed and unbracketed IPv6 literals are allowed).
         port:
           type: integer
           minimum: 1
@@ -11349,16 +11350,18 @@ components:
           type: boolean
           default: false
           description: >-
-            Enable DTLS encryption for log datagrams. When true, certificate/key/CA
-            sources are materialized at admission and cached for the plugin generation.
-            When false or omitted, DTLS-only fields are rejected.
+            Enable DTLS encryption for log datagrams. Shared Admin / CP validation
+            checks configuration shape without opening node-local sources. On the
+            consuming node, certificate/key/CA sources are materialized and cached
+            for the plugin generation. When false or omitted, DTLS-only fields are
+            rejected.
         dtls_cert_path:
           type: string
           minLength: 1
           description: >-
-            PEM client certificate for DTLS mutual TLS. Validated/materialized at
-            admission when dtls is true; must be paired with dtls_key_path.
-            Rejected unless dtls is true.
+            PEM client certificate for DTLS mutual TLS. Materialized during the
+            consuming node's dependency/construction phase when dtls is true; must
+            be paired with dtls_key_path. Rejected unless dtls is true.
         dtls_key_path:
           type: string
           minLength: 1
@@ -11369,8 +11372,8 @@ components:
           type: string
           minLength: 1
           description: >-
-            PEM CA certificate for verifying the DTLS server. Materialized at
-            admission whenever set with dtls true, including when dtls_no_verify
+            PEM CA certificate for verifying the DTLS server. Materialized on the
+            consuming node whenever set with dtls true, including when dtls_no_verify
             is true (the source must still be valid even though verification is
             disabled). Rejected unless dtls is true.
         dtls_no_verify:

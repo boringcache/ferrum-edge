@@ -618,9 +618,9 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `host` | String | *(required)* | UDP endpoint hostname or IP address |
 | `port` | Integer | *(required)* | UDP endpoint port (1–65535) |
 | `dtls` | Boolean | `false` | Enable DTLS encryption for log datagrams |
-| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized at admission) |
+| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized on the consuming node) |
 | `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
-| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized at admission when set, even if `dtls_no_verify` disables use of the resulting verifier) |
+| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier) |
 | `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only; requires `dtls: true`) |
 | `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
@@ -632,7 +632,7 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 **Delivery success contract:** A successful flush means the local UDP socket (or DTLS engine + connected socket) accepted the datagram. It does **not** mean the remote collector delivered or acknowledged the payload. Local DTLS plaintext rejection, serialization failure, DTLS engine failure, connected-socket send failure, and a stalled DTLS send that exceeds the plugin's 10-second completion budget return errors into the configured retry / final-loss accounting path; they are never treated as silent success. Deterministic local encoding/size rejection does not tear down a healthy DTLS association; transport/driver failures (including send timeout) do.
 
-**Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized plain-UDP datagrams may be fragmented or dropped by the network. For DTLS, the effective plaintext ceiling is `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default **16,384**). A single-entry batch that exceeds that ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting.
+**Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized plain-UDP datagrams may be fragmented or dropped by the network. For DTLS, the effective plaintext ceiling is `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default **16,384**). A single-entry batch that exceeds that ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting. Split delivery is at-least-once: if an earlier entry succeeds and a later entry fails, retrying the original batch can duplicate the earlier entry, so collectors must tolerate duplicates.
 
 **DNS / association lifecycle:** Both plain UDP and DTLS re-resolve the collector through the gateway's shared `DnsCache` every 60 seconds. When the resolved address is unchanged, the existing connected socket / DTLS association is retained. When the address changes, Ferrum builds a replacement connected socket and — for DTLS — performs a fresh handshake before swapping the sender. If re-resolution or the replacement handshake fails, the current sender is retained at the previously pinned address until a later interval or a send-error teardown forces recovery.
 
@@ -647,11 +647,13 @@ config:
 
 #### DTLS Configuration
 
-For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided. When `dtls: true`, certificate, key, and CA sources are materialized at admission (constructor + the mode-aware plugin file-dependency phase) without network I/O, and the parsed material is cached in the committed plugin generation so first flush and reconnect reuse it:
+For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided. Shared Admin / CP validation is shape-only and never opens node-local certificate, key, or CA paths. When `dtls: true`, the consuming node materializes those sources during construction and, where applicable, the mode-aware plugin file-dependency phase without network I/O. Parsed material is cached in the committed plugin generation so first flush and reconnect reuse it:
 
 - **File mode:** unusable DTLS material is fatal during config load.
 - **Database mode:** the file-dependency phase warns; construction still fails closed for that instance (`OptionalFailOpen` omits it).
 - **DP mode:** the shared file-dependency phase is skipped (node-local paths may differ); construction on the DP still materializes local sources and omits the instance on failure.
+
+Cached DTLS material is immutable for that plugin generation. Certificate/key/CA rotation, or making a previously missing source available, requires reapplying or reloading the configuration; transport and handshake failures do not repeatedly reopen source paths.
 
 ```yaml
 plugin_name: udp_logging

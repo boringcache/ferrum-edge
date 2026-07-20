@@ -6761,7 +6761,8 @@ pub(crate) fn validate_plugin_config_with_http_client(
         return geo_restriction::GeoRestriction::validate_config(config);
     }
     if name == "udp_logging" {
-        // Shape + DTLS material checks without spawning the batching worker.
+        // Shape-only: shared Admin / CP validation must not open node-local
+        // DTLS paths. Mode-aware dependency validation and construction do.
         return udp_logging::UdpLogging::validate_config(config, http_client);
     }
     if name == "oidc_relying_party" {

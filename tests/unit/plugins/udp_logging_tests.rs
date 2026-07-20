@@ -696,6 +696,22 @@ async fn test_udp_logging_dtls_rejects_missing_cert_source_at_admission() {
     );
 }
 
+#[test]
+fn test_udp_logging_shared_validation_skips_node_local_dtls_sources() {
+    validate_plugin_config(
+        "udp_logging",
+        &json!({
+            "host": "logs.example.com",
+            "port": 9514,
+            "dtls": true,
+            "dtls_cert_path": "/definitely/missing/dp-local-udp-cert.pem",
+            "dtls_key_path": "/definitely/missing/dp-local-udp-key.pem",
+            "dtls_ca_cert_path": "/definitely/missing/dp-local-udp-ca.pem"
+        }),
+    )
+    .expect("shared Admin / CP validation must check shape without opening DP-local paths");
+}
+
 #[tokio::test]
 async fn test_udp_logging_dtls_rejects_malformed_pem_at_admission() {
     let cert = write_temp_pem("not-a-certificate");
@@ -1240,6 +1256,34 @@ fn test_udp_logging_dtls_batch_size_gate_classifies_send_reject_and_split() {
 }
 
 #[test]
+fn test_dtls_client_send_drain_continues_past_a_full_application_data_round() {
+    assert!(
+        ferrum_edge::_test_support::dtls_client_send_output_drain_needs_another_round_for_test(
+            true, false, false, false, true,
+        ),
+        "a pending send hidden behind a full inbound-data round must keep draining"
+    );
+    for terminal in [
+        (false, false, false, false, true),
+        (true, true, false, false, true),
+        (true, false, true, false, true),
+        (true, false, false, true, true),
+        (true, false, false, false, false),
+    ] {
+        assert!(
+            !ferrum_edge::_test_support::dtls_client_send_output_drain_needs_another_round_for_test(
+                terminal.0,
+                terminal.1,
+                terminal.2,
+                terminal.3,
+                terminal.4,
+            ),
+            "terminal or completed state must not spin another drain round: {terminal:?}"
+        );
+    }
+}
+
+#[test]
 fn test_udp_logging_default_summary_remote_trigger_and_cobatch_split() {
     let max = 16_384usize;
     let mut oversized = create_test_transaction_summary();
@@ -1409,6 +1453,10 @@ fn test_udp_logging_openapi_dtls_policy_contract() {
         })),
         "paired cert/key with dtls true must validate"
     );
+    assert!(
+        validator.is_valid(&json!({"host": "2001:db8::10", "port": 9514})),
+        "unbracketed IPv6 accepted by parse_socket_host must validate"
+    );
 
     for invalid in [
         json!({"host": "127.0.0.1", "port": 9514, "dtls_no_verify": true}),
@@ -1444,8 +1492,10 @@ fn test_udp_logging_docs_dns_and_delivery_contract() {
         "FERRUM_DTLS_MAX_PLAINTEXT_BYTES",
         "split per entry",
         "co-batched siblings",
+        "at-least-once",
         "OptionalFailOpen",
-        "materialized at admission",
+        "shape-only",
+        "immutable for that plugin generation",
         "10-second completion budget",
         "requires `dtls: true`",
         "File mode",

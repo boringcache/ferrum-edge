@@ -4,12 +4,13 @@
 //! sends them to a remote UDP endpoint in batches. Uses
 //! `BatchingLogger<LogEntry>` to decouple the proxy hot path from network I/O.
 //!
-//! Supports both plain UDP and DTLS-encrypted transport. When `dtls` is
-//! enabled, certificate/key/CA sources are materialized at admission (and
-//! through the mode-aware plugin file-dependency phase) and cached in the
-//! committed plugin generation so first flush and reconnect do not rediscover
-//! static source errors. The gateway's CRL list (`FERRUM_TLS_CRL_FILE_PATH`) is
-//! applied to the DTLS server verifier with
+//! Supports both plain UDP and DTLS-encrypted transport. Shared Admin / CP
+//! validation checks DTLS configuration shape without opening node-local
+//! certificate/key/CA sources. Those sources are materialized by the
+//! mode-aware plugin file-dependency phase and by runtime construction, then
+//! cached in the committed plugin generation so first flush and reconnect do
+//! not rediscover static source errors. The gateway's CRL list
+//! (`FERRUM_TLS_CRL_FILE_PATH`) is applied to the DTLS server verifier with
 //! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`,
 //! matching the proxy backend / DTLS / frontend mTLS surfaces.
 //!
@@ -149,7 +150,7 @@ impl UdpLogging {
             dtls_material,
             batch_defaults,
             schema,
-        } = parse_udp_logging_config(config, &http_client)?;
+        } = parse_udp_logging_config(config, &http_client, DtlsMaterialMode::Materialize)?;
 
         let next_resolve_addr = Arc::new(Mutex::new(None));
         let dtls_connect_timeout_ms = Arc::new(AtomicU64::new(
@@ -192,7 +193,8 @@ impl UdpLogging {
         })
     }
 
-    /// Shape + DTLS material admission without spawning the batching worker.
+    /// Shape-only admission without spawning the batching worker or opening
+    /// node-local DTLS material sources.
     ///
     /// Used by shared plugin validation / Admin surfaces. Runtime construction
     /// still goes through [`Self::new`], which reuses the same parser and then
@@ -203,8 +205,17 @@ impl UdpLogging {
         config: &Value,
         http_client: PluginHttpClient,
     ) -> Result<(), String> {
-        parse_udp_logging_config(config, &http_client).map(|_| ())
+        parse_udp_logging_config(config, &http_client, DtlsMaterialMode::ShapeOnly).map(|_| ())
     }
+}
+
+#[derive(Clone, Copy)]
+enum DtlsMaterialMode {
+    /// Shared Admin / CP validation must not read paths that belong to a data
+    /// plane. The mode-aware dependency phase and runtime constructor enforce
+    /// usable material on the node that will actually consume it.
+    ShapeOnly,
+    Materialize,
 }
 
 struct ParsedUdpLogging {
@@ -220,6 +231,7 @@ struct ParsedUdpLogging {
 fn parse_udp_logging_config(
     config: &Value,
     http_client: &PluginHttpClient,
+    material_mode: DtlsMaterialMode,
 ) -> Result<ParsedUdpLogging, String> {
     let object = config
         .as_object()
@@ -276,7 +288,7 @@ fn parse_udp_logging_config(
     validate_batch_config(config, "udp_logging", batch_defaults)?;
     let schema = resolve_schema(config, "udp_logging", SchemaCapabilities::BASE)?;
 
-    let dtls_material = if dtls_enabled {
+    let dtls_material = if dtls_enabled && matches!(material_mode, DtlsMaterialMode::Materialize) {
         Some(Arc::new(materialize_dtls_material(
             &host,
             dtls_cert_path.as_deref(),
@@ -302,8 +314,8 @@ fn parse_udp_logging_config(
 
 /// Materialize DTLS certificate/key/CA sources without network I/O.
 ///
-/// Shared by constructor admission and the mode-aware plugin file-dependency
-/// phase so both surfaces enforce the same usable-material contract.
+/// Shared by runtime construction and the mode-aware plugin file-dependency
+/// phase so both node-local surfaces enforce the same usable-material contract.
 pub(crate) fn materialize_dtls_material(
     host: &str,
     cert_path: Option<&str>,

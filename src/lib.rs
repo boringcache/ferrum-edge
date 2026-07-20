@@ -2207,6 +2207,22 @@ pub mod _test_support {
         crate::plugins::udp_logging::duplicate_dtls_materialization_probe_for_test(config)
     }
 
+    pub fn dtls_client_send_output_drain_needs_another_round_for_test(
+        has_pending_completion: bool,
+        wrote_ciphertext_datagram: bool,
+        socket_send_failed: bool,
+        fatal_send_failed: bool,
+        drain_round_exhausted: bool,
+    ) -> bool {
+        crate::dtls::client_send_output_drain_needs_another_round_for_test(
+            has_pending_completion,
+            wrote_ciphertext_datagram,
+            socket_send_failed,
+            fatal_send_failed,
+            drain_round_exhausted,
+        )
+    }
+
     pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
         crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
     }

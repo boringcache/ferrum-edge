@@ -295,6 +295,39 @@ pub struct DtlsConnection {
     shutdown_tx: mpsc::Sender<()>,
 }
 
+fn client_send_output_drain_needs_another_round(
+    has_pending_completion: bool,
+    wrote_ciphertext_datagram: bool,
+    socket_send_failed: bool,
+    fatal_send_failed: bool,
+    drain_round_exhausted: bool,
+) -> bool {
+    has_pending_completion
+        && !wrote_ciphertext_datagram
+        && !socket_send_failed
+        && !fatal_send_failed
+        && drain_round_exhausted
+}
+
+/// Pin the fairness-boundary decision for external hosted tests without
+/// exposing it as runtime API.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn client_send_output_drain_needs_another_round_for_test(
+    has_pending_completion: bool,
+    wrote_ciphertext_datagram: bool,
+    socket_send_failed: bool,
+    fatal_send_failed: bool,
+    drain_round_exhausted: bool,
+) -> bool {
+    client_send_output_drain_needs_another_round(
+        has_pending_completion,
+        wrote_ciphertext_datagram,
+        socket_send_failed,
+        fatal_send_failed,
+        drain_round_exhausted,
+    )
+}
+
 impl DtlsConnection {
     /// Perform a DTLS client handshake over the given connected socket and return
     /// an established `DtlsConnection`.
@@ -477,46 +510,70 @@ impl DtlsConnection {
                     }
                 }
 
-                // Drain all pending outputs (break on Timeout — it repeats forever)
+                // Drain pending outputs in bounded rounds. dimpl deliberately
+                // returns received ApplicationData before queued ciphertext,
+                // so a send awaiting completion must continue across a full
+                // fairness round instead of being declared a false failure.
                 let mut socket_send_error: Option<String> = None;
                 let mut wrote_ciphertext_datagram = false;
-                for _ in 0..MAX_OUTPUTS_PER_DRAIN {
-                    match dtls.poll_output(&mut out_buf) {
-                        Output::Packet(data) => match socket.send(data).await {
-                            Ok(written) if written == data.len() => {
-                                wrote_ciphertext_datagram = true;
-                            }
-                            Ok(written) => {
-                                socket_send_error = Some(format!(
-                                    "DTLS UDP send was incomplete: wrote {written} of {} bytes",
-                                    data.len()
-                                ));
-                                break;
-                            }
-                            Err(e) => {
-                                socket_send_error = Some(format!("DTLS UDP send error: {e}"));
-                                break;
-                            }
-                        },
-                        Output::Timeout(t) => {
-                            next_timeout = Some(t);
-                            break;
-                        }
-                        Output::ApplicationData(data) => {
-                            if driver_app_tx.send(data.to_vec()).await.is_err() {
-                                if let Some(completion) = pending_completion.take() {
-                                    let _ =
-                                        completion.send(Err("DTLS connection closed".to_string()));
+                loop {
+                    let mut drain_round_exhausted = true;
+                    for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+                        match dtls.poll_output(&mut out_buf) {
+                            Output::Packet(data) => match socket.send(data).await {
+                                Ok(written) if written == data.len() => {
+                                    wrote_ciphertext_datagram = true;
                                 }
-                                fail_pending_app_sends(&mut driver_app_rx).await;
-                                return;
+                                Ok(written) => {
+                                    socket_send_error = Some(format!(
+                                        "DTLS UDP send was incomplete: wrote {written} of {} bytes",
+                                        data.len()
+                                    ));
+                                    drain_round_exhausted = false;
+                                    break;
+                                }
+                                Err(e) => {
+                                    socket_send_error = Some(format!("DTLS UDP send error: {e}"));
+                                    drain_round_exhausted = false;
+                                    break;
+                                }
+                            },
+                            Output::Timeout(t) => {
+                                next_timeout = Some(t);
+                                drain_round_exhausted = false;
+                                break;
+                            }
+                            Output::ApplicationData(data) => {
+                                if driver_app_tx.send(data.to_vec()).await.is_err() {
+                                    if let Some(completion) = pending_completion.take() {
+                                        let _ = completion
+                                            .send(Err("DTLS connection closed".to_string()));
+                                    }
+                                    fail_pending_app_sends(&mut driver_app_rx).await;
+                                    return;
+                                }
+                            }
+                            Output::Connected | Output::PeerCert(_) => {
+                                // Already handled during handshake
+                            }
+                            _ => {
+                                drain_round_exhausted = false;
+                                break;
                             }
                         }
-                        Output::Connected | Output::PeerCert(_) => {
-                            // Already handled during handshake
-                        }
-                        _ => break,
                     }
+
+                    if client_send_output_drain_needs_another_round(
+                        pending_completion.is_some(),
+                        wrote_ciphertext_datagram,
+                        socket_send_error.is_some(),
+                        fatal_send_error.is_some(),
+                        drain_round_exhausted,
+                    ) {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    break;
                 }
 
                 if let Some(completion) = pending_completion.take() {
@@ -532,7 +589,11 @@ impl DtlsConnection {
                     }
                 }
 
-                if socket_send_error.is_some() || fatal_send_error.is_some() {
+                // A connected UDP send error is per-datagram: report it to the
+                // caller, but retain the shared DTLS association. Callers such
+                // as udp_logging may still reset their own sender. Receive,
+                // engine, timeout-engine, and shutdown failures remain fatal.
+                if fatal_send_error.is_some() {
                     fail_pending_app_sends(&mut driver_app_rx).await;
                     break;
                 }
