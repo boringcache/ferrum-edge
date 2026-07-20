@@ -671,10 +671,7 @@ impl KafkaLogging {
             "queue.buffering.max.kbytes",
             admitted.queue_kbytes.to_string(),
         );
-        kafka_config.set(
-            "message.max.bytes",
-            admitted.message_max_bytes.to_string(),
-        );
+        kafka_config.set("message.max.bytes", admitted.message_max_bytes.to_string());
 
         if !ssl_no_verify {
             if let Some(gateway) = gateway_crl_path.as_ref() {
@@ -876,9 +873,9 @@ fn admit_producer_config(
         if key.trim().is_empty() {
             return Err("kafka_logging: 'producer_config' keys must not be empty".to_string());
         }
-        let prop = value.as_str().ok_or_else(|| {
-            format!("kafka_logging: 'producer_config.{key}' must be a string")
-        })?;
+        let prop = value
+            .as_str()
+            .ok_or_else(|| format!("kafka_logging: 'producer_config.{key}' must be a string"))?;
         if prop.trim().is_empty() {
             return Err(format!(
                 "kafka_logging: 'producer_config.{key}' must not be empty"
