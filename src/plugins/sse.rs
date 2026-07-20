@@ -536,10 +536,8 @@ impl super::Plugin for SsePlugin {
         }
 
         if !is_sse && (will_wrap || will_force) {
-            ctx.metadata.insert(
-                RELABELLED_NON_SSE_METADATA_KEY.to_string(),
-                "1".to_string(),
-            );
+            ctx.metadata
+                .insert(RELABELLED_NON_SSE_METADATA_KEY.to_string(), "1".to_string());
         }
 
         // Wrapping implies a browser-consumable EventSource media type.

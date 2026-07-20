@@ -882,12 +882,7 @@ async fn test_force_only_instance_before_wrapper_preserves_original_non_sse_prov
             .is_none()
     );
     let transformed = wrapping
-        .transform_response_body_with_context(
-            &mut ctx,
-            body,
-            Some("text/event-stream"),
-            &headers,
-        )
+        .transform_response_body_with_context(&mut ctx, body, Some("text/event-stream"), &headers)
         .await
         .expect("a later wrapper must honor the original non-SSE provenance");
 
