@@ -948,7 +948,8 @@ pub async fn finalize_all_generations() {
     // Independent producers share no lifecycle state. Finalize them
     // concurrently so the shutdown/reload ceiling is the slowest configured
     // producer budget, rather than the sum of every live generation's budget.
-    futures::future::join_all(generations.iter().map(|generation| generation.finalize())).await;
+    futures_util::future::join_all(generations.iter().map(|generation| generation.finalize()))
+        .await;
     for generation in generations {
         unregister_generation(generation.state.metrics.generation_id);
     }
@@ -1762,7 +1763,7 @@ async fn send_batch(
         let state = Arc::clone(state);
         let topic = topic.to_string();
 
-        let enqueue_result = spawn_blocking(move || {
+        spawn_blocking(move || {
             let enqueue_error = match key.as_deref() {
                 Some(key) => state
                     .producer
@@ -1787,11 +1788,9 @@ async fn send_batch(
                     // classification above are the terminal accounting. Do not
                     // feed the raw librdkafka error into the generic per-batch
                     // warning path or a second retry loop.
-                    Ok(())
                 }
                 None => {
                     state.metrics.record_admitted();
-                    Ok(())
                 }
             }
         })
@@ -1801,7 +1800,6 @@ async fn send_batch(
         // librdkafka has copied/assumed ownership (or rejected). Release the
         // Ferrum retained-byte lease on every path, including errors.
         drop(record.lease.take());
-        enqueue_result?;
     }
 
     Ok(())

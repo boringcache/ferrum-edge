@@ -157,7 +157,6 @@ type FailedBatchHook<T> = Arc<dyn Fn(Vec<T>, String) + Send + Sync>;
 type OverflowHook<T> = Arc<dyn Fn(T, &'static str) + Send + Sync>;
 type HighWaterHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
-#[derive(Clone)]
 pub struct LoggerHooks<T: Send + 'static> {
     pub on_failed_batch: Option<FailedBatchHook<T>>,
     pub on_overflow: Option<OverflowHook<T>>,
@@ -165,6 +164,17 @@ pub struct LoggerHooks<T: Send + 'static> {
     /// high-water mark. This hook is independent of `on_overflow`.
     pub on_high_water: Option<HighWaterHook>,
     pub high_watermark_percent: u8,
+}
+
+impl<T: Send + 'static> Clone for LoggerHooks<T> {
+    fn clone(&self) -> Self {
+        Self {
+            on_failed_batch: self.on_failed_batch.clone(),
+            on_overflow: self.on_overflow.clone(),
+            on_high_water: self.on_high_water.clone(),
+            high_watermark_percent: self.high_watermark_percent,
+        }
+    }
 }
 
 impl<T: Send + 'static> Default for LoggerHooks<T> {
