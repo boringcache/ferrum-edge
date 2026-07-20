@@ -709,7 +709,9 @@ async fn response_transformer_buffers_json_when_client_accepts_sse() {
         },
         HttpStep::RespondHeader {
             name: "Content-Type".into(),
-            value: "application/json".into(),
+            // The parameter deliberately contains `event-stream`: release must
+            // key on the exact media-type essence, not a permissive substring.
+            value: "application/json; profile=event-stream".into(),
         },
         HttpStep::RespondHeader {
             name: "Content-Length".into(),

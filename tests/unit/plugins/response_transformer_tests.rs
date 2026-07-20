@@ -787,6 +787,45 @@ async fn test_response_transformer_backend_event_stream_releases_buffering() {
 }
 
 #[tokio::test]
+async fn test_response_transformer_ambiguous_event_stream_types_stay_buffered() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "body", "key": "secret"}
+        ]
+    }))
+    .unwrap();
+    let ctx = make_ctx();
+
+    for content_type in [
+        "application/json; profile=event-stream",
+        "application/vnd.acme-event-stream",
+        "text/event-stream-like",
+        "application/event-stream+json",
+    ] {
+        let response_headers =
+            HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        assert!(
+            plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &response_headers,
+            ),
+            "ambiguous media type must stay buffered: {content_type}"
+        );
+        assert!(plugin.may_release_response_body_under_retries(&ctx));
+        assert!(
+            !plugin.should_release_response_body_under_retries(
+                &ctx,
+                200,
+                &response_headers,
+            ),
+            "ambiguous media type must not release under retries: {content_type}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_response_transformer_missing_response_type_stays_fail_closed() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [

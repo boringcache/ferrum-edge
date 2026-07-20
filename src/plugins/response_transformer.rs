@@ -623,6 +623,15 @@ fn media_type_admits_body_rules(
     })
 }
 
+fn backend_declares_text_event_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
+}
+
 #[async_trait]
 impl Plugin for ResponseTransformer {
     fn name(&self) -> &str {
@@ -726,9 +735,7 @@ impl Plugin for ResponseTransformer {
         self.should_buffer_response_body(ctx)
             && response_headers
                 .get("content-type")
-                .is_some_and(|content_type| {
-                    body_transform::is_event_stream_content_type(content_type)
-                })
+                .is_some_and(|content_type| backend_declares_text_event_stream(content_type))
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -746,7 +753,7 @@ impl Plugin for ResponseTransformer {
         // this downgrade when any later hook may rewrite Content-Type, so a
         // relabel cannot bypass the final client-visible policy decision.
         self.should_buffer_response_body(ctx)
-            && !content_type.is_some_and(body_transform::is_event_stream_content_type)
+            && !content_type.is_some_and(backend_declares_text_event_stream)
     }
 
     fn enforces_response_body_policy(
