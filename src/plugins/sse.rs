@@ -606,11 +606,8 @@ impl super::Plugin for SsePlugin {
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Fallback when no request context is available (legacy callers).
-        let mut ctx = RequestContext::new(
-            "0.0.0.0".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        );
+        let mut ctx =
+            RequestContext::new("0.0.0.0".to_string(), "GET".to_string(), "/".to_string());
         self.transform_response_body_with_context(&mut ctx, body, content_type, response_headers)
             .await
     }

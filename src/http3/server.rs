@@ -38,9 +38,8 @@ use crate::proxy::grpc_proxy::{
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
-    strip_client_response_hop_by_hop_headers,
     is_proxy_generated_forwarding_header, parse_connection_listed_from_str_map,
-    strip_response_hop_by_hop_trailers,
+    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,

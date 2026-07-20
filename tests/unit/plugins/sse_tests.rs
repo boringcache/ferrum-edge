@@ -162,7 +162,10 @@ fn test_explicit_null_members_rejected() {
     let err = SsePlugin::new(&json!({"require_get_method": null}))
         .err()
         .expect("null member must be rejected");
-    assert!(err.contains("'require_get_method' must be a boolean"), "{err}");
+    assert!(
+        err.contains("'require_get_method' must be a boolean"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -170,7 +173,10 @@ fn test_null_retry_ms_rejected() {
     let err = SsePlugin::new(&json!({"retry_ms": null}))
         .err()
         .expect("null retry_ms must be rejected");
-    assert!(err.contains("'retry_ms' must be an unsigned integer"), "{err}");
+    assert!(
+        err.contains("'retry_ms' must be an unsigned integer"),
+        "{err}"
+    );
 }
 
 // ── on_request_received: method validation ────────────────────────────────────
@@ -319,8 +325,7 @@ async fn test_oversized_last_event_id_rejected() {
     let plugin = make_plugin(json!({}));
     let mut ctx = make_sse_ctx();
     let oversized = "x".repeat(MAX_LAST_EVENT_ID_BYTES + 1);
-    ctx.headers
-        .insert("last-event-id".to_string(), oversized);
+    ctx.headers.insert("last-event-id".to_string(), oversized);
     let result = plugin.on_request_received(&mut ctx).await;
     assert_reject(&result, 400);
     assert!(!ctx.metadata.contains_key(LAST_EVENT_ID_METADATA_KEY));
@@ -371,10 +376,7 @@ async fn test_last_event_id_redacted_from_log_metadata() {
         #[serde(serialize_with = "serialize_redacted_metadata")]
         metadata: HashMap<String, String>,
     }
-    let encoded = serde_json::to_value(Wrapper {
-        metadata: residual,
-    })
-    .unwrap();
+    let encoded = serde_json::to_value(Wrapper { metadata: residual }).unwrap();
     assert_eq!(
         encoded["metadata"][LAST_EVENT_ID_METADATA_KEY],
         REDACTED_PLACEHOLDER
@@ -546,7 +548,10 @@ async fn test_cache_control_preserves_quoted_and_malformed() {
     plugin.after_proxy(&mut ctx, 200, &mut headers).await;
 
     let cc = headers.get("cache-control").unwrap();
-    assert!(cc.starts_with("private, community=\"no-cache,x\", weird=\""), "{cc}");
+    assert!(
+        cc.starts_with("private, community=\"no-cache,x\", weird=\""),
+        "{cc}"
+    );
     assert!(cc.ends_with("no-cache"), "{cc}");
     assert!(cc.contains("private"), "{cc}");
 }
