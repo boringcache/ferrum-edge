@@ -1756,21 +1756,12 @@ SHELL_SOURCE_PARAMETER_REFERENCE = re.compile(
 # not become a synthetic binding.
 SHELL_SOURCE_ASSIGNMENT = re.compile(
     COMMAND_START_CONTEXT
+    + SUBSHELL_OPENERS
     + r"(?:(?:export|readonly|local|declare|typeset)"
     r"(?:\s+--?[A-Za-z]+)*\s+)?"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
 )
-# After the first assignment word, further assignment words need no fresh
-# command-start marker. Consume one bounded shell word at a time so
-# `prefix=trusted source="$(./generator)"` records `source`, but stop before a
-# real command name: `prefix=trusted printf ... source=...` makes the latter an
-# argv word, not a binding. Quoted atoms may contain whitespace; unquoted atoms
-# stop on every outer command/pipeline separator.
-SHELL_SOURCE_ASSIGNMENT_VALUE_ATOM = (
-    r"(?:[^\s'\";&|]+|'[^']*'|\"(?:[^\"\\]|\\.)*\")"
-)
-SHELL_SOURCE_CHAINED_ASSIGNMENT = re.compile(
-    rf"(?:{SHELL_SOURCE_ASSIGNMENT_VALUE_ATOM})*\s+"
+SHELL_SOURCE_NEXT_ASSIGNMENT = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
 )
 SHELL_ASSIGNMENT_TOKEN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=.*", re.DOTALL)
@@ -3455,6 +3446,77 @@ def generated_shell_expansion_spans(line: str) -> tuple[tuple[int, int], ...]:
     return tuple(generated)
 
 
+def shell_assignment_value_end(line: str, start: int) -> int:
+    """Return the outer shell-word boundary for one assignment value.
+
+    The value may contain quoted whitespace and nested command, parameter,
+    arithmetic, or process substitutions. Only whitespace or shell punctuation
+    at the value's outer level ends the assignment word. An unbalanced construct
+    conservatively owns the remainder of the line instead of withdrawing a
+    possible generated-program producer.
+    """
+
+    quote: str | None = None
+    escaped = False
+    pending: list[tuple[str, str | None]] = []
+    index = start
+    while index < len(line):
+        character = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote != "'" and (
+            line.startswith("$(", index)
+            or line.startswith("${", index)
+            or character == "`"
+        ):
+            if character == "`":
+                if pending and pending[-1][0] == "`":
+                    _, quote = pending.pop()
+                else:
+                    pending.append(("`", quote))
+                    quote = None
+                index += 1
+                continue
+            pending.append(("}" if line.startswith("${", index) else ")", quote))
+            quote = None
+            index += 2
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+            index += 1
+            continue
+        if pending and character == pending[-1][0]:
+            _, quote = pending.pop()
+            index += 1
+            continue
+        if character == "(" or (
+            character in "<>" and line.startswith("(", index + 1)
+        ):
+            if not pending and character == "(":
+                return index
+            pending.append((")", quote))
+            index += 2 if character in "<>" else 1
+            continue
+        if pending:
+            index += 1
+            continue
+        if character.isspace() or character in ";&|<>)":
+            return index
+        index += 1
+    return len(line)
+
+
 def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
     """Return shell variables whose values later become opaque program source.
 
@@ -3478,7 +3540,8 @@ def shell_source_variable_names(lines: tuple[str, ...]) -> frozenset[str]:
             ):
                 evaluated.add(parameter.group("braced") or parameter.group("bare"))
         for name, value_start in shell_source_assignments(line):
-            assignments.append((name, line[value_start:]))
+            value_end = shell_assignment_value_end(line, value_start)
+            assignments.append((name, line[value_start:value_end]))
 
     changed = True
     while changed:
@@ -3502,12 +3565,16 @@ def shell_source_assignments(line: str) -> tuple[tuple[str, int], ...]:
         if shell_quote_at(line, bound.start("name")) is not None:
             continue
         bindings.append((bound.group("name"), bound.end()))
-        cursor = bound.end()
-        while chained := SHELL_SOURCE_CHAINED_ASSIGNMENT.match(line, cursor):
+        cursor = shell_assignment_value_end(line, bound.end())
+        while True:
+            cursor += len(line[cursor:]) - len(line[cursor:].lstrip())
+            chained = SHELL_SOURCE_NEXT_ASSIGNMENT.match(line, cursor)
+            if chained is None:
+                break
             if shell_quote_at(line, chained.start("name")) is not None:
                 break
             bindings.append((chained.group("name"), chained.end()))
-            cursor = chained.end()
+            cursor = shell_assignment_value_end(line, chained.end())
     return tuple(dict.fromkeys(bindings))
 
 
@@ -3520,7 +3587,7 @@ def generated_shell_assignment_spans(
     if not evaluated_variables:
         return ()
     assignments = tuple(
-        value_start
+        (value_start, shell_assignment_value_end(line, value_start))
         for name, value_start in shell_source_assignments(line)
         if name in evaluated_variables
     )
@@ -3534,7 +3601,10 @@ def generated_shell_assignment_spans(
     return tuple(
         (start, end)
         for start, end in sorted(candidates)
-        if any(value_start <= start for value_start in assignments)
+        if any(
+            value_start <= start < value_end
+            for value_start, value_end in assignments
+        )
     )
 
 
@@ -18601,9 +18671,20 @@ pre_build = []
             'if true; then generated="$(./scripts/build)"; fi; '
             'eval "$generated"',
         ),
+        "eval through a bare-subshell assignment": extensionless_workflow.replace(
+            "./scripts/build",
+            '( generated="$(./scripts/build)"; eval "$generated" )',
+        ),
         "eval through chained assignment words": extensionless_workflow.replace(
             "./scripts/build",
             'prefix=trusted generated="$(./scripts/build)"; eval "$generated"',
+        ),
+        "eval through spaced chained assignment words": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'prefix="$(printf \'%s\' trusted)" '
+                'generated="$(./scripts/build)"; eval "$generated"',
+            )
         ),
         "shell -c through assignment aliases": extensionless_workflow.replace(
             "./scripts/build",
@@ -18675,6 +18756,16 @@ pre_build = []
             "./scripts/build",
             "printf '%s\\n' evaluated=\"$(./scripts/build)\"; "
             "evaluated='echo safe'; eval \"$evaluated\"",
+        ),
+        "later-statement command substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            "evaluated='echo safe'; printf '%s\\n' \"$(./scripts/build)\"; "
+            "eval \"$evaluated\"",
+        ),
+        "later-statement assignment alias": extensionless_workflow.replace(
+            "./scripts/build",
+            "evaluated='echo safe'; printf '%s\\n' \"$unrelated\"; "
+            "unrelated=\"$(./scripts/build)\"; eval \"$evaluated\"",
         ),
     }
     for data_label, data_workflow in extensionless_data_substitution_workflows.items():
