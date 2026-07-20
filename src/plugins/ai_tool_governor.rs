@@ -4920,13 +4920,9 @@ fn serialize_json_bounded(value: &Value) -> Result<Vec<u8>, ()> {
 
     impl std::io::Write for BoundedWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let next_len = self
-                .output
-                .len()
-                .checked_add(bytes.len())
-                .ok_or_else(|| {
-                    std::io::Error::other("ai_tool_governor JSON output length overflow")
-                })?;
+            let next_len = self.output.len().checked_add(bytes.len()).ok_or_else(|| {
+                std::io::Error::other("ai_tool_governor JSON output length overflow")
+            })?;
             if next_len > MAX_PARSE_BYTES {
                 return Err(std::io::Error::other(
                     "ai_tool_governor JSON output exceeds inspectable limit",
