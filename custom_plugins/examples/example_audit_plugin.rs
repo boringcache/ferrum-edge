@@ -420,10 +420,15 @@ pub fn classify_http_audit_protocol(summary: &TransactionSummary) -> String {
     if let Some(protocol) = summary.metadata.get("request_protocol") {
         match protocol.as_str() {
             "grpc" => return "grpc".to_string(),
+            "grpc-web" => return "grpc-web".to_string(),
             "websocket" => return "websocket".to_string(),
             "hbone" => return "hbone".to_string(),
             "http" | "http1" | "http2" | "http3" | "https" => return "http".to_string(),
-            other => return other.clone(),
+            // Metadata is a shared plugin surface. Never copy an unknown value
+            // into MySQL's VARCHAR(32) protocol column: an oversized value from
+            // another plugin would roll back the entire audit batch. Fall
+            // through to the typed/status-derived classification below.
+            _ => {}
         }
     }
     if summary.grpc_status().is_some() {

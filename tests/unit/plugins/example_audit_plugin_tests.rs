@@ -600,6 +600,22 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
 
     plugin
         .log(&TransactionSummary {
+            timestamp_received: "2026-07-20T12:00:00.740Z".to_string(),
+            client_ip: "192.0.2.19".to_string(),
+            http_method: "GET".to_string(),
+            request_path: "/unknown-protocol-metadata".to_string(),
+            response_status_code: 200,
+            latency_total_ms: 1.0,
+            metadata: HashMap::from([(
+                "request_protocol".to_string(),
+                "attacker-shaped-unknown-protocol".repeat(64),
+            )]),
+            ..Default::default()
+        })
+        .await;
+
+    plugin
+        .log(&TransactionSummary {
             timestamp_received: "2026-07-20T12:00:00.750Z".to_string(),
             client_ip: "192.0.2.15".to_string(),
             http_method: "M".repeat(300),
@@ -650,6 +666,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     let mut saw_grpc_web = false;
     let mut saw_h1_websocket = false;
     let mut saw_h2_websocket = false;
+    let mut saw_unknown_protocol_fallback = false;
     let mut saw_bounded_method = false;
     let mut saw_stream_protocols = std::collections::HashSet::new();
     let mut expired_gone = false;
@@ -694,6 +711,9 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                 assert_eq!(status, Some(200));
                 saw_h2_websocket = true;
             }
+            if protocol == "http" && client_ip == "192.0.2.19" {
+                saw_unknown_protocol_fallback = true;
+            }
             if protocol == "http" && client_ip == "192.0.2.15" {
                 let method = method.as_deref().expect("bounded HTTP method");
                 assert_eq!(method.chars().count(), 256);
@@ -711,6 +731,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             && saw_grpc_web
             && saw_h1_websocket
             && saw_h2_websocket
+            && saw_unknown_protocol_fallback
             && saw_bounded_method
             && saw_stream_protocols.len() == 4
             && expired_gone
@@ -726,6 +747,10 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     assert!(
         saw_h2_websocket,
         "expected H2 Extended CONNECT WebSocket audit row"
+    );
+    assert!(
+        saw_unknown_protocol_fallback,
+        "unknown shared metadata must fall back to a bounded canonical protocol label"
     );
     assert!(
         saw_bounded_method,
