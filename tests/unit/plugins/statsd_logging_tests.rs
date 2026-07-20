@@ -706,7 +706,10 @@ async fn test_statsd_websocket_session_metrics_and_opt_in() {
 fn test_statsd_namespace_tag_collision_resistance_and_reserved_keys() {
     let a = format!("{}tenant-a", "n".repeat(64));
     let b = format!("{}tenant-b", "n".repeat(64));
-    assert_ne!(sanitize_namespace_tag_value(&a), sanitize_namespace_tag_value(&b));
+    assert_ne!(
+        sanitize_namespace_tag_value(&a),
+        sanitize_namespace_tag_value(&b)
+    );
     assert!(sanitize_namespace_tag_value(&a).contains("tenant-a"));
 
     assert!(validate_tag_key("env").is_ok());

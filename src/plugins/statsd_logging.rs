@@ -365,10 +365,7 @@ fn validate_statsd_schema_keys(schema: Option<&SummarySchema>) -> Result<(), Str
     Ok(())
 }
 
-fn build_global_tags(
-    config: &Value,
-    namespace: &str,
-) -> Result<String, String> {
+fn build_global_tags(config: &Value, namespace: &str) -> Result<String, String> {
     let mut pairs = Vec::new();
     let mut seen_keys = HashSet::new();
 
@@ -386,13 +383,10 @@ fn build_global_tags(
                     "statsd_logging: duplicate global_tags key '{validated}' after normalization"
                 ));
             }
-            let value = value.as_str().ok_or_else(|| {
-                format!("statsd_logging: 'global_tags.{key}' must be a string")
-            })?;
-            pairs.push(format!(
-                "{validated}:{}",
-                sanitize_tag_value(value)
-            ));
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("statsd_logging: 'global_tags.{key}' must be a string"))?;
+            pairs.push(format!("{validated}:{}", sanitize_tag_value(value)));
         }
     }
 
@@ -611,8 +605,7 @@ impl Plugin for StatsdLogging {
     }
 
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
-        self.logger
-            .try_send(MetricEntry::WebSocket(ctx.clone()));
+        self.logger.try_send(MetricEntry::WebSocket(ctx.clone()));
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -769,7 +762,13 @@ pub fn format_stream_metrics(
     let tags = builder.finish(global_tags);
 
     let _ = writeln!(buf, "{prefix}.stream.count:1|c{tags}");
-    write_timer(buf, prefix, "stream.duration_ms", summary.duration_ms, &tags);
+    write_timer(
+        buf,
+        prefix,
+        "stream.duration_ms",
+        summary.duration_ms,
+        &tags,
+    );
     let _ = writeln!(
         buf,
         "{prefix}.stream.bytes_sent:{}|g{tags}",
@@ -885,8 +884,7 @@ pub fn pack_udp_datagrams(payload: &str, max_payload: usize) -> (Vec<String>, us
             dropped = dropped.saturating_add(1);
             warn!(
                 line_len = line.len(),
-                max_payload,
-                "statsd_logging: dropping metric line exceeding UDP payload ceiling"
+                max_payload, "statsd_logging: dropping metric line exceeding UDP payload ceiling"
             );
             continue;
         }
@@ -1105,7 +1103,11 @@ mod tests {
         let out = sanitize_namespace_tag_value(&ns);
         assert!(out.contains("unique-suffix-tenant-b"), "got: {out}");
         assert_ne!(
-            sanitize_namespace_tag_value(&format!("{}{}", "a".repeat(64), "unique-suffix-tenant-a")),
+            sanitize_namespace_tag_value(&format!(
+                "{}{}",
+                "a".repeat(64),
+                "unique-suffix-tenant-a"
+            )),
             out
         );
     }
