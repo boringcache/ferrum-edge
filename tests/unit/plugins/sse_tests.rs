@@ -559,17 +559,34 @@ async fn test_cache_control_preserves_quoted_and_malformed() {
 #[tokio::test]
 async fn test_h3_final_strip_removes_plugin_reintroduced_connection() {
     // Defense in depth: even if a plugin reintroduces hop-by-hop fields after
-    // backend sanitation, the H3 final-field strip removes them.
+    // backend sanitation, the H3 final-field strip removes static and
+    // Connection-nominated fields regardless of plugin-supplied casing.
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/event-stream".to_string());
-    headers.insert("connection".to_string(), "keep-alive".to_string());
-    headers.insert("keep-alive".to_string(), "timeout=5".to_string());
+    headers.insert(
+        "ConNection".to_string(),
+        "X-Plugin-Hop, Keep-Alive".to_string(),
+    );
+    headers.insert("Keep-Alive".to_string(), "timeout=5".to_string());
+    headers.insert("X-Plugin-Hop".to_string(), "secret-routing-state".to_string());
+    headers.insert("Transfer-Encoding".to_string(), "chunked".to_string());
     headers.insert("x-accel-buffering".to_string(), "no".to_string());
 
     strip_client_response_hop_by_hop_headers(&mut headers);
 
-    assert!(!headers.contains_key("connection"));
-    assert!(!headers.contains_key("keep-alive"));
+    for stripped in [
+        "connection",
+        "keep-alive",
+        "x-plugin-hop",
+        "transfer-encoding",
+    ] {
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(stripped)),
+            "{stripped} survived final H3 sanitation: {headers:?}"
+        );
+    }
     assert_eq!(headers.get("x-accel-buffering").unwrap(), "no");
     assert_eq!(headers.get("content-type").unwrap(), "text/event-stream");
 }

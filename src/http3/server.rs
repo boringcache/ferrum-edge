@@ -7638,7 +7638,7 @@ async fn proxy_to_backend_h3_refined_response(
     let backend_admission_elapsed = backend_admission_start.elapsed();
     let response_status = h3_resp.status;
     let mut response_headers = h3_resp.headers;
-    response_headers.retain(|name, _| !is_backend_response_strip_header(name));
+    strip_client_response_hop_by_hop_headers(&mut response_headers);
 
     let response_is_retryable = retry_config.is_some_and(|retry_config| {
         crate::retry::should_retry(
@@ -8948,7 +8948,7 @@ async fn dispatch_grpc_native_h3(
     // streaming path applies the same predicate; the gRPC response path must too,
     // since `response_headers` here comes straight from the backend / after_proxy
     // hooks.
-    response_headers.retain(|name, _| !is_backend_response_strip_header(name));
+    strip_client_response_hop_by_hop_headers(&mut response_headers);
 
     // Send response headers. gRPC carries its own `content-type`
     // (`application/grpc`); never override it with the plain JSON default.
@@ -9843,7 +9843,7 @@ async fn proxy_to_backend_h3_streaming(
     // Strip hop-by-hop response headers per RFC 9110 §7.6.1 — see
     // `proxy::headers` for the canonical predicate. Response-direction
     // set differs from the request-direction set.
-    response_headers.retain(|name, _| !is_backend_response_strip_header(name));
+    strip_client_response_hop_by_hop_headers(&mut response_headers);
 
     // Capture original response invariants before `after_proxy` below can let a
     // response transformer strip `Content-Range` or `Cache-Control`; compression
@@ -10853,6 +10853,7 @@ async fn send_h3_grpc_error(
         grpc_message,
         initial_response_header_policy_plugins,
     );
+    strip_client_response_hop_by_hop_headers(&mut headers);
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC error response: {}", e))?;
@@ -11150,7 +11151,13 @@ async fn send_h3_reject_flavor_aware_with_header_state(
         };
     }
 
-    // gRPC flavor only — derive signalling now.
+    // gRPC flavor only — strip plugin-synthesized connection-specific fields at
+    // the final H3 boundary before they can affect signalling or reach the wire.
+    let mut sanitized_headers = headers.clone();
+    strip_client_response_hop_by_hop_headers(&mut sanitized_headers);
+    let headers = &sanitized_headers;
+
+    // Derive signalling from the sanitized response metadata.
     let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
 
     // Build a trailers-only gRPC error that preserves any custom headers

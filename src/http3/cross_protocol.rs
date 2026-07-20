@@ -122,7 +122,8 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    apply_response_headers, is_backend_response_strip_header, parse_connection_listed_headers,
+    apply_response_headers, has_client_response_hop_by_hop_headers,
+    is_backend_response_strip_header, parse_connection_listed_headers,
     strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
@@ -6476,10 +6477,7 @@ where
     // malformed on HTTP/3 (RFC 9114 §4.2). Clone only when stripping is needed
     // so the common clean map stays allocation-free on this path.
     let mut owned_headers;
-    let headers = if headers
-        .keys()
-        .any(|name| is_backend_response_strip_header(name))
-    {
+    let headers = if has_client_response_hop_by_hop_headers(headers) {
         owned_headers = headers.clone();
         strip_client_response_hop_by_hop_headers(&mut owned_headers);
         &owned_headers
@@ -6739,9 +6737,11 @@ async fn write_reject_with_headers<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    let mut headers = headers.clone();
+    strip_client_response_hop_by_hop_headers(&mut headers);
     let mut resp_builder = Response::builder().status(status);
     let mut has_content_type = false;
-    for (k, v) in headers {
+    for (k, v) in &headers {
         if k.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
         }
@@ -7035,8 +7035,10 @@ where
         reject.body.is_empty(),
         "normalized gRPC rejects should be trailers-only"
     );
+    let mut headers = reject.headers.clone();
+    strip_client_response_hop_by_hop_headers(&mut headers);
     let mut resp_builder = Response::builder().status(reject.http_status);
-    for (key, value) in &reject.headers {
+    for (key, value) in &headers {
         let sanitized_grpc_message;
         let header_value = if key.eq_ignore_ascii_case("grpc-message") {
             sanitized_grpc_message = sanitize_h3_grpc_message_for_header(value);
@@ -7332,6 +7334,7 @@ where
         &grpc_message,
         initial_response_header_policy_plugins,
     );
+    strip_client_response_hop_by_hop_headers(&mut headers);
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;
