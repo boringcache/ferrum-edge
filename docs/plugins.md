@@ -669,10 +669,10 @@ Kafka uses its own binary protocol over TCP/TLS (not HTTP), so TLS is handled by
 
 - **`FERRUM_TLS_CA_BUNDLE_PATH`** is applied as `ssl.ca.location` when `ssl_ca_location` is not set in the plugin config
 - **`FERRUM_TLS_NO_VERIFY`** is applied as `enable.ssl.certificate.verification=false` when `ssl_no_verify` is not set in the plugin config
-- **`FERRUM_TLS_CRL_FILE_PATH`** is applied as `ssl.crl.location` whenever certificate verification is enabled. The gateway CRL path is resolved only when verification is effective, so `ssl_no_verify: true` does not fail merely because loaded CRLs lack a filesystem identity. A conflicting `producer_config.ssl.crl.location` is rejected fail-closed; reload keeps last-known-good configuration
+- **`FERRUM_TLS_CRL_FILE_PATH`**, or a file-backed **`FERRUM_TLS_CRL_SOURCE`**, is applied as `ssl.crl.location` whenever certificate verification is enabled. Plain paths and `file://` URIs normalize to the filesystem path expected by librdkafka. Inline and provider-backed CRL sources cannot be passed to librdkafka; a verified Kafka TLS configuration therefore fails admission closed when such a source is active, while `ssl_no_verify: true` does not require a filesystem identity. A conflicting `producer_config.ssl.crl.location` is rejected fail-closed; reload keeps last-known-good configuration
 - Plugin-level fields always override the gateway defaults except for the CRL baseline conflict rule above. `producer_config` cannot silently override top-level TLS/SASL security controls after they were validated, including through librdkafka aliases or alternate PEM/keystore inputs
 
-This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CRL_FILE_PATH` for internal CAs do not need to duplicate those paths in the kafka_logging plugin config.
+This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` and a file-backed gateway CRL for internal CAs do not need to duplicate those paths in the kafka_logging plugin config.
 
 ```yaml
 plugin_name: kafka_logging

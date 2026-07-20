@@ -349,6 +349,13 @@ impl KafkaDeliveryMetrics {
         self.warn_saturation(reason, "ferrum_channel");
     }
 
+    fn record_producer_task_join_failure(&self) {
+        self.ferrum_dropped.fetch_add(1, Ordering::Relaxed);
+        self.healthy.store(false, Ordering::Relaxed);
+        self.store_failure("queue", "producer_task_join_failed");
+        self.warn_saturation("producer task join failed", "producer_task_join_failed");
+    }
+
     fn record_entry_oversize(&self) {
         self.entry_oversize.fetch_add(1, Ordering::Relaxed);
         self.ferrum_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1396,17 +1403,13 @@ fn resolve_gateway_crl_path(http_client: &PluginHttpClient) -> Result<Option<Str
     if let Some(path) = http_client.tls_crl_file_path() {
         return Ok(Some(path.to_string()));
     }
-    let from_env = std::env::var("FERRUM_TLS_CRL_FILE_PATH")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if !http_client.tls_crls().is_empty() && from_env.is_none() {
+    if http_client.tls_crl_source_configured() || !http_client.tls_crls().is_empty() {
         return Err(
-            "kafka_logging: gateway CRL is loaded but no filesystem path is available for librdkafka ssl.crl.location"
+            "kafka_logging: verified broker TLS requires a file-backed gateway CRL source because librdkafka ssl.crl.location cannot consume inline or provider-backed CRL material"
                 .to_string(),
         );
     }
-    Ok(from_env)
+    Ok(None)
 }
 
 /// Deterministic admission-order probe for external unit tests: a gated
@@ -1761,9 +1764,10 @@ async fn send_batch(
         let payload = Arc::clone(&record.payload);
         let key = record.key.clone();
         let state = Arc::clone(state);
+        let metrics = Arc::clone(&state.metrics);
         let topic = topic.to_string();
 
-        spawn_blocking(move || {
+        let join_result = spawn_blocking(move || {
             let enqueue_error = match key.as_deref() {
                 Some(key) => state
                     .producer
@@ -1794,12 +1798,17 @@ async fn send_batch(
                 }
             }
         })
-        .await
-        .map_err(|error| format!("kafka_logging: producer task join failed: {error}"))?;
+        .await;
 
         // librdkafka has copied/assumed ownership (or rejected). Release the
         // Ferrum retained-byte lease on every path, including errors.
         drop(record.lease.take());
+        if let Err(error) = join_result {
+            metrics.record_producer_task_join_failure();
+            return Err(format!(
+                "kafka_logging: producer task join failed: {error}"
+            ));
+        }
     }
 
     Ok(())

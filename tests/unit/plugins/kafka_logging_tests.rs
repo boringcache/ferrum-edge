@@ -554,7 +554,7 @@ async fn test_kafka_logging_rejects_oversized_producer_queue_budget() {
 #[tokio::test]
 async fn test_kafka_logging_rejects_conflicting_crl_override() {
     let client =
-        default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
+        default_http_client().with_tls_crl_source(Some("/etc/ferrum/gateway.crl".to_string()));
     // Assert the pure admission boundary (same path construction uses) so
     // CRL conflict coverage does not depend on librdkafka/OpenSSL.
     let result = kafka_logging_validate_producer_admission_for_test(
@@ -580,7 +580,7 @@ async fn test_kafka_logging_rejects_conflicting_crl_override() {
 #[tokio::test]
 async fn test_kafka_logging_allows_matching_crl_override() {
     let client =
-        default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
+        default_http_client().with_tls_crl_source(Some("/etc/ferrum/gateway.crl".to_string()));
     // Matching CRL overrides are admitted without constructing a producer
     // (CI librdkafka builds may lack OpenSSL).
     kafka_logging_validate_producer_admission_for_test(
@@ -598,9 +598,51 @@ async fn test_kafka_logging_allows_matching_crl_override() {
 }
 
 #[tokio::test]
+async fn test_kafka_logging_normalizes_file_uri_gateway_crl_source() {
+    let client = default_http_client()
+        .with_tls_crl_source(Some("file:///etc/ferrum/gateway.crl".to_string()));
+    assert_eq!(
+        client.tls_crl_file_path(),
+        Some("/etc/ferrum/gateway.crl")
+    );
+    kafka_logging_validate_producer_admission_for_test(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "ssl",
+            "producer_config": {
+                "ssl.crl.location": "/etc/ferrum/gateway.crl"
+            }
+        }),
+        &client,
+    )
+    .expect("file URI CRL source must normalize to librdkafka's filesystem path");
+}
+
+#[tokio::test]
+async fn test_kafka_logging_rejects_non_file_gateway_crl_source_for_verified_tls() {
+    let source_reference = "vault://secret/data/kafka-crl";
+    let client = default_http_client().with_tls_crl_source(Some(source_reference.to_string()));
+    let error = kafka_logging_validate_producer_admission_for_test(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "ssl"
+        }),
+        &client,
+    )
+    .expect_err("non-file CRL sources cannot be silently omitted for verified Kafka TLS");
+    assert!(error.contains("file-backed gateway CRL source"));
+    assert!(
+        !error.contains(source_reference),
+        "CRL provider identity must not be echoed"
+    );
+}
+
+#[tokio::test]
 async fn test_kafka_logging_no_verify_skips_crl_conflict() {
     let client =
-        default_http_client().with_tls_crl_file_path(Some("/etc/ferrum/gateway.crl".to_string()));
+        default_http_client().with_tls_crl_source(Some("/etc/ferrum/gateway.crl".to_string()));
     // ssl_no_verify disables verification, so a divergent CRL path is not a
     // conflict; assert via pure admission (no producer / OpenSSL required).
     kafka_logging_validate_producer_admission_for_test(
@@ -941,6 +983,8 @@ async fn test_kafka_logging_rejects_producer_config_security_aliases_case_insens
 #[tokio::test]
 async fn test_kafka_logging_ssl_no_verify_skips_gateway_crl_path_requirement() {
     // Verification disabled: gateway CRL filesystem identity is not required.
+    let client = default_http_client()
+        .with_tls_crl_source(Some("vault://secret/data/kafka-crl".to_string()));
     kafka_logging_validate_producer_admission_for_test(
         &json!({
             "broker_list": "localhost:9092",
@@ -948,7 +992,7 @@ async fn test_kafka_logging_ssl_no_verify_skips_gateway_crl_path_requirement() {
             "security_protocol": "ssl",
             "ssl_no_verify": true
         }),
-        &default_http_client(),
+        &client,
     )
     .expect("ssl_no_verify must skip gateway CRL path resolution");
 }

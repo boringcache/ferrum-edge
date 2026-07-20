@@ -5444,7 +5444,7 @@ impl ProxyState {
             env_config_arc.pool_shard_amount,
         )
         .with_real_ip_header(env_config_arc.real_ip_header.clone())
-        .with_tls_crl_file_path(env_config_arc.tls_crl_file_path.clone());
+        .with_tls_crl_source(env_config_arc.tls_crl_file_path.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
         // route `__mesh_bpf_metrics` to use it via `with_state`.
