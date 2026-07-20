@@ -1339,6 +1339,62 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn compression_unknown_key_reload_keeps_last_known_good_generation() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("compression-policy", true);
+    plugin.plugin_name = "compression".to_string();
+    plugin.config = serde_json::json!({
+        "min_content_length": 512,
+        "gzip_level": 4,
+        "remove_accept_encoding": true
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "compression")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "min_content_lenght": 4096,
+        "gzip_leveel": 1
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+        panic!("unknown compression keys must reject database/CP-DP reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("config.gzip_leveel") && error.contains("config.min_content_lenght")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["min_content_length"],
+        512
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "compression"),
+        "rejected reload must retain the last-known-good compression generation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation() {
     let state = empty_proxy_state();
     let mut internal = test_plugin_config("internal-request-id-policy", true);
@@ -1517,6 +1573,64 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
             }
         ),
         "rejected candidate must not replace the last-known-good allow policy"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_typo_reload_keeps_last_known_good_expose_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("grpc-web-policy", true);
+    plugin.plugin_name = "grpc_web".to_string();
+    plugin.config = serde_json::json!({
+        "expose_headers": ["x-request-id", "custom-header-bin"]
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "grpc_web"),
+        "baseline cache must include grpc_web"
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "expose_header": ["x-must-not-publish"]
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+        panic!("misspelled grpc_web expose_headers must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("grpc_web")
+            && error.contains("config.expose_header")
+            && error.contains("did you mean 'expose_headers'")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config,
+        serde_json::json!({
+            "expose_headers": ["x-request-id", "custom-header-bin"]
+        })
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "grpc_web"),
+        "rejected reload must retain the last-known-good grpc_web generation"
     );
 }
 

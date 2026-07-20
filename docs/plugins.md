@@ -2922,6 +2922,8 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 **Priority:** 4050
 
+**Strict config validation:** Configuration must be a top-level object (or `null`/omitted for defaults). The only accepted keys are `algorithms`, `brotli_quality`, `content_types`, `decompress_request`, `gzip_level`, `max_decompressed_request_size`, `min_content_length`, and `remove_accept_encoding`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions (for example `min_content_lenght` → `min_content_length`) instead of silently falling back to defaults. The removed `disable_on_etag` key still fails with an explicit migration message. Shared `validate_plugin_config` admission covers file, Admin, database, and CP-DP surfaces; invalid enabled configs reject the new generation while `KeepLastKnownGood` retains the last published compression instance.
+
 **Response compression** (enabled by default):
 
 | Parameter | Type | Default | Description |
@@ -2930,7 +2932,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
 | `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
-| `gzip_level` | u64 | `6` | Gzip compression level (1=fastest, 9=best) |
+| `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, 1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
 
 **Request decompression** (opt-in):
@@ -3385,6 +3387,8 @@ On the request path, the plugin rewrites `content-type` to `application/grpc` so
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `expose_headers` | String[] | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. |
+
+Config must be a JSON/YAML object whose only accepted key is `expose_headers`. Empty `{}` is valid and uses defaults. Explicit top-level `null`, arrays, strings, numbers, and booleans are rejected with `grpc_web: config must be an object` — `null` is not an alias for `{}`. Unknown or misspelled keys (for example `expose_header`) are rejected with path-qualified diagnostics and spelling suggestions. The shared constructor enforces this for admin API, file mode, database/CP validation, and DP snapshot application; a rejected reload keeps the last-known-good plugin generation (`KeepLastKnownGood`).
 
 ```yaml
 plugin_name: grpc_web
@@ -4123,6 +4127,8 @@ config:
 ### `ai_semantic_cache`
 
 Caches LLM responses keyed by normalized prompts to reduce redundant API calls and latency. The default path uses exact-match normalization: prompts are lowercased, whitespace is collapsed, and the result is SHA-256 hashed to produce the cache key. Optional semantic similarity can be enabled to compute prompt embeddings through a configured embedding provider and search a local HNSW vector index (`instant-distance`) before forwarding exact misses to the backend. Exact response storage supports local in-memory (DashMap) and centralized Redis backends.
+
+**Admission.** Every root configuration key is closed: unknown retention, multimodal, consumer-scope, size, semantic-policy, and Redis sync properties are rejected with deterministic path-qualified diagnostics and spelling suggestions. There are no intentionally open maps. Registration policy is `KeepLastKnownGood` — invalid reloads keep the previously admitted generation rather than silently falling back to defaults that would retain or share cache content contrary to operator intent. On successful admission the gateway logs the effective retention and storage posture (TTL, size caps, consumer scoping, multimodal mode, semantic enabled/disabled, and `local`/`redis` sync mode) at debug level without logging cached bodies, Redis passwords, or embedding API keys.
 
 **Priority:** 2980
 

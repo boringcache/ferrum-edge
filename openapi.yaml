@@ -15264,7 +15264,8 @@ components:
 
     CompressionConfig:
       type: object
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression."
+      additionalProperties: false
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression. Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance."
       properties:
         algorithms:
           type: array
@@ -15289,10 +15290,10 @@ components:
           description: "Strip Accept-Encoding from backend request so backend sends uncompressed"
         gzip_level:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 9
           default: 6
-          description: "Gzip compression level (1=fastest, 9=best)"
+          description: "Gzip compression level (0=no compression, 1=fastest, 9=best)"
         brotli_quality:
           type: integer
           minimum: 0
@@ -17005,10 +17006,13 @@ components:
 
     GrpcWebConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_web — Translates between gRPC-Web (browser-compatible)
         and native gRPC (HTTP/2) wire formats. Supports binary
         (application/grpc-web) and text (application/grpc-web-text) encoding.
+        Config must be a JSON object (not null); `{}` and objects that only set
+        `expose_headers` are accepted. Unknown keys are rejected.
       properties:
         expose_headers:
           type: array
@@ -17562,7 +17566,15 @@ components:
 
     AiSemanticCacheConfig:
       type: object
-      description: "Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized prompts. Exact-match normalization is enabled by default; optional semantic similarity uses a configured embedding provider and a local HNSW vector index. Supports local DashMap and Redis exact-response storage."
+      additionalProperties: false
+      description: >-
+        Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized
+        prompts. Exact-match normalization is enabled by default; optional
+        semantic similarity uses a configured embedding provider and a local
+        HNSW vector index. Supports local DashMap and Redis exact-response
+        storage. Unknown root, semantic-policy, and Redis sync keys are
+        rejected at admission with path-qualified diagnostics (registration
+        policy KeepLastKnownGood). There are no intentionally open maps.
       properties:
         ttl_seconds:
           type: integer
