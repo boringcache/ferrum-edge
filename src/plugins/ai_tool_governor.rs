@@ -901,7 +901,10 @@ impl GovernorEngine {
             .unwrap_or_else(|| self.approval_now());
 
         for ((call, (outcome, matched, risk)), amplification) in
-            calls.iter().zip(evaluations).zip(redaction_amplification)
+            calls
+                .iter()
+                .zip(evaluations)
+                .zip(redaction_amplification.iter().copied())
         {
             let arguments_hash = self
                 .observability
