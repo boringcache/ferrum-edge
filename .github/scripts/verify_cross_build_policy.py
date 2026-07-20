@@ -11027,7 +11027,12 @@ def reachable_automation_references(
         # directly, so the bare reading is keyed rather than compared.
         return tuple(sorted(kinds, key=lambda kind: (kind is not None, kind or "")))
 
-    def follow_dispatchers(groups: set[str], origin: str) -> None:
+    def follow_dispatchers(
+        groups: set[str],
+        origin: str,
+        *,
+        generated_shell_output: bool = False,
+    ) -> None:
         """Resolve each dispatch to whichever of its candidate files exists.
 
         Build dispatchers name a manifest and `python -m` names a module, but
@@ -11039,6 +11044,11 @@ def reachable_automation_references(
             candidates = group.split("|")
             present = [name for name in candidates if name in automation]
             if present:
+                if generated_shell_output:
+                    for name in present:
+                        interpreters.setdefault(name, set()).add(
+                            GENERATED_SHELL_OUTPUT_PROVENANCE
+                        )
                 pending.extend(present)
                 continue
             errors.append(
@@ -11111,13 +11121,28 @@ def reachable_automation_references(
                 interpreter_hint=hint,
             )
             errors.extend(failures)
+            generated_shell_output = (
+                GENERATED_SHELL_OUTPUT_PROVENANCE
+                in interpreters.get(name, set())
+            )
+            if generated_shell_output:
+                # A marked program's stdout is shell source. Any repository
+                # program it dispatches can contribute bytes through inherited
+                # stdout, so carry the same provenance through the reachable
+                # graph instead of protecting only the first producer.
+                for kinds in discovered.values():
+                    kinds.add(GENERATED_SHELL_OUTPUT_PROVENANCE)
             record(discovered)
             # Not `references - reachable`: an already-reached path must be
             # re-queued so the loop above can notice that this edge gave it a
             # new interpreter. The outstanding-hint set, not the filter, is what
             # stops the walk.
             pending.extend(sorted(references))
-            follow_dispatchers(dispatchers, f"{label}/{name}")
+            follow_dispatchers(
+                dispatchers,
+                f"{label}/{name}",
+                generated_shell_output=generated_shell_output,
+            )
     return reachable, interpreters, list(dict.fromkeys(errors))
 
 
@@ -18379,6 +18404,32 @@ pre_build = []
                 f"a Python output generator behind {generated_label} changed "
                 "without moving its protected surface"
             )
+    transitive_generator = (
+        "#!/usr/bin/env -S python3 -I\n"
+        "import subprocess\n"
+        "subprocess.run(['scripts/emitter'], check=True)\n"
+    )
+    transitive_generated_baseline = {
+        "scripts/build": transitive_generator,
+        "scripts/emitter": "#!/usr/bin/env -S python3 -I\nprint('echo safe')\n",
+    }
+    transitive_generated_proposed = {
+        "scripts/build": transitive_generator,
+        "scripts/emitter": extensionless_python_template["scripts/build"],
+    }
+    if not compare_pr_automation_collection(
+        {"ci.yml": extensionless_eval_workflow},
+        {"ci.yml": extensionless_eval_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        transitive_generated_baseline,
+        transitive_generated_proposed,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "a transitive Python output generator changed without moving its "
+            "protected surface"
+        )
     extensionless_data_substitution_workflows = {
         "command substitution": extensionless_workflow.replace(
             "./scripts/build",
