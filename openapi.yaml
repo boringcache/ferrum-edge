@@ -11255,6 +11255,14 @@ components:
       required:
         - host
         - port
+      allOf:
+        - if:
+            required: [tls_server_name]
+          then:
+            required: [tls]
+            properties:
+              tls:
+                const: true
       properties:
         host:
           type: string
@@ -11272,12 +11280,13 @@ components:
         tls_server_name:
           type: string
           minLength: 1
-          pattern: '^\S+$'
+          pattern: '^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$'
           description: >-
             DNS or IP identity for TLS SNI/certificate verification (defaults to
-            `host`). Allowed only when `tls` is true. Must be a rustls-acceptable
-            server name without URL scheme, path, query, fragment, or whitespace;
-            invalid values fail plugin admission.
+            `host`). Allowed only when `tls` is true. The schema rejects URL
+            schemes, paths, queries, fragments, credentials, whitespace, and
+            host:port values; full rustls DNS/IP identity validation is enforced
+            during plugin admission.
         batch_size:
           type: integer
           default: 50

@@ -3410,7 +3410,10 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     assert_eq!(schema["properties"]["write_timeout_ms"]["minimum"], 100);
     assert_eq!(schema["properties"]["write_timeout_ms"]["maximum"], 60000);
     assert_eq!(schema["properties"]["write_timeout_ms"]["default"], 5000);
-    assert_eq!(schema["properties"]["tls_server_name"]["pattern"], r"^\S+$");
+    assert_eq!(
+        schema["properties"]["tls_server_name"]["pattern"],
+        r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$",
+    );
     let connect_desc = schema["properties"]["connect_timeout_ms"]["description"]
         .as_str()
         .expect("connect_timeout_ms description");
@@ -3462,6 +3465,15 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     assert_component_validity(&spec, "TcpLoggingConfig", &valid, true);
     assert!(TcpLogging::new(&valid, PluginHttpClient::default()).is_ok());
 
+    let valid_ipv6_identity = json!({
+        "host": "logs.example.com",
+        "port": 6514,
+        "tls": true,
+        "tls_server_name": "2001:db8::1"
+    });
+    assert_component_validity(&spec, "TcpLoggingConfig", &valid_ipv6_identity, true);
+    assert!(TcpLogging::new(&valid_ipv6_identity, PluginHttpClient::default()).is_ok());
+
     let valid_minima = json!({"host": "127.0.0.1", "port": 5140});
     assert_component_validity(&spec, "TcpLoggingConfig", &valid_minima, true);
     assert!(TcpLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
@@ -3479,6 +3491,17 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
         json!({"host": "logs.example.com", "port": 6514, "connect_timeout_ms": 50}),
         json!({"host": "logs.example.com", "port": 6514, "write_timeout_ms": 60001}),
         json!({"host": "logs.example.com", "port": 6514, "connect_timeout_ms": 60001}),
+        json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "tls_server_name": "logs.example.com"
+        }),
+        json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "tls": false,
+            "tls_server_name": "logs.example.com"
+        }),
         json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": " logs.example.com"}),
         json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": "logs.example.com "}),
     ];
@@ -3487,6 +3510,27 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
         assert!(
             TcpLogging::new(&config, PluginHttpClient::default()).is_err(),
             "runtime accepted OpenAPI-invalid tcp_logging config: {config}"
+        );
+    }
+
+    for tls_server_name in [
+        "https://logs.example.com",
+        "logs.example.com/path",
+        "logs.example.com?token=secret",
+        "logs.example.com#fragment",
+        "user@logs.example.com",
+        "logs.example.com:6514",
+    ] {
+        let config = json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "tls": true,
+            "tls_server_name": tls_server_name
+        });
+        assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
+        assert!(
+            TcpLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid TLS server name: {tls_server_name}"
         );
     }
 
