@@ -309,7 +309,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `correlation_id` | ✓ | | Assigns a UUID request ID to metadata |
 | `otel_tracing` | ✓ | ✓ | Generates trace/span IDs; emits structured trace log |
 | `stdout_logging` | | ✓ | JSON access log for stream connections |
-| `statsd_logging` | | ✓ | Sends stream connection metrics to StatsD over UDP |
+| `statsd_logging` | | ✓ | Sends stream connection and WebSocket session metrics to StatsD over UDP |
 | `http_logging` | | ✓ | Sends stream connection logs to webhook endpoint |
 | `tcp_logging` | | ✓ | Sends stream connection logs to TCP/TLS endpoint |
 | `kafka_logging` | | ✓ | Sends stream connection logs to Kafka topic |
@@ -559,7 +559,7 @@ Given all built-in plugins enabled, the execution order is:
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect |
 | 67 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 68 | `statsd_logging` | 9075 | log, on_stream_disconnect |
+| 68 | `statsd_logging` | 9075 | log, on_stream_disconnect, on_ws_disconnect |
 | 69 | `http_logging` | 9100 | log, on_stream_disconnect |
 | 70 | `tcp_logging` | 9125 | log, on_stream_disconnect |
 | 71 | `kafka_logging` | 9150 | log, on_stream_disconnect |
