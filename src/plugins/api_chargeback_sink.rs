@@ -26,6 +26,7 @@ use url::Url;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig};
+use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
 use super::utils::{BatchConfig, BatchingLogger, LoggerHooks, PluginHttpClient, RetryPolicy};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -370,7 +371,13 @@ pub struct ChargeEvent {
     pub proxy_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_id: Option<String>,
+    /// Billable status: wire HTTP for ordinary requests, canonical effective
+    /// HTTP status for native gRPC and translated gRPC-Web.
     pub status_code: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_status: Option<u32>,
     pub protocol: String,
     pub call_count: u32,
     pub charge_call: f64,
@@ -834,8 +841,9 @@ impl Plugin for ApiChargebackSink {
             Some(c) if !c.is_empty() => c,
             _ => return,
         };
+        let outcome = http_billing_outcome(summary);
         let Some(charge) = self.pricing.compute_http(
-            summary.response_status_code,
+            outcome.status_code,
             summary.bytes_sent,
             summary.bytes_received,
         ) else {
@@ -843,13 +851,14 @@ impl Plugin for ApiChargebackSink {
         };
         if self.config.mode == SinkMode::Snapshot {
             if let Some(accumulator) = self.snapshot_accumulator.as_ref() {
-                accumulator.record_http(summary, consumer, charge);
+                accumulator.record_http(summary, consumer, outcome, charge);
             }
             return;
         }
         self.enqueue(event_from_http_summary(
             summary,
             consumer,
+            outcome,
             charge,
             &self.config,
             &self.node_id,
@@ -1981,6 +1990,8 @@ struct SnapshotMetadata {
     proxy_name: String,
     route_id: Option<String>,
     status_code: u16,
+    http_status_code: Option<u16>,
+    grpc_status: Option<u32>,
     protocol: String,
 }
 
@@ -2097,7 +2108,13 @@ impl SnapshotAccumulator {
         }
     }
 
-    fn record_http(&self, summary: &TransactionSummary, consumer: &str, charge: ChargeComputation) {
+    fn record_http(
+        &self,
+        summary: &TransactionSummary,
+        consumer: &str,
+        outcome: HttpBillingOutcome,
+        charge: ChargeComputation,
+    ) {
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
         let meta = SnapshotMetadata {
@@ -2107,7 +2124,9 @@ impl SnapshotAccumulator {
             proxy_id: bound_string(proxy_id, MAX_FIELD_LEN),
             proxy_name: bound_string(proxy_name, MAX_FIELD_LEN),
             route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: summary.response_status_code,
+            status_code: outcome.status_code,
+            http_status_code: Some(outcome.http_status_code),
+            grpc_status: outcome.grpc_status,
             protocol: infer_http_protocol(summary),
         };
         self.record(meta, charge);
@@ -2130,6 +2149,8 @@ impl SnapshotAccumulator {
             ),
             route_id: metadata_value(&summary.metadata, &["route_id"]),
             status_code: STREAM_STATUS_SENTINEL,
+            http_status_code: None,
+            grpc_status: None,
             protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
         };
         self.record(meta, charge);
@@ -2152,6 +2173,8 @@ impl SnapshotAccumulator {
             ),
             route_id: metadata_value(&summary.metadata, &["route_id"]),
             status_code: STREAM_STATUS_SENTINEL,
+            http_status_code: None,
+            grpc_status: None,
             protocol: "ws".to_string(),
         };
         self.record(meta, charge);
@@ -2163,6 +2186,9 @@ impl SnapshotAccumulator {
             &meta.consumer_id,
             &meta.proxy_id,
             meta.status_code,
+            meta.http_status_code,
+            meta.grpc_status,
+            &meta.protocol,
         );
         let now = unix_timestamp_seconds();
         let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
@@ -2255,10 +2281,23 @@ impl SnapshotAccumulator {
                 proxy_name: proxy_name.to_string(),
                 route_id: None,
                 status_code,
+                http_status_code: (protocol == "http").then_some(status_code),
+                grpc_status: None,
                 protocol: protocol.to_string(),
             },
             charge,
         );
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn record_http_for_test(
+        &self,
+        summary: &TransactionSummary,
+        consumer: &str,
+        charge: ChargeComputation,
+    ) {
+        self.record_http(summary, consumer, http_billing_outcome(summary), charge);
     }
 }
 
@@ -2319,6 +2358,7 @@ fn start_snapshot_task(
 fn event_from_http_summary(
     summary: &TransactionSummary,
     consumer: &str,
+    outcome: HttpBillingOutcome,
     charge: ChargeComputation,
     config: &ApiChargebackSinkConfig,
     node_id: &str,
@@ -2341,7 +2381,9 @@ fn event_from_http_summary(
             MAX_FIELD_LEN,
         ),
         route_id: metadata_value(metadata, &["route_id"]),
-        status_code: summary.response_status_code,
+        status_code: outcome.status_code,
+        http_status_code: Some(outcome.http_status_code),
+        grpc_status: outcome.grpc_status,
         protocol: infer_http_protocol(summary),
         call_count: charge.call_count,
         charge_call: charge.charge_call,
@@ -2396,6 +2438,8 @@ fn event_from_stream_summary(
         ),
         route_id: metadata_value(metadata, &["route_id"]),
         status_code: STREAM_STATUS_SENTINEL,
+        http_status_code: None,
+        grpc_status: None,
         protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
         call_count: charge.call_count,
         charge_call: charge.charge_call,
@@ -2450,6 +2494,8 @@ fn event_from_ws_summary(
         ),
         route_id: metadata_value(metadata, &["route_id"]),
         status_code: STREAM_STATUS_SENTINEL,
+        http_status_code: None,
+        grpc_status: None,
         protocol: "ws".to_string(),
         call_count: charge.call_count,
         charge_call: charge.charge_call,
@@ -2500,6 +2546,8 @@ fn event_from_snapshot(
         proxy_name: meta.proxy_name.clone(),
         route_id: meta.route_id.clone(),
         status_code: meta.status_code,
+        http_status_code: meta.http_status_code,
+        grpc_status: meta.grpc_status,
         protocol: meta.protocol.clone(),
         call_count: saturating_u64_to_u32(totals.call_count),
         charge_call: totals.charge_call,
@@ -2549,8 +2597,24 @@ fn bound_string(value: &str, max_len: usize) -> String {
     value[..end].to_string()
 }
 
-fn snapshot_key(namespace: &str, consumer: &str, proxy_id: &str, status_code: u16) -> String {
-    format!("{namespace}|{consumer}|{proxy_id}|{status_code}")
+fn snapshot_key(
+    namespace: &str,
+    consumer: &str,
+    proxy_id: &str,
+    status_code: u16,
+    http_status_code: Option<u16>,
+    grpc_status: Option<u32>,
+    protocol: &str,
+) -> String {
+    format!(
+        "{namespace}|{consumer}|{proxy_id}|{status_code}|{}|{}|{protocol}",
+        http_status_code
+            .map(|status| status.to_string())
+            .unwrap_or_default(),
+        grpc_status
+            .map(|status| status.to_string())
+            .unwrap_or_default()
+    )
 }
 
 fn non_negative_delta(current: f64, last: f64) -> f64 {

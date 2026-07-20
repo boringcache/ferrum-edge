@@ -2,8 +2,9 @@
 //!
 //! Tracks per-consumer API usage charges across three pricing dimensions:
 //!
-//! 1. **Per-call pricing** keyed by HTTP status code (`pricing_tiers`) — used
-//!    for HTTP-family transactions (HTTP/1.1, H2, H3, gRPC, WebSocket upgrades).
+//! 1. **Per-call pricing** keyed by billable status code (`pricing_tiers`) —
+//!    ordinary HTTP uses its wire status, while native gRPC and translated
+//!    gRPC-Web use the final terminal status mapped to an effective HTTP status.
 //! 2. **Bandwidth pricing** keyed by direction (`bandwidth_pricing`) — applied
 //!    to both HTTP-family transactions and stream transactions (TCP, TCP+TLS,
 //!    UDP, DTLS) using the gateway-perspective `bytes_sent` / `bytes_received`
@@ -727,7 +728,7 @@ impl ChargebackRegistry {
         }
 
         output.push_str(
-            "# HELP ferrum_api_chargeable_calls_total Total chargeable HTTP-family API calls per consumer.\n",
+            "# HELP ferrum_api_chargeable_calls_total Total chargeable HTTP-family API calls per consumer by billable status.\n",
         );
         output.push_str("# TYPE ferrum_api_chargeable_calls_total counter\n");
         for ((consumer, proxy_id, status_code, _, _), agg) in &http_aggregates {
@@ -1259,11 +1260,12 @@ impl Plugin for ApiChargeback {
             _ => return,
         };
 
-        let Some(charge) = self.pricing.compute_http(
-            summary.response_status_code,
-            summary.bytes_sent,
-            summary.bytes_received,
-        ) else {
+        let status_code = super::chargeback::http_billing_outcome(summary).status_code;
+
+        let Some(charge) =
+            self.pricing
+                .compute_http(status_code, summary.bytes_sent, summary.bytes_received)
+        else {
             return;
         };
 
@@ -1275,7 +1277,7 @@ impl Plugin for ApiChargeback {
             consumer,
             proxy_id,
             proxy_name,
-            summary.response_status_code,
+            status_code,
             charge.charge_call,
             summary.bytes_sent,
             summary.bytes_received,

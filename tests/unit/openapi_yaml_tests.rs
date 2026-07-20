@@ -3303,6 +3303,22 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         schema["properties"]["global_tags"]["additionalProperties"]["type"], "string",
         "global_tags must remain an intentionally open string map"
     );
+    assert_eq!(
+        schema["properties"]["global_tags"]["propertyNames"]["pattern"],
+        "^[A-Za-z_][A-Za-z0-9_.-]*$",
+        "global_tags keys must encode the runtime ASCII tag-key grammar"
+    );
+    assert_eq!(
+        schema["properties"]["global_tags"]["propertyNames"]["maxLength"], 64,
+        "global_tags key ceiling must match the runtime 64-byte ASCII limit"
+    );
+    let prefix_desc = schema["properties"]["prefix"]["description"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        prefix_desc.contains("Unicode characters") && prefix_desc.contains("UTF-8 bytes"),
+        "prefix description must distinguish OpenAPI character maxLength from runtime byte cap: {prefix_desc}"
+    );
 
     let documented = schema["properties"]
         .as_object()
@@ -3365,6 +3381,10 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         json!({"host": "statsd.example.test", "port": 0}),
         json!({"host": "statsd.example.test", "port": 65536}),
         json!({"host": "statsd.example.test", "global_tags": {"env": true}}),
+        json!({"host": "statsd.example.test", "global_tags": {"evil\nkey": "x"}}),
+        json!({"host": "statsd.example.test", "global_tags": {" env ": "prod"}}),
+        json!({"host": "statsd.example.test", "global_tags": {"1bad": "x"}}),
+        json!({"host": "statsd.example.test", "global_tags": { ("k".repeat(65)): "x" }}),
         json!({"host": "statsd.example.test", "prefix": null}),
         json!({"host": "statsd.example.test", "global_tags": null}),
         json!({"host": "statsd.example.test", "schema": null}),
