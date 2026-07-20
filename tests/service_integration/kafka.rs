@@ -99,7 +99,11 @@ fn plugin(bootstrap: &str, topic: &str, overrides: Value) -> KafkaLogging {
         .unwrap_or_else(|error| panic!("construct kafka_logging for topic {topic}: {error}"))
 }
 
-async fn wait_snapshot<F>(plugin: &KafkaLogging, timeout: Duration, mut pred: F) -> KafkaSinkSnapshot
+async fn wait_snapshot<F>(
+    plugin: &KafkaLogging,
+    timeout: Duration,
+    mut pred: F,
+) -> KafkaSinkSnapshot
 where
     F: FnMut(&KafkaSinkSnapshot) -> bool,
 {
@@ -117,8 +121,7 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn kafka_logging_real_broker_delivers_consumes_and_finalizes() {
-    let Some(broker) =
-        redpanda("kafka_logging_real_broker_delivers_consumes_and_finalizes").await
+    let Some(broker) = redpanda("kafka_logging_real_broker_delivers_consumes_and_finalizes").await
     else {
         return;
     };
@@ -244,9 +247,7 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
         }),
     );
     let big_path = format!("/{}", "x".repeat(2_048));
-    oversized
-        .log(&summary(&big_path, "203.0.113.52"))
-        .await;
+    oversized.log(&summary(&big_path, "203.0.113.52")).await;
     let oversized_snap = wait_snapshot(&oversized, Duration::from_secs(20), |snap| {
         snap.delivery_failed_total >= 1 || snap.queue_rejected_total >= 1
     })
@@ -301,7 +302,8 @@ async fn kafka_logging_real_broker_terminal_failure_and_finalize_paths() {
     assert!(
         timed_snap.delivery_failed_total >= 1,
         "expected delivery timeout/retry exhaustion, got delivered={} failed={}",
-        timed_snap.delivered_total, timed_snap.delivery_failed_total
+        timed_snap.delivered_total,
+        timed_snap.delivery_failed_total
     );
     assert_eq!(timed_snap.delivered_total, 0);
     timed.finalize().await;
@@ -416,7 +418,10 @@ async fn kafka_logging_real_broker_generation_isolation_and_reload_disposal() {
     let plugin_b = plugin(&broker.bootstrap, topic_b, json!({}));
     let gen_a = plugin_a.snapshot().generation_id;
     let gen_b = plugin_b.snapshot().generation_id;
-    assert_ne!(gen_a, gen_b, "each plugin instance must own a distinct generation");
+    assert_ne!(
+        gen_a, gen_b,
+        "each plugin instance must own a distinct generation"
+    );
 
     plugin_a
         .log(&summary("/kafka-si-gen-a", "203.0.113.60"))
@@ -461,8 +466,10 @@ async fn kafka_logging_real_broker_generation_isolation_and_reload_disposal() {
     let old_gen = old.snapshot().generation_id;
     old.log(&summary("/kafka-si-reload-old", "203.0.113.62"))
         .await;
-    let pending = wait_snapshot(&old, Duration::from_secs(10), |snap| snap.admitted_total >= 1)
-        .await;
+    let pending = wait_snapshot(&old, Duration::from_secs(10), |snap| {
+        snap.admitted_total >= 1
+    })
+    .await;
     assert!(pending.admitted_total >= 1);
     drop(old);
 

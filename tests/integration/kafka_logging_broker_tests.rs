@@ -98,12 +98,15 @@ async fn kafka_logging_broker_delivers_and_finalizes() {
     assert!(
         mid.admitted_total >= 1,
         "expected local admission against real broker, got admitted={} delivered={} failed={}",
-        mid.admitted_total, mid.delivered_total, mid.delivery_failed_total
+        mid.admitted_total,
+        mid.delivered_total,
+        mid.delivery_failed_total
     );
     assert!(
         mid.delivered_total >= 1,
         "expected successful terminal delivery against real broker, got delivered={} failed={}",
-        mid.delivered_total, mid.delivery_failed_total
+        mid.delivered_total,
+        mid.delivery_failed_total
     );
     assert_eq!(mid.delivery_failed_total, 0);
     assert_eq!(mid.queue_rejected_total, 0);

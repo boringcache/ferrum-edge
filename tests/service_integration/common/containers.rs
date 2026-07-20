@@ -327,8 +327,8 @@ async fn wait_redpanda_ready(bootstrap: &str) -> Result<(), BoxError> {
 }
 
 fn redpanda_metadata_ok(bootstrap: &str) -> bool {
-    use rdkafka::consumer::{BaseConsumer, Consumer};
     use rdkafka::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
 
     let consumer: Result<BaseConsumer, _> = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
@@ -350,11 +350,7 @@ impl RedpandaContainer {
     /// Create a single-partition topic, optionally with broker topic configs
     /// (`max.message.bytes`, `min.insync.replicas`, …). Retries while the
     /// admin path is still warming up.
-    pub async fn create_topic(
-        &self,
-        name: &str,
-        configs: &[(&str, &str)],
-    ) -> Result<(), BoxError> {
+    pub async fn create_topic(&self, name: &str, configs: &[(&str, &str)]) -> Result<(), BoxError> {
         let mut script = format!("rpk topic create {name} -p 1 -r 1");
         for (key, value) in configs {
             script.push_str(&format!(" --config {key}={value}"));
@@ -439,7 +435,8 @@ fn consume_one_blocking(
                 let key = message
                     .key()
                     .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
-                let payload = String::from_utf8_lossy(message.payload().unwrap_or(b"")).into_owned();
+                let payload =
+                    String::from_utf8_lossy(message.payload().unwrap_or(b"")).into_owned();
                 return Ok(Some((key, payload)));
             }
             Some(Err(_)) | None => continue,
