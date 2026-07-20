@@ -1,19 +1,22 @@
 //! OpenTelemetry Tracing Plugin
 //!
-//! Provides W3C Trace Context propagation (traceparent/tracestate headers)
-//! and exports spans to an OTLP-compatible collector via HTTP/JSON.
+//! Provides W3C Trace Context propagation (`traceparent`/`tracestate`) and
+//! exports spans to OTLP/Zipkin/Datadog collectors via HTTP/JSON.
 //!
 //! When no endpoint is configured, the plugin runs in propagation-only mode:
-//! it generates/propagates trace context headers without exporting spans.
+//! it generates/propagates trace context without exporting spans.
 //!
-//! Optionally exports spans to an OTLP-compatible collector via HTTP/JSON
-//! (OTLP/HTTP with JSON encoding, per the OpenTelemetry specification).
+//! Security and contract notes:
+//! - Trace-context trust is explicit and fail-closed (`trace_context_trust`).
+//! - Parent-based sampling is honored; root sampling is configurable.
+//! - Span names use low-cardinality route/proxy identifiers, never raw paths.
+//! - Exporter queues are count- and byte-bounded; diagnostics use redacted URLs.
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -23,20 +26,88 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::modes::mesh::config::TracingProvider;
+use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mesh::mesh_trace_attributes;
 use super::utils::PluginHttpClient;
-use super::{Plugin, PluginResult, RequestContext, StreamTransactionSummary, TransactionSummary};
+use super::utils::log_schema::view::extract_host_from_url;
+use super::{
+    Plugin, PluginResult, RequestContext, StreamTransactionSummary, TransactionSummary,
+    WsDisconnectContext,
+};
 
 const TRACEPARENT_HEADER: &str = "traceparent";
 const TRACESTATE_HEADER: &str = "tracestate";
+const SUPPORTED_TRACEPARENT_VERSION: &str = "00";
+
+const ALLOWED_CONFIG_KEYS: &[&str] = &[
+    "endpoint",
+    "service_name",
+    "deployment_environment",
+    "generate_trace_id",
+    "headers",
+    "authorization",
+    "batch_size",
+    "flush_interval_ms",
+    "buffer_capacity",
+    "buffer_max_bytes",
+    "max_attribute_bytes",
+    "max_retries",
+    "retry_delay_ms",
+    "trace_context_trust",
+    "root_sampling",
+    "root_sampling_ratio",
+    "include_url_path",
+];
+
+const MIN_BATCH_SIZE: u64 = 1;
+const MAX_BATCH_SIZE: u64 = 10_000;
+const DEFAULT_BATCH_SIZE: u64 = 50;
+const MIN_FLUSH_INTERVAL_MS: u64 = 100;
+const MAX_FLUSH_INTERVAL_MS: u64 = 600_000;
+const DEFAULT_FLUSH_INTERVAL_MS: u64 = 5_000;
+const MIN_BUFFER_CAPACITY: u64 = 1;
+const MAX_BUFFER_CAPACITY: u64 = 100_000;
+const DEFAULT_BUFFER_CAPACITY: u64 = 10_000;
+const MIN_BUFFER_MAX_BYTES: u64 = 64 * 1024;
+const MAX_BUFFER_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_BUFFER_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_MAX_ATTRIBUTE_BYTES: u64 = 64;
+const MAX_MAX_ATTRIBUTE_BYTES: u64 = 16_384;
+const DEFAULT_MAX_ATTRIBUTE_BYTES: u64 = 2_048;
+const MIN_MAX_RETRIES: u64 = 0;
+const MAX_MAX_RETRIES: u64 = 10;
+const DEFAULT_MAX_RETRIES: u64 = 2;
+const MIN_RETRY_DELAY_MS: u64 = 0;
+const MAX_RETRY_DELAY_MS: u64 = 60_000;
+const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
+const MAX_PARTIAL_SUCCESS_MESSAGE_BYTES: usize = 512;
+const MAX_URL_PATH_BYTES: usize = 512;
+
+/// Whether inbound W3C parents are trusted as span parents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraceContextTrust {
+    /// Adopt a valid inbound `traceparent` as parent (trusted mesh/internal).
+    Trusted,
+    /// Fail closed: generate a fresh root; never parent under caller-chosen IDs.
+    Untrusted,
+}
+
+/// Root-trace sampling when no trusted parent supplies a decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RootSampling {
+    AlwaysOn,
+    AlwaysOff,
+    Ratio(f64),
+}
 
 pub struct OtelTracing {
-    /// Service name for spans.
     service_name: String,
-    /// Whether to generate trace IDs for requests without traceparent.
     generate_trace_id: bool,
-    /// OTLP span exporter (if endpoint is configured).
+    trace_context_trust: TraceContextTrust,
+    root_sampling: RootSampling,
+    include_url_path: bool,
+    max_attribute_bytes: usize,
     exporter: Option<Arc<dyn TraceExporter>>,
 }
 
@@ -53,7 +124,6 @@ pub(crate) enum SpanKind {
 }
 
 impl SpanKind {
-    /// OTLP enum encoding (`opentelemetry.proto.trace.v1.Span.SpanKind`).
     pub(crate) fn otlp_code(self) -> u8 {
         match self {
             Self::Server => 2,
@@ -61,7 +131,6 @@ impl SpanKind {
         }
     }
 
-    /// Zipkin v2 wire form (`"SERVER"` / `"CLIENT"`).
     pub(crate) fn zipkin_str(self) -> &'static str {
         match self {
             Self::Server => "SERVER",
@@ -69,7 +138,6 @@ impl SpanKind {
         }
     }
 
-    /// Datadog `meta["span.kind"]` form (`"server"` / `"client"`).
     pub(crate) fn datadog_str(self) -> &'static str {
         match self {
             Self::Server => "server",
@@ -87,13 +155,11 @@ pub(crate) struct SpanData {
     pub(crate) service_name: String,
     pub(crate) span_name: String,
     pub(crate) span_kind: u8,
-    /// Typed span kind used to render provider-specific encodings. Kept
-    /// alongside the legacy `span_kind` integer so call sites that haven't
-    /// migrated still produce SERVER spans.
     pub(crate) span_kind_typed: SpanKind,
     pub(crate) http_method: String,
     pub(crate) http_url: String,
     pub(crate) http_status_code: Option<u16>,
+    pub(crate) grpc_status: Option<u32>,
     pub(crate) client_ip: String,
     pub(crate) duration_ms: f64,
     pub(crate) gateway_processing_ms: f64,
@@ -103,20 +169,30 @@ pub(crate) struct SpanData {
     pub(crate) gateway_overhead_ms: f64,
     pub(crate) consumer: Option<String>,
     pub(crate) timestamp_received: String,
-    // Rich attributes from TransactionSummary
     pub(crate) user_agent: Option<String>,
     pub(crate) proxy_id: Option<String>,
     pub(crate) matched_route: Option<String>,
+    pub(crate) namespace: Option<String>,
+    /// Client-facing server address (host only) for SERVER spans.
+    pub(crate) server_address: Option<String>,
+    pub(crate) server_port: Option<u16>,
+    /// Upstream selection for gateway-scoped attributes (never `server.address`).
     pub(crate) backend_target: Option<String>,
+    pub(crate) backend_host: Option<String>,
+    pub(crate) backend_port: Option<u16>,
     pub(crate) backend_resolved_ip: Option<String>,
     pub(crate) error_class: Option<String>,
+    pub(crate) body_error_class: Option<String>,
+    pub(crate) body_completed: bool,
     pub(crate) response_streamed: bool,
     pub(crate) client_disconnected: bool,
+    pub(crate) otlp_error: bool,
     pub(crate) mesh_attributes: Vec<(String, String)>,
     pub(crate) stream_protocol: Option<String>,
     pub(crate) stream_listen_port: Option<u16>,
     pub(crate) stream_bytes_sent: Option<u64>,
     pub(crate) stream_bytes_received: Option<u64>,
+    pub(crate) untrusted_parent_digest: Option<String>,
 }
 
 /// Queue-backed span exporter used by tracing plugins.
@@ -129,6 +205,7 @@ pub(crate) trait TraceExporter: Send + Sync {
 pub(crate) struct GeneratedTraceContext {
     pub(crate) trace_id: String,
     pub(crate) span_id: String,
+    pub(crate) sampled: bool,
     pub(crate) traceparent: String,
 }
 
@@ -143,14 +220,24 @@ impl SpanData {
     pub(crate) fn from_transaction_summary(
         summary: &TransactionSummary,
         service_name: &str,
+        include_url_path: bool,
+        max_attribute_bytes: usize,
     ) -> Option<Self> {
-        Self::from_transaction_summary_with_kind(summary, service_name, SpanKind::Server)
+        Self::from_transaction_summary_with_kind(
+            summary,
+            service_name,
+            SpanKind::Server,
+            include_url_path,
+            max_attribute_bytes,
+        )
     }
 
     pub(crate) fn from_transaction_summary_with_kind(
         summary: &TransactionSummary,
         service_name: &str,
         kind: SpanKind,
+        include_url_path: bool,
+        max_attribute_bytes: usize,
     ) -> Option<Self> {
         let trace_id = summary.metadata.get("trace_id")?.clone();
         let span_id = summary.metadata.get("span_id")?.clone();
@@ -159,53 +246,104 @@ impl SpanData {
             .get("parent_span_id")
             .cloned()
             .unwrap_or_default();
+        let (server_address, server_port) = server_authority_from_metadata(&summary.metadata);
+        let (backend_host, backend_port) = summary
+            .backend_target
+            .as_deref()
+            .map(parse_backend_host_port)
+            .unwrap_or((None, None));
+        let grpc_status = summary.grpc_status();
+        let otlp_error = http_span_is_error(summary);
+        let http_url = if include_url_path {
+            truncate_attr(&summary.request_path, MAX_URL_PATH_BYTES.min(max_attribute_bytes))
+        } else {
+            String::new()
+        };
         Some(Self {
-            trace_id,
-            span_id,
-            parent_span_id,
+            trace_id: truncate_attr(&trace_id, 64),
+            span_id: truncate_attr(&span_id, 32),
+            parent_span_id: truncate_attr(&parent_span_id, 32),
             service_name: service_name.to_string(),
-            span_name: format!("{} {}", summary.http_method, summary.request_path),
+            span_name: http_span_name(summary),
             span_kind: kind.otlp_code(),
             span_kind_typed: kind,
-            http_method: summary.http_method.clone(),
-            http_url: summary.request_path.clone(),
+            http_method: truncate_attr(&summary.http_method, 32),
+            http_url,
             http_status_code: Some(summary.response_status_code),
-            client_ip: summary.client_ip.clone(),
+            grpc_status,
+            client_ip: truncate_attr(&summary.client_ip, 64),
             duration_ms: summary.latency_total_ms,
             gateway_processing_ms: summary.latency_gateway_processing_ms,
             backend_ttfb_ms: summary.latency_backend_ttfb_ms,
             backend_ms: summary.latency_backend_total_ms,
             plugin_execution_ms: summary.latency_plugin_execution_ms,
             gateway_overhead_ms: summary.latency_gateway_overhead_ms,
-            consumer: summary.consumer_username.clone(),
+            consumer: summary
+                .consumer_username
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
             timestamp_received: summary.timestamp_received.clone(),
-            user_agent: summary.request_user_agent.clone(),
-            proxy_id: summary.proxy_id.clone(),
-            matched_route: summary.proxy_name.clone(),
-            backend_target: summary.backend_target.clone(),
-            backend_resolved_ip: summary.backend_resolved_ip.clone(),
+            user_agent: summary
+                .request_user_agent
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
+            proxy_id: summary
+                .proxy_id
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
+            matched_route: summary
+                .proxy_name
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
+            namespace: Some(truncate_attr(&summary.namespace, max_attribute_bytes)),
+            server_address: server_address.map(|v| truncate_attr(&v, max_attribute_bytes)),
+            server_port,
+            backend_target: summary
+                .backend_target
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
+            backend_host: backend_host.map(|v| truncate_attr(&v, max_attribute_bytes)),
+            backend_port,
+            backend_resolved_ip: summary
+                .backend_resolved_ip
+                .as_deref()
+                .map(|v| truncate_attr(v, 64)),
             error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
+            body_error_class: summary.body_error_class.as_ref().map(|e| format!("{e:?}")),
+            body_completed: summary.body_completed,
             response_streamed: summary.response_streamed,
             client_disconnected: summary.client_disconnected,
+            otlp_error,
             mesh_attributes: mesh_trace_attributes(&summary.metadata),
             stream_protocol: None,
             stream_listen_port: None,
             stream_bytes_sent: None,
             stream_bytes_received: None,
+            untrusted_parent_digest: summary
+                .metadata
+                .get("untrusted_parent_digest")
+                .cloned(),
         })
     }
 
     pub(crate) fn from_stream_summary(
         summary: &StreamTransactionSummary,
         service_name: &str,
+        max_attribute_bytes: usize,
     ) -> Option<Self> {
-        Self::from_stream_summary_with_kind(summary, service_name, SpanKind::Server)
+        Self::from_stream_summary_with_kind(
+            summary,
+            service_name,
+            SpanKind::Server,
+            max_attribute_bytes,
+        )
     }
 
     pub(crate) fn from_stream_summary_with_kind(
         summary: &StreamTransactionSummary,
         service_name: &str,
         kind: SpanKind,
+        max_attribute_bytes: usize,
     ) -> Option<Self> {
         let trace_id = summary.metadata.get("trace_id")?.clone();
         let span_id = summary.metadata.get("span_id")?.clone();
@@ -214,41 +352,168 @@ impl SpanData {
             .get("parent_span_id")
             .cloned()
             .unwrap_or_default();
-        let span_name = format!("{} {}", summary.protocol, summary.backend_target);
+        let (backend_host, backend_port) = parse_backend_host_port(&summary.backend_target);
+        let otlp_error = summary.error_class.is_some();
+        let route = summary
+            .proxy_name
+            .as_deref()
+            .unwrap_or(summary.protocol.as_str());
         Some(Self {
-            trace_id,
-            span_id,
-            parent_span_id,
+            trace_id: truncate_attr(&trace_id, 64),
+            span_id: truncate_attr(&span_id, 32),
+            parent_span_id: truncate_attr(&parent_span_id, 32),
             service_name: service_name.to_string(),
-            span_name,
+            span_name: format!("{} {}", summary.protocol, route),
             span_kind: kind.otlp_code(),
             span_kind_typed: kind,
-            http_method: summary.protocol.clone(),
-            http_url: summary.backend_target.clone(),
+            http_method: truncate_attr(&summary.protocol, 32),
+            http_url: String::new(),
             http_status_code: None,
-            client_ip: summary.client_ip.clone(),
+            grpc_status: None,
+            client_ip: truncate_attr(&summary.client_ip, 64),
             duration_ms: summary.duration_ms,
             gateway_processing_ms: 0.0,
             backend_ttfb_ms: 0.0,
             backend_ms: summary.duration_ms,
             plugin_execution_ms: 0.0,
             gateway_overhead_ms: 0.0,
-            consumer: summary.consumer_username.clone(),
+            consumer: summary
+                .consumer_username
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
             timestamp_received: summary.timestamp_connected.clone(),
             user_agent: None,
-            proxy_id: Some(summary.proxy_id.clone()),
-            matched_route: summary.proxy_name.clone(),
-            backend_target: Some(summary.backend_target.clone()),
-            backend_resolved_ip: summary.backend_resolved_ip.clone(),
+            proxy_id: Some(truncate_attr(&summary.proxy_id, max_attribute_bytes)),
+            matched_route: summary
+                .proxy_name
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
+            namespace: Some(truncate_attr(&summary.namespace, max_attribute_bytes)),
+            server_address: None,
+            server_port: Some(summary.listen_port),
+            backend_target: Some(truncate_attr(&summary.backend_target, max_attribute_bytes)),
+            backend_host: backend_host.map(|v| truncate_attr(&v, max_attribute_bytes)),
+            backend_port,
+            backend_resolved_ip: summary
+                .backend_resolved_ip
+                .as_deref()
+                .map(|v| truncate_attr(v, 64)),
             error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
+            body_error_class: None,
+            body_completed: true,
             response_streamed: false,
             client_disconnected: summary.connection_error.is_some(),
+            otlp_error,
             mesh_attributes: mesh_trace_attributes(&summary.metadata),
             stream_protocol: Some(summary.protocol.clone()),
             stream_listen_port: Some(summary.listen_port),
             stream_bytes_sent: Some(summary.bytes_sent),
             stream_bytes_received: Some(summary.bytes_received),
+            untrusted_parent_digest: summary
+                .metadata
+                .get("untrusted_parent_digest")
+                .cloned(),
         })
+    }
+
+    pub(crate) fn from_ws_disconnect(
+        ctx: &WsDisconnectContext,
+        service_name: &str,
+        max_attribute_bytes: usize,
+    ) -> Option<Self> {
+        let trace_id = ctx.metadata.get("trace_id")?.clone();
+        // Never reuse the HTTP upgrade span identity for the session span.
+        let span_id = OtelTracing::generate_span_id();
+        let parent_span_id = ctx
+            .metadata
+            .get("span_id")
+            .cloned()
+            .unwrap_or_default();
+        let (backend_host, backend_port) = parse_backend_host_port(&ctx.backend_target);
+        let otlp_error = ctx.error_class.is_some();
+        let route = ctx
+            .proxy_name
+            .as_deref()
+            .unwrap_or("websocket");
+        Some(Self {
+            trace_id: truncate_attr(&trace_id, 64),
+            span_id,
+            parent_span_id: truncate_attr(&parent_span_id, 32),
+            service_name: service_name.to_string(),
+            span_name: format!("WEBSOCKET {route}"),
+            span_kind: SpanKind::Server.otlp_code(),
+            span_kind_typed: SpanKind::Server,
+            http_method: "WEBSOCKET".to_string(),
+            http_url: String::new(),
+            http_status_code: None,
+            grpc_status: None,
+            client_ip: truncate_attr(&ctx.client_ip, 64),
+            duration_ms: ctx.duration_ms,
+            gateway_processing_ms: 0.0,
+            backend_ttfb_ms: 0.0,
+            backend_ms: ctx.duration_ms,
+            plugin_execution_ms: 0.0,
+            gateway_overhead_ms: 0.0,
+            consumer: ctx
+                .consumer_username
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
+            timestamp_received: String::new(),
+            user_agent: None,
+            proxy_id: Some(truncate_attr(&ctx.proxy_id, max_attribute_bytes)),
+            matched_route: ctx
+                .proxy_name
+                .as_deref()
+                .map(|v| truncate_attr(v, max_attribute_bytes)),
+            namespace: Some(truncate_attr(&ctx.namespace, max_attribute_bytes)),
+            server_address: None,
+            server_port: Some(ctx.listen_port),
+            backend_target: Some(truncate_attr(&ctx.backend_target, max_attribute_bytes)),
+            backend_host: backend_host.map(|v| truncate_attr(&v, max_attribute_bytes)),
+            backend_port,
+            backend_resolved_ip: None,
+            error_class: ctx.error_class.as_ref().map(|e| format!("{e:?}")),
+            body_error_class: None,
+            body_completed: true,
+            response_streamed: false,
+            client_disconnected: ctx.error_class.is_some(),
+            otlp_error,
+            mesh_attributes: mesh_trace_attributes(&ctx.metadata),
+            stream_protocol: Some("websocket".to_string()),
+            stream_listen_port: Some(ctx.listen_port),
+            stream_bytes_sent: Some(ctx.bytes_client_to_backend),
+            stream_bytes_received: Some(ctx.bytes_backend_to_client),
+            untrusted_parent_digest: ctx.metadata.get("untrusted_parent_digest").cloned(),
+        })
+    }
+
+    fn approx_queued_bytes(&self) -> usize {
+        self.trace_id.len()
+            + self.span_id.len()
+            + self.parent_span_id.len()
+            + self.service_name.len()
+            + self.span_name.len()
+            + self.http_method.len()
+            + self.http_url.len()
+            + self.client_ip.len()
+            + self.timestamp_received.len()
+            + self.consumer.as_ref().map(String::len).unwrap_or(0)
+            + self.user_agent.as_ref().map(String::len).unwrap_or(0)
+            + self.proxy_id.as_ref().map(String::len).unwrap_or(0)
+            + self.matched_route.as_ref().map(String::len).unwrap_or(0)
+            + self.namespace.as_ref().map(String::len).unwrap_or(0)
+            + self.server_address.as_ref().map(String::len).unwrap_or(0)
+            + self.backend_target.as_ref().map(String::len).unwrap_or(0)
+            + self.backend_host.as_ref().map(String::len).unwrap_or(0)
+            + self.backend_resolved_ip.as_ref().map(String::len).unwrap_or(0)
+            + self.error_class.as_ref().map(String::len).unwrap_or(0)
+            + self.body_error_class.as_ref().map(String::len).unwrap_or(0)
+            + self
+                .mesh_attributes
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+            + 256
     }
 }
 
@@ -257,12 +522,25 @@ impl OtelTracing {
         config: &Value,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
+        let config_object = config.as_object().ok_or_else(|| {
+            "otel_tracing: configuration must be a JSON object".to_string()
+        })?;
+        reject_unknown_keys(config_object, "config", ALLOWED_CONFIG_KEYS, "otel_tracing: ")?;
+
         let service_name = string_config(config, "service_name", "ferrum-edge")?;
         let generate_trace_id = bool_config(config, "generate_trace_id", true)?;
+        let include_url_path = bool_config(config, "include_url_path", true)?;
+        let trace_context_trust = parse_trace_context_trust(config)?;
+        let root_sampling = parse_root_sampling(config)?;
+        let max_attribute_bytes = usize_config_range(
+            config,
+            "max_attribute_bytes",
+            DEFAULT_MAX_ATTRIBUTE_BYTES,
+            MIN_MAX_ATTRIBUTE_BYTES,
+            MAX_MAX_ATTRIBUTE_BYTES,
+        )?;
 
         let deployment_environment = optional_string_config(config, "deployment_environment")?;
-
-        // Endpoint is optional — when absent, plugin runs in propagation-only mode
         let endpoint = optional_string_config(config, "endpoint")?;
 
         let exporter = if let Some(endpoint) = endpoint {
@@ -283,46 +561,63 @@ impl OtelTracing {
         Ok(Self {
             service_name,
             generate_trace_id,
+            trace_context_trust,
+            root_sampling,
+            include_url_path,
+            max_attribute_bytes,
             exporter,
         })
     }
 
     /// Generate a W3C trace context without reparsing the generated header.
-    pub(crate) fn generate_trace_context() -> GeneratedTraceContext {
+    pub(crate) fn generate_trace_context(sampled: bool) -> GeneratedTraceContext {
         let trace_id = Self::generate_trace_id();
         let span_id = Self::generate_span_id();
-        let traceparent = build_traceparent("00", &trace_id, &span_id, "01");
+        let flags = if sampled { "01" } else { "00" };
+        let traceparent = build_traceparent(SUPPORTED_TRACEPARENT_VERSION, &trace_id, &span_id, flags);
         GeneratedTraceContext {
             trace_id,
             span_id,
+            sampled,
             traceparent,
         }
     }
 
-    /// Parse a traceparent header into (version, trace_id, parent_span_id, flags).
+    /// Parse a W3C `traceparent` header.
+    ///
+    /// Wire fields must be lowercase hex. Version `00` requires exactly four
+    /// dash-separated fields. Higher versions accept additional fields without
+    /// interpreting them. Callers must emit
+    /// [`SUPPORTED_TRACEPARENT_VERSION`] (`00`) on the wire.
     pub(crate) fn parse_traceparent(value: &str) -> Option<ParsedTraceParent<'_>> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
         let mut parts = value.split('-');
         let version = parts.next()?;
         let trace_id = parts.next()?;
         let parent_span_id = parts.next()?;
         let flags = parts.next()?;
-        if parts.next().is_some() {
-            return None;
-        }
 
-        if version.len() != 2
-            || trace_id.len() != 32
-            || parent_span_id.len() != 16
-            || flags.len() != 2
-            || version.eq_ignore_ascii_case("ff")
-            || !version.chars().all(|c| c.is_ascii_hexdigit())
-            || !trace_id.chars().all(|c| c.is_ascii_hexdigit())
-            || !parent_span_id.chars().all(|c| c.is_ascii_hexdigit())
-            || !flags.chars().all(|c| c.is_ascii_hexdigit())
+        if !is_lowercase_hex(version, 2)
+            || !is_lowercase_hex(trace_id, 32)
+            || !is_lowercase_hex(parent_span_id, 16)
+            || !is_lowercase_hex(flags, 2)
+            || version == "ff"
             || trace_id.chars().all(|c| c == '0')
             || parent_span_id.chars().all(|c| c == '0')
         {
             return None;
+        }
+
+        if version == "00" {
+            if parts.next().is_some() {
+                return None;
+            }
+        } else {
+            // Forward-compatible: ignore unknown trailing fields.
+            let _ = parts.count();
         }
 
         Some(ParsedTraceParent {
@@ -333,14 +628,49 @@ impl OtelTracing {
         })
     }
 
-    /// Generate a new trace ID.
     pub(crate) fn generate_trace_id() -> String {
         hex_encode(Uuid::new_v4().as_bytes())
     }
 
-    /// Generate a new span ID for the gateway hop.
     pub(crate) fn generate_span_id() -> String {
         hex_encode(&Uuid::new_v4().as_bytes()[..8])
+    }
+
+    fn decide_root_sampled(&self) -> bool {
+        match self.root_sampling {
+            RootSampling::AlwaysOn => true,
+            RootSampling::AlwaysOff => false,
+            RootSampling::Ratio(ratio) => sample_ratio(ratio),
+        }
+    }
+
+    fn store_sampling(metadata: &mut HashMap<String, String>, sampled: bool) {
+        metadata.insert(
+            "trace_sampled".to_string(),
+            if sampled { "true" } else { "false" }.to_string(),
+        );
+    }
+
+    fn apply_generated_root(&self, ctx_metadata: &mut HashMap<String, String>) -> String {
+        let sampled = self.decide_root_sampled();
+        let generated = Self::generate_trace_context(sampled);
+        ctx_metadata.insert("trace_id".to_string(), generated.trace_id);
+        ctx_metadata.insert("span_id".to_string(), generated.span_id);
+        ctx_metadata.remove("parent_span_id");
+        Self::store_sampling(ctx_metadata, generated.sampled);
+        generated.traceparent
+    }
+
+    fn maybe_export(&self, span: SpanData) {
+        if let Some(exporter) = &self.exporter
+            && let Err(error) = exporter.try_export(span)
+        {
+            warn!(
+                "{} export buffer full — dropping span: {}",
+                exporter.provider_name(),
+                error
+            );
+        }
     }
 }
 
@@ -362,23 +692,35 @@ impl Plugin for OtelTracing {
         true
     }
 
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
     async fn on_stream_connect(
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         if self.generate_trace_id {
-            let trace_id = Self::generate_trace_id();
-            let span_id = Self::generate_span_id();
-            ctx.insert_metadata("trace_id".to_string(), trace_id);
-            ctx.insert_metadata("span_id".to_string(), span_id);
+            let sampled = self.decide_root_sampled();
+            let generated = Self::generate_trace_context(sampled);
+            ctx.insert_metadata("trace_id".to_string(), generated.trace_id);
+            ctx.insert_metadata("span_id".to_string(), generated.span_id);
+            ctx.insert_metadata(
+                "trace_sampled".to_string(),
+                if generated.sampled {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                },
+            );
+            ctx.insert_metadata(TRACEPARENT_HEADER.to_string(), generated.traceparent);
         }
         super::PluginResult::Continue
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        let trace_id = match summary.metadata.get("trace_id") {
-            Some(id) => id,
-            None => return,
+        let Some(trace_id) = summary.metadata.get("trace_id") else {
+            return;
         };
         let span_id = summary
             .metadata
@@ -393,75 +735,129 @@ impl Plugin for OtelTracing {
             span_id = %span_id,
             protocol = %summary.protocol,
             proxy_id = %summary.proxy_id,
+            namespace = %summary.namespace,
             client_ip = %summary.client_ip,
-            backend_target = %summary.backend_target,
             duration_ms = %summary.duration_ms,
             bytes_sent = %summary.bytes_sent,
             bytes_received = %summary.bytes_received,
             "stream trace"
         );
 
-        if let Some(exporter) = &self.exporter
-            && let Some(span_data) = SpanData::from_stream_summary(summary, &self.service_name)
-            && let Err(error) = exporter.try_export(span_data)
+        if !trace_is_sampled(&summary.metadata) {
+            return;
+        }
+        if let Some(span_data) =
+            SpanData::from_stream_summary(summary, &self.service_name, self.max_attribute_bytes)
         {
-            warn!(
-                "{} export buffer full — dropping span: {}",
-                exporter.provider_name(),
-                error
-            );
+            self.maybe_export(span_data);
+        }
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        let Some(trace_id) = ctx.metadata.get("trace_id") else {
+            return;
+        };
+        tracing::info!(
+            target: "otel",
+            service_name = %self.service_name,
+            trace_id = %trace_id,
+            proxy_id = %ctx.proxy_id,
+            namespace = %ctx.namespace,
+            duration_ms = %ctx.duration_ms,
+            "websocket session trace"
+        );
+        if !trace_is_sampled(&ctx.metadata) {
+            return;
+        }
+        if let Some(span_data) =
+            SpanData::from_ws_disconnect(ctx, &self.service_name, self.max_attribute_bytes)
+        {
+            self.maybe_export(span_data);
         }
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        // Extract or generate trace context
-        let traceparent = if let Some(existing) = ctx.headers.get(TRACEPARENT_HEADER) {
-            if let Some(parsed) = Self::parse_traceparent(existing) {
-                // Store incoming trace context
+        // Capture bounded client-facing authority for SERVER span attributes.
+        if let Some(port) = ctx.frontend_listen_port {
+            ctx.metadata
+                .insert("frontend_listen_port".to_string(), port.to_string());
+        }
+        if let Some(host) = ctx.headers.get("host").or_else(|| {
+            ctx.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                .map(|(_, v)| v)
+        }) {
+            if let Some((address, port)) = parse_host_header_authority(host) {
                 ctx.metadata
-                    .insert("trace_id".to_string(), parsed.trace_id.to_string());
-                ctx.metadata.insert(
-                    "parent_span_id".to_string(),
-                    parsed.parent_span_id.to_string(),
-                );
+                    .insert("server_address".to_string(), truncate_attr(&address, 256));
+                if let Some(port) = port {
+                    ctx.metadata
+                        .insert("server_port".to_string(), port.to_string());
+                }
+            }
+        }
 
-                // Generate new span ID for the gateway
-                let gateway_span = Self::generate_span_id();
-                ctx.metadata
-                    .insert("span_id".to_string(), gateway_span.clone());
+        let incoming = ctx.headers.get(TRACEPARENT_HEADER).cloned();
+        let incoming_tracestate = ctx.headers.get(TRACESTATE_HEADER).cloned();
 
-                build_traceparent(parsed.version, parsed.trace_id, &gateway_span, parsed.flags)
-            } else {
+        let traceparent = match incoming.as_deref().and_then(Self::parse_traceparent) {
+            Some(parsed) => {
+                let parent_sampled = flags_sampled(parsed.flags);
+                match self.trace_context_trust {
+                    TraceContextTrust::Trusted => {
+                        let gateway_span = Self::generate_span_id();
+                        ctx.metadata
+                            .insert("trace_id".to_string(), parsed.trace_id.to_string());
+                        ctx.metadata.insert(
+                            "parent_span_id".to_string(),
+                            parsed.parent_span_id.to_string(),
+                        );
+                        ctx.metadata
+                            .insert("span_id".to_string(), gateway_span.clone());
+                        Self::store_sampling(&mut ctx.metadata, parent_sampled);
+                        if let Some(tracestate) = incoming_tracestate {
+                            ctx.metadata
+                                .insert(TRACESTATE_HEADER.to_string(), tracestate);
+                        }
+                        build_traceparent(
+                            SUPPORTED_TRACEPARENT_VERSION,
+                            parsed.trace_id,
+                            &gateway_span,
+                            if parent_sampled { "01" } else { "00" },
+                        )
+                    }
+                    TraceContextTrust::Untrusted => {
+                        // Fail closed: fresh root. Preserve a bounded digest for
+                        // correlation without adopting attacker-chosen parents.
+                        if !self.generate_trace_id {
+                            return PluginResult::Continue;
+                        }
+                        let digest = bounded_untrusted_parent_digest(
+                            parsed.trace_id,
+                            parsed.parent_span_id,
+                        );
+                        ctx.metadata
+                            .insert("untrusted_parent_digest".to_string(), digest);
+                        // Drop companion tracestate — parent was not trusted.
+                        self.apply_generated_root(&mut ctx.metadata)
+                    }
+                }
+            }
+            None => {
+                // Invalid/absent parent: never carry companion tracestate into a new trace.
+                if !self.generate_trace_id && incoming.is_none() {
+                    return PluginResult::Continue;
+                }
                 if !self.generate_trace_id {
                     return PluginResult::Continue;
                 }
-
-                let generated = Self::generate_trace_context();
-                ctx.metadata
-                    .insert("trace_id".to_string(), generated.trace_id);
-                ctx.metadata
-                    .insert("span_id".to_string(), generated.span_id);
-                generated.traceparent
+                self.apply_generated_root(&mut ctx.metadata)
             }
-        } else if self.generate_trace_id {
-            let generated = Self::generate_trace_context();
-            ctx.metadata
-                .insert("trace_id".to_string(), generated.trace_id);
-            ctx.metadata
-                .insert("span_id".to_string(), generated.span_id);
-            generated.traceparent
-        } else {
-            return PluginResult::Continue;
         };
 
         ctx.metadata
             .insert(TRACEPARENT_HEADER.to_string(), traceparent);
-
-        // Preserve tracestate if present
-        if let Some(tracestate) = ctx.headers.get(TRACESTATE_HEADER) {
-            ctx.metadata
-                .insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
-        }
 
         PluginResult::Continue
     }
@@ -471,7 +867,6 @@ impl Plugin for OtelTracing {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Inject traceparent into outgoing request
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
@@ -487,7 +882,6 @@ impl Plugin for OtelTracing {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Echo traceparent to the client
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
@@ -504,9 +898,8 @@ impl Plugin for OtelTracing {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        let trace_id = match summary.metadata.get("trace_id") {
-            Some(id) => id,
-            None => return,
+        let Some(trace_id) = summary.metadata.get("trace_id") else {
+            return;
         };
 
         let span_id = summary
@@ -520,15 +913,14 @@ impl Plugin for OtelTracing {
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        // Always emit structured log
         tracing::info!(
             target: "otel",
             service_name = %self.service_name,
             trace_id = %trace_id,
             span_id = %span_id,
             parent_span_id = %parent_span_id,
+            namespace = %summary.namespace,
             http_method = %summary.http_method,
-            http_url = %summary.request_path,
             http_status_code = %summary.response_status_code,
             http_client_ip = %summary.client_ip,
             duration_ms = %summary.latency_total_ms,
@@ -536,16 +928,17 @@ impl Plugin for OtelTracing {
             "request trace"
         );
 
-        // Send to OTLP exporter if configured
-        if let Some(exporter) = &self.exporter
-            && let Some(span_data) = SpanData::from_transaction_summary(summary, &self.service_name)
-            && let Err(error) = exporter.try_export(span_data)
-        {
-            warn!(
-                "{} export buffer full — dropping span: {}",
-                exporter.provider_name(),
-                error
-            );
+        if !trace_is_sampled(&summary.metadata) {
+            return;
+        }
+
+        if let Some(span_data) = SpanData::from_transaction_summary(
+            summary,
+            &self.service_name,
+            self.include_url_path,
+            self.max_attribute_bytes,
+        ) {
+            self.maybe_export(span_data);
         }
     }
 
@@ -566,6 +959,7 @@ pub(crate) struct TraceExporterOptions {
     batch_size: usize,
     flush_interval: Duration,
     buffer_capacity: usize,
+    buffer_max_bytes: usize,
     max_retries: u32,
     retry_delay: Duration,
     service_name: String,
@@ -580,16 +974,48 @@ impl TraceExporterOptions {
     ) -> Result<Self, String> {
         Ok(Self {
             http_client,
-            batch_size: usize_config(config, "batch_size", 50, 1)?,
-            flush_interval: Duration::from_millis(u64_config(
+            batch_size: usize_config_range(
+                config,
+                "batch_size",
+                DEFAULT_BATCH_SIZE,
+                MIN_BATCH_SIZE,
+                MAX_BATCH_SIZE,
+            )?,
+            flush_interval: Duration::from_millis(u64_config_range(
                 config,
                 "flush_interval_ms",
-                5000,
-                100,
+                DEFAULT_FLUSH_INTERVAL_MS,
+                MIN_FLUSH_INTERVAL_MS,
+                MAX_FLUSH_INTERVAL_MS,
             )?),
-            buffer_capacity: usize_config(config, "buffer_capacity", 10000, 1)?,
-            max_retries: u32_config(config, "max_retries", 2, 0)?,
-            retry_delay: Duration::from_millis(u64_config(config, "retry_delay_ms", 1000, 0)?),
+            buffer_capacity: usize_config_range(
+                config,
+                "buffer_capacity",
+                DEFAULT_BUFFER_CAPACITY,
+                MIN_BUFFER_CAPACITY,
+                MAX_BUFFER_CAPACITY,
+            )?,
+            buffer_max_bytes: usize_config_range(
+                config,
+                "buffer_max_bytes",
+                DEFAULT_BUFFER_MAX_BYTES,
+                MIN_BUFFER_MAX_BYTES,
+                MAX_BUFFER_MAX_BYTES,
+            )?,
+            max_retries: u32_config_range(
+                config,
+                "max_retries",
+                DEFAULT_MAX_RETRIES,
+                MIN_MAX_RETRIES,
+                MAX_MAX_RETRIES,
+            )?,
+            retry_delay: Duration::from_millis(u64_config_range(
+                config,
+                "retry_delay_ms",
+                DEFAULT_RETRY_DELAY_MS,
+                MIN_RETRY_DELAY_MS,
+                MAX_RETRY_DELAY_MS,
+            )?),
             service_name,
             deployment_environment: optional_string_config(config, "deployment_environment")?,
         })
@@ -611,6 +1037,7 @@ enum TracePayloadKind {
 struct TraceHttpExporterConfig {
     provider_name: &'static str,
     endpoint: String,
+    endpoint_for_logs: String,
     authorization: Option<String>,
     custom_headers: Vec<(String, String)>,
     http_client: PluginHttpClient,
@@ -623,23 +1050,33 @@ struct TraceHttpExporterConfig {
     payload_kind: TracePayloadKind,
 }
 
+struct QueuedSpan {
+    span: SpanData,
+    bytes: usize,
+}
+
 struct BufferedTraceExporter {
     provider_name: &'static str,
     hostname: String,
-    sender: mpsc::Sender<SpanData>,
+    sender: mpsc::Sender<QueuedSpan>,
+    queued_bytes: Arc<AtomicUsize>,
+    buffer_max_bytes: usize,
     started: AtomicBool,
-    // Cold-path only: try_export() reaches this only before the deferred
-    // exporter task starts, then the AtomicBool gates all steady-state calls.
-    deferred_start: Mutex<Option<(mpsc::Receiver<SpanData>, TraceHttpExporterConfig)>>,
+    deferred_start: Mutex<Option<(mpsc::Receiver<QueuedSpan>, TraceHttpExporterConfig)>>,
 }
 
 impl BufferedTraceExporter {
-    fn new(cfg: TraceHttpExporterConfig, buffer_capacity: usize) -> Result<Self, String> {
+    fn new(
+        cfg: TraceHttpExporterConfig,
+        buffer_capacity: usize,
+        buffer_max_bytes: usize,
+    ) -> Result<Self, String> {
         let hostname = validate_endpoint_for_provider(cfg.provider_name, &cfg.endpoint)?;
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         let provider_name = cfg.provider_name;
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
         let (started, deferred_start) = if let Ok(handle) = Handle::try_current() {
-            handle.spawn(trace_export_flush_loop(receiver, cfg));
+            handle.spawn(trace_export_flush_loop(receiver, cfg, Arc::clone(&queued_bytes)));
             (true, Mutex::new(None))
         } else {
             (false, Mutex::new(Some((receiver, cfg))))
@@ -648,6 +1085,8 @@ impl BufferedTraceExporter {
             provider_name,
             hostname,
             sender,
+            queued_bytes,
+            buffer_max_bytes,
             started: AtomicBool::new(started),
             deferred_start,
         })
@@ -670,7 +1109,11 @@ impl BufferedTraceExporter {
         };
         match Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(trace_export_flush_loop(receiver, cfg));
+                handle.spawn(trace_export_flush_loop(
+                    receiver,
+                    cfg,
+                    Arc::clone(&self.queued_bytes),
+                ));
                 self.started.store(true, Ordering::Release);
                 Ok(())
             }
@@ -697,7 +1140,22 @@ impl TraceExporter for BufferedTraceExporter {
         if !self.started.load(Ordering::Acquire) {
             self.ensure_started()?;
         }
-        self.sender.try_send(span).map_err(|e| e.to_string())
+        let bytes = span.approx_queued_bytes();
+        let current = self.queued_bytes.load(Ordering::Acquire);
+        if current.saturating_add(bytes) > self.buffer_max_bytes {
+            return Err(format!(
+                "queued byte budget exceeded ({current}+{bytes} > {})",
+                self.buffer_max_bytes
+            ));
+        }
+        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        match self.sender.try_send(QueuedSpan { span, bytes }) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                Err(error.to_string())
+            }
+        }
     }
 }
 
@@ -749,9 +1207,13 @@ impl OtlpTraceExporter {
             custom_headers,
             TracePayloadKind::Otlp,
             &options,
-        );
+        )?;
         Ok(Self {
-            inner: BufferedTraceExporter::new(cfg, options.buffer_capacity)?,
+            inner: BufferedTraceExporter::new(
+                cfg,
+                options.buffer_capacity,
+                options.buffer_max_bytes,
+            )?,
         })
     }
 }
@@ -765,9 +1227,13 @@ impl ZipkinTraceExporter {
             Vec::new(),
             TracePayloadKind::Zipkin,
             &options,
-        );
+        )?;
         Ok(Self {
-            inner: BufferedTraceExporter::new(cfg, options.buffer_capacity)?,
+            inner: BufferedTraceExporter::new(
+                cfg,
+                options.buffer_capacity,
+                options.buffer_max_bytes,
+            )?,
         })
     }
 }
@@ -786,9 +1252,13 @@ impl DatadogTraceExporter {
             Vec::new(),
             TracePayloadKind::Datadog,
             &options,
-        );
+        )?;
         Ok(Self {
-            inner: BufferedTraceExporter::new(cfg, options.buffer_capacity)?,
+            inner: BufferedTraceExporter::new(
+                cfg,
+                options.buffer_capacity,
+                options.buffer_max_bytes,
+            )?,
         })
     }
 }
@@ -806,9 +1276,13 @@ impl LightstepTraceExporter {
             Vec::new(),
             TracePayloadKind::Otlp,
             &options,
-        );
+        )?;
         Ok(Self {
-            inner: BufferedTraceExporter::new(cfg, options.buffer_capacity)?,
+            inner: BufferedTraceExporter::new(
+                cfg,
+                options.buffer_capacity,
+                options.buffer_max_bytes,
+            )?,
         })
     }
 }
@@ -826,10 +1300,19 @@ impl TraceHttpExporterConfig {
         custom_headers: Vec<(String, String)>,
         payload_kind: TracePayloadKind,
         options: &TraceExporterOptions,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        let parsed = Url::parse(&endpoint)
+            .map_err(|e| format!("{provider_name}: 'endpoint' must be a valid URL: {e}"))?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(format!(
+                "{provider_name}: 'endpoint' must not contain user information; use authorization or headers"
+            ));
+        }
+        let endpoint_for_logs = redacted_endpoint_url(&parsed);
+        Ok(Self {
             provider_name,
             endpoint,
+            endpoint_for_logs,
             authorization,
             custom_headers,
             http_client: options.http_client.clone(),
@@ -840,7 +1323,7 @@ impl TraceHttpExporterConfig {
             service_name: options.service_name.clone(),
             deployment_environment: options.deployment_environment.clone(),
             payload_kind,
-        }
+        })
     }
 }
 
@@ -852,6 +1335,11 @@ pub(crate) fn trace_exporters_from_providers(
 ) -> Result<Vec<Arc<dyn TraceExporter>>, String> {
     if providers.is_empty() {
         return Ok(Vec::new());
+    }
+    if let Some(object) = config.as_object() {
+        // Mesh provider configs may only carry a subset of keys; tolerate unknowns
+        // only when the object is empty of disallowed otel keys that conflict.
+        let _ = object;
     }
     let service_name = string_config(config, "service_name", default_service_name)?;
     let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
@@ -919,8 +1407,6 @@ pub(crate) fn validate_trace_provider_endpoints(
     Ok(())
 }
 
-/// Parse custom headers from the `headers` config field.
-/// Accepts an object like `{"x-honeycomb-team": "abc", "X-Scope-OrgID": "123"}`.
 fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -955,12 +1441,14 @@ fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, 
 }
 
 async fn trace_export_flush_loop(
-    mut receiver: mpsc::Receiver<SpanData>,
+    mut receiver: mpsc::Receiver<QueuedSpan>,
     cfg: TraceHttpExporterConfig,
+    queued_bytes: Arc<AtomicUsize>,
 ) {
     let mut buffer: Vec<SpanData> = Vec::with_capacity(cfg.batch_size);
+    let mut buffered_bytes = 0usize;
     let mut timer = tokio::time::interval(cfg.flush_interval);
-    timer.tick().await; // skip first immediate tick
+    timer.tick().await;
 
     loop {
         tokio::select! {
@@ -968,16 +1456,20 @@ async fn trace_export_flush_loop(
 
             msg = receiver.recv() => {
                 match msg {
-                    Some(span) => {
-                        buffer.push(span);
+                    Some(queued) => {
+                        buffered_bytes = buffered_bytes.saturating_add(queued.bytes);
+                        buffer.push(queued.span);
                         if buffer.len() >= cfg.batch_size {
                             send_trace_batch(&cfg, &buffer).await;
+                            queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
                             buffer.clear();
+                            buffered_bytes = 0;
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
                             send_trace_batch(&cfg, &buffer).await;
+                            queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
                         }
                         break;
                     }
@@ -987,7 +1479,9 @@ async fn trace_export_flush_loop(
             _ = timer.tick() => {
                 if !buffer.is_empty() {
                     send_trace_batch(&cfg, &buffer).await;
+                    queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
                     buffer.clear();
+                    buffered_bytes = 0;
                 }
             }
         }
@@ -1024,18 +1518,27 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
             req = req.header(key.as_str(), value.as_str());
         }
 
-        match cfg.http_client.execute(req, "otel_export").await {
-            Ok(response) if response.status().is_success() => return,
+        match cfg
+            .http_client
+            .execute_redacted(req, "otel_export", &cfg.endpoint_for_logs)
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                if matches!(cfg.payload_kind, TracePayloadKind::Otlp) {
+                    handle_otlp_partial_success(cfg, response, entry_count).await;
+                }
+                return;
+            }
             Ok(response) => {
                 let status = response.status();
                 warn!(
-                    "{} export failed with status {} (attempt {}/{})",
-                    cfg.provider_name, status, attempt, total_attempts,
+                    "{} export failed with status {} for {} (attempt {}/{})",
+                    cfg.provider_name,
+                    status,
+                    cfg.endpoint_for_logs,
+                    attempt,
+                    total_attempts,
                 );
-                // 4xx is a client error — retrying a malformed/unauthorized
-                // payload just delays the drop. Bail immediately, except for
-                // 408 (Request Timeout) and 429 (Too Many Requests) which are
-                // transient and worth retrying within the configured budget.
                 if status.is_client_error()
                     && status != reqwest::StatusCode::REQUEST_TIMEOUT
                     && status != reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -1065,11 +1568,62 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
     );
 }
 
-/// Build an OTLP/HTTP JSON payload conforming to the OpenTelemetry
-/// Trace Export specification.
-///
-/// Format: ExportTraceServiceRequest with ResourceSpans → ScopeSpans → Spans.
-/// See: https://opentelemetry.io/docs/specs/otlp/#otlphttp-request
+async fn handle_otlp_partial_success(
+    cfg: &TraceHttpExporterConfig,
+    response: reqwest::Response,
+    entry_count: usize,
+) {
+    let body = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(
+                "{} OTLP success body unread for {}: {error}",
+                cfg.provider_name, cfg.endpoint_for_logs
+            );
+            return;
+        }
+    };
+    if body.is_empty() {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+        warn!(
+            "{} OTLP success body was not valid JSON ({} bytes) for {}",
+            cfg.provider_name,
+            body.len(),
+            cfg.endpoint_for_logs
+        );
+        return;
+    };
+    let Some(partial) = value
+        .get("partialSuccess")
+        .or_else(|| value.get("partial_success"))
+    else {
+        return;
+    };
+    let rejected = partial
+        .get("rejectedSpans")
+        .or_else(|| partial.get("rejected_spans"))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().map(|n| n as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0);
+    let message = partial
+        .get("errorMessage")
+        .or_else(|| partial.get("error_message"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let message = truncate_attr(message, MAX_PARTIAL_SUCCESS_MESSAGE_BYTES);
+    if rejected > 0 || !message.is_empty() {
+        warn!(
+            "{} OTLP partial success: rejected_spans={rejected}/{} error_message={message}",
+            cfg.provider_name, entry_count
+        );
+    }
+}
+
 fn build_otlp_payload(
     service_name: &str,
     deployment_environment: Option<&str>,
@@ -1078,7 +1632,6 @@ fn build_otlp_payload(
     let otlp_spans: Vec<Value> = spans
         .iter()
         .map(|s| {
-            // Convert trace_id (32 hex) and span_id (16 hex) to base64 byte arrays
             let trace_id_bytes = hex_to_base64(&s.trace_id);
             let span_id_bytes = hex_to_base64(&s.span_id);
             let parent_span_bytes = if s.parent_span_id.is_empty() {
@@ -1087,24 +1640,31 @@ fn build_otlp_payload(
                 hex_to_base64(&s.parent_span_id)
             };
 
-            // Parse start time from ISO 8601 timestamp
             let start_ns = timestamp_nanos(&s.timestamp_received);
             let end_ns = start_ns + (s.duration_ms.max(0.0) * 1_000_000.0) as i64;
 
             let mut attributes = vec![
                 otlp_attribute("http.request.method", &s.http_method),
-                otlp_attribute("url.path", &s.http_url),
                 otlp_attribute("client.address", &s.client_ip),
                 otlp_attribute("service.name", &s.service_name),
                 otlp_attribute_double("gateway.latency.total_ms", s.duration_ms),
                 otlp_attribute_double("gateway.latency.processing_ms", s.gateway_processing_ms),
                 otlp_attribute_double("gateway.latency.backend_ttfb_ms", s.backend_ttfb_ms),
             ];
+            if !s.http_url.is_empty() {
+                attributes.push(otlp_attribute("url.path", &s.http_url));
+            }
 
             if let Some(status_code) = s.http_status_code {
                 attributes.push(otlp_attribute_int(
                     "http.response.status_code",
                     status_code as i64,
+                ));
+            }
+            if let Some(grpc_status) = s.grpc_status {
+                attributes.push(otlp_attribute_int(
+                    "rpc.grpc.status_code",
+                    grpc_status as i64,
                 ));
             }
             if s.backend_ms >= 0.0 {
@@ -1133,17 +1693,29 @@ fn build_otlp_payload(
             if let Some(ref route) = s.matched_route {
                 attributes.push(otlp_attribute("http.route", route));
             }
+            if let Some(ref namespace) = s.namespace {
+                attributes.push(otlp_attribute("ferrum.namespace", namespace));
+            }
+            if let Some(ref address) = s.server_address {
+                attributes.push(otlp_attribute("server.address", address));
+            }
+            if let Some(port) = s.server_port.or(s.stream_listen_port) {
+                attributes.push(otlp_attribute_int("server.port", port as i64));
+            }
+            if let Some(ref host) = s.backend_host {
+                attributes.push(otlp_attribute("gateway.backend.address", host));
+            }
+            if let Some(port) = s.backend_port {
+                attributes.push(otlp_attribute_int("gateway.backend.port", port as i64));
+            }
             if let Some(ref target) = s.backend_target {
-                attributes.push(otlp_attribute("server.address", target));
+                attributes.push(otlp_attribute("gateway.backend.target", target));
             }
             if let Some(ref resolved) = s.backend_resolved_ip {
                 attributes.push(otlp_attribute("server.socket.address", resolved));
             }
             if let Some(ref protocol) = s.stream_protocol {
                 attributes.push(otlp_attribute("network.protocol.name", protocol));
-            }
-            if let Some(port) = s.stream_listen_port {
-                attributes.push(otlp_attribute_int("server.port", port as i64));
             }
             if let Some(bytes) = s.stream_bytes_sent {
                 attributes.push(otlp_attribute_int(
@@ -1163,11 +1735,22 @@ fn build_otlp_payload(
             if s.client_disconnected {
                 attributes.push(otlp_attribute_bool("gateway.client.disconnected", true));
             }
+            if let Some(ref body_error) = s.body_error_class {
+                attributes.push(otlp_attribute("gateway.body.error_class", body_error));
+            }
+            if s.response_streamed {
+                attributes.push(otlp_attribute_bool(
+                    "gateway.body.completed",
+                    s.body_completed,
+                ));
+            }
+            if let Some(ref digest) = s.untrusted_parent_digest {
+                attributes.push(otlp_attribute("gateway.trace.untrusted_parent", digest));
+            }
             for (key, value) in &s.mesh_attributes {
                 attributes.push(otlp_attribute(key, value));
             }
 
-            // Build span events for error conditions
             let mut events = Vec::new();
             if let Some(ref error_class) = s.error_class {
                 events.push(serde_json::json!({
@@ -1179,6 +1762,26 @@ fn build_otlp_payload(
                     ]
                 }));
             }
+            if let Some(ref body_error) = s.body_error_class {
+                events.push(serde_json::json!({
+                    "name": "exception",
+                    "timeUnixNano": end_ns.to_string(),
+                    "attributes": [
+                        otlp_attribute("exception.type", "BodyError"),
+                        otlp_attribute("exception.message", body_error),
+                    ]
+                }));
+            }
+            if let Some(grpc_status) = s.grpc_status.filter(|status| *status != 0) {
+                events.push(serde_json::json!({
+                    "name": "exception",
+                    "timeUnixNano": end_ns.to_string(),
+                    "attributes": [
+                        otlp_attribute("exception.type", "GrpcStatus"),
+                        otlp_attribute("exception.message", &format!("grpc-status {grpc_status}")),
+                    ]
+                }));
+            }
             if s.client_disconnected {
                 events.push(serde_json::json!({
                     "name": "client.disconnect",
@@ -1187,11 +1790,7 @@ fn build_otlp_payload(
                 }));
             }
 
-            let status_code = if s.http_status_code.is_some_and(|code| code >= 500) {
-                2 // ERROR
-            } else {
-                1 // OK (includes 4xx — client errors are not server errors)
-            };
+            let status_code = if s.otlp_error { 2 } else { 1 };
 
             let mut span = serde_json::json!({
                 "traceId": trace_id_bytes,
@@ -1217,7 +1816,6 @@ fn build_otlp_payload(
         })
         .collect();
 
-    // Build resource attributes
     let mut resource_attributes = vec![otlp_attribute("service.name", service_name)];
     resource_attributes.push(otlp_attribute("service.version", env!("CARGO_PKG_VERSION")));
     resource_attributes.push(otlp_attribute("telemetry.sdk.name", "ferrum-edge"));
@@ -1245,6 +1843,52 @@ fn build_otlp_payload(
     })
 }
 
+fn push_common_tags(tags: &mut serde_json::Map<String, Value>, span: &SpanData) {
+    insert_tag(tags, "http.method", &span.http_method);
+    if !span.http_url.is_empty() {
+        insert_tag(tags, "http.path", &span.http_url);
+    }
+    if let Some(status_code) = span.http_status_code {
+        insert_tag(tags, "http.status_code", &status_code.to_string());
+    }
+    if let Some(grpc_status) = span.grpc_status {
+        insert_tag(tags, "rpc.grpc.status_code", &grpc_status.to_string());
+    }
+    insert_tag(tags, "client.ip", &span.client_ip);
+    insert_tag(
+        tags,
+        "gateway.latency.total_ms",
+        &span.duration_ms.to_string(),
+    );
+    if let Some(ref proxy_id) = span.proxy_id {
+        insert_tag(tags, "gateway.proxy.id", proxy_id);
+    }
+    if let Some(ref route) = span.matched_route {
+        insert_tag(tags, "http.route", route);
+    }
+    if let Some(ref namespace) = span.namespace {
+        insert_tag(tags, "ferrum.namespace", namespace);
+    }
+    if let Some(ref address) = span.server_address {
+        insert_tag(tags, "server.address", address);
+    }
+    if let Some(port) = span.server_port.or(span.stream_listen_port) {
+        insert_tag(tags, "server.port", &port.to_string());
+    }
+    if let Some(ref host) = span.backend_host {
+        insert_tag(tags, "gateway.backend.address", host);
+    }
+    if let Some(ref target) = span.backend_target {
+        insert_tag(tags, "gateway.backend.target", target);
+    }
+    if let Some(ref protocol) = span.stream_protocol {
+        insert_tag(tags, "network.protocol.name", protocol);
+    }
+    for (key, value) in &span.mesh_attributes {
+        insert_tag(tags, key, value);
+    }
+}
+
 fn build_zipkin_payload(service_name: &str, spans: &[SpanData]) -> Value {
     let zipkin_spans: Vec<Value> = spans
         .iter()
@@ -1252,32 +1896,7 @@ fn build_zipkin_payload(service_name: &str, spans: &[SpanData]) -> Value {
             let start_us = timestamp_micros(&span.timestamp_received);
             let duration_us = (span.duration_ms.max(0.0) * 1_000.0) as i64;
             let mut tags = serde_json::Map::new();
-            insert_tag(&mut tags, "http.method", &span.http_method);
-            insert_tag(&mut tags, "http.path", &span.http_url);
-            if let Some(status_code) = span.http_status_code {
-                insert_tag(&mut tags, "http.status_code", &status_code.to_string());
-            }
-            insert_tag(&mut tags, "client.ip", &span.client_ip);
-            insert_tag(
-                &mut tags,
-                "gateway.latency.total_ms",
-                &span.duration_ms.to_string(),
-            );
-            if let Some(ref proxy_id) = span.proxy_id {
-                insert_tag(&mut tags, "gateway.proxy.id", proxy_id);
-            }
-            if let Some(ref route) = span.matched_route {
-                insert_tag(&mut tags, "http.route", route);
-            }
-            if let Some(ref target) = span.backend_target {
-                insert_tag(&mut tags, "server.address", target);
-            }
-            if let Some(ref protocol) = span.stream_protocol {
-                insert_tag(&mut tags, "network.protocol.name", protocol);
-            }
-            for (key, value) in &span.mesh_attributes {
-                insert_tag(&mut tags, key, value);
-            }
+            push_common_tags(&mut tags, span);
 
             let mut value = serde_json::json!({
                 "traceId": span.trace_id.clone(),
@@ -1321,29 +1940,13 @@ fn datadog_span_value(service_name: &str, span: &SpanData) -> Value {
     let duration_ns = (span.duration_ms.max(0.0) * 1_000_000.0) as i64;
     let mut meta = serde_json::Map::new();
     insert_tag(&mut meta, "span.kind", span.span_kind_typed.datadog_str());
-    insert_tag(&mut meta, "http.method", &span.http_method);
-    insert_tag(&mut meta, "http.url", &span.http_url);
-    insert_tag(&mut meta, "client.ip", &span.client_ip);
+    push_common_tags(&mut meta, span);
     if let Some(high_trace_bits) = datadog_high_trace_id(&span.trace_id) {
         insert_tag(&mut meta, "_dd.p.tid", high_trace_bits);
     }
-    if let Some(ref proxy_id) = span.proxy_id {
-        insert_tag(&mut meta, "gateway.proxy.id", proxy_id);
-    }
-    if let Some(ref route) = span.matched_route {
-        insert_tag(&mut meta, "http.route", route);
-    }
-    if let Some(ref target) = span.backend_target {
-        insert_tag(&mut meta, "server.address", target);
-    }
-    if let Some(ref protocol) = span.stream_protocol {
-        insert_tag(&mut meta, "network.protocol.name", protocol);
-    }
-    for (key, value) in &span.mesh_attributes {
-        insert_tag(&mut meta, key, value);
-    }
 
     let mut metrics = serde_json::Map::new();
+    // Sampled exports only reach Datadog; keep sampling priority affirmative.
     metrics.insert(
         "_sampling_priority_v1".to_string(),
         serde_json::json!(1.0_f64),
@@ -1358,6 +1961,9 @@ fn datadog_span_value(service_name: &str, span: &SpanData) -> Value {
             serde_json::json!(status_code as i64),
         );
     }
+    if span.otlp_error {
+        metrics.insert("error".to_string(), serde_json::json!(1.0_f64));
+    }
 
     serde_json::json!({
         "trace_id": hex_low_u64(&span.trace_id),
@@ -1371,6 +1977,7 @@ fn datadog_span_value(service_name: &str, span: &SpanData) -> Value {
         "duration": duration_ns,
         "meta": meta,
         "metrics": metrics,
+        "error": if span.otlp_error { 1 } else { 0 },
     })
 }
 
@@ -1465,27 +2072,112 @@ fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String>
     }
 }
 
-fn u64_config(config: &Value, key: &str, default: u64, min: u64) -> Result<u64, String> {
-    match config.get(key) {
-        None | Some(Value::Null) => Ok(default.max(min)),
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .map(|n| n.max(min))
-            .ok_or_else(|| format!("otel_tracing: '{key}' must be a non-negative integer")),
+fn u64_config_range(
+    config: &Value,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let value = match config.get(key) {
+        None | Some(Value::Null) => default,
+        Some(Value::Number(value)) => value.as_u64().ok_or_else(|| {
+            format!("otel_tracing: '{key}' must be a non-negative integer")
+        })?,
+        Some(other) => {
+            return Err(format!(
+                "otel_tracing: '{key}' must be a non-negative integer, got: {other}"
+            ));
+        }
+    };
+    if value < min || value > max {
+        return Err(format!(
+            "otel_tracing: '{key}' must be between {min} and {max}, got: {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn usize_config_range(
+    config: &Value,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<usize, String> {
+    let value = u64_config_range(config, key, default, min, max)?;
+    usize::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
+}
+
+fn u32_config_range(
+    config: &Value,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u32, String> {
+    let value = u64_config_range(config, key, default, min, max)?;
+    u32::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
+}
+
+fn parse_trace_context_trust(config: &Value) -> Result<TraceContextTrust, String> {
+    match config.get("trace_context_trust") {
+        None | Some(Value::Null) => Ok(TraceContextTrust::Untrusted),
+        Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "untrusted" => Ok(TraceContextTrust::Untrusted),
+            "trusted" => Ok(TraceContextTrust::Trusted),
+            other => Err(format!(
+                "otel_tracing: 'trace_context_trust' must be 'trusted' or 'untrusted', got: {other}"
+            )),
+        },
         Some(other) => Err(format!(
-            "otel_tracing: '{key}' must be a non-negative integer, got: {other}"
+            "otel_tracing: 'trace_context_trust' must be a string, got: {other}"
         )),
     }
 }
 
-fn usize_config(config: &Value, key: &str, default: usize, min: usize) -> Result<usize, String> {
-    let value = u64_config(config, key, default as u64, min as u64)?;
-    usize::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
-}
-
-fn u32_config(config: &Value, key: &str, default: u32, min: u32) -> Result<u32, String> {
-    let value = u64_config(config, key, default as u64, min as u64)?;
-    u32::try_from(value).map_err(|_| format!("otel_tracing: '{key}' is too large"))
+fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
+    let mode = match config.get("root_sampling") {
+        None | Some(Value::Null) => "always_on".to_string(),
+        Some(Value::String(value)) => value.trim().to_ascii_lowercase(),
+        Some(other) => {
+            return Err(format!(
+                "otel_tracing: 'root_sampling' must be a string, got: {other}"
+            ));
+        }
+    };
+    match mode.as_str() {
+        "always_on" => Ok(RootSampling::AlwaysOn),
+        "always_off" => Ok(RootSampling::AlwaysOff),
+        "ratio" => {
+            let ratio = match config.get("root_sampling_ratio") {
+                None | Some(Value::Null) => {
+                    return Err(
+                        "otel_tracing: 'root_sampling_ratio' is required when root_sampling=ratio"
+                            .to_string(),
+                    );
+                }
+                Some(Value::Number(n)) => n.as_f64().ok_or_else(|| {
+                    "otel_tracing: 'root_sampling_ratio' must be a number between 0.0 and 1.0"
+                        .to_string()
+                })?,
+                Some(other) => {
+                    return Err(format!(
+                        "otel_tracing: 'root_sampling_ratio' must be a number, got: {other}"
+                    ));
+                }
+            };
+            if !(0.0..=1.0).contains(&ratio) || ratio.is_nan() {
+                return Err(format!(
+                    "otel_tracing: 'root_sampling_ratio' must be between 0.0 and 1.0, got: {ratio}"
+                ));
+            }
+            Ok(RootSampling::Ratio(ratio))
+        }
+        other => Err(format!(
+            "otel_tracing: 'root_sampling' must be always_on, always_off, or ratio, got: {other}"
+        )),
+    }
 }
 
 fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result<String, String> {
@@ -1498,6 +2190,11 @@ fn validate_endpoint_for_provider(provider_name: &str, endpoint: &str) -> Result
                 "{provider_name}: 'endpoint' scheme must be http or https, got: {scheme}"
             ));
         }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "{provider_name}: 'endpoint' must not contain user information; use authorization or headers"
+        ));
     }
     if !has_non_empty_authority(endpoint) {
         return Err(format!(
@@ -1518,6 +2215,11 @@ fn datadog_traces_endpoint(agent_url: &str) -> Result<String, String> {
                 "Datadog: 'agent_url' scheme must be http or https, got: {scheme}"
             ));
         }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "Datadog: 'agent_url' must not contain user information".to_string(),
+        );
     }
     if !has_non_empty_authority(agent_url) || normalized_url_hostname(&url).is_none() {
         return Err("Datadog: 'agent_url' must include a hostname".to_string());
@@ -1550,6 +2252,21 @@ fn normalized_url_hostname(url: &Url) -> Option<String> {
     }
 }
 
+/// Structurally redacted collector URL for diagnostics (path/query omitted).
+pub(crate) fn redacted_endpoint_url(endpoint: &Url) -> String {
+    let host = match endpoint.host() {
+        Some(Host::Domain(host)) => host.to_string(),
+        Some(Host::Ipv4(host)) => host.to_string(),
+        Some(Host::Ipv6(host)) => format!("[{host}]"),
+        None => "redacted-host".to_string(),
+    };
+    let port = endpoint
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    format!("{}://{}{}/redacted", endpoint.scheme(), host, port)
+}
+
 pub(crate) fn build_traceparent(
     version: &str,
     trace_id: &str,
@@ -1573,6 +2290,17 @@ pub(crate) fn ensure_trace_metadata(
     headers: &HashMap<String, String>,
 ) {
     if metadata.contains_key("trace_id") && metadata.contains_key("span_id") {
+        if !metadata.contains_key("trace_sampled") {
+            let sampled = metadata
+                .get(TRACEPARENT_HEADER)
+                .and_then(|value| OtelTracing::parse_traceparent(value))
+                .map(|parsed| flags_sampled(parsed.flags))
+                .unwrap_or(true);
+            metadata.insert(
+                "trace_sampled".to_string(),
+                if sampled { "true" } else { "false" }.to_string(),
+            );
+        }
         return;
     }
 
@@ -1586,16 +2314,27 @@ pub(crate) fn ensure_trace_metadata(
         );
         let span_id = OtelTracing::generate_span_id();
         metadata.insert("span_id".to_string(), span_id.clone());
+        let sampled = flags_sampled(parsed.flags);
+        metadata.insert(
+            "trace_sampled".to_string(),
+            if sampled { "true" } else { "false" }.to_string(),
+        );
         metadata.insert(
             TRACEPARENT_HEADER.to_string(),
-            build_traceparent(parsed.version, parsed.trace_id, &span_id, parsed.flags),
+            build_traceparent(
+                SUPPORTED_TRACEPARENT_VERSION,
+                parsed.trace_id,
+                &span_id,
+                if sampled { "01" } else { "00" },
+            ),
         );
         return;
     }
 
-    let generated = OtelTracing::generate_trace_context();
+    let generated = OtelTracing::generate_trace_context(true);
     metadata.insert("trace_id".to_string(), generated.trace_id);
     metadata.insert("span_id".to_string(), generated.span_id);
+    metadata.insert("trace_sampled".to_string(), "true".to_string());
     metadata.insert(TRACEPARENT_HEADER.to_string(), generated.traceparent);
 }
 
@@ -1664,14 +2403,6 @@ fn otlp_attribute_bool(key: &str, value: bool) -> Value {
     })
 }
 
-/// Convert a hex string to base64-encoded bytes (OTLP/HTTP JSON encoding).
-///
-/// Per the OpenTelemetry spec, `traceId` (16 bytes / 32 hex chars) and
-/// `spanId` (8 bytes / 16 hex chars) are JSON-encoded as base64-standard
-/// strings. Callers in this module always pass even-length hex (validated
-/// upstream by `parse_traceparent` / produced by `generate_traceparent`),
-/// but the implementation is robust against odd-length input — the trailing
-/// half-byte is dropped rather than panicking on a slice out of bounds.
 fn hex_to_base64(hex: &str) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -1690,6 +2421,128 @@ fn hex_to_base64(hex: &str) -> String {
     STANDARD.encode(&bytes)
 }
 
+fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn flags_sampled(flags: &str) -> bool {
+    u8::from_str_radix(flags, 16)
+        .map(|flags| flags & 0x01 == 0x01)
+        .unwrap_or(false)
+}
+
+fn sample_ratio(ratio: f64) -> bool {
+    if ratio <= 0.0 {
+        return false;
+    }
+    if ratio >= 1.0 {
+        return true;
+    }
+    let random = Uuid::new_v4().as_u128() as f64 / (u128::MAX as f64);
+    random < ratio
+}
+
+fn truncate_attr(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = value[..end].to_string();
+    out.push_str("...");
+    out
+}
+
+fn http_span_name(summary: &TransactionSummary) -> String {
+    let method = summary.http_method.as_str();
+    if let Some(route) = summary.proxy_name.as_deref().filter(|v| !v.is_empty()) {
+        format!("{method} {route}")
+    } else if let Some(proxy_id) = summary.proxy_id.as_deref().filter(|v| !v.is_empty()) {
+        format!("{method} {proxy_id}")
+    } else {
+        method.to_string()
+    }
+}
+
+fn http_span_is_error(summary: &TransactionSummary) -> bool {
+    summary.is_terminal_failure()
+        || summary.response_status_code >= 500
+        || summary.grpc_status().is_some_and(|status| status != 0)
+}
+
+fn server_authority_from_metadata(
+    metadata: &HashMap<String, String>,
+) -> (Option<String>, Option<u16>) {
+    let address = metadata.get("server_address").cloned();
+    let port = metadata
+        .get("server_port")
+        .or_else(|| metadata.get("frontend_listen_port"))
+        .and_then(|v| v.parse().ok());
+    (address, port)
+}
+
+fn parse_host_header_authority(host: &str) -> Option<(String, Option<u16>)> {
+    let host = host.trim();
+    if host.is_empty() || host.len() > 256 {
+        return None;
+    }
+    if let Some(rest) = host.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let address = rest[..end].to_string();
+        if address.is_empty() {
+            return None;
+        }
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok());
+        return Some((address, port));
+    }
+    match host.rsplit_once(':') {
+        Some((address, port)) if !address.contains(':') => {
+            let port = port.parse().ok();
+            Some((address.to_string(), port))
+        }
+        _ => Some((host.to_string(), None)),
+    }
+}
+
+fn parse_backend_host_port(target: &str) -> (Option<String>, Option<u16>) {
+    let host = extract_host_from_url(target).map(|h| h.to_string());
+    let port = extract_port_from_url_or_hostport(target);
+    (host, port)
+}
+
+fn extract_port_from_url_or_hostport(s: &str) -> Option<u16> {
+    if let Ok(url) = Url::parse(s) {
+        return url.port().or_else(|| match url.scheme() {
+            "https" | "wss" => Some(443),
+            "http" | "ws" => Some(80),
+            _ => None,
+        });
+    }
+    let after_scheme = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return rest[end + 1..].strip_prefix(':')?.parse().ok();
+    }
+    authority.rsplit_once(':').and_then(|(_, port)| port.parse().ok())
+}
+
+fn bounded_untrusted_parent_digest(trace_id: &str, parent_span_id: &str) -> String {
+    // Bound and avoid retaining full attacker-chosen IDs as parents.
+    let mut material = String::with_capacity(16);
+    material.push_str(&trace_id.chars().take(8).collect::<String>());
+    material.push(':');
+    material.push_str(&parent_span_id.chars().take(4).collect::<String>());
+    material
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,12 +2553,13 @@ mod tests {
             span_id: span_id.to_string(),
             parent_span_id: String::new(),
             service_name: "ferrum-edge".to_string(),
-            span_name: "GET /api".to_string(),
+            span_name: "GET api".to_string(),
             span_kind: 2,
             span_kind_typed: SpanKind::Server,
             http_method: "GET".to_string(),
             http_url: "/api".to_string(),
             http_status_code: Some(200),
+            grpc_status: None,
             client_ip: "127.0.0.1".to_string(),
             duration_ms: 10.0,
             gateway_processing_ms: 1.0,
@@ -1718,16 +2572,25 @@ mod tests {
             user_agent: None,
             proxy_id: Some("proxy-a".to_string()),
             matched_route: Some("api".to_string()),
+            namespace: Some("ferrum".to_string()),
+            server_address: Some("edge.example".to_string()),
+            server_port: Some(443),
             backend_target: None,
+            backend_host: None,
+            backend_port: None,
             backend_resolved_ip: None,
             error_class: None,
+            body_error_class: None,
+            body_completed: true,
             response_streamed: false,
             client_disconnected: false,
+            otlp_error: false,
             mesh_attributes: Vec::new(),
             stream_protocol: None,
             stream_listen_port: None,
             stream_bytes_sent: None,
             stream_bytes_received: None,
+            untrusted_parent_digest: None,
         }
     }
 
@@ -1735,6 +2598,7 @@ mod tests {
         TraceHttpExporterConfig {
             provider_name: "workload_metrics",
             endpoint: "http://collector:4318/v1/traces".to_string(),
+            endpoint_for_logs: "http://collector:4318/redacted".to_string(),
             authorization: None,
             custom_headers: Vec::new(),
             http_client: PluginHttpClient::default(),
@@ -1750,7 +2614,7 @@ mod tests {
 
     #[test]
     fn buffered_trace_exporter_defers_start_without_runtime() {
-        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8)
+        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8, 1024 * 1024)
             .expect("exporter config accepted");
 
         assert!(!exporter.started.load(Ordering::Acquire));
@@ -1771,7 +2635,7 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_trace_exporter_marks_started_when_runtime_available() {
-        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8)
+        let exporter = BufferedTraceExporter::new(test_trace_http_exporter_config(), 8, 1024 * 1024)
             .expect("exporter config accepted");
 
         assert!(
@@ -1782,16 +2646,13 @@ mod tests {
 
     #[test]
     fn hex_to_base64_decodes_even_length_input() {
-        // Standard 16-byte trace_id (32 hex chars).
         let hex = "4bf92f3577b34da6a3ce929d0e0e4736";
         let encoded = hex_to_base64(hex);
-        // base64.b64encode(bytes.fromhex(...)) == "S/kvNXezTaajzpKdDg5HNg=="
         assert_eq!(encoded, "S/kvNXezTaajzpKdDg5HNg==");
     }
 
     #[test]
     fn hex_to_base64_decodes_8_byte_span_id() {
-        // Standard 8-byte span_id (16 hex chars).
         let hex = "00f067aa0ba902b7";
         let encoded = hex_to_base64(hex);
         assert_eq!(encoded, "APBnqgupArc=");
@@ -1804,18 +2665,35 @@ mod tests {
 
     #[test]
     fn hex_to_base64_handles_odd_length_without_panic() {
-        // Defensive: odd-length should not panic. The trailing half-byte
-        // is dropped (the final iteration would slice past hex.len() and
-        // is filtered out via the `end > hex.len()` guard).
         let _ = hex_to_base64("abc");
         let _ = hex_to_base64("4bf92f3577b34da6a3ce929d0e0e473");
     }
 
     #[test]
     fn hex_to_base64_invalid_chars_filtered() {
-        // Non-hex chars are filtered out via from_str_radix Err.
         let encoded = hex_to_base64("XX");
-        assert_eq!(encoded, ""); // no valid bytes decoded
+        assert_eq!(encoded, "");
+    }
+
+    #[test]
+    fn parse_traceparent_rejects_uppercase_and_accepts_future_version_extensions() {
+        assert!(
+            OtelTracing::parse_traceparent(
+                "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01"
+            )
+            .is_none()
+        );
+        let parsed = OtelTracing::parse_traceparent(
+            "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        )
+        .expect("future version with extension");
+        assert_eq!(parsed.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert!(
+            OtelTracing::parse_traceparent(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra"
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1864,49 +2742,20 @@ mod tests {
 
     #[test]
     fn otlp_payload_includes_mesh_identity_attributes() {
-        let span = SpanData {
-            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
-            span_id: "00f067aa0ba902b7".to_string(),
-            parent_span_id: String::new(),
-            service_name: "ferrum-edge".to_string(),
-            span_name: "GET /".to_string(),
-            span_kind: 2,
-            span_kind_typed: SpanKind::Server,
-            http_method: "GET".to_string(),
-            http_url: "/".to_string(),
-            http_status_code: Some(200),
-            client_ip: "127.0.0.1".to_string(),
-            duration_ms: 10.0,
-            gateway_processing_ms: 1.0,
-            backend_ttfb_ms: 2.0,
-            backend_ms: 3.0,
-            plugin_execution_ms: 1.0,
-            gateway_overhead_ms: 1.0,
-            consumer: None,
-            timestamp_received: "2025-01-01T00:00:00Z".to_string(),
-            user_agent: None,
-            proxy_id: Some("proxy-a".to_string()),
-            matched_route: Some("payments".to_string()),
-            backend_target: None,
-            backend_resolved_ip: None,
-            error_class: None,
-            response_streamed: false,
-            client_disconnected: false,
-            mesh_attributes: vec![
-                (
-                    "mesh.source.principal".to_string(),
-                    "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
-                ),
-                (
-                    "mesh.destination.service".to_string(),
-                    "payments".to_string(),
-                ),
-            ],
-            stream_protocol: None,
-            stream_listen_port: None,
-            stream_bytes_sent: None,
-            stream_bytes_received: None,
-        };
+        let mut span = test_span("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7");
+        span.span_name = "GET /".to_string();
+        span.http_url = "/".to_string();
+        span.matched_route = Some("payments".to_string());
+        span.mesh_attributes = vec![
+            (
+                "mesh.source.principal".to_string(),
+                "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+            ),
+            (
+                "mesh.destination.service".to_string(),
+                "payments".to_string(),
+            ),
+        ];
 
         let payload = build_otlp_payload("ferrum-edge", None, &[span]);
         let attributes = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
@@ -1922,5 +2771,23 @@ mod tests {
             attribute["key"] == "mesh.destination.service"
                 && attribute["value"]["stringValue"] == "payments"
         }));
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == "ferrum.namespace"
+                && attribute["value"]["stringValue"] == "ferrum"
+        }));
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == "server.address"
+                && attribute["value"]["stringValue"] == "edge.example"
+        }));
+    }
+
+    #[test]
+    fn server_address_never_contains_backend_url_path() {
+        let (host, port) = parse_backend_host_port("https://api.internal:8443/v1/orders");
+        assert_eq!(host.as_deref(), Some("api.internal"));
+        assert_eq!(port, Some(8443));
+        let (host6, port6) = parse_backend_host_port("http://[2001:db8::1]:8080/path");
+        assert_eq!(host6.as_deref(), Some("2001:db8::1"));
+        assert_eq!(port6, Some(8080));
     }
 }

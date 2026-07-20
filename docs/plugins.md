@@ -1361,29 +1361,49 @@ normalized final `grpc_status` as separate fields.
 
 ### `otel_tracing`
 
-W3C Trace Context propagation and OTLP span export. Runs at priority 25 (earliest plugin) to capture accurate request timing.
+W3C Trace Context propagation and OTLP/Zipkin/Datadog span export. Runs at priority 25 (earliest plugin) to capture accurate request timing.
 
 **Priority:** 25
 
 Supports two modes:
-- **Propagation + Export** (default): Generates/propagates `traceparent`/`tracestate` headers and exports spans to an OTLP collector via HTTP/JSON.
+- **Propagation + Export**: Generates/propagates `traceparent`/`tracestate` and exports sampled spans to a collector via HTTP/JSON.
 - **Propagation-only**: When no `endpoint` is configured, generates/propagates trace context without exporting spans.
+
+#### Trace-context trust and sampling
+
+`trace_context_trust` defaults to `untrusted` (fail-closed). Untrusted ingress never adopts a caller-chosen parent; Ferrum creates a fresh root and may record only a bounded digest of the inbound IDs. Set `trusted` only for internal/mesh listeners that should parent under a valid W3C `traceparent`.
+
+Wire parsing follows W3C Trace Context: lowercase hex only, version-`00` exact field count, forward-compatible higher versions, outgoing version always `00`, and `tracestate` is dropped whenever the parent is invalid or untrusted.
+
+Sampling is parent-based for trusted parents (`sampled=0` suppresses export while still propagating flags). Root traces use `root_sampling` (`always_on` by default, or `always_off` / `ratio` with `root_sampling_ratio`).
+
+#### Span semantics
+
+Gateway spans are `SERVER`. `server.address` / `server.port` come from the client-facing Host/listener when known and are omitted otherwise. Upstream selection is emitted as `gateway.backend.*` and never as `server.address`. Span names use `METHOD <proxy_name|proxy_id>` (or method alone) — never the raw request path. Bounded `url.path` remains an attribute when `include_url_path` is true.
+
+Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/stream failures, and classified stream/WebSocket errors. Ordinary HTTP 4xx alone stays `OK`. WebSocket upgrades emit the HTTP handshake span from `log` and a separate disconnect span from `on_ws_disconnect` with a new span ID under the same trace.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode |
+| `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode. URL userinfo is rejected; diagnostics redact path/query |
 | `service_name` | String | `ferrum-edge` | Service name in spans and resource attributes |
 | `deployment_environment` | String | _(none)_ | `deployment.environment` resource attribute |
-| `generate_trace_id` | Boolean | `true` | Generate trace IDs for requests without incoming `traceparent` |
-| `headers` | Object | `{}` | Custom HTTP headers sent with OTLP exports |
-| `authorization` | String | _(none)_ | Authorization header value for OTLP exports |
-| `batch_size` | Integer | `50` | Spans per export batch |
-| `flush_interval_ms` | Integer | `5000` | Max delay before flushing a partial batch |
-| `buffer_capacity` | Integer | `10000` | Max pending spans; new spans are dropped when the buffer is full |
-| `max_retries` | Integer | `2` | Retry attempts on export failure |
-| `retry_delay_ms` | Integer | `1000` | Delay between retries |
+| `generate_trace_id` | Boolean | `true` | Generate trace IDs when no usable incoming context exists |
+| `trace_context_trust` | String | `untrusted` | `untrusted` or `trusted` inbound parent policy |
+| `root_sampling` | String | `always_on` | `always_on`, `always_off`, or `ratio` for locally created roots |
+| `root_sampling_ratio` | Number | _(required for ratio)_ | Fraction in `[0.0, 1.0]` when `root_sampling=ratio` |
+| `include_url_path` | Boolean | `true` | Include bounded `url.path` attribute |
+| `headers` | Object | `{}` | Custom HTTP headers sent with exports (values treated as secrets) |
+| `authorization` | String | _(none)_ | Authorization header value for OTLP exports (secret) |
+| `batch_size` | Integer | `50` | Spans per export batch (`1`–`10000`) |
+| `flush_interval_ms` | Integer | `5000` | Max delay before flushing a partial batch (`100`–`600000`) |
+| `buffer_capacity` | Integer | `10000` | Max pending spans; **new** spans are dropped when full (`1`–`100000`) |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate queued span byte budget |
+| `max_attribute_bytes` | Integer | `2048` | Max retained bytes per string attribute |
+| `max_retries` | Integer | `2` | Retry attempts on export failure (`0`–`10`) |
+| `retry_delay_ms` | Integer | `1000` | Delay between retries (`0`–`60000`) |
 
-Exported spans include OTel semantic convention attributes, gateway-specific attributes (`gateway.proxy.id`, `gateway.latency.*`), error classification events, and resource attributes.
+Unknown configuration keys and out-of-range numeric values are rejected. OTLP partial-success responses are recognized (not retried) and logged with a bounded collector message. Exported spans include `ferrum.namespace`, gateway latency attributes, and role-correct address mapping across OTLP, Zipkin, and Datadog.
 
 ---
 

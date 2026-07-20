@@ -785,6 +785,8 @@ impl WorkloadMetrics {
             summary,
             &self.service_name,
             kind,
+            true,
+            2_048,
         ));
     }
 }
@@ -1014,6 +1016,7 @@ impl Plugin for WorkloadMetrics {
             summary,
             &self.service_name,
             kind,
+            2_048,
         ));
     }
 

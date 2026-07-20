@@ -755,6 +755,59 @@ fn assert_loki_config_projection_redacted(config: &Value) {
 }
 
 #[tokio::test]
+async fn otel_tracing_config_projections_redact_endpoint_auth_and_headers() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+
+    let path_secret = "otel-path-canary";
+    let query_secret = "otel-query-canary";
+    let auth_secret = "otel-auth-canary";
+    let header_secret = "otel-header-canary";
+    let endpoint = format!(
+        "https://collector.example.com/{path_secret}/v1/traces?api_key={query_secret}"
+    );
+    let plugin = json!({
+        "id": "otel-redaction-config",
+        "plugin_name": "otel_tracing",
+        "scope": "global",
+        "config": {
+            "endpoint": endpoint,
+            "authorization": format!("Bearer {auth_secret}"),
+            "headers": {
+                "x-honeycomb-team": header_secret
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "otel plugin create failed: {body:?}");
+    assert_eq!(body["config"]["endpoint"], endpoint);
+
+    let (status, projected) =
+        get_json(&base, "/plugins/config/otel-redaction-config", &viewer).await;
+    assert_eq!(status, 200, "viewer otel config read failed: {projected:?}");
+    assert_eq!(
+        projected["config"]["endpoint"],
+        "https://collector.example.com/redacted"
+    );
+    assert_eq!(projected["config"]["authorization"], "[REDACTED]");
+    assert_eq!(
+        projected["config"]["headers"]["x-honeycomb-team"],
+        "[REDACTED]"
+    );
+    let serialized = projected["config"].to_string();
+    for secret in [path_secret, query_secret, auth_secret, header_secret] {
+        assert!(
+            !serialized.contains(secret),
+            "otel config projection leaked {secret}: {serialized}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn disabled_non_object_loki_configs_are_fully_redacted_across_projections() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
