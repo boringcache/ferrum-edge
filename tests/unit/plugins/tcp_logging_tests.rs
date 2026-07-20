@@ -496,7 +496,8 @@ async fn test_tcp_logging_accepts_valid_dns_and_ip_tls_server_names() {
         );
         assert!(
             result.is_ok(),
-            "valid tls_server_name {tls_server_name} should admit: {result:?}"
+            "valid tls_server_name {tls_server_name} should admit: {:?}",
+            result.as_ref().err()
         );
     }
 }
