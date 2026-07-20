@@ -3610,6 +3610,74 @@ def generated_shell_assignment_spans(
     )
 
 
+def shell_capture_target_names(segment: tuple[str, ...]) -> frozenset[str]:
+    """Return variables populated by a bounded shell capture builtin."""
+
+    index, executes = executable_index(segment)
+    if not executes or index >= len(segment):
+        return frozenset()
+    command = tool_name(segment[index])
+    if command == "builtin" and index + 1 < len(segment):
+        index += 1
+        command = tool_name(segment[index])
+    arguments = segment[index + 1 :]
+    names: set[str] = set()
+    if command == "printf":
+        for position, argument in enumerate(arguments):
+            if argument == "-v" and position + 1 < len(arguments):
+                target = arguments[position + 1]
+            elif argument.startswith("-v") and len(argument) > 2:
+                target = argument[2:]
+            else:
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", target):
+                names.add(target)
+        return frozenset(names)
+    if command not in {"mapfile", "read", "readarray"}:
+        return frozenset()
+    names.update(
+        argument
+        for argument in arguments
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", argument)
+    )
+    # These are the documented implicit destinations when no explicit variable
+    # is supplied. Retaining them unconditionally is conservative when options
+    # carry identifier-shaped operands and avoids mistaking one for a target.
+    names.add("REPLY" if command == "read" else "MAPFILE")
+    return frozenset(names)
+
+
+def generated_shell_capture_operands(
+    line: str,
+    evaluated_variables: frozenset[str],
+) -> frozenset[str]:
+    """Return repository commands whose output enters an evaluated variable."""
+
+    if not evaluated_variables:
+        return frozenset()
+    tokens = shell_tokens(line)
+    if tokens is None:
+        return frozenset()
+    operands: set[str] = set()
+    for statement in shell_statement_groups(tokens):
+        pipeline = split_shell_pipeline(statement)
+        for position, segment in enumerate(pipeline):
+            if not (
+                shell_capture_target_names(segment) & evaluated_variables
+            ):
+                continue
+            # An earlier pipeline stage feeds `read`, while command/process
+            # substitutions used by `printf -v` or a redirected capture remain
+            # in the capture segment itself. Every literal repository command in
+            # either position can therefore influence the evaluated bytes.
+            for contributing in (*pipeline[:position], segment):
+                for word in contributing:
+                    normalized = normalize_repository_path(word)
+                    if normalized is not None:
+                        operands.add(normalized)
+    return frozenset(operands)
+
+
 def shell_statement_groups(
     tokens: tuple[str, ...],
 ) -> tuple[tuple[str, ...], ...]:
@@ -10864,8 +10932,12 @@ def block_automation_references(
                     )
                 )
             )
-            generated_stdin_operands = generated_stdin_program_operands(
-                normalized_line
+            generated_output_operands = (
+                generated_stdin_program_operands(normalized_line)
+                | generated_shell_capture_operands(
+                    normalized_line,
+                    generated_source_variables,
+                )
             )
             directory_matches = list(CD_COMMAND.finditer(normalized_line))
             opened_controls = len(
@@ -10954,7 +11026,7 @@ def block_automation_references(
                 normalized_raw_command_path = normalize_repository_path(
                     raw_command_path
                 )
-                if normalized_raw_command_path in generated_stdin_operands:
+                if normalized_raw_command_path in generated_output_operands:
                     # A literal repository program whose stdout enters an
                     # interpreter stdin is an output generator just as surely
                     # as one nested directly inside `eval "$(...)"`. Keep its
@@ -18697,6 +18769,23 @@ pre_build = []
             "./scripts/build",
             "bash --norc < <(./scripts/build)",
         ),
+        "eval through read process substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'IFS= read -r generated < <(./scripts/build); eval "$generated"',
+        ),
+        "eval through a read pipeline": extensionless_workflow.replace(
+            "./scripts/build",
+            './scripts/build | read generated; eval "$generated"',
+        ),
+        "eval through mapfile capture": extensionless_workflow.replace(
+            "./scripts/build",
+            'mapfile -t generated < <(./scripts/build); eval "${generated[*]}"',
+        ),
+        "eval through printf-v capture": extensionless_workflow.replace(
+            "./scripts/build",
+            'printf -v generated \'%s\' "$(./scripts/build)"; '
+            'eval "$generated"',
+        ),
         "eval through an assigned variable": extensionless_workflow.replace(
             "./scripts/build",
             'generated="$(./scripts/build)"; eval "$generated"',
@@ -18817,6 +18906,11 @@ pre_build = []
             "./scripts/build",
             "evaluated='echo safe'; printf '%s\\n' \"$unrelated\"; "
             "unrelated=\"$(./scripts/build)\"; eval \"$evaluated\"",
+        ),
+        "capture into an unevaluated variable": extensionless_workflow.replace(
+            "./scripts/build",
+            "IFS= read -r data < <(./scripts/build); "
+            "evaluated='echo safe'; eval \"$evaluated\"",
         ),
     }
     for data_label, data_workflow in extensionless_data_substitution_workflows.items():
