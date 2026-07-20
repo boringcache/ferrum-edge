@@ -733,6 +733,9 @@ async fn response_transformer_buffers_json_when_client_accepts_sse() {
         .expect("spawn backend");
 
     let harness = GatewayHarness::builder()
+        // Keep the scripted backend cold: binary-mode startup performs an
+        // independent capability probe that would be counted as a request.
+        .mode_in_process()
         .file_config(response_transformer_sse_policy_file_config(backend_port))
         .pool_warmup_enabled(false)
         .spawn()
@@ -816,6 +819,9 @@ async fn response_transformer_releases_backend_sse_incrementally() {
         .expect("spawn backend");
 
     let harness = GatewayHarness::builder()
+        // Keep the scripted backend cold: binary-mode startup performs an
+        // independent capability probe that would be counted as a request.
+        .mode_in_process()
         .file_config(response_transformer_sse_policy_file_config(backend_port))
         .pool_warmup_enabled(false)
         .spawn()
