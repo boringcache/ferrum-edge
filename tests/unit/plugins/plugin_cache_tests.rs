@@ -1597,6 +1597,46 @@ fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance
 }
 
 #[test]
+fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "compression-1",
+            "compression",
+            json!({"min_content_length": 512, "gzip_level": 4}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid compression cache");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "compression");
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "compression-1",
+            "compression",
+            json!({"min_content_lenght": 4096}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("unknown compression key must reject cache publication");
+    assert!(error.contains("config.min_content_lenght"), "got: {error}");
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted compression instance"
+    );
+}
+
+#[test]
 fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
     let valid_cfg = json!({
         "channels": {
@@ -7301,4 +7341,69 @@ fn test_priority_override_reverses_default_order() {
     assert_eq!(plugins[0].priority(), 50);
     assert_eq!(plugins[1].name(), "cors");
     assert_eq!(plugins[1].priority(), 5000);
+}
+
+#[test]
+fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good() {
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("ai_semantic_cache"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::KeepLastKnownGood)
+    );
+
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec!["ai-cache"])],
+        vec![make_plugin_config_with_json(
+            "ai-cache",
+            "ai_semantic_cache",
+            json!({
+                "ttl_seconds": 60,
+                "cache_multimodal": "reject",
+                "scope_by_consumer": true
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid ai_semantic_cache must admit");
+    let last_good = cache.get_plugins("p1");
+    assert_eq!(last_good.len(), 1);
+    assert_eq!(last_good[0].name(), "ai_semantic_cache");
+
+    for bad_config in [
+        json!({"ttl_second": 30, "cache_multimodal": "reject"}),
+        json!({"ttl_seconds": 30, "cache_multimoda": "reject"}),
+        json!({"ttl_seconds": 30, "sync_mod": "redis", "redis_url": "redis://127.0.0.1:6379/0"}),
+        json!({"ttl_seconds": 30, "semantic_similarity_enable": true}),
+    ] {
+        let invalid = make_config(
+            vec![make_proxy("p1", "/api", vec!["ai-cache"])],
+            vec![make_plugin_config_with_json(
+                "ai-cache",
+                "ai_semantic_cache",
+                bad_config.clone(),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let delta = ConfigDelta::compute(&valid, &invalid);
+        let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&valid, &invalid);
+        let error = cache
+            .apply_delta(
+                &invalid,
+                &proxy_ids,
+                &delta.removed_proxy_ids,
+                delta.global_plugin_configs_changed,
+            )
+            .expect_err("unknown ai_semantic_cache key must reject reload");
+        assert!(
+            error.contains("ai_semantic_cache: unknown configuration key(s):"),
+            "unexpected reload error for {bad_config}: {error}"
+        );
+        let after_reject = cache.get_plugins("p1");
+        assert_eq!(after_reject.len(), 1);
+        assert!(
+            Arc::ptr_eq(&after_reject[0], &last_good[0]),
+            "rejected candidate must retain the last-known-good ai_semantic_cache generation"
+        );
+    }
 }
