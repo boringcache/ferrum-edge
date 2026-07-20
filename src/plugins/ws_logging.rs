@@ -309,6 +309,7 @@ impl WsByteLease {
         }
     }
 
+    #[cfg(test)]
     fn charged_bytes(&self) -> usize {
         self.bytes.load(Ordering::Acquire)
     }
@@ -338,6 +339,7 @@ impl WsByteBudget {
         }
     }
 
+    #[cfg(test)]
     fn used(&self) -> usize {
         self.used_bytes.load(Ordering::Acquire)
     }
