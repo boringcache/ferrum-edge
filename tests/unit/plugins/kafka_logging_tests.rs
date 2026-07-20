@@ -695,7 +695,9 @@ fn test_kafka_logging_finalize_budget_includes_blocking_pool_queue() {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let blocker = tokio::task::spawn_blocking(move || {
-            started_tx.send(()).expect("announce occupied blocking slot");
+            started_tx
+                .send(())
+                .expect("announce occupied blocking slot");
             release_rx.recv().expect("release occupied blocking slot");
         });
         started_rx
@@ -731,7 +733,10 @@ fn test_kafka_logging_finalize_budget_includes_blocking_pool_queue() {
         assert_eq!(snapshot.flush_timeouts_total, 1);
         assert_eq!(snapshot.flush_failures_total, 1);
         assert_eq!(
-            snapshot.last_failure.as_ref().map(|failure| failure.error_kind.as_str()),
+            snapshot
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.error_kind.as_str()),
             Some("flush_task_timed_out")
         );
 
