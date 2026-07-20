@@ -8788,6 +8788,14 @@ def tokenized_stdin_interpreter_language(
 def executable_heredoc_language(line: str, start: int) -> str | None:
     """Classify the interpreter that receives one heredoc body, if any."""
 
+    def named_language(executable: str) -> str:
+        name = tool_name(executable)
+        if PYTHON_INTERPRETER.fullmatch(name):
+            return "python"
+        if name.lower() in {"pwsh", "powershell"}:
+            return "powershell"
+        return "shell"
+
     # The regex layer intentionally accepts only bounded, visibly separated
     # prefixes. Tokenize as a fallback for literal command shapes whose quoting
     # is semantically meaningful, most importantly `env -S 'bash -s'`. The
@@ -8840,43 +8848,34 @@ def executable_heredoc_language(line: str, start: int) -> str | None:
             language = tokenized_stdin_interpreter_language(segment)
             if language is not None:
                 tail_languages.append(language)
-    if "opaque" in tail_languages:
-        # Every stage in a pipeline executes concurrently. A later literal
-        # Python or shell stage cannot make an earlier/later computed stage
-        # safe: that opaque command may itself be the interpreter that consumes
-        # and executes the heredoc stream.
-        return "opaque"
-    if tail_languages:
-        return tail_languages[-1]
+    # Preserve the bounded regex path when tokenization found no interpreter on
+    # that side. Do not append duplicate token/regex readings of the same stage:
+    # the count below represents distinct executable stages, not detectors.
+    if prefix_language is None:
+        prefix_interpreters = [
+            match.group("interpreter")
+            for match in HEREDOC_EXECUTABLE.finditer(line[:start])
+        ]
+        if prefix_interpreters:
+            prefix_language = named_language(prefix_interpreters[-1])
+    if not tail_languages:
+        tail_languages.extend(
+            named_language(match.group("interpreter"))
+            for match in HEREDOC_PIPED_INTERPRETER.finditer(visible_tail)
+        )
 
-    # Preserve the bounded regex path as a fallback for shell text that the
-    # tokenizer cannot resolve. Piped evidence wins over the direct receiver,
-    # matching the historical classifier, but only after the token pass above
-    # has had a chance to reject an opaque stage anywhere in the pipeline.
-    piped_interpreters = [
-        match.group("interpreter")
-        for match in HEREDOC_PIPED_INTERPRETER.finditer(visible_tail)
+    observed_languages = [
+        *([prefix_language] if prefix_language is not None else []),
+        *tail_languages,
     ]
-    if piped_interpreters:
-        executable = tool_name(piped_interpreters[-1])
-        if PYTHON_INTERPRETER.fullmatch(executable):
-            return "python"
-        if executable.lower() in {"pwsh", "powershell"}:
-            return "powershell"
-        return "shell"
-    if prefix_language is not None:
-        return prefix_language
-    prefix_interpreters = [
-        match.group("interpreter")
-        for match in HEREDOC_EXECUTABLE.finditer(line[:start])
-    ]
-    if prefix_interpreters:
-        executable = tool_name(prefix_interpreters[-1])
-        if PYTHON_INTERPRETER.fullmatch(executable):
-            return "python"
-        if executable.lower() in {"pwsh", "powershell"}:
-            return "powershell"
-        return "shell"
+    if "opaque" in observed_languages or len(observed_languages) > 1:
+        # Every interpreter stage executes concurrently. An opaque stage may
+        # select any reader, and even two literal readers form a generated-code
+        # chain: the later stage receives the earlier one's output, not the raw
+        # heredoc. No single language can safely represent that union.
+        return "opaque"
+    if observed_languages:
+        return observed_languages[0]
     return None
 
 
@@ -15186,6 +15185,69 @@ pre_build = []
             failures.append(
                 f"a {dynamic_label} piped heredoc escaped trusted-shell policy"
             )
+
+    # Literal interpreter stages are not interchangeable either. The first
+    # executes the heredoc, while every later interpreter executes generated
+    # output. Even repeated instances of one language are therefore a code-
+    # generation chain that no single body reader can represent safely.
+    for mixed_program, mixed_label in (
+        (
+            "cat <<'EOF' | python3 | bash\n"
+            "print('echo safe')\n"
+            "EOF\n",
+            "Python then shell",
+        ),
+        (
+            "cat <<'EOF' | bash | python3\n"
+            "echo 'print(\"safe\")'\n"
+            "EOF\n",
+            "shell then Python",
+        ),
+        (
+            "python3 <<'EOF' | bash\n"
+            "print('echo safe')\n"
+            "EOF\n",
+            "direct Python then piped shell",
+        ),
+        (
+            "cat <<'EOF' | bash | bash\n"
+            "echo 'echo safe'\n"
+            "EOF\n",
+            "repeated shell interpreters",
+        ),
+    ):
+        programs, errors = executable_heredocs(
+            mixed_program,
+            f"self-test {mixed_label} heredoc",
+        )
+        if errors or [language for language, _ in programs] != ["opaque"]:
+            failures.append(
+                f"a {mixed_label} heredoc collapsed to one literal language"
+            )
+            continue
+        sensitive, runtime_errors = runtime_program_cross_surface(
+            list(programs),
+            f"self-test {mixed_label} heredoc",
+            include_opaque_shell_executable=True,
+        )
+        if sensitive or not runtime_errors:
+            failures.append(
+                f"a {mixed_label} heredoc did not fail closed"
+            )
+
+    single_interpreter_program = (
+        "python3 <<'EOF' | tee generated.txt\n"
+        "print('safe')\n"
+        "EOF\n"
+    )
+    programs, errors = executable_heredocs(
+        single_interpreter_program,
+        "self-test single interpreter with inert tail",
+    )
+    if errors or [language for language, _ in programs] != ["python"]:
+        failures.append(
+            "an inert pipeline stage made one literal heredoc interpreter opaque"
+        )
 
     # Pipes in quoted arguments or later statements do not receive the heredoc,
     # while a literal non-interpreter may consume it only as data. The dynamic
