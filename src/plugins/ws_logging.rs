@@ -984,7 +984,10 @@ impl Drop for WsConnection {
 }
 
 struct BatchPayload {
-    json: Arc<str>,
+    /// Tungstenite's UTF-8 payload wraps ref-counted `Bytes`: construction
+    /// consumes the batch `String` without copying, and each retry clones only
+    /// the buffer handle rather than the attacker-sized payload.
+    json: tokio_tungstenite::tungstenite::Utf8Bytes,
     /// Keep the conservative byte reservations alive for the payload's full
     /// send/retry lifetime after the individual queued JSON allocations drop.
     _leases: Vec<Arc<WsByteLease>>,
@@ -1010,7 +1013,7 @@ fn build_batch_payload(entries: Vec<QueuedEntry>) -> BatchPayload {
     }
     out.push(']');
     BatchPayload {
-        json: Arc::from(out),
+        json: out.into(),
         _leases: leases,
     }
 }
@@ -1055,8 +1058,9 @@ async fn send_batch(
         }
 
         if let Some(ref mut ws) = conn {
-            let msg =
-                tokio_tungstenite::tungstenite::protocol::Message::Text((&*payload.json).into());
+            let msg = tokio_tungstenite::tungstenite::protocol::Message::Text(
+                payload.json.clone(),
+            );
             match tokio::time::timeout(cfg.write_timeout, ws.sink.send(msg)).await {
                 Ok(Ok(())) => return conn,
                 Ok(Err(e)) => {
