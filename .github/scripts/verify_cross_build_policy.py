@@ -3503,6 +3503,30 @@ def generated_shell_assignment_spans(
     )
 
 
+def shell_statement_groups(
+    tokens: tuple[str, ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Split commands at outer statement boundaries while retaining pipelines."""
+
+    statements: list[tuple[str, ...]] = []
+    current: list[str] = []
+    depth = 0
+    for token in tokens:
+        if token == "(":
+            depth += 1
+        elif token == ")" and depth:
+            depth -= 1
+        if token in STATEMENT_SEPARATOR_TOKENS and depth == 0:
+            if current:
+                statements.append(tuple(current))
+            current = []
+        else:
+            current.append(token)
+    if current:
+        statements.append(tuple(current))
+    return tuple(statements)
+
+
 def generated_stdin_program_operands(line: str) -> frozenset[str]:
     """Return path words whose stdout can become interpreter source on stdin.
 
@@ -3524,7 +3548,13 @@ def generated_stdin_program_operands(line: str) -> frozenset[str]:
     if tokens is None:
         return frozenset()
     operands: set[str] = set()
-    for statement in shell_statement_segments(tokens):
+    # Keep each pipeline intact until the receiving interpreter is identified.
+    # `shell_statement_segments()` deliberately flattens pipelines into the
+    # individual commands a shell dispatches; using it here erased the producer
+    # / interpreter relationship before `split_shell_pipeline()` could inspect
+    # it, so `./scripts/generator | bash` marked neither helper provenance nor
+    # the equivalent Python-stdin path.
+    for statement in shell_statement_groups(tokens):
         pipeline = split_shell_pipeline(statement)
         for position, segment in enumerate(pipeline):
             language, _program, opaque = shell_stdin_program(segment)
@@ -6229,25 +6259,9 @@ def literal_command_text_has_cross(
 def shell_statement_segments(tokens: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
     """Split a token stream into the individual commands a shell dispatches."""
 
-    statements: list[tuple[str, ...]] = []
-    current: list[str] = []
-    depth = 0
-    for token in tokens:
-        if token == "(":
-            depth += 1
-        elif token == ")" and depth:
-            depth -= 1
-        if token in STATEMENT_SEPARATOR_TOKENS and depth == 0:
-            if current:
-                statements.append(tuple(current))
-            current = []
-        else:
-            current.append(token)
-    if current:
-        statements.append(tuple(current))
     return tuple(
         segment
-        for statement in statements
+        for statement in shell_statement_groups(tokens)
         for segment in split_shell_pipeline(statement)
     )
 
