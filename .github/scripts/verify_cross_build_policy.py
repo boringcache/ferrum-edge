@@ -1418,7 +1418,7 @@ LOCAL_ACTION_CANDIDATE = re.compile(
 )
 LOCAL_COMMAND_REFERENCE = re.compile(
     r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|"
-    r"(?:<|>)\(\s*|\{\s+|"
+    r"\x60\s*|(?:<|>)\(\s*|\{\s+|"
     r"\b(?:if|elif|while|until|then|do|else)\s+)"
     r"(?:!\s*)?"
     r"(?:\(\s*)?"
@@ -10662,7 +10662,11 @@ def block_automation_references(
 
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
                 generated_shell_output = any(
-                    start < match.start() < end
+                    # The repository-reference expression consumes the command
+                    # substitution opener as its command-start context, so a
+                    # producer immediately inside `$(`, a backtick, or `<(`
+                    # begins at the span boundary rather than one byte after it.
+                    start <= match.start() < end
                     for start, end in generated_shell_spans
                 )
                 enclosing_quote = shell_quote_at(normalized_line, match.start())
@@ -18375,24 +18379,31 @@ pre_build = []
                 f"a Python output generator behind {generated_label} changed "
                 "without moving its protected surface"
             )
-    extensionless_data_substitution_workflow = extensionless_workflow.replace(
-        "./scripts/build",
-        'generated="$(./scripts/build)"; printf \'%s\\n\' "$generated"',
-    )
-    data_substitution_errors = compare_pr_automation_collection(
-        {"ci.yml": extensionless_data_substitution_workflow},
-        {"ci.yml": extensionless_data_substitution_workflow},
-        {"setup/action.yml": safe_action},
-        {"setup/action.yml": safe_action},
-        extensionless_baseline,
-        extensionless_python_template,
-        "self-test automation directory",
-    )
-    if data_substitution_errors:
-        failures.append(
-            "a command substitution used only as data froze its Python producer: "
-            f"{data_substitution_errors!r}"
+    extensionless_data_substitution_workflows = {
+        "command substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated="$(./scripts/build)"; printf \'%s\\n\' "$generated"',
+        ),
+        "backtick substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'generated=`./scripts/build`; printf \'%s\\n\' "$generated"',
+        ),
+    }
+    for data_label, data_workflow in extensionless_data_substitution_workflows.items():
+        data_substitution_errors = compare_pr_automation_collection(
+            {"ci.yml": data_workflow},
+            {"ci.yml": data_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            extensionless_baseline,
+            extensionless_python_template,
+            "self-test automation directory",
         )
+        if data_substitution_errors:
+            failures.append(
+                f"a {data_label} used only as data froze its Python producer: "
+                f"{data_substitution_errors!r}"
+            )
     for label, proposed in (
         ("extensionless Python", extensionless_python_cross),
         ("extensionless shell", extensionless_shell_cross),
