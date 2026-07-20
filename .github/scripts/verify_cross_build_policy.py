@@ -1741,8 +1741,12 @@ _inline_program_depth = 0
 # shell program assigns it, so the names a program binds are tracked while that
 # program is scanned and consulted when inline interpreter source is read.
 SHELL_PARAMETER_REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+# Match the variable name at the start of a braced parameter expansion without
+# consuming the rest of that expansion. The evaluated source may use default,
+# slicing, removal, replacement, array, case, or indirect operators, and nested
+# references inside the operator word must remain visible to the same scan.
 SHELL_SOURCE_PARAMETER_REFERENCE = re.compile(
-    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"\$(?:\{!?(?P<braced>[A-Za-z_][A-Za-z0-9_]*)|"
     r"(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
 )
 # Generated-program variables can be assigned anywhere a shell command begins,
@@ -18697,6 +18701,13 @@ pre_build = []
             "./scripts/build",
             'generated="$(./scripts/build)"; eval "$generated"',
         ),
+        "eval through a parameter-default assignment": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                'generated="$(./scripts/build)"; '
+                'eval "${generated:-echo safe}"',
+            )
+        ),
         "eval through a control-flow assignment": extensionless_workflow.replace(
             "./scripts/build",
             'if true; then generated="$(./scripts/build)"; fi; '
@@ -18723,6 +18734,15 @@ pre_build = []
             '          first="$(./scripts/build)"\n'
             '          second="$first"\n'
             '          bash -c "$second"',
+        ),
+        "shell -c through parameter-default aliases": (
+            extensionless_workflow.replace(
+                "./scripts/build",
+                "|-\n"
+                '          first="$(./scripts/build)"\n'
+                '          second="${first:-echo safe}"\n'
+                '          bash -c "$second"',
+            )
         ),
     }
     for generated_label, generated_workflow in generated_shell_workflows.items():
