@@ -122,15 +122,57 @@ fn install_ws_log_capture(capture: &WsLogCapture) -> tracing::subscriber::Defaul
     tracing::subscriber::set_default(subscriber)
 }
 
+/// Process-global no-op subscriber that keeps callsite interest at `sometimes`
+/// and the max-level hint at `TRACE`. Emits nothing (`enabled` is always false).
+///
+/// Per-test captures use `set_default` (thread-local only). Without a global
+/// floor, `rebuild_interest_cache()` sees no global dispatcher and caches the
+/// construction `warn!` / `tracing::enabled!` callsites as `never` after other
+/// unit tests construct `WsFrameLogging` with no subscriber — so the thread-local
+/// EnvFilter capture never observes the diagnostic under parallel suite runs.
+struct InterestFloorSubscriber;
+
+impl tracing::Subscriber for InterestFloorSubscriber {
+    fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn install_interest_floor() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(InterestFloorSubscriber);
+    });
+}
+
 /// Install a capture subscriber filtered like the gateway EnvFilter
 /// (`FERRUM_LOG_LEVEL` / `RUST_LOG` directive, default `warn`).
 fn install_filtered_ws_log_capture(
     directive: &str,
     capture: &WsLogCapture,
 ) -> tracing::subscriber::DefaultGuard {
+    install_interest_floor();
     let subscriber =
         tracing_subscriber::registry().with(capture.layer().with_filter(EnvFilter::new(directive)));
-    tracing::subscriber::set_default(subscriber)
+    let guard = tracing::subscriber::set_default(subscriber);
+    // `set_default` does not rebuild interest; force `sometimes` so the
+    // thread-local EnvFilter is consulted for `enabled!` and `warn!`.
+    tracing::callsite::rebuild_interest_cache();
+    guard
 }
 
 fn disconnect_context(metadata: HashMap<String, String>) -> WsDisconnectContext {
