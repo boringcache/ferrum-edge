@@ -1417,11 +1417,9 @@ LOCAL_ACTION_CANDIDATE = re.compile(
     r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*['\"]?\./"
 )
 LOCAL_COMMAND_REFERENCE = re.compile(
-    r"(?:^\s*|(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\$\(\s*|"
-    r"\x60\s*|(?:<|>)\(\s*|\{\s+|"
-    r"\b(?:if|elif|while|until|then|do|else)\s+)"
-    r"(?:!\s*)?"
-    r"(?:\(\s*)?"
+    COMMAND_START_CONTEXT
+    + SUBSHELL_OPENERS
+    + r"(?:!\s*)?"
     # The same interleaved wrapper/`env`/assignment layer the opaque executable
     # scanners use. The older wrapper-then-`env` ordering could not describe
     # `env sudo bash scripts/unsafe.sh` or `sudo FOO=bar bash scripts/unsafe.sh`,
@@ -14310,6 +14308,39 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("transitive referenced-script Cross invocation was not rejected")
+
+    for reference_label, reference_command in {
+        "nested subshell": "( (bash scripts/safe.sh) )",
+        "negated subshell": "( ! bash scripts/safe.sh )",
+        "case arm": "case safe in safe) bash scripts/safe.sh;; esac",
+    }.items():
+        nested_reference_workflow = referenced_workflow.replace(
+            "bash scripts/safe.sh",
+            reference_command,
+        )
+        if not compare_pr_automation_collection(
+            {"ci.yml": nested_reference_workflow},
+            {"ci.yml": nested_reference_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            safe_automation,
+            cross_automation,
+            "self-test automation directory",
+        ):
+            failures.append(
+                f"a helper reached through a {reference_label} changed without "
+                "moving its protected surface"
+            )
+        if not validate_automation_collection(
+            {"ci.yml": nested_reference_workflow},
+            {"setup/action.yml": safe_action},
+            cross_automation,
+            "self-test automation directory",
+        ):
+            failures.append(
+                f"trusted revalidation allowed Cross automation reached through "
+                f"a {reference_label}"
+            )
 
     python_workflow = referenced_workflow.replace(
         "bash scripts/safe.sh",
