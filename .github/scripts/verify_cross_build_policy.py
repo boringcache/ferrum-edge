@@ -1328,6 +1328,10 @@ APPROVED_AUTOMATION_ROOTS = (
     "tests/k8s/",
     "tests/performance/",
 )
+# A repository program whose stdout becomes shell source is still executed in
+# its own language, but every edit can change the generated program. Carry this
+# extra provenance alongside (never instead of) the ordinary interpreter hint.
+GENERATED_SHELL_OUTPUT_PROVENANCE = "generated-shell-output"
 GENERATED_COMMAND_PATHS = frozenset(
     {
         "target/ci-release/ferrum-edge",
@@ -3325,6 +3329,100 @@ def command_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
         spans.append((start, end))
         cursor = end
     return tuple(spans)
+
+
+def backtick_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
+    """Locate outer legacy command substitutions without decoding them."""
+
+    def escaped(position: int) -> bool:
+        cursor = position
+        while cursor > 0 and line[cursor - 1] == "\\":
+            cursor -= 1
+        return (position - cursor) % 2 == 1
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        start = line.find("`", cursor)
+        while start >= 0 and escaped(start):
+            start = line.find("`", start + 1)
+        if start < 0:
+            break
+        end = line.find("`", start + 1)
+        while end >= 0 and escaped(end):
+            end = line.find("`", end + 1)
+        end = len(line) if end < 0 else end + 1
+        spans.append((start, end))
+        cursor = end
+    return tuple(spans)
+
+
+def process_substitution_spans(line: str) -> tuple[tuple[int, int], ...]:
+    """Locate outer <(...) and >(...) spans, including balanced nesting."""
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        candidates = [
+            position
+            for marker in ("<(", ">(")
+            if (position := line.find(marker, cursor)) >= 0
+        ]
+        if not candidates:
+            break
+        start = min(candidates)
+        depth = 1
+        quote: str | None = None
+        index = start + 2
+        while index < len(line) and depth:
+            character = line[index]
+            if quote is not None:
+                if character == "\\" and quote == '"':
+                    index += 2
+                    continue
+                if character == quote:
+                    quote = None
+                index += 1
+                continue
+            if character in "'\"":
+                quote = character
+            elif character == "\\":
+                index += 2
+                continue
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            index += 1
+        spans.append((start, index if depth == 0 else len(line)))
+        cursor = spans[-1][1]
+    return tuple(spans)
+
+
+def generated_shell_expansion_spans(line: str) -> tuple[tuple[int, int], ...]:
+    """Return expansions whose bytes become source for an opaque shell eval.
+
+    The existing opaque-inline-shell expression decides whether an expansion
+    occupies a generated-code slot. Extending each matched opener through its
+    balanced body lets reachability attribute repository programs inside that
+    producer without broadening the decision to ordinary command substitutions
+    used as data.
+    """
+
+    candidates = [
+        *((start, end, 2) for start, end in command_substitution_spans(line)),
+        *((start, end, 1) for start, end in backtick_substitution_spans(line)),
+        *((start, end, 2) for start, end in process_substitution_spans(line)),
+    ]
+    generated: list[tuple[int, int]] = []
+    for start, end, opener_length in sorted(candidates):
+        probe = line[: start + opener_length]
+        if any(
+            match.end() == len(probe)
+            for match in OPAQUE_INLINE_SHELL.finditer(probe)
+        ):
+            generated.append((start, end))
+    return tuple(generated)
 
 
 def flattened_command_substitutions(line: str) -> str:
@@ -7977,6 +8075,13 @@ def automation_file_cross_surfaces(
     if not shell_reading and CROSS_ENVIRONMENT.search(contents):
         digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
         surfaces.append(f"cross-environment:{digest}")
+    if GENERATED_SHELL_OUTPUT_PROVENANCE in interpreters:
+        # The caller evaluates this file's stdout as shell source. The file is
+        # still parsed and traversed in its real language, but comparison must
+        # freeze its complete output-producing implementation because static
+        # source inspection cannot prove which bytes it will emit.
+        digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        surfaces.append(f"generated-shell-output:{digest}")
     # Nested heredocs belong to this reading too. A suffixless file only needs
     # the fallback shell interpretation when its own contents name no language;
     # an explicit Python/PowerShell shebang remains authoritative unless the
@@ -10249,6 +10354,11 @@ def automation_command_scripts(
             for script in dispatcher_manifest_scripts(source, contents)
         ], []
     language = automation_language(source, contents)
+    if interpreter_hint == GENERATED_SHELL_OUTPUT_PROVENANCE:
+        # This is additional output provenance, not the language that executes
+        # the file. Its ordinary bare/explicit hint is recorded alongside it
+        # and performs the real traversal, so this replay owes no second parse.
+        return [], []
     if interpreter_hint is not None:
         # The interpreter a call site names is what actually executes the file,
         # so it outranks the file's own suffix and shebang rather than only
@@ -10501,6 +10611,9 @@ def block_automation_references(
                 inside_subshell = True
                 subshell_control_stack.clear()
             normalized_line = repository_command_line(line)
+            generated_shell_spans = generated_shell_expansion_spans(
+                normalized_line
+            )
             directory_matches = list(CD_COMMAND.finditer(normalized_line))
             opened_controls = len(
                 re.findall(r"\b(?:if|while|until|for|case)\b", normalized_line)
@@ -10548,6 +10661,10 @@ def block_automation_references(
                 )
 
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
+                generated_shell_output = any(
+                    start < match.start() < end
+                    for start, end in generated_shell_spans
+                )
                 enclosing_quote = shell_quote_at(normalized_line, match.start())
                 if enclosing_quote is not None and not (
                     enclosing_quote == '"'
@@ -10555,7 +10672,7 @@ def block_automation_references(
                         normalized_line.startswith("$(", match.start())
                         or normalized_line.startswith("`", match.start())
                     )
-                ):
+                ) and not generated_shell_output:
                     # Shell-looking separators inside a quoted regex/string are
                     # data. The old raw regex treated the `|tests/...` fragment
                     # of a grep pattern as a new pipeline command and queued a
@@ -10662,9 +10779,15 @@ def block_automation_references(
                     # `python3 scripts/poly` edge erase the bare `run:
                     # scripts/poly` one, so the shell-only edges the bare read
                     # really executes were never followed.
-                    interpreters.setdefault(command_path, set()).add(
-                        reference_interpreter
+                    recorded_interpreters = interpreters.setdefault(
+                        command_path,
+                        set(),
                     )
+                    recorded_interpreters.add(reference_interpreter)
+                    if generated_shell_output:
+                        recorded_interpreters.add(
+                            GENERATED_SHELL_OUTPUT_PROVENANCE
+                        )
                 else:
                     errors.append(
                         f"{source}:{line_number} repository command {command_path!r} "
@@ -18204,20 +18327,71 @@ pre_build = []
         'eval "$(./scripts/build)"',
     )
     if not validate_workflow_collection(
-        {"ci.yml": extensionless_eval_workflow},
+        {"generated.yml": extensionless_eval_workflow},
         "self-test workflow directory",
     ):
         failures.append(
             "dynamic evaluation of extensionless Python output was accepted"
         )
     if not compare_pr_workflow_collection(
-        {"ci.yml": extensionless_workflow},
-        {"ci.yml": extensionless_eval_workflow},
+        {"generated.yml": extensionless_workflow},
+        {"generated.yml": extensionless_eval_workflow},
         "self-test workflow directory",
     ):
         failures.append(
             "a newly added dynamic evaluation of extensionless Python output "
             "did not change the PR Cross surface"
+        )
+    # A trusted caller may already evaluate one helper's output. In that case a
+    # later pull request changes only the helper, so the workflow digest does
+    # not move. Carrying generated-output provenance to the referenced file
+    # freezes that implementation without pretending its Python text is shell.
+    generated_shell_workflows = {
+        "eval command substitution": extensionless_eval_workflow,
+        "shell -c command substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'bash -c "$(./scripts/build)"',
+        ),
+        "eval backtick substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            'eval "`./scripts/build`"',
+        ),
+        "source process substitution": extensionless_workflow.replace(
+            "./scripts/build",
+            "source <(./scripts/build)",
+        ),
+    }
+    for generated_label, generated_workflow in generated_shell_workflows.items():
+        if not compare_pr_automation_collection(
+            {"ci.yml": generated_workflow},
+            {"ci.yml": generated_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            extensionless_baseline,
+            extensionless_python_template,
+            "self-test automation directory",
+        ):
+            failures.append(
+                f"a Python output generator behind {generated_label} changed "
+                "without moving its protected surface"
+            )
+    extensionless_data_substitution_workflow = extensionless_workflow.replace(
+        "./scripts/build",
+        'generated="$(./scripts/build)"; printf \'%s\\n\' "$generated"',
+    )
+    data_substitution_errors = compare_pr_automation_collection(
+        {"ci.yml": extensionless_data_substitution_workflow},
+        {"ci.yml": extensionless_data_substitution_workflow},
+        {"setup/action.yml": safe_action},
+        {"setup/action.yml": safe_action},
+        extensionless_baseline,
+        extensionless_python_template,
+        "self-test automation directory",
+    )
+    if data_substitution_errors:
+        failures.append(
+            "a command substitution used only as data froze its Python producer: "
+            f"{data_substitution_errors!r}"
         )
     for label, proposed in (
         ("extensionless Python", extensionless_python_cross),
