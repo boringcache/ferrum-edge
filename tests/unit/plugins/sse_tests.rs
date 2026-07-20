@@ -809,12 +809,7 @@ async fn test_multiple_sse_instances_wrap_once_and_merge_cache_control_idempoten
 
     let body = br#"{"message":"hello"}"#;
     let transformed = first
-        .transform_response_body_with_context(
-            &mut ctx,
-            body,
-            Some("text/event-stream"),
-            &headers,
-        )
+        .transform_response_body_with_context(&mut ctx, body, Some("text/event-stream"), &headers)
         .await
         .expect("the first wrapper must consume the original response decision");
     assert!(
@@ -830,7 +825,10 @@ async fn test_multiple_sse_instances_wrap_once_and_merge_cache_control_idempoten
             &headers,
         )
         .await;
-    assert!(repeated.is_none(), "a later SSE instance must not double-wrap");
+    assert!(
+        repeated.is_none(),
+        "a later SSE instance must not double-wrap"
+    );
     assert_eq!(
         String::from_utf8(transformed).unwrap(),
         "data: {\"message\":\"hello\"}\n\n"
