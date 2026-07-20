@@ -387,7 +387,10 @@ fn test_config_rejects_unknown_provider_and_fallback_keys() {
         }]
     });
     let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("'config.providers[0].allow_plaintex'"), "{err}");
+    assert!(
+        err.contains("'config.providers[0].allow_plaintex'"),
+        "{err}"
+    );
     assert!(
         err.contains("'config.providers[0].inherit_backend_tl'"),
         "{err}"
