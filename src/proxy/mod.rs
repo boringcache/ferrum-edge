@@ -18232,10 +18232,9 @@ async fn handle_proxy_request_inner(
                             "Mesh REGISTRY_ONLY: rejecting outbound route miss for unadmitted destination"
                         );
                         state.request_count.fetch_add(1, Ordering::Relaxed);
-                        let status = StatusCode::from_u16(reject_status)
-                            .unwrap_or(StatusCode::BAD_GATEWAY);
-                        let body: &[u8] = if request_host.as_deref().is_none_or(|h| h.is_empty())
-                        {
+                        let status =
+                            StatusCode::from_u16(reject_status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        let body: &[u8] = if request_host.as_deref().is_none_or(|h| h.is_empty()) {
                             br#"{"error":"host header required"}"#
                         } else {
                             br#"{"error":"destination not in mesh registry (REGISTRY_ONLY policy)"}"#

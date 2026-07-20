@@ -277,8 +277,7 @@ fn mesh_outbound_registry_metric_contract_matches_docs_and_help() {
     // Force the series into the scrape output so HELP is rendered.
     ferrum_edge::plugins::prometheus_metrics::global_registry()
         .record_mesh_outbound_registry_decision("metric-contract-ns", "<admit_explicit>", "admit");
-    let rendered =
-        ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+    let rendered = ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
     assert!(
         rendered.contains(
             "# HELP ferrum_mesh_outbound_registry_decisions_total Mesh outbound registry decisions with bounded host buckets (<admit_explicit>, <admit_wildcard>, <denied>)."
