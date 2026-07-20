@@ -727,6 +727,7 @@ fn serialize_batch_payload(
     }
 }
 
+#[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn classify_serialized_dtls_batch_for_test(
     batch: &[SummaryLogEntry],
     max_plaintext: usize,
