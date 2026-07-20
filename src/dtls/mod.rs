@@ -19,7 +19,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dimpl::{Config, Dtls, DtlsCertificate, Output};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::types::Proxy;
@@ -64,6 +64,16 @@ pub fn init_dtls_buf_config(max_plaintext: usize, record_overhead: usize) {
     });
 }
 
+/// Effective DTLS plaintext ceiling for one application datagram.
+///
+/// Sourced from `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` after startup init, otherwise
+/// the RFC 9147 default (16,384). Logging sinks and other callers must treat
+/// payloads larger than this as local delivery failures rather than enqueueing
+/// them into the driver.
+pub fn max_plaintext_bytes() -> usize {
+    dtls_buf_config().max_plaintext
+}
+
 fn dtls_buf_config() -> &'static DtlsBufConfig {
     DTLS_BUF_CONFIG.get_or_init(|| {
         // Fallback if init_dtls_buf_config() was never called (e.g. tests).
@@ -75,8 +85,26 @@ fn dtls_buf_config() -> &'static DtlsBufConfig {
     })
 }
 
+/// Application payload waiting for the DTLS driver to encrypt and write it.
+struct PendingAppSend {
+    data: Vec<u8>,
+    /// Completes with `Ok(())` only after `send_application_data` succeeds and
+    /// every resulting ciphertext datagram is accepted by the connected UDP
+    /// socket. Oversized plaintext, DTLS engine errors, and socket-send
+    /// failures complete with `Err` so callers can drive retry/final-loss.
+    completion: oneshot::Sender<Result<(), String>>,
+}
+
 /// Maximum datagrams to drain per `poll_output` loop before yielding.
 const MAX_OUTPUTS_PER_DRAIN: usize = 64;
+
+async fn fail_pending_app_sends(driver_app_rx: &mut mpsc::Receiver<PendingAppSend>) {
+    while let Ok(pending) = driver_app_rx.try_recv() {
+        let _ = pending
+            .completion
+            .send(Err("DTLS connection closed".to_string()));
+    }
+}
 
 // ============================================================================
 // Configuration Builders
@@ -260,7 +288,7 @@ pub fn build_frontend_dtls_config(
 /// to avoid locking the state machine on the hot path.
 pub struct DtlsConnection {
     /// Send application data to the DTLS engine for encryption + transmission.
-    app_tx: mpsc::Sender<Vec<u8>>,
+    app_tx: mpsc::Sender<PendingAppSend>,
     /// Receive decrypted application data from the DTLS engine.
     app_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Signal the driver task to shut down.
@@ -378,7 +406,7 @@ impl DtlsConnection {
     /// Spawn the background driver task and return the connection handle.
     fn spawn_driver(dtls: Dtls, socket: Arc<UdpSocket>) -> Self {
         // Channels: app data in/out, shutdown signal
-        let (app_tx, mut driver_app_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (app_tx, mut driver_app_rx) = mpsc::channel::<PendingAppSend>(256);
         let (driver_app_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -393,6 +421,9 @@ impl DtlsConnection {
                     .map(|t| t.saturating_duration_since(Instant::now()))
                     .unwrap_or(Duration::from_secs(60));
 
+                let mut pending_completion: Option<oneshot::Sender<Result<(), String>>> = None;
+                let mut fatal_send_error: Option<String> = None;
+
                 tokio::select! {
                     // Incoming UDP datagram from peer
                     result = socket.recv(&mut recv_buf) => {
@@ -400,25 +431,31 @@ impl DtlsConnection {
                             Ok(len) => {
                                 if let Err(e) = dtls.handle_packet(&recv_buf[..len]) {
                                     trace!("DTLS handle_packet error: {}", e);
-                                    break;
+                                    fatal_send_error =
+                                        Some(format!("DTLS handle_packet error: {e}"));
                                 }
                             }
-                            Err(_) => break,
+                            Err(e) => {
+                                fatal_send_error = Some(format!("DTLS UDP recv error: {e}"));
+                            }
                         }
                     }
-                    // Application data to send
-                    Some(data) = driver_app_rx.recv() => {
-                        if data.len() > dtls_buf_config().max_plaintext {
-                            warn!(
-                                "DTLS dropping oversized datagram ({} bytes, max {})",
-                                data.len(),
-                                dtls_buf_config().max_plaintext,
-                            );
-                            continue;
-                        }
-                        if let Err(e) = dtls.send_application_data(&data) {
-                            trace!("DTLS send_application_data error: {}", e);
-                            break;
+                    // Application data to send — complete only after encrypt + socket write.
+                    Some(pending) = driver_app_rx.recv() => {
+                        let PendingAppSend { data, completion } = pending;
+                        let max_plaintext = dtls_buf_config().max_plaintext;
+                        if data.len() > max_plaintext {
+                            let _ = completion.send(Err(format!(
+                                "DTLS plaintext exceeds max_plaintext ({max_plaintext} bytes, got {})",
+                                data.len()
+                            )));
+                        } else if let Err(e) = dtls.send_application_data(&data) {
+                            let msg = format!("DTLS send_application_data error: {e}");
+                            trace!("{msg}");
+                            let _ = completion.send(Err(msg.clone()));
+                            fatal_send_error = Some(msg);
+                        } else {
+                            pending_completion = Some(completion);
                         }
                     }
                     // Timer fired
@@ -428,22 +465,27 @@ impl DtlsConnection {
                         {
                             if let Err(e) = dtls.handle_timeout(Instant::now()) {
                                 trace!("DTLS handle_timeout error: {}", e);
-                                break;
+                                fatal_send_error =
+                                    Some(format!("DTLS handle_timeout error: {e}"));
                             }
                             next_timeout = None;
                         }
                     }
                     // Shutdown requested
                     _ = shutdown_rx.recv() => {
-                        break;
+                        fatal_send_error = Some("DTLS connection closed".to_string());
                     }
                 }
 
                 // Drain all pending outputs (break on Timeout — it repeats forever)
+                let mut socket_send_error: Option<String> = None;
                 for _ in 0..MAX_OUTPUTS_PER_DRAIN {
                     match dtls.poll_output(&mut out_buf) {
                         Output::Packet(data) => {
-                            let _ = socket.send(data).await;
+                            if let Err(e) = socket.send(data).await {
+                                socket_send_error = Some(format!("DTLS UDP send error: {e}"));
+                                break;
+                            }
                         }
                         Output::Timeout(t) => {
                             next_timeout = Some(t);
@@ -451,7 +493,12 @@ impl DtlsConnection {
                         }
                         Output::ApplicationData(data) => {
                             if driver_app_tx.send(data.to_vec()).await.is_err() {
-                                return; // receiver dropped
+                                if let Some(completion) = pending_completion.take() {
+                                    let _ = completion
+                                        .send(Err("DTLS connection closed".to_string()));
+                                }
+                                fail_pending_app_sends(&mut driver_app_rx).await;
+                                return;
                             }
                         }
                         Output::Connected | Output::PeerCert(_) => {
@@ -459,6 +506,19 @@ impl DtlsConnection {
                         }
                         _ => break,
                     }
+                }
+
+                if let Some(completion) = pending_completion.take() {
+                    if let Some(error) = socket_send_error.as_ref() {
+                        let _ = completion.send(Err(error.clone()));
+                    } else {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+
+                if socket_send_error.is_some() || fatal_send_error.is_some() {
+                    fail_pending_app_sends(&mut driver_app_rx).await;
+                    break;
                 }
             }
         });
@@ -471,11 +531,33 @@ impl DtlsConnection {
     }
 
     /// Send application data through the DTLS tunnel.
+    ///
+    /// Success means the local DTLS engine accepted the plaintext and every
+    /// resulting ciphertext datagram was accepted by the connected UDP socket.
+    /// It does **not** mean the remote peer delivered or acknowledged the
+    /// payload. Oversized plaintext, DTLS engine failures, and local socket
+    /// send errors return `Err` so callers can retry or account for final loss.
     pub async fn send(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+        let max_plaintext = dtls_buf_config().max_plaintext;
+        if data.len() > max_plaintext {
+            return Err(anyhow::anyhow!(
+                "DTLS plaintext exceeds max_plaintext ({max_plaintext} bytes, got {})",
+                data.len()
+            ));
+        }
+        let (completion_tx, completion_rx) = oneshot::channel();
         self.app_tx
-            .send(data.to_vec())
+            .send(PendingAppSend {
+                data: data.to_vec(),
+                completion: completion_tx,
+            })
             .await
-            .map_err(|_| anyhow::anyhow!("DTLS connection closed"))
+            .map_err(|_| anyhow::anyhow!("DTLS connection closed"))?;
+        match completion_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(anyhow::anyhow!(error)),
+            Err(_) => Err(anyhow::anyhow!("DTLS connection closed")),
+        }
     }
 
     /// Receive decrypted application data from the DTLS tunnel.
@@ -1287,6 +1369,21 @@ pub fn load_dtls_certificate(
             anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
         })?;
 
+    // dimpl only supports ECDSA P-256 / P-384. Reject unsupported algorithms at
+    // materialization time so admission/config load surfaces the defect instead
+    // of panicking inside the DTLS handshake on first use.
+    let private_key = key_der.secret_der().to_vec();
+    Config::default()
+        .crypto_provider()
+        .key_provider
+        .load_private_key(&private_key)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Unsupported DTLS private key in {} (dimpl requires ECDSA P-256 or P-384): {e}",
+                key_material.display_source_id
+            )
+        })?;
+
     // SAFETY: dimpl::DtlsCertificate stores `private_key` as plain Vec<u8>
     // without zeroize-on-drop. Unlike the kTLS path (which uses
     // Zeroizing<Vec<u8>>), we cannot wrap the key here because dimpl owns
@@ -1294,7 +1391,7 @@ pub fn load_dtls_certificate(
     // Upstream contribution needed to add Zeroize to dimpl::DtlsCertificate.
     Ok(DtlsCertificate {
         certificate: cert_der.to_vec(),
-        private_key: key_der.secret_der().to_vec(),
+        private_key,
     })
 }
 

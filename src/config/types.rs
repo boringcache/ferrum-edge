@@ -8948,13 +8948,14 @@ impl GatewayConfig {
     }
 
     /// Validate file dependencies for plugins that reference external files
-    /// (e.g., geo_restriction `.mmdb` databases).
+    /// (e.g., geo_restriction `.mmdb` databases, `udp_logging` DTLS sources).
     ///
     /// This is separate from `validate_all_fields_with_ip_policy()` so that
     /// each mode can handle missing files independently:
     /// - **File mode**: fatal (bail)
     /// - **DB mode**: warn (data already in DB)
-    /// - **DP mode**: skip (plugin degrades gracefully with `reader: None`)
+    /// - **DP mode**: skip (callers omit this phase; node-local material is
+    ///   still checked when the DP constructs the plugin instance)
     ///
     /// Deduplicates paths so each file is checked at most once.
     pub fn validate_plugin_file_dependencies(&self) -> Vec<String> {
@@ -9082,6 +9083,18 @@ impl GatewayConfig {
                     {
                         errors.push(format!("PluginConfig '{}': {}", pc.id, e));
                     }
+                }
+            }
+            if pc.plugin_name == "udp_logging"
+                && let Some(config) = pc.config.as_object()
+                && let Err(e) =
+                    crate::plugins::udp_logging::validate_dtls_file_dependencies(config)
+            {
+                // Deduplicate by plugin id + error text so identical multi-
+                // instance configs still report once per PluginConfig row.
+                let message = format!("PluginConfig '{}': {}", pc.id, e);
+                if !errors.iter().any(|existing| existing == &message) {
+                    errors.push(message);
                 }
             }
         }

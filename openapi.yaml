@@ -11295,7 +11295,13 @@ components:
 
     UdpLoggingConfig:
       type: object
-      description: "Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in batches."
+      additionalProperties: false
+      description: >-
+        Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in
+        batches. Unknown top-level keys are rejected at construction / Admin
+        validation so transport typos (for example `dtsl`) cannot silently
+        fall back to plaintext. Registration policy is OptionalFailOpen
+        (invalid enabled instances are omitted from the published cache).
       required:
         - host
         - port
@@ -11311,16 +11317,24 @@ components:
         dtls:
           type: boolean
           default: false
-          description: Enable DTLS encryption for log datagrams
+          description: >-
+            Enable DTLS encryption for log datagrams. When true, certificate/key/CA
+            sources are materialized at admission and cached for the plugin generation.
         dtls_cert_path:
           type: string
-          description: PEM client certificate for DTLS mutual TLS
+          description: >-
+            PEM client certificate for DTLS mutual TLS. Validated/materialized at
+            admission when dtls is true; must be paired with dtls_key_path.
         dtls_key_path:
           type: string
-          description: PEM private key for DTLS mutual TLS (must be paired with dtls_cert_path)
+          description: >-
+            PEM private key for DTLS mutual TLS (ECDSA P-256 or P-384). Must be
+            paired with dtls_cert_path.
         dtls_ca_cert_path:
           type: string
-          description: PEM CA certificate for verifying the DTLS server
+          description: >-
+            PEM CA certificate for verifying the DTLS server. Materialized at
+            admission when set and dtls_no_verify is false.
         dtls_no_verify:
           type: boolean
           default: false

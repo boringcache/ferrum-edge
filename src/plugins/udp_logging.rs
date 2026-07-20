@@ -5,24 +5,28 @@
 //! `BatchingLogger<LogEntry>` to decouple the proxy hot path from network I/O.
 //!
 //! Supports both plain UDP and DTLS-encrypted transport. When `dtls` is
-//! enabled, the plugin performs a DTLS handshake on first use and encrypts all
-//! log datagrams. DTLS client certificates and CA verification are configurable
-//! for mutual TLS environments. The gateway's CRL list
-//! (`FERRUM_TLS_CRL_FILE_PATH`) is applied to the DTLS server verifier with
+//! enabled, certificate/key/CA sources are materialized at admission (and
+//! through the mode-aware plugin file-dependency phase) and cached in the
+//! committed plugin generation so first flush and reconnect do not rediscover
+//! static source errors. The gateway's CRL list (`FERRUM_TLS_CRL_FILE_PATH`) is
+//! applied to the DTLS server verifier with
 //! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`,
 //! matching the proxy backend / DTLS / frontend mTLS surfaces.
 //!
 //! Each batch is serialized as a JSON array and sent as a single UDP datagram.
-//! Operators should size `batch_size` to keep serialized payloads under the
-//! network MTU (typically ~1400 bytes for DTLS, ~1472 for plain UDP over
-//! Ethernet). Oversized datagrams may be fragmented or dropped.
+//! DTLS success means local engine + connected-socket acceptance, not remote
+//! UDP delivery. Payloads larger than `FERRUM_DTLS_MAX_PLAINTEXT_BYTES`
+//! (default 16,384) fail closed into the batching retry / final-loss path;
+//! multi-entry batches that exceed the ceiling are split so one oversized
+//! record cannot silently discard its co-batched neighbors.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rustls::pki_types::CertificateRevocationListDer;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use tracing::warn;
@@ -37,23 +41,50 @@ use super::utils::{
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Accepted top-level `udp_logging` configuration keys.
+///
+/// Unknown keys (including near-miss transport typos such as `dtsl`) are
+/// rejected at construction / Admin validation so encryption cannot silently
+/// default to plaintext.
+pub const UDP_LOGGING_CONFIG_KEYS: &[&str] = &[
+    "batch_size",
+    "buffer_capacity",
+    "dtls",
+    "dtls_ca_cert_path",
+    "dtls_cert_path",
+    "dtls_key_path",
+    "dtls_no_verify",
+    "flush_interval_ms",
+    "host",
+    "max_retries",
+    "port",
+    "retry_delay_ms",
+    "schema",
+    "schema_ref",
+];
+
+/// Pre-materialized DTLS client identity and verifier for one plugin generation.
+#[derive(Clone)]
+pub(crate) struct CachedDtlsMaterial {
+    certificate: dimpl::DtlsCertificate,
+    server_name: Option<rustls::pki_types::ServerName<'static>>,
+    server_cert_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+}
 
 #[derive(Clone)]
 struct UdpFlushConfig {
     host: String,
     port: u16,
     dtls_enabled: bool,
-    dtls_cert_path: Option<String>,
-    dtls_key_path: Option<String>,
-    dtls_ca_cert_path: Option<String>,
-    dtls_no_verify: bool,
-    /// Gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`). Applied to the DTLS
-    /// `WebPkiServerVerifier` so that revoked log-sink certificates are
-    /// rejected, matching the proxy backend / DTLS / frontend mTLS surfaces.
-    /// Empty when no CRL file is configured.
-    dtls_crls: Vec<CertificateRevocationListDer<'static>>,
+    dtls_material: Option<Arc<CachedDtlsMaterial>>,
     dns_cache: Option<DnsCache>,
     schema: Option<Arc<SummarySchema>>,
+    /// Test-only resolve override. Production construction leaves the slot
+    /// empty; deterministic DNS-lifecycle tests may publish an address that
+    /// the next resolve consumes exactly once.
+    next_resolve_addr: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 struct UdpFlushState {
@@ -65,75 +96,38 @@ struct UdpFlushState {
 pub struct UdpLogging {
     logger: BatchingLogger<SummaryLogEntry>,
     endpoint_hostname: Option<String>,
+    flush_state: Arc<Mutex<UdpFlushState>>,
+    next_resolve_addr: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 impl UdpLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("udp_logging: config must be an object".to_string());
-        }
+        let ParsedUdpLogging {
+            host,
+            port,
+            socket_host_warmup,
+            dtls_enabled,
+            dtls_material,
+            batch_defaults,
+            schema,
+        } = parse_udp_logging_config(config, &http_client)?;
 
-        let raw_host = config
-            .get("host")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| "udp_logging: 'host' is required".to_string())?
-            .to_string();
-        let socket_host = parse_socket_host("udp_logging", "host", &raw_host)?;
-        socket_host.screen_egress_ip("udp_logging", "host", http_client.backend_allow_ips())?;
-        let host = socket_host.dial_host.clone();
-        let port = config.get("port").and_then(Value::as_u64).ok_or_else(|| {
-            "udp_logging: 'port' is required and must be a positive integer".to_string()
-        })?;
-        if port == 0 || port > 65535 {
-            return Err(format!(
-                "udp_logging: 'port' must be between 1 and 65535 (got {port})"
-            ));
-        }
-
-        let dtls_enabled = optional_bool(config, "dtls")?.unwrap_or(false);
-        let dtls_cert_path = optional_non_empty_string(config, "dtls_cert_path")?;
-        let dtls_key_path = optional_non_empty_string(config, "dtls_key_path")?;
-        let dtls_ca_cert_path = optional_non_empty_string(config, "dtls_ca_cert_path")?;
-        let dtls_no_verify = optional_bool(config, "dtls_no_verify")?.unwrap_or(false);
-
-        if dtls_cert_path.is_some() != dtls_key_path.is_some() {
-            return Err(
-                "udp_logging: 'dtls_cert_path' and 'dtls_key_path' must be provided together"
-                    .to_string(),
-            );
-        }
-
-        let batch_defaults = BatchConfigDefaults {
-            batch_size_key: "batch_size",
-            batch_size: 10,
-            flush_interval_ms: 1000,
-            min_flush_interval_ms: 100,
-            buffer_capacity: 10000,
-            max_retries: 1,
-            retry_delay_ms: 500,
-        };
-        validate_batch_config(config, "udp_logging", batch_defaults)?;
-
-        let schema = resolve_schema(config, "udp_logging", SchemaCapabilities::BASE)?;
+        let next_resolve_addr = Arc::new(Mutex::new(None));
         let flush_config = UdpFlushConfig {
             host: host.clone(),
-            port: port as u16,
+            port,
             dtls_enabled,
-            dtls_cert_path,
-            dtls_key_path,
-            dtls_ca_cert_path,
-            dtls_no_verify,
-            dtls_crls: http_client.tls_crls().to_vec(),
+            dtls_material,
             dns_cache: http_client.dns_cache().cloned(),
             schema,
+            next_resolve_addr: Arc::clone(&next_resolve_addr),
         };
         let state = Arc::new(Mutex::new(UdpFlushState {
             sender: None,
             current_addr: None,
             last_resolve: Instant::now(),
         }));
+        let flush_state = Arc::clone(&state);
         let logger = BatchingLogger::spawn(
             // Config remains `max_retries`; the shared retry policy counts the
             // initial attempt plus those retries.
@@ -147,8 +141,226 @@ impl UdpLogging {
 
         Ok(Self {
             logger,
-            endpoint_hostname: socket_host.warmup_hostname,
+            endpoint_hostname: socket_host_warmup,
+            flush_state,
+            next_resolve_addr,
         })
+    }
+
+    /// Shape + DTLS material admission without spawning the batching worker.
+    ///
+    /// Used by shared plugin validation / Admin surfaces. Runtime construction
+    /// still goes through [`Self::new`], which reuses the same parser and then
+    /// starts the flush worker. Registration remains `OptionalFailOpen`: a
+    /// failed enabled instance is omitted from the published cache rather than
+    /// retaining last-known-good.
+    pub(crate) fn validate_config(
+        config: &Value,
+        http_client: PluginHttpClient,
+    ) -> Result<(), String> {
+        parse_udp_logging_config(config, &http_client).map(|_| ())
+    }
+}
+
+struct ParsedUdpLogging {
+    host: String,
+    port: u16,
+    socket_host_warmup: Option<String>,
+    dtls_enabled: bool,
+    dtls_material: Option<Arc<CachedDtlsMaterial>>,
+    batch_defaults: BatchConfigDefaults,
+    schema: Option<Arc<SummarySchema>>,
+}
+
+fn parse_udp_logging_config(
+    config: &Value,
+    http_client: &PluginHttpClient,
+) -> Result<ParsedUdpLogging, String> {
+    let object = config
+        .as_object()
+        .ok_or_else(|| "udp_logging: config must be an object".to_string())?;
+    reject_unknown_keys(object, "config", UDP_LOGGING_CONFIG_KEYS, "udp_logging: ")?;
+
+    let raw_host = config
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "udp_logging: 'host' is required".to_string())?
+        .to_string();
+    let socket_host = parse_socket_host("udp_logging", "host", &raw_host)?;
+    socket_host.screen_egress_ip("udp_logging", "host", http_client.backend_allow_ips())?;
+    let host = socket_host.dial_host.clone();
+    let port = config.get("port").and_then(Value::as_u64).ok_or_else(|| {
+        "udp_logging: 'port' is required and must be a positive integer".to_string()
+    })?;
+    if port == 0 || port > 65535 {
+        return Err(format!(
+            "udp_logging: 'port' must be between 1 and 65535 (got {port})"
+        ));
+    }
+
+    let dtls_enabled = optional_bool(config, "dtls")?.unwrap_or(false);
+    let dtls_cert_path = optional_non_empty_string(config, "dtls_cert_path")?;
+    let dtls_key_path = optional_non_empty_string(config, "dtls_key_path")?;
+    let dtls_ca_cert_path = optional_non_empty_string(config, "dtls_ca_cert_path")?;
+    let dtls_no_verify = optional_bool(config, "dtls_no_verify")?.unwrap_or(false);
+
+    if dtls_cert_path.is_some() != dtls_key_path.is_some() {
+        return Err(
+            "udp_logging: 'dtls_cert_path' and 'dtls_key_path' must be provided together"
+                .to_string(),
+        );
+    }
+
+    let batch_defaults = BatchConfigDefaults {
+        batch_size_key: "batch_size",
+        batch_size: 10,
+        flush_interval_ms: 1000,
+        min_flush_interval_ms: 100,
+        buffer_capacity: 10000,
+        max_retries: 1,
+        retry_delay_ms: 500,
+    };
+    validate_batch_config(config, "udp_logging", batch_defaults)?;
+    let schema = resolve_schema(config, "udp_logging", SchemaCapabilities::BASE)?;
+
+    let dtls_material = if dtls_enabled {
+        Some(Arc::new(materialize_dtls_material(
+            &host,
+            dtls_cert_path.as_deref(),
+            dtls_key_path.as_deref(),
+            dtls_ca_cert_path.as_deref(),
+            dtls_no_verify,
+            http_client.tls_crls(),
+        )?))
+    } else {
+        None
+    };
+
+    Ok(ParsedUdpLogging {
+        host,
+        port: port as u16,
+        socket_host_warmup: socket_host.warmup_hostname,
+        dtls_enabled,
+        dtls_material,
+        batch_defaults,
+        schema,
+    })
+}
+
+/// Materialize DTLS certificate/key/CA sources without network I/O.
+///
+/// Shared by constructor admission and the mode-aware plugin file-dependency
+/// phase so both surfaces enforce the same usable-material contract.
+pub(crate) fn materialize_dtls_material(
+    host: &str,
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+    ca_path: Option<&str>,
+    no_verify: bool,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<CachedDtlsMaterial, String> {
+    let certificate = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+        crate::dtls::load_dtls_certificate(cert_path, key_path)
+            .map_err(|error| format!("udp_logging: DTLS cert/key materialization failed: {error}"))?
+    } else {
+        crate::dtls::generate_ephemeral_cert_public()
+            .map_err(|error| format!("udp_logging: DTLS ephemeral cert failed: {error}"))?
+    };
+
+    let (server_name, server_cert_verifier) = if no_verify {
+        (None, None)
+    } else {
+        let root_store = if let Some(ca_path) = ca_path {
+            crate::dtls::load_root_store_from_pem(ca_path)
+                .map_err(|error| format!("udp_logging: DTLS CA materialization failed: {error}"))?
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            roots
+        };
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| format!("udp_logging: invalid DTLS server name: {host}"))?;
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
+            .map_err(|error| format!("udp_logging: DTLS verifier build failed: {error}"))?;
+        (
+            Some(server_name),
+            Some(verifier as Arc<dyn rustls::client::danger::ServerCertVerifier>),
+        )
+    };
+
+    Ok(CachedDtlsMaterial {
+        certificate,
+        server_name,
+        server_cert_verifier,
+    })
+}
+
+/// Validate enabled `udp_logging` DTLS file/provider sources for the shared
+/// plugin file-dependency phase (file-mode fatal, DB warning, DP skip).
+pub(crate) fn validate_dtls_file_dependencies(config: &Map<String, Value>) -> Result<(), String> {
+    let dtls_enabled = match config.get("dtls") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(_) => return Err("udp_logging: 'dtls' must be a boolean".to_string()),
+        None => false,
+    };
+    if !dtls_enabled {
+        return Ok(());
+    }
+
+    let cert_path = optional_non_empty_string_from_map(config, "dtls_cert_path")?;
+    let key_path = optional_non_empty_string_from_map(config, "dtls_key_path")?;
+    let ca_path = optional_non_empty_string_from_map(config, "dtls_ca_cert_path")?;
+    let no_verify = match config.get("dtls_no_verify") {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err("udp_logging: 'dtls_no_verify' must be a boolean".to_string()),
+        None => false,
+    };
+
+    if cert_path.is_some() != key_path.is_some() {
+        return Err(
+            "udp_logging: 'dtls_cert_path' and 'dtls_key_path' must be provided together"
+                .to_string(),
+        );
+    }
+
+    // Host is only needed for ServerName when verifying; fall back to a
+    // syntactically valid placeholder when the shape phase has not yet run.
+    let host = config
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("udp-logging.invalid");
+
+    materialize_dtls_material(
+        host,
+        cert_path.as_deref(),
+        key_path.as_deref(),
+        ca_path.as_deref(),
+        no_verify,
+        &[],
+    )
+    .map(|_| ())
+}
+
+fn optional_non_empty_string_from_map(
+    config: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match config.get(key) {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("udp_logging: '{key}' must be a string"))?
+                .trim();
+            if value.is_empty() {
+                return Err(format!("udp_logging: '{key}' must not be empty"));
+            }
+            Ok(Some(value.to_string()))
+        }
+        None => Ok(None),
     }
 }
 
@@ -176,6 +388,16 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
         }
         None => Ok(None),
     }
+}
+
+/// Pure DNS/lifecycle predicate shared with deterministic tests.
+pub(crate) fn should_replace_sender_on_resolve(
+    elapsed: Duration,
+    current_addr: Option<SocketAddr>,
+    new_addr: SocketAddr,
+    interval: Duration,
+) -> bool {
+    elapsed >= interval && current_addr != Some(new_addr)
 }
 
 #[async_trait]
@@ -227,17 +449,29 @@ impl UdpSender {
     }
 }
 
+async fn resolve_endpoint(
+    cfg: &UdpFlushConfig,
+    dns_cache: Option<&DnsCache>,
+) -> Result<SocketAddr, String> {
+    if let Ok(mut slot) = cfg.next_resolve_addr.lock()
+        && let Some(addr) = slot.take()
+    {
+        return Ok(addr);
+    }
+    resolve_udp_endpoint(&cfg.host, cfg.port, dns_cache, "udp_logging").await
+}
+
 async fn create_sender(
     cfg: &UdpFlushConfig,
     dns_cache: Option<&DnsCache>,
 ) -> Result<(UdpSender, SocketAddr), String> {
-    let remote_addr = resolve_udp_endpoint(&cfg.host, cfg.port, dns_cache, "udp_logging").await?;
+    let remote_addr = resolve_endpoint(cfg, dns_cache).await?;
     let sender = build_sender_for_addr(cfg, remote_addr).await?;
     Ok((sender, remote_addr))
 }
 
 /// Bind an ephemeral local UDP socket, connect to `remote_addr`, and (if
-/// configured) complete a DTLS handshake.
+/// configured) complete a DTLS handshake using admission-cached material.
 async fn build_sender_for_addr(
     cfg: &UdpFlushConfig,
     remote_addr: SocketAddr,
@@ -245,44 +479,14 @@ async fn build_sender_for_addr(
     let socket = bind_connected_udp_socket(remote_addr, "udp_logging").await?;
 
     if cfg.dtls_enabled {
-        let certificate =
-            if let (Some(cert_path), Some(key_path)) = (&cfg.dtls_cert_path, &cfg.dtls_key_path) {
-                crate::dtls::load_dtls_certificate(cert_path, key_path)
-                    .map_err(|error| format!("udp_logging: DTLS cert load failed: {error}"))?
-            } else {
-                crate::dtls::generate_ephemeral_cert_public()
-                    .map_err(|error| format!("udp_logging: DTLS ephemeral cert failed: {error}"))?
-            };
-
-        let (server_name, server_cert_verifier) = if cfg.dtls_no_verify {
-            (None, None)
-        } else {
-            let root_store = if let Some(ca_path) = &cfg.dtls_ca_cert_path {
-                crate::dtls::load_root_store_from_pem(ca_path)
-                    .map_err(|error| format!("udp_logging: DTLS CA load failed: {error}"))?
-            } else {
-                let mut roots = rustls::RootCertStore::empty();
-                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                roots
-            };
-            let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
-                .map_err(|_| format!("udp_logging: invalid DTLS server name: {}", cfg.host))?;
-            // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so revoked
-            // DTLS log-sink certificates are rejected, matching the proxy
-            // backend / DTLS / frontend mTLS surfaces.
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &cfg.dtls_crls)
-                .map_err(|error| format!("udp_logging: DTLS verifier build failed: {error}"))?;
-            (
-                Some(server_name),
-                Some(verifier as Arc<dyn rustls::client::danger::ServerCertVerifier>),
-            )
-        };
-
+        let material = cfg.dtls_material.as_ref().ok_or_else(|| {
+            "udp_logging: DTLS enabled but admission-cached material is missing".to_string()
+        })?;
         let params = crate::dtls::BackendDtlsParams {
             config: Arc::new(dimpl::Config::default()),
-            certificate,
-            server_name,
-            server_cert_verifier,
+            certificate: material.certificate.clone(),
+            server_name: material.server_name.clone(),
+            server_cert_verifier: material.server_cert_verifier.clone(),
             // The udp_logging plugin doesn't expose a connect timeout config,
             // so preserve the historical 10s budget that this code path used
             // before `BackendDtlsParams.connect_timeout_ms` existed.
@@ -304,17 +508,9 @@ async fn send_batch(
     state: &Mutex<UdpFlushState>,
     batch: Vec<SummaryLogEntry>,
 ) -> Result<(), String> {
-    let view = SummaryLogEntryBatchView {
-        entries: &batch,
-        schema: cfg.schema.as_deref(),
-    };
-    let payload = match serde_json::to_vec(&view) {
-        Ok(payload) => payload,
-        Err(error) => {
-            warn!("udp_logging: failed to serialize batch: {error}");
-            return Ok(());
-        }
-    };
+    if batch.is_empty() {
+        return Ok(());
+    }
 
     let (mut sender, mut current_addr, mut last_resolve) = {
         let mut state = state
@@ -334,22 +530,45 @@ async fn send_batch(
     // address actually changes (DNS rollover, pod reschedule, LB failover).
     // This applies to DTLS too: a connected DTLS association established once
     // at startup would otherwise keep sending to a stale peer forever. The
-    // `current_addr != Some(new_addr)` guard ensures a fresh DTLS handshake
-    // only runs when the resolved address moved, not on every interval.
+    // address-equality guard ensures a fresh DTLS handshake only runs when the
+    // resolved address moved. Re-resolve or replacement-handshake failure
+    // retains the current sender at the previously pinned address.
     if last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
+        let elapsed = last_resolve.elapsed();
         last_resolve = Instant::now();
-        if let Ok(new_addr) =
-            resolve_udp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "udp_logging").await
-            && current_addr != Some(new_addr)
-            && let Ok(new_sender) = build_sender_for_addr(cfg, new_addr).await
-        {
-            sender = Some(new_sender);
-            current_addr = Some(new_addr);
+        match resolve_endpoint(cfg, cfg.dns_cache.as_ref()).await {
+            Ok(new_addr)
+                if should_replace_sender_on_resolve(
+                    elapsed,
+                    current_addr,
+                    new_addr,
+                    UDP_RE_RESOLVE_INTERVAL,
+                ) =>
+            {
+                match build_sender_for_addr(cfg, new_addr).await {
+                    Ok(new_sender) => {
+                        sender = Some(new_sender);
+                        current_addr = Some(new_addr);
+                    }
+                    Err(error) => {
+                        warn!(
+                            "udp_logging: DTLS/UDP sender rebuild after DNS change failed; \
+                             retaining current association: {error}"
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    "udp_logging: periodic DNS re-resolve failed; retaining current association: {error}"
+                );
+            }
         }
     }
 
     let result = match sender.as_ref() {
-        Some(sender) => sender.send(&payload).await,
+        Some(active_sender) => deliver_batch(cfg, active_sender, &batch).await,
         None => Err("udp_logging: sender unavailable after initialization".to_string()),
     };
 
@@ -371,4 +590,85 @@ async fn send_batch(
     state.last_resolve = last_resolve;
 
     result
+}
+
+async fn deliver_batch(
+    cfg: &UdpFlushConfig,
+    sender: &UdpSender,
+    batch: &[SummaryLogEntry],
+) -> Result<(), String> {
+    let view = SummaryLogEntryBatchView {
+        entries: batch,
+        schema: cfg.schema.as_deref(),
+    };
+    let payload = match serde_json::to_vec(&view) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!("udp_logging: failed to serialize batch: {error}");
+            return Ok(());
+        }
+    };
+
+    if cfg.dtls_enabled {
+        let max_plaintext = crate::dtls::max_plaintext_bytes();
+        if payload.len() > max_plaintext {
+            if batch.len() == 1 {
+                return Err(format!(
+                    "udp_logging: DTLS batch exceeds max_plaintext \
+                     ({max_plaintext} bytes, got {}); local delivery rejected before driver enqueue",
+                    payload.len()
+                ));
+            }
+            // Split so one oversized record cannot erase co-batched siblings.
+            // Oversized singles are discarded with an explicit warning; other
+            // local delivery failures still propagate into retry/final-loss.
+            for entry in batch {
+                match deliver_batch(cfg, sender, std::slice::from_ref(entry)).await {
+                    Ok(()) => {}
+                    Err(error) if error.contains("exceeds max_plaintext") => {
+                        warn!(
+                            "udp_logging: discarded oversized co-batched record with explicit \
+                             loss marker (siblings preserved): {error}"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    sender.send(&payload).await
+}
+
+// ---------------------------------------------------------------------------
+// Test support
+// ---------------------------------------------------------------------------
+
+impl UdpLogging {
+    /// Age the flush worker's last DNS resolve so the next batch exercises the
+    /// periodic re-resolve path. Production code never calls this.
+    pub fn age_last_resolve_for_test(&self, elapsed: Duration) {
+        if let Ok(mut state) = self.flush_state.lock() {
+            state.last_resolve = Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// Publish a one-shot resolve override consumed by the next DNS lookup in
+    /// the flush worker. Production code never calls this.
+    pub fn set_next_resolve_addr_for_test(&self, addr: SocketAddr) {
+        if let Ok(mut slot) = self.next_resolve_addr.lock() {
+            *slot = Some(addr);
+        }
+    }
+
+    /// Snapshot of the flush worker's currently pinned destination, if any.
+    pub fn current_addr_for_test(&self) -> Option<SocketAddr> {
+        self.flush_state
+            .lock()
+            .ok()
+            .and_then(|state| state.current_addr)
+    }
 }

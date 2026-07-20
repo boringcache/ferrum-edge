@@ -2141,4 +2141,24 @@ pub mod _test_support {
     ) -> crate::plugins::ProxyProtocol {
         crate::http3::server::h3_plugin_protocol_for_request(flavor, grpc_web_request)
     }
+
+    pub fn udp_logging_should_replace_sender_on_resolve_for_test(
+        elapsed: Duration,
+        current_addr: Option<std::net::SocketAddr>,
+        new_addr: std::net::SocketAddr,
+        interval: Duration,
+    ) -> bool {
+        crate::plugins::udp_logging::should_replace_sender_on_resolve(
+            elapsed,
+            current_addr,
+            new_addr,
+            interval,
+        )
+    }
+
+    pub fn udp_logging_validate_dtls_file_dependencies_for_test(
+        config: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        crate::plugins::udp_logging::validate_dtls_file_dependencies(config)
+    }
 }
