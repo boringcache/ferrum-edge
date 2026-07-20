@@ -472,7 +472,7 @@ fn is_valid_explicit_grpc_status(value: &HeaderValue) -> bool {
             .to_str()
             .ok()
             .and_then(|status| status.parse::<u32>().ok())
-            .is_some_and(|status| status <= 16)
+            .is_some()
 }
 
 fn is_remote_h2_no_error_reset(err: &h2::Error) -> bool {
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn preserve_no_error_reset_with_malformed_grpc_status() {
-        for malformed in ["invalid", "+14", "014", "17", "999"] {
+        for malformed in ["invalid", "+14", "014"] {
             let mut headers = HeaderMap::new();
             headers.insert("grpc-status", malformed.parse().unwrap());
             let kept = suppress_benign_early_response_reset(
@@ -742,6 +742,28 @@ mod tests {
             assert!(
                 kept.is_some(),
                 "malformed grpc-status {malformed:?} must not make an incomplete response valid"
+            );
+        }
+    }
+
+    #[test]
+    fn suppress_no_error_reset_with_unknown_numeric_grpc_status() {
+        // The gRPC wire grammar accepts any decimal integer without leading
+        // zeros. Codes outside the defined 0..=16 set map to UNKNOWN at the
+        // client API, but still form an explicit terminal status.
+        for unknown in ["17", "999"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("grpc-status", unknown.parse().unwrap());
+            let cleared = suppress_benign_early_response_reset(
+                Some("body error: stream error received: not a result of an error".into()),
+                true,
+                &headers,
+                true,
+                None,
+            );
+            assert!(
+                cleared.is_none(),
+                "numeric grpc-status {unknown:?} must retain the terminal response"
             );
         }
     }
