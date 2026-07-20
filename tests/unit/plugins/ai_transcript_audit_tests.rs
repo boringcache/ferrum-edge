@@ -9,12 +9,17 @@ use bytes::Bytes;
 use ferrum_edge::config::types::DEFAULT_NAMESPACE;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::plugins::ai_transcript_audit::AiTranscriptAudit;
+use ferrum_edge::plugins::ai_transcript_audit::{
+    AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS, AI_TRANSCRIPT_AUDIT_CONFIG_KEYS,
+    AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
+    AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
+    AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
+};
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
-    chain_response_stream_inspectors, plugin_failure_policy, priority,
+    chain_response_stream_inspectors, plugin_failure_policy, priority, validate_plugin_config,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::{Value, json};
@@ -207,13 +212,12 @@ async fn name_priority_and_protocols() {
     assert_eq!(plugin.priority(), 2924);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.requires_response_committed_hook());
-    // Registration matches the observability sink family (http/tcp/udp_logging,
-    // prometheus_metrics): a construction failure omits the plugin rather than
-    // rejecting startup/reload. Runtime fail-closed capture is the explicit
-    // on_sink_error/on_buffer_full=reject config, not registration policy.
+    // Privacy and fail-closed sink typos must reject the candidate generation so
+    // reload keeps the last-known-good audit instance. Runtime fail-closed
+    // capture remains the explicit on_sink_error/on_buffer_full=reject config.
     assert_eq!(
         plugin_failure_policy("ai_transcript_audit"),
-        Some(PluginFailurePolicy::OptionalFailOpen)
+        Some(PluginFailurePolicy::KeepLastKnownGood)
     );
     assert_eq!(
         plugin.warmup_hostnames(),
@@ -358,6 +362,255 @@ async fn non_http_sink_scheme_rejected() {
         .err()
         .expect("expected config rejection");
     assert!(err.contains("http:// or https://"), "got: {err}");
+}
+
+#[tokio::test]
+async fn rejects_multiple_unknown_root_keys_sorted_with_suggestions() {
+    let config = config_with_sink(
+        "https://audit.example.com/x",
+        json!({
+            "zzz_unknown": true,
+            "allow_full_bod": true,
+            "aaa_unknown": false
+        }),
+    );
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("unknown root keys must fail closed");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
+    assert!(
+        err.contains("'config.aaa_unknown'")
+            && err.contains("'config.allow_full_bod'")
+            && err.contains("'config.zzz_unknown'"),
+        "got: {err}"
+    );
+    let aaa = err.find("'config.aaa_unknown'").expect("aaa path");
+    let allow = err.find("'config.allow_full_bod'").expect("allow path");
+    let zzz = err.find("'config.zzz_unknown'").expect("zzz path");
+    assert!(
+        aaa < allow && allow < zzz,
+        "unknown keys must be sorted: {err}"
+    );
+    assert!(
+        err.contains("did you mean 'allow_full_body'"),
+        "typo should suggest allow_full_body: {err}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_privacy_capture_sampling_redaction_limits_and_fail_posture_typos() {
+    for (overrides, needle, suggestion) in [
+        (
+            json!({ "privacy": { "include_consumer_usernme": false } }),
+            "config.privacy.include_consumer_usernme",
+            Some("include_consumer_username"),
+        ),
+        (
+            json!({ "capture": { "respose": false } }),
+            "config.capture.respose",
+            Some("response"),
+        ),
+        (
+            json!({ "sampling": { "always_capture_on_guardrai": false } }),
+            "config.sampling.always_capture_on_guardrai",
+            Some("always_capture_on_guardrail"),
+        ),
+        (
+            json!({ "redaction": { "hash_secre": "fleet-stable-hmac-key" } }),
+            "config.redaction.hash_secre",
+            Some("hash_secret"),
+        ),
+        (
+            json!({ "limits": { "max_request_byte": 1024 } }),
+            "config.limits.max_request_byte",
+            Some("max_request_bytes"),
+        ),
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x",
+                    "on_sink_eror": "reject"
+                }
+            }),
+            "config.sink.on_sink_eror",
+            Some("on_sink_error"),
+        ),
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x",
+                    "on_buffer_ful": "reject"
+                }
+            }),
+            "config.sink.on_buffer_ful",
+            Some("on_buffer_full"),
+        ),
+        (
+            json!({
+                "redaction": {
+                    "custom_patterns": [{
+                        "name": "internal_id",
+                        "regex": "CUST-[0-9]+",
+                        "flagz": "i"
+                    }]
+                }
+            }),
+            "config.redaction.custom_patterns[0].flagz",
+            None,
+        ),
+    ] {
+        let config = if overrides.get("sink").is_some() {
+            overrides
+        } else {
+            config_with_sink("https://audit.example.com/x", overrides)
+        };
+        let err = AiTranscriptAudit::new(&config, loopback_http_client())
+            .err()
+            .expect("security-relevant typo must fail closed");
+        assert!(
+            err.contains("unknown configuration key"),
+            "missing unknown-key wording for {needle}: {err}"
+        );
+        assert!(
+            err.contains(&format!("'{needle}'")),
+            "error did not identify {needle}: {err}"
+        );
+        if let Some(suggestion) = suggestion {
+            assert!(
+                err.contains(&format!("did you mean '{suggestion}'")),
+                "expected suggestion {suggestion} for {needle}: {err}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn null_optional_nested_objects_keep_defaults_and_custom_headers_stay_free_form() {
+    let config = json!({
+        "mode": null,
+        "allow_full_body": null,
+        "capture": null,
+        "sampling": null,
+        "redaction": null,
+        "limits": null,
+        "privacy": null,
+        "sink": {
+            "type": "http",
+            "endpoint_url": "https://audit.example.com/x",
+            "custom_headers": {
+                "Authorization": "Bearer ${AUDIT_TOKEN}",
+                "X-Custom-Collector": "fleet-a"
+            },
+            "retry_delay_ms": 250
+        }
+    });
+    assert!(
+        AiTranscriptAudit::new(&config, loopback_http_client()).is_ok(),
+        "null nested objects and free-form custom_headers must remain valid"
+    );
+}
+
+#[test]
+fn shared_admission_rejects_unknown_keys_and_uses_keep_last_known_good() {
+    let err = validate_plugin_config(
+        "ai_transcript_audit",
+        &json!({
+            "privacy": { "include_consumer_usernme": false },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x"
+            }
+        }),
+    )
+    .expect_err("shared admission must reject privacy typo");
+    assert!(
+        err.contains("config.privacy.include_consumer_usernme"),
+        "got: {err}"
+    );
+    assert_eq!(
+        plugin_failure_policy("ai_transcript_audit"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+}
+
+#[test]
+fn accepted_config_key_sets_are_exported_for_schema_parity() {
+    assert_eq!(
+        AI_TRANSCRIPT_AUDIT_CONFIG_KEYS,
+        &[
+            "mode",
+            "allow_full_body",
+            "capture",
+            "sampling",
+            "redaction",
+            "limits",
+            "privacy",
+            "sink",
+        ]
+    );
+    assert_eq!(
+        AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS,
+        &[
+            "request",
+            "response",
+            "streaming_response",
+            "headers",
+            "tool_calls"
+        ]
+    );
+    assert_eq!(
+        AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS,
+        &[
+            "rate",
+            "always_capture_on_guardrail",
+            "always_capture_on_error",
+            "max_records_per_minute",
+        ]
+    );
+    assert_eq!(
+        AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
+        &[
+            "builtins",
+            "custom_patterns",
+            "placeholder",
+            "hash_redacted_values",
+            "hash_secret",
+        ]
+    );
+    assert_eq!(AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, &["name", "regex"]);
+    assert_eq!(
+        AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
+        &[
+            "max_request_bytes",
+            "max_response_bytes",
+            "max_stream_capture_bytes",
+        ]
+    );
+    assert_eq!(
+        AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS,
+        &[
+            "include_consumer_username",
+            "include_client_ip",
+            "include_raw_headers",
+        ]
+    );
+    assert_eq!(
+        AI_TRANSCRIPT_AUDIT_SINK_KEYS,
+        &[
+            "type",
+            "endpoint_url",
+            "custom_headers",
+            "batch_size",
+            "flush_interval_ms",
+            "buffer_capacity",
+            "max_retries",
+            "retry_delay_ms",
+            "on_buffer_full",
+            "on_sink_error",
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------

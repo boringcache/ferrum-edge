@@ -55,9 +55,82 @@ use crate::proxy::{
     REJECTION_RESPONSE_METADATA_KEY, REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY,
     SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Schema version stamped onto every emitted record.
 const RECORD_VERSION: u32 = 1;
+
+const ERROR_PREFIX: &str = "ai_transcript_audit: ";
+
+/// Accepted root keys for `ai_transcript_audit` config objects.
+pub const AI_TRANSCRIPT_AUDIT_CONFIG_KEYS: &[&str] = &[
+    "mode",
+    "allow_full_body",
+    "capture",
+    "sampling",
+    "redaction",
+    "limits",
+    "privacy",
+    "sink",
+];
+
+/// Accepted keys under `capture`.
+pub const AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS: &[&str] = &[
+    "request",
+    "response",
+    "streaming_response",
+    "headers",
+    "tool_calls",
+];
+
+/// Accepted keys under `sampling`.
+pub const AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS: &[&str] = &[
+    "rate",
+    "always_capture_on_guardrail",
+    "always_capture_on_error",
+    "max_records_per_minute",
+];
+
+/// Accepted keys under `redaction`.
+pub const AI_TRANSCRIPT_AUDIT_REDACTION_KEYS: &[&str] = &[
+    "builtins",
+    "custom_patterns",
+    "placeholder",
+    "hash_redacted_values",
+    "hash_secret",
+];
+
+/// Accepted keys under each `redaction.custom_patterns[]` object.
+pub const AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS: &[&str] = &["name", "regex"];
+
+/// Accepted keys under `limits`.
+pub const AI_TRANSCRIPT_AUDIT_LIMITS_KEYS: &[&str] = &[
+    "max_request_bytes",
+    "max_response_bytes",
+    "max_stream_capture_bytes",
+];
+
+/// Accepted keys under `privacy`.
+pub const AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS: &[&str] = &[
+    "include_consumer_username",
+    "include_client_ip",
+    "include_raw_headers",
+];
+
+/// Accepted keys under `sink`. `custom_headers` remains an intentional free-form
+/// string map; every other sink property is fixed-shape.
+pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
+    "type",
+    "endpoint_url",
+    "custom_headers",
+    "batch_size",
+    "flush_interval_ms",
+    "buffer_capacity",
+    "max_retries",
+    "retry_delay_ms",
+    "on_buffer_full",
+    "on_sink_error",
+];
 
 /// Above this many staged entries, opportunistically drop expired orphans (a
 /// request that never reached the `log` hook). The common path removes staging
@@ -356,9 +429,15 @@ pub struct AiTranscriptAudit {
 
 impl AiTranscriptAudit {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_obj) = config.as_object() else {
             return Err("ai_transcript_audit: config must be an object".to_string());
-        }
+        };
+        reject_unknown_keys(
+            config_obj,
+            "config",
+            AI_TRANSCRIPT_AUDIT_CONFIG_KEYS,
+            ERROR_PREFIX,
+        )?;
         let empty = Value::Object(serde_json::Map::new());
 
         // ---- mode + full-body guardrail ----
@@ -384,6 +463,12 @@ impl AiTranscriptAudit {
         }
 
         // ---- capture ----
+        reject_nested_unknown_keys(
+            config,
+            "capture",
+            "config.capture",
+            AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS,
+        )?;
         let capture_obj = cfg_object(config, "capture", "capture")?.unwrap_or(&empty);
         let streaming = cfg_streaming(capture_obj, "streaming_response")?;
         let capture = CaptureConfig {
@@ -402,6 +487,12 @@ impl AiTranscriptAudit {
         }
 
         // ---- sampling ----
+        reject_nested_unknown_keys(
+            config,
+            "sampling",
+            "config.sampling",
+            AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS,
+        )?;
         let sampling_obj = cfg_object(config, "sampling", "sampling")?.unwrap_or(&empty);
         let rate = cfg_f64(sampling_obj, "rate", 1.0, "sampling")?;
         if !(0.0..=1.0).contains(&rate) {
@@ -422,6 +513,12 @@ impl AiTranscriptAudit {
         };
 
         // ---- redaction ----
+        reject_nested_unknown_keys(
+            config,
+            "redaction",
+            "config.redaction",
+            AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
+        )?;
         let redaction_obj = cfg_object(config, "redaction", "redaction")?.unwrap_or(&empty);
         let builtins = cfg_string_array(redaction_obj, "builtins", "redaction")?
             .unwrap_or_else(default_builtins);
@@ -468,6 +565,12 @@ impl AiTranscriptAudit {
         )?;
 
         // ---- limits ----
+        reject_nested_unknown_keys(
+            config,
+            "limits",
+            "config.limits",
+            AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
+        )?;
         let limits_obj = cfg_object(config, "limits", "limits")?.unwrap_or(&empty);
         let limits = LimitsConfig {
             max_request_bytes: cfg_positive_usize(
@@ -491,6 +594,12 @@ impl AiTranscriptAudit {
         };
 
         // ---- privacy ----
+        reject_nested_unknown_keys(
+            config,
+            "privacy",
+            "config.privacy",
+            AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS,
+        )?;
         let privacy_obj = cfg_object(config, "privacy", "privacy")?.unwrap_or(&empty);
         let privacy = PrivacyConfig {
             include_consumer_username: cfg_bool(
@@ -504,6 +613,7 @@ impl AiTranscriptAudit {
         };
 
         // ---- sink ----
+        reject_nested_unknown_keys(config, "sink", "config.sink", AI_TRANSCRIPT_AUDIT_SINK_KEYS)?;
         let sink_obj = cfg_object(config, "sink", "sink")?
             .ok_or("ai_transcript_audit: 'sink' configuration is required")?;
         if let Some(sink_type) = cfg_str(sink_obj, "type", "sink")?
@@ -2368,6 +2478,18 @@ fn is_valid_env_name(name: &str) -> bool {
 
 // ---- config parsing helpers ----
 
+fn reject_nested_unknown_keys(
+    parent: &Value,
+    key: &str,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(Value::Object(map)) = parent.get(key) {
+        reject_unknown_keys(map, path, allowed, ERROR_PREFIX)?;
+    }
+    Ok(())
+}
+
 fn default_builtins() -> Vec<String> {
     [
         "ssn",
@@ -2392,6 +2514,16 @@ fn parse_custom_patterns(obj: &Value) -> Result<Vec<(String, String)>, String> {
         .ok_or("ai_transcript_audit: 'redaction.custom_patterns' must be an array")?;
     let mut out = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
+        let path = format!("config.redaction.custom_patterns[{index}]");
+        let map = entry
+            .as_object()
+            .ok_or_else(|| format!("ai_transcript_audit: '{path}' must be an object"))?;
+        reject_unknown_keys(
+            map,
+            &path,
+            AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS,
+            ERROR_PREFIX,
+        )?;
         let name = entry.get("name").and_then(|value| value.as_str()).ok_or_else(|| {
             format!("ai_transcript_audit: redaction.custom_patterns[{index}] requires a string 'name'")
         })?;
