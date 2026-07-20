@@ -65,7 +65,7 @@ use tracing::{debug, warn};
 
 use super::utils::sse::is_text_event_stream_media_type;
 use super::{PluginResult, RequestContext};
-use crate::util::http_headers::cache_control_has_directive;
+use crate::util::http_headers::headers_have_cache_control_directive;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Request-scoped metadata key holding the raw `Last-Event-ID` for backend
@@ -272,25 +272,23 @@ fn optional_positive_u64_config(
 /// appends `no-cache` when that directive name is not already present as a
 /// top-level token (quoted-string interiors are skipped).
 fn ensure_sse_cache_control(response_headers: &mut HashMap<String, String>) {
-    match response_headers.get("cache-control") {
-        None => {
-            response_headers.insert("cache-control".to_string(), "no-cache".to_string());
+    if headers_have_cache_control_directive(response_headers, "no-cache") {
+        // Preserve the origin value verbatim (duplicates, extensions,
+        // private/no-store/no-transform, quoted forms, malformed tokens).
+        return;
+    }
+
+    if let Some(existing) = response_headers.iter_mut().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("cache-control").then_some(value)
+    }) {
+        if !existing.trim_end().is_empty() && !existing.trim_end().ends_with(',') {
+            existing.push_str(", ");
+        } else if !existing.is_empty() && !existing.ends_with(' ') {
+            existing.push(' ');
         }
-        Some(existing) if cache_control_has_directive(existing, "no-cache") => {
-            // Preserve the origin value verbatim (duplicates, extensions,
-            // private/no-store/no-transform, quoted forms, malformed tokens).
-        }
-        Some(existing) => {
-            let mut merged = String::with_capacity(existing.len() + ", no-cache".len());
-            merged.push_str(existing);
-            if !existing.trim_end().is_empty() && !existing.trim_end().ends_with(',') {
-                merged.push_str(", ");
-            } else if !existing.is_empty() && !existing.ends_with(' ') {
-                merged.push(' ');
-            }
-            merged.push_str("no-cache");
-            response_headers.insert("cache-control".to_string(), merged);
-        }
+        existing.push_str("no-cache");
+    } else {
+        response_headers.insert("cache-control".to_string(), "no-cache".to_string());
     }
 }
 
@@ -319,11 +317,13 @@ impl super::Plugin for SsePlugin {
     fn should_buffer_response_body_for_content_type(
         &self,
         _ctx: &RequestContext,
-        _content_type: Option<&str>,
+        content_type: Option<&str>,
         response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.wrap_non_sse_responses && super::response_body_rewrite_allowed(response_status)
+        self.wrap_non_sse_responses
+            && super::response_body_rewrite_allowed(response_status)
+            && !content_type.is_some_and(Self::is_sse_content_type)
     }
 
     fn should_release_response_body_before_content_type_rewrite(
@@ -415,14 +415,6 @@ impl super::Plugin for SsePlugin {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Save original Accept for the response phase.
-        // Read from `headers` param — ctx.headers may be empty when the handler
-        // uses the zero-clone fast path (std::mem::take).
-        if let Some(accept) = headers.get("accept") {
-            ctx.metadata
-                .insert("sse:original_accept".to_string(), accept.clone());
-        }
-
         // Strip Accept-Encoding to prevent the backend from gzip-compressing
         // the SSE stream. Compressed chunked responses break SSE's
         // line-delimited text framing — the EventSource parser expects raw

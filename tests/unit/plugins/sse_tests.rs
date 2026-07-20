@@ -87,6 +87,32 @@ fn test_requires_response_body_buffering_when_wrap_enabled() {
 }
 
 #[test]
+fn test_wrap_releases_genuine_sse_after_backend_content_type_is_known() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let ctx = make_sse_ctx();
+    let headers = HashMap::new();
+
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers,
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &headers,
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("Text/Event-Stream; charset=utf-8"),
+        200,
+        &headers,
+    ));
+}
+
+#[test]
 fn test_modifies_request_headers_default_true() {
     let plugin = make_plugin(json!({}));
     assert!(plugin.modifies_request_headers());
@@ -434,22 +460,6 @@ async fn test_preserves_accept_encoding_when_disabled() {
     assert_eq!(headers.get("accept-encoding").unwrap(), "gzip");
 }
 
-// ── before_proxy: original Accept saved in metadata ───────────────────────────
-
-#[tokio::test]
-async fn test_original_accept_saved_in_metadata() {
-    let plugin = make_plugin(json!({}));
-    let mut ctx = make_sse_ctx();
-    let mut headers = HashMap::new();
-    headers.insert("accept".to_string(), "text/event-stream".to_string());
-
-    plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_eq!(
-        ctx.metadata.get("sse:original_accept").unwrap(),
-        "text/event-stream"
-    );
-}
-
 // ── before_proxy: Last-Event-ID forwarding ────────────────────────────────────
 
 #[tokio::test]
@@ -534,6 +544,29 @@ async fn test_cache_control_appends_no_cache_when_absent() {
     assert_eq!(
         headers.get("cache-control").unwrap(),
         "private, no-store, no-transform, no-cache"
+    );
+}
+
+#[tokio::test]
+async fn test_cache_control_merges_into_mixed_case_key_without_duplicate() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    let mut headers = sse_response_headers();
+    headers.insert("Cache-Control".to_string(), "private, no-store".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    assert_eq!(
+        headers.get("Cache-Control").map(String::as_str),
+        Some("private, no-store, no-cache")
+    );
+    assert_eq!(
+        headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("cache-control"))
+            .count(),
+        1,
+        "SSE cache policy must not create case-variant duplicates: {headers:?}"
     );
 }
 
@@ -1240,10 +1273,6 @@ async fn test_full_sse_lifecycle() {
     assert_continue(&result);
     assert!(!backend_headers.contains_key("accept-encoding"));
     assert_eq!(backend_headers.get("last-event-id").unwrap(), "42");
-    assert_eq!(
-        ctx.metadata.get("sse:original_accept").unwrap(),
-        "text/event-stream"
-    );
 
     // Phase 3: decorate response.
     let mut response_headers = sse_response_headers();
