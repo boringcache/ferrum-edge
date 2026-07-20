@@ -223,8 +223,7 @@ fn test_creation_rejects_unknown_config_keys() {
     }
 
     let err = validate_plugin_config("ws_frame_logging", &json!({"payload_preview_byte": 64}))
-        .err()
-        .expect("shared validation must reject unknown keys");
+        .expect_err("shared validation must reject unknown keys");
     assert!(err.contains("payload_preview_byte"), "got: {err}");
 }
 
