@@ -865,6 +865,42 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_load_testing_keys() {
+    let document = serde_json::json!({
+        "version": "1",
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "load-testing-typo",
+            "plugin_name": "load_testing",
+            "config": {
+                "key": "test-key",
+                "concurrent_clients": 5,
+                "duration_seconds": 10,
+                "request_timeot_ms": 5000
+            },
+            "scope": "global",
+            "enabled": true
+        }]
+    });
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{document}").unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file-mode load must reject unknown load_testing config keys");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("1 plugin config error(s)"),
+        "unexpected file-load error: {message}"
+    );
+}
+
+#[test]
 fn test_file_config_rejects_unknown_ai_semantic_cache_keys() {
     for (id, config) in [
         ("ai-cache-ttl-typo", serde_json::json!({"ttl_second": 60})),

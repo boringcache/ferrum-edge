@@ -72,8 +72,14 @@
 //! | `gateway_tls` | bool | `false` | Use HTTPS for local loopback synthetic requests |
 //! | `gateway_tls_no_verify` | bool | `true` when `gateway_tls` is enabled | Skip TLS certificate verification for loopback connections (the gateway cert typically won't match `127.0.0.1`) |
 //! | `request_timeout_ms` | u64 | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll). Must be > 0 |
-//! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Maximum synthetic response bytes consumed per request. Larger responses are truncated to cap per-worker memory |
+//! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Maximum response bytes the synthetic client consumes per request; must be greater than zero. The client stops reading at the cap, bounding per-worker work and memory without changing the backend response |
 //! | `gateway_addresses` | string[] | (none) | Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test |
+//!
+//! Unknown top-level keys are rejected with path-qualified diagnostics (and
+//! spelling suggestions when close). File, admin/database, and CP/DP admission
+//! share `validate_plugin_config` / constructor validation. Serving-mode
+//! publication uses `KeepLastKnownGood`: an invalid candidate generation is
+//! rejected and the prior valid plugin generation remains active.
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -88,6 +94,24 @@ use url::{Url, form_urlencoded};
 use super::utils::auth_flow::constant_time_eq;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::dns::DnsCacheResolver;
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Authoritative closed set of top-level `load_testing` configuration keys.
+///
+/// Constructor admission, OpenAPI `LoadTestingConfig`, and operator docs must
+/// stay in lockstep with this list.
+pub const LOAD_TESTING_CONFIG_KEYS: &[&str] = &[
+    "concurrent_clients",
+    "duration_seconds",
+    "gateway_addresses",
+    "gateway_port",
+    "gateway_tls",
+    "gateway_tls_no_verify",
+    "key",
+    "max_response_body_bytes",
+    "ramp",
+    "request_timeout_ms",
+];
 
 pub struct LoadTesting {
     /// Shared plugin HTTP client — used for fan-out trigger requests to remote
@@ -113,9 +137,15 @@ pub struct LoadTesting {
 
 impl LoadTesting {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("load_testing: config must be an object".to_string());
-        }
+        let config_obj = config
+            .as_object()
+            .ok_or_else(|| "load_testing: config must be an object".to_string())?;
+        reject_unknown_keys(
+            config_obj,
+            "config",
+            LOAD_TESTING_CONFIG_KEYS,
+            "load_testing: ",
+        )?;
 
         let key = optional_string(config, "key")?
             .filter(|s| !s.is_empty())

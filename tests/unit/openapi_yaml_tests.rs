@@ -3286,6 +3286,139 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
 }
 
 #[tokio::test]
+async fn load_testing_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::load_testing::{LOAD_TESTING_CONFIG_KEYS, LoadTesting};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LoadTestingConfig")
+        .expect("LoadTestingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("LoadTesting properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = LOAD_TESTING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        documented, runtime,
+        "load_testing runtime/OpenAPI key drift"
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let load_testing_docs = plugin_docs
+        .split("### `load_testing`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("load_testing docs section");
+    for key in LOAD_TESTING_CONFIG_KEYS {
+        assert!(
+            load_testing_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md load_testing section missing `{key}`"
+        );
+    }
+    assert!(load_testing_docs.contains("KeepLastKnownGood"));
+    assert!(load_testing_docs.contains("Unknown top-level keys"));
+
+    let valid = json!({
+        "key": "parity-key",
+        "concurrent_clients": 10,
+        "duration_seconds": 30,
+        "ramp": true,
+        "request_timeout_ms": 5000,
+        "max_response_body_bytes": 2048,
+        "gateway_port": 8443,
+        "gateway_tls": true,
+        "gateway_tls_no_verify": true,
+        "gateway_addresses": ["https://127.0.0.1:8443"]
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid, true);
+    assert!(LoadTesting::new(&valid, PluginHttpClient::default()).is_ok());
+
+    let valid_minima = json!({
+        "key": "min-key",
+        "concurrent_clients": 1,
+        "duration_seconds": 1
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid_minima, true);
+    assert!(LoadTesting::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let valid_null_defaults = json!({
+        "key": "null-defaults",
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "ramp": null,
+        "request_timeout_ms": null,
+        "max_response_body_bytes": null,
+        "gateway_port": null,
+        "gateway_tls": null,
+        "gateway_tls_no_verify": null,
+        "gateway_addresses": null
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid_null_defaults, true);
+    assert!(LoadTesting::new(&valid_null_defaults, PluginHttpClient::default()).is_ok());
+
+    let runtime_and_schema_invalid = [
+        json!({
+            "key": "k",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "request_timeot_ms": 5000
+        }),
+        json!({
+            "key": "k",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "rmap": true,
+            "gateway_adresses": ["https://127.0.0.1:8443"]
+        }),
+        json!({
+            "key": "k",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "aaa_extra": 1,
+            "zzz_extra": 2
+        }),
+        json!({}),
+        json!({
+            "key": "k",
+            "concurrent_clients": 0,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": "k",
+            "concurrent_clients": 1,
+            "duration_seconds": 0
+        }),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "LoadTestingConfig", &config, false);
+        assert!(
+            LoadTesting::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid load_testing config: {config}"
+        );
+    }
+
+    let empty_key = json!({
+        "key": "",
+        "concurrent_clients": 1,
+        "duration_seconds": 1
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &empty_key, false);
+    assert!(
+        LoadTesting::new(&empty_key, PluginHttpClient::default()).is_err(),
+        "runtime must still reject empty key"
+    );
+}
+
+#[tokio::test]
 async fn compression_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
 
