@@ -2936,6 +2936,66 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
 }
 
 #[test]
+fn test_apply_delta_rejects_unknown_ai_tool_governor_keys_and_keeps_last_known_good() {
+    let good_governor = json!({
+        "default_action": "deny",
+        "tools": {
+            "github.create_pr": {
+                "action": "allow",
+                "required_args": ["ticket_id"]
+            }
+        }
+    });
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc-gov"])],
+        vec![make_plugin_config_with_json(
+            "pc-gov",
+            "ai_tool_governor",
+            good_governor.clone(),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config1).expect("valid governor config constructs");
+
+    let mut bad_governor = good_governor.clone();
+    bad_governor["tools"]["github.create_pr"]
+        .as_object_mut()
+        .unwrap()
+        .insert("required_arg".into(), json!(["ticket_id"]));
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc-gov"])],
+        vec![make_plugin_config_with_json(
+            "pc-gov",
+            "ai_tool_governor",
+            bad_governor,
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+
+    let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+    let error = cache
+        .apply_delta(&config2, &proxy_ids, &[], false)
+        .expect_err("unknown ai_tool_governor key must reject the reload");
+    let message = error.to_string();
+    assert!(
+        message.contains("unknown configuration key")
+            && message.contains("config.tools.github.create_pr.required_arg"),
+        "unexpected reload error: {message}"
+    );
+
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "ai_tool_governor");
+    assert_eq!(
+        config1.plugin_configs[0].config["tools"]["github.create_pr"]["required_args"],
+        json!(["ticket_id"]),
+        "last-known-good required_args policy must remain installed"
+    );
+}
+
+#[test]
 fn test_apply_delta_rejects_unknown_mesh_route_nested_keys_and_keeps_last_known_good() {
     let good_route = json!({
         "rules": [{

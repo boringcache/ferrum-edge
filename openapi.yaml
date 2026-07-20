@@ -18154,24 +18154,39 @@ components:
 
     AiToolGovernorConfig:
       type: object
-      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions (tools[].function.name / functions[].name), buffered response tool calls (choices[].message.tool_calls[] and legacy function_call), streaming SSE tool-call deltas (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
+      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions (tools[].function.name / functions[].name), buffered response tool calls (choices[].message.tool_calls[] and legacy function_call), streaming SSE tool-call deltas (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Configuration is strict: unknown root, inspect, tool-policy, blocked-pattern, approval, response, and observability properties are rejected (with path-qualified diagnostics). The free-form `tools` name map and arbitrary per-tool `json_schema` document remain open. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
       properties:
         enabled:
           type: boolean
           default: true
-          description: "When false the plugin is inert (no buffering, no inspection), and policy fields are ignored."
+          description: "When false the plugin is inert (no buffering, no inspection), and policy field *values* are ignored — but unknown property names are still rejected at every fixed-shape layer."
       allOf:
         - if:
             required: [enabled]
             properties:
               enabled:
                 const: false
-          then: {}
+          then:
+            # Disabled drafts may carry ignored policy fields of any value, but
+            # only the known property names — typos still fail closed.
+            type: object
+            additionalProperties: false
+            properties:
+              enabled:
+                const: false
+              mode: true
+              default_action: true
+              inspect: true
+              tools: true
+              approval: true
+              response: true
+              observability: true
           else:
             $ref: "#/components/schemas/AiToolGovernorEnabledConfig"
 
     AiToolGovernorEnabledConfig:
       type: object
+      additionalProperties: false
       allOf:
         # Runtime defaults response_tool_calls to true. The only no-surface
         # shape is therefore an explicit response_tool_calls=false with
@@ -18270,7 +18285,8 @@ components:
           description: "Action for a tool with no explicit policy entry. tools may be empty only when default_action governs (deny/require_approval)."
         inspect:
           type: object
-          description: "Independently toggled inspection surfaces. At least one must be enabled."
+          additionalProperties: false
+          description: "Independently toggled inspection surfaces. At least one must be enabled. Unknown surface switches are rejected."
           properties:
             request_tool_definitions:
               type: boolean
@@ -18296,9 +18312,10 @@ components:
           type: object
           propertyNames:
             minLength: 1
-          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name)."
+          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name). The tool-name map is intentionally free-form; each policy object is closed."
           additionalProperties:
             type: object
+            additionalProperties: false
             required: [action]
             allOf:
               - if:
@@ -18335,6 +18352,7 @@ components:
                 type: array
                 items:
                   type: object
+                  additionalProperties: false
                   required: [name, regex]
                   properties:
                     name:
@@ -18348,9 +18366,10 @@ components:
                 description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args."
               json_schema:
                 type: object
-                description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny."
+                description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny. Intentionally open — arbitrary JSON Schema keywords are allowed; do not set additionalProperties: false here."
         approval:
           type: object
+          additionalProperties: false
           description: "Approval webhook, required when any policy can reach require_approval."
           required: [endpoint_url]
           properties:
@@ -18382,6 +18401,7 @@ components:
               description: "Include the raw tool arguments in the approval request body. Off by default so secrets are not sent."
         response:
           type: object
+          additionalProperties: false
           properties:
             deny_status_code:
               type: integer
@@ -18399,6 +18419,7 @@ components:
               description: "Emit a terminal SSE error event when cutting a streamed tool call."
         observability:
           type: object
+          additionalProperties: false
           properties:
             emit_metadata:
               type: boolean
