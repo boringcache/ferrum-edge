@@ -129,8 +129,7 @@ fn test_rejects_one_unknown_key_with_spelling_suggestion() {
     let shared = validate_plugin_config("compression", &json!({"gzip_leveel": 1}))
         .expect_err("shared file/admin/database/CP-DP admission must reject the typo");
     assert!(
-        shared.contains("'config.gzip_leveel'")
-            && shared.contains("did you mean 'gzip_level'?"),
+        shared.contains("'config.gzip_leveel'") && shared.contains("did you mean 'gzip_level'?"),
         "got: {shared}"
     );
 }

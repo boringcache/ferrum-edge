@@ -1626,10 +1626,7 @@ fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
     let error = cache
         .rebuild(&malformed)
         .expect_err("unknown compression key must reject cache publication");
-    assert!(
-        error.contains("config.min_content_lenght"),
-        "got: {error}"
-    );
+    assert!(error.contains("config.min_content_lenght"), "got: {error}");
 
     let after = cache.get_plugins("p1");
     assert_eq!(after.len(), 1);
