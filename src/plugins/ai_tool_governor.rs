@@ -895,14 +895,8 @@ impl GovernorEngine {
                     if skip_approvals {
                         cd.label = "require_approval";
                     } else {
-                        self.resolve_require_approval(
-                            corr,
-                            call,
-                            ns,
-                            approval_deadline,
-                            &mut cd,
-                        )
-                        .await;
+                        self.resolve_require_approval(corr, call, ns, approval_deadline, &mut cd)
+                            .await;
                         // Stop further webhook fan-out once enforce mode has a
                         // blocking decision; remaining calls keep an
                         // observational require_approval label.
