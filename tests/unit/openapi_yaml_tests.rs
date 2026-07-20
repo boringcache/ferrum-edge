@@ -1984,8 +1984,8 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         "per-tool policy objects must be closed"
     );
     assert_eq!(
-        enabled["properties"]["tools"]["additionalProperties"]["properties"]
-            ["blocked_arg_patterns"]["items"]["additionalProperties"],
+        enabled["properties"]["tools"]["additionalProperties"]["properties"]["blocked_arg_patterns"]
+            ["items"]["additionalProperties"],
         json!(false)
     );
     assert!(

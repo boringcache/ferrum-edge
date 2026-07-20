@@ -502,7 +502,11 @@ fn rejects_enforcement_relevant_unknown_keys_with_path_and_suggestion() {
         let err = try_make(config.clone())
             .err()
             .unwrap_or_else(|| panic!("expected unknown-key rejection for {label}"));
-        assert_unknown_key_error(&err, path_fragment, path_fragment.rsplit('.').next().unwrap());
+        assert_unknown_key_error(
+            &err,
+            path_fragment,
+            path_fragment.rsplit('.').next().unwrap(),
+        );
         if let Some(expected) = suggestion {
             assert!(
                 err.contains(&format!("did you mean '{expected}'")),
@@ -533,7 +537,10 @@ fn disabled_config_still_rejects_unknown_keys() {
     .err()
     .expect("unknown keys must fail even when disabled");
     assert!(err.contains("unknown configuration key"), "{err}");
-    assert!(err.contains("config.modde") || err.contains("config.required_arg"), "{err}");
+    assert!(
+        err.contains("config.modde") || err.contains("config.required_arg"),
+        "{err}"
+    );
 }
 
 #[test]

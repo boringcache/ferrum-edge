@@ -4790,10 +4790,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                 AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS,
                 "ai_tool_governor: ",
             )?;
-            if let Some(patterns) = object
-                .get("blocked_arg_patterns")
-                .and_then(Value::as_array)
-            {
+            if let Some(patterns) = object.get("blocked_arg_patterns").and_then(Value::as_array) {
                 for (idx, entry) in patterns.iter().enumerate() {
                     if let Some(entry_obj) = entry.as_object() {
                         reject_unknown_keys(
