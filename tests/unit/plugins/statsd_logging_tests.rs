@@ -478,8 +478,8 @@ fn test_statsd_logging_disabled_config_skips_construction_validation() {
         .expect("disabled statsd_logging must skip unknown-key validation");
 }
 
-#[test]
-fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebuild() {
+#[tokio::test]
+async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebuild() {
     use ferrum_edge::config::types::Proxy;
 
     let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
