@@ -123,13 +123,24 @@ def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
 
 
 def git_diff(base_ref: str) -> str:
-    commands = [
-        ["git", "diff", "--unified=0", "--no-ext-diff", f"{base_ref}...HEAD", "--", "src/plugins"],
-        ["git", "diff", "--unified=0", "--no-ext-diff", f"{base_ref}..HEAD", "--", "src/plugins"],
-    ]
     last_error = ""
-    for command in commands:
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
+    for revision_range in (f"{base_ref}...HEAD", f"{base_ref}..HEAD"):
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--unified=0",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--end-of-options",
+                revision_range,
+                "--",
+                "src/plugins",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
         if result.returncode == 0:
             return result.stdout
         last_error = result.stderr.strip()
