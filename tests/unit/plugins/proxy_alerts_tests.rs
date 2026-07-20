@@ -22,8 +22,8 @@ use ferrum_edge::plugins::proxy_alerts::windows::{
 };
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, TransactionSummary,
-    WsDisconnectContext, plugin_failure_policy,
+    ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, TransactionSummary, WsDisconnectContext,
+    plugin_failure_policy,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
