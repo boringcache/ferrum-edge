@@ -402,15 +402,21 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 
 **Priority:** 9075
 
+**Admission.** Top-level config keys are closed: unknown properties are rejected with the exact key name(s) in the error. Nested `global_tags` remains an intentionally open string map. Registration policy is `OptionalFailOpen` — Admin create/update still returns HTTP 400 for invalid enabled configs, while file-mode load and plugin-cache rebuild warn and omit the plugin rather than aborting the gateway. Disabled plugin configs skip construction validation.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | StatsD server hostname or IP address |
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
 | `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`) |
-| `global_tags` | Object | *(none)* | Key-value pairs appended as DogStatsD tags to every metric |
+| `global_tags` | Object | *(none)* | Key-value pairs appended as DogStatsD tags to every metric (open string map) |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing |
+| `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (shared batching logger) |
+| `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts |
+| `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Large payloads are automatically split across multiple UDP packets at 1472-byte MTU boundaries.
 
@@ -418,7 +424,7 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 
 **Tag sanitization.** Operator-controlled tag values (proxy name/id, HTTP method, protocol) are sanitized before being written to the line protocol: `,` `|` `#` `:` and whitespace are replaced with `_`. Empty values become the literal `none`. This keeps a proxy name containing delimiters from corrupting downstream parsing in StatsD / DogStatsD / Telegraf.
 
-**Metrics emitted per HTTP/gRPC/WebSocket request:**
+**Metrics emitted per HTTP/gRPC request** (WebSocket upgrade handshakes currently share this HTTP formatter path; dedicated WebSocket terminal metrics are tracked separately in [#2555](https://github.com/ferrum-edge/ferrum-edge/issues/2555) and must not be assumed present here):
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -428,19 +434,37 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 | `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead |
 | `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
 | `{prefix}.request.status.{N}xx` | Counter | Status code bucket (2xx, 4xx, 5xx, etc.) |
+| `{prefix}.request.client_disconnect` | Counter | Emitted only when the terminal HTTP summary records `client_disconnected: true` |
 
 Tags: `method`, `status`, `status_class`, `proxy`, `namespace` (plus any `global_tags`).
 
-**Metrics emitted per stream (TCP/UDP) disconnect:**
+**Metrics emitted per stream (TCP/UDP/DTLS) disconnect:**
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `{prefix}.stream.count` | Counter | Stream connection count |
 | `{prefix}.stream.duration_ms` | Timer | Connection duration |
-| `{prefix}.stream.bytes_sent` | Gauge | Bytes sent to client |
-| `{prefix}.stream.bytes_received` | Gauge | Bytes received from client |
+| `{prefix}.stream.bytes_sent` | Gauge | Bytes the gateway relayed **client→backend** (same directional contract as `StreamTransactionSummary.bytes_sent`) |
+| `{prefix}.stream.bytes_received` | Gauge | Bytes the gateway relayed **backend→client** (same directional contract as `StreamTransactionSummary.bytes_received`) |
+| `{prefix}.stream.disconnect` | Counter | One disconnect event per stream summary |
 
-Tags: `protocol`, `proxy`, `error`, `namespace` (plus any `global_tags`).
+Stream byte families are **per-disconnect gauges with last-observation semantics**, not cumulative byte counters: each disconnect overwrites the series with that session's final byte totals.
+
+Tags: `protocol`, `proxy`, `error`, `cause`, `direction`, `namespace` (plus any `global_tags`).
+
+**`cause` tag values** (from `disconnect_cause`; when the summary field is unset the tag is the literal `unknown`):
+
+- `idle_timeout`
+- `recv_error`
+- `backend_error`
+- `graceful_shutdown`
+- `unknown` (summary `disconnect_cause` is `None`)
+
+**`direction` tag values** (from `disconnect_direction`; both `None` and explicit `Unknown` serialize as `unknown`):
+
+- `client_to_backend`
+- `backend_to_client`
+- `unknown`
 
 ```yaml
 plugin_name: statsd_logging
@@ -453,6 +477,8 @@ config:
     region: "us-east-1"
   flush_interval_ms: 500
   max_batch_lines: 50
+  max_retries: 0
+  retry_delay_ms: 0
 ```
 
 #### DogStatsD / Datadog Integration
@@ -2642,12 +2668,22 @@ config:
 
 Returns configurable mock responses without proxying to the backend. Supports matching by HTTP method and path pattern (exact or regex), with configurable status codes, headers, body, and optional latency simulation. Useful for early API testing before backends are ready, contract testing, and local development.
 
-**Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family
+**Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family (HTTP, gRPC, WebSocket handshake)
 
-**Path matching is relative to the proxy's `listen_path`.** The plugin strips the proxy's prefix listen_path before matching rules. For example, if the proxy has `listen_path: /api/v1` and a request arrives at `/api/v1/users`, the mock rule path should be `/users`. For proxies with regex listen_paths (`~` prefix) or root listen_path (`/`), the full request path is used.
+Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be in range 100–599. Runtime construction is the authoritative final boundary.
+
+**Path matching by listen-path scope:**
+
+| Proxy `listen_path` | Rule `path` semantics | Example |
+|---|---|---|
+| Prefix (e.g. `/api/v1`) | Relative after stripping the prefix. A request exactly equal to that prefix matches `/`. | Request `/api/v1/users` → rule `/users` |
+| Exact (`=/api/v1`) | Full request path (no stripping). A rule of `/` does **not** match `/api/v1`. | Request `/api/v1` → rule `/api/v1` |
+| Regex (`~/api/v[0-9]+`) | Full request path (no literal prefix to strip). | Request `/api/v1/users` → rule `/api/v1/users` |
+| Root (`/`) | Full request path (stripping `/` would corrupt paths). | Request `/users` → rule `/users` |
+| Host-only (`listen_path` omitted) | Full request path (no prefix scope). | Request `/health` → rule `/health` |
 
 ```yaml
-# Proxy with listen_path: /api/v1
+# Proxy with listen_path: /api/v1  (prefix — relative rule paths)
 config:
   rules:
     - method: GET                        # optional — omit to match all methods
@@ -2667,7 +2703,17 @@ config:
   passthrough_on_no_match: true          # false (default) returns 404 for unmatched requests
 ```
 
-Rules are evaluated in order — first match wins. Regex paths use the same `~` prefix and auto-anchoring as `listen_path` patterns. A request to exactly the listen_path (e.g., `/api/v1` with no trailing path) is matched as `/`. When `passthrough_on_no_match` is `false` (default), requests that don't match any rule receive a `404` with `{"error":"no mock rule matched"}`. When `true`, unmatched requests continue to the real backend — useful for mocking only some endpoints while the rest hit the backend.
+```yaml
+# Exact listen_path: =/api/v1  — rule path must be the full request path
+config:
+  rules:
+    - path: /api/v1
+      body: exact-root-mock
+```
+
+Rules are evaluated in order — first match wins. Regex rule paths use the same `~` prefix and auto-anchoring as `listen_path` patterns. For **prefix** listen paths only, a request exactly equal to the listen path (e.g., `/api/v1` with no trailing path) is matched as `/`. When `passthrough_on_no_match` is `false` (default), requests that don't match any rule receive a `404` with `{"error":"no mock rule matched"}`. When `true`, unmatched requests continue to the real backend — useful for mocking only some endpoints while the rest hit the backend.
+
+**WebSocket handshake contract:** Upgrade requests are classified as `WebSocket` and therefore select this plugin. A matching rule returns a synthetic HTTP handshake response and never establishes an upgraded frame stream — including a `101` response on HTTP/1.1 or a success-like `200` response on HTTP/2 / HTTP/3 Extended CONNECT. An unmatched upgrade with `passthrough_on_no_match: false` (default) returns the same terminal `404` mock and blocks backend upgrade handling; set `passthrough_on_no_match: true` to let unmatched upgrades continue to the WebSocket backend. Frame-level mocking belongs to WebSocket frame plugins, not `response_mock`. The same handshake short-circuit applies for HTTP/1.1 Upgrade and HTTP/2 / HTTP/3 Extended CONNECT frontends because protocol selection uses `ProxyProtocol::WebSocket` for all of them.
 
 ### `spec_expose`
 
@@ -4859,6 +4905,8 @@ These plugins are registered built-ins even when they are most often generated o
 ### `mesh_route_dispatch`
 
 Applies per-request route overrides generated from mesh/Istio routing resources. It runs in `before_proxy` after authentication and admission plugins, so policy evaluates the original public proxy identity before the backend override is applied. For WebSockets, the override selects the upgrade backend only; individual frames are not re-routed.
+
+**Strict config validation:** unknown keys are rejected at every security-relevant nesting level — top-level plugin config, each rule, match, destination, fault, rewrite, redirect, transform, route-local `retry`, nested retry backoff, and destination `backend_tls`. Misspellings such as `reject_unmtached`, `requires_node_waypoint_auth`, `retry.max_retry`, or `backend_tls.client_certpath` fail admission on native/file/admin/translated/CP-DP paths instead of silently disabling fail-closed controls. Shared gateway `RetryConfig` / `BackendTlsConfig` consumers keep their existing compatibility boundary; mesh route policy uses strict route-local wire shapes that convert into those runtime types after validation.
 
 See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [plugin execution order](plugin_execution_order.md#why-this-order-matters) for route-collapse, fault, rewrite, redirect, and HBONE behavior.
 

@@ -107,6 +107,17 @@ pub struct ProxyBody {
     /// will complete successfully on the next wake. Cheap — one atomic RMW
     /// on the first poll per body, zero cost thereafter.
     polled: AtomicBool,
+    /// Unread frontend gRPC upload retained across a synthesized Trailers-Only
+    /// gateway error (#2057). With the pinned h2 0.4.x transport, response
+    /// HEADERS are already serialized before the permitted NO_ERROR request
+    /// cancellation; retaining the upload couples its lifetime to the response
+    /// body as defense-in-depth rather than claiming a stronger wire-order
+    /// guarantee. Raw clients must still accept that legal residual reset after
+    /// an explicit Trailers-Only `grpc-status`.
+    /// Boxed so this rare error-path hold remains pointer-sized on every
+    /// ordinary response body. `GrpcBody` contains an `Incoming` or mpsc
+    /// receiver and must not inflate the proxy hot-path response envelope.
+    _held_frontend_grpc_upload: Option<Box<crate::proxy::grpc_proxy::GrpcBody>>,
 }
 
 #[derive(Clone)]
@@ -372,6 +383,7 @@ impl ProxyBody {
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
+            _held_frontend_grpc_upload: None,
         }
     }
 
@@ -396,6 +408,7 @@ impl ProxyBody {
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
+            _held_frontend_grpc_upload: None,
         }
     }
 
@@ -418,6 +431,18 @@ impl ProxyBody {
         guard: crate::runtime_metrics::ReqwestBackendRequestGuard,
     ) -> Self {
         self._reqwest_backend_guard = Some(guard);
+        self
+    }
+
+    /// Retain an unread frontend gRPC upload until this response body is
+    /// dropped. This keeps request ownership coupled to the synthesized
+    /// Trailers-Only response lifecycle as an H2 defense-in-depth measure;
+    /// the client still handles the legal post-response NO_ERROR reset (#2057).
+    pub(crate) fn with_held_frontend_grpc_upload(
+        mut self,
+        upload: crate::proxy::grpc_proxy::GrpcBody,
+    ) -> Self {
+        self._held_frontend_grpc_upload = Some(Box::new(upload));
         self
     }
 
@@ -689,6 +714,7 @@ impl ProxyBody {
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
+            _held_frontend_grpc_upload: None,
         }
     }
 

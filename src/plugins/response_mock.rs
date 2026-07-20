@@ -8,16 +8,25 @@
 //!
 //! ## Path Matching
 //!
-//! Mock rule paths are **relative to the proxy's `listen_path`**. The plugin
-//! strips the proxy's prefix listen_path from the incoming request path before
-//! matching rules. For example, if the proxy has `listen_path: /api/v1` and
-//! a request arrives at `/api/v1/users`, the mock rule path should be `/users`.
-//!
-//! For proxies with regex listen_paths (`~` prefix), the full request path is
-//! used since there is no literal prefix to strip.
-//!
-//! A request to exactly the listen_path itself (e.g., `/api/v1` with no
+//! Mock rule paths are **relative to a prefix `listen_path`**. The plugin
+//! strips that prefix from the incoming request path before matching rules.
+//! For example, if the proxy has `listen_path: /api/v1` and a request arrives
+//! at `/api/v1/users`, the mock rule path should be `/users`. A request to
+//! exactly that strip-eligible prefix listen path (e.g., `/api/v1` with no
 //! trailing component) is matched as `/`.
+//!
+//! Full request path matching (no stripping) applies for:
+//! - exact listen paths (`=` prefix)
+//! - regex listen paths (`~` prefix)
+//! - root listen path (`/`)
+//! - host-only proxies (`listen_path` omitted / `None`)
+//!
+//! ## WebSocket handshake
+//!
+//! `response_mock` participates in the HTTP-family protocol set, including
+//! WebSocket upgrade handshakes. A matching rule short-circuits only the HTTP
+//! handshake response (`PluginResult::Reject`). It does **not** establish or
+//! mock an upgraded WebSocket frame stream — even when `status_code` is `101`.
 //!
 //! ## Config
 //!
@@ -44,16 +53,22 @@
 //! ```
 //!
 //! - **rules**: Array of mock rules evaluated in order (first match wins)
-//!   - **method**: HTTP method to match (optional; omit to match all methods)
-//!   - **path**: Path relative to the proxy's listen_path, or regex with `~`
-//!     prefix (required)
-//!   - **status_code**: HTTP status to return (default: 200)
+//!   - **method**: HTTP method token to match (optional; omit to match all
+//!     methods). When supplied it must be non-empty and parse as an HTTP
+//!     method token.
+//!   - **path**: Non-empty path relative to a prefix listen_path, full path
+//!     for exact/regex/root/host-only scopes, or regex with `~` prefix
+//!     (required)
+//!   - **status_code**: HTTP status to return (default: 200; must be 100–599)
 //!   - **headers**: Response headers (default: `{"content-type": "application/json"}`)
 //!   - **body**: Response body string (default: empty)
 //!   - **delay_ms**: Simulated latency in milliseconds (default: 0, max
 //!     3,600,000 = 1 hour; larger values are rejected at construction)
 //! - **passthrough_on_no_match**: If true, requests not matching any rule
 //!   continue to the backend. If false (default), unmatched requests get 404.
+//!
+//! Unknown top-level and per-rule keys are rejected at construction. The
+//! free-form `headers` map remains open for arbitrary string-valued headers.
 
 use async_trait::async_trait;
 use http::{
@@ -61,10 +76,23 @@ use http::{
     header::{HeaderName, HeaderValue},
 };
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Every accepted top-level configuration property.
+pub const RESPONSE_MOCK_CONFIG_KEYS: &[&str] = &["rules", "passthrough_on_no_match"];
+
+/// Every accepted per-rule configuration property.
+pub const RESPONSE_MOCK_RULE_KEYS: &[&str] = &[
+    "method",
+    "path",
+    "status_code",
+    "headers",
+    "body",
+    "delay_ms",
+];
 
 /// Upper bound for a rule's `delay_ms` (1 hour). `delay_ms` feeds
 /// `tokio::time::sleep` on the request hot path, so an unbounded value
@@ -94,9 +122,13 @@ pub struct ResponseMock {
 
 impl ResponseMock {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("response_mock: config must be an object".to_string());
-        }
+        let config = config.as_object().ok_or_else(|| {
+            format!(
+                "response_mock: config must be an object; allowed keys: {}",
+                RESPONSE_MOCK_CONFIG_KEYS.join(", ")
+            )
+        })?;
+        reject_unknown_keys(config, "config", RESPONSE_MOCK_CONFIG_KEYS)?;
 
         let passthrough_on_no_match =
             optional_bool(config, "passthrough_on_no_match")?.unwrap_or(false);
@@ -113,11 +145,13 @@ impl ResponseMock {
         let mut rules = Vec::with_capacity(rules_val.len());
 
         for (i, rule_val) in rules_val.iter().enumerate() {
-            if !rule_val.is_object() {
-                return Err(format!("response_mock: rule[{i}] must be an object"));
-            }
+            let rule_obj = rule_val
+                .as_object()
+                .ok_or_else(|| format!("response_mock: rule[{i}] must be an object"))?;
+            let rule_path = format!("config.rules[{i}]");
+            reject_unknown_keys(rule_obj, &rule_path, RESPONSE_MOCK_RULE_KEYS)?;
 
-            let method = match rule_val.get("method") {
+            let method = match rule_obj.get("method") {
                 Some(Value::String(method)) if !method.is_empty() => {
                     Method::from_bytes(method.as_bytes()).map_err(|_| {
                         format!(
@@ -139,8 +173,9 @@ impl ResponseMock {
                 }
             };
 
-            let path_str = rule_val["path"]
-                .as_str()
+            let path_str = rule_obj
+                .get("path")
+                .and_then(Value::as_str)
                 .ok_or_else(|| format!("response_mock: rule[{i}] missing 'path'"))?;
             if path_str.is_empty() {
                 return Err(format!("response_mock: rule[{i}] 'path' must not be empty"));
@@ -161,10 +196,10 @@ impl ResponseMock {
                 PathMatcher::Exact(path_str.to_string())
             };
 
-            let status_code = optional_status_code(rule_val, i)?;
+            let status_code = optional_status_code(rule_obj, i)?;
 
             let mut headers = HashMap::new();
-            match rule_val.get("headers") {
+            match rule_obj.get("headers") {
                 Some(Value::Object(obj)) => {
                     for (k, v) in obj {
                         HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
@@ -190,7 +225,7 @@ impl ResponseMock {
                 headers.insert("content-type".to_string(), "application/json".to_string());
             }
 
-            let body = match rule_val.get("body") {
+            let body = match rule_obj.get("body") {
                 Some(Value::String(body)) => body.clone(),
                 Some(Value::Null) | None => String::new(),
                 Some(_) => {
@@ -198,7 +233,7 @@ impl ResponseMock {
                 }
             };
 
-            let delay_ms = optional_u64(rule_val, "delay_ms", i)?.unwrap_or(0);
+            let delay_ms = optional_u64(rule_obj, "delay_ms", i)?.unwrap_or(0);
             if delay_ms > MAX_DELAY_MS {
                 return Err(format!(
                     "response_mock: rule[{i}] 'delay_ms' must be <= {MAX_DELAY_MS}, got {delay_ms}"
@@ -235,7 +270,28 @@ impl ResponseMock {
     }
 }
 
-fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
+fn reject_unknown_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "response_mock: unknown config key(s) under '{path}': {}; allowed keys: {}",
+        unknown.join(", "),
+        allowed.join(", ")
+    ))
+}
+
+fn optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(Value::Null) | None => Ok(None),
@@ -243,7 +299,11 @@ fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     }
 }
 
-fn optional_u64(config: &Value, key: &str, rule_idx: usize) -> Result<Option<u64>, String> {
+fn optional_u64(
+    config: &Map<String, Value>,
+    key: &str,
+    rule_idx: usize,
+) -> Result<Option<u64>, String> {
     match config.get(key) {
         Some(Value::Number(value)) => value.as_u64().map(Some).ok_or_else(|| {
             format!("response_mock: rule[{rule_idx}] '{key}' must be an unsigned integer")
@@ -255,7 +315,7 @@ fn optional_u64(config: &Value, key: &str, rule_idx: usize) -> Result<Option<u64
     }
 }
 
-fn optional_status_code(rule_val: &Value, rule_idx: usize) -> Result<u16, String> {
+fn optional_status_code(rule_val: &Map<String, Value>, rule_idx: usize) -> Result<u16, String> {
     let Some(raw) = optional_u64(rule_val, "status_code", rule_idx)? else {
         return Ok(200);
     };

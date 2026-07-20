@@ -120,11 +120,18 @@ gateway_matrix! {
 //
 // The gRPC cell is also the regression guard for #2057. Unlike the
 // bodyless GET cells, its raw h2 client sends request HEADERS and DATA
-// separately. A fast Trailers-Only UNAVAILABLE may close the request
-// direction before the local DATA write runs, so the client can observe
-// `inactive stream` from `send_data` while the response future still carries
-// the correctly formatted gateway error. The client must keep awaiting that
-// response rather than treating the request-write race as the RPC outcome.
+// separately. Two related races were observed on accept-then-RST:
+//
+// 1. Request-direction: a fast Trailers-Only UNAVAILABLE can close the
+//    request half before local DATA runs (`inactive stream` from
+//    `send_data`) while the response future still carries grpc-status.
+// 2. Response-direction residual (main run 29709363349): h2 delivered the
+//    complete Trailers-Only response and then the RFC 9113 §8.1-permitted
+//    RST_STREAM(NO_ERROR), which the raw client surfaced on the recv half.
+//    Production retains the unread upload with the response as H2
+//    defense-in-depth, but the primary compatibility fix is for the test
+//    client to accept only that typed remote reset after END_STREAM carried
+//    an explicit valid grpc-status.
 gateway_matrix! {
     name = backend_accepts_then_rst_returns_502,
     frontend = [H1, H2, Grpc],

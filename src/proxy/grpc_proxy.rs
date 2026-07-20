@@ -2220,6 +2220,22 @@ pub fn build_grpc_error_response_with_policy(
     })
 }
 
+/// Attach an unread frontend gRPC upload to a synthesized Trailers-Only error
+/// so its ownership follows the response-body lifecycle (#2057). This is
+/// defense-in-depth on the pinned h2 0.4.x transport: h2 already writes the
+/// response HEADERS before its permitted NO_ERROR request cancellation, and a
+/// raw client can still observe that reset after the complete response.
+pub fn attach_held_frontend_grpc_upload(
+    mut response: hyper::Response<super::ProxyBody>,
+    held_frontend_upload: Option<GrpcBody>,
+) -> hyper::Response<super::ProxyBody> {
+    if let Some(upload) = held_frontend_upload {
+        let body = std::mem::replace(response.body_mut(), super::ProxyBody::empty());
+        *response.body_mut() = body.with_held_frontend_grpc_upload(upload);
+    }
+    response
+}
+
 /// Build a gRPC error response without route policy. Pre-routing callers use
 /// this form because no resolved plugin configuration exists yet.
 pub fn build_grpc_error_response(status: u32, message: &str) -> hyper::Response<super::ProxyBody> {
@@ -2359,6 +2375,7 @@ pub async fn proxy_grpc_request_streaming(
     body_size_exceeded: Arc<AtomicBool>,
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    held_frontend_upload: &mut Option<GrpcBody>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
     let grpc_body = GrpcBody::Streaming {
@@ -2379,6 +2396,7 @@ pub async fn proxy_grpc_request_streaming(
         max_grpc_recv_size_bytes,
         body_size_exceeded,
         grpc_deadline_at,
+        held_frontend_upload,
     )
     .await
 }
@@ -2407,6 +2425,7 @@ pub async fn proxy_grpc_request_streaming_channel(
     body_size_exceeded: Arc<AtomicBool>,
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    held_frontend_upload: &mut Option<GrpcBody>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let grpc_body = GrpcBody::Channel {
         receiver,
@@ -2426,6 +2445,7 @@ pub async fn proxy_grpc_request_streaming_channel(
         max_grpc_recv_size_bytes,
         body_size_exceeded,
         grpc_deadline_at,
+        held_frontend_upload,
     )
     .await
 }
@@ -2451,10 +2471,21 @@ async fn proxy_grpc_streaming_dispatch(
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    held_frontend_upload: &mut Option<GrpcBody>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
-    let uri: hyper::Uri = backend_url
-        .parse()
-        .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(uri) => uri,
+        Err(e) => {
+            // Preserve the unread frontend upload so the caller controls its
+            // termination relative to the synthesized Trailers-Only response:
+            // response-body ownership on H2 and post-HEADERS+FIN on H3 (#2057).
+            *held_frontend_upload = Some(grpc_body);
+            return Err(GrpcProxyError::Internal(format!(
+                "Invalid backend URL: {}",
+                e
+            )));
+        }
+    };
 
     // Build headers: merge plugin/proxy headers on top of the inbound
     // request's headers, then run the gRPC-specific strip on the union.
@@ -2505,22 +2536,40 @@ async fn proxy_grpc_streaming_dispatch(
         None
     };
 
+    // Acquire the backend sender BEFORE moving the frontend upload into the
+    // outbound request. A connect/handshake failure (accept-then-RST) must
+    // return the unread Incoming/Channel body so the caller owns termination:
+    // H2 retains it with the response as defense-in-depth, while H3 must defer
+    // channel drop/STOP_SENDING until after Trailers-Only HEADERS+FIN (#2057).
+    let mut sender = if let Some(deadline) = grpc_deadline_at {
+        match tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy)).await {
+            Err(_) => {
+                *held_frontend_upload = Some(grpc_body);
+                return Err(GrpcProxyError::ClientDeadlineExceeded(
+                    "gRPC deadline exceeded during backend connection acquisition".to_string(),
+                ));
+            }
+            Ok(Err(e)) => {
+                *held_frontend_upload = Some(grpc_body);
+                return Err(e);
+            }
+            Ok(Ok(sender)) => sender,
+        }
+    } else {
+        match grpc_pool.get_sender(proxy).await {
+            Ok(sender) => sender,
+            Err(e) => {
+                *held_frontend_upload = Some(grpc_body);
+                return Err(e);
+            }
+        }
+    };
+
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
 
-    let mut sender = if let Some(deadline) = grpc_deadline_at {
-        tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy))
-            .await
-            .map_err(|_| {
-                GrpcProxyError::ClientDeadlineExceeded(
-                    "gRPC deadline exceeded during backend connection acquisition".to_string(),
-                )
-            })??
-    } else {
-        grpc_pool.get_sender(proxy).await?
-    };
     let response = if let Some(deadline) = grpc_deadline_at {
         tokio::time::timeout_at(deadline, sender.send_request(backend_req))
             .await

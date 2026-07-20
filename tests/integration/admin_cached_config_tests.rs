@@ -2618,6 +2618,68 @@ async fn test_admin_create_rejects_unknown_proxy_alerts_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_mesh_route_dispatch_nested_policy_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config) in [
+        (
+            "mesh-route-reject-typo",
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"}
+                }],
+                "reject_unmtached": true
+            }),
+        ),
+        (
+            "mesh-route-retry-typo",
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "api"},
+                    "retry": {"max_retry": 2}
+                }]
+            }),
+        ),
+        (
+            "mesh-route-backend-tls-typo",
+            json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "api.internal",
+                        "backend_port": 443,
+                        "backend_tls": {"client_certpath": "/tls/client.pem"}
+                    }
+                }]
+            }),
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(
+            status, 400,
+            "unknown mesh_route_dispatch nested key was admitted: {body}"
+        );
+        assert!(
+            body.to_string().contains("unknown field"),
+            "unexpected admin validation response: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_malformed_correlation_id_configs() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
