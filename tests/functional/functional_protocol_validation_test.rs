@@ -2683,8 +2683,7 @@ async fn functional_protocol_validation_h3_strips_plugin_reintroduced_hop_header
     sleep(Duration::from_millis(150)).await;
 
     let config = build_config_with_h3_sse_plugin_hop_headers(echo_port);
-    let (mut gateway, https_port) =
-        start_h3_validation_gateway_with_config(config, &[]).await;
+    let (mut gateway, https_port) = start_h3_validation_gateway_with_config(config, &[]).await;
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/");

@@ -278,9 +278,10 @@ fn ensure_sse_cache_control(response_headers: &mut HashMap<String, String>) {
         return;
     }
 
-    if let Some(existing) = response_headers.iter_mut().find_map(|(name, value)| {
-        name.eq_ignore_ascii_case("cache-control").then_some(value)
-    }) {
+    if let Some(existing) = response_headers
+        .iter_mut()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case("cache-control").then_some(value))
+    {
         if !existing.trim_end().is_empty() && !existing.trim_end().ends_with(',') {
             existing.push_str(", ");
         } else if !existing.is_empty() && !existing.ends_with(' ') {
