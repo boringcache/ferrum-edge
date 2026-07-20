@@ -11239,13 +11239,34 @@ components:
 
     TcpLoggingConfig:
       type: object
-      description: "Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent TCP or TCP+TLS connection."
+      additionalProperties: false
+      description: >-
+        Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent
+        TCP or TCP+TLS connection. Only the properties below are admitted;
+        unknown keys (for example a misspelled `tlls`) are rejected so transport
+        security cannot silently default to plaintext. `connect_timeout_ms`
+        bounds DNS, TCP connect, and TLS handshake when enabled.
+        `write_timeout_ms` bounds each batch write/flush; timeouts discard the
+        writer and use the shared retry/reconnect path. Delivery is
+        at-least-once after partial-write failure. Registration policy is
+        KeepLastKnownGood: an invalid enabled candidate rejects startup or
+        reload publication instead of silently removing or downgrading the
+        previously accepted logger.
       required:
         - host
         - port
+      allOf:
+        - if:
+            required: [tls_server_name]
+          then:
+            required: [tls]
+            properties:
+              tls:
+                const: true
       properties:
         host:
           type: string
+          minLength: 1
           description: Hostname or IP of the TCP log receiver
         port:
           type: integer
@@ -11258,10 +11279,18 @@ components:
           description: Enable TLS encryption for the connection
         tls_server_name:
           type: string
-          description: SNI server name override for TLS (defaults to host)
+          minLength: 1
+          pattern: '^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$'
+          description: >-
+            DNS or IP identity for TLS SNI/certificate verification (defaults to
+            `host`). Allowed only when `tls` is true. The schema rejects URL
+            schemes, paths, queries, fragments, credentials, whitespace, and
+            host:port values; full rustls DNS/IP identity validation is enforced
+            during plugin admission.
         batch_size:
           type: integer
           default: 50
+          minimum: 1
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11271,24 +11300,39 @@ components:
         max_retries:
           type: integer
           default: 3
+          minimum: 0
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 0
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
           description: Channel capacity — new entries are dropped when full
         connect_timeout_ms:
           type: integer
           default: 5000
           minimum: 100
-          description: TCP connection timeout in milliseconds
+          maximum: 60000
+          description: >-
+            Connection establishment timeout in milliseconds. Covers DNS
+            resolution, TCP connect, and the TLS handshake when `tls` is true.
+        write_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          maximum: 60000
+          description: >-
+            Per-batch socket write_all + flush timeout in milliseconds. On
+            timeout the persistent writer is discarded and retries reconnect.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.
@@ -15443,7 +15487,8 @@ components:
 
     SseConfig:
       type: object
-      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers."
+      additionalProperties: false
+      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers. Unknown keys and non-object configs are rejected. Explicit null members are rejected; omitted keys keep defaults. wrap_non_sse_responses implies client-visible text/event-stream for wrapped responses."
       properties:
         require_get_method:
           type: boolean
@@ -15468,7 +15513,8 @@ components:
         retry_ms:
           type: integer
           format: uint64
-          description: "EventSource reconnection hint in milliseconds"
+          minimum: 1
+          description: "EventSource reconnection hint in milliseconds (must be >= 1 when set)"
         force_sse_content_type:
           type: boolean
           default: false
@@ -15476,7 +15522,7 @@ components:
         wrap_non_sse_responses:
           type: boolean
           default: false
-          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering)"
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type."
 
     RateLimitingRuleConfig:
       type: object

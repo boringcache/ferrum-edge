@@ -562,22 +562,29 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 
 **Priority:** 9125
 
+**Failure policy:** `KeepLastKnownGood` — construction/validation failures reject the candidate plugin generation and keep the last-known-good instance.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | Hostname or IP of the TCP log receiver |
 | `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
 | `tls` | Boolean | `false` | Enable TLS encryption for the connection |
-| `tls_server_name` | String | *(none)* | SNI server name override for TLS (defaults to `host`) |
+| `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name (no URL scheme, path, query, fragment, credentials, whitespace, or host:port); invalid values fail admission. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-| `connect_timeout_ms` | Integer | `5000` | TCP connection timeout in milliseconds (min: 100) |
+| `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
+| `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
+| `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
+
+Unknown top-level configuration keys are rejected at admission with an actionable allowed-key list (for example a misspelled `tlls` cannot silently leave the sink on plaintext).
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each entry is serialized as a single JSON line followed by a newline (`\n`), making the output compatible with NDJSON/JSON Lines consumers.
 
-The TCP connection is persistent — it is reused across batches and automatically re-established on write failure or disconnect. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) and skip-verify setting (`FERRUM_TLS_NO_VERIFY`).
+The TCP connection is persistent — it is reused across batches and automatically re-established on write failure, write/flush timeout, connect/handshake timeout, or disconnect. Delivery is at-least-once: a timeout or I/O error after a partial write may cause the full batch to be retried, so collectors must tolerate duplicates. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`), skip-verify setting (`FERRUM_TLS_NO_VERIFY`), and CRL list (`FERRUM_TLS_CRL_FILE_PATH`).
 
 ```yaml
 plugin_name: tcp_logging
@@ -3031,10 +3038,12 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 
 **Lifecycle:**
 
-1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, stashes `Last-Event-ID` in metadata for reconnection.
+1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, bounds `Last-Event-ID` (max 1024 bytes) and stashes it for backend forwarding. The raw ID is omitted from transaction logs (`sse:leid_present` / `sse:leid_bytes` correlation only) and never interpolated into diagnostics.
 2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
-3. **`after_proxy`** — Sets `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`. Strips `Content-Length`. Optionally forces `Content-Type: text/event-stream`.
-4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only).
+3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body.
+4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it.
+
+**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an integer ≥ 1 when set.
 
 **Request validation:**
 
@@ -3055,11 +3064,11 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
 | `strip_content_length` | bool | `true` | Remove `Content-Length` (SSE streams are indefinite) |
-| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 |
 | `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
-| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing |
+| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses |
 
-**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering. When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`.
+**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
 
 ```yaml
 config:
