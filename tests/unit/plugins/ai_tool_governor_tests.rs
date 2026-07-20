@@ -8252,7 +8252,10 @@ async fn mcp_omitted_arguments_normalize_to_empty_object_for_schema() {
         })
         .to_string(),
     );
-    assert_reject(required.before_proxy(&mut ctx, &mut headers).await, Some(403));
+    assert_reject(
+        required.before_proxy(&mut ctx, &mut headers).await,
+        Some(403),
+    );
 
     // Provider response shapes must NOT coerce a missing function.arguments
     // into {} — an allowlisted tool with a required object schema still fails

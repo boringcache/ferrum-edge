@@ -1480,7 +1480,8 @@ impl AiToolGovernor {
     }
 
     fn clear_response_hash(&self, ctx: &mut RequestContext) {
-        ctx.ai_tool_governor_response_hashes.remove(&self.instance_id);
+        ctx.ai_tool_governor_response_hashes
+            .remove(&self.instance_id);
     }
 
     fn request_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
@@ -3509,9 +3510,10 @@ impl StreamingToolCallAccumulator {
     /// not carry an ungovernable sibling past policy.
     fn has_ungovernable_call(&self) -> bool {
         self.malformed
-            || self.calls.iter().any(|(_, c)| {
-                c.name.is_empty() || c.non_string_args || c.ambiguous_identity
-            })
+            || self
+                .calls
+                .iter()
+                .any(|(_, c)| c.name.is_empty() || c.non_string_args || c.ambiguous_identity)
     }
 
     fn build_calls(&self) -> Vec<ToolCall> {
