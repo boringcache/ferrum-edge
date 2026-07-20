@@ -834,7 +834,10 @@ mod tests {
     async fn test_tcp_logging_tls_handshake_honors_connect_timeout() {
         ensure_crypto_provider();
 
-        let listener = must(TcpListener::bind("127.0.0.1:0").await, "bind silent TLS peer");
+        let listener = must(
+            TcpListener::bind("127.0.0.1:0").await,
+            "bind silent TLS peer",
+        );
         let port = must(listener.local_addr(), "read silent peer addr").port();
         tokio::spawn(async move {
             // Accept and hold the socket open without completing a handshake.
@@ -846,7 +849,10 @@ mod tests {
             drop(stream);
         });
 
-        let tls_connector = must(build_tls_connector(true, None, &[]), "build no-verify connector");
+        let tls_connector = must(
+            build_tls_connector(true, None, &[]),
+            "build no-verify connector",
+        );
         let cfg = TcpFlushConfig {
             host: "127.0.0.1".to_string(),
             port,
@@ -894,7 +900,10 @@ mod tests {
     async fn test_tcp_logging_write_timeout_discards_socket_and_recovers() {
         ensure_crypto_provider();
 
-        let stalled = must(TcpListener::bind("127.0.0.1:0").await, "bind stalled reader");
+        let stalled = must(
+            TcpListener::bind("127.0.0.1:0").await,
+            "bind stalled reader",
+        );
         let stalled_port = must(stalled.local_addr(), "read stalled addr").port();
         tokio::spawn(async move {
             let Ok((stream, _)) = stalled.accept().await else {
@@ -909,7 +918,10 @@ mod tests {
             drop(stream);
         });
 
-        let healthy = must(TcpListener::bind("127.0.0.1:0").await, "bind healthy reader");
+        let healthy = must(
+            TcpListener::bind("127.0.0.1:0").await,
+            "bind healthy reader",
+        );
         let healthy_port = must(healthy.local_addr(), "read healthy addr").port();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
