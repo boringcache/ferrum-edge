@@ -11204,7 +11204,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     if ws_disconnect_plugins.is_empty() {
         return;
     }
-    let disconnect_duration_ms = (chrono::Utc::now() - session_meta.session_start)
+    let disconnected_at = chrono::Utc::now();
+    let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
         .num_milliseconds()
         .max(0) as f64;
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
@@ -11219,6 +11220,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         frames_backend_to_client: 0,
         bytes_client_to_backend,
         bytes_backend_to_client,
+        timestamp_connected: session_meta.session_start.to_rfc3339(),
+        timestamp_disconnected: disconnected_at.to_rfc3339(),
         direction: failure.as_ref().map(|(d, _, _)| *d),
         io_side: failure.as_ref().and_then(|(_, _, side)| *side),
         error_class: failure.map(|(_, c, _)| c),
@@ -12425,7 +12428,8 @@ where
     // the whole block — zero overhead for deployments that don't observe
     // WebSocket sessions.
     if !ws_disconnect_plugins.is_empty() {
-        let disconnect_duration_ms = (chrono::Utc::now() - session_meta.session_start)
+        let disconnected_at = chrono::Utc::now();
+        let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
             .num_milliseconds()
             .max(0) as f64;
         let failure = first_failure.get().cloned();
@@ -12441,6 +12445,8 @@ where
             frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
             bytes_client_to_backend: bytes_c2b.load(Ordering::Relaxed),
             bytes_backend_to_client: bytes_b2c.load(Ordering::Relaxed),
+            timestamp_connected: session_meta.session_start.to_rfc3339(),
+            timestamp_disconnected: disconnected_at.to_rfc3339(),
             direction: failure.as_ref().map(|(d, _, _)| *d),
             io_side: failure.as_ref().and_then(|(_, _, side)| *side),
             error_class: failure.map(|(_, c, _)| c),

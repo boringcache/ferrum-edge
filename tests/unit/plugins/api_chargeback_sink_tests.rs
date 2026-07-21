@@ -481,6 +481,8 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
             frames_backend_to_client: 1,
             bytes_client_to_backend: 300,
             bytes_backend_to_client: 400,
+            timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+            timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
             direction: None,
             io_side: None,
             error_class: None,

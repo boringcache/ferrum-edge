@@ -1330,6 +1330,14 @@ pub struct WsDisconnectContext {
     /// Total payload bytes proxied from backend toward client over the
     /// lifetime of this WebSocket session.
     pub bytes_backend_to_client: u64,
+    /// Wall-clock session start (RFC3339). Captured at upgrade and carried
+    /// through delayed `ws_logging` delivery so collectors do not depend on
+    /// receipt time for event ordering.
+    pub timestamp_connected: String,
+    /// Wall-clock session end (RFC3339). Sampled once at teardown alongside
+    /// `duration_ms` so disconnect records remain self-contained under batch
+    /// flush, retry, and reconnect delay.
+    pub timestamp_disconnected: String,
     /// Which direction observed the first terminating error. `None` for
     /// clean close initiated by either peer.
     pub direction: Option<Direction>,
