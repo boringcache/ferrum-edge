@@ -7,13 +7,13 @@
 //! ## How it works
 //!
 //! When a matching key is received in `before_proxy`, the plugin strips the
-//! trigger key from the original request (so backends and earlier mirrors that
-//! already copied headers cannot reuse a post-trigger observation from this
-//! request path), then spawns a background load test that sends concurrent
-//! requests back through the gateway's local listener
-//! (`127.0.0.1:{gateway_port}`). Synthetic requests omit the trigger key, so
-//! they flow through the full proxy pipeline without re-triggering the load
-//! test. Native transaction logging captures every synthetic request.
+//! trigger key from the original request before later deferred transforms
+//! (notably `request_mirror`) or backends can observe it, then spawns a
+//! background load test that sends concurrent requests back through the
+//! gateway's local listener (`127.0.0.1:{gateway_port}`). Synthetic requests
+//! omit the trigger key, so they flow through the full proxy pipeline without
+//! re-triggering the load test. Native transaction logging captures every
+//! synthetic request.
 //!
 //! The triggering request itself proceeds normally through the proxy pipeline
 //! and is not blocked by the load test.
@@ -37,9 +37,9 @@
 //! ## Caveats
 //!
 //! - **Auth forwarding**: Synthetic requests forward the triggering request's
-//!   headers (minus the trigger key, hop-by-hop headers, and client-supplied
-//!   forwarding identity). For auth schemes with short-lived tokens, tokens may
-//!   expire during long-duration tests.
+//!   headers (minus the trigger key, hop-by-hop / Connection-listed headers,
+//!   and client-supplied forwarding identity). For auth schemes with
+//!   short-lived tokens, tokens may expire during long-duration tests.
 //! - **Rate limiting**: Synthetic requests pass through rate limiting plugins
 //!   on the proxy. High `concurrent_clients` values may trigger rate limits.
 //!
@@ -63,6 +63,7 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::dns::DnsCacheResolver;
 use crate::proxy::headers::{
     is_backend_request_strip_header, is_proxy_generated_forwarding_header,
+    parse_connection_listed_from_str_map,
 };
 use crate::retry::classify_reqwest_error;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -81,12 +82,16 @@ pub const LOAD_TESTING_CONFIG_KEYS: &[&str] = &[
     "request_timeout_ms",
 ];
 
-/// Minimum accepted trigger-key length. Short reusable keys are rejected at
-/// admission so a weak shared secret is harder to guess or leak into logs.
+/// Minimum accepted trigger-key length in Unicode scalar values (matches
+/// OpenAPI `minLength`, which is character-count based — not UTF-8 bytes).
 pub const MIN_TRIGGER_KEY_LEN: usize = 16;
 
 /// Hard ceiling for per-request timeout (independent of run duration).
 pub const MAX_REQUEST_TIMEOUT_MS: u64 = 60_000;
+
+/// Maximum accepted one-hop fan-out peer addresses. Bounds controller fan-out
+/// work and config size while remaining large enough for typical mesh cohorts.
+pub const MAX_GATEWAY_ADDRESSES: usize = 32;
 
 /// Process-wide admission budget across every effective load_testing instance.
 const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
@@ -94,16 +99,21 @@ const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
 const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
 const HEADER_FANOUT: &str = "x-loadtesting-fanout";
 const FANOUT_MARKER: &str = "1";
+const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 
 static PROCESS_ACTIVE_CLIENTS: AtomicU64 = AtomicU64::new(0);
 static SHARED_STATES: OnceLock<Mutex<HashMap<String, Weak<LoadTestingState>>>> = OnceLock::new();
 
 /// Stable run-admission state shared across compatible plugin-cache generations
 /// for one plugin-config identity.
+///
+/// Detached cohort tasks may hold `Arc<Self>` without counting as plugin
+/// owners. Cancellation on plugin removal is driven by [`LoadTestingOwner`].
 pub(crate) struct LoadTestingState {
     is_running: AtomicBool,
     run_cancel: Mutex<CancellationToken>,
     last_result: Mutex<Option<RunResult>>,
+    live_owners: AtomicU64,
 }
 
 impl LoadTestingState {
@@ -112,6 +122,7 @@ impl LoadTestingState {
             is_running: AtomicBool::new(false),
             run_cancel: Mutex::new(CancellationToken::new()),
             last_result: Mutex::new(None),
+            live_owners: AtomicU64::new(0),
         })
     }
 
@@ -154,6 +165,33 @@ impl Drop for LoadTestingState {
     fn drop(&mut self) {
         self.cancel_active_run();
         self.is_running.store(false, Ordering::Release);
+    }
+}
+
+/// Plugin-instance ownership of a shared [`LoadTestingState`].
+///
+/// Task-held `Arc` clones do not create owners. When the last live plugin
+/// instance for a policy identity is dropped, any active cohort is cancelled.
+/// A compatible replacement generation that shares the same state does not
+/// cancel the existing cohort.
+struct LoadTestingOwner {
+    state: Arc<LoadTestingState>,
+}
+
+impl LoadTestingOwner {
+    fn acquire(state: Arc<LoadTestingState>) -> Self {
+        state.live_owners.fetch_add(1, Ordering::SeqCst);
+        Self { state }
+    }
+}
+
+impl Drop for LoadTestingOwner {
+    fn drop(&mut self) {
+        // fetch_sub returns the previous value; 1 means we were the last owner.
+        let previous = self.state.live_owners.fetch_sub(1, Ordering::SeqCst);
+        if previous == 1 {
+            self.state.cancel_active_run();
+        }
     }
 }
 
@@ -257,7 +295,10 @@ pub struct LoadTesting {
     max_response_body_bytes: u64,
     gateway_base_url: String,
     gateway_addresses: Vec<String>,
+    request_headers_to_redact: Vec<String>,
     state: Arc<LoadTestingState>,
+    /// Keeps plugin-instance ownership alive; must outlive task-only state refs.
+    _owner: LoadTestingOwner,
 }
 
 impl LoadTesting {
@@ -336,7 +377,7 @@ impl LoadTesting {
             .ok_or_else(|| {
                 "load_testing: 'key' is required and must be a non-empty string".to_string()
             })?;
-        if key.len() < MIN_TRIGGER_KEY_LEN {
+        if key.chars().count() < MIN_TRIGGER_KEY_LEN {
             return Err(format!(
                 "load_testing: 'key' must be at least {MIN_TRIGGER_KEY_LEN} characters"
             ));
@@ -436,9 +477,10 @@ gateway_port in 1–65535"
         }
         let load_test_client = load_test_builder
             .build()
-            .map_err(|e| format!("load_testing: failed to build HTTP client: {}", e))?;
+            .map_err(|_| "load_testing: failed to build HTTP client".to_string())?;
 
         let gateway_addresses = parse_gateway_addresses(config, &http_client, &gateway_base_url)?;
+        let owner = LoadTestingOwner::acquire(Arc::clone(&state));
 
         Ok(Self {
             http_client,
@@ -451,7 +493,9 @@ gateway_port in 1–65535"
             max_response_body_bytes,
             gateway_base_url,
             gateway_addresses,
+            request_headers_to_redact: vec![HEADER_TRIGGER_KEY.to_string()],
             state,
+            _owner: owner,
         })
     }
 
@@ -496,9 +540,17 @@ fn parse_gateway_addresses(
                     "load_testing: 'gateway_addresses' must not be empty when provided".to_string(),
                 );
             }
+            if addresses.len() > MAX_GATEWAY_ADDRESSES {
+                return Err(format!(
+                    "load_testing: 'gateway_addresses' must have at most {MAX_GATEWAY_ADDRESSES} entries (got {})",
+                    addresses.len()
+                ));
+            }
+            let local = Url::parse(local_base_url).map_err(|_| {
+                "load_testing: internal local gateway base URL is invalid".to_string()
+            })?;
             let mut urls = Vec::with_capacity(addresses.len());
             let mut seen = HashSet::new();
-            let local_label = sanitize_gateway_label(local_base_url);
             for addr in addresses {
                 let url = addr.as_str().ok_or_else(|| {
                     "load_testing: each 'gateway_addresses' entry must be a string".to_string()
@@ -508,18 +560,16 @@ fn parse_gateway_addresses(
                         "load_testing: 'gateway_addresses' entries must not be empty".to_string(),
                     );
                 }
-                validate_gateway_address(url)?;
-                if let Ok(parsed) = Url::parse(url) {
-                    crate::plugins::utils::log_helpers::screen_url_host_egress(
-                        "load_testing",
-                        "gateway_addresses",
-                        &parsed,
-                        http_client.backend_allow_ips(),
-                    )?;
-                }
+                let parsed = validate_gateway_address(url)?;
+                crate::plugins::utils::log_helpers::screen_url_host_egress(
+                    "load_testing",
+                    "gateway_addresses",
+                    &parsed,
+                    http_client.backend_allow_ips(),
+                )?;
                 let normalized = url.trim_end_matches('/').to_string();
                 let label = sanitize_gateway_label(&normalized);
-                if label == local_label {
+                if is_local_loopback_alias(&parsed, &local) {
                     return Err(format!(
                         "load_testing: 'gateway_addresses' must not include this node's local loopback target ({label})"
                     ));
@@ -538,29 +588,31 @@ fn parse_gateway_addresses(
     }
 }
 
-fn validate_gateway_address(url: &str) -> Result<(), String> {
-    let parsed = Url::parse(url)
-        .map_err(|e| format!("load_testing: invalid gateway address '{url}': {e}"))?;
+fn validate_gateway_address(url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(url).map_err(|_| {
+        format!("load_testing: invalid gateway address ({INVALID_ADDRESS_LABEL})")
+    })?;
     if !matches!(parsed.scheme(), "http" | "https")
         || !has_non_empty_authority(url)
         || parsed.host_str().is_none()
     {
         return Err(format!(
-            "load_testing: gateway address '{url}' must be an http(s) URL with a host"
+            "load_testing: gateway address must be an http(s) URL with a host ({INVALID_ADDRESS_LABEL})"
         ));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
+        let label = sanitize_gateway_label(url);
         return Err(format!(
-            "load_testing: gateway address must not include URL userinfo (credentials); got host '{}'",
-            parsed.host_str().unwrap_or("unknown")
+            "load_testing: gateway address must not include URL userinfo (credentials); got {label}"
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
+        let label = sanitize_gateway_label(url);
         return Err(format!(
-            "load_testing: gateway address '{url}' must not include a query or fragment"
+            "load_testing: gateway address must not include a query or fragment ({label})"
         ));
     }
-    Ok(())
+    Ok(parsed)
 }
 
 fn has_non_empty_authority(raw_url: &str) -> bool {
@@ -570,18 +622,37 @@ fn has_non_empty_authority(raw_url: &str) -> bool {
         .is_some_and(|authority| !authority.is_empty())
 }
 
-/// Scheme/host/port label suitable for logs — never path, query, or userinfo.
+/// Scheme/host/port label suitable for logs — never path, query, fragment,
+/// userinfo, or raw parser diagnostics.
 fn sanitize_gateway_label(url: &str) -> String {
     match Url::parse(url) {
         Ok(parsed) => {
             let scheme = parsed.scheme();
             let host = parsed.host_str().unwrap_or("invalid-host");
-            match parsed.port() {
+            match parsed.port_or_known_default() {
                 Some(port) => format!("{scheme}://{host}:{port}"),
                 None => format!("{scheme}://{host}"),
             }
         }
-        Err(_) => "invalid-gateway-address".to_string(),
+        Err(_) => INVALID_ADDRESS_LABEL.to_string(),
+    }
+}
+
+/// Reject local-loopback aliases of the selected local target so delayed
+/// self-fanout cannot start another cohort (127/8, `::1`, `localhost` when
+/// scheme and effective port match).
+fn is_local_loopback_alias(candidate: &Url, local: &Url) -> bool {
+    if candidate.scheme() != local.scheme() {
+        return false;
+    }
+    if candidate.port_or_known_default() != local.port_or_known_default() {
+        return false;
+    }
+    match candidate.host() {
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
     }
 }
 
@@ -672,6 +743,14 @@ impl Plugin for LoadTesting {
         ctx.headers.contains_key(HEADER_TRIGGER_KEY)
     }
 
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.request_headers_to_redact
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -684,7 +763,8 @@ impl Plugin for LoadTesting {
 
         let is_fanout = Self::is_fanout_control_request(headers);
 
-        // Never forward the reusable administrative trigger key to backends.
+        // Never forward the reusable administrative trigger key to later
+        // plugins or backends. Strip before any early-return admission path.
         headers.remove(HEADER_TRIGGER_KEY);
         // Fanout marker is control-plane only.
         headers.remove(HEADER_FANOUT);
@@ -756,11 +836,16 @@ impl Plugin for LoadTesting {
                 let body = body_bytes.clone();
 
                 tokio::spawn(async move {
-                    let mut req =
-                        build_request(client.get(), &fanout_method, &fanout_url, &fanout_hdrs);
-                    if method_allows_body(&fanout_method)
-                        && let Some(bytes) = body
-                    {
+                    let Ok(mut req) =
+                        build_request(client.get(), &fanout_method, &fanout_url, &fanout_hdrs)
+                    else {
+                        tracing::warn!(
+                            remote = %remote_label,
+                            "load_testing: failed to build fan-out request"
+                        );
+                        return;
+                    };
+                    if let Some(bytes) = body {
                         req = req.body(bytes);
                     }
                     if let Err(err) = client
@@ -834,10 +919,15 @@ impl Plugin for LoadTesting {
                         counters.attempted_requests = counters.attempted_requests.saturating_add(1);
 
                         let url = build_url(&base_url, &path, raw_query.as_deref());
-                        let mut req = build_request(&client, &method, &url, &req_headers);
-                        if method_allows_body(&method)
-                            && let Some(ref bytes) = body
-                        {
+                        let mut req = match build_request(&client, &method, &url, &req_headers) {
+                            Ok(req) => req,
+                            Err(()) => {
+                                counters.transport_errors =
+                                    counters.transport_errors.saturating_add(1);
+                                continue;
+                            }
+                        };
+                        if let Some(ref bytes) = body {
                             req = req.body(bytes.clone());
                         }
 
@@ -1026,30 +1116,34 @@ fn filter_outbound_headers(
     headers: &HashMap<String, String>,
     keep_trigger_key: bool,
 ) -> Vec<(String, String)> {
+    // Snapshot Connection-listed names before filtering so RFC 9110 dynamic
+    // hop-by-hop tokens are removed even though `connection` itself is stripped.
+    let connection_listed: HashSet<String> = parse_connection_listed_from_str_map(headers)
+        .into_iter()
+        .collect();
+
     headers
         .iter()
         .filter(|(k, _)| {
             let name = k.as_str();
+            let name_lower = name.to_ascii_lowercase();
             if name == HEADER_FANOUT {
                 return false;
             }
             if name == HEADER_TRIGGER_KEY {
                 return keep_trigger_key;
             }
+            if connection_listed.contains(&name_lower) {
+                return false;
+            }
             if is_backend_request_strip_header(name) || is_proxy_generated_forwarding_header(name) {
                 return false;
             }
+            // Keep Host for host-based routing on synthetic/fan-out requests.
             true
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
-}
-
-fn method_allows_body(method: &str) -> bool {
-    !matches!(
-        method.to_ascii_uppercase().as_str(),
-        "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE"
-    )
 }
 
 fn record_status(counters: &mut WorkerCounters, status: u16) {
@@ -1080,25 +1174,13 @@ fn build_request(
     method: &str,
     url: &str,
     headers: &[(String, String)],
-) -> reqwest::RequestBuilder {
-    let mut req = match method {
-        "GET" => client.get(url),
-        "POST" => client.post(url),
-        "PUT" => client.put(url),
-        "DELETE" => client.delete(url),
-        "PATCH" => client.patch(url),
-        "HEAD" => client.head(url),
-        _ => client.request(
-            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
-            url,
-        ),
-    };
-
+) -> Result<reqwest::RequestBuilder, ()> {
+    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| ())?;
+    let mut req = client.request(method, url);
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
-
-    req
+    Ok(req)
 }
 
 async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) -> BodyConsumeOutcome {
@@ -1107,9 +1189,13 @@ async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) -> B
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
-                consumed = consumed.saturating_add(chunk.len() as u64);
-                if consumed >= max_bytes {
-                    return BodyConsumeOutcome::Truncated;
+                let chunk_len = chunk.len() as u64;
+                // Bytes beyond the cap are truncated; exactly-at-cap plus EOF
+                // remains a completed response (no unbounded read).
+                match consumed.checked_add(chunk_len) {
+                    Some(next) if next > max_bytes => return BodyConsumeOutcome::Truncated,
+                    Some(next) => consumed = next,
+                    None => return BodyConsumeOutcome::Truncated,
                 }
             }
             Err(_) => return BodyConsumeOutcome::StreamError,

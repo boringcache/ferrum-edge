@@ -3455,6 +3455,16 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     }
     assert!(load_testing_docs.contains("KeepLastKnownGood"));
     assert!(load_testing_docs.contains("Unknown top-level keys"));
+    assert_eq!(
+        schema["properties"]["gateway_addresses"]["maxItems"],
+        json!(32),
+        "OpenAPI maxItems must match runtime MAX_GATEWAY_ADDRESSES"
+    );
+    assert_eq!(
+        schema["properties"]["key"]["minLength"],
+        json!(16),
+        "OpenAPI minLength must match runtime character-count MIN_TRIGGER_KEY_LEN"
+    );
 
     let valid = json!({
         "key": "parity-key-16chr",
@@ -3470,6 +3480,17 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     });
     assert_component_validity(&spec, "LoadTestingConfig", &valid, true);
     assert!(LoadTesting::new(&valid, PluginHttpClient::default()).is_ok());
+
+    // Unicode character-count parity: 16 scalar values (multi-byte) must pass both.
+    let unicode_key = "😀".repeat(16);
+    let valid_unicode = json!({
+        "key": unicode_key,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 8000
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid_unicode, true);
+    assert!(LoadTesting::new(&valid_unicode, PluginHttpClient::default()).is_ok());
 
     let valid_minima = json!({
         "key": "sixteen-char-key",
@@ -3542,6 +3563,14 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "gateway_port": 0
+        }),
+        json!({
+            "key": "sixteen-char-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": (0..33)
+                .map(|i| format!("https://10.0.0.{}:8443", i + 2))
+                .collect::<Vec<_>>()
         }),
     ];
     for config in runtime_and_schema_invalid {

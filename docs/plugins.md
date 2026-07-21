@@ -3602,16 +3602,16 @@ config:
 
 Enables on-demand load testing of a proxy's backend by sending concurrent requests through the gateway's own proxy listener. Triggered when a request includes an `X-Loadtesting-Key` header matching the configured secret key. The triggering request proceeds normally after the key is stripped; the load test runs in the background.
 
-**Priority:** 3080
+**Priority:** 3070 (before `request_mirror` at 3075 so a matching trigger secret is removed before mirror can copy it)
 **Protocols:** HTTP
 
-Synthetic requests are sent to `127.0.0.1:{gateway_port}` without the `X-Loadtesting-Key` header, so they flow through the full proxy pipeline (routing, auth, rate limiting, backend dispatch, logging) without re-triggering the load test. The gateway's native transaction logging captures every synthetic request automatically. Shared run-admission state (keyed by plugin-config identity) prevents concurrent cohorts across reload generations for the same instance, and a process-wide active-client budget caps aggregate detached work.
+Synthetic requests are sent to `127.0.0.1:{gateway_port}` without the `X-Loadtesting-Key` header, so they flow through the full proxy pipeline (routing, auth, rate limiting, backend dispatch, logging) without re-triggering the load test. The gateway's native transaction logging captures every synthetic request automatically. Shared run-admission state (keyed by plugin-config identity) prevents concurrent cohorts across reload generations for the same instance, and a process-wide active-client budget caps aggregate detached work. Removing the last live plugin instance for that identity cancels any active cohort; a compatible replacement generation that shares the state does not.
 
-For multi-node deployments, `gateway_addresses` fans out once from the originating controller (WITH the key plus `X-Loadtesting-Fanout: 1`). Peer receivers start a local cohort only, never re-fanout, and terminate the control request with `204` before backend dispatch.
+For multi-node deployments, `gateway_addresses` fans out once from the originating controller (WITH the key plus `X-Loadtesting-Fanout: 1`). Peer receivers start a local cohort only, never re-fanout, and terminate the control request with `204` before backend dispatch. At most 32 unique peer addresses are accepted; local-loopback aliases of the selected local target (`127/8`, `::1`, `localhost` with matching scheme/effective port) are rejected.
 
 For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. A resolved gateway port of `0` (Ferrum's disabled-listener sentinel from `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`) is rejected at admission. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
 
-**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the original raw query string on every synthetic and fan-out request. Non-trigger requests stay on the ordinary no-buffer hot path. Synthetic/fan-out headers use Ferrum's canonical backend strip predicates and omit client-supplied `X-Forwarded-*` identity; `Content-Length` is never copied — reqwest derives framing from the attached body.
+**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the exact buffered bytes for every accepted method that supplied a body (including DELETE/OPTIONS/extension methods — never silently rewritten to GET). The original raw query string is preserved on every synthetic and fan-out request. Non-trigger requests stay on the ordinary no-buffer hot path. Synthetic/fan-out headers snapshot RFC 9110 `Connection`-listed tokens before filtering, strip those names plus Ferrum's canonical backend/proxy-generated forwarding sets, and keep `Host` for host-based routing; client framing (`Content-Length` / `Transfer-Encoding`) is never copied — reqwest derives exact `Content-Length` from the attached body.
 
 **Completion metrics:** The finish log reports unambiguous counters — `attempted_requests`, `responses_received`, `responses_completed`, `responses_truncated`, `response_body_errors`, `transport_errors`, HTTP status classes, `worker_failures`, `cancelled_workers`, and separate `completed_requests_per_second` / `attempted_requests_per_second`. Outcome is `Success`, `Degraded`, `Failed`, or `Cancelled`. Attempt-only loops are never labeled as completed throughput.
 
@@ -3619,7 +3619,7 @@ For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: tru
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `key` | String | **(required)** | Value that `X-Loadtesting-Key` must match (≥16 chars). Stripped from the original request before backend dispatch |
+| `key` | String | **(required)** | Value that `X-Loadtesting-Key` must match (≥16 Unicode characters; OpenAPI `minLength` / runtime character-count parity). Stripped from the original request before later deferred plugins or backend dispatch; declared for generic log redaction |
 | `concurrent_clients` | Integer | **(required)** | Number of concurrent virtual clients (1–10,000) |
 | `duration_seconds` | Integer | **(required)** | Absolute run deadline in seconds (1–3,600). In-flight attempts are capped to the remaining deadline |
 | `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once (see ramp example below) |
@@ -3628,7 +3628,7 @@ For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: tru
 | `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests (1–65535). Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled). Resolved `0` is rejected |
 | `gateway_tls` | Boolean | `false` | Use HTTPS for local loopback synthetic requests |
 | `gateway_tls_no_verify` | Boolean | `true` when `gateway_tls` on | Skip TLS cert verification for loopback only |
-| `gateway_addresses` | Array | _(none)_ | Unique remote gateway URLs for one-hop fan-out. No userinfo/query/fragment; self/loopback duplicates of the local target are rejected |
+| `gateway_addresses` | Array | _(none)_ | Unique remote gateway URLs for one-hop fan-out (max 32). No userinfo/query/fragment; local-loopback aliases of the local target (`127/8`, `::1`, `localhost`) are rejected; validation/diagnostics never echo raw URL secrets |
 
 **Ramp behavior:** When `ramp: true`, all client tasks are spawned immediately but each sleeps a stagger delay before sending requests. The delay for client _i_ is `duration * i / concurrent_clients`. All clients share the same deadline, so later clients get less sending time.
 
