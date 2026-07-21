@@ -1657,6 +1657,8 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
         frames_backend_to_client: 3,
         bytes_client_to_backend: 10,
         bytes_backend_to_client: 20,
+        timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
         direction: None,
         io_side: None,
         error_class: None,
@@ -1736,6 +1738,8 @@ async fn test_otel_tracing_ws_disconnect_distinguishes_client_and_backend_failur
             frames_backend_to_client: 3,
             bytes_client_to_backend: 10,
             bytes_backend_to_client: 20,
+            timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+            timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
             direction: Some(direction),
             io_side: Some(io_side),
             error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionReset),
@@ -2029,7 +2033,7 @@ async fn test_workload_metrics_zipkin_sets_error_tag_on_failure() {
     failed.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionTimeout);
     plugin.log(&failed).await;
     // Wait until a second request arrives (first success already counted).
-    let mut failed_payload = None;
+    let mut failed_payload: Option<Value> = None;
     for _ in 0..50 {
         if let Some(requests) = mock_server.received_requests().await
             && requests.len() >= 2
