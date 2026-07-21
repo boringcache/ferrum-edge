@@ -1301,10 +1301,7 @@ async fn test_otel_tracing_grpc_nonzero_status_is_error() {
     let payload = received_json(&mock_server).await;
     let span = otlp_span(&payload);
     assert_eq!(span["status"]["code"], 2);
-    assert_eq!(
-        otlp_string_attr(span, "rpc.grpc.status_code").is_none(),
-        true
-    );
+    assert!(otlp_string_attr(span, "rpc.grpc.status_code").is_none());
     assert_eq!(
         otlp_attr_value(span, "rpc.grpc.status_code")
             .and_then(|v| v.get("intValue"))
