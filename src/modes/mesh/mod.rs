@@ -8834,6 +8834,7 @@ fn refresh_mesh_outbound_enforcement(
             &runtime.cluster_domain,
             runtime.namespace.clone(),
             ports,
+            runtime.outbound_registry_reject_status,
         )
         .map(Arc::new)
     } else {
@@ -13587,6 +13588,7 @@ async fn shutdown_and_join_mesh(
     tasks.handles.extend(tasks.mesh_background_handles);
 
     crate::modes::file::join_background_handles(tasks.handles, Duration::from_secs(5)).await;
+    crate::plugins::kafka_logging::finalize_all_generations().await;
 }
 
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {

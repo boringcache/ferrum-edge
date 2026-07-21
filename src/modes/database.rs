@@ -2427,6 +2427,7 @@ pub async fn run(
     // `Drop for HealthChecker` abort that fires at process exit.
     background_handles.extend(proxy_state.health_checker.take_active_check_handles());
     join_background_handles(background_handles, Duration::from_secs(5)).await;
+    crate::plugins::kafka_logging::finalize_all_generations().await;
 
     listener_result?;
 

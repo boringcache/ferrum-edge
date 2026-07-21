@@ -108,6 +108,15 @@ pub struct PluginHttpClient {
     /// matching the policy applied to the proxy backend / DTLS / frontend mTLS surfaces.
     /// Empty when `FERRUM_TLS_CRL_FILE_PATH` is unset.
     tls_crls: CrlList,
+    /// Filesystem identity derived from the configured gateway CRL source.
+    /// Plain paths and `file://` URIs are normalized here; inline material and
+    /// provider-backed sources deliberately have no path because librdkafka
+    /// cannot consume the parsed DER CRLs above directly.
+    tls_crl_file_path: Option<String>,
+    /// Whether any non-empty gateway CRL source was configured. This remains
+    /// separate from `tls_crl_file_path` so non-file sources fail closed for
+    /// sinks such as Kafka that require a filesystem path.
+    tls_crl_source_configured: bool,
     /// The gateway's namespace (`FERRUM_NAMESPACE`). Used by plugins that store
     /// state in external systems (Redis, Prometheus, StatsD) to prevent key/metric
     /// collisions when multiple gateway instances with different namespaces share
@@ -392,6 +401,8 @@ impl PluginHttpClient {
             tls_no_verify,
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
             tls_crls,
+            tls_crl_file_path: None,
+            tls_crl_source_configured: false,
             namespace: namespace.to_string(),
             real_ip_header: None,
             backend_allow_ips,
@@ -477,6 +488,8 @@ impl PluginHttpClient {
             tls_no_verify: false,
             tls_ca_bundle_path: None,
             tls_crls: Arc::new(Vec::new()),
+            tls_crl_file_path: None,
+            tls_crl_source_configured: false,
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             real_ip_header: None,
             backend_allow_ips: BackendEgressPolicy::unrestricted(),
@@ -545,6 +558,22 @@ impl PluginHttpClient {
         self
     }
 
+    /// Carry the configured gateway CRL source for non-rustls sinks. Only a
+    /// plain path or `file://` URI has a librdkafka-compatible filesystem
+    /// identity; other source kinds remain marked as configured so Kafka can
+    /// reject verified TLS admission instead of silently omitting revocation.
+    pub fn with_tls_crl_source(mut self, tls_crl_source: Option<String>) -> Self {
+        let source = tls_crl_source
+            .as_deref()
+            .map(str::trim)
+            .filter(|source| !source.is_empty());
+        self.tls_crl_source_configured = source.is_some();
+        self.tls_crl_file_path = source
+            .and_then(|source| CertSource::parse(source, MaterialKind::Crl).as_file_path())
+            .map(|path| path.to_string_lossy().into_owned());
+        self
+    }
+
     /// Effective authoritative real-IP header for cold-path plugin validation.
     pub(crate) fn real_ip_header(&self) -> Option<&str> {
         self.real_ip_header.as_deref()
@@ -604,6 +633,19 @@ impl PluginHttpClient {
     /// configuration.
     pub fn tls_crls(&self) -> &[rustls::pki_types::CertificateRevocationListDer<'static>] {
         &self.tls_crls
+    }
+
+    /// Filesystem path for `FERRUM_TLS_CRL_FILE_PATH` when a gateway CRL was
+    /// loaded. Used by librdkafka (`ssl.crl.location`); rustls sinks consume
+    /// [`Self::tls_crls`] instead.
+    pub fn tls_crl_file_path(&self) -> Option<&str> {
+        self.tls_crl_file_path.as_deref()
+    }
+
+    /// Whether a gateway CRL source was configured, including source kinds
+    /// that cannot be represented as a filesystem path for librdkafka.
+    pub(crate) fn tls_crl_source_configured(&self) -> bool {
+        self.tls_crl_source_configured
     }
 
     /// The gateway's namespace (`FERRUM_NAMESPACE`).

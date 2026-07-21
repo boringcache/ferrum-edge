@@ -189,6 +189,8 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget.
 
+Response bodies are never logged or retained. After reading the status, each batch response is asynchronously drained and discarded under a 1 MiB hard cap and a one-second drain timeout so HTTP/1.1 keep-alive connections can be reused. Oversized, stalled, or malformed acknowledgement bodies abort the drain without changing the status classification (2xx remains success; non-retryable 4xx remains a discard).
+
 `endpoint_url` must be a valid `http://` or `https://` URL with a hostname. Malformed or non-HTTP URLs reject plugin creation at config load time instead of failing later in the background flush task.
 
 The `endpoint_url` is also subject to the gateway's [backend egress policy](configuration.md#backend-egress--ssrf-protection): a literal-IP endpoint is screened at config-load time, and every resolved address is screened at send time, the same way proxy backends are. Under the default policy, loopback/RFC1918 sinks (a local agent or in-cluster collector reached by IP) are allowed, but cloud-metadata/`169.254.169.254`, multicast, and unspecified targets are rejected by the dangerous-range baseline; under `FERRUM_BACKEND_ALLOW_IPS=public`/`private` a sink pointing at a disallowed address (e.g. a public IP under `private`, or any private/RFC1918 address under `public`) is also rejected. `FERRUM_BACKEND_ALLOW_CIDRS` re-permits a specific address. The same applies to `loki_logging`'s endpoint.
@@ -215,7 +217,7 @@ The table below summarizes how to configure `http_logging` for popular log inges
 | **Datadog** | `https://http-intake.logs.datadoghq.com/api/v2/logs` | `DD-API-KEY: "<key>"` | Dedicated API key header | Yes | 1000 entries / 5MB | Regional endpoints: `.datadoghq.eu` (EU), `.us3.datadoghq.com` (US3), `.us5.datadoghq.com` (US5), `.ap1.datadoghq.com` (AP1) |
 | **New Relic** | `https://log-api.newrelic.com/log/v1` | `Api-Key: "<license-key>"` | Dedicated API key header | Yes | 1MB compressed | EU: `log-api.eu.newrelic.com` |
 | **Sumo Logic** | `https://<endpoint>.sumologic.com/receiver/v1/http/<token>` | `X-Sumo-Category`, `X-Sumo-Name`, `X-Sumo-Host` (optional metadata) | Token embedded in URL | Yes | 1MB default | No auth header needed — token is in the URL path |
-| **Elastic / OpenSearch** | `https://<host>:9200/<index>/_bulk` | `Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"` | Standard Authorization header | Yes (bulk API) | 100MB default | Consider using `_bulk` with NDJSON adapter or direct index API |
+| **Elastic / OpenSearch** | Requires intermediary (Logstash/Fluent Bit NDJSON transform) | `Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"` (at the intermediary) | Standard Authorization header | **No** — `_bulk` requires NDJSON action/source lines and `_doc` accepts one document object | N/A | Cannot POST the plugin's JSON array directly; see the Elastic / OpenSearch section below |
 | **Azure Monitor** | `https://<dce>.ingest.monitor.azure.com/dataCollectionRules/<dcr-id>/streams/<stream>?api-version=2023-01-01` | `Authorization: "Bearer <aad-token>"` | Azure AD OAuth2 bearer token | Yes (custom tables) | 1MB per call | Requires Data Collection Endpoint + Rule; fields map to custom table columns |
 | **AWS CloudWatch** | Requires intermediary (Fluent Bit/Firehose HTTP endpoint) | `Authorization: "Bearer <token>"` or custom | Varies by intermediary | **No** — needs `PutLogEvents` API format | N/A | Cannot POST directly; use a Firehose HTTP endpoint or Fluent Bit as intermediary |
 | **Google Cloud Logging** | Requires intermediary (Fluent Bit/custom) | `Authorization: "Bearer <token>"` | OAuth2 bearer token | **No** — needs `entries.write` format | N/A | Cannot POST directly; use Fluent Bit or a custom HTTP bridge |
@@ -342,19 +344,21 @@ config:
 
 #### Elastic / OpenSearch Integration
 
-For direct index ingestion, use the `_doc` endpoint with Basic or Bearer auth:
+Elasticsearch and OpenSearch cannot ingest this plugin's payload directly. The plugin always POSTs a JSON **array** of log-entry objects, while the index-document API (`/<index>/_doc`) accepts a **single** JSON document and the bulk API (`/<index>/_bulk`) requires newline-delimited action/source records (NDJSON), not a JSON array. Posting the array to either endpoint returns an ordinary 4xx, which the plugin treats as a terminal discard — the batch is dropped, not retried — so a direct configuration silently loses logs.
+
+Use a log shipper as an intermediary that accepts the JSON array and re-frames each entry into the NDJSON bulk format:
 
 ```yaml
 plugin_name: http_logging
 config:
-  endpoint_url: "https://elasticsearch.example.com:9200/ferrum-logs/_doc"
-  custom_headers:
-    Authorization: "Basic dXNlcjpwYXNzd29yZA=="
+  # Fluent Bit HTTP input listening for the plugin's JSON arrays; an
+  # Elasticsearch/OpenSearch output re-frames entries into _bulk NDJSON.
+  endpoint_url: "http://fluent-bit.internal:8888/ferrum"
   batch_size: 100
   flush_interval_ms: 2000
 ```
 
-> **Note:** The `_doc` endpoint accepts single documents. For bulk ingestion, use a log shipper (Logstash, Fluent Bit) as an intermediary that transforms the JSON array into Elasticsearch's NDJSON bulk format.
+> **Note:** Configure the intermediary with the target cluster's credentials (`Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"`). Do not point `endpoint_url` at `/<index>/_doc` or `/<index>/_bulk` directly — neither endpoint accepts the plugin's JSON array payload.
 
 #### Azure Monitor Integration
 
@@ -526,25 +530,30 @@ Sends transaction summaries as JSON to an external WebSocket endpoint. Like `htt
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname. Malformed or non-WebSocket schemes are rejected at config load time. |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (minimum 1) |
+| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname and must not include URL userinfo. Path/query may carry collector tokens when required; operational diagnostics always emit a structurally redacted form (`scheme://host[:port]/redacted`). Malformed or non-WebSocket schemes are rejected at config load time. |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (minimum 100) |
-| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
-| `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure |
-| `buffer_capacity` | Integer | `10000` | Channel capacity (minimum 1) — new entries are dropped on the proxy hot path when the in-memory buffer is full, with a warning log |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (1–60000) |
+| `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure (1–60000) |
+| `connect_timeout_ms` | Integer | `5000` | Bound covering DNS, TCP, TLS, and WebSocket Upgrade establishment (100–60000). On timeout the partial transport is dropped and retry/reconnect advances. |
+| `write_timeout_ms` | Integer | `5000` | Bound covering batch write/flush progress on an established socket (100–60000). On timeout the complete connection (writer + drain task) is invalidated before retry/reconnect. Delivery is at-least-once: a timeout after partial progress may duplicate a batch on the next attempt. |
+| `buffer_capacity` | Integer | `10000` | Channel slot capacity (1–1000000). Hot-path hooks reserve a slot before serialization; when full, new entries are dropped with a rate-limited warning. |
+| `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted log record (1024–1048576). Oversized records are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate serialized-content budget across queued records, contiguous batch assembly, and retries (2050–268435456). Admission conservatively reserves two copies plus JSON-array framing, so this must be ≥ `2 * (max_entry_bytes + 1)`. |
 | `schema` | Object | *(none)* | Inline customizable log schema; see [Customizing Transaction Log Output](log_schema.md) |
 | `schema_ref` | String | *(none)* | Name of a schema registered by `transaction_log_schema`; mutually exclusive with `schema` |
 
-Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is sent as a single JSON array text message over the WebSocket connection.
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is sent as a single JSON array text message over the WebSocket connection. Entries are serialized under `max_entry_bytes` at admission (schema applied then). Each lease conservatively reserves the queued JSON plus a second copy and framing for contiguous batch assembly; assembly consumes the queued entries, retains only their leases, and converts the completed payload into tungstenite's reference-counted UTF-8 buffer. Retries clone only that buffer handle. This keeps queued, assembly, and retry content within `buffer_max_bytes` even while new records arrive. Overflow diagnostics are rate-limited (first drop, then every 100).
 
 Custom schemas apply to WebSocket disconnect records as well as ordinary
 HTTP/gRPC and TCP/UDP summaries. Disconnect-specific keys such as `event`,
-`frames_client_to_backend`, `frames_backend_to_client`, `direction`, and
-`io_side` can be renamed, omitted, or reordered; see the log-schema reference
-for the complete field list.
+`frames_client_to_backend`, `frames_backend_to_client`,
+`bytes_client_to_backend`, `bytes_backend_to_client`, `timestamp_connected`,
+`timestamp_disconnected`, `direction`, and `io_side` can be renamed, omitted,
+or reordered; see the log-schema reference for the complete field list.
 
-`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname. Malformed or non-WebSocket URLs reject plugin creation at config load time.
+`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname and no userinfo. Malformed or non-WebSocket URLs reject plugin creation at config load time.
 
 ```yaml
 plugin_name: ws_logging
@@ -552,9 +561,11 @@ config:
   endpoint_url: "wss://logging-service.example.com/ws/ingest"
   batch_size: 50
   flush_interval_ms: 1000
+  connect_timeout_ms: 5000
+  write_timeout_ms: 5000
 ```
 
-**Connection lifecycle:** The plugin establishes a persistent WebSocket connection on the first batch flush. If the connection drops, the plugin automatically reconnects on the next send attempt. Failed batches are retried up to `max_retries` times with `retry_delay_ms` between attempts. After exhausting retries, the batch is discarded and a warning is logged.
+**Connection lifecycle:** The plugin establishes a persistent WebSocket connection on the first batch flush, bounded by `connect_timeout_ms`. If the connection drops, write/flush stalls past `write_timeout_ms`, or the read-side drain observes unexpected application frames / Close / read errors, the complete connection (writer + drain task) is invalidated and the plugin reconnects on the next send attempt. Failed batches are retried up to `max_retries` times with `retry_delay_ms` between attempts. After exhausting retries, the batch is discarded and a warning is logged. The plugin is write-only: collectors that send Text/Binary acknowledgements cause immediate connection invalidation so Ping/Pong and Close handling are not abandoned on a stale socket.
 
 ### `tcp_logging`
 
@@ -562,22 +573,29 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 
 **Priority:** 9125
 
+**Failure policy:** `KeepLastKnownGood` — construction/validation failures reject the candidate plugin generation and keep the last-known-good instance.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | Hostname or IP of the TCP log receiver |
 | `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
 | `tls` | Boolean | `false` | Enable TLS encryption for the connection |
-| `tls_server_name` | String | *(none)* | SNI server name override for TLS (defaults to `host`) |
+| `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name (no URL scheme, path, query, fragment, credentials, whitespace, or host:port); invalid values fail admission. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-| `connect_timeout_ms` | Integer | `5000` | TCP connection timeout in milliseconds (min: 100) |
+| `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
+| `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
+| `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
+
+Unknown top-level configuration keys are rejected at admission with an actionable allowed-key list (for example a misspelled `tlls` cannot silently leave the sink on plaintext).
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each entry is serialized as a single JSON line followed by a newline (`\n`), making the output compatible with NDJSON/JSON Lines consumers.
 
-The TCP connection is persistent — it is reused across batches and automatically re-established on write failure or disconnect. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) and skip-verify setting (`FERRUM_TLS_NO_VERIFY`).
+The TCP connection is persistent — it is reused across batches and automatically re-established on write failure, write/flush timeout, connect/handshake timeout, or disconnect. Delivery is at-least-once: a timeout or I/O error after a partial write may cause the full batch to be retried, so collectors must tolerate duplicates. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`), skip-verify setting (`FERRUM_TLS_NO_VERIFY`), and CRL list (`FERRUM_TLS_CRL_FILE_PATH`).
 
 ```yaml
 plugin_name: tcp_logging
@@ -611,15 +629,17 @@ Sends transaction summaries as JSON to an external UDP endpoint. Entries are buf
 
 **Priority:** 9160
 
+Unknown top-level keys are rejected at construction / Admin validation (OpenAPI `additionalProperties: false`). A typo such as `dtsl: true` fails admission instead of silently shipping plaintext. Registration is `OptionalFailOpen`: an invalid enabled instance is omitted from the published plugin cache rather than retaining last-known-good.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | UDP endpoint hostname or IP address |
 | `port` | Integer | *(required)* | UDP endpoint port (1–65535) |
 | `dtls` | Boolean | `false` | Enable DTLS encryption for log datagrams |
-| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS |
-| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (must be paired with `dtls_cert_path`) |
-| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server |
-| `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only) |
+| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized on the consuming node) |
+| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
+| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier) |
+| `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only; requires `dtls: true`) |
 | `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `1` | Retry attempts on failed batch delivery |
@@ -628,9 +648,11 @@ Sends transaction summaries as JSON to an external UDP endpoint. Entries are buf
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 
-**Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized datagrams may be fragmented or dropped by the network.
+**Delivery success contract:** A successful flush means the local UDP socket (or DTLS engine + connected socket) accepted the datagram. It does **not** mean the remote collector delivered or acknowledged the payload. Local DTLS plaintext rejection, serialization failure, DTLS engine failure, connected-socket send failure, and a stalled DTLS send that exceeds the plugin's 10-second completion budget return errors into the configured retry / final-loss accounting path; they are never treated as silent success. Deterministic local encoding/size rejection does not tear down a healthy DTLS association; transport/driver failures (including send timeout) do.
 
-**DNS handling:** The UDP endpoint is resolved through the gateway's shared `DnsCache` (TTL-aware, stale-while-revalidate, background refresh). For plain UDP, the background flush task re-resolves every 60 seconds and rebinds the socket if the address changes — DNS flips propagate without a restart. DTLS sessions are not re-handshaken mid-session.
+**Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized plain-UDP datagrams may be fragmented or dropped by the network. For DTLS, the effective plaintext ceiling is `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default **16,384**). A single-entry batch that exceeds that ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting. Split delivery is at-least-once: if an earlier entry succeeds and a later entry fails, retrying the original batch can duplicate the earlier entry, so collectors must tolerate duplicates.
+
+**DNS / association lifecycle:** Both plain UDP and DTLS re-resolve the collector through the gateway's shared `DnsCache` every 60 seconds. When the resolved address is unchanged, the existing connected socket / DTLS association is retained. When the address changes, Ferrum builds a replacement connected socket and — for DTLS — performs a fresh handshake before swapping the sender. If re-resolution or the replacement handshake fails, the current sender is retained at the previously pinned address until a later interval or a send-error teardown forces recovery.
 
 ```yaml
 plugin_name: udp_logging
@@ -643,7 +665,13 @@ config:
 
 #### DTLS Configuration
 
-For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided:
+For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided. Shared Admin / CP validation is shape-only and never opens node-local certificate, key, or CA paths. When `dtls: true`, the consuming node materializes those sources during construction and, where applicable, the mode-aware plugin file-dependency phase without network I/O. Parsed material is cached in the committed plugin generation so first flush and reconnect reuse it:
+
+- **File mode:** unusable DTLS material is fatal during config load.
+- **Database mode:** the file-dependency phase warns; construction still fails closed for that instance (`OptionalFailOpen` omits it).
+- **DP mode:** the shared file-dependency phase is skipped (node-local paths may differ); construction on the DP still materializes local sources and omits the instance on failure.
+
+Cached DTLS material is immutable for that plugin generation. Certificate/key/CA rotation, or making a previously missing source available, requires reapplying or reloading the configuration; transport and handshake failures do not repeatedly reopen source paths.
 
 ```yaml
 plugin_name: udp_logging
@@ -658,23 +686,29 @@ config:
 
 ### `kafka_logging`
 
-Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async mpsc channel to decouple the proxy hot path from Kafka I/O, with librdkafka's `ThreadedProducer` handling batching, compression, delivery retries, and partition assignment.
+Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async mpsc channel of pre-serialized records to decouple the proxy hot path from Kafka I/O, with librdkafka's `ThreadedProducer` handling batching, compression, delivery retries, and partition assignment.
 
 **Priority:** 9150
 
-**Requires:** The `kafka` cargo feature (`--features kafka` or `--all-features`). Without it, plugin creation returns an error at runtime.
+**Availability:** Built into every default Ferrum Edge binary. `rdkafka` / librdkafka is an unconditional dependency — there is no `kafka` Cargo feature to enable or disable.
+
+**Admission:** Kafka is `KeepLastKnownGood`: invalid startup configuration is rejected, and an invalid reload candidate is not published, so the previously accepted producer generation continues serving. This prevents a misspelled security control or conflicting TLS/CRL setting from silently removing the configured audit sink.
+
+Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and a worst-case `max_entry_bytes` lease from the aggregate `buffer_max_bytes` budget before serializing or cloning attacker-shaped summary fields. It then enforces the exact per-entry limit, shrinks the lease to the purpose-built payload/key record's retained size, and queues that record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue (Ferrum then releases its retained-byte lease). Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one producer flush whose complete blocking-pool scheduling and librdkafka work is bounded by `flush_timeout_seconds`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `broker_list` | String | *(required)* | Comma-separated Kafka broker addresses (e.g., `broker1:9092,broker2:9092`) |
 | `topic` | String | *(required)* | Kafka topic to produce messages to |
-| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin). Any other value is rejected at plugin construction time so operator typos surface immediately instead of silently falling back to `client_ip` |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full. Each entry is a serialized JSON `TransactionSummary` (~1-2 KB), so the default 10,000 entries may use ~10-20 MB of memory |
+| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin). Any other value is rejected at plugin construction time so operator typos surface immediately instead of silently falling back to `client_ip`. Keys are derived from borrowed summary fields after channel reservation |
+| `buffer_capacity` | Integer | `10000` | Ferrum userspace channel capacity (record count). Minimum `1` (zero is rejected). Hard maximum `100000`. A slot is reserved before serialization |
+| `max_entry_bytes` | Integer | `65536` | Maximum retained bytes for one pre-serialized payload plus optional partition key. Oversized entries are dropped before enqueue. Hard maximum `1048576` |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate Ferrum retained-content byte budget across queued records awaiting librdkafka admission and transient serializers. Admission reserves `max_entry_bytes` before serialization and shrinks that lease to the exact retained record size. Must be `>= max_entry_bytes`. Bytes release when librdkafka `send` returns. Hard maximum `268435456` |
 | `compression` | String | `"lz4"` | Compression: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
-| `flush_timeout_seconds` | Integer | `5` | Seconds to wait for librdkafka to flush pending messages during graceful shutdown |
-| `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0`, `1`, `all` (or `-1`) |
+| `flush_timeout_seconds` | Integer | `5` | Total bounded seconds for blocking-pool scheduling and librdkafka `flush` during graceful shutdown and reload disposal after Ferrum admission is closed. Minimum `1` (zero is rejected). Hard maximum `300` |
+| `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0` (broker may never persist; Ferrum still observes the local delivery callback), `1`, `all` (or `-1`) |
 | `message_timeout_ms` | Integer | *(librdkafka default)* | Timeout for message delivery in milliseconds |
-| `security_protocol` | String | *(none)* | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl` |
+| `security_protocol` | String | `"plaintext"` | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl`. Unknown root keys (for example a misspelled `security_protcol`) are rejected so PLAINTEXT cannot be selected by typo. Explicit TLS controls require `ssl`/`sasl_ssl`; explicit SASL controls require `sasl_plaintext`/`sasl_ssl`; username and password must be paired |
 | `sasl_mechanism` | String | *(none)* | SASL mechanism (e.g., `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) |
 | `sasl_username` | String | *(none)* | SASL username |
 | `sasl_password` | String | *(none)* | SASL password |
@@ -682,7 +716,7 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 | `ssl_no_verify` | Boolean | *(gateway default)* | Skip broker TLS certificate verification. Falls back to `FERRUM_TLS_NO_VERIFY` |
 | `ssl_certificate_location` | String | *(none)* | Path to client certificate for mTLS |
 | `ssl_key_location` | String | *(none)* | Path to client private key for mTLS |
-| `producer_config` | Object | *(none)* | Escape hatch: arbitrary librdkafka producer properties as key-value pairs |
+| `producer_config` | Object | *(none)* | Escape hatch: additional librdkafka producer properties as string key-value pairs. Cannot override `bootstrap.servers` or top-level TLS/SASL controls, including official aliases (`sasl.mechanisms`), PEM/keystore identity alternatives, or hostname-verification disablement. TLS-namespace properties require `ssl`/`sasl_ssl`; SASL/HTTPS-auth properties require `sasl_plaintext`/`sasl_ssl`. Queue/message byte budgets cannot exceed Ferrum hard maxima. `ssl.crl.location` cannot conflict with the gateway CRL baseline when verification is enabled |
 
 #### Gateway TLS Integration
 
@@ -690,11 +724,10 @@ Kafka uses its own binary protocol over TCP/TLS (not HTTP), so TLS is handled by
 
 - **`FERRUM_TLS_CA_BUNDLE_PATH`** is applied as `ssl.ca.location` when `ssl_ca_location` is not set in the plugin config
 - **`FERRUM_TLS_NO_VERIFY`** is applied as `enable.ssl.certificate.verification=false` when `ssl_no_verify` is not set in the plugin config
-- Plugin-level fields always override the gateway defaults
+- **`FERRUM_TLS_CRL_FILE_PATH`**, or a file-backed **`FERRUM_TLS_CRL_SOURCE`**, is applied as `ssl.crl.location` whenever certificate verification is enabled. Plain paths and `file://` URIs normalize to the filesystem path expected by librdkafka. Inline and provider-backed CRL sources cannot be passed to librdkafka; a verified Kafka TLS configuration therefore fails admission closed when such a source is active, while `ssl_no_verify: true` does not require a filesystem identity. A conflicting `producer_config.ssl.crl.location` is rejected fail-closed; reload keeps last-known-good configuration
+- Plugin-level fields always override the gateway defaults except for the CRL baseline conflict rule above. `producer_config` cannot silently override top-level TLS/SASL security controls after they were validated, including through librdkafka aliases or alternate PEM/keystore inputs
 
-This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` for internal CAs do not need to duplicate the CA path in the kafka_logging plugin config.
-
-**Note:** `FERRUM_TLS_CRL_FILE_PATH` is **not** applied to Kafka connections — librdkafka manages CRL checking independently via its own `ssl.crl.location` property (configurable via `producer_config`).
+This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` and a file-backed gateway CRL for internal CAs do not need to duplicate those paths in the kafka_logging plugin config.
 
 ```yaml
 plugin_name: kafka_logging
@@ -704,6 +737,7 @@ config:
   compression: "lz4"
   acks: "1"
   key_field: "client_ip"
+  security_protocol: "ssl"
 ```
 
 #### Kafka with SASL/SSL Authentication
@@ -730,7 +764,7 @@ config:
   producer_config:
     linger.ms: "50"
     batch.num.messages: "1000"
-    queue.buffering.max.kbytes: "1048576"
+    queue.buffering.max.kbytes: "65536"
 ```
 
 ### Transaction Summary Reference
@@ -2138,9 +2172,9 @@ Rejects HTTP-family requests whose `Host` / `:authority` destination is not in a
 |---|---|---|---|
 | `registry` | String[] | `[]` | Known destinations. Entries can be bare hosts (`reviews.default.svc.cluster.local`), exact host/port pairs (`reviews.default.svc.cluster.local:8080`), any-explicit-port markers (`reviews.default.svc.cluster.local:*`), or one-label wildcards (`*.example.com`, `*.example.com:443`, `*.example.com:*`). |
 | `reject_status` | u16 | `502` | HTTP 4xx/5xx status returned for unknown destinations. Use `404` when you want to mask policy details. |
-| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs. |
+| `outbound_listen_ports` | u16[] | `[]` | Optional frontend listener ports where the registry applies. Mesh auto-injection sets this to the outbound capture listener so inbound sidecar/ambient traffic is not gated by outbound policy. Empty applies wherever the plugin runs. Port `0` is rejected at construction; use `[]` for intentional global scope. |
 
-Bare-host registry entries match only requests whose Host header omits an explicit port. `host:port` entries match only that exact port. `host:*` entries match any explicit Host port; mesh-generated registries use this marker for services, ServiceEntries, or workload addresses with no declared ports so known destinations remain reachable when callers include `Host: service:9080`.
+Bare-host registry entries match only requests whose Host header omits an explicit port. `host:port` entries match only that exact port. `host:*` entries match any explicit Host port; mesh-generated registries use this marker for services, ServiceEntries, or workload addresses with no declared ports so known destinations remain reachable when callers include `Host: service:9080`. One-label wildcards (`*.example.com`) are indexed by suffix so lookup cost does not grow with unrelated wildcard count. Decision metrics use fixed `host` buckets (`<admit_explicit>`, `<admit_wildcard>`, `<denied>`).
 
 ### `tcp_connection_throttle`
 
@@ -2520,20 +2554,22 @@ Returns a predefined response without proxying to the backend. Useful for mainte
 
 The response body and `Content-Type` are rendered **once** at construction time — the request hot path skips `format!()`, JSON/XML escaping, and `String::replace()` chains entirely. Repeated dispatch returns identical, immutable bytes.
 
+Configuration must be a top-level object. Accepted keys are `status_code`, `content_type`, `body`, `message`, and `trigger`; unknown top-level or nested `trigger` keys are rejected instead of being ignored (a typo such as `triger` must not silently become unconditional termination). Scalar/array/`null` configs are rejected, and explicit `null` is rejected for every property; omit an optional property to select its documented default. When present, `trigger` must select exactly one mode: `path_prefix`, or `header` with an optional `header_value`; an empty trigger or a detached `header_value` is rejected. `{}` remains the intentional maintenance-mode default.
+
 **Priority:** 125
 **Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `status_code` | u16 | `503` | HTTP status code to return. Values outside 100–599 are coerced to 503. |
-| `body` | String | `""` | Explicit response body. When set (non-empty) it is returned verbatim and `message` is ignored. |
-| `content_type` | String | `application/json` | Response `Content-Type` header. Substring match for `json` / `xml` decides how `message` is rendered. |
-| `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is empty. JSON and XML special characters are escaped automatically. |
+| `status_code` | u16 | `503` | Final HTTP status (200–599). Informational statuses including `101` and out-of-range values are rejected at construction. `204`/`205`/`304` force an empty body (explicit non-empty `body` is rejected). A configured 2xx never establishes a CONNECT/Extended CONNECT tunnel — those requests fail closed with `403`. |
+| `body` | String | _(omit)_ | Explicit response body. Field presence — including `body: ""` — is authoritative and suppresses `message`. Omitting the field selects the default renderer. |
+| `content_type` | String | `application/json` | Response `Content-Type` header. Default-body formatting uses exact subtype `json`/`xml` or RFC 6838 `+json`/`+xml` suffixes after parameter stripping — not arbitrary substrings (`application/notjson` is plain text). |
+| `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is omitted. JSON escaping is applied automatically. For XML media types, the message must contain only XML 1.0-legal characters (tab/LF/CR and the XML Char ranges); illegal controls are rejected. |
 | `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix. Must start with `/` (or be exactly `*` to match the asterisk-form target of a server-wide `OPTIONS *` request) and contain no control characters; any other value can never match a request path. Mutually exclusive with `trigger.header`. |
-| `trigger.header` | String | _(none)_ | Only terminate when this request header is present. Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
-| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches any value. |
+| `trigger.header` | String | _(none)_ | Only terminate when this request header is present on any raw field line (including non-UTF-8 values). Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
+| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches presence. A non-empty value matches any individual field line exactly — never a comma-folded multi-line serialization. |
 
-Without a trigger every request on the proxy is terminated (maintenance-mode default).
+Without a trigger every request on the proxy is terminated (maintenance-mode default). HEAD responses keep representation metadata (including `Content-Length`) but never send content bytes; H1/H2/H3 share that wire rule.
 
 ```yaml
 # Maintenance window: short-circuit every request with a JSON body
@@ -3025,10 +3061,12 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 
 **Lifecycle:**
 
-1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, stashes `Last-Event-ID` in metadata for reconnection.
+1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, bounds `Last-Event-ID` (max 1024 bytes) and stashes it for backend forwarding. The raw ID is omitted from transaction logs (`sse:leid_present` / `sse:leid_bytes` correlation only) and never interpolated into diagnostics.
 2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
-3. **`after_proxy`** — Sets `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`. Strips `Content-Length`. Optionally forces `Content-Type: text/event-stream`.
-4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only).
+3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body.
+4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it.
+
+**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an integer ≥ 1 when set.
 
 **Request validation:**
 
@@ -3049,11 +3087,11 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
 | `strip_content_length` | bool | `true` | Remove `Content-Length` (SSE streams are indefinite) |
-| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 |
 | `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
-| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing |
+| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses |
 
-**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering. When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`.
+**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
 
 ```yaml
 config:
@@ -3345,14 +3383,14 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `ttl_seconds` | u64 | `300` | Default freshness lifetime when the backend response does not provide `max-age` or `s-maxage`; upstream `Age` and `Date` still reduce remaining freshness |
-| `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries before eviction |
-| `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body |
-| `max_total_size_bytes` | u64 | `104857600` | Maximum total in-memory cache size across all entries |
-| `cacheable_methods` | String[] | `["GET","HEAD"]` | Methods eligible for caching |
-| `cacheable_status_codes` | u16[] | `[200,301,404]` | Response status codes eligible for caching |
+| `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries before eviction (must be > 0) |
+| `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body (must be > 0) |
+| `max_total_size_bytes` | u64 | `104857600` | Maximum total in-memory cache size across all entries (must be > 0) |
+| `cacheable_methods` | String[] | `["GET","HEAD"]` | Methods eligible for caching. Must contain at least one entry, and every entry must be a valid HTTP method token |
+| `cacheable_status_codes` | u16[] | `[200,301,404]` | Response status codes eligible for caching. Must contain at least one entry, and every entry must be within 100-599 |
 | `respect_cache_control` | bool | `true` | Honor backend `Cache-Control` directives such as `no-store`, `private`, `max-age`, and `s-maxage` |
 | `respect_no_cache` | bool | `true` | Bypass cache lookup when the client sends `Cache-Control: no-cache` or `no-store` |
-| `vary_by_headers` | String[] | `[]` | Additional request headers to include in the cache key even when the backend does not send `Vary` |
+| `vary_by_headers` | String[] | `[]` | Additional request headers to include in the cache key even when the backend does not send `Vary`. Every entry must be a valid HTTP header-name token |
 | `cache_key_include_query` | bool | `true` | Include the exact raw query string in the cache key as a SHA-256 hash |
 | `cache_key_include_consumer` | bool | `false` | Allow caching authenticated responses under their isolated identity key even when the backend does not send `public`, `must-revalidate`, or `s-maxage`; also add an `_anon` key partition for unauthenticated requests. Authenticated requests are always keyed by the hashed effective identity. |
 | `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses |
@@ -3400,27 +3438,27 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth |
 | `max_complexity` | u32 (optional) | — | Maximum allowed field count |
 | `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
-| `introspection_allowed` | bool | `true` | Whether introspection queries are permitted |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
-| `type_rate_limits` | Object | `{}` | Rate limits by operation type (`query`, `mutation`, `subscription`) |
-| `operation_rate_limits` | Object | `{}` | Rate limits by named operation |
-| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
+| `introspection_allowed` | bool | `true` | Whether introspection queries are permitted. Only `false` counts as an effective protection rule; the default `true` does not. |
+| `limit_by` | String | `ip` | Rate limit key: exact lowercase `ip` or `consumer`. Other values are rejected at plugin load time. |
+| `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
+| `operation_rate_limits` | Object | `{}` | Rate limits by named operation. Keys must be valid GraphQL Names (`[_A-Za-z][_0-9A-Za-z]*`). |
+| `sync_mode` | String | `local` | Exact lowercase `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
-| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"`. Must be non-empty when set. |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1) |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds (must be ≥ 1) |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be ≥ 1) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
 
-The plugin requires at least one rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, `type_rate_limits`, or `operation_rate_limits`) — an empty config is rejected so it cannot be a no-op.
+The plugin requires at least one effective rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, a non-empty `type_rate_limits`, or a non-empty `operation_rate_limits`) — an empty or no-op config is rejected. Unknown top-level keys are rejected so misspelled introspection, identity, rate-map, or Redis synchronization fields cannot silently fall back to defaults.
 
 Populates `ctx.metadata` with `graphql_operation_type`, `graphql_operation_name`, `graphql_depth`, and `graphql_complexity`.
 
-**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically.
+**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Explicit `redis_*` fields are validated even while `sync_mode` is `local`, so a later mode switch cannot activate malformed latent settings. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically.
 
 ```yaml
 plugin_name: graphql
@@ -3722,7 +3760,7 @@ Controlled AI payload capture for compliance review, incident response, customer
 
 **Strict configuration.** Unknown keys are rejected at the root and inside every fixed nested object (`capture`, `sampling`, `redaction`, each `redaction.custom_patterns[]` entry, `limits`, `privacy`, and `sink`) with path-qualified errors and spelling suggestions when the typo is close. `sink.custom_headers` is the only intentional free-form string map. Nested objects may be omitted or set to `null` to keep defaults. Misspellings such as `privacy.include_consumer_usernme`, `capture.respose`, `sink.on_sink_eror`, or `sink.on_buffer_ful` fail admission instead of silently leaving privacy-on or fail-open sink defaults. Registration policy is `KeepLastKnownGood`: Admin create/update still returns HTTP 400 for invalid enabled configs, and file/DB/CP-DP reload rejects the candidate generation so the previous audit instance remains published.
 
-**Async HTTP sink.** Records batch through the shared `BatchingLogger` + `PluginHttpClient` framework: a bounded queue, batch-by-size/interval, and retry on transient (5xx/408/429) failures. The `endpoint_url` is SSRF-screened against the backend egress policy (literal IPs at construction, resolved hostnames at send time), matching every other logger sink. `sink.custom_headers` values support `${ENV_VAR}` expansion resolved lazily at send time, so a token is referenced by env and never stored in config:
+**Async HTTP sink.** Records batch through the shared `BatchingLogger` + `PluginHttpClient` framework: a bounded queue, batch-by-size/interval, and retry on transient (5xx/408/429) failures. Sink response bodies are drained and discarded through the shared HTTP batch helper (1 MiB cap, one-second drain timeout) so HTTP/1.1 keep-alive can be reused; bodies are never logged. The `endpoint_url` is SSRF-screened against the backend egress policy (literal IPs at construction, resolved hostnames at send time), matching every other logger sink. `sink.custom_headers` values support `${ENV_VAR}` expansion resolved lazily at send time, so a token is referenced by env and never stored in config:
 
 ```yaml
 plugin_name: ai_transcript_audit

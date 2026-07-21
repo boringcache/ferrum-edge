@@ -62,6 +62,7 @@ fn test_graphql_empty_config_returns_error() {
     assert!(result.is_err(), "Empty config should return Err");
     let err = result.err().unwrap();
     assert!(err.contains("no protection rules configured"));
+    assert!(err.contains("introspection_allowed: false"));
 }
 
 #[test]
@@ -78,10 +79,21 @@ fn test_graphql_rejects_invalid_scalar_config_types() {
         json!({"max_complexity": "100"}),
         json!({"max_aliases": "3"}),
         json!({"introspection_allowed": "false"}),
+        json!({"limit_by": null}),
+        json!({"sync_mode": null}),
+        json!({"sync_mode": 1}),
     ] {
         let result = create_plugin("graphql", &config);
         assert!(result.is_err(), "config should be rejected: {config:?}");
     }
+
+    let sync_mode_error = create_plugin("graphql", &json!({"max_depth": 5, "sync_mode": null}))
+        .err()
+        .expect("null sync_mode must be rejected");
+    assert!(
+        sync_mode_error.starts_with("graphql: 'sync_mode' must be a string"),
+        "GraphQL must own the sync_mode admission error: {sync_mode_error}"
+    );
 }
 
 #[test]
@@ -94,11 +106,75 @@ fn test_graphql_rejects_invalid_rate_limit_shapes() {
         json!({"operation_rate_limits": {"bad-name": {"max_requests": 1, "window_seconds": 60}}}),
         json!({"type_rate_limits": {"query": "bad"}}),
         json!({"type_rate_limits": {"query": {"max_requests": "1", "window_seconds": 60}}}),
+        json!({"type_rate_limits": {"query": {"max_requests": 0, "window_seconds": 60}}}),
+        json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
+        json!({"type_rate_limits": {}}),
+        json!({"operation_rate_limits": {}}),
+        json!({"introspection_allowed": true}),
+        json!({"type_rate_limits": {"Query": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"max_depth": 5, "limit_by": "IP"}),
+        json!({"max_depth": 5, "sync_mode": "REDIS", "redis_url": "redis://localhost:6379"}),
         json!({"max_depth": 5, "sync_mode": "database"}),
         json!({"max_depth": 5, "sync_mode": "redis"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_url": "garbage"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_tls": "yes"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_pool_size": 0}),
     ] {
         let result = create_plugin("graphql", &config);
         assert!(result.is_err(), "config should be rejected: {config:?}");
+    }
+}
+
+#[test]
+fn test_graphql_rejects_unknown_top_level_keys() {
+    // GHSA-q3p3-94cj-8wh6 GraphQL component: a valid rule must not mask typos.
+    for config in [
+        json!({"max_depth": 10, "introspection_allowd": false}),
+        json!({
+            "type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60}},
+            "sync_mdoe": "redis",
+            "redis_url": "redis://localhost:6379/0"
+        }),
+        json!({"max_depth": 5, "limit_byy": "consumer"}),
+        json!({"max_depth": 5, "redis_key_prefx": "ferrum:graphql"}),
+        json!({"max_depth": 5, "type_rate_limit": {"query": {"max_requests": 1, "window_seconds": 60}}}),
+    ] {
+        let err = create_plugin("graphql", &config)
+            .err()
+            .unwrap_or_else(|| panic!("config should be rejected: {config:?}"));
+        assert!(
+            err.contains("unknown configuration key"),
+            "expected unknown-key rejection for {config:?}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_graphql_accepts_closed_redis_and_named_operation_shapes() {
+    for config in [
+        json!({"introspection_allowed": false}),
+        json!({"operation_rate_limits": {"getUser": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({
+            "type_rate_limits": {
+                "query": { "max_requests": 10, "window_seconds": 60 }
+            },
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_pool_size": 1,
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 1
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "local",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_tls": false,
+            "redis_pool_size": 1
+        }),
+    ] {
+        create_plugin("graphql", &config)
+            .unwrap_or_else(|err| panic!("config should be accepted: {config:?}: {err}"))
+            .unwrap();
     }
 }
 
@@ -658,7 +734,10 @@ fn test_unknown_limit_by_rejected() {
         }),
     );
     let err = result.err().expect("unknown limit_by must be rejected");
-    assert!(err.contains("'limit_by' must be one of"), "got: {err}");
+    assert!(
+        err.contains("'limit_by' must be exactly 'ip' or 'consumer'"),
+        "got: {err}"
+    );
 }
 
 // ── Constructor validation: rate-limit specs ──

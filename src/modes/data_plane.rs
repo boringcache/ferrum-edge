@@ -890,6 +890,7 @@ pub async fn run(
     {
         warn!("Background tasks did not drain within 5s, proceeding with shutdown");
     }
+    crate::plugins::kafka_logging::finalize_all_generations().await;
 
     Ok(())
 }

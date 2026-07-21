@@ -176,7 +176,7 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn emit_timestamp<S: SerializeMap>(
+pub(crate) fn emit_timestamp<S: SerializeMap>(
     out_key: &str,
     rfc3339: &str,
     ts_format: TimestampFormat,

@@ -1330,6 +1330,14 @@ pub struct WsDisconnectContext {
     /// Total payload bytes proxied from backend toward client over the
     /// lifetime of this WebSocket session.
     pub bytes_backend_to_client: u64,
+    /// Wall-clock session start (RFC3339). Captured at upgrade and carried
+    /// through delayed `ws_logging` delivery so collectors do not depend on
+    /// receipt time for event ordering.
+    pub timestamp_connected: String,
+    /// Wall-clock session end (RFC3339). Sampled once at teardown alongside
+    /// `duration_ms` so disconnect records remain self-contained under batch
+    /// flush, retry, and reconnect delay.
+    pub timestamp_disconnected: String,
     /// Which direction observed the first terminating error. `None` for
     /// clean close initiated by either peer.
     pub direction: Option<Direction>,
@@ -1574,14 +1582,20 @@ pub struct RequestContext {
     /// admission uses it to reject a retired service-discovery target view
     /// after a structural target-set publication.
     pub lb_generation: u64,
-    /// Raw HTTP headers from the request. Stored at init time and consumed by
-    /// `materialize_headers()`. Core proxy lookups (IP resolution, host
-    /// extraction) read from this directly via `raw_header_get()` to avoid
-    /// eagerly converting every header to an owned `String`.
+    /// Raw HTTP headers from the request. Stored at init time and retained
+    /// after `materialize_headers()` so security plugins can evaluate
+    /// multi-value / non-UTF-8 field lines without the lossy folded map.
+    /// Core proxy lookups (IP resolution, host extraction) read from this
+    /// directly via `raw_header_get()` to avoid eagerly converting every
+    /// header to an owned `String`.
     raw_headers: Option<HeaderMap>,
     /// Materialized headers HashMap. Empty until `materialize_headers()` is
     /// called. Plugin code and backend dispatch read from this field.
     pub headers: HashMap<String, String>,
+    /// Whether [`Self::materialize_headers`] has already populated `headers`
+    /// from `raw_headers`. Keeps materialization one-shot while preserving the
+    /// raw map for policy evaluation (mirrors query-param materialization).
+    headers_materialized: bool,
     /// Raw query string stored for lazy parsing. `None` when empty. Preserved
     /// after query-param materialization so security plugins can inspect raw
     /// duplicate pairs.
@@ -1745,6 +1759,13 @@ pub struct RequestContext {
     /// markers (a hash over the raw request body including tool-call arguments),
     /// so they remain off `metadata` too.
     pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Per-instance buffered `redact_args` rewrites computed during governance
+    /// amplification preflight and consumed by the response-body transform.
+    /// Keys are digests of `(tool name, raw args)`; aggregate value bytes are
+    /// capped at the plugin's 4 MiB inspectable window, and at most one plugin
+    /// instance may stage a memo set at once, so multiple configured governors
+    /// cannot multiply that retained window between hooks.
+    pub(crate) ai_tool_governor_redaction_memos: HashMap<u64, HashMap<String, String>>,
     /// Per-`ai_semantic_firewall`-instance hashes of request bodies already
     /// inspected before request transforms. Kept outside serialized metadata so
     /// prompt-derived digests never enter transaction logs.
@@ -2125,6 +2146,7 @@ impl RequestContext {
             lb_generation: 1,
             raw_headers: None,
             headers: HashMap::new(),
+            headers_materialized: false,
             raw_query_string: None,
             query_params_materialized: false,
             query_params: HashMap::new(),
@@ -2163,6 +2185,7 @@ impl RequestContext {
             ai_tool_governor_replay_redactions: HashSet::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
+            ai_tool_governor_redaction_memos: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
@@ -2717,6 +2740,7 @@ impl RequestContext {
             lb_generation: self.lb_generation,
             raw_headers: None,
             headers: self.headers.clone(),
+            headers_materialized: true,
             raw_query_string: None,
             query_params_materialized: false,
             query_params: HashMap::new(),
@@ -2772,6 +2796,7 @@ impl RequestContext {
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
+            ai_tool_governor_redaction_memos: self.ai_tool_governor_redaction_memos.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
@@ -3228,12 +3253,20 @@ impl RequestContext {
     /// owned `String`s.
     #[inline]
     pub fn set_raw_headers(&mut self, headers: HeaderMap) {
+        self.headers_materialized = false;
         self.raw_headers = Some(headers);
     }
 
+    /// Whether the pristine wire `HeaderMap` is still available for
+    /// multi-value / byte-validity policy evaluation.
+    #[inline]
+    pub fn has_raw_headers(&self) -> bool {
+        self.raw_headers.is_some()
+    }
+
     /// Look up a single header from the raw `HeaderMap` without materializing
-    /// the full `HashMap<String, String>`. Returns `None` if the raw headers
-    /// have already been consumed by `materialize_headers()`.
+    /// the full `HashMap<String, String>`. Returns `None` when no raw headers
+    /// were stored.
     ///
     /// Single hash lookup for call sites that only need one field-line value.
     /// Multiple `Host` headers are rejected earlier by `check_protocol_headers()`.
@@ -3247,9 +3280,10 @@ impl RequestContext {
             .and_then(|v| v.to_str().ok())
     }
 
-    /// Iterate all values for a raw header without materializing the full
-    /// header map. Returns an empty iterator if raw headers were already
-    /// consumed.
+    /// Iterate all UTF-8 values for a raw header without materializing the full
+    /// header map. Returns an empty iterator when raw headers were never set.
+    /// Non-UTF-8 field lines are skipped here; security decisions that must see
+    /// every field line should use [`Self::raw_header_value_bytes`].
     #[inline]
     pub fn raw_header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.raw_headers
@@ -3274,37 +3308,43 @@ impl RequestContext {
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
     /// String>`). This is a one-time operation — subsequent calls are no-ops.
-    /// Non-UTF-8 header values are silently skipped (same as the previous eager
-    /// path).
+    /// The raw map is retained so plugins can evaluate multi-value and
+    /// non-UTF-8 field lines. Non-UTF-8 header values are still omitted from
+    /// the materialized map (same as the previous eager path).
     pub fn materialize_headers(&mut self) {
-        if let Some(raw) = self.raw_headers.take() {
-            self.headers.reserve(raw.keys_len());
-            for (name, value) in &raw {
-                if let Ok(v) = value.to_str() {
-                    // http::HeaderName stores names in lowercase already (HTTP/2+3
-                    // spec), and hyper normalizes HTTP/1.1 header names to
-                    // lowercase at parse time. No `to_lowercase()` needed.
-                    let key = name.as_str();
-                    // Reserved gateway-asserted headers are never trusted from
-                    // clients. Identity headers are injected after
-                    // authentication; path-param headers are injected after
-                    // route matching from regex captures.
-                    if matches!(
-                        key,
-                        "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
-                    ) || key.starts_with("x-path-param-")
-                    {
-                        continue;
-                    }
-                    let separator = repeated_request_header_separator(key);
-                    self.headers
-                        .entry(key.to_owned())
-                        .and_modify(|existing| {
-                            existing.push_str(separator);
-                            existing.push_str(v);
-                        })
-                        .or_insert_with(|| v.to_owned());
+        if self.headers_materialized {
+            return;
+        }
+        self.headers_materialized = true;
+        let Some(raw) = self.raw_headers.as_ref() else {
+            return;
+        };
+        self.headers.reserve(raw.keys_len());
+        for (name, value) in raw {
+            if let Ok(v) = value.to_str() {
+                // http::HeaderName stores names in lowercase already (HTTP/2+3
+                // spec), and hyper normalizes HTTP/1.1 header names to
+                // lowercase at parse time. No `to_lowercase()` needed.
+                let key = name.as_str();
+                // Reserved gateway-asserted headers are never trusted from
+                // clients. Identity headers are injected after
+                // authentication; path-param headers are injected after
+                // route matching from regex captures.
+                if matches!(
+                    key,
+                    "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
+                ) || key.starts_with("x-path-param-")
+                {
+                    continue;
                 }
+                let separator = repeated_request_header_separator(key);
+                self.headers
+                    .entry(key.to_owned())
+                    .and_modify(|existing| {
+                        existing.push_str(separator);
+                        existing.push_str(v);
+                    })
+                    .or_insert_with(|| v.to_owned());
             }
         }
     }
@@ -6760,6 +6800,11 @@ pub(crate) fn validate_plugin_config_with_http_client(
     if name == "geo_restriction" {
         return geo_restriction::GeoRestriction::validate_config(config);
     }
+    if name == "udp_logging" {
+        // Shape-only: shared Admin / CP validation must not open node-local
+        // DTLS paths. Mode-aware dependency validation and construction do.
+        return udp_logging::UdpLogging::validate_config(config, http_client);
+    }
     if name == "oidc_relying_party" {
         screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
@@ -6998,8 +7043,8 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     ),
     builtin_plugin("stdout_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
-    builtin_plugin("tcp_logging", PluginFailurePolicy::OptionalFailOpen),
-    builtin_plugin("kafka_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("tcp_logging", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("kafka_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ws_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin(
         "transaction_debugger",

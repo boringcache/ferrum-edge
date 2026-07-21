@@ -9,13 +9,27 @@
 //! construction time so the request hot path only does string clones —
 //! no per-request `format!()`, no `String::replace()` chains, no JSON/XML
 //! escape work.
+//!
+//! Configuration must be a JSON object with only the documented keys.
+//! Unknown top-level or `trigger` keys are rejected. Status codes must be
+//! final (200–599); informational statuses including `101` are rejected.
+//! Statuses `204`/`205`/`304` force an empty body. Header triggers evaluate
+//! raw multi-value field lines (including non-UTF-8 presence) rather than the
+//! lossy materialized map.
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Every accepted top-level configuration property.
+pub const REQUEST_TERMINATION_CONFIG_KEYS: &[&str] =
+    &["status_code", "content_type", "body", "message", "trigger"];
+
+/// Every accepted key inside `trigger`.
+pub const REQUEST_TERMINATION_TRIGGER_KEYS: &[&str] = &["path_prefix", "header", "header_value"];
 
 #[derive(Debug, Clone)]
 enum Trigger {
@@ -30,22 +44,52 @@ pub struct RequestTermination {
     content_type: String,
     /// Pre-rendered response body. Built once from `body`, `message`,
     /// `content_type`, and `status_code` at construction time so the hot path
-    /// never re-renders it.
+    /// never re-renders it. Empty for 204/205/304.
     body: String,
     trigger: Trigger,
 }
 
 impl RequestTermination {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let config = config.as_object().ok_or_else(|| {
+            format!(
+                "request_termination: config must be a JSON object; allowed keys: {}",
+                REQUEST_TERMINATION_CONFIG_KEYS.join(", ")
+            )
+        })?;
+        reject_unknown_keys(
+            config,
+            "config",
+            REQUEST_TERMINATION_CONFIG_KEYS,
+            "request_termination",
+        )?;
+
         let status_code = parse_status_code(config)?;
         let content_type = parse_content_type(config)?;
         let raw_body = optional_string(config, "body")?;
         let message = optional_string(config, "message")?;
+        let no_body_status =
+            super::utils::synthetic_response::status_forbids_response_body(status_code);
 
         // Pre-render the response body so the hot path skips format!/replace.
-        let body = if let Some(raw_body) = raw_body {
+        let body = if no_body_status {
+            if let Some(raw) = raw_body.as_ref()
+                && !raw.is_empty()
+            {
+                return Err(format!(
+                    "request_termination: status {status_code} cannot carry a response body; omit 'body' or set it to \"\""
+                ));
+            }
+            String::new()
+        } else if let Some(raw_body) = raw_body {
+            // Explicit body — including "" — is authoritative and suppresses
+            // `message`. Field absence (not empty string) selects the default
+            // renderer.
             raw_body
         } else {
+            if matches!(classify_media_type(&content_type), MediaType::Xml) {
+                validate_xml_1_0_message(message.as_deref().unwrap_or("Service unavailable"))?;
+            }
             render_default_body(&content_type, status_code, message.as_deref())
         };
 
@@ -60,33 +104,56 @@ impl RequestTermination {
     }
 }
 
-fn parse_status_code(config: &Value) -> Result<u16, String> {
+fn reject_unknown_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+    plugin: &str,
+) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "{plugin}: unknown config key(s) under '{path}': {}; allowed keys: {}",
+        unknown.join(", "),
+        allowed.join(", ")
+    ))
+}
+
+fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
     match config.get("status_code") {
-        None | Some(Value::Null) => Ok(503),
+        None => Ok(503),
         Some(Value::Number(value)) => {
             let Some(code) = value.as_u64() else {
                 return Err(
-                    "request_termination: 'status_code' must be an integer from 100 to 599"
+                    "request_termination: 'status_code' must be an integer from 200 to 599"
                         .to_string(),
                 );
             };
-            if !(100..=599).contains(&code) {
+            if !(200..=599).contains(&code) {
                 return Err(format!(
-                    "request_termination: 'status_code' must be from 100 to 599, got {code}"
+                    "request_termination: 'status_code' must be a final response from 200 to 599 \
+                     (informational statuses including 101 are rejected), got {code}"
                 ));
             }
             u16::try_from(code)
                 .map_err(|_| "request_termination: 'status_code' is too large".to_string())
         }
         Some(other) => Err(format!(
-            "request_termination: 'status_code' must be an integer from 100 to 599, got: {other}"
+            "request_termination: 'status_code' must be an integer from 200 to 599, got: {other}"
         )),
     }
 }
 
-fn parse_content_type(config: &Value) -> Result<String, String> {
+fn parse_content_type(config: &Map<String, Value>) -> Result<String, String> {
     match config.get("content_type") {
-        None | Some(Value::Null) => Ok("application/json".to_string()),
+        None => Ok("application/json".to_string()),
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -106,9 +173,9 @@ fn parse_content_type(config: &Value) -> Result<String, String> {
     }
 }
 
-fn optional_string(config: &Value, key: &str) -> Result<Option<String>, String> {
+fn optional_string(config: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(other) => Err(format!(
             "request_termination: '{key}' must be a string, got: {other}"
@@ -116,23 +183,33 @@ fn optional_string(config: &Value, key: &str) -> Result<Option<String>, String> 
     }
 }
 
-fn parse_trigger(config: &Value) -> Result<Trigger, String> {
+fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
     let Some(trigger) = config.get("trigger") else {
         return Ok(Trigger::Always);
     };
-    if trigger.is_null() {
-        return Ok(Trigger::Always);
-    }
     let Value::Object(trigger) = trigger else {
         return Err("request_termination: 'trigger' must be an object".to_string());
     };
+    reject_unknown_keys(
+        trigger,
+        "trigger",
+        REQUEST_TERMINATION_TRIGGER_KEYS,
+        "request_termination",
+    )?;
 
     let has_path = trigger.contains_key("path_prefix");
     let has_header = trigger.contains_key("header");
-    if has_path && has_header {
+    let has_header_value = trigger.contains_key("header_value");
+    if has_path && (has_header || has_header_value) {
         return Err(
-            "request_termination: 'trigger' must set only one of 'path_prefix' or 'header'"
+            "request_termination: 'trigger' must set only one of 'path_prefix' or 'header'; \
+             'header_value' is valid only with 'header'"
                 .to_string(),
+        );
+    }
+    if has_header_value && !has_header {
+        return Err(
+            "request_termination: 'trigger.header_value' requires 'trigger.header'".to_string(),
         );
     }
 
@@ -186,7 +263,7 @@ fn parse_trigger(config: &Value) -> Result<Trigger, String> {
             .as_str()
             .to_string();
         let value = match trigger.get("header_value") {
-            None | Some(Value::Null) => String::new(),
+            None => String::new(),
             Some(Value::String(value)) => value.clone(),
             Some(other) => {
                 return Err(format!(
@@ -254,6 +331,25 @@ fn classify_media_type(content_type: &str) -> MediaType {
     }
 }
 
+/// XML 1.0 character legality for character content (XML 1.0 §2.2).
+fn is_xml_1_0_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r')
+        || ('\u{20}'..='\u{D7FF}').contains(&c)
+        || ('\u{E000}'..='\u{FFFD}').contains(&c)
+        || ('\u{10000}'..='\u{10FFFF}').contains(&c)
+}
+
+fn validate_xml_1_0_message(message: &str) -> Result<(), String> {
+    if let Some(bad) = message.chars().find(|c| !is_xml_1_0_char(*c)) {
+        return Err(format!(
+            "request_termination: 'message' contains U+{:04X}, which is not a valid XML 1.0 character \
+             when content_type selects XML rendering",
+            bad as u32
+        ));
+    }
+    Ok(())
+}
+
 /// Minimal XML character-content escaping. `'` (apos) is intentionally not
 /// escaped — the message is rendered as element character content, where only
 /// `&`, `<`, `>` are required, plus `"` to be safe in case the operator wraps
@@ -270,6 +366,36 @@ fn xml_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Header-trigger evaluation over raw multi-value field lines.
+///
+/// * Presence (`header_value` empty): any field line — including non-UTF-8 —
+///   counts as present.
+/// * Exact value: any individual field line whose bytes equal the configured
+///   value matches. Never compares against a comma-folded serialization.
+///
+/// When raw headers are unavailable (unit-test harnesses that only populate
+/// `ctx.headers`), falls back to the materialized map.
+fn header_trigger_matches(ctx: &RequestContext, header: &str, expected: &str) -> bool {
+    if ctx.has_raw_headers() {
+        for value in ctx.raw_header_value_bytes(header) {
+            if expected.is_empty() {
+                // Presence-only: any field line, including non-UTF-8, matches.
+                return true;
+            }
+            if value == expected.as_bytes() {
+                // Exact match against an individual field line — never against
+                // a comma-folded serialization of repeated lines.
+                return true;
+            }
+        }
+        return false;
+    }
+
+    ctx.headers
+        .get(header)
+        .is_some_and(|v| expected.is_empty() || v == expected)
 }
 
 #[async_trait]
@@ -290,23 +416,42 @@ impl Plugin for RequestTermination {
         let should_terminate = match &self.trigger {
             Trigger::Always => true,
             Trigger::PathPrefix(prefix) => ctx.path.starts_with(prefix.as_str()),
-            Trigger::HeaderMatch { header, value } => ctx
-                .headers
-                .get(header.as_str())
-                .is_some_and(|v| value.is_empty() || v == value),
+            Trigger::HeaderMatch { header, value } => {
+                header_trigger_matches(ctx, header.as_str(), value.as_str())
+            }
         };
 
-        if should_terminate {
-            let mut headers = HashMap::with_capacity(1);
-            headers.insert("content-type".to_string(), self.content_type.clone());
-
-            return PluginResult::Reject {
-                status_code: self.status_code,
-                body: self.body.clone(),
-                headers,
-            };
+        if !should_terminate {
+            return PluginResult::Continue;
         }
 
-        PluginResult::Continue
+        // Extended CONNECT (and classic CONNECT) treat a 2xx as tunnel
+        // establishment. Never reinterpret a canned ordinary body as tunnel
+        // bytes — fail closed with a non-success rejection instead.
+        let (status_code, body, content_type) = if ctx.method.eq_ignore_ascii_case("CONNECT")
+            && (200..300).contains(&self.status_code)
+        {
+            (
+                403u16,
+                "{\"message\":\"CONNECT termination requires a non-success status\",\"status_code\":403}"
+                    .to_string(),
+                "application/json".to_string(),
+            )
+        } else {
+            (
+                self.status_code,
+                self.body.clone(),
+                self.content_type.clone(),
+            )
+        };
+
+        let mut headers = HashMap::with_capacity(1);
+        headers.insert("content-type".to_string(), content_type);
+
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        }
     }
 }

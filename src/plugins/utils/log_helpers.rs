@@ -6,7 +6,83 @@ use url::{Host, Url};
 
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
+use super::response_body::{BoundedReadError, measure_response_body_bounded};
 use super::{BatchConfig, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy};
+
+/// Hard cap on acknowledgement bodies drained from HTTP log sinks.
+///
+/// Sink ACKs are typically tiny; this bound exists only so a misbehaving
+/// collector cannot stream an unbounded body into the flush worker. Chunks are
+/// counted and discarded — never buffered or logged. Matches the notification
+/// dispatch drain and Loki's delivery path.
+pub const HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Maximum time spent draining one sink response body after headers arrive.
+///
+/// Separate from the plugin HTTP client's overall request timeout so a stalled
+/// acknowledgement cannot pin a flush worker for the full request budget.
+pub const HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Result of a bounded, discard-only drain of an HTTP batch-response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpBatchDrainOutcome {
+    /// Body reached EOF within the byte cap.
+    Complete(u64),
+    /// Advertised `Content-Length` or streamed total exceeded the hard cap.
+    LimitExceeded,
+    /// Drain did not finish before [`HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT`].
+    Timeout,
+    /// Underlying byte stream failed (truncated/malformed framing, reset, etc.).
+    TransportFailure,
+}
+
+impl HttpBatchDrainOutcome {
+    pub fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Complete(_) => "response body drained",
+            Self::LimitExceeded => "response body exceeded the drain limit",
+            Self::Timeout => "response body drain timed out",
+            Self::TransportFailure => "response body drain had a transport failure",
+        }
+    }
+}
+
+/// Discard a sink response body under the shared hard cap and drain timeout.
+///
+/// Used by [`handle_http_batch_response`] and by Loki's delivery classifier so
+/// every HTTP log sink shares one keep-alive-safe drain contract.
+///
+/// After a complete EOF drain the reqwest/hyper client returns the socket to
+/// its idle pool asynchronously. Log-sink flush workers (especially
+/// `batch_size = 1`) may start the next POST on the same task immediately;
+/// yielding once after EOF lets that pool reclaim run before the next
+/// checkout. This is cold-path sink I/O only — it does not change status,
+/// retry, cap, or timeout semantics.
+pub async fn drain_http_batch_response_body(response: reqwest::Response) -> HttpBatchDrainOutcome {
+    if response
+        .content_length()
+        .is_some_and(|length| length > HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES as u64)
+    {
+        return HttpBatchDrainOutcome::LimitExceeded;
+    }
+    match tokio::time::timeout(
+        HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT,
+        measure_response_body_bounded(response, HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES),
+    )
+    .await
+    {
+        Err(_) => HttpBatchDrainOutcome::Timeout,
+        Ok(Ok(bytes)) => {
+            // Response (and its pooled connection) were dropped when the
+            // measure future completed; give the idle-pool reclaim a turn
+            // before the caller issues another request on this client.
+            tokio::task::yield_now().await;
+            HttpBatchDrainOutcome::Complete(bytes)
+        }
+        Ok(Err(BoundedReadError::LimitExceeded { .. })) => HttpBatchDrainOutcome::LimitExceeded,
+        Ok(Err(BoundedReadError::Stream(_))) => HttpBatchDrainOutcome::TransportFailure,
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct BatchConfigDefaults {
@@ -24,22 +100,6 @@ pub struct BatchConfigDefaults {
 pub enum SummaryLogEntry {
     Http(TransactionSummary),
     Stream(StreamTransactionSummary),
-}
-
-impl SummaryLogEntry {
-    pub fn client_ip(&self) -> &str {
-        match self {
-            Self::Http(summary) => &summary.client_ip,
-            Self::Stream(summary) => &summary.client_ip,
-        }
-    }
-
-    pub fn proxy_id(&self) -> Option<&str> {
-        match self {
-            Self::Http(summary) => summary.proxy_id.as_deref(),
-            Self::Stream(summary) => Some(&summary.proxy_id),
-        }
-    }
 }
 
 impl From<&TransactionSummary> for SummaryLogEntry {
@@ -285,31 +345,65 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
     authority_end > 0
 }
 
-pub fn handle_http_batch_response(
+/// Classify an HTTP batch-delivery response after a bounded body drain.
+///
+/// Status semantics are unchanged from the historical helper:
+/// - 2xx succeeds (drain is best-effort so a committed ACK is never retried)
+/// - non-408/429 4xx discards without retry
+/// - 408/429/5xx (and other non-success statuses) remain retryable
+///
+/// Every `Ok(response)` path asynchronously drains/discards the body under
+/// [`HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES`] and
+/// [`HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT`] so HTTP/1.1 keep-alive connections can
+/// be reused. Peer-controlled body bytes are never logged or retained.
+pub async fn handle_http_batch_response(
     plugin_label: &str,
     entry_count: usize,
     result: Result<reqwest::Response, reqwest::Error>,
 ) -> Result<(), String> {
     match result {
-        Ok(response) if response.status().is_success() => Ok(()),
         Ok(response) => {
             let status = response.status();
-            if status.is_client_error()
-                && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-            {
-                tracing::warn!(
-                    "{plugin_label} batch discarded due to {} response ({} entries lost)",
-                    status,
-                    entry_count,
-                );
-                Ok(())
-            } else {
-                Err(format!("{plugin_label} batch failed with status {status}"))
-            }
+            let drain = drain_http_batch_response_body(response).await;
+            classify_http_batch_response(plugin_label, entry_count, status, drain)
         }
         Err(error) => Err(format!("{plugin_label} batch failed: {error}")),
     }
+}
+
+fn classify_http_batch_response(
+    plugin_label: &str,
+    entry_count: usize,
+    status: reqwest::StatusCode,
+    drain: HttpBatchDrainOutcome,
+) -> Result<(), String> {
+    if status.is_success() {
+        if !matches!(drain, HttpBatchDrainOutcome::Complete(_)) {
+            tracing::warn!(
+                "{plugin_label}: successful batch response drain incomplete ({}); connection may not be reused",
+                drain.diagnostic(),
+            );
+        }
+        return Ok(());
+    }
+
+    if status.is_client_error()
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        tracing::warn!(
+            "{plugin_label} batch discarded due to {} response ({} entries lost); {}",
+            status,
+            entry_count,
+            drain.diagnostic(),
+        );
+        return Ok(());
+    }
+
+    Err(format!(
+        "{plugin_label} batch failed with status {status}; {}",
+        drain.diagnostic()
+    ))
 }
 
 #[cfg(test)]

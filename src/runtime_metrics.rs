@@ -655,6 +655,7 @@ pub struct LogsSnapshot {
     pub by_level: BTreeMap<&'static str, u64>,
     pub by_category: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     pub sinks: crate::logging::LoggingSnapshot,
+    pub kafka_logging: Vec<crate::plugins::kafka_logging::KafkaSinkSnapshot>,
 }
 
 pub fn build_snapshot(
@@ -906,6 +907,7 @@ fn build_logs_snapshot(metrics: &RuntimeMetrics) -> LogsSnapshot {
         by_level,
         by_category,
         sinks: crate::logging::snapshot(),
+        kafka_logging: crate::plugins::kafka_logging::snapshots(),
     }
 }
 

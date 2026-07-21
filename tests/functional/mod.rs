@@ -71,6 +71,7 @@ mod functional_query_param_limits_test;
 mod functional_redis_rate_limiting_test;
 mod functional_regex_routing_test;
 mod functional_request_body_limits_test;
+mod functional_request_termination_h3_test;
 mod functional_response_body_limits_test;
 mod functional_retry_test;
 mod functional_router_cache_test;

@@ -45,6 +45,10 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
     "bearer",
     "password",
     "secret",
+    // SSE reconnection identifiers (Last-Event-ID) are origin-defined opaque
+    // resume cursors; substring match covers `sse:last_event_id` and variants.
+    "last_event_id",
+    "last-event-id",
 ];
 
 /// Key segments that make a singular `token` metadata key credential-shaped.
@@ -310,6 +314,14 @@ mod tests {
         ));
         assert!(is_sensitive_metadata_key_with_extras("api_secret", &extras));
         assert!(is_sensitive_metadata_key_with_extras("Bearer", &extras));
+        assert!(is_sensitive_metadata_key_with_extras(
+            "sse:last_event_id",
+            &extras
+        ));
+        assert!(is_sensitive_metadata_key_with_extras(
+            "Last-Event-ID",
+            &extras
+        ));
     }
 
     #[test]
