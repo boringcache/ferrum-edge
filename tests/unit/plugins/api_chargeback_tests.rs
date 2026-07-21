@@ -393,6 +393,142 @@ fn test_bandwidth_pricing_rejects_unknown_key() {
     assert!(err.contains("unknown key"));
 }
 
+/// GHSA-8478: misspelled top-level pricing dimensions and unknown
+/// `pricing_tiers[]` keys must fail both OpenAPI draft 2020-12 validation and
+/// runtime construction — never silently bill at zero.
+#[test]
+fn test_unknown_keys_rejected_by_schema_and_runtime() {
+    use ferrum_edge::plugins::api_chargeback::API_CHARGEBACK_CONFIG_KEYS;
+    use ferrum_edge::plugins::create_plugin;
+    use serde_json::Value as JsonValue;
+
+    let spec: JsonValue =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("ApiChargebackConfig schema compiles");
+
+    let accepted = [
+        json!({
+            "currency": "USD",
+            "pricing_tiers": [
+                { "status_codes": [200, 201], "price_per_call": 0.00001 }
+            ]
+        }),
+        json!({
+            "bandwidth_pricing": {
+                "price_per_byte_sent": 0.0000001,
+                "price_per_byte_received": 0.0000002
+            }
+        }),
+        json!({
+            "stream_connection_pricing": { "price_per_connection": 0.0005 }
+        }),
+        json!({
+            "currency": "USD",
+            "pricing_tiers": [
+                { "status_codes": [200], "price_per_call": 0.001 }
+            ],
+            "bandwidth_pricing": {
+                "price_per_byte_sent": 0.0000001
+            },
+            "stream_connection_pricing": {
+                "price_per_connection": 0.0005
+            },
+            "render_cache_ttl_seconds": 5,
+            "stale_entry_ttl_seconds": 3600,
+            "cache_invalidation_min_age_ms": 500,
+            "cleanup_interval_seconds": 300
+        }),
+    ];
+    for config in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "config should be schema-valid: {config}"
+        );
+        assert!(
+            ApiChargeback::new(config, "ferrum").is_ok(),
+            "config should be runtime-valid via ApiChargeback::new: {config}"
+        );
+        assert!(
+            create_plugin("api_chargeback", config).is_ok(),
+            "config should be runtime-valid via create_plugin: {config}"
+        );
+    }
+
+    // Advisory reproduction: valid HTTP tier + misspelled bandwidth key.
+    let misspelled_top_level = json!({
+        "pricing_tiers": [
+            { "status_codes": [200], "price_per_call": 0.00001 }
+        ],
+        "bandwith_pricing": {
+            "price_per_byte_sent": 0.0000001
+        }
+    });
+    assert!(
+        validator.validate(&misspelled_top_level).is_err(),
+        "misspelled bandwith_pricing must be schema-invalid"
+    );
+    let runtime_err = ApiChargeback::new(&misspelled_top_level, "ferrum")
+        .err()
+        .expect("misspelled bandwith_pricing must be runtime-rejected");
+    assert!(
+        runtime_err.contains("bandwith_pricing")
+            || runtime_err.contains("unknown configuration key"),
+        "runtime error should name the unknown key: {runtime_err}"
+    );
+    assert!(
+        create_plugin("api_chargeback", &misspelled_top_level).is_err(),
+        "create_plugin must reject misspelled bandwith_pricing"
+    );
+
+    let unknown_tier_key = json!({
+        "pricing_tiers": [
+            {
+                "status_codes": [200],
+                "price_per_call": 0.00001,
+                "price_per_requst": 0.001
+            }
+        ]
+    });
+    assert!(
+        validator.validate(&unknown_tier_key).is_err(),
+        "unknown pricing_tiers[] key must be schema-invalid"
+    );
+    let tier_err = ApiChargeback::new(&unknown_tier_key, "ferrum")
+        .err()
+        .expect("unknown pricing_tiers[] key must be runtime-rejected");
+    assert!(
+        tier_err.contains("pricing_tiers[0]")
+            && (tier_err.contains("price_per_requst")
+                || tier_err.contains("unknown configuration key")),
+        "runtime error should name the tier path and unknown key: {tier_err}"
+    );
+    assert!(
+        create_plugin("api_chargeback", &unknown_tier_key).is_err(),
+        "create_plugin must reject unknown pricing_tiers[] keys"
+    );
+
+    assert_eq!(
+        API_CHARGEBACK_CONFIG_KEYS,
+        &[
+            "currency",
+            "pricing_tiers",
+            "bandwidth_pricing",
+            "stream_connection_pricing",
+            "render_cache_ttl_seconds",
+            "stale_entry_ttl_seconds",
+            "cache_invalidation_min_age_ms",
+            "cleanup_interval_seconds",
+        ]
+    );
+}
+
 #[test]
 fn test_bandwidth_pricing_rejects_negative() {
     let config = json!({

@@ -1273,7 +1273,12 @@ dimensions:
    silently dropped L4 transactions entirely.
 
 At least one of the three blocks must be configured (otherwise the plugin
-would record nothing and is rejected at startup).
+would record nothing and is rejected at startup). Unknown top-level keys and
+unknown keys inside `pricing_tiers[]` objects are rejected at admission — a
+misspelled pricing dimension (for example `bandwith_pricing`) fails
+construction rather than silently omitting that dimension and billing at
+zero. Nested `bandwidth_pricing` and `stream_connection_pricing` objects are
+likewise closed.
 
 Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
 in both Prometheus text and JSON formats for external billing system

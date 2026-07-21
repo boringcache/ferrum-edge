@@ -19636,6 +19636,7 @@ components:
 
     ApiChargebackConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: api_chargeback — Per-consumer API usage charge tracking across
         three independent pricing dimensions: per-call pricing by billable
@@ -19648,6 +19649,9 @@ components:
         status fails closed to 500.
         At least one of `pricing_tiers`, `bandwidth_pricing`, or
         `stream_connection_pricing` must be configured.
+        Unknown top-level keys and unknown `pricing_tiers[]` keys are
+        rejected so a misspelled pricing dimension cannot silently bill
+        at zero.
       properties:
         currency:
           type: string
@@ -19658,6 +19662,7 @@ components:
           minItems: 1
           items:
             type: object
+            additionalProperties: false
             required: [status_codes, price_per_call]
             properties:
               status_codes:

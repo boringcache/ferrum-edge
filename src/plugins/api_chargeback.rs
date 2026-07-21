@@ -40,6 +40,24 @@ use std::time::Instant;
 
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::plugins::chargeback::pricing::PricingConfig;
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Closed top-level config key set for `api_chargeback` admission.
+///
+/// Source of truth: keys read by [`ApiChargeback::new`] and
+/// [`PricingConfig::from_config`]. `schema` / `schema_ref` are intentionally
+/// excluded — they are rejected with a dedicated non-shipping-plugin error
+/// before unknown-key screening.
+pub const API_CHARGEBACK_CONFIG_KEYS: &[&str] = &[
+    "currency",
+    "pricing_tiers",
+    "bandwidth_pricing",
+    "stream_connection_pricing",
+    "render_cache_ttl_seconds",
+    "stale_entry_ttl_seconds",
+    "cache_invalidation_min_age_ms",
+    "cleanup_interval_seconds",
+];
 
 /// Global chargeback registry (singleton per process).
 static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
@@ -1158,15 +1176,21 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
 
 impl ApiChargeback {
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("api_chargeback: config must be an object".to_string());
-        }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "api_chargeback: config must be an object".to_string())?;
         if config.get("schema").is_some() || config.get("schema_ref").is_some() {
             return Err("api_chargeback: 'schema' / 'schema_ref' is not supported \
                  (transaction-log schema customization applies only to log-shipping plugins; \
                  see docs/plugins.md)"
                 .to_string());
         }
+        reject_unknown_keys(
+            object,
+            "config",
+            API_CHARGEBACK_CONFIG_KEYS,
+            "api_chargeback: ",
+        )?;
 
         let registry = global_registry();
 

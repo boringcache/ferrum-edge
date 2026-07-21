@@ -7391,3 +7391,65 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
     assert!(section.contains("KeepLastKnownGood"));
     assert!(section.contains("unknown retention"));
 }
+
+#[test]
+fn api_chargeback_schema_closes_unknown_keys() {
+    use ferrum_edge::plugins::api_chargeback::API_CHARGEBACK_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/ApiChargebackConfig")
+        .expect("ApiChargebackConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["pricing_tiers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["bandwidth_pricing"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["stream_connection_pricing"]["additionalProperties"],
+        json!(false)
+    );
+
+    let documented: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("ApiChargebackConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime: BTreeSet<_> = API_CHARGEBACK_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        documented, runtime,
+        "ApiChargebackConfig OpenAPI/runtime key drift"
+    );
+
+    let tier_props: BTreeSet<_> = schema["properties"]["pricing_tiers"]["items"]["properties"]
+        .as_object()
+        .expect("pricing_tiers item properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        tier_props,
+        BTreeSet::from(["status_codes", "price_per_call"])
+    );
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `api_chargeback`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("api_chargeback docs section");
+    assert!(
+        section.contains("Unknown top-level keys") || section.contains("unknown top-level keys"),
+        "docs/plugins.md api_chargeback section must note unknown-key rejection"
+    );
+    assert!(
+        section.contains("bandwith_pricing") || section.contains("silently"),
+        "docs/plugins.md api_chargeback section must warn about misspelled pricing dimensions"
+    );
+}
