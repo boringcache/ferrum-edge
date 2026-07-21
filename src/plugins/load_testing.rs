@@ -323,9 +323,7 @@ fn next_worker_error_backoff(current: Duration) -> Duration {
     if current.is_zero() {
         MIN_WORKER_ERROR_BACKOFF
     } else {
-        current
-            .saturating_mul(2)
-            .min(MAX_WORKER_ERROR_BACKOFF)
+        current.saturating_mul(2).min(MAX_WORKER_ERROR_BACKOFF)
     }
 }
 
@@ -1116,8 +1114,7 @@ impl Plugin for LoadTesting {
                                 counters.transport_errors =
                                     counters.transport_errors.saturating_add(1);
                                 error_backoff = next_worker_error_backoff(error_backoff);
-                                let remaining =
-                                    deadline.saturating_duration_since(Instant::now());
+                                let remaining = deadline.saturating_duration_since(Instant::now());
                                 let delay = error_backoff.min(remaining);
                                 if delay.is_zero() {
                                     break;

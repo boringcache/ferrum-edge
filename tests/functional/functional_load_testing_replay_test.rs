@@ -217,7 +217,10 @@ async fn functional_load_testing_replays_exact_body_query_and_framing_from_h1_an
 }
 
 fn assert_replay_captures(captures: &[CapturedRequest], expected_body: &[u8]) {
-    assert!(captures.len() >= 2, "original plus synthetic request required");
+    assert!(
+        captures.len() >= 2,
+        "original plus synthetic request required"
+    );
     let expected_content_length = expected_body.len().to_string();
     for capture in captures {
         assert_eq!(capture.body, expected_body);
@@ -245,10 +248,7 @@ async fn send_raw_h1_trigger(port: u16, target: &str, body: &[u8]) {
             .write_all(request_head.as_bytes())
             .await
             .expect("write H1 request head");
-        stream
-            .write_all(body)
-            .await
-            .expect("write H1 request body");
+        stream.write_all(body).await.expect("write H1 request body");
         stream.flush().await.expect("flush H1 request");
         let mut response = Vec::new();
         stream
@@ -285,11 +285,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<CapturedRequest> {
 
     let header_text = std::str::from_utf8(&request[..header_end]).ok()?;
     let mut lines = header_text.split("\r\n");
-    let request_target = lines
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .to_string();
+    let request_target = lines.next()?.split_whitespace().nth(1)?.to_string();
     let mut headers = HashMap::new();
     for line in lines {
         if line.is_empty() {
