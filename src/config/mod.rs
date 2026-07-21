@@ -28,8 +28,8 @@ pub(crate) mod validation_pipeline;
 pub use env_config::AutoBool;
 #[allow(unused_imports)] // DbTlsMode is used by unit tests and public config consumers
 pub use env_config::{
-    AdminHttpExposure, BackendAllowIps, BackendEgressPolicy, DbTlsMode, EnvConfig, OperatingMode,
-    check_backend_ip_allowed,
+    AdminHttpExposure, BackendAllowIps, BackendEgressPolicy, DbTlsMode, EffectiveSqlBackend,
+    EnvConfig, OperatingMode, check_backend_ip_allowed,
 };
 #[allow(unused_imports)] // Used by unit tests
 pub use env_config::{is_always_blocked_range, is_private_ip};

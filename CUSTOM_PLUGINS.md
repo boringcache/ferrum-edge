@@ -1426,7 +1426,7 @@ demonstrates:
 - PostgreSQL overrides (including `DOUBLE PRECISION`)
 - MySQL overrides (`VARCHAR` sizing) with exact drop/recreate index reconciliation
 - Multi-statement SQL (CREATE TABLE + CREATE INDEX in one migration)
-- Atomic batch persistence via a bounded queue into the gateway configuration database
+- Atomic batch persistence via a bounded queue into the gateway configuration database (effective SQL URL through `EnvConfig::resolve_effective_sql_backend`, including canonical `FERRUM_DB_TLS_*` parameters; SQL-only)
 - Separate HTTP transport and terminal gRPC status fields; WebSocket upgrade transactions without frame capture
 - Lifecycle-owned hourly retention and documented best-effort storage-failure recovery
 

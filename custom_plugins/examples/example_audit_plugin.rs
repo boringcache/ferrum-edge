@@ -9,15 +9,23 @@
 //! ## Storage target
 //!
 //! Migrations and runtime writes both use the **gateway configuration
-//! database** (`FERRUM_DB_URL` / `FERRUM_DB_TYPE`, resolved with the same
-//! environment-over-`ferrum.conf` precedence as the gateway). There is no
-//! separate plugin database URL: a second URL would silently diverge from the
-//! schema that migrate mode / auto-apply maintain.
+//! database**. Runtime pool construction resolves `FERRUM_DB_TYPE` /
+//! `FERRUM_DB_URL` / `FERRUM_DB_TLS_*` through
+//! [`EnvConfig::resolve_effective_sql_backend`](crate::config::EnvConfig::resolve_effective_sql_backend)
+//! — the same environment-over-`ferrum.conf` path and canonical TLS query
+//! parameters as the gateway primary pool. There is no separate plugin
+//! database URL: a second URL would silently diverge from the schema that
+//! migrate mode / auto-apply maintain. MongoDB is rejected because this
+//! example is SQL-only (`sqlite` / `postgres` / `mysql`).
 //!
+//! The runtime worker opens a **lazy** SQL pool during
+//! `start_background_tasks` (construction itself does not connect). The first
+//! flush surfaces connectivity errors through the batching retry/warn path.
 //! Supported modes for the storage path: `database`, `cp`, and standalone
 //! `migrate` (for schema). File / DP / mesh / injector / node-agent modes do
 //! not run SQL custom-plugin migrations; constructing the plugin there will
-//! still attempt writes against `FERRUM_DB_URL` if set.
+//! still attempt writes against the effective gateway SQL URL when those
+//! settings are present.
 //!
 //! ## Failure contract
 //!
@@ -112,6 +120,14 @@ const MAX_METADATA_KEY_CHARS: usize = 128;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
 const MAX_CONTEXT_BYTES: usize = 4096;
 const INSERT_COLUMN_COUNT: usize = 13;
+
+/// Per-connection SQLite setup for the audit pool. Must stay aligned with the
+/// primary gateway SQLite pool (`DatabaseStore` `after_connect`).
+pub const SQLITE_AUDIT_CONNECT_PRAGMAS: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "PRAGMA journal_mode = WAL",
+    "PRAGMA busy_timeout = 5000",
+];
 
 /// Gateway SQL dialect resolved from `FERRUM_DB_TYPE` (never from the raw URL).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,7 +240,8 @@ impl ExampleAuditPlugin {
                     "example_audit_plugin config contains unknown key '{key}'; \
                      expected only log_request_headers, retention_days, and optional batch keys \
                      (queue_capacity/buffer_capacity, batch_size, flush_interval_ms, max_retries, retry_delay_ms). \
-                     Storage uses the gateway database (FERRUM_DB_URL / FERRUM_DB_TYPE); \
+                     Storage uses the gateway SQL database via EnvConfig::resolve_effective_sql_backend \
+                     (FERRUM_DB_URL / FERRUM_DB_TYPE / FERRUM_DB_TLS_*); \
                      per-plugin db_url/db_type are not supported."
                 ));
             }
@@ -587,16 +604,12 @@ fn canonical_timestamp(input: &str) -> String {
 }
 
 fn connect_gateway_pool_lazy() -> Result<GatewayAuditStore, String> {
-    let db_url = crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_URL").ok_or_else(|| {
-        "example_audit_plugin requires FERRUM_DB_URL (gateway configuration database)".to_string()
-    })?;
-    // Resolve dialect from FERRUM_DB_TYPE only — never infer or log the raw URL
-    // (URLs may embed credentials).
-    let db_type = crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TYPE").ok_or_else(|| {
-        "example_audit_plugin requires FERRUM_DB_TYPE for the gateway database dialect"
-            .to_string()
-    })?;
-    let dialect = AuditSqlDialect::from_db_type(&db_type)?;
+    // Use the gateway's effective SQL backend (conf-aware URL + canonical
+    // FERRUM_DB_TLS_* parameters). Never infer dialect from the raw URL, and
+    // never log the effective URL (it may embed credentials).
+    let backend = crate::config::EnvConfig::resolve_effective_sql_backend()
+        .map_err(|error| format!("example_audit_plugin: {error}"))?;
+    let dialect = AuditSqlDialect::from_db_type(&backend.db_type)?;
     // Use a lazy pool so `start_background_tasks` stays sync-safe on the Tokio
     // runtime; the first flush surfaces connectivity errors through the
     // batching retry/warn path.
@@ -610,15 +623,16 @@ fn connect_gateway_pool_lazy() -> Result<GatewayAuditStore, String> {
             Box::pin(async move {
                 if is_sqlite {
                     use sqlx::Executor;
-                    conn.execute("PRAGMA foreign_keys = ON").await?;
-                    conn.execute("PRAGMA busy_timeout = 5000").await?;
+                    for pragma in SQLITE_AUDIT_CONNECT_PRAGMAS {
+                        conn.execute(*pragma).await?;
+                    }
                 }
                 Ok(())
             })
         })
-        .connect_lazy(&db_url)
+        .connect_lazy(&backend.effective_url)
         .map_err(|_| {
-            "example_audit_plugin: failed to create gateway database pool from FERRUM_DB_URL"
+            "example_audit_plugin: failed to create gateway database pool from effective configuration"
                 .to_string()
         })?;
     Ok(GatewayAuditStore { pool, dialect })

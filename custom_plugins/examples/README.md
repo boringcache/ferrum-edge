@@ -17,6 +17,13 @@ cp custom_plugins/examples/example_audit_plugin.rs custom_plugins/
 cargo build
 ```
 
+## `example_audit_plugin` storage notes
+
+Runtime writes use the gateway SQL configuration database via
+`EnvConfig::resolve_effective_sql_backend` (`FERRUM_DB_TYPE` / `FERRUM_DB_URL` /
+`FERRUM_DB_TLS_*`). MongoDB is rejected. The worker pool is created lazily in
+`start_background_tasks`; construction does not open a network connection.
+
 ## Uninstall / leftover schema
 
 Custom plugin migrations have no automatic down path. If you previously opted

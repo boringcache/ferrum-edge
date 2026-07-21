@@ -183,21 +183,155 @@ fn test_supported_protocols_is_all_protocols() {
 }
 
 #[test]
-fn test_gateway_database_settings_use_canonical_conf_aware_resolution() {
+fn test_gateway_database_settings_use_effective_sql_backend() {
     let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
     assert!(
-        source.contains("resolve_ferrum_var(\"FERRUM_DB_URL\")"),
-        "runtime persistence must honor ferrum.conf as well as the process environment"
+        source.contains("EnvConfig::resolve_effective_sql_backend()"),
+        "runtime persistence must use the gateway effective SQL backend helper"
     );
     assert!(
-        source.contains("resolve_ferrum_var(\"FERRUM_DB_TYPE\")"),
-        "runtime persistence must use the gateway's canonical database-type resolution"
+        source.contains("SQLITE_AUDIT_CONNECT_PRAGMAS")
+            && source.contains("PRAGMA journal_mode = WAL"),
+        "SQLite audit pool must apply the repository WAL invariant"
     );
     assert!(
         !source.contains("db_url.contains")
             && !source.contains("parse_db_url")
             && source.contains("from_db_type"),
         "dialect must come from FERRUM_DB_TYPE, never from inspecting the raw URL"
+    );
+}
+
+#[test]
+fn test_effective_sql_backend_appends_postgres_tls_params() {
+    use ferrum_edge::config::{DbTlsMode, EnvConfig};
+
+    let config = EnvConfig {
+        db_type: Some("postgres".to_string()),
+        db_url: Some("postgres://user:s3cret@db.example.com/ferrum".to_string()),
+        db_tls_mode: Some(DbTlsMode::Require),
+        db_tls_ca_cert_path: None,
+        db_tls_client_cert_path: None,
+        db_tls_client_key_path: None,
+        ..EnvConfig::default()
+    };
+
+    let backend = config
+        .effective_sql_backend()
+        .expect("postgres require TLS must resolve");
+    assert_eq!(backend.db_type, "postgres");
+    assert_eq!(
+        backend.effective_url,
+        "postgres://user:s3cret@db.example.com/ferrum?sslmode=require"
+    );
+}
+
+#[test]
+fn test_effective_sql_backend_appends_mysql_tls_params() {
+    use ferrum_edge::config::{DbTlsMode, EnvConfig};
+
+    let config = EnvConfig {
+        db_type: Some("mysql".to_string()),
+        db_url: Some("mysql://user:s3cret@db.example.com/ferrum".to_string()),
+        db_tls_mode: Some(DbTlsMode::VerifyCa),
+        db_tls_ca_cert_path: Some("/certs/ca.pem".to_string()),
+        db_tls_client_cert_path: None,
+        db_tls_client_key_path: None,
+        ..EnvConfig::default()
+    };
+
+    let backend = config
+        .effective_sql_backend()
+        .expect("mysql verify-ca must resolve");
+    assert_eq!(backend.db_type, "mysql");
+    assert_eq!(
+        backend.effective_url,
+        "mysql://user:s3cret@db.example.com/ferrum?ssl-mode=VERIFY_CA&ssl-ca=/certs/ca.pem"
+    );
+}
+
+#[test]
+fn test_effective_sql_backend_rejects_mongodb_and_missing_identity() {
+    use ferrum_edge::config::EnvConfig;
+
+    let mongo = EnvConfig {
+        db_type: Some("mongodb".to_string()),
+        db_url: Some("mongodb://user:s3cret@db.example.com/ferrum".to_string()),
+        ..EnvConfig::default()
+    };
+    let mongo_err = mongo
+        .effective_sql_backend()
+        .expect_err("mongodb must be rejected for SQL-only consumers");
+    assert!(
+        mongo_err.contains("MongoDB") && !mongo_err.contains("s3cret"),
+        "got: {mongo_err}"
+    );
+
+    let missing_url = EnvConfig {
+        db_type: Some("sqlite".to_string()),
+        db_url: None,
+        ..EnvConfig::default()
+    };
+    let url_err = missing_url
+        .effective_sql_backend()
+        .expect_err("missing FERRUM_DB_URL must fail");
+    assert!(url_err.contains("FERRUM_DB_URL"), "got: {url_err}");
+
+    let missing_type = EnvConfig {
+        db_type: None,
+        db_url: Some("sqlite::memory:".to_string()),
+        ..EnvConfig::default()
+    };
+    let type_err = missing_type
+        .effective_sql_backend()
+        .expect_err("missing FERRUM_DB_TYPE must fail");
+    assert!(type_err.contains("FERRUM_DB_TYPE"), "got: {type_err}");
+}
+
+#[test]
+fn test_effective_sql_backend_resolve_from_env_matches_gateway_tls_path() {
+    use ferrum_edge::config::EnvConfig;
+
+    let _env_lock = crate::unit::env_lock::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _db_type = ScopedEnv::set("FERRUM_DB_TYPE", "postgres");
+    let _db_url = ScopedEnv::set(
+        "FERRUM_DB_URL",
+        "postgres://user:env-secret@db.example.com/ferrum",
+    );
+    let _tls_mode = ScopedEnv::set("FERRUM_DB_TLS_MODE", "prefer");
+    let _tls_ca = ScopedEnv::remove("FERRUM_DB_TLS_CA_CERT_PATH");
+    let _tls_cert = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_CERT_PATH");
+    let _tls_key = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_KEY_PATH");
+
+    let backend = EnvConfig::resolve_effective_sql_backend()
+        .expect("conf-aware SQL backend resolution must succeed");
+    assert_eq!(backend.db_type, "postgres");
+    assert_eq!(
+        backend.effective_url,
+        "postgres://user:env-secret@db.example.com/ferrum?sslmode=prefer"
+    );
+}
+
+#[test]
+fn test_sqlite_audit_connect_pragmas_include_wal_contract() {
+    if !example_audit_plugin_registered() {
+        // Without the opt-in build the const is unavailable; keep the source
+        // contract assertion so packaging still documents the invariant.
+        let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+        assert!(source.contains("PRAGMA journal_mode = WAL"));
+        return;
+    }
+
+    let pragmas = ferrum_edge::custom_plugins::example_audit_plugin::SQLITE_AUDIT_CONNECT_PRAGMAS;
+    assert_eq!(
+        pragmas,
+        &[
+            "PRAGMA foreign_keys = ON",
+            "PRAGMA journal_mode = WAL",
+            "PRAGMA busy_timeout = 5000",
+        ]
     );
 }
 
@@ -244,8 +378,8 @@ fn test_dialect_sql_forms_use_table_name_and_correct_placeholders() {
     );
     assert!(
         source.contains("AuditSqlDialect::from_db_type")
-            && source.contains("resolve_ferrum_var(\"FERRUM_DB_TYPE\")"),
-        "dialect must be resolved from FERRUM_DB_TYPE, not the raw URL"
+            && source.contains("resolve_effective_sql_backend()"),
+        "dialect must be resolved from the effective SQL backend, not the raw URL"
     );
 
     // Reconstruct the placeholder clauses the helpers emit and prove counts.
