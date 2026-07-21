@@ -40,6 +40,7 @@ const STATUS_CACHE_TTL: Duration = Duration::from_secs(1);
 const MAX_FIELD_LEN: usize = 512;
 const MAX_METADATA_FIELD_LEN: usize = 256;
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
+const GRPC_STATUS_OTHER_SENTINEL: u32 = u32::MAX;
 
 static ACTIVE_SINK: OnceLock<ArcSwap<Option<Arc<SinkRuntime>>>> = OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
@@ -2126,7 +2127,7 @@ impl SnapshotAccumulator {
             route_id: metadata_value(&summary.metadata, &["route_id"]),
             status_code: outcome.status_code,
             http_status_code: Some(outcome.http_status_code),
-            grpc_status: outcome.grpc_status,
+            grpc_status: outcome.grpc_status.map(normalize_snapshot_grpc_status),
             protocol: infer_http_protocol(summary),
         };
         self.record(meta, charge);
@@ -2615,6 +2616,14 @@ fn snapshot_key(
             .map(|status| status.to_string())
             .unwrap_or_default()
     )
+}
+
+fn normalize_snapshot_grpc_status(status: u32) -> u32 {
+    if status <= 16 {
+        status
+    } else {
+        GRPC_STATUS_OTHER_SENTINEL
+    }
 }
 
 fn non_negative_delta(current: f64, last: f64) -> f64 {
