@@ -818,10 +818,7 @@ async fn otel_tracing_config_projections_redact_endpoint_auth_and_headers() {
         raw["config"]["authorization"],
         format!("Bearer {auth_secret}")
     );
-    assert_eq!(
-        raw["config"]["headers"]["x-honeycomb-team"],
-        header_secret
-    );
+    assert_eq!(raw["config"]["headers"]["x-honeycomb-team"], header_secret);
 
     for projection in [audit_config, &projected["config"], &listed["config"]] {
         let serialized = projection.to_string();

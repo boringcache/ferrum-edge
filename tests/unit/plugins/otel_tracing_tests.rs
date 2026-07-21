@@ -3,8 +3,7 @@
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, PluginResult, RequestContext,
     StreamTransactionSummary, TransactionSummary, WsDisconnectContext,
-    mesh::workload_metrics::WorkloadMetrics, otel_tracing::OtelTracing,
-    utils::PluginHttpClient,
+    mesh::workload_metrics::WorkloadMetrics, otel_tracing::OtelTracing, utils::PluginHttpClient,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use serde_json::{Value, json};
@@ -433,7 +432,9 @@ async fn test_otel_tracing_before_proxy_replaces_all_caller_trace_context_casing
     assert_eq!(trace_headers.len(), 1);
     assert_eq!(
         trace_headers[0].1,
-        ctx.metadata.get("traceparent").expect("generated traceparent")
+        ctx.metadata
+            .get("traceparent")
+            .expect("generated traceparent")
     );
     assert!(
         headers
@@ -461,8 +462,7 @@ async fn test_otel_tracing_before_proxy_strips_untrusted_context_when_generation
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     assert!(headers.keys().all(|name| {
-        !name.eq_ignore_ascii_case("traceparent")
-            && !name.eq_ignore_ascii_case("tracestate")
+        !name.eq_ignore_ascii_case("traceparent") && !name.eq_ignore_ascii_case("tracestate")
     }));
 }
 
@@ -481,7 +481,10 @@ async fn test_otel_tracing_trusted_context_is_forwarded_once_with_canonical_name
     let mut headers = ctx.headers.clone();
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert_eq!(headers.get("tracestate").map(String::as_str), Some("vendor=trusted"));
+    assert_eq!(
+        headers.get("tracestate").map(String::as_str),
+        Some("vendor=trusted")
+    );
     assert_eq!(
         headers
             .keys()
@@ -1606,7 +1609,10 @@ async fn test_otel_tracing_stream_failures_preserve_protocol_cause_and_direction
             otlp_bool_attr(span, "gateway.client.disconnected").unwrap_or(false),
             client_disconnected
         );
-        assert_eq!(otlp_int_attr(span, "gateway.stream.bytes_sent"), Some("128"));
+        assert_eq!(
+            otlp_int_attr(span, "gateway.stream.bytes_sent"),
+            Some("128")
+        );
         assert_eq!(
             otlp_int_attr(span, "gateway.stream.bytes_received"),
             Some("512")
@@ -1684,10 +1690,7 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
         otlp_int_attr(span, "gateway.websocket.frames_backend_to_client"),
         Some("3")
     );
-    assert_eq!(
-        otlp_int_attr(span, "gateway.stream.bytes_sent"),
-        Some("10")
-    );
+    assert_eq!(otlp_int_attr(span, "gateway.stream.bytes_sent"), Some("10"));
     assert_eq!(
         otlp_int_attr(span, "gateway.stream.bytes_received"),
         Some("20")
@@ -1813,13 +1816,11 @@ async fn test_otel_tracing_otlp_success_body_variants_are_bounded_and_never_retr
         ),
         (
             "null-default-success",
-            wiremock::ResponseTemplate::new(200)
-                .set_body_json(json!({"partialSuccess": null})),
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"partialSuccess": null})),
         ),
         (
             "malformed-partial-success-shape",
-            wiremock::ResponseTemplate::new(200)
-                .set_body_json(json!({"partialSuccess": []})),
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"partialSuccess": []})),
         ),
         (
             "malformed-rejected-count",

@@ -257,11 +257,8 @@ impl SpanData {
             .as_deref()
             .map(parse_backend_host_port)
             .unwrap_or((None, None));
-        let backend_target = gateway_backend_target(
-            backend_host.as_deref(),
-            backend_port,
-            max_attribute_bytes,
-        );
+        let backend_target =
+            gateway_backend_target(backend_host.as_deref(), backend_port, max_attribute_bytes);
         let grpc_status = summary.grpc_status();
         let otlp_error = http_span_is_error(summary);
         let http_url = if include_url_path {
@@ -364,11 +361,8 @@ impl SpanData {
             .cloned()
             .unwrap_or_default();
         let (backend_host, backend_port) = parse_backend_host_port(&summary.backend_target);
-        let backend_target = gateway_backend_target(
-            backend_host.as_deref(),
-            backend_port,
-            max_attribute_bytes,
-        );
+        let backend_target =
+            gateway_backend_target(backend_host.as_deref(), backend_port, max_attribute_bytes);
         let otlp_error = summary.error_class.is_some()
             || summary.connection_error.is_some()
             || summary
@@ -456,11 +450,8 @@ impl SpanData {
         let span_id = OtelTracing::generate_span_id();
         let parent_span_id = ctx.metadata.get("span_id").cloned().unwrap_or_default();
         let (backend_host, backend_port) = parse_backend_host_port(&ctx.backend_target);
-        let backend_target = gateway_backend_target(
-            backend_host.as_deref(),
-            backend_port,
-            max_attribute_bytes,
-        );
+        let backend_target =
+            gateway_backend_target(backend_host.as_deref(), backend_port, max_attribute_bytes);
         let disconnect_cause = websocket_disconnect_cause(ctx);
         let otlp_error = ctx.error_class.is_some();
         let route = ctx.proxy_name.as_deref().unwrap_or("websocket");
@@ -514,10 +505,7 @@ impl SpanData {
             stream_bytes_received: Some(ctx.bytes_backend_to_client),
             disconnect_direction: ctx.direction.map(direction_label).map(str::to_string),
             disconnect_cause: Some(disconnect_cause_label(disconnect_cause).to_string()),
-            stream_io_side: ctx
-                .io_side
-                .map(stream_io_side_label)
-                .map(str::to_string),
+            stream_io_side: ctx.io_side.map(stream_io_side_label).map(str::to_string),
             ws_frames_client_to_backend: Some(ctx.frames_client_to_backend),
             ws_frames_backend_to_client: Some(ctx.frames_backend_to_client),
         })
@@ -553,11 +541,7 @@ impl SpanData {
                 .as_ref()
                 .map(String::len)
                 .unwrap_or(0)
-            + self
-                .disconnect_cause
-                .as_ref()
-                .map(String::len)
-                .unwrap_or(0)
+            + self.disconnect_cause.as_ref().map(String::len).unwrap_or(0)
             + self.stream_io_side.as_ref().map(String::len).unwrap_or(0)
             + self
                 .mesh_attributes
@@ -602,8 +586,7 @@ impl OtelTracing {
         // Validate exporter controls even in propagation-only mode. A stored
         // typo or invalid queue setting must not become latent until an
         // endpoint is added later.
-        let options =
-            TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+        let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
 
         let exporter = if let Some(endpoint) = endpoint {
             Some(Arc::new(OtlpTraceExporter::new(
@@ -1803,7 +1786,11 @@ fn otlp_json_content_type(content_type: &str) -> bool {
 fn bounded_log_value(value: &str, max_bytes: usize) -> String {
     let mut output = String::with_capacity(value.len().min(max_bytes));
     for character in value.chars() {
-        let character = if character.is_control() { ' ' } else { character };
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
         if output.len().saturating_add(character.len_utf8()) > max_bytes {
             break;
         }
@@ -1900,10 +1887,7 @@ fn build_otlp_payload(
                 attributes.push(otlp_attribute("gateway.backend.target", target));
             }
             if let Some(ref resolved) = s.backend_resolved_ip {
-                attributes.push(otlp_attribute(
-                    "gateway.backend.resolved_address",
-                    resolved,
-                ));
+                attributes.push(otlp_attribute("gateway.backend.resolved_address", resolved));
             }
             if let Some(ref protocol) = s.stream_protocol {
                 attributes.push(otlp_attribute("network.protocol.name", protocol));
@@ -2002,21 +1986,15 @@ fn build_otlp_payload(
                 }));
             }
             if let Some(ref cause) = s.disconnect_cause {
-                let mut disconnect_attributes = vec![otlp_attribute(
-                    "gateway.disconnect.cause",
-                    cause,
-                )];
+                let mut disconnect_attributes =
+                    vec![otlp_attribute("gateway.disconnect.cause", cause)];
                 if let Some(ref direction) = s.disconnect_direction {
-                    disconnect_attributes.push(otlp_attribute(
-                        "gateway.disconnect.direction",
-                        direction,
-                    ));
+                    disconnect_attributes
+                        .push(otlp_attribute("gateway.disconnect.direction", direction));
                 }
                 if let Some(ref io_side) = s.stream_io_side {
-                    disconnect_attributes.push(otlp_attribute(
-                        "gateway.disconnect.io_side",
-                        io_side,
-                    ));
+                    disconnect_attributes
+                        .push(otlp_attribute("gateway.disconnect.io_side", io_side));
                 }
                 events.push(serde_json::json!({
                     "name": "gateway.disconnect",
@@ -2336,9 +2314,7 @@ fn datadog_high_trace_id(hex: &str) -> Option<&str> {
 fn string_config(config: &Value, key: &str, default: &str) -> Result<String, String> {
     match config.get(key) {
         None => Ok(default.to_string()),
-        Some(Value::Null) => Err(format!(
-            "otel_tracing: '{key}' must be a non-null string"
-        )),
+        Some(Value::Null) => Err(format!("otel_tracing: '{key}' must be a non-null string")),
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -2356,9 +2332,7 @@ fn string_config(config: &Value, key: &str, default: &str) -> Result<String, Str
 fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, String> {
     match config.get(key) {
         None => Ok(None),
-        Some(Value::Null) => Err(format!(
-            "otel_tracing: '{key}' must be a non-null string"
-        )),
+        Some(Value::Null) => Err(format!("otel_tracing: '{key}' must be a non-null string")),
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -2376,9 +2350,7 @@ fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, S
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
     match config.get(key) {
         None => Ok(default),
-        Some(Value::Null) => Err(format!(
-            "otel_tracing: '{key}' must be a non-null boolean"
-        )),
+        Some(Value::Null) => Err(format!("otel_tracing: '{key}' must be a non-null boolean")),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
             "otel_tracing: '{key}' must be a boolean, got: {other}"
@@ -2442,9 +2414,9 @@ fn u32_config_range(
 fn parse_trace_context_trust(config: &Value) -> Result<TraceContextTrust, String> {
     match config.get("trace_context_trust") {
         None => Ok(TraceContextTrust::Untrusted),
-        Some(Value::Null) => Err(
-            "otel_tracing: 'trace_context_trust' must be a non-null string".to_string(),
-        ),
+        Some(Value::Null) => {
+            Err("otel_tracing: 'trace_context_trust' must be a non-null string".to_string())
+        }
         Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
             "untrusted" => Ok(TraceContextTrust::Untrusted),
             "trusted" => Ok(TraceContextTrust::Trusted),
@@ -2951,9 +2923,7 @@ const fn disconnect_cause_label(cause: DisconnectCause) -> &'static str {
     }
 }
 
-const fn stream_io_side_label(
-    side: crate::proxy::tcp_proxy::StreamIoSide,
-) -> &'static str {
+const fn stream_io_side_label(side: crate::proxy::tcp_proxy::StreamIoSide) -> &'static str {
     match side {
         crate::proxy::tcp_proxy::StreamIoSide::Read => "read",
         crate::proxy::tcp_proxy::StreamIoSide::Write => "write",
@@ -3116,7 +3086,8 @@ mod tests {
         barrier.wait();
         let admitted = workers
             .into_iter()
-            .filter(|worker| worker.join().expect("reservation worker did not panic"))
+            .map(|worker| worker.join().expect("reservation worker did not panic"))
+            .filter(|ok| *ok)
             .count();
         assert_eq!(admitted, 8);
         assert_eq!(exporter.queued_bytes.load(Ordering::Acquire), 1_024);

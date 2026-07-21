@@ -298,9 +298,7 @@ impl WorkloadMetrics {
             custom_trace_attributes_marker,
             tracing_providers,
             trace_exporters,
-            export_drop_log_limiter: Mutex::new(
-                crate::util::accept_backoff::LogRateLimiter::new(),
-            ),
+            export_drop_log_limiter: Mutex::new(crate::util::accept_backoff::LogRateLimiter::new()),
             span_reporting_disabled,
             service_name,
             direction_emit,
