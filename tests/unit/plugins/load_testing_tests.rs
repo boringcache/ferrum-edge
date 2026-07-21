@@ -854,10 +854,8 @@ async fn test_header_transformers_cannot_manufacture_or_change_trigger_authentic
         "GET".to_string(),
         "/api/test".to_string(),
     );
-    let mut injected_headers = HashMap::from([(
-        "x-loadtesting-key".to_string(),
-        VALID_KEY.to_string(),
-    )]);
+    let mut injected_headers =
+        HashMap::from([("x-loadtesting-key".to_string(), VALID_KEY.to_string())]);
     let injected_result = plugin
         .before_proxy(&mut injected_ctx, &mut injected_headers)
         .await;
@@ -1016,10 +1014,7 @@ async fn test_ingress_fanout_marker_cannot_be_removed_to_reenable_fanout() {
 
     // Model an earlier transformer removing only the one-hop marker from the
     // effective map. Ingress provenance must still force the terminal 204 ack.
-    let mut headers = HashMap::from([(
-        "x-loadtesting-key".to_string(),
-        VALID_KEY.to_string(),
-    )]);
+    let mut headers = HashMap::from([("x-loadtesting-key".to_string(), VALID_KEY.to_string())]);
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 204),

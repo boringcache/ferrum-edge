@@ -919,8 +919,7 @@ impl Plugin for LoadTesting {
             };
         }
         let client_budget = ProcessClientBudget::new(u64::from(self.concurrent_clients));
-        let Some(request_body) =
-            RetainedRequestBody::try_new(ctx.request_body_bytes.clone())
+        let Some(request_body) = RetainedRequestBody::try_new(ctx.request_body_bytes.clone())
         else {
             tracing::warn!(
                 requested_bytes = ctx.request_body_bytes.as_ref().map_or(0, Bytes::len),
@@ -1162,8 +1161,7 @@ impl Plugin for LoadTesting {
             for handle in handles {
                 match handle.await {
                     Ok(worker) => {
-                        aggregation_saturated |=
-                            worker.counters.saturating_add_into(&mut totals);
+                        aggregation_saturated |= worker.counters.saturating_add_into(&mut totals);
                         if worker.cancelled {
                             cancelled_workers = cancelled_workers.saturating_add(1);
                         }
