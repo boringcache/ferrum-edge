@@ -1279,6 +1279,62 @@ async fn full_snapshot_rehydrates_quarantined_hmac_after_conflict_repair() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn request_termination_invalid_reload_keeps_last_known_good_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("termination-policy", true);
+    plugin.plugin_name = "request_termination".to_string();
+    plugin.config = serde_json::json!({
+        "status_code": 451,
+        "trigger": {"path_prefix": "/maintenance"}
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "request_termination")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "status_code": 451,
+        "triger": {"path_prefix": "/must-not-publish"}
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let outcome = state.update_config(invalid);
+    let ConfigApplyOutcome::Rejected { errors } = outcome else {
+        panic!("misspelled request_termination trigger must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("request_termination") && error.contains("triger")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["trigger"]["path_prefix"],
+        "/maintenance"
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "request_termination"),
+        "rejected reload must retain the last-known-good termination policy"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
     let state = empty_proxy_state();
     let mut plugin = test_plugin_config("security-policy", true);

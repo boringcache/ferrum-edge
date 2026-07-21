@@ -39,9 +39,12 @@ pub fn prepare_synthetic_response_wire<'a>(
     // HEAD keeps representation metadata unless the status itself forbids a
     // body; 204/205/304 (including HEAD+those statuses) strip Content-Length.
     if method.eq_ignore_ascii_case("HEAD") && !status_forbids_response_body(status) {
-        headers
-            .entry("content-length".to_string())
-            .or_insert_with(|| body.len().to_string());
+        if !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length"))
+        {
+            headers.insert("content-length".to_string(), body.len().to_string());
+        }
     } else {
         remove_content_length(headers);
     }

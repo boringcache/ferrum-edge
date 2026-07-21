@@ -148,16 +148,29 @@ fn test_trigger_rejects_invalid_header_name() {
 
 #[test]
 fn test_trigger_rejects_ambiguous_fields() {
-    let err = RequestTermination::new(&json!({
-        "trigger": {
+    for trigger in [
+        json!({
             "path_prefix": "/admin",
             "header": "x-maintenance"
-        }
+        }),
+        json!({
+            "path_prefix": "/admin",
+            "header_value": "true"
+        }),
+    ] {
+        let err = RequestTermination::new(&json!({"trigger": trigger}))
+            .err()
+            .expect("ambiguous trigger fields should be rejected");
+
+        assert!(err.contains("only one"), "got: {err}");
+    }
+
+    let err = RequestTermination::new(&json!({
+        "trigger": {"header_value": "true"}
     }))
     .err()
-    .expect("ambiguous trigger fields should be rejected");
-
-    assert!(err.contains("only one"), "got: {err}");
+    .expect("header_value without header should be rejected");
+    assert!(err.contains("requires 'trigger.header'"), "got: {err}");
 }
 
 #[test]
@@ -660,6 +673,35 @@ fn test_config_requires_object_and_rejects_unknown_keys() {
         "trigger": { "path_prefix": "/maintenance" }
     }))
     .expect("valid conditional config must be accepted");
+}
+
+#[test]
+fn test_explicit_null_properties_are_rejected() {
+    for (path, invalid) in [
+        ("status_code", json!({"status_code": null})),
+        ("content_type", json!({"content_type": null})),
+        ("body", json!({"body": null})),
+        ("message", json!({"message": null})),
+        ("trigger", json!({"trigger": null})),
+        (
+            "trigger.path_prefix",
+            json!({"trigger": {"path_prefix": null}}),
+        ),
+        ("trigger.header", json!({"trigger": {"header": null}})),
+        (
+            "trigger.header_value",
+            json!({"trigger": {"header": "x-policy", "header_value": null}}),
+        ),
+    ] {
+        let err = RequestTermination::new(&invalid)
+            .err()
+            .unwrap_or_else(|| panic!("expected explicit null at {path} to be rejected"));
+        let leaf = path.rsplit('.').next().expect("path has a leaf");
+        assert!(
+            err.contains(leaf),
+            "unexpected error for explicit null at {path}: {err}"
+        );
+    }
 }
 
 #[test]

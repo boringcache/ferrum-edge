@@ -128,7 +128,7 @@ fn reject_unknown_keys(
 
 fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
     match config.get("status_code") {
-        None | Some(Value::Null) => Ok(503),
+        None => Ok(503),
         Some(Value::Number(value)) => {
             let Some(code) = value.as_u64() else {
                 return Err(
@@ -153,7 +153,7 @@ fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
 
 fn parse_content_type(config: &Map<String, Value>) -> Result<String, String> {
     match config.get("content_type") {
-        None | Some(Value::Null) => Ok("application/json".to_string()),
+        None => Ok("application/json".to_string()),
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -175,7 +175,7 @@ fn parse_content_type(config: &Map<String, Value>) -> Result<String, String> {
 
 fn optional_string(config: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(other) => Err(format!(
             "request_termination: '{key}' must be a string, got: {other}"
@@ -187,9 +187,6 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
     let Some(trigger) = config.get("trigger") else {
         return Ok(Trigger::Always);
     };
-    if trigger.is_null() {
-        return Ok(Trigger::Always);
-    }
     let Value::Object(trigger) = trigger else {
         return Err("request_termination: 'trigger' must be an object".to_string());
     };
@@ -202,10 +199,17 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
 
     let has_path = trigger.contains_key("path_prefix");
     let has_header = trigger.contains_key("header");
-    if has_path && has_header {
+    let has_header_value = trigger.contains_key("header_value");
+    if has_path && (has_header || has_header_value) {
         return Err(
-            "request_termination: 'trigger' must set only one of 'path_prefix' or 'header'"
+            "request_termination: 'trigger' must set only one of 'path_prefix' or 'header'; \
+             'header_value' is valid only with 'header'"
                 .to_string(),
+        );
+    }
+    if has_header_value && !has_header {
+        return Err(
+            "request_termination: 'trigger.header_value' requires 'trigger.header'".to_string(),
         );
     }
 
@@ -259,7 +263,7 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
             .as_str()
             .to_string();
         let value = match trigger.get("header_value") {
-            None | Some(Value::Null) => String::new(),
+            None => String::new(),
             Some(Value::String(value)) => value.clone(),
             Some(other) => {
                 return Err(format!(

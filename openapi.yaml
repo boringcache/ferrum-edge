@@ -16330,7 +16330,8 @@ components:
         path/header-based short-circuiting. Runs after CORS so browser
         preflight responses are still emitted correctly. HTTP-family only.
         Configuration must be an object; unknown top-level and trigger keys
-        are rejected. Null/scalar/array configs are rejected.
+        are rejected. Null/scalar/array configs and explicit null property
+        values are rejected; omit optional properties to select their defaults.
       properties:
         status_code:
           type: integer
@@ -16375,7 +16376,18 @@ components:
             Optional trigger condition. Without a trigger every request on the
             proxy is terminated (maintenance-mode default). Set only one of
             `path_prefix` or `header`; configuring both is rejected. Unknown
-            nested keys are rejected.
+            nested keys are rejected. When `trigger` is present it must contain
+            exactly `path_prefix`, or `header` with optional `header_value`;
+            an empty trigger and a detached `header_value` are invalid.
+          oneOf:
+            - required: [path_prefix]
+              not:
+                anyOf:
+                  - required: [header]
+                  - required: [header_value]
+            - required: [header]
+              not:
+                required: [path_prefix]
           properties:
             path_prefix:
               type: string

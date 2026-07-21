@@ -35,6 +35,19 @@ fn prepare_head_keeps_representation_content_length() {
 }
 
 #[test]
+fn prepare_head_preserves_existing_content_length_case_insensitively() {
+    let mut headers = HashMap::new();
+    headers.insert("Content-Length".to_string(), "18".to_string());
+    let wire = prepare_synthetic_response_wire("HEAD", 503, &mut headers, b"");
+    assert!(wire.is_empty());
+    assert_eq!(
+        headers.get("Content-Length").map(String::as_str),
+        Some("18")
+    );
+    assert_eq!(headers.len(), 1, "must not add a case-variant duplicate");
+}
+
+#[test]
 fn prepare_no_body_status_strips_content_length() {
     for status in [204u16, 205, 304] {
         let mut headers = HashMap::new();

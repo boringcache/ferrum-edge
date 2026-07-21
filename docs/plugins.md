@@ -2520,7 +2520,7 @@ Returns a predefined response without proxying to the backend. Useful for mainte
 
 The response body and `Content-Type` are rendered **once** at construction time — the request hot path skips `format!()`, JSON/XML escaping, and `String::replace()` chains entirely. Repeated dispatch returns identical, immutable bytes.
 
-Configuration must be a top-level object. Accepted keys are `status_code`, `content_type`, `body`, `message`, and `trigger`; unknown top-level or nested `trigger` keys are rejected instead of being ignored (a typo such as `triger` must not silently become unconditional termination). Scalar/array/`null` configs are rejected. `{}` remains the intentional maintenance-mode default.
+Configuration must be a top-level object. Accepted keys are `status_code`, `content_type`, `body`, `message`, and `trigger`; unknown top-level or nested `trigger` keys are rejected instead of being ignored (a typo such as `triger` must not silently become unconditional termination). Scalar/array/`null` configs are rejected, and explicit `null` is rejected for every property; omit an optional property to select its documented default. When present, `trigger` must select exactly one mode: `path_prefix`, or `header` with an optional `header_value`; an empty trigger or a detached `header_value` is rejected. `{}` remains the intentional maintenance-mode default.
 
 **Priority:** 125
 **Supported protocols:** HTTP, gRPC, WebSocket

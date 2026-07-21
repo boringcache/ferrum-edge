@@ -6105,6 +6105,13 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         schema["properties"]["trigger"]["additionalProperties"],
         false
     );
+    assert_eq!(
+        schema["properties"]["trigger"]["oneOf"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "trigger schema must encode the path-prefix and header alternatives"
+    );
     let trigger_fields: BTreeSet<_> = schema["properties"]["trigger"]["properties"]
         .as_object()
         .expect("trigger properties")
@@ -6164,6 +6171,18 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({"status_code": 100}),
         json!({"status_code": 101}),
         json!({"status_code": 700}),
+        json!({"status_code": null}),
+        json!({"content_type": null}),
+        json!({"body": null}),
+        json!({"message": null}),
+        json!({"trigger": null}),
+        json!({"trigger": {"path_prefix": null}}),
+        json!({"trigger": {"header": null}}),
+        json!({"trigger": {"header": "x-policy", "header_value": null}}),
+        json!({"trigger": {}}),
+        json!({"trigger": {"path_prefix": "/a", "header": "x-policy"}}),
+        json!({"trigger": {"path_prefix": "/a", "header_value": "1"}}),
+        json!({"trigger": {"header_value": "1"}}),
         json!({"trigger": {"path_prefix": "/a", "extra": true}}),
         json!({"unknown": true}),
     ] {
@@ -6174,11 +6193,10 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         );
     }
 
-    // Runtime contracts that JSON Schema cannot express alone.
+    // Runtime contracts deliberately left to construction-time validation.
     for runtime_only in [
         json!({"status_code": 204, "body": "x"}),
         json!({"content_type": "application/xml", "message": "\u{0001}"}),
-        json!({"trigger": {"path_prefix": "/a", "header": "x"}}),
     ] {
         assert!(
             RequestTermination::new(&runtime_only).is_err(),
@@ -6189,6 +6207,8 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     let guide = include_str!("../../docs/plugins.md");
     assert!(guide.contains("Configuration must be a top-level object."));
     assert!(guide.contains("unknown top-level or nested `trigger` keys are rejected"));
+    assert!(guide.contains("explicit `null` is rejected for every property"));
+    assert!(guide.contains("an empty trigger or a detached `header_value` is rejected"));
     assert!(guide.contains("`body: \"\"`"));
     assert!(guide.contains("XML 1.0"));
     assert!(guide.contains("individual field line"));
