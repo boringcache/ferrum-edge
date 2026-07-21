@@ -1402,7 +1402,7 @@ async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
     let mut plugin = test_plugin_config("load-testing-policy", true);
     plugin.plugin_name = "load_testing".to_string();
     plugin.config = serde_json::json!({
-        "key": "stable-key",
+        "key": "stable-load-key-0123456789abcdef!",
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "ramp": true
@@ -1428,7 +1428,7 @@ async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
 
     let mut invalid = valid;
     invalid.plugin_configs[0].config = serde_json::json!({
-        "key": "must-not-publish",
+        "key": "must-not-publish-load-key-0123456789!",
         "concurrent_clients": 50,
         "duration_seconds": 30,
         "rmap": true,
@@ -1446,7 +1446,7 @@ async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
     }));
     assert_eq!(
         state.config.load().plugin_configs[0].config["key"],
-        "stable-key"
+        "stable-load-key-0123456789abcdef!"
     );
     assert_eq!(state.config.load().plugin_configs[0].config["ramp"], true);
     assert!(

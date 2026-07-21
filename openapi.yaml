@@ -14925,6 +14925,8 @@ components:
             - x-csrf-token
             - x-xsrf-token
             - x-forwarded-authorization
+            - x-loadtesting-key
+            - x-loadtesting-fanout
           description: >-
             Additional request headers to redact from `input.headers`. Built-in
             sensitive headers and active authentication credential headers are
@@ -16785,7 +16787,9 @@ components:
         constructor validation; serving-mode publication uses KeepLastKnownGood
         so an invalid candidate keeps the prior valid generation active.
         Omitted optional fields select defaults; runtime also treats explicit
-        null on optional fields as omitted.
+        null on optional fields as omitted. Matching replay bodies have a hard
+        10 MiB plugin-local ceiling and active local/fan-out replay work shares
+        a 64 MiB process-wide retained-body budget.
       required:
         - key
         - concurrent_clients
@@ -16793,8 +16797,15 @@ components:
       properties:
         key:
           type: string
-          minLength: 1
-          description: Secret value that the X-Loadtesting-Key header must match to trigger the load test
+          minLength: 32
+          pattern: '^[!-~][ -~]*[!-~]$'
+          description: >-
+            Secret value that the X-Loadtesting-Key header must match to trigger
+            the load test. Must be a randomly generated secret of at least 32
+            printable ASCII HTTP field-value characters with no leading or
+            trailing space. The gateway never echoes the value in validation
+            errors and strips this reserved header on matching and non-matching
+            paths before later deferred plugins or backend dispatch.
         concurrent_clients:
           type: integer
           format: uint64
@@ -16816,7 +16827,11 @@ components:
           format: uint64
           default: 30000
           minimum: 1
-          description: "Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll)"
+          maximum: 60000
+          description: >-
+            Per-request timeout in milliseconds (1–60000). Each attempt is also
+            capped to the remaining absolute run deadline so workers cannot
+            outlive duration_seconds.
         max_response_body_bytes:
           type: [integer, "null"]
           format: uint64
@@ -16830,7 +16845,13 @@ components:
         gateway_port:
           type: [integer, "null"]
           format: uint16
-          description: "Local gateway port for synthetic requests. Defaults to FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT when gateway_tls is enabled) or 8000/8443"
+          minimum: 1
+          maximum: 65535
+          description: >-
+            Local gateway port for synthetic requests (1–65535). Defaults to
+            FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT when gateway_tls
+            is enabled) or 8000/8443. A resolved port of 0 (disabled listener)
+            is rejected.
         gateway_tls:
           type: [boolean, "null"]
           default: false
@@ -16840,9 +16861,20 @@ components:
           description: "Skip TLS cert verification for loopback connections. Defaults to true when gateway_tls is enabled (gateway cert typically won't match 127.0.0.1)"
         gateway_addresses:
           type: [array, "null"]
+          minItems: 1
+          maxItems: 32
+          uniqueItems: true
           items:
             type: string
-          description: "Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test"
+            minLength: 1
+          description: >-
+            Remote gateway URLs for one-hop fan-out from the originating
+            controller (at most 32). Peers receive X-Loadtesting-Fanout and
+            never re-fanout. Entries must be unique http(s) URLs without
+            userinfo, query, or fragment. Local-loopback aliases of the
+            selected local target (127/8, IPv4-mapped loopback, ::1,
+            localhost, and names beneath .localhost with matching scheme and
+            effective port) are rejected.
 
     RequestMirrorConfig:
       type: object

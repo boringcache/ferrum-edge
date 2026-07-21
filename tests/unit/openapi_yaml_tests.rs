@@ -3129,9 +3129,10 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         (
             "load_testing",
             json!({
-                "key": "test-key",
+                "key": "test-load-key-0123456789abcdef!!",
                 "concurrent_clients": 1,
                 "duration_seconds": 1,
+                "gateway_port": 8000,
                 "max_response_body_bytes": 1024
             }),
         ),
@@ -4065,7 +4066,12 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
 #[tokio::test]
 async fn load_testing_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::PluginHttpClient;
-    use ferrum_edge::plugins::load_testing::{LOAD_TESTING_CONFIG_KEYS, LoadTesting};
+    use ferrum_edge::plugins::load_testing::{
+        LOAD_TESTING_CONFIG_KEYS, LoadTesting, MAX_GATEWAY_ADDRESSES, MIN_TRIGGER_KEY_LEN,
+    };
+
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
+    env.unset("FERRUM_PROXY_HTTP_PORT");
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -4103,9 +4109,36 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     }
     assert!(load_testing_docs.contains("KeepLastKnownGood"));
     assert!(load_testing_docs.contains("Unknown top-level keys"));
+    assert_eq!(
+        schema["properties"]["gateway_addresses"]["maxItems"],
+        json!(MAX_GATEWAY_ADDRESSES),
+        "OpenAPI maxItems must match runtime MAX_GATEWAY_ADDRESSES"
+    );
+    assert_eq!(
+        schema["properties"]["gateway_addresses"]["minItems"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["gateway_addresses"]["uniqueItems"],
+        json!(true)
+    );
+    assert_eq!(
+        schema["properties"]["gateway_addresses"]["items"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["key"]["minLength"],
+        json!(MIN_TRIGGER_KEY_LEN),
+        "OpenAPI minLength must match runtime MIN_TRIGGER_KEY_LEN"
+    );
+    assert_eq!(
+        schema["properties"]["key"]["pattern"],
+        json!("^[!-~][ -~]*[!-~]$"),
+        "OpenAPI pattern must match runtime printable-ASCII header-value admission"
+    );
 
     let valid = json!({
-        "key": "parity-key",
+        "key": "test-load-key-0123456789abcdef!!",
         "concurrent_clients": 10,
         "duration_seconds": 30,
         "ramp": true,
@@ -4114,13 +4147,22 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
         "gateway_port": 8443,
         "gateway_tls": true,
         "gateway_tls_no_verify": true,
-        "gateway_addresses": ["https://127.0.0.1:8443"]
+        "gateway_addresses": ["https://10.0.0.2:8443"]
     });
     assert_component_validity(&spec, "LoadTestingConfig", &valid, true);
     assert!(LoadTesting::new(&valid, PluginHttpClient::default()).is_ok());
 
+    let valid_internal_space = json!({
+        "key": "test load key 0123456789abcdef!!",
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 8000
+    });
+    assert_component_validity(&spec, "LoadTestingConfig", &valid_internal_space, true);
+    assert!(LoadTesting::new(&valid_internal_space, PluginHttpClient::default()).is_ok());
+
     let valid_minima = json!({
-        "key": "min-key",
+        "key": "test-load-key-0123456789abcdef!!",
         "concurrent_clients": 1,
         "duration_seconds": 1
     });
@@ -4128,7 +4170,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert!(LoadTesting::new(&valid_minima, PluginHttpClient::default()).is_ok());
 
     let valid_null_defaults = json!({
-        "key": "null-defaults",
+        "key": "null-defaults-key-0123456789abcdef!",
         "concurrent_clients": 1,
         "duration_seconds": 1,
         "ramp": null,
@@ -4144,20 +4186,20 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
 
     let runtime_and_schema_invalid = [
         json!({
-            "key": "k",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "request_timeot_ms": 5000
         }),
         json!({
-            "key": "k",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "rmap": true,
-            "gateway_adresses": ["https://127.0.0.1:8443"]
+            "gateway_adresses": ["https://10.0.0.2:8443"]
         }),
         json!({
-            "key": "k",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "aaa_extra": 1,
@@ -4165,14 +4207,75 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
         }),
         json!({}),
         json!({
-            "key": "k",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 0,
             "duration_seconds": 1
         }),
         json!({
-            "key": "k",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 0
+        }),
+        json!({
+            "key": "short-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "request_timeout_ms": 60001
+        }),
+        json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 0
+        }),
+        json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": (0..33)
+                .map(|i| format!("https://10.0.0.{}:8443", i + 2))
+                .collect::<Vec<_>>()
+        }),
+        json!({
+            "key": "😀".repeat(32),
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": " test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": "test-load-key-0123456789abcdef!! ",
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": []
+        }),
+        json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": [""]
+        }),
+        json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": [
+                "https://10.0.0.2:8443",
+                "https://10.0.0.2:8443"
+            ]
         }),
     ];
     for config in runtime_and_schema_invalid {
@@ -4576,6 +4679,18 @@ fn opa_schema_matches_runtime_validation_contract() {
             .is_none(),
         "runtime accepts positive timeout_ms values above 30000 and clamps the effective timeout"
     );
+    let default_redact_headers = component
+        .pointer("/properties/redact_headers/default")
+        .and_then(serde_json::Value::as_array)
+        .expect("OPA redact_headers default is an array");
+    for reserved in ["x-loadtesting-key", "x-loadtesting-fanout"] {
+        assert!(
+            default_redact_headers
+                .iter()
+                .any(|header| header.as_str() == Some(reserved)),
+            "OPA OpenAPI defaults must redact reserved load-testing header {reserved}"
+        );
+    }
 
     let base = json!({
         "opa_host": "http://opa.internal:8181",

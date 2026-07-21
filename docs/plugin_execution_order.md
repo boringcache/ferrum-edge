@@ -177,18 +177,23 @@ mocked, deadline-rejected, or load-fanned-out before it is enforced. Proxies
 without a backend-path policy retain the ordinary single `before_proxy` pass.
 Deferred hooks generally observe the original client path, preserving their
 normal request semantics even when mesh routing rewrote the backend path.
-`request_mirror` is the security-sensitive exception: when backend-path policy
-is active and `mirror_path` is unset, it mirrors the exact effective path that
-passed final authorization. An explicit operator-configured `mirror_path`
-still wins. A deferred hook that can inject routing headers runs after the
-selected target's single state-consuming enforcement, and that target is pinned
-across the external call. After each
-deferred pass, the gateway removes every case variant of the reserved
-`x-consumer-username` and `x-consumer-custom-id` headers, restores only
-authenticated gateway values, and reapplies configured egress baggage-key
-filtering. Plugin-returned headers therefore cannot spoof backend identity,
-restore forbidden baggage, or steer this request to a different unauthorized
-target.
+Within that deferred transform band, `load_testing` (3070) runs before
+`request_mirror` (3075) so the reserved `X-Loadtesting-Key` is stripped on both
+matching and non-matching paths before mirror can copy it. As defense in depth,
+`request_mirror` also excludes both load-testing control headers if priority
+overrides reverse the order. Both plugins still require backend-path resolution
+and pre-`before_proxy` body availability when they opt in. `request_mirror` is
+also the security-sensitive path exception: when backend-path policy is active
+and `mirror_path` is unset, it mirrors the exact effective path that passed
+final authorization. An explicit operator-configured `mirror_path` still wins.
+A deferred hook that can inject routing headers runs after the selected
+target's single state-consuming enforcement, and that target is pinned across
+the external call. After each deferred pass, the gateway removes every case
+variant of the reserved `x-consumer-username` and `x-consumer-custom-id`
+headers, restores only authenticated gateway values, and reapplies configured
+egress baggage-key filtering. Plugin-returned headers therefore cannot spoof
+backend identity, restore forbidden baggage, or steer this request to a
+different unauthorized target.
 
 Terminal final-request-body plugins run after the selected path is pinned and
 authorized, and after both deferred `before_proxy` subphases, but before
@@ -459,7 +464,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Early** | 0–949 | Matched-request tracing, IDs, preflight, and short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
 | **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_transcript_audit` (2924), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_tool_governor` (2978), `ai_semantic_cache` (2980), `ai_stream_router` (2984), `mcp_gateway` (2992), `a2a_gateway` (2993), `mesh_route_dispatch` (2995) |
-| **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
+| **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `load_testing` (3070), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, security headers, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_prompt_compressor` (4055), `ai_federation` (4060), `ai_response_guard` (4075), `security_headers` (4080), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `api_chargeback_sink` (9351), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365) |
@@ -545,8 +550,8 @@ Given all built-in plugins enabled, the execution order is:
 | 51 | `serverless_function` | 3025 | before_proxy |
 | 52 | `response_mock` | 3030 | before_proxy |
 | 53 | `grpc_deadline` | 3050 | receipt-time deadline preflight, before_proxy |
-| 54 | `request_mirror` | 3075 | before_proxy |
-| 55 | `load_testing` | 3080 | before_proxy |
+| 54 | `load_testing` | 3070 | before_proxy |
+| 55 | `request_mirror` | 3075 | before_proxy |
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 57 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
 | 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |

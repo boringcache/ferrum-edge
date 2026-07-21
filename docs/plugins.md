@@ -2129,7 +2129,7 @@ Allow decisions:
 - An object with `allow: true` at `decision_pointer` also continues the request.
 - Any other value denies with the configured policy-denial response.
 
-Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA. Active custom authentication credential headers, including configured `key_auth` header locations, are also omitted automatically. Query parameters with common credential names (including `api_key`, `access_token`, `id_token`, `jwt`, and `token`) and present custom query locations configured by authentication plugins are omitted from `input.query`, even when multi-auth succeeds through a different mechanism. Set `include_query_credentials: true` only when the policy service is explicitly trusted to receive credential material; operator-specified `redact_query_keys` still apply.
+Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `x-forwarded-authorization`, `x-loadtesting-key`, and `x-loadtesting-fanout` before sending `input.headers` to OPA. Active custom authentication credential headers, including configured `key_auth` header locations, are also omitted automatically. Query parameters with common credential names (including `api_key`, `access_token`, `id_token`, `jwt`, and `token`) and present custom query locations configured by authentication plugins are omitted from `input.query`, even when multi-auth succeeds through a different mechanism. Set `include_query_credentials: true` only when the policy service is explicitly trusted to receive credential material; operator-specified `redact_query_keys` still apply.
 
 `include_body` collection occurs only after authentication succeeds, so a `401` does not retain an OPA body copy. OPA's positive `max_body_bytes` limit is always enforced, including when `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`. Successful OPA responses are streamed through the positive `max_response_bytes` ceiling before JSON parsing; body contents are never written to OPA error logs.
 
@@ -3640,31 +3640,35 @@ config:
 
 ### `load_testing`
 
-Enables on-demand load testing of a proxy's backend by sending concurrent requests through the gateway's own proxy listener. Triggered when a request includes an `X-Loadtesting-Key` header matching the configured secret key. The triggering request proceeds normally; the load test runs in the background.
+Enables on-demand load testing of a proxy's backend by sending concurrent requests through the gateway's own proxy listener. Triggered when a request includes an `X-Loadtesting-Key` header matching the configured secret key. The triggering request proceeds normally after the key is stripped; the load test runs in the background.
 
-**Priority:** 3080
+**Priority:** 3070 (before `request_mirror` at 3075 so reserved load-testing control headers are removed before mirror can copy them)
 **Protocols:** HTTP
 
-Synthetic requests are sent to `127.0.0.1:{gateway_port}` without the `X-Loadtesting-Key` header, so they flow through the full proxy pipeline (routing, auth, rate limiting, backend dispatch, logging) without re-triggering the load test. The gateway's native transaction logging captures every synthetic request automatically. An `AtomicBool` guard prevents concurrent load tests on the same proxy.
+Synthetic requests are sent to `127.0.0.1:{gateway_port}` without the `X-Loadtesting-Key` header, so they flow through the full proxy pipeline (routing, auth, rate limiting, backend dispatch, logging) without re-triggering the load test. The gateway's native transaction logging captures every synthetic request automatically. Shared run-admission state (keyed by plugin-config identity) prevents concurrent cohorts across reload generations for the same instance, and a process-wide active-client budget caps aggregate detached work. Removing the last live plugin instance for that identity cancels any active cohort; a compatible replacement generation that shares the state does not.
 
-For multi-node deployments, `gateway_addresses` fans out the trigger (WITH the key) to remote gateway nodes, so each starts its own independent local load test.
+For multi-node deployments, `gateway_addresses` fans out once from the originating controller (WITH the key plus `X-Loadtesting-Fanout: 1`). Peer receivers start a local cohort only, never re-fanout, and terminate the control request with `204` before backend dispatch. At most 32 unique peer addresses are accepted; local-loopback aliases of the selected local target (`127/8`, IPv4-mapped loopback, `::1`, `localhost`, and names beneath `.localhost` with matching scheme/effective port) are rejected.
 
-For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
+For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. A resolved gateway port of `0` (Ferrum's disabled-listener sentinel from `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`) is rejected at admission. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
+
+**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the exact buffered bytes for every accepted method that supplied a body (including DELETE/OPTIONS/extension methods — never silently rewritten to GET). Replay bodies have a hard 10 MiB plugin-local ceiling even when the global request-body limit is unlimited, and active local/fan-out replay work shares a 64 MiB process-wide retained-body budget; the strictest applicable limit wins. The original raw query string is preserved on every synthetic and fan-out request. Decoded query-map transforms are deliberately not serialized into the replay: the synthetic request re-enters the ordinary plugin pipeline, so configured query transforms apply exactly once without losing duplicate pairs or encoding. Requests with no key or a wrong key stay on the ordinary no-buffer hot path. Synthetic/fan-out headers snapshot RFC 9110 `Connection`-listed tokens before filtering, strip those names plus Ferrum's canonical backend/proxy-generated forwarding sets, and keep `Host` for host-based routing; client framing (`Content-Length` / `Transfer-Encoding`) is never copied — reqwest derives exact `Content-Length` from the attached body.
+
+**Completion metrics:** The finish log reports unambiguous counters — `attempted_requests`, `responses_received`, `responses_completed`, `responses_truncated`, `response_body_errors`, `request_timeouts`, non-timeout `transport_errors`, HTTP status classes, `worker_failures`, `cancelled_workers`, and separate `completed_requests_per_second` / `attempted_requests_per_second`. Cooperative cancellation counts affected workers instead of disappearing into a successful result. Outcome is `Success`, `Degraded`, `Failed`, or `Cancelled`. Attempt-only loops are never labeled as completed throughput. Consecutive request-build, transport, timeout, and response-stream errors use a cancellation-aware exponential backoff from 10 ms to 250 ms; a completed or cap-truncated response resets the backoff so valid load is not throttled.
 
 **Strict config admission:** Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions when the typo is close enough (for example `request_timeot_ms` → `request_timeout_ms`). File mode, admin/database writes, and CP/DP distribution share the same constructor validation via `validate_plugin_config`. The plugin is registered as `KeepLastKnownGood`: an invalid reload or DP candidate is rejected and the previously published generation stays active. Optional recognized fields may still be omitted or set to `null` to select defaults; wrong types and out-of-range values continue to fail closed.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `key` | String | **(required)** | Value that `X-Loadtesting-Key` must match to trigger |
+| `key` | String | **(required)** | Randomly generated secret that `X-Loadtesting-Key` must match (≥32 printable ASCII HTTP field-value characters, with no leading/trailing space). The value is never echoed in validation errors. Every case variant of both reserved load-testing control headers is stripped on matching and non-matching paths before later deferred plugins or backend dispatch; the key is declared for generic log redaction, both controls are redacted from OPA decision payloads by default, and both are excluded defensively by `request_mirror` even under priority overrides |
 | `concurrent_clients` | Integer | **(required)** | Number of concurrent virtual clients (1–10,000) |
-| `duration_seconds` | Integer | **(required)** | How long the test runs in seconds (1–3,600) |
+| `duration_seconds` | Integer | **(required)** | Absolute run deadline in seconds (1–3,600). In-flight attempts are capped to the remaining deadline |
 | `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once (see ramp example below) |
-| `request_timeout_ms` | Integer | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll) |
+| `request_timeout_ms` | Integer | `30000` | Per-request timeout in milliseconds (1–60,000), further capped to the remaining run deadline |
 | `max_response_body_bytes` | Integer | `1048576` (1 MiB) | Maximum response bytes the synthetic client consumes per request; must be greater than zero. The client stops reading at the cap, bounding its own work and memory without changing the backend response |
-| `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests. Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled) |
+| `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests (1–65535). Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled). Resolved `0` is rejected |
 | `gateway_tls` | Boolean | `false` | Use HTTPS for local loopback synthetic requests |
 | `gateway_tls_no_verify` | Boolean | `true` when `gateway_tls` on | Skip TLS cert verification for loopback only |
-| `gateway_addresses` | Array | _(none)_ | Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header |
+| `gateway_addresses` | Array | _(none)_ | Non-empty array of unique, non-empty remote gateway URLs for one-hop fan-out (max 32). No userinfo/query/fragment; local-loopback aliases of the local target (`127/8`, IPv4-mapped loopback, `::1`, `localhost`, `.localhost`) are rejected; validation/diagnostics never echo raw URL secrets |
 
 **Ramp behavior:** When `ramp: true`, all client tasks are spawned immediately but each sleeps a stagger delay before sending requests. The delay for client _i_ is `duration * i / concurrent_clients`. All clients share the same deadline, so later clients get less sending time.
 
@@ -3693,10 +3697,11 @@ With `ramp: false` (default), all clients start sending at t=0 simultaneously.
 ```yaml
 plugin_name: load_testing
 config:
-  key: my-secret-load-test-key
+  key: replace-with-random-32-byte-secret
   concurrent_clients: 50
   duration_seconds: 30
   ramp: true
+  request_timeout_ms: 30000
   max_response_body_bytes: 1048576
   gateway_tls: true
   gateway_port: 8443

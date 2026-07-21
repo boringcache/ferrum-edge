@@ -731,6 +731,8 @@ fn default_redact_headers() -> HashSet<String> {
         "x-csrf-token",
         "x-xsrf-token",
         "x-forwarded-authorization",
+        "x-loadtesting-key",
+        "x-loadtesting-fanout",
     ]
     .into_iter()
     .map(str::to_string)

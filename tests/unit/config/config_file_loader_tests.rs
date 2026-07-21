@@ -874,7 +874,7 @@ fn test_file_config_rejects_unknown_load_testing_keys() {
             "id": "load-testing-typo",
             "plugin_name": "load_testing",
             "config": {
-                "key": "test-key",
+                "key": "test-load-key-0123456789abcdef!!",
                 "concurrent_clients": 5,
                 "duration_seconds": 10,
                 "request_timeot_ms": 5000
