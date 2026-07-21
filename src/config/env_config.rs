@@ -795,6 +795,26 @@ fn resolve_tls_source_override(
     }
 }
 
+/// Resolve the same source-over-path contract through the process-wide
+/// conf-aware resolver for consumers that do not hold the `ConfFile` used by
+/// `EnvConfig::from_env_with_conf`.
+fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Option<String> {
+    let path_value = crate::config::conf_file::resolve_ferrum_var(path_key);
+    match crate::config::conf_file::resolve_ferrum_var(source_key) {
+        Some(source_value) => {
+            if path_value.as_ref().is_some_and(|value| !value.is_empty()) {
+                tracing::warn!(
+                    source_key,
+                    path_key,
+                    "{source_key} is set; it overrides {path_key}"
+                );
+            }
+            Some(source_value)
+        }
+        None => path_value,
+    }
+}
+
 fn resolve_tls_key_exchange_groups(
     configured: Option<String>,
     legacy_curves: Option<String>,
@@ -4156,23 +4176,25 @@ impl EnvConfig {
     pub fn resolve_effective_sql_backend() -> Result<EffectiveSqlBackend, String> {
         use env_config_macro::EnvValue;
 
-        let db_tls_mode =
-            match crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TLS_MODE") {
-                Some(raw) => Some(DbTlsMode::parse_env(&raw, "FERRUM_DB_TLS_MODE")?),
-                None => None,
-            };
+        let db_tls_mode = match crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TLS_MODE") {
+            Some(raw) => Some(DbTlsMode::parse_env(&raw, "FERRUM_DB_TLS_MODE")?),
+            None => None,
+        };
 
         let cfg = Self {
             db_type: crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TYPE"),
             db_url: crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_URL"),
             db_tls_mode,
-            db_tls_ca_cert_path: crate::config::conf_file::resolve_ferrum_var(
+            db_tls_ca_cert_path: resolve_cached_tls_source_override(
+                "FERRUM_DB_TLS_CA_CERT_SOURCE",
                 "FERRUM_DB_TLS_CA_CERT_PATH",
             ),
-            db_tls_client_cert_path: crate::config::conf_file::resolve_ferrum_var(
+            db_tls_client_cert_path: resolve_cached_tls_source_override(
+                "FERRUM_DB_TLS_CLIENT_CERT_SOURCE",
                 "FERRUM_DB_TLS_CLIENT_CERT_PATH",
             ),
-            db_tls_client_key_path: crate::config::conf_file::resolve_ferrum_var(
+            db_tls_client_key_path: resolve_cached_tls_source_override(
+                "FERRUM_DB_TLS_CLIENT_KEY_SOURCE",
                 "FERRUM_DB_TLS_CLIENT_KEY_PATH",
             ),
             ..Self::default()
@@ -4208,8 +4230,9 @@ impl EnvConfig {
             "postgres" | "mysql" | "sqlite" => {}
             other => {
                 return Err(format!(
-                    "unsupported FERRUM_DB_TYPE '{other}' for SQL gateway database consumers \
-                     (expected sqlite, postgres, or mysql)"
+                    "unsupported FERRUM_DB_TYPE {} for SQL gateway database consumers \
+                     (expected sqlite, postgres, or mysql)",
+                    crate::secrets::quoted_env_value("FERRUM_DB_TYPE", other)
                 ));
             }
         }

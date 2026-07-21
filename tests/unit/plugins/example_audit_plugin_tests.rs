@@ -289,7 +289,7 @@ fn test_effective_sql_backend_rejects_mongodb_and_missing_identity() {
 }
 
 #[test]
-fn test_effective_sql_backend_resolve_from_env_matches_gateway_tls_path() {
+fn test_effective_sql_backend_resolve_from_env_matches_gateway_tls_source_precedence() {
     use ferrum_edge::config::EnvConfig;
 
     let _env_lock = crate::unit::env_lock::ENV_LOCK
@@ -300,17 +300,23 @@ fn test_effective_sql_backend_resolve_from_env_matches_gateway_tls_path() {
         "FERRUM_DB_URL",
         "postgres://user:env-secret@db.example.com/ferrum",
     );
-    let _tls_mode = ScopedEnv::set("FERRUM_DB_TLS_MODE", "prefer");
-    let _tls_ca = ScopedEnv::remove("FERRUM_DB_TLS_CA_CERT_PATH");
+    let _tls_mode = ScopedEnv::set("FERRUM_DB_TLS_MODE", "verify-ca");
+    let _tls_ca_path = ScopedEnv::set("FERRUM_DB_TLS_CA_CERT_PATH", "/certs/path-ca.pem");
+    let _tls_ca_source = ScopedEnv::set(
+        "FERRUM_DB_TLS_CA_CERT_SOURCE",
+        "/certs/source-ca.pem",
+    );
     let _tls_cert = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_CERT_PATH");
+    let _tls_cert_source = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_CERT_SOURCE");
     let _tls_key = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_KEY_PATH");
+    let _tls_key_source = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_KEY_SOURCE");
 
     let backend = EnvConfig::resolve_effective_sql_backend()
         .expect("conf-aware SQL backend resolution must succeed");
     assert_eq!(backend.db_type, "postgres");
     assert_eq!(
         backend.effective_url,
-        "postgres://user:env-secret@db.example.com/ferrum?sslmode=prefer"
+        "postgres://user:env-secret@db.example.com/ferrum?sslmode=verify-ca&sslrootcert=/certs/source-ca.pem"
     );
 }
 
