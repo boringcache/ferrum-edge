@@ -4,9 +4,9 @@ use ferrum_edge::{
     _test_support::clone_log_metadata,
     config::{BackendAllowIps, BackendEgressPolicy},
     plugins::{
-        Plugin, PluginFailurePolicy, PluginHttpClient, RequestContext, ResponseStreamAction,
-        ResponseStreamInspector, ai_tool_governor::AiToolGovernor, available_plugins,
-        correlation_id::CorrelationId, create_plugin_with_http_client,
+        Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
+        ResponseStreamAction, ResponseStreamInspector, ai_tool_governor::AiToolGovernor,
+        available_plugins, correlation_id::CorrelationId, create_plugin_with_http_client,
         create_response_stream_inspector, plugin_failure_policy, priority, validate_plugin_config,
     },
     proxy::deferred_log::BodyOutcome,
@@ -923,7 +923,9 @@ async fn redacts_matched_args_and_never_leaks_secret_in_metadata() {
             .contains_key("ai_tool_governor.arguments_hashes")
     );
 
-    // The transform rewrites the secret out of the delivered body.
+    // The transform rewrites the secret out of the delivered body. Preflight
+    // already computed the rewrite once; the transform must reuse that result
+    // (or an equivalent fresh compute on memo miss) without changing output.
     let transformed = plugin
         .transform_response_body_with_context(
             &mut ctx,
@@ -938,6 +940,72 @@ async fn redacts_matched_args_and_never_leaks_secret_in_metadata() {
     assert!(
         text.contains("[REDACTED_TOOL_ARG:secret]"),
         "placeholder missing: {text}"
+    );
+}
+
+/// Tool names and raw argument strings are arbitrary JSON strings, so the
+/// request-scoped redaction memo key must not rely on a delimiter that either
+/// input can contain. These two distinct pairs collided under `name + NUL +
+/// args`; each call must receive only its own preflighted rewrite.
+#[tokio::test]
+async fn redaction_memos_distinguish_embedded_nul_boundaries() {
+    let plugin = make(json!({
+        "tools": {
+            "a": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "first", "regex": "b" }]
+            },
+            "a\u{0}": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "second", "regex": "b" }]
+            }
+        }
+    }));
+    let body = serde_json::to_vec(&json!({
+        "choices": [{
+            "message": {
+                "tool_calls": [
+                    {
+                        "id": "call_first",
+                        "type": "function",
+                        "function": { "name": "a", "arguments": "\u{0}b" }
+                    },
+                    {
+                        "id": "call_second",
+                        "type": "function",
+                        "function": { "name": "a\u{0}", "arguments": "b" }
+                    }
+                ]
+            }
+        }]
+    }))
+    .expect("serialize NUL-boundary redaction response");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let transformed = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("both tool calls require redaction");
+    let json: Value = serde_json::from_slice(&transformed).expect("transformed response JSON");
+    let calls = json["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("tool call array");
+    assert_eq!(
+        calls[0]["function"]["arguments"],
+        json!("\u{0}[REDACTED_TOOL_ARG:first]")
+    );
+    assert_eq!(
+        calls[1]["function"]["arguments"],
+        json!("[REDACTED_TOOL_ARG:second]")
     );
 }
 
@@ -8082,4 +8150,1266 @@ async fn absent_content_type_non_json_posts_are_out_of_scope() {
             .on_final_request_body_with_context(&mut final_ctx, &headers, b"\x00\x01binary upload")
             .await,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Audit residuals: #2258, #2260, GHSA-5j2p / GHSA-pcv8 / GHSA-6h6w
+// ---------------------------------------------------------------------------
+
+/// `redact_args` rewrite must invalidate origin representation validators so
+/// clients never validate against pre-redaction bytes (#2258).
+#[tokio::test]
+async fn redact_args_transform_invalidates_stale_response_validators() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+    let validators = [
+        "etag",
+        "ETag",
+        "last-modified",
+        "content-digest",
+        "repr-digest",
+        "RePr-DiGeSt",
+        "digest",
+        "content-md5",
+        "x-amz-checksum-sha256",
+    ];
+    let mut original_headers = HashMap::from([
+        ("cache-control".to_string(), "private".to_string()),
+        ("content-length".to_string(), "999".to_string()),
+    ]);
+    for validator in validators {
+        original_headers.insert(validator.to_string(), "upstream-value".to_string());
+    }
+
+    let clean = response_with_tool_call("filesystem.write", r#"{"path":"/ok"}"#);
+    let clean_headers = original_headers.clone();
+    let mut clean_ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut clean_ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut clean_ctx,
+                &clean,
+                Some("application/json"),
+                &clean_headers,
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(clean_headers, original_headers);
+
+    let secret_body = response_with_tool_call(
+        "filesystem.write",
+        r#"{"token":"sk-secret123","path":"/tmp/a"}"#,
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &secret_body)
+            .await,
+    );
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &secret_body,
+            Some("application/json"),
+            &original_headers,
+        )
+        .await
+        .expect("redact_args must rewrite the body");
+    assert!(
+        !String::from_utf8_lossy(&rewritten).contains("sk-secret123"),
+        "secret must be redacted from the rewritten body"
+    );
+
+    let mut rewritten_headers = original_headers.clone();
+    plugin.on_response_body_transformed(&mut ctx, &mut rewritten_headers);
+    for validator in validators {
+        assert!(
+            rewritten_headers
+                .keys()
+                .all(|key| !key.eq_ignore_ascii_case(validator)),
+            "mixed-case {validator} survived a redact_args rewrite"
+        );
+    }
+    assert_eq!(
+        rewritten_headers.get("cache-control").map(String::as_str),
+        Some("private")
+    );
+}
+
+/// MCP omitted `params.arguments` normalizes to `{}` for schema evaluation
+/// (#2260). Provider response omissions keep distinct semantics.
+#[tokio::test]
+async fn mcp_omitted_arguments_normalize_to_empty_object_for_schema() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": {
+            "github.ping_tool": {
+                "action": "allow",
+                "json_schema": {
+                    "type": "object",
+                    "additionalProperties": false
+                }
+            }
+        },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 29,
+            "method": "tools/call",
+            "params": { "name": "github.ping_tool" }
+        })
+        .to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Explicit {} is equivalent.
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": { "name": "github.ping_tool", "arguments": {} }
+        })
+        .to_string(),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Required properties still fail after normalization to {}.
+    let required = make(json!({
+        "default_action": "deny",
+        "tools": {
+            "github.ping_tool": {
+                "action": "allow",
+                "json_schema": {
+                    "type": "object",
+                    "required": ["repo"],
+                    "additionalProperties": false,
+                    "properties": { "repo": { "type": "string" } }
+                }
+            }
+        },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": { "name": "github.ping_tool" }
+        })
+        .to_string(),
+    );
+    assert_reject(
+        required.before_proxy(&mut ctx, &mut headers).await,
+        Some(403),
+    );
+
+    // Provider response shapes must NOT coerce a missing function.arguments
+    // into {} — an allowlisted tool with a required object schema still fails
+    // when the response omits arguments entirely.
+    let response_plugin = make(json!({
+        "default_action": "deny",
+        "tools": {
+            "github.ping_tool": {
+                "action": "allow",
+                "json_schema": {
+                    "type": "object",
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let body = serde_json::to_vec(&json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "github.ping_tool" }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    assert_reject(
+        response_plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(403),
+    );
+}
+
+#[test]
+fn rejects_zero_width_redaction_regex_and_oversized_placeholder() {
+    // Use `.err().expect(...)` (not `Result::expect_err`) so these negative
+    // construction checks do not require `AiToolGovernor: Debug`.
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "any", "regex": ".*" }]
+            }
+        }
+    }))
+    .err()
+    .expect("zero-width regex must be rejected");
+    assert!(
+        err.contains("must not match the empty string"),
+        "unexpected error: {err}"
+    );
+
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "any", "regex": "a*" }]
+            }
+        }
+    }))
+    .err()
+    .expect("a* is zero-width");
+    assert!(err.contains("must not match the empty string"));
+
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "allow",
+                "blocked_arg_patterns": [{ "name": "any", "regex": ".*?" }]
+            }
+        }
+    }))
+    .err()
+    .expect("zero-width deny patterns are also rejected");
+    assert!(err.contains("must not match the empty string"));
+
+    let long = "X".repeat(257);
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "sk-[a-z0-9]+" }]
+            }
+        },
+        "response": { "redaction_placeholder": long }
+    }))
+    .err()
+    .expect("placeholder length must be bounded");
+    assert!(err.contains("redaction_placeholder"));
+
+    // OpenAPI maxLength counts Unicode characters; runtime counts UTF-8 bytes.
+    let multibyte_placeholder = "é".repeat(129); // 258 bytes, 129 chars
+    assert_eq!(multibyte_placeholder.chars().count(), 129);
+    assert!(multibyte_placeholder.len() > 256);
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "sk-[a-z0-9]+" }]
+            }
+        },
+        "response": { "redaction_placeholder": multibyte_placeholder }
+    }))
+    .err()
+    .expect("multibyte placeholder over 256 UTF-8 bytes must be rejected");
+    assert!(err.contains("redaction_placeholder") && err.contains("UTF-8 bytes"));
+
+    assert!(
+        try_make(json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{ "name": "X".repeat(256), "regex": "tok" }]
+                }
+            }
+        }))
+        .is_ok(),
+        "256 ASCII-byte pattern names are admitted"
+    );
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "X".repeat(257), "regex": "tok" }]
+            }
+        }
+    }))
+    .err()
+    .expect("257 ASCII-byte pattern names must be rejected");
+    assert!(err.contains("blocked_arg_patterns") && err.contains("name"));
+
+    let multibyte_name = "é".repeat(129); // 258 bytes, 129 chars
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": multibyte_name, "regex": "tok" }]
+            }
+        }
+    }))
+    .err()
+    .expect("multibyte pattern names over 256 UTF-8 bytes must be rejected");
+    assert!(err.contains("blocked_arg_patterns") && err.contains("UTF-8 bytes"));
+
+    let too_many: Vec<Value> = (0..33)
+        .map(|i| json!({ "name": format!("p{i}"), "regex": format!("token{i}") }))
+        .collect();
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": too_many
+            }
+        }
+    }))
+    .err()
+    .expect("pattern count must be bounded");
+    assert!(err.contains("at most 32"));
+}
+
+#[tokio::test]
+async fn contextual_zero_length_redaction_match_fails_closed() {
+    // A word boundary does not match empty input, but it does yield empty spans
+    // beside words. Runtime construction must reject the span before appending
+    // any placeholder bytes rather than amplifying the response.
+    let plugin = make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "boundary", "regex": "\\b" }]
+            }
+        }
+    }));
+    let body = response_with_tool_call("search", r#"{"query":"secret"}"#);
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+#[test]
+fn rejects_oversized_approval_timeout() {
+    let err = try_make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": {
+            "endpoint_url": "https://approval.example/decide",
+            "timeout_ms": 30001
+        }
+    }))
+    .err()
+    .expect("timeout_ms must be capped");
+    assert!(err.contains("timeout_ms"));
+}
+
+/// More than 64 concrete calls in one batch fail closed before approval fan-out.
+#[tokio::test]
+async fn governable_call_limit_fails_closed_before_approvals() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "default_action": "require_approval",
+        "tools": {},
+        "approval": {
+            "endpoint_url": format!("{}/approve", server.uri()),
+            "cache_ttl_seconds": 0,
+            "timeout_ms": 500
+        }
+    }));
+
+    let tool_calls: Vec<Value> = (0..65)
+        .map(|i| {
+            json!({
+                "id": format!("call_{i}"),
+                "type": "function",
+                "function": {
+                    "name": "deploy",
+                    "arguments": format!(r#"{{"n":{i}}}"#)
+                }
+            })
+        })
+        .collect();
+    let body = serde_json::to_vec(&json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": tool_calls
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+/// After an enforce-mode approval denial, remaining unique calls must not each
+/// wait out another webhook timeout (GHSA-pcv8).
+#[tokio::test]
+async fn approval_stops_fanout_after_enforce_block() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "decision": "deny" }))
+                .set_delay(std::time::Duration::from_millis(50)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "default_action": "require_approval",
+        "tools": {},
+        "approval": {
+            "endpoint_url": format!("{}/approve", server.uri()),
+            "cache_ttl_seconds": 0,
+            "timeout_ms": 1500
+        }
+    }));
+
+    let tool_calls: Vec<Value> = (0..5)
+        .map(|i| {
+            json!({
+                "id": format!("call_{i}"),
+                "type": "function",
+                "function": {
+                    "name": "deploy",
+                    "arguments": format!(r#"{{"n":{i}}}"#)
+                }
+            })
+        })
+        .collect();
+    let body = serde_json::to_vec(&json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": tool_calls
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(403),
+    );
+}
+
+/// Sequential unique approvals share one cumulative 30s batch budget
+/// (GHSA-pcv8-f48c-mppw). Later webhook calls must not dispatch after the
+/// budget is exhausted. The test-only approval clock advances by the
+/// production ceiling on the first webhook response so hosted CI never sleeps
+/// 30 seconds; public config / OpenAPI stay unchanged.
+#[tokio::test]
+async fn approval_batch_deadline_stops_later_webhook_fanout() {
+    let server = MockServer::start().await;
+    let plugin = std::sync::Arc::new(make(json!({
+        "default_action": "require_approval",
+        "tools": {},
+        "approval": {
+            "endpoint_url": format!("{}/approve", server.uri()),
+            "cache_ttl_seconds": 0,
+            "timeout_ms": 5000
+        }
+    })));
+    assert_eq!(
+        AiToolGovernor::max_approval_batch_deadline(),
+        std::time::Duration::from_secs(30),
+        "production approval batch ceiling must remain exactly 30s"
+    );
+
+    let clock = std::sync::Arc::clone(&plugin);
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(move |_req: &wiremock::Request| {
+            // Simulate the first unique approval consuming the whole batch
+            // budget. Subsequent unique calls must fail closed without another
+            // webhook dispatch.
+            clock.advance_approval_clock_for_tests(AiToolGovernor::max_approval_batch_deadline());
+            ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tool_calls: Vec<Value> = (0..3)
+        .map(|i| {
+            json!({
+                "id": format!("call_{i}"),
+                "type": "function",
+                "function": {
+                    "name": "deploy",
+                    "arguments": format!(r#"{{"n":{i}}}"#)
+                }
+            })
+        })
+        .collect();
+    let body = serde_json::to_vec(&json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": tool_calls
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    match plugin
+        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502, "deadline exhaustion is fail-closed");
+            assert!(
+                body.contains("approval batch deadline exceeded"),
+                "unexpected reject body: {body}"
+            );
+            assert!(
+                body.contains("approval_denied"),
+                "unexpected reject body: {body}"
+            );
+        }
+        other => panic!("expected reject after batch deadline, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("approval_denied")
+    );
+    server.verify().await;
+}
+
+/// Duplicate streamed indexes with distinct ids must fail closed instead of
+/// merging a denied call into an allowed synthetic name (GHSA-6h6w).
+#[tokio::test]
+async fn duplicate_stream_index_with_conflicting_ids_fails_closed() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    // One held frame carries two same-index entries with distinct ids/names.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"c_safe\",\"function\":{\"name\":\"safe\",\"arguments\":\"{}\"}},",
+        "{\"index\":0,\"id\":\"c_danger\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(terminated, "ambiguous streamed identity must fail closed");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("danger"),
+        "denied call must not be released"
+    );
+
+    // Buffered SSE path shares the accumulator and must fail closed too.
+    let buffered = make(json!({
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_reject(
+        buffered
+            .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// Conflicting ids across split frames for the same slot are ungovernable.
+#[tokio::test]
+async fn stream_id_change_within_slot_fails_closed() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    let chunks: &[&[u8]] = &[
+        br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"safe","arguments":""}}]}}]}"#,
+        b"\n\n",
+        br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"name":"danger","arguments":"{}"}}]}}]}"#,
+        b"\n\n",
+        br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        b"\n\n",
+        b"data: [DONE]\n\n",
+    ];
+    let (out, terminated) = drive_stream(&mut inspector, chunks).await;
+    assert!(terminated, "id change within a slot must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+}
+
+/// Introducing an id only after an untagged fragment is ambiguous: the first
+/// bytes may belong to an independently addressed call rather than a
+/// continuation. Both live and buffered-SSE paths must fail closed, while an
+/// omitted id after a stable initial id remains a valid continuation.
+#[tokio::test]
+async fn stream_late_id_introduction_fails_closed_but_missing_continuation_id_is_valid() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+    let ambiguous = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"function\":{\"name\":\"safe\",\"arguments\":\"\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"late-id\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[ambiguous.as_bytes()]).await;
+    assert!(terminated, "late id introduction must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+    let buffered = make(json!({
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let mut buffered_ctx = create_test_context();
+    assert_reject(
+        buffered
+            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), ambiguous.as_bytes())
+            .await,
+        Some(502),
+    );
+
+    let valid_chunks: &[&[u8]] = &[
+        br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"stable-id","function":{"name":"safe","arguments":"{"}}]}}]}"#,
+        b"\n\n",
+        br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}"#,
+        b"\n\n",
+        br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        b"\n\n",
+        b"data: [DONE]\n\n",
+    ];
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (_out, terminated) = drive_stream(&mut inspector, valid_chunks).await;
+    assert!(
+        !terminated,
+        "missing id on a continuation after a stable id must remain valid"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_choice_index_and_malformed_call_id_fail_closed() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+
+    let duplicate_choice = concat!(
+        "data: {\"choices\":[",
+        "{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"same\",\"function\":{\"name\":\"safe\",\"arguments\":\"{}\"}}]}},",
+        "{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"same\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}",
+        "]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[duplicate_choice.as_bytes()]).await;
+    assert!(terminated, "duplicate choice identity must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+    let malformed_id = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":42,\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}",
+        "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[malformed_id.as_bytes()]).await;
+    assert!(terminated, "non-string call id must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+}
+
+/// JSON `null` for `tool_calls[].id` is omission (like a missing field), while
+/// empty-string and non-string ids remain malformed. Live stream and buffered
+/// SSE must agree.
+#[tokio::test]
+async fn stream_null_call_id_is_omission_but_empty_string_fails_closed() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+
+    let null_id = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":null,\"function\":{\"name\":\"safe\",\"arguments\":\"{\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"function\":{\"arguments\":\"}\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (_out, terminated) = drive_stream(&mut inspector, &[null_id.as_bytes()]).await;
+    assert!(
+        !terminated,
+        "null call id must be treated as omitted continuation, not malformed"
+    );
+
+    let buffered = make(json!({
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let mut buffered_ctx = create_test_context();
+    assert_continue(
+        buffered
+            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), null_id.as_bytes())
+            .await,
+    );
+
+    let empty_id = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}",
+        "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[empty_id.as_bytes()]).await;
+    assert!(terminated, "empty-string call id must fail closed");
+    assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+    let mut buffered_ctx = create_test_context();
+    assert_reject(
+        buffered
+            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), empty_id.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// Dry-run still evaluates ambiguous stream identity without cutting traffic
+/// when mode is dry_run — but the held bytes of an enforce cut must not leak.
+#[tokio::test]
+async fn duplicate_stream_index_dry_run_releases_without_cut() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"c_safe\",\"function\":{\"name\":\"safe\",\"arguments\":\"{}\"}},",
+        "{\"index\":0,\"id\":\"c_danger\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}",
+        "]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "dry-run must not cut on ungovernable identity");
+}
+
+// ---------------------------------------------------------------------------
+// Coverage residuals: amplification fail-closed + admission edge cases
+// (hosted Coverage run 29753983615: 142/172 = 82.56% < 84.98%)
+// ---------------------------------------------------------------------------
+
+/// Long placeholder × many matches must fail closed in enforce before the
+/// redaction transform can emit an amplified body.
+fn amplifying_redact_config(mode: &str) -> Value {
+    json!({
+        "mode": mode,
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "a", "regex": "a" }]
+            }
+        },
+        "response": { "redaction_placeholder": "X".repeat(256) }
+    })
+}
+
+fn amplifying_argument_blob() -> String {
+    // 17_000 × 256-byte placeholder exceeds MAX_PARSE_BYTES (4 MiB).
+    "a".repeat(17_000)
+}
+
+/// A deterministic amplification failure anywhere in an enforce-mode batch
+/// must suppress all approval fan-out, including require_approval calls that
+/// appear earlier in the response array.
+#[tokio::test]
+async fn redaction_amplification_block_skips_earlier_approval_webhook() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": {
+            "deploy": { "action": "require_approval" },
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "a", "regex": "a" }]
+            }
+        },
+        "approval": {
+            "endpoint_url": format!("{}/approve", server.uri()),
+            "cache_ttl_seconds": 0
+        },
+        "response": { "redaction_placeholder": "X".repeat(256) }
+    }));
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "tool_calls": [
+                    {
+                        "id": "approval-first",
+                        "type": "function",
+                        "function": { "name": "deploy", "arguments": "{}" }
+                    },
+                    {
+                        "id": "amplification-second",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": amplifying_argument_blob()
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .expect("serialize response");
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+    server.verify().await;
+}
+
+fn response_with_function_call(name: &str, arguments: &str) -> Vec<u8> {
+    json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": Value::Null,
+                "function_call": { "name": name, "arguments": arguments }
+            },
+            "finish_reason": "function_call"
+        }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn redact_args_amplification_fails_closed_in_enforce() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    let body = response_with_tool_call("search", &amplifying_argument_blob());
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+/// Amplifying redaction must clear the governed-response hash so the final
+/// re-check cannot hash-skip an unredacted secret.
+#[tokio::test]
+async fn redact_args_amplification_clears_hash_on_transform() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    let body = response_with_tool_call("search", &amplifying_argument_blob());
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "amplifying redact must decline the rewrite"
+    );
+
+    // Hash cleared: the final re-check cannot hash-skip the raw body and fails
+    // closed because redaction is no longer available on that lifecycle hook.
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn aggregate_redacted_arguments_cannot_exceed_response_limit() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    // Each call expands to ~2.3 MiB and therefore passes the per-call preflight;
+    // their aggregate must still be rejected before both strings are retained.
+    let arguments = "a".repeat(9_000);
+    let body = serde_json::to_vec(&json!({
+        "id": "chatcmpl-aggregate",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": arguments.clone()}},
+                    {"id": "call_2", "type": "function", "function": {"name": "search", "arguments": arguments}}
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "aggregate redaction past 4 MiB must not be emitted"
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn serialized_redaction_overhead_cannot_exceed_response_limit() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    // 16,384 replacements produce exactly 4 MiB of argument text. JSON framing
+    // necessarily exceeds the cap, so the bounded serializer must fail closed
+    // without allocating the complete oversized representation.
+    let body = response_with_tool_call("search", &"a".repeat(16_384));
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "serialized body past 4 MiB must not be emitted"
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+/// Legacy `function_call` redaction must rewrite arguments in place (not only
+/// modern `tool_calls[]`).
+#[tokio::test]
+async fn buffered_legacy_function_call_redact_args_rewrites() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+    let body = response_with_function_call(
+        "filesystem.write",
+        r#"{"token":"sk-legacysecret99","path":"/tmp"}"#,
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("legacy function_call redact must rewrite");
+    let text = String::from_utf8(rewritten).unwrap();
+    assert!(!text.contains("sk-legacysecret99"), "secret leaked: {text}");
+    assert!(text.contains("[REDACTED_TOOL_ARG:secret]"), "{text}");
+}
+
+/// Amplifying redaction on a legacy `function_call` also fails closed.
+#[tokio::test]
+async fn buffered_legacy_function_call_redact_amplification_fails_closed() {
+    let plugin = make(amplifying_redact_config("enforce"));
+    let body = response_with_function_call("search", &amplifying_argument_blob());
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+    // Transform after a reject still hits AmplificationFailed and clears the
+    // governed hash recorded before the deny.
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none()
+    );
+}
+
+/// Pattern names used in `{name}` expansion are admission-capped at 256 UTF-8
+/// bytes so a hostile config cannot stage multi-MiB substitutions.
+#[test]
+fn blocked_arg_pattern_name_admission_rejects_oversized_names() {
+    let err = try_make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "N".repeat(4 * 1024 * 1024 + 1), "regex": "tok" }]
+            }
+        },
+        "response": { "redaction_placeholder": "{name}" }
+    }))
+    .err()
+    .expect("multi-MiB pattern names must fail at admission");
+    assert!(
+        err.contains("blocked_arg_patterns") && err.contains("UTF-8 bytes"),
+        "unexpected admission error: {err}"
+    );
+}
+
+#[test]
+fn rejects_non_positive_approval_timeout() {
+    for timeout_ms in [json!(0), json!(-1), json!("fast"), json!(1.5)] {
+        let result = try_make(json!({
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": {
+                "endpoint_url": "https://approval.example/decide",
+                "timeout_ms": timeout_ms.clone()
+            }
+        }));
+        let err = match result {
+            Ok(_) => panic!("non-positive timeout_ms must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("timeout_ms") && err.contains("positive"),
+            "unexpected error for {timeout_ms}: {err}"
+        );
+    }
+}
+
+/// Transform no-ops for shapes that are not redactable in place, without
+/// clearing a previously recorded governed hash.
+#[tokio::test]
+async fn redact_transform_leaves_non_redactable_shapes_unchanged() {
+    let plugin = make(json!({
+        "tools": {
+            "search": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "sk-[A-Za-z0-9]+" }]
+            },
+            "other": { "action": "allow" }
+        }
+    }));
+    // Record a governed hash via an allowlisted sibling call.
+    let seed = response_with_tool_call("other", r#"{"ok":true}"#);
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &seed)
+            .await,
+    );
+
+    let probes: &[Value] = &[
+        // No choices array.
+        json!({ "id": "x" }),
+        // Function object present but name missing.
+        json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{ "function": { "arguments": "{}" } }]
+                }
+            }]
+        }),
+        // Name not in the redact_args tool set.
+        json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "function": { "name": "other", "arguments": r#"{"token":"sk-abc"}"# }
+                    }]
+                }
+            }]
+        }),
+        // redact_args tool but arguments omitted.
+        json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{ "function": { "name": "search" } }]
+                }
+            }]
+        }),
+    ];
+    for probe in probes {
+        let body = serde_json::to_vec(probe).unwrap();
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &json_headers(),
+                )
+                .await
+                .is_none(),
+            "probe should be a no-op: {probe}"
+        );
+    }
 }

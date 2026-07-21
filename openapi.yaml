@@ -18533,15 +18533,15 @@ components:
             response_tool_calls:
               type: boolean
               default: true
-              description: "Govern tool calls in buffered (non-streaming) responses."
+              description: "Govern tool calls in buffered (non-streaming) responses. At most 64 concrete tool calls are governed per request/response/SSE batch (unconditional; applies to allow/deny/redact_args/require_approval/dry_run)."
             streaming_response_tool_calls:
               type: boolean
               default: false
-              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
+              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. Duplicate choice/tool indexes, empty-string or non-string IDs, conflicting IDs, or an ID introduced after an untagged fragment are ungovernable and fail closed in enforce mode. JSON null for tool_calls[].id is treated as omitted (same as a missing field). At most 64 concrete tool calls are governed per SSE batch. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
             mcp_tool_calls:
               type: boolean
               default: false
-              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays."
+              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays. When params.arguments is omitted, the governor normalizes it to {} before required-arg / regex / hash / approval / JSON Schema evaluation (MCP zero-argument calls). Provider response shapes that omit function.arguments are not normalized."
             a2a_methods:
               type: boolean
               default: false
@@ -18570,7 +18570,7 @@ components:
               action:
                 type: string
                 enum: [allow, deny, redact_args, require_approval, dry_run]
-                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records ai_tool_governor.decision=dry_run distinctly from a real allow."
+                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records ai_tool_governor.decision=dry_run distinctly from a real allow. At most 64 concrete tool calls are governed per request/response/SSE batch regardless of action."
               risk:
                 type: string
                 enum: [low, medium, high, critical]
@@ -18588,6 +18588,7 @@ components:
                 description: "Deny when any listed key is absent from the parsed arguments object."
               blocked_arg_patterns:
                 type: array
+                maxItems: 32
                 items:
                   type: object
                   additionalProperties: false
@@ -18596,12 +18597,13 @@ components:
                     name:
                       type: string
                       minLength: 1
-                      description: "Pattern identifier; substituted into redaction_placeholder {name}."
+                      maxLength: 256
+                      description: "Pattern identifier; substituted into redaction_placeholder {name}. OpenAPI maxLength: 256 counts Unicode characters; runtime admission enforces a stricter 256 UTF-8 byte cap."
                     regex:
                       type: string
                       minLength: 1
-                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted."
-                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args."
+                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted. Patterns that match empty input are rejected at config load; contextual zero-length matches fail closed at runtime."
+                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args. At most 32 patterns per tool; every append is checked before allocation and redacted output is capped at the 4 MiB inspectable body limit."
               json_schema:
                 type: object
                 description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny. Intentionally open — arbitrary JSON Schema keywords are allowed; do not set additionalProperties: false here."
@@ -18620,8 +18622,9 @@ components:
             timeout_ms:
               type: integer
               minimum: 1
+              maximum: 30000
               default: 1500
-              description: "Per-request approval webhook timeout."
+              description: "Per-request approval webhook timeout (max 30000). A whole batch of approvals is also capped at 30s cumulative wait; after an enforce-mode block, further webhook calls in that batch are skipped. At most 64 concrete tool calls are governed per request/response/SSE batch. Dropping the governing future (client cancel) cancels any in-flight approval HTTP call."
             cache_ttl_seconds:
               type: integer
               minimum: 0
@@ -18649,8 +18652,9 @@ components:
               description: "HTTP error status (400-599) returned for a deterministic tool policy denial in enforce mode. Uninspectable governed bodies fail closed with 502."
             redaction_placeholder:
               type: string
+              maxLength: 256
               default: "[REDACTED_TOOL_ARG:{name}]"
-              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name."
+              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name. OpenAPI maxLength: 256 counts Unicode characters; runtime admission enforces a stricter 256 UTF-8 byte cap. Redacted argument output is capped at the 4 MiB inspectable body limit."
             streaming_deny_event:
               type: boolean
               default: true
