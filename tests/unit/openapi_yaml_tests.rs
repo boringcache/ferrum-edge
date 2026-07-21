@@ -7445,8 +7445,7 @@ fn api_chargeback_schema_closes_unknown_keys() {
         .and_then(|rest| rest.split("\n### `").next())
         .expect("api_chargeback docs section");
     assert!(
-        section.contains("Unknown top-level keys")
-            || section.contains("unknown top-level keys"),
+        section.contains("Unknown top-level keys") || section.contains("unknown top-level keys"),
         "docs/plugins.md api_chargeback section must note unknown-key rejection"
     );
     assert!(

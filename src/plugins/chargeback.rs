@@ -178,11 +178,9 @@ pub mod pricing {
 
         let mut price_by_status: HashMap<u16, f64> = HashMap::new();
         for (i, tier) in tiers.iter().enumerate() {
-            let tier_obj = tier.as_object().ok_or_else(|| {
-                format!(
-                    "{plugin_name}: pricing_tiers[{i}] must be an object"
-                )
-            })?;
+            let tier_obj = tier
+                .as_object()
+                .ok_or_else(|| format!("{plugin_name}: pricing_tiers[{i}] must be an object"))?;
             reject_unknown_keys(
                 tier_obj,
                 &format!("pricing_tiers[{i}]"),
