@@ -18227,6 +18227,7 @@ async fn handle_proxy_request_inner(
                     {
                         debug!(
                             path = %path,
+                            host = %request_host.as_deref().unwrap_or("<missing>"),
                             client_ip = %ctx.client_ip,
                             reject_status,
                             "Mesh REGISTRY_ONLY: rejecting outbound route miss for unadmitted destination"
@@ -38601,9 +38602,10 @@ mod tests {
         let gate_pos = src
             .find("enforcement.http_route_miss_reject_status")
             .expect("REGISTRY_ONLY route-miss gate helper call not found");
-        let not_found_pos = src
-            .find(r#"{"error":"Not Found"}"#)
-            .expect("generic route-miss Not Found body not found");
+        let not_found_pos = gate_pos
+            + src[gate_pos..]
+                .find("No route matched for request path")
+                .expect("generic route-miss log after the REGISTRY_ONLY gate not found");
         assert!(
             gate_pos < not_found_pos,
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
