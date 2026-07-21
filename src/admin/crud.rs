@@ -2787,6 +2787,9 @@ fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
         if resource.plugin_name == "loki_logging" {
             redact_loki_logging_config_projection(config);
         }
+        if resource.plugin_name == "otel_tracing" {
+            redact_otel_tracing_config_projection(config);
+        }
     }
     body
 }
@@ -2834,6 +2837,38 @@ fn redact_loki_custom_header_values(value: &mut Value, marker: &str) {
         }
         Value::Null => {}
         _ => *value = json!(marker),
+    }
+}
+
+fn redact_otel_tracing_config_projection(config: &mut Value) {
+    let marker = crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER;
+    let Some(config) = config.as_object_mut() else {
+        *config = json!(marker);
+        return;
+    };
+
+    if let Some(endpoint) = config.get_mut("endpoint")
+        && !endpoint.is_null()
+    {
+        *endpoint = match endpoint
+            .as_str()
+            .and_then(|value| url::Url::parse(value).ok())
+        {
+            Some(endpoint) => {
+                json!(crate::plugins::otel_tracing::redacted_endpoint_url(
+                    &endpoint
+                ))
+            }
+            None => json!(marker),
+        };
+    }
+    if let Some(authorization) = config.get_mut("authorization")
+        && !authorization.is_null()
+    {
+        *authorization = json!(marker);
+    }
+    if let Some(headers) = config.get_mut("headers") {
+        redact_loki_custom_header_values(headers, marker);
     }
 }
 

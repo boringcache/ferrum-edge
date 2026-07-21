@@ -9,7 +9,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::MeshTrafficDirection;
@@ -169,6 +169,7 @@ pub struct WorkloadMetrics {
     /// span reporting is disabled.
     tracing_providers: Vec<TracingProvider>,
     trace_exporters: Vec<Arc<dyn TraceExporter>>,
+    export_drop_log_limiter: Mutex<crate::util::accept_backoff::LogRateLimiter>,
     span_reporting_disabled: bool,
     service_name: String,
     /// Which directions of a mesh hop this plugin instance should emit spans
@@ -297,6 +298,7 @@ impl WorkloadMetrics {
             custom_trace_attributes_marker,
             tracing_providers,
             trace_exporters,
+            export_drop_log_limiter: Mutex::new(crate::util::accept_backoff::LogRateLimiter::new()),
             span_reporting_disabled,
             service_name,
             direction_emit,
@@ -741,18 +743,26 @@ impl WorkloadMetrics {
         };
         for exporter in earlier_exporters {
             if let Err(error) = exporter.try_export(span.clone()) {
-                tracing::warn!(
-                    provider = exporter.provider_name(),
-                    "workload_metrics tracing export buffer full — dropping span: {}",
-                    error
-                );
+                self.warn_export_drop(exporter.provider_name(), &error);
             }
         }
         if let Err(error) = last_exporter.try_export(span) {
+            self.warn_export_drop(last_exporter.provider_name(), &error);
+        }
+    }
+
+    fn warn_export_drop(&self, provider: &'static str, error: &str) {
+        let now_ms = crate::socket_opts::monotonic_now_ms();
+        let suppressed = match self.export_drop_log_limiter.lock() {
+            Ok(mut limiter) => limiter.on_event(now_ms),
+            Err(poisoned) => poisoned.into_inner().on_event(now_ms),
+        };
+        if let Some(suppressed) = suppressed {
             tracing::warn!(
-                provider = last_exporter.provider_name(),
-                "workload_metrics tracing export buffer full — dropping span: {}",
-                error
+                provider = provider,
+                suppressed = suppressed,
+                error = %error,
+                "workload_metrics trace export buffer rejected a span"
             );
         }
     }
@@ -785,6 +795,8 @@ impl WorkloadMetrics {
             summary,
             &self.service_name,
             kind,
+            true,
+            2_048,
         ));
     }
 }
@@ -1014,6 +1026,7 @@ impl Plugin for WorkloadMetrics {
             summary,
             &self.service_name,
             kind,
+            2_048,
         ));
     }
 

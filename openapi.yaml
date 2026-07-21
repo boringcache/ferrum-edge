@@ -12595,51 +12595,109 @@ components:
 
     OtelTracingConfig:
       type: object
-      description: "Plugin: otel_tracing — W3C Trace Context propagation and OTLP span export."
+      additionalProperties: false
+      description: >-
+        Plugin: otel_tracing — W3C Trace Context propagation and OTLP/Zipkin/Datadog
+        span export. Trace-context trust defaults to untrusted (fail-closed). Parent
+        sampling is honored; root sampling defaults to always_on. Server span names
+        use low-cardinality proxy/route identifiers. Every configured property is
+        non-null; omit optional properties instead of sending null.
       properties:
         endpoint:
           type: string
-          description: OTLP/HTTP collector endpoint. Omit for propagation-only mode
+          minLength: 1
+          description: >-
+            OTLP/HTTP collector endpoint. Omit for propagation-only mode.
+            URL userinfo is rejected; path/query credentials are redacted in diagnostics.
         service_name:
           type: string
+          minLength: 1
           default: ferrum-edge
           description: Service name in spans and resource attributes
         deployment_environment:
           type: string
+          minLength: 1
           description: deployment.environment resource attribute
         generate_trace_id:
           type: boolean
           default: true
-          description: Generate trace IDs for requests without incoming traceparent
+          description: Generate trace IDs for requests without a usable incoming traceparent
         headers:
           type: object
           additionalProperties:
             type: string
           default: {}
-          description: Custom HTTP headers sent with OTLP exports
+          description: Custom HTTP headers sent with OTLP exports (values treated as secrets)
         authorization:
           type: string
-          description: Authorization header value for OTLP exports
+          minLength: 1
+          description: Authorization header value for OTLP exports (secret)
         batch_size:
           type: integer
           default: 50
+          minimum: 1
+          maximum: 10000
           description: Spans per export batch
         flush_interval_ms:
           type: integer
           default: 5000
+          minimum: 100
+          maximum: 600000
           description: Max delay before flushing a partial batch
         buffer_capacity:
           type: integer
           default: 10000
-          description: Max pending spans; drops oldest when full
+          minimum: 1
+          maximum: 100000
+          description: Max pending spans; new spans are dropped when the buffer is full
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 65536
+          maximum: 268435456
+          description: Aggregate queued span byte budget before new spans are dropped
+        max_attribute_bytes:
+          type: integer
+          default: 2048
+          minimum: 64
+          maximum: 16384
+          description: Max retained bytes per string span attribute
         max_retries:
           type: integer
           default: 2
+          minimum: 0
+          maximum: 10
           description: Retry attempts on export failure
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 0
+          maximum: 60000
           description: Delay between retries
+        trace_context_trust:
+          type: string
+          enum: [untrusted, trusted]
+          default: untrusted
+          description: >-
+            Whether inbound W3C parents are adopted. untrusted (default) creates a
+            fresh root and never parents under caller-chosen IDs. trusted adopts a
+            valid lowercase W3C parent for internal/mesh propagation.
+        root_sampling:
+          type: string
+          enum: [always_on, always_off, ratio]
+          default: always_on
+          description: Sampling policy for locally created root traces
+        root_sampling_ratio:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: >-
+            Required when root_sampling=ratio; fraction of roots sampled.
+            Rejected when set with any other root_sampling mode.
+        include_url_path:
+          type: boolean
+          default: true
+          description: Include bounded url.path attribute (never used as span name)
 
     MtlsAuthConfig:
       type: object

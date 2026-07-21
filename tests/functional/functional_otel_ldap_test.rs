@@ -390,6 +390,7 @@ plugin_configs:
     enabled: true
     config:
       service_name: "test-gateway"
+      trace_context_trust: trusted
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
