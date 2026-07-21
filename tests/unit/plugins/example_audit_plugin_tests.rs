@@ -302,10 +302,7 @@ fn test_effective_sql_backend_resolve_from_env_matches_gateway_tls_source_preced
     );
     let _tls_mode = ScopedEnv::set("FERRUM_DB_TLS_MODE", "verify-ca");
     let _tls_ca_path = ScopedEnv::set("FERRUM_DB_TLS_CA_CERT_PATH", "/certs/path-ca.pem");
-    let _tls_ca_source = ScopedEnv::set(
-        "FERRUM_DB_TLS_CA_CERT_SOURCE",
-        "/certs/source-ca.pem",
-    );
+    let _tls_ca_source = ScopedEnv::set("FERRUM_DB_TLS_CA_CERT_SOURCE", "/certs/source-ca.pem");
     let _tls_cert = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_CERT_PATH");
     let _tls_cert_source = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_CERT_SOURCE");
     let _tls_key = ScopedEnv::remove("FERRUM_DB_TLS_CLIENT_KEY_PATH");
@@ -557,6 +554,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
         let _env_lock = crate::unit::env_lock::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _db_type = ScopedEnv::set("FERRUM_DB_TYPE", "sqlite");
         let _db_url = ScopedEnv::remove("FERRUM_DB_URL");
         plugin
             .start_background_tasks()
