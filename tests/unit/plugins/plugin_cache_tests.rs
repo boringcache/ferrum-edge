@@ -1661,6 +1661,47 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
     );
 }
 
+#[tokio::test]
+async fn test_tcp_logging_unknown_key_reload_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "tcp-logging-1",
+            "tcp_logging",
+            json!({"host": "127.0.0.1", "port": 5140, "tls": false}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid tcp_logging must admit");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "tcp_logging");
+
+    let typo = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "tcp-logging-1",
+            "tcp_logging",
+            json!({"host": "127.0.0.1", "port": 5140, "tlls": true}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&typo)
+        .expect_err("unknown tcp_logging key must reject cache publication");
+    assert!(error.contains("config.tlls"), "got: {error}");
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].name(), "tcp_logging");
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted tcp_logging instance"
+    );
+}
+
 #[test]
 fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
     let valid = make_config(

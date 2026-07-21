@@ -11239,13 +11239,34 @@ components:
 
     TcpLoggingConfig:
       type: object
-      description: "Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent TCP or TCP+TLS connection."
+      additionalProperties: false
+      description: >-
+        Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent
+        TCP or TCP+TLS connection. Only the properties below are admitted;
+        unknown keys (for example a misspelled `tlls`) are rejected so transport
+        security cannot silently default to plaintext. `connect_timeout_ms`
+        bounds DNS, TCP connect, and TLS handshake when enabled.
+        `write_timeout_ms` bounds each batch write/flush; timeouts discard the
+        writer and use the shared retry/reconnect path. Delivery is
+        at-least-once after partial-write failure. Registration policy is
+        KeepLastKnownGood: an invalid enabled candidate rejects startup or
+        reload publication instead of silently removing or downgrading the
+        previously accepted logger.
       required:
         - host
         - port
+      allOf:
+        - if:
+            required: [tls_server_name]
+          then:
+            required: [tls]
+            properties:
+              tls:
+                const: true
       properties:
         host:
           type: string
+          minLength: 1
           description: Hostname or IP of the TCP log receiver
         port:
           type: integer
@@ -11258,10 +11279,18 @@ components:
           description: Enable TLS encryption for the connection
         tls_server_name:
           type: string
-          description: SNI server name override for TLS (defaults to host)
+          minLength: 1
+          pattern: '^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$'
+          description: >-
+            DNS or IP identity for TLS SNI/certificate verification (defaults to
+            `host`). Allowed only when `tls` is true. The schema rejects URL
+            schemes, paths, queries, fragments, credentials, whitespace, and
+            host:port values; full rustls DNS/IP identity validation is enforced
+            during plugin admission.
         batch_size:
           type: integer
           default: 50
+          minimum: 1
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11271,38 +11300,91 @@ components:
         max_retries:
           type: integer
           default: 3
+          minimum: 0
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 0
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
           description: Channel capacity — new entries are dropped when full
         connect_timeout_ms:
           type: integer
           default: 5000
           minimum: 100
-          description: TCP connection timeout in milliseconds
+          maximum: 60000
+          description: >-
+            Connection establishment timeout in milliseconds. Covers DNS
+            resolution, TCP connect, and the TLS handshake when `tls` is true.
+        write_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          maximum: 60000
+          description: >-
+            Per-batch socket write_all + flush timeout in milliseconds. On
+            timeout the persistent writer is discarded and retries reconnect.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.
 
     UdpLoggingConfig:
       type: object
-      description: "Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in batches."
+      additionalProperties: false
+      description: >-
+        Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in
+        batches. Unknown top-level keys are rejected at construction / Admin
+        validation so transport typos (for example `dtsl`) cannot silently
+        fall back to plaintext. DTLS-only fields require `dtls: true` (omitted
+        or false rejects them) so Admin/spec admission cannot accept plaintext
+        configs that runtime would ignore. Registration policy is
+        OptionalFailOpen (invalid enabled instances are omitted from the
+        published cache).
       required:
         - host
         - port
+      allOf:
+        - if:
+            required: [dtls]
+            properties:
+              dtls:
+                const: true
+          then:
+            dependentRequired:
+              dtls_cert_path: [dtls_key_path]
+              dtls_key_path: [dtls_cert_path]
+          else:
+            not:
+              anyOf:
+                - required: [dtls_cert_path]
+                - required: [dtls_key_path]
+                - required: [dtls_ca_cert_path]
+                - required: [dtls_no_verify]
       properties:
         host:
           type: string
-          description: UDP endpoint hostname or IP address
+          minLength: 1
+          # Match runtime parse_socket_host: hostname or IP without scheme,
+          # path, query, fragment, credentials, or a single-colon host:port.
+          # Valid IPv6 literals necessarily contain at least two colons.
+          not:
+            anyOf:
+              - pattern: "://"
+              - pattern: "[/?#@\\s]"
+              - pattern: "^[^\\[\\]:]+:[^:]+$"
+          description: >-
+            UDP endpoint hostname or IP address. Must be a bare hostname or IP
+            without scheme, path, query, fragment, credentials, or port
+            (bracketed and unbracketed IPv6 literals are allowed).
         port:
           type: integer
           minimum: 1
@@ -11311,20 +11393,39 @@ components:
         dtls:
           type: boolean
           default: false
-          description: Enable DTLS encryption for log datagrams
+          description: >-
+            Enable DTLS encryption for log datagrams. Shared Admin / CP validation
+            checks configuration shape without opening node-local sources. On the
+            consuming node, certificate/key/CA sources are materialized and cached
+            for the plugin generation. When false or omitted, DTLS-only fields are
+            rejected.
         dtls_cert_path:
           type: string
-          description: PEM client certificate for DTLS mutual TLS
+          minLength: 1
+          description: >-
+            PEM client certificate for DTLS mutual TLS. Materialized during the
+            consuming node's dependency/construction phase when dtls is true; must
+            be paired with dtls_key_path. Rejected unless dtls is true.
         dtls_key_path:
           type: string
-          description: PEM private key for DTLS mutual TLS (must be paired with dtls_cert_path)
+          minLength: 1
+          description: >-
+            PEM private key for DTLS mutual TLS (ECDSA P-256 or P-384). Must be
+            paired with dtls_cert_path. Rejected unless dtls is true.
         dtls_ca_cert_path:
           type: string
-          description: PEM CA certificate for verifying the DTLS server
+          minLength: 1
+          description: >-
+            PEM CA certificate for verifying the DTLS server. Materialized on the
+            consuming node whenever set with dtls true, including when dtls_no_verify
+            is true (the source must still be valid even though verification is
+            disabled). Rejected unless dtls is true.
         dtls_no_verify:
           type: boolean
           default: false
-          description: Skip DTLS server certificate verification (testing only)
+          description: >-
+            Skip DTLS server certificate verification (testing only). Rejected
+            unless dtls is true.
         batch_size:
           type: integer
           default: 10
@@ -15346,7 +15447,8 @@ components:
 
     SseConfig:
       type: object
-      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers."
+      additionalProperties: false
+      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers. Unknown keys and non-object configs are rejected. Explicit null members are rejected; omitted keys keep defaults. wrap_non_sse_responses implies client-visible text/event-stream for wrapped responses."
       properties:
         require_get_method:
           type: boolean
@@ -15371,7 +15473,8 @@ components:
         retry_ms:
           type: integer
           format: uint64
-          description: "EventSource reconnection hint in milliseconds"
+          minimum: 1
+          description: "EventSource reconnection hint in milliseconds (must be >= 1 when set)"
         force_sse_content_type:
           type: boolean
           default: false
@@ -15379,7 +15482,7 @@ components:
         wrap_non_sse_responses:
           type: boolean
           default: false
-          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering)"
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type."
 
     RateLimitingRuleConfig:
       type: object
@@ -16900,7 +17003,47 @@ components:
 
     GraphqlConfig:
       type: object
-      description: "Plugin: graphql — Query depth/complexity limiting, introspection control, per-operation rate limiting. Rate-limit counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      additionalProperties: false
+      description: >-
+        Plugin: graphql — Query depth/complexity limiting, introspection control,
+        and per-operation rate limiting. At least one effective protection rule is
+        required (`max_depth`, `max_complexity`, `max_aliases`,
+        `introspection_allowed: false`, a non-empty `type_rate_limits`, or a
+        non-empty `operation_rate_limits`). `introspection_allowed: true` alone is
+        not an effective rule. Unknown top-level keys are rejected. Rate-limit
+        counter storage supports only local memory and Redis; database-backed
+        counters are intentionally unsupported. When `sync_mode` is `redis`,
+        `redis_url` is required. Explicit Redis fields are validated even in
+        local mode so latent configuration cannot become invalid only when the
+        mode is changed. Runtime numeric fields require integer JSON encoding
+        (for example `2`, not `2.0`); JSON Schema treats those two encodings as
+        the same mathematical integer. Runtime also rejects invalid Redis URL
+        shapes that JSON Schema cannot fully cross-validate with every authoring
+        tool.
+      allOf:
+        - anyOf:
+            - required: [max_depth]
+            - required: [max_complexity]
+            - required: [max_aliases]
+            - required: [introspection_allowed]
+              properties:
+                introspection_allowed:
+                  const: false
+            - required: [type_rate_limits]
+              properties:
+                type_rate_limits:
+                  minProperties: 1
+            - required: [operation_rate_limits]
+              properties:
+                operation_rate_limits:
+                  minProperties: 1
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
       properties:
         max_depth:
           type: integer
@@ -16917,7 +17060,9 @@ components:
         introspection_allowed:
           type: boolean
           default: true
-          description: Whether introspection queries are permitted
+          description: >-
+            Whether introspection queries are permitted. Setting this to `false`
+            counts as an effective protection rule; the default `true` does not.
         limit_by:
           type: string
           enum: [ip, consumer]
@@ -16925,14 +17070,26 @@ components:
           description: Rate limit key
         type_rate_limits:
           type: object
-          additionalProperties:
-            $ref: "#/components/schemas/RateSpec"
-          description: "Rate limits by operation type (query, mutation, subscription)"
+          additionalProperties: false
+          properties:
+            query:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+            mutation:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+            subscription:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+          description: >-
+            Rate limits by operation type. Only `query`, `mutation`, and
+            `subscription` keys are accepted; unknown keys are rejected.
         operation_rate_limits:
           type: object
+          propertyNames:
+            pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
           additionalProperties:
-            $ref: "#/components/schemas/RateSpec"
-          description: Rate limits by named operation
+            $ref: "#/components/schemas/GraphqlRateSpec"
+          description: >-
+            Rate limits by named operation. Keys must be valid GraphQL Names
+            (`[_A-Za-z][_0-9A-Za-z]*`).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -16940,6 +17097,8 @@ components:
           description: "GraphQL rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
         redis_url:
           type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
           description: "Redis connection URL. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
@@ -16947,10 +17106,12 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "ferrum:graphql"
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
           description: Number of multiplexed Redis connections
         redis_username:
@@ -16961,10 +17122,12 @@ components:
           description: Redis password
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Health check ping interval when Redis is unavailable
 
@@ -19878,9 +20041,32 @@ components:
         case-insensitive and runtime storage is normalized to uppercase. Other
         reserved, user-assigned, deleted, and alias codes are rejected.
 
+    GraphqlRateSpec:
+      type: object
+      additionalProperties: false
+      description: >-
+        Closed GraphQL rate limit specification. Both fields are required and
+        must be positive integers; unknown keys are rejected.
+      required: [max_requests, window_seconds]
+      properties:
+        max_requests:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Maximum requests allowed in the window
+        window_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Time window in seconds
+
     RateSpec:
       type: object
-      description: Rate limit specification used by graphql and grpc_method_router plugins.
+      description: >-
+        Rate limit specification used by grpc_method_router. Both fields are
+        required and must be positive integers. The gRPC runtime currently
+        ignores additional keys, so this shared component remains open to
+        preserve schema/runtime parity.
       required: [max_requests, window_seconds]
       properties:
         max_requests:

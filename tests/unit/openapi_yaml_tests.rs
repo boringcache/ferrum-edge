@@ -1606,6 +1606,215 @@ fn grpc_method_router_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn graphql_config_schema_matches_runtime_validation() {
+    use ferrum_edge::plugins::create_plugin;
+    use ferrum_edge::plugins::graphql::GRAPHQL_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/GraphqlConfig")
+        .expect("GraphqlConfig component exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["type_rate_limits"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/GraphqlRateSpec/additionalProperties"),
+        Some(&json!(false))
+    );
+    assert_ne!(
+        spec.pointer("/components/schemas/RateSpec/additionalProperties"),
+        Some(&json!(false)),
+        "GraphQL hardening must not close the shared gRPC RateSpec ahead of its runtime"
+    );
+    assert_eq!(
+        schema["properties"]["type_rate_limits"]["properties"]
+            .as_object()
+            .expect("type_rate_limits properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["query", "mutation", "subscription"])
+    );
+    assert_eq!(
+        schema["properties"]["operation_rate_limits"]["propertyNames"]["pattern"],
+        json!("^[A-Za-z_][A-Za-z0-9_]*$")
+    );
+    assert_eq!(schema["properties"]["redis_pool_size"]["minimum"], 1);
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        1
+    );
+    assert_eq!(
+        spec.pointer("/components/schemas/GraphqlRateSpec/properties/max_requests/minimum"),
+        Some(&json!(1))
+    );
+
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("GraphqlConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = GRAPHQL_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        schema_fields, runtime_fields,
+        "graphql OpenAPI/runtime key drift"
+    );
+    for key in REDIS_PLUGIN_CONFIG_KEYS {
+        assert!(
+            GRAPHQL_CONFIG_KEYS.contains(key),
+            "GRAPHQL_CONFIG_KEYS must include Redis key {key}"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs = plugin_docs
+        .split("### `graphql`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("graphql docs section");
+    for key in GRAPHQL_CONFIG_KEYS {
+        assert!(
+            docs.contains(&format!("`{key}`")),
+            "docs/plugins.md graphql section missing `{key}`"
+        );
+    }
+    assert!(docs.contains("Unknown top-level keys are rejected"));
+    assert!(docs.contains("valid GraphQL Names"));
+    assert!(docs.contains("`2`, not `2.0`"));
+    assert!(docs.contains("validated even while `sync_mode` is `local`"));
+
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/GraphqlConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .expect("GraphqlConfig schema compiles");
+
+    let accepted = [
+        json!({"max_depth": 5}),
+        json!({"max_complexity": 100}),
+        json!({"max_aliases": 3}),
+        json!({"introspection_allowed": false}),
+        json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"type_rate_limits": {
+            "query": {"max_requests": 10, "window_seconds": 60},
+            "mutation": {"max_requests": 5, "window_seconds": 60},
+            "subscription": {"max_requests": 2, "window_seconds": 60}
+        }}),
+        json!({"operation_rate_limits": {"getUser": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"operation_rate_limits": {"_internal": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({
+            "type_rate_limits": {
+                "query": { "max_requests": 10, "window_seconds": 60 }
+            },
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_pool_size": 1,
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 1
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "local",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_tls": false,
+            "redis_pool_size": 1
+        }),
+    ];
+    for config in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "config should be schema-valid: {config}"
+        );
+        assert!(
+            create_plugin("graphql", config).is_ok(),
+            "config should be runtime-valid: {config}"
+        );
+    }
+
+    let rejected = [
+        // Issue #2496 reproduction shapes
+        json!({}),
+        json!({"type_rate_limits": {"other": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"operation_rate_limits": {"bad-name": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"type_rate_limits": {"query": {"max_requests": 0, "window_seconds": 60}}}),
+        json!({"max_depth": 5, "sync_mode": "redis"}),
+        // Effective-rule and closed-object residuals
+        json!({"introspection_allowed": true}),
+        json!({"type_rate_limits": {}}),
+        json!({"operation_rate_limits": {}}),
+        json!({"type_rate_limits": {"Query": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"max_depth": 5, "limit_by": "IP"}),
+        json!({"max_depth": 5, "limit_by": null}),
+        json!({"max_depth": 5, "sync_mode": "REDIS", "redis_url": "redis://localhost:6379"}),
+        json!({"max_depth": 5, "sync_mode": null}),
+        json!({"max_depth": 5, "sync_mode": 1}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_url": "garbage"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_tls": "yes"}),
+        json!({"max_depth": 5, "sync_mode": "local", "redis_pool_size": 0}),
+        json!({"operation_rate_limits": {"": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"type_rate_limits": {"query": {"max_requests": 1, "window_seconds": 60, "burst": 2}}}),
+        json!({"max_depth": 5, "introspection_allowd": false}),
+        json!({"max_depth": 5, "sync_mdoe": "redis", "redis_url": "redis://localhost:6379/0"}),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": ""
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "http://localhost:6379"
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_key_prefix": ""
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_pool_size": 0
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_connect_timeout_seconds": 0
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_health_check_interval_seconds": 0
+        }),
+    ];
+    for config in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "config should be schema-invalid: {config}"
+        );
+        assert!(
+            create_plugin("graphql", config).is_err(),
+            "config should be runtime-invalid: {config}"
+        );
+    }
+}
+
+#[test]
 fn key_auth_location_schema_matches_runtime_whitespace_contract() {
     use ferrum_edge::plugins::key_auth::KeyAuth;
 
@@ -3408,6 +3617,161 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
             .expect("config object")
             .insert((*key).to_string(), serde_json::Value::Null);
         assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+    }
+}
+
+#[tokio::test]
+async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::tcp_logging::{TCP_LOGGING_CONFIG_KEYS, TcpLogging};
+
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/TcpLoggingConfig")
+        .expect("TcpLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(schema["properties"]["connect_timeout_ms"]["minimum"], 100);
+    assert_eq!(schema["properties"]["connect_timeout_ms"]["maximum"], 60000);
+    assert_eq!(schema["properties"]["write_timeout_ms"]["minimum"], 100);
+    assert_eq!(schema["properties"]["write_timeout_ms"]["maximum"], 60000);
+    assert_eq!(schema["properties"]["write_timeout_ms"]["default"], 5000);
+    assert_eq!(
+        schema["properties"]["tls_server_name"]["pattern"],
+        r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$",
+    );
+    let connect_desc = schema["properties"]["connect_timeout_ms"]["description"]
+        .as_str()
+        .expect("connect_timeout_ms description");
+    assert!(
+        connect_desc.to_ascii_lowercase().contains("tls"),
+        "connect_timeout_ms must document TLS handshake coverage"
+    );
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("TcpLogging properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = TCP_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "tcp_logging runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let tcp_docs = plugin_docs
+        .split("### `tcp_logging`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("tcp_logging docs section");
+    for key in TCP_LOGGING_CONFIG_KEYS {
+        assert!(
+            tcp_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md tcp_logging section missing `{key}`"
+        );
+    }
+    assert!(tcp_docs.contains("KeepLastKnownGood"));
+    assert!(tcp_docs.contains("at-least-once"));
+
+    let valid = json!({
+        "host": "logs.example.com",
+        "port": 6514,
+        "tls": true,
+        "tls_server_name": "logs.example.com",
+        "batch_size": 50,
+        "flush_interval_ms": 1000,
+        "max_retries": 3,
+        "retry_delay_ms": 1000,
+        "buffer_capacity": 10000,
+        "connect_timeout_ms": 5000,
+        "write_timeout_ms": 5000
+    });
+    assert_component_validity(&spec, "TcpLoggingConfig", &valid, true);
+    assert!(TcpLogging::new(&valid, PluginHttpClient::default()).is_ok());
+
+    let valid_ipv6_identity = json!({
+        "host": "logs.example.com",
+        "port": 6514,
+        "tls": true,
+        "tls_server_name": "2001:db8::1"
+    });
+    assert_component_validity(&spec, "TcpLoggingConfig", &valid_ipv6_identity, true);
+    assert!(TcpLogging::new(&valid_ipv6_identity, PluginHttpClient::default()).is_ok());
+
+    let valid_minima = json!({"host": "127.0.0.1", "port": 5140});
+    assert_component_validity(&spec, "TcpLoggingConfig", &valid_minima, true);
+    assert!(TcpLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let runtime_and_schema_invalid = [
+        json!({"host": "logs.example.com", "port": 6514, "tlls": true}),
+        json!({"host": "logs.example.com", "port": 6514, "write_timeot_ms": 1000}),
+        json!({"host": "logs.example.com", "port": 6514, "aaa_extra": 1, "zzz_extra": 2}),
+        json!({"host": "logs.example.com"}),
+        json!({"port": 6514}),
+        json!({"host": "logs.example.com", "port": 0}),
+        json!({"host": "logs.example.com", "port": 65536}),
+        json!({"host": "logs.example.com", "port": 6514, "tls": null}),
+        json!({"host": "logs.example.com", "port": 6514, "write_timeout_ms": 50}),
+        json!({"host": "logs.example.com", "port": 6514, "connect_timeout_ms": 50}),
+        json!({"host": "logs.example.com", "port": 6514, "write_timeout_ms": 60001}),
+        json!({"host": "logs.example.com", "port": 6514, "connect_timeout_ms": 60001}),
+        json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "tls_server_name": "logs.example.com"
+        }),
+        json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "tls": false,
+            "tls_server_name": "logs.example.com"
+        }),
+        json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": " logs.example.com"}),
+        json!({"host": "logs.example.com", "port": 6514, "tls": true, "tls_server_name": "logs.example.com "}),
+    ];
+    for config in runtime_and_schema_invalid {
+        assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
+        assert!(
+            TcpLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid tcp_logging config: {config}"
+        );
+    }
+
+    for tls_server_name in [
+        "https://logs.example.com",
+        "logs.example.com/path",
+        "logs.example.com?token=secret",
+        "logs.example.com#fragment",
+        "user@logs.example.com",
+        "logs.example.com:6514",
+    ] {
+        let config = json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "tls": true,
+            "tls_server_name": tls_server_name
+        });
+        assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
+        assert!(
+            TcpLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid TLS server name: {tls_server_name}"
+        );
+    }
+
+    // OpenAPI rejects typed nulls on every declared property. Unknown-key
+    // closure is the TCP portion of GHSA-7fgr-gqg5-xj6c under test here.
+    for key in TCP_LOGGING_CONFIG_KEYS {
+        let mut config = json!({"host": "logs.example.com", "port": 6514});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        assert_component_validity(&spec, "TcpLoggingConfig", &config, false);
     }
 }
 

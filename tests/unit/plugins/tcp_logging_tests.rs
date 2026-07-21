@@ -1,6 +1,9 @@
 //! Tests for tcp_logging plugin
 
-use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, tcp_logging::TcpLogging};
+use ferrum_edge::plugins::{
+    ALL_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, plugin_failure_policy,
+    tcp_logging::TcpLogging,
+};
 use serde_json::json;
 
 use super::plugin_utils::{
@@ -9,6 +12,14 @@ use super::plugin_utils::{
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+#[test]
+fn test_tcp_logging_keeps_last_known_good_on_invalid_candidates() {
+    assert_eq!(
+        plugin_failure_policy("tcp_logging"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
 }
 
 /// `tls: true` now builds a rustls `ClientConfig` in `TcpLogging::new` (finding
@@ -411,4 +422,160 @@ async fn test_tcp_logging_rejects_metadata_host_under_default_policy() {
         BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid policy"),
     );
     assert!(TcpLogging::new(&json!({"host": "127.0.0.1", "port": 9000}), client).is_ok());
+}
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_unknown_keys_with_suggestion() {
+    let err = match TcpLogging::new(
+        &json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "tlls": true
+        }),
+        default_client(),
+    ) {
+        Ok(_) => panic!("misspelled tls key must fail admission"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("unknown configuration key")
+            && err.contains("tlls")
+            && err.contains("did you mean 'tls'?"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_multiple_unknown_keys_sorted() {
+    let err = match TcpLogging::new(
+        &json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "zzz_extra": 1,
+            "aaa_extra": 2
+        }),
+        default_client(),
+    ) {
+        Ok(_) => panic!("unknown keys must fail admission"),
+        Err(e) => e,
+    };
+    let aaa = err.find("aaa_extra").expect("aaa_extra in error");
+    let zzz = err.find("zzz_extra").expect("zzz_extra in error");
+    assert!(aaa < zzz, "unknown keys must be reported sorted: {err}");
+}
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_invalid_tls_server_names_at_admission() {
+    ensure_crypto_provider();
+    for tls_server_name in [
+        "https://logs.example.com",
+        "logs.example.com/path",
+        "logs example.com",
+        "logs.example.com:6514",
+        " logs.example.com",
+        "logs.example.com ",
+    ] {
+        let err = match TcpLogging::new(
+            &json!({
+                "host": "logs.example.com",
+                "port": 6514,
+                "tls": true,
+                "tls_server_name": tls_server_name
+            }),
+            default_client(),
+        ) {
+            Ok(_) => panic!("invalid tls_server_name must fail admission: {tls_server_name}"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("invalid TLS server name") || err.contains("tls_server_name"),
+            "name={tls_server_name} err={err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_tcp_logging_accepts_valid_dns_and_ip_tls_server_names() {
+    ensure_crypto_provider();
+    for tls_server_name in ["logs.example.com", "localhost", "127.0.0.1"] {
+        let result = TcpLogging::new(
+            &json!({
+                "host": "127.0.0.1",
+                "port": 6514,
+                "tls": true,
+                "tls_server_name": tls_server_name
+            }),
+            default_client(),
+        );
+        assert!(
+            result.is_ok(),
+            "valid tls_server_name {tls_server_name} should admit: {:?}",
+            result.as_ref().err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_tls_server_name_without_tls() {
+    let err = match TcpLogging::new(
+        &json!({
+            "host": "logs.example.com",
+            "port": 6514,
+            "tls": false,
+            "tls_server_name": "logs.example.com"
+        }),
+        default_client(),
+    ) {
+        Ok(_) => panic!("tls_server_name without tls must fail admission"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("tls_server_name") && err.contains("tls: true"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_tcp_logging_accepts_write_timeout_ms() {
+    let plugin = TcpLogging::new(
+        &json!({
+            "host": "localhost",
+            "port": 5140,
+            "write_timeout_ms": 1500,
+            "connect_timeout_ms": 1200
+        }),
+        default_client(),
+    );
+    assert!(plugin.is_ok(), "write_timeout_ms should be admitted");
+}
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_invalid_write_timeout_shape() {
+    let result = TcpLogging::new(
+        &json!({
+            "host": "localhost",
+            "port": 5140,
+            "write_timeout_ms": false
+        }),
+        default_client(),
+    );
+    assert!(result.is_err(), "non-integer write_timeout_ms must fail");
+}
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_timeouts_above_recovery_bound() {
+    for key in ["connect_timeout_ms", "write_timeout_ms"] {
+        let mut config = json!({"host": "localhost", "port": 5140});
+        config
+            .as_object_mut()
+            .expect("object config")
+            .insert(key.to_string(), json!(60_001));
+        let error = TcpLogging::new(&config, default_client())
+            .err()
+            .expect("excessive timeout must fail admission");
+        assert!(
+            error.contains(key) && error.contains("60000"),
+            "unexpected {key} error: {error}"
+        );
+    }
 }

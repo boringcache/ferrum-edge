@@ -562,22 +562,29 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 
 **Priority:** 9125
 
+**Failure policy:** `KeepLastKnownGood` — construction/validation failures reject the candidate plugin generation and keep the last-known-good instance.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | Hostname or IP of the TCP log receiver |
 | `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
 | `tls` | Boolean | `false` | Enable TLS encryption for the connection |
-| `tls_server_name` | String | *(none)* | SNI server name override for TLS (defaults to `host`) |
+| `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name (no URL scheme, path, query, fragment, credentials, whitespace, or host:port); invalid values fail admission. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-| `connect_timeout_ms` | Integer | `5000` | TCP connection timeout in milliseconds (min: 100) |
+| `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
+| `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
+| `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
+
+Unknown top-level configuration keys are rejected at admission with an actionable allowed-key list (for example a misspelled `tlls` cannot silently leave the sink on plaintext).
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each entry is serialized as a single JSON line followed by a newline (`\n`), making the output compatible with NDJSON/JSON Lines consumers.
 
-The TCP connection is persistent — it is reused across batches and automatically re-established on write failure or disconnect. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) and skip-verify setting (`FERRUM_TLS_NO_VERIFY`).
+The TCP connection is persistent — it is reused across batches and automatically re-established on write failure, write/flush timeout, connect/handshake timeout, or disconnect. Delivery is at-least-once: a timeout or I/O error after a partial write may cause the full batch to be retried, so collectors must tolerate duplicates. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`), skip-verify setting (`FERRUM_TLS_NO_VERIFY`), and CRL list (`FERRUM_TLS_CRL_FILE_PATH`).
 
 ```yaml
 plugin_name: tcp_logging
@@ -611,15 +618,17 @@ Sends transaction summaries as JSON to an external UDP endpoint. Entries are buf
 
 **Priority:** 9160
 
+Unknown top-level keys are rejected at construction / Admin validation (OpenAPI `additionalProperties: false`). A typo such as `dtsl: true` fails admission instead of silently shipping plaintext. Registration is `OptionalFailOpen`: an invalid enabled instance is omitted from the published plugin cache rather than retaining last-known-good.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `host` | String | *(required)* | UDP endpoint hostname or IP address |
 | `port` | Integer | *(required)* | UDP endpoint port (1–65535) |
 | `dtls` | Boolean | `false` | Enable DTLS encryption for log datagrams |
-| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS |
-| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (must be paired with `dtls_cert_path`) |
-| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server |
-| `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only) |
+| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS (requires `dtls: true`; materialized on the consuming node) |
+| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
+| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier) |
+| `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only; requires `dtls: true`) |
 | `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `1` | Retry attempts on failed batch delivery |
@@ -628,9 +637,11 @@ Sends transaction summaries as JSON to an external UDP endpoint. Entries are buf
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 
-**Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized datagrams may be fragmented or dropped by the network.
+**Delivery success contract:** A successful flush means the local UDP socket (or DTLS engine + connected socket) accepted the datagram. It does **not** mean the remote collector delivered or acknowledged the payload. Local DTLS plaintext rejection, serialization failure, DTLS engine failure, connected-socket send failure, and a stalled DTLS send that exceeds the plugin's 10-second completion budget return errors into the configured retry / final-loss accounting path; they are never treated as silent success. Deterministic local encoding/size rejection does not tear down a healthy DTLS association; transport/driver failures (including send timeout) do.
 
-**DNS handling:** The UDP endpoint is resolved through the gateway's shared `DnsCache` (TTL-aware, stale-while-revalidate, background refresh). For plain UDP, the background flush task re-resolves every 60 seconds and rebinds the socket if the address changes — DNS flips propagate without a restart. DTLS sessions are not re-handshaken mid-session.
+**Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized plain-UDP datagrams may be fragmented or dropped by the network. For DTLS, the effective plaintext ceiling is `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default **16,384**). A single-entry batch that exceeds that ceiling fails closed into retry/final-loss. A multi-entry batch that exceeds the ceiling is split per entry so one oversized record cannot erase co-batched siblings; each oversized single is discarded with explicit, rate-limited loss accounting. Split delivery is at-least-once: if an earlier entry succeeds and a later entry fails, retrying the original batch can duplicate the earlier entry, so collectors must tolerate duplicates.
+
+**DNS / association lifecycle:** Both plain UDP and DTLS re-resolve the collector through the gateway's shared `DnsCache` every 60 seconds. When the resolved address is unchanged, the existing connected socket / DTLS association is retained. When the address changes, Ferrum builds a replacement connected socket and — for DTLS — performs a fresh handshake before swapping the sender. If re-resolution or the replacement handshake fails, the current sender is retained at the previously pinned address until a later interval or a send-error teardown forces recovery.
 
 ```yaml
 plugin_name: udp_logging
@@ -643,7 +654,13 @@ config:
 
 #### DTLS Configuration
 
-For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided:
+For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided. Shared Admin / CP validation is shape-only and never opens node-local certificate, key, or CA paths. When `dtls: true`, the consuming node materializes those sources during construction and, where applicable, the mode-aware plugin file-dependency phase without network I/O. Parsed material is cached in the committed plugin generation so first flush and reconnect reuse it:
+
+- **File mode:** unusable DTLS material is fatal during config load.
+- **Database mode:** the file-dependency phase warns; construction still fails closed for that instance (`OptionalFailOpen` omits it).
+- **DP mode:** the shared file-dependency phase is skipped (node-local paths may differ); construction on the DP still materializes local sources and omits the instance on failure.
+
+Cached DTLS material is immutable for that plugin generation. Certificate/key/CA rotation, or making a previously missing source available, requires reapplying or reloading the configuration; transport and handshake failures do not repeatedly reopen source paths.
 
 ```yaml
 plugin_name: udp_logging
@@ -3025,10 +3042,12 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 
 **Lifecycle:**
 
-1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, stashes `Last-Event-ID` in metadata for reconnection.
+1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, bounds `Last-Event-ID` (max 1024 bytes) and stashes it for backend forwarding. The raw ID is omitted from transaction logs (`sse:leid_present` / `sse:leid_bytes` correlation only) and never interpolated into diagnostics.
 2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
-3. **`after_proxy`** — Sets `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`. Strips `Content-Length`. Optionally forces `Content-Type: text/event-stream`.
-4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only).
+3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body.
+4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it.
+
+**Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an integer ≥ 1 when set.
 
 **Request validation:**
 
@@ -3049,11 +3068,11 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
 | `strip_content_length` | bool | `true` | Remove `Content-Length` (SSE streams are indefinite) |
-| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 |
 | `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
-| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing |
+| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses |
 
-**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering. When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`.
+**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
 
 ```yaml
 config:
@@ -3400,27 +3419,27 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth |
 | `max_complexity` | u32 (optional) | — | Maximum allowed field count |
 | `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
-| `introspection_allowed` | bool | `true` | Whether introspection queries are permitted |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
-| `type_rate_limits` | Object | `{}` | Rate limits by operation type (`query`, `mutation`, `subscription`) |
-| `operation_rate_limits` | Object | `{}` | Rate limits by named operation |
-| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
+| `introspection_allowed` | bool | `true` | Whether introspection queries are permitted. Only `false` counts as an effective protection rule; the default `true` does not. |
+| `limit_by` | String | `ip` | Rate limit key: exact lowercase `ip` or `consumer`. Other values are rejected at plugin load time. |
+| `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
+| `operation_rate_limits` | Object | `{}` | Rate limits by named operation. Keys must be valid GraphQL Names (`[_A-Za-z][_0-9A-Za-z]*`). |
+| `sync_mode` | String | `local` | Exact lowercase `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
-| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"`. Must be non-empty when set. |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1) |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds (must be ≥ 1) |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be ≥ 1) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive integer JSON values (`2`, not `2.0`) — missing, zero, or unknown keys are rejected at plugin load time so a typo cannot silently disable a rate limit. The same integer-encoding rule applies to the top-level numeric limits and Redis pool/timeout settings.
 
-The plugin requires at least one rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, `type_rate_limits`, or `operation_rate_limits`) — an empty config is rejected so it cannot be a no-op.
+The plugin requires at least one effective rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, a non-empty `type_rate_limits`, or a non-empty `operation_rate_limits`) — an empty or no-op config is rejected. Unknown top-level keys are rejected so misspelled introspection, identity, rate-map, or Redis synchronization fields cannot silently fall back to defaults.
 
 Populates `ctx.metadata` with `graphql_operation_type`, `graphql_operation_name`, `graphql_depth`, and `graphql_complexity`.
 
-**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically.
+**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Explicit `redis_*` fields are validated even while `sync_mode` is `local`, so a later mode switch cannot activate malformed latent settings. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically.
 
 ```yaml
 plugin_name: graphql
