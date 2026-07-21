@@ -850,9 +850,7 @@ impl GovernorEngine {
         let mut redaction_memos = HashMap::new();
         let mut redacted_argument_bytes = 0usize;
         let mut redaction_amplification = vec![false; calls.len()];
-        for (index, (call, (outcome, _, _))) in
-            calls.iter().zip(evaluations.iter()).enumerate()
-        {
+        for (index, (call, (outcome, _, _))) in calls.iter().zip(evaluations.iter()).enumerate() {
             let PolicyOutcome::Redact(patterns) = outcome else {
                 continue;
             };
