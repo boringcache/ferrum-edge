@@ -277,6 +277,22 @@ async fn test_sse_plugin_allows_valid_sse_request() {
         "SSE plugin should strip Content-Length header"
     );
 
+    // Connection keep-alive must not be emitted (illegal on H2/H3; unused on H1.1).
+    assert!(
+        headers.get("connection").is_none(),
+        "SSE plugin must not emit Connection keep-alive"
+    );
+
+    // Cache-Control should include no-cache
+    let cache_control = headers
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        cache_control.to_ascii_lowercase().contains("no-cache"),
+        "SSE plugin should ensure Cache-Control includes no-cache, got {cache_control:?}"
+    );
+
     // Cleanup
     let _ = gateway_process.kill();
     let _ = gateway_process.wait();

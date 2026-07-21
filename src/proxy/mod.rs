@@ -2797,6 +2797,9 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // `observability.emit_metadata: false` ineffective.
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_REQUESTED_KEY);
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_MODEL_KEY);
+    // SSE Last-Event-ID is origin-defined resume state: omit the raw value from
+    // transaction logs and retain only safe present/length correlation hints.
+    crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
 }
 
@@ -5443,7 +5446,8 @@ impl ProxyState {
             mesh_egress_strip_baggage_keys.clone(),
             env_config_arc.pool_shard_amount,
         )
-        .with_real_ip_header(env_config_arc.real_ip_header.clone());
+        .with_real_ip_header(env_config_arc.real_ip_header.clone())
+        .with_tls_crl_source(env_config_arc.tls_crl_file_path.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
         // route `__mesh_bpf_metrics` to use it via `with_state`.
@@ -11201,7 +11205,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     if ws_disconnect_plugins.is_empty() {
         return;
     }
-    let disconnect_duration_ms = (chrono::Utc::now() - session_meta.session_start)
+    let disconnected_at = chrono::Utc::now();
+    let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
         .num_milliseconds()
         .max(0) as f64;
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
@@ -11216,6 +11221,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         frames_backend_to_client: 0,
         bytes_client_to_backend,
         bytes_backend_to_client,
+        timestamp_connected: session_meta.session_start.to_rfc3339(),
+        timestamp_disconnected: disconnected_at.to_rfc3339(),
         direction: failure.as_ref().map(|(d, _, _)| *d),
         io_side: failure.as_ref().and_then(|(_, _, side)| *side),
         error_class: failure.map(|(_, c, _)| c),
@@ -12422,7 +12429,8 @@ where
     // the whole block — zero overhead for deployments that don't observe
     // WebSocket sessions.
     if !ws_disconnect_plugins.is_empty() {
-        let disconnect_duration_ms = (chrono::Utc::now() - session_meta.session_start)
+        let disconnected_at = chrono::Utc::now();
+        let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
             .num_milliseconds()
             .max(0) as f64;
         let failure = first_failure.get().cloned();
@@ -12438,6 +12446,8 @@ where
             frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
             bytes_client_to_backend: bytes_c2b.load(Ordering::Relaxed),
             bytes_backend_to_client: bytes_b2c.load(Ordering::Relaxed),
+            timestamp_connected: session_meta.session_start.to_rfc3339(),
+            timestamp_disconnected: disconnected_at.to_rfc3339(),
             direction: failure.as_ref().map(|(d, _, _)| *d),
             io_side: failure.as_ref().and_then(|(_, _, side)| *side),
             error_class: failure.map(|(_, c, _)| c),
@@ -14610,7 +14620,7 @@ fn should_apply_synthetic_response_body_hooks(
         || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
     !is_grpc_request
         && governed_synthetic_status
-        && !matches!(status_code, 204 | 205 | 304)
+        && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
         && !response_body.is_empty()
         && plugins.iter().any(|plugin| {
             plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
@@ -14843,8 +14853,11 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
 /// `before_proxy` rejection path, so AI guardrails (`ai_response_guard` /
 /// `ai_semantic_firewall`) see synthetic 2xx bodies (e.g. `ai_federation` /
 /// `ai_semantic_cache` hits surfaced via `RejectBinary{200}`) identically
-/// across all frontends. It mutates `status`, `headers`, and `body` in place;
-/// any normalization of the final wire form (gRPC trailers, content-length) is
+/// across all frontends. It mutates `status`, `headers`, and `body` in place.
+/// After body guardrails and reject-path `after_proxy` hooks, it applies shared
+/// HEAD/204/205/304 wire preparation so H1/H2 finalize and every H3 reject
+/// writer omit content bytes together (HEAD keeps representation
+/// `Content-Length`). Remaining wire normalization (gRPC trailers) is still
 /// the caller's responsibility.
 ///
 /// Ordering: the synthetic body hooks run first (they may *replace* the
@@ -14974,6 +14987,19 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             );
             break;
         }
+    }
+
+    // Final wire shape for synthetic/reject responses: HEAD keeps representation
+    // metadata (Content-Length) but omits content bytes; 204/205/304 omit both
+    // content and Content-Length. Applied here so H1/H2 finalize and every H3
+    // path that runs this shared hook cannot diverge.
+    if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+        &ctx.method,
+        *status,
+        headers,
+        body.len(),
+    ) {
+        body.clear();
     }
 }
 
@@ -18206,6 +18232,50 @@ async fn handle_proxy_request_inner(
                     (relay_proxy, 0)
                 }
                 None => {
+                    // Outbound-capture route misses under effective
+                    // REGISTRY_ONLY must take the same configured deny /
+                    // metric path as the auto-injected
+                    // `mesh_outbound_registry` plugin. Routing completes
+                    // before the plugin chain, so without this gate an
+                    // unknown destination would return a generic 404 and
+                    // skip `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS`
+                    // plus the fixed-cardinality deny counter. Inbound
+                    // listeners and HBONE relay synthesis above are
+                    // unchanged (capture-port Skip / inbound-only relay).
+                    if let Some(listen_port) = ctx.frontend_listen_port
+                        && let Some(enforcement) =
+                            state.mesh_outbound_enforcement.load_full().as_ref()
+                        && let Some(reject_status) = enforcement.http_route_miss_reject_status(
+                            listen_port,
+                            request_host.as_deref(),
+                            authority_port,
+                        )
+                    {
+                        debug!(
+                            path = %path,
+                            host = %request_host.as_deref().unwrap_or("<missing>"),
+                            client_ip = %ctx.client_ip,
+                            reject_status,
+                            "Mesh REGISTRY_ONLY: rejecting outbound route miss for unadmitted destination"
+                        );
+                        state.request_count.fetch_add(1, Ordering::Relaxed);
+                        let status =
+                            StatusCode::from_u16(reject_status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        let body: &[u8] = if request_host.as_deref().is_none_or(|h| h.is_empty()) {
+                            br#"{"error":"host header required"}"#
+                        } else {
+                            br#"{"error":"destination not in mesh registry (REGISTRY_ONLY policy)"}"#
+                        };
+                        let response = build_pre_plugin_reject_response(
+                            status,
+                            body,
+                            &EMPTY_HEADERS,
+                            request_uses_grpc_content_type,
+                            grpc_web_response_content_type,
+                        );
+                        record_status(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
                     debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
                     state.request_count.fetch_add(1, Ordering::Relaxed);
                     let response = build_pre_plugin_reject_response(
@@ -34311,8 +34381,20 @@ mod tests {
         )
         .await;
 
+        // Guardrails inspected the GET representation and replaced it; the
+        // shared finalizer then restores HEAD and applies wire omission so the
+        // client receives representation metadata without content bytes.
+        const BLOCKED_REPRESENTATION: &[u8] = b"blocked synthetic representation";
+        let expected_content_length = BLOCKED_REPRESENTATION.len().to_string();
         assert_eq!(status, 451);
-        assert_eq!(body, b"blocked synthetic representation");
+        assert!(
+            body.is_empty(),
+            "HEAD final wire body must be empty after shared no-body preparation"
+        );
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(expected_content_length.as_str())
+        );
         assert_eq!(
             ctx.metadata
                 .get("test:synthetic_body_method")
@@ -38544,6 +38626,34 @@ mod tests {
             build_xff_value(Some("2001:DB8::1"), "2001:db8::1", "10.0.0.7", &lb_trusted),
             "2001:DB8::1, 10.0.0.7",
             "IPv6 case differences must not duplicate the client in the chain"
+        );
+    }
+
+    /// Complementary ordering guard for the inbound HBONE relay synthesis that
+    /// must stay ahead of the REGISTRY_ONLY route-miss gate in the same arm.
+    /// Executable request-path coverage for the gate itself lives in
+    /// `tests/integration/mesh_outbound_registry_route_miss_tests.rs`; this
+    /// fingerprint only asserts the hard-to-drive HBONE-vs-gate source order.
+    #[test]
+    fn registry_only_route_miss_gate_precedes_generic_not_found() {
+        let src = include_str!("mod.rs");
+        let gate_pos = src
+            .find("enforcement.http_route_miss_reject_status")
+            .expect("REGISTRY_ONLY route-miss gate helper call not found");
+        let not_found_pos = gate_pos
+            + src[gate_pos..]
+                .find("No route matched for request path")
+                .expect("generic route-miss log after the REGISTRY_ONLY gate not found");
+        assert!(
+            gate_pos < not_found_pos,
+            "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
+        );
+        let relay_pos = src[..not_found_pos]
+            .rfind("build_inbound_hbone_relay_proxy(req.uri().authority()")
+            .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
+        assert!(
+            relay_pos < gate_pos,
+            "inbound HBONE relay synthesis must stay ahead of the REGISTRY_ONLY route-miss gate"
         );
     }
 

@@ -2,8 +2,8 @@
 
 Functional integration tests for Ferrum's **external-middleware integrations** —
 the code paths that can only be validated against the **real third-party
-software** (a service registry, a directory server, …). Each backend runs as a
-local container via [`testcontainers`](https://docs.rs/testcontainers) (Docker)
+software** (a service registry, a directory server, a Kafka broker, …). Each
+backend runs as a local container via [`testcontainers`](https://docs.rs/testcontainers) (Docker)
 using free, open-source images. No managed or cloud service is ever involved,
 and every fixture seeds its own fully-controlled data so the assertions are
 deterministic.
@@ -22,6 +22,7 @@ their *failure* path, leaving the real client logic uncovered:
 | --- | --- | --- | --- |
 | **Consul** (`src/service_discovery/consul.rs`) | `ConsulDiscoverer::discover()` — health-API JSON parsing | inline unit tests covered only `build_url()` | live Consul: Service-vs-Node address fallback, port/weight/tag extraction, `passing=true` health filter, per-tag filtering, unknown-service empty result |
 | **LDAP** (`src/plugins/ldap_auth.rs`) | `ldap3` bind / search-then-bind / group membership, via `create_plugin` → `authenticate` | functional test only pointed the plugin at an *unreachable* server (500 / 401 paths) | live OpenLDAP: valid/invalid direct bind, search-then-bind, group-membership allow (Continue) vs deny (403) |
+| **Kafka** (`src/plugins/kafka_logging.rs`) | librdkafka produce, delivery callbacks, consume-back, bounded finalize | deterministic unit tests for admission/CRL/budgets/finalize ownership; ignored optional broker harness | live Redpanda: successful ack + key/record consume, unknown-topic reject after admission, broker oversized reject, paused-broker delivery timeout, producer-queue saturation, successful and stalled finalize, multi-instance generation isolation, Drop/reload disposal with pending records |
 | **MySQL** (`src/config/migrations/mod.rs`) | custom-plugin DDL plus tracking under MySQL's implicit-commit rules | SQLite covered atomic migration behavior; MySQL SQL was previously inspected only as strings | live MySQL 8.4: failure after committed V1 DDL, exact index reconstruction on retry, V2 index/tracker-gap recovery, and SQLx Any text bindings used by `example_audit_plugin` |
 
 ## Running locally
@@ -33,6 +34,7 @@ cargo test --test service_integration
 # One backend (the test-name filter selects the module)
 cargo test --test service_integration consul
 cargo test --test service_integration ldap
+cargo test --test service_integration kafka
 cargo test --test service_integration mysql
 ```
 
@@ -57,30 +59,67 @@ rather than silently passing.
 | --- | --- | --- |
 | Consul | `hashicorp/consul:1.19` | `agent -dev`; readiness polled via `/v1/status/leader` |
 | OpenLDAP | `osixia/openldap:1.5.0` | base `dc=example,dc=org`; test tree seeded via `ldapadd` exec (readiness handled by retry) |
+| Redpanda | `redpandadata/redpanda:v24.2.4` | Kafka API on external listener `127.0.0.1:<mapped-port>`; auto-topic-create disabled; readiness via librdkafka metadata; topics created with `rpk` |
 | MySQL | `mysql:8.4` | isolated `ferrum` database; readiness polled with the same SQLx Any driver used by migrations/runtime persistence |
 
-Readiness is confirmed by **active polling** (Consul leader endpoint, LDAP
-`ldapadd` retry, or a MySQL connection), not by matching a startup log line —
+Readiness is confirmed by **active polling** (Consul leader endpoint; LDAP
+`ldapadd` retry; Redpanda metadata fetch; a MySQL connection), not by matching a
+startup log line —
 so the helpers do not depend on which stream a given image logs to.
 
 ## CI
 
 `.github/workflows/ci.yml` job `test-service-integration` runs on
-`ubuntu-latest` (Docker available). Consul, LDAP, and MySQL run in one nextest
+`ubuntu-latest` (Docker available). Consul, LDAP, Kafka, and MySQL run in one nextest
 `--no-fail-fast` invocation, which preserves per-test reporting and continues
 after one backend fails without allocating a second runner. It is wired into
 the `test` aggregation gate, so it blocks merge on failure.
 
+## Kafka acceptance split
+
+Hosted Redpanda covers the broker-dependent acceptance contract from #2548 /
+#2551 as fully as practical:
+
+- successful acknowledgement with delivered count, zero failure/rejection, key +
+  consume-back of a known path marker
+- unknown-topic rejection after local admission
+- broker-side oversized-message rejection (`max.message.bytes` on the topic)
+- delivery timeout via `acks=all` against a docker-paused broker (Redpanda
+  v24.2 does not materialize Kafka's topic `min.insync.replicas`; produce the
+  producer while live, then pause so ack cannot complete)
+- immediate `queue.buffering.max.messages=1` saturation while a prior record is
+  stuck on that paused broker
+- successful bounded finalize after delivery
+- stalled/failed bounded finalize accounting against a paused broker
+- generation isolation across instances and Drop-time old-generation disposal
+  while a record is pending on a paused broker (then unpause for the next
+  healthy generation)
+
+Deterministic unit coverage remains the home for cases that do not need a
+broker (and must stay OpenSSL/librdkafka-host independent):
+
+- unknown root keys / producer_config security aliases
+- gateway CRL conflict, match, file-URI normalize, non-file fail-closed,
+  `ssl_no_verify` skip
+- Ferrum channel / byte-budget / entry-oversize admission
+- reserve-before-serialize
+- exact-once finalize without pending broker I/O
+- docs feature-contract (no undeclared `kafka` Cargo feature)
+
+The optional ignored harness in
+`tests/integration/kafka_logging_broker_tests.rs` remains for developers with
+an external broker via `FERRUM_TEST_KAFKA_BOOTSTRAP`; hosted CI does **not**
+rely on it.
+
 ## Adding another external service
 
-The high-value gaps closed here are the first wave. The same pattern extends to
-the rest; follow `common/containers.rs` (and `tests/secrets_functional/` for the
+Follow `common/containers.rs` (and `tests/secrets_functional/` for the
 cloud-SDK variant):
 
 1. Add a `start_<svc>_container()` (+ a small fixture struct) to
    `common/containers.rs`. Prefer **active readiness polling** over a log-line
    wait. Seed fixtures via the container's API or an `exec` (see the Consul
-   register helper and the LDAP `ldapadd` seeder).
+   register helper, the LDAP `ldapadd` seeder, and the Redpanda `rpk` helper).
 2. Add a `<svc>.rs` module and register it in `mod.rs`.
 3. Drive the **real** code: construct the plugin via
    `ferrum_edge::plugins::create_plugin(name, &config)` and call the relevant
@@ -91,12 +130,6 @@ cloud-SDK variant):
 
 ### Candidates / roadmap
 
-- **Kafka** (`kafka_logging`, `rdkafka` producer) — broker publish is untested.
-  Use `apache/kafka` (KRaft, no ZooKeeper). The one wrinkle is the dynamic
-  advertised-listener / host-port mapping (the broker must advertise the
-  host-mapped port to the client); pin the host port for the dedicated matrix
-  shard, or replicate the testcontainers-java startup-script approach. Verify
-  against a real broker before landing — it is the trickiest of the set.
 - **OIDC relying party / OAuth2 introspection** — login/session/introspection
   flows. Use `ory/hydra` or `keycloak`.
 

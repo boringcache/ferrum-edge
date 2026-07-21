@@ -322,6 +322,22 @@ pub const WS_DISCONNECT_FIELDS: &[FieldMeta] = &[
         is_timestamp: false,
     },
     FieldMeta {
+        name: "bytes_client_to_backend",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "bytes_backend_to_client",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "timestamp_connected",
+        is_timestamp: true,
+    },
+    FieldMeta {
+        name: "timestamp_disconnected",
+        is_timestamp: true,
+    },
+    FieldMeta {
         name: "direction",
         is_timestamp: false,
     },
@@ -581,6 +597,6 @@ mod tests {
 
     #[test]
     fn websocket_disconnect_fields_match_expected_count() {
-        assert_eq!(WS_DISCONNECT_FIELDS.len(), 17);
+        assert_eq!(WS_DISCONNECT_FIELDS.len(), 21);
     }
 }

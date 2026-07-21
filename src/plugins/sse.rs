@@ -16,24 +16,27 @@
 //! 1. **`on_request_received`** — Validates inbound SSE client criteria:
 //!    - Method must be GET (SSE is read-only, no request body)
 //!    - `Accept` header must include `text/event-stream`
-//!    - Optionally validates `Last-Event-ID` format for reconnection
+//!    - Bounds `Last-Event-ID` for reconnection (treated as sensitive)
 //!    - Rejects non-conforming requests with 405 (wrong method) or 406 (wrong Accept)
 //!
 //! 2. **`before_proxy`** — Shapes the request for the upstream backend:
 //!    - Strips `Accept-Encoding` to prevent compressed chunked responses that
 //!      break SSE framing (SSE relies on line-delimited text over chunked transfer)
 //!    - Forwards `Last-Event-ID` as a header so the backend can resume the stream
-//!    - Stores the original `Accept` value in metadata for the response phase
 //!
 //! 3. **`after_proxy`** — Sets proper SSE response headers:
-//!    - `Cache-Control: no-cache` (SSE streams must not be cached)
-//!    - `Connection: keep-alive` (long-lived streaming connection)
+//!    - Conservatively merges `Cache-Control` with `no-cache` without weakening
+//!      origin `private` / `no-store` / `no-transform` / extensions
+//!    - Does **not** emit HTTP/1-only `Connection: keep-alive` (illegal on H2/H3;
+//!      unnecessary on HTTP/1.1 persistent connections)
 //!    - `X-Accel-Buffering: no` (disables nginx/ALB response buffering)
 //!    - Strips `Content-Length` (SSE streams are indefinite)
-//!    - Optionally forces `Content-Type: text/event-stream` on non-SSE backends
+//!    - Relabels non-SSE responses as `text/event-stream` when forcing and/or
+//!      when wrapping will convert the body
 //!
 //! 4. **`transform_response_body`** — Optionally wraps non-SSE upstream
-//!    responses into `data: ...\n\n` SSE event framing (buffered responses only).
+//!    responses into `data: ...\n\n` SSE event framing (buffered responses only),
+//!    preserving terminal line-break semantics for EventSource `MessageEvent.data`.
 //!
 //! ## Config
 //!
@@ -49,14 +52,50 @@
 //!   "wrap_non_sse_responses": false
 //! }
 //! ```
+//!
+//! Unknown keys and non-object configs are rejected. Explicit JSON `null`
+//! members are rejected (missing keys keep defaults). `wrap_non_sse_responses`
+//! implies a client-visible `text/event-stream` media type for responses that
+//! are wrapped.
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use super::utils::sse::is_text_event_stream_media_type;
 use super::{PluginResult, RequestContext};
+use crate::util::http_headers::headers_have_cache_control_directive;
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Request-scoped metadata key holding the raw `Last-Event-ID` for backend
+/// forwarding. Stripped from transaction-log metadata; never interpolate into
+/// diagnostics.
+pub const LAST_EVENT_ID_METADATA_KEY: &str = "sse:last_event_id";
+
+/// Request-scoped flag set by `after_proxy` when a non-SSE backend response
+/// should be wrapped. Body transforms key off this rather than the (possibly
+/// already relabeled) client-facing `Content-Type`.
+const WRAP_NON_SSE_METADATA_KEY: &str = "sse:wrap_non_sse";
+
+/// Request-scoped provenance marker set when an SSE plugin relabels an
+/// originally non-SSE response. A later SSE instance must not mistake that
+/// relabelled media type for a genuine upstream event stream and skip wrapping.
+const RELABELLED_NON_SSE_METADATA_KEY: &str = "sse:relabeled_non_sse";
+
+/// Maximum accepted `Last-Event-ID` byte length (hostile-input bound).
+pub const MAX_LAST_EVENT_ID_BYTES: usize = 1024;
+
+const SSE_CONFIG_KEYS: &[&str] = &[
+    "require_accept_header",
+    "require_get_method",
+    "strip_accept_encoding",
+    "add_no_buffering_header",
+    "strip_content_length",
+    "retry_ms",
+    "force_sse_content_type",
+    "wrap_non_sse_responses",
+];
 
 pub struct SsePlugin {
     // ── Request validation ───────────────────────────────────────────────
@@ -83,20 +122,29 @@ pub struct SsePlugin {
     /// a different content type. Default: false.
     force_sse_content_type: bool,
     /// Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing.
-    /// Only applies to buffered responses. Default: false.
+    /// Only applies to buffered responses. Implies client-visible
+    /// `text/event-stream` for wrapped responses. Default: false.
     wrap_non_sse_responses: bool,
 }
 
 impl SsePlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let require_accept_header = bool_config(config, "require_accept_header", true)?;
-        let require_get_method = bool_config(config, "require_get_method", true)?;
-        let strip_accept_encoding = bool_config(config, "strip_accept_encoding", true)?;
-        let add_no_buffering_header = bool_config(config, "add_no_buffering_header", true)?;
-        let strip_content_length = bool_config(config, "strip_content_length", true)?;
-        let retry_ms = optional_positive_u64_config(config, "retry_ms")?;
-        let force_sse_content_type = bool_config(config, "force_sse_content_type", false)?;
-        let wrap_non_sse_responses = bool_config(config, "wrap_non_sse_responses", false)?;
+        let Some(config_obj) = config.as_object() else {
+            return Err(format!(
+                "sse: config must be an object, got: {}",
+                value_kind(config)
+            ));
+        };
+        reject_unknown_keys(config_obj, "config", SSE_CONFIG_KEYS, "sse: ")?;
+
+        let require_accept_header = bool_config(config_obj, "require_accept_header", true)?;
+        let require_get_method = bool_config(config_obj, "require_get_method", true)?;
+        let strip_accept_encoding = bool_config(config_obj, "strip_accept_encoding", true)?;
+        let add_no_buffering_header = bool_config(config_obj, "add_no_buffering_header", true)?;
+        let strip_content_length = bool_config(config_obj, "strip_content_length", true)?;
+        let retry_ms = optional_positive_u64_config(config_obj, "retry_ms")?;
+        let force_sse_content_type = bool_config(config_obj, "force_sse_content_type", false)?;
+        let wrap_non_sse_responses = bool_config(config_obj, "wrap_non_sse_responses", false)?;
         let retry_ms_text = retry_ms.map(|retry| retry.to_string());
         let retry_field = retry_ms_text.as_ref().map(|retry| {
             let mut field = Vec::with_capacity("retry: \n".len() + retry.len());
@@ -130,19 +178,81 @@ impl SsePlugin {
     fn is_sse_content_type(content_type: &str) -> bool {
         is_text_event_stream_media_type(content_type.trim())
     }
-}
 
-fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
-    match config.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(other) => Err(format!("sse: '{key}' must be a boolean, got: {other}")),
+    /// Wrap normalized text into one SSE event, preserving terminal newlines.
+    fn wrap_body_as_sse_event(&self, body: &[u8]) -> Vec<u8> {
+        // Per the WHATWG EventSource algorithm, each `data:` field appends its
+        // value plus LF to the data buffer, then dispatch removes exactly one
+        // trailing LF. A payload that itself ends in LF therefore requires an
+        // empty final `data:` field. `str::lines()` drops a single trailing
+        // terminator, so restore it when the normalized body ends with `\n`.
+        //
+        // Normalize CRLF and lone CR to LF first so no bare CR reaches the wire
+        // (lone CR would reintroduce field-injection boundaries).
+        let body_str = String::from_utf8_lossy(body);
+        let normalized = body_str.replace("\r\n", "\n").replace('\r', "\n");
+        let ends_with_newline = normalized.ends_with('\n');
+        let mut output = Vec::with_capacity(normalized.len() + 64);
+
+        if let Some(retry_field) = &self.retry_field {
+            output.extend_from_slice(retry_field);
+        }
+
+        for line in normalized.lines() {
+            output.extend_from_slice(b"data: ");
+            output.extend_from_slice(line.as_bytes());
+            output.push(b'\n');
+        }
+        if ends_with_newline {
+            output.extend_from_slice(b"data: \n");
+        }
+        // Blank line terminates the event.
+        output.push(b'\n');
+        output
     }
 }
 
-fn optional_positive_u64_config(config: &Value, key: &str) -> Result<Option<u64>, String> {
+/// Remove SSE lifecycle/control metadata from operator-visible transaction logs
+/// while preserving safe correlation hints. Raw `Last-Event-ID` must never reach
+/// logging sinks. Correlation keys intentionally avoid the `last_event_id`
+/// substring so default metadata redaction does not blank them.
+pub fn redact_sse_log_metadata(metadata: &mut HashMap<String, String>) {
+    if let Some(raw) = metadata.remove(LAST_EVENT_ID_METADATA_KEY) {
+        metadata.insert("sse:leid_present".to_string(), "1".to_string());
+        metadata.insert("sse:leid_bytes".to_string(), raw.len().to_string());
+    }
+    metadata.remove(WRAP_NON_SSE_METADATA_KEY);
+    metadata.remove(RELABELLED_NON_SSE_METADATA_KEY);
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn bool_config(config: &Map<String, Value>, key: &str, default: bool) -> Result<bool, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(format!(
+            "sse: '{key}' must be a boolean, got: {}",
+            value_kind(other)
+        )),
+    }
+}
+
+fn optional_positive_u64_config(
+    config: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        None => Ok(None),
         Some(Value::Number(number)) => match number.as_u64() {
             Some(value) if value > 0 => Ok(Some(value)),
             Some(_) => Err(format!("sse: '{key}' must be greater than zero")),
@@ -151,8 +261,35 @@ fn optional_positive_u64_config(config: &Value, key: &str) -> Result<Option<u64>
             )),
         },
         Some(other) => Err(format!(
-            "sse: '{key}' must be an unsigned integer, got: {other}"
+            "sse: '{key}' must be an unsigned integer, got: {}",
+            value_kind(other)
         )),
+    }
+}
+
+/// Conservatively ensure SSE responses carry `no-cache` without weakening the
+/// origin `Cache-Control` contract. Never replaces the existing field; only
+/// appends `no-cache` when that directive name is not already present as a
+/// top-level token (quoted-string interiors are skipped).
+fn ensure_sse_cache_control(response_headers: &mut HashMap<String, String>) {
+    if headers_have_cache_control_directive(response_headers, "no-cache") {
+        // Preserve the origin value verbatim (duplicates, extensions,
+        // private/no-store/no-transform, quoted forms, malformed tokens).
+        return;
+    }
+
+    if let Some(existing) = response_headers
+        .iter_mut()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case("cache-control").then_some(value))
+    {
+        if !existing.trim_end().is_empty() && !existing.trim_end().ends_with(',') {
+            existing.push_str(", ");
+        } else if !existing.is_empty() && !existing.ends_with(' ') {
+            existing.push(' ');
+        }
+        existing.push_str("no-cache");
+    } else {
+        response_headers.insert("cache-control".to_string(), "no-cache".to_string());
     }
 }
 
@@ -181,11 +318,13 @@ impl super::Plugin for SsePlugin {
     fn should_buffer_response_body_for_content_type(
         &self,
         _ctx: &RequestContext,
-        _content_type: Option<&str>,
+        content_type: Option<&str>,
         response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.wrap_non_sse_responses && super::response_body_rewrite_allowed(response_status)
+        self.wrap_non_sse_responses
+            && super::response_body_rewrite_allowed(response_status)
+            && !content_type.is_some_and(Self::is_sse_content_type)
     }
 
     fn should_release_response_body_before_content_type_rewrite(
@@ -239,12 +378,31 @@ impl super::Plugin for SsePlugin {
             }
         }
 
-        // Stash Last-Event-ID in metadata so before_proxy can forward it and
-        // the backend can resume the stream from the correct position.
+        // Stash Last-Event-ID for backend forwarding only. The value is
+        // origin-defined opaque UTF-8 and is treated as sensitive: never
+        // interpolate it into diagnostics, and omit/redact it from transaction
+        // logs (see `redact_sse_log_metadata` + metadata redaction defaults).
         if let Some(last_id) = ctx.headers.get("last-event-id") {
+            if last_id.len() > MAX_LAST_EVENT_ID_BYTES {
+                warn!(
+                    plugin = "sse",
+                    last_event_id_len = last_id.len(),
+                    max_bytes = MAX_LAST_EVENT_ID_BYTES,
+                    "SSE request rejected: Last-Event-ID exceeds maximum length"
+                );
+                return PluginResult::Reject {
+                    status_code: 400,
+                    body: r#"{"error":"Last-Event-ID exceeds maximum length"}"#.to_string(),
+                    headers: HashMap::new(),
+                };
+            }
             ctx.metadata
-                .insert("sse:last_event_id".to_string(), last_id.clone());
-            debug!(plugin = "sse", last_event_id = %last_id, "SSE reconnection with Last-Event-ID");
+                .insert(LAST_EVENT_ID_METADATA_KEY.to_string(), last_id.clone());
+            debug!(
+                plugin = "sse",
+                last_event_id_len = last_id.len(),
+                "SSE reconnection with Last-Event-ID"
+            );
         }
 
         debug!(plugin = "sse", "SSE client request validated");
@@ -258,14 +416,6 @@ impl super::Plugin for SsePlugin {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Save original Accept for the response phase.
-        // Read from `headers` param — ctx.headers may be empty when the handler
-        // uses the zero-clone fast path (std::mem::take).
-        if let Some(accept) = headers.get("accept") {
-            ctx.metadata
-                .insert("sse:original_accept".to_string(), accept.clone());
-        }
-
         // Strip Accept-Encoding to prevent the backend from gzip-compressing
         // the SSE stream. Compressed chunked responses break SSE's
         // line-delimited text framing — the EventSource parser expects raw
@@ -277,7 +427,7 @@ impl super::Plugin for SsePlugin {
         // Ensure Last-Event-ID is forwarded as a header. Some clients send it
         // only as a query parameter; the metadata stash from on_request_received
         // ensures it's always available. The header takes precedence if both exist.
-        if let Some(last_id) = ctx.metadata.get("sse:last_event_id") {
+        if let Some(last_id) = ctx.metadata.get(LAST_EVENT_ID_METADATA_KEY) {
             headers
                 .entry("last-event-id".to_string())
                 .or_insert_with(|| last_id.clone());
@@ -295,17 +445,11 @@ impl super::Plugin for SsePlugin {
         response_content_type: Option<&str>,
     ) -> bool {
         // `after_proxy` rewrites the response `Content-Type` to
-        // `text/event-stream` only when `force_sse_content_type` is set AND the
-        // backend did not already send an SSE type. Mirror that exact condition
-        // so the proxy's buffer/stream downgrade keys off the final
-        // client-visible type rather than the backend header it is about to
-        // overwrite — while still letting a genuine `text/event-stream`
-        // response take the SSE→stream downgrade. Returning `true`
-        // unconditionally on `force_sse_content_type` would pin an unbounded SSE
-        // stream onto the buffered path and collect it until the
-        // max-response-body limit 502s it, defeating the SSE-never-buffer
-        // protection every response-buffering plugin already implements.
-        self.force_sse_content_type && !response_content_type.is_some_and(Self::is_sse_content_type)
+        // `text/event-stream` when forcing OR when wrapping a non-SSE body.
+        // Mirror that condition so the proxy's buffer/stream downgrade keys off
+        // the final client-visible type.
+        (self.force_sse_content_type || self.wrap_non_sse_responses)
+            && !response_content_type.is_some_and(Self::is_sse_content_type)
     }
 
     async fn after_proxy(
@@ -317,34 +461,56 @@ impl super::Plugin for SsePlugin {
         let is_sse = response_headers
             .get("content-type")
             .is_some_and(|ct| Self::is_sse_content_type(ct));
+        let was_relabelled_non_sse = ctx
+            .metadata
+            .get(RELABELLED_NON_SSE_METADATA_KEY)
+            .is_some_and(|value| value == "1");
+        let origin_was_sse = is_sse && !was_relabelled_non_sse;
 
-        // For a non-SSE backend response, forcing SSE headers depends on the
+        // For a non-SSE backend response, wrapping/forcing depends on the
         // configured body wrapper running. Preserved 206/226 bytes cannot be
         // wrapped, so do not relabel them as an SSE event stream.
-        if !is_sse
-            && self.wrap_non_sse_responses
-            && !super::response_body_rewrite_allowed(response_status)
-        {
+        let wrap_allowed =
+            self.wrap_non_sse_responses && super::response_body_rewrite_allowed(response_status);
+        if !origin_was_sse && self.wrap_non_sse_responses && !wrap_allowed {
             return PluginResult::Continue;
         }
 
-        // If the backend didn't return SSE and we're not forcing, nothing to do.
-        if !is_sse && !self.force_sse_content_type {
+        let will_wrap = !origin_was_sse && wrap_allowed;
+        let will_force = !is_sse && self.force_sse_content_type;
+
+        // If the backend didn't return SSE and we're neither wrapping nor
+        // forcing, nothing to do.
+        if !is_sse && !will_wrap && !will_force {
             return PluginResult::Continue;
         }
 
-        // Force Content-Type to text/event-stream if the backend returned
-        // something else (e.g., application/json from a generic endpoint).
-        if self.force_sse_content_type && !is_sse {
+        if will_wrap {
+            // Coordinate body wrapping with the original backend type even after
+            // we relabel the client-facing Content-Type below.
+            ctx.metadata
+                .insert(WRAP_NON_SSE_METADATA_KEY.to_string(), "1".to_string());
+        }
+
+        if !is_sse && (will_wrap || will_force) {
+            ctx.metadata
+                .insert(RELABELLED_NON_SSE_METADATA_KEY.to_string(), "1".to_string());
+        }
+
+        // Wrapping implies a browser-consumable EventSource media type.
+        // Force alone also relabels. Genuine upstream SSE keeps its type.
+        if (will_wrap || will_force) && !is_sse {
             response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
-            debug!(plugin = "sse", "forced Content-Type to text/event-stream");
+            debug!(plugin = "sse", "set Content-Type to text/event-stream");
         }
 
-        // SSE streams must not be cached — stale events are meaningless.
-        response_headers.insert("cache-control".to_string(), "no-cache".to_string());
+        // Conservatively merge Cache-Control: add no-cache without removing
+        // private / no-store / no-transform / extensions / duplicates.
+        ensure_sse_cache_control(response_headers);
 
-        // Keep-alive signals that this is a long-lived streaming connection.
-        response_headers.insert("connection".to_string(), "keep-alive".to_string());
+        // Do not emit `Connection: keep-alive`. Connection-specific fields are
+        // forbidden on HTTP/2 and HTTP/3 (RFC 9113 §8.6 / RFC 9114 §4.2), and
+        // HTTP/1.1 persistence does not require an explicit keep-alive token.
 
         // Disable reverse-proxy buffering (nginx X-Accel-Buffering, AWS ALB, etc.).
         // Without this, intermediary proxies may buffer the entire response before
@@ -371,8 +537,9 @@ impl super::Plugin for SsePlugin {
 
     // ── Phase 4: Optionally wrap non-SSE body into SSE framing ───────────
 
-    async fn transform_response_body(
+    async fn transform_response_body_with_context(
         &self,
+        ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
@@ -381,46 +548,28 @@ impl super::Plugin for SsePlugin {
             return None;
         }
 
-        // Don't double-wrap a response that's already SSE.
-        if let Some(ct) = content_type
-            && Self::is_sse_content_type(ct)
-        {
+        // This is a one-shot request decision. Multiple `sse` instances can
+        // run on one proxy; only the first configured wrapper may consume the
+        // original non-SSE body. Leaving the shared marker in metadata would
+        // make every later instance wrap the already-framed event again.
+        let wrap_requested = ctx
+            .metadata
+            .remove(WRAP_NON_SSE_METADATA_KEY)
+            .is_some_and(|v| v == "1");
+        if wrap_requested {
+            ctx.metadata.remove(RELABELLED_NON_SSE_METADATA_KEY);
+        }
+
+        // Don't double-wrap a genuine upstream SSE response. When after_proxy
+        // already decided to wrap (and may have relabeled Content-Type), honor
+        // that request-scoped decision instead of the mutated media type.
+        // Direct callers without after_proxy still wrap only when the supplied
+        // type is not already SSE.
+        if !wrap_requested && content_type.is_some_and(Self::is_sse_content_type) {
             return None;
         }
 
-        // Build the SSE event. Per the spec, multi-line data uses one
-        // `data:` field per line, and a blank line terminates the event.
-        //
-        // The WHATWG/W3C EventSource wire format treats CR, LF, *or* CRLF as a
-        // line terminator, but `str::lines()` only splits on `\n` and `\r\n`. A
-        // lone `\r` would therefore survive verbatim into the output and be
-        // re-interpreted by the client's parser as a field/line boundary,
-        // letting upstream-controlled bytes inject arbitrary `data:`/`event:`/
-        // `id:`/`retry:` fields or forge an event boundary (blank line). Since
-        // this hook wraps untrusted non-SSE upstream bytes into trusted SSE
-        // framing, normalize every terminator (CRLF and lone CR) to LF first so
-        // no bare CR ever reaches the wire and each upstream logical line maps
-        // to exactly one escaped `data:` field. The `\r\n` pass runs before the
-        // lone-`\r` pass so a CRLF does not become a double LF (spurious empty
-        // data line).
-        let body_str = String::from_utf8_lossy(body);
-        let normalized = body_str.replace("\r\n", "\n").replace('\r', "\n");
-        let mut output = Vec::with_capacity(normalized.len() + 64);
-
-        // Prepend `retry:` field if configured — tells the EventSource client
-        // how long to wait before reconnecting after a disconnect.
-        if let Some(retry_field) = &self.retry_field {
-            output.extend_from_slice(retry_field);
-        }
-
-        for line in normalized.lines() {
-            output.extend_from_slice(b"data: ");
-            output.extend_from_slice(line.as_bytes());
-            output.push(b'\n');
-        }
-        // Blank line terminates the event.
-        output.push(b'\n');
-
+        let output = self.wrap_body_as_sse_event(body);
         debug!(
             plugin = "sse",
             original_bytes = body.len(),
@@ -428,5 +577,18 @@ impl super::Plugin for SsePlugin {
             "wrapped response into SSE event"
         );
         Some(output)
+    }
+
+    async fn transform_response_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // Fallback when no request context is available (legacy callers).
+        let mut ctx =
+            RequestContext::new("0.0.0.0".to_string(), "GET".to_string(), "/".to_string());
+        self.transform_response_body_with_context(&mut ctx, body, content_type, response_headers)
+            .await
     }
 }

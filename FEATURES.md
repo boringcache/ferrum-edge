@@ -172,7 +172,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ### SSE Plugin
 
-- **SSE** — Server-Sent Events stream handler. Validates inbound SSE client criteria (GET method, `Accept: text/event-stream`), shapes requests for backends (strips `Accept-Encoding`, forwards `Last-Event-ID`), and ensures proper streaming response headers (`Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`). Optionally forces `text/event-stream` content type and wraps non-SSE responses into SSE event framing
+- **SSE** — Server-Sent Events stream handler. Validates inbound SSE client criteria (GET method, `Accept: text/event-stream`), shapes requests for backends (strips `Accept-Encoding`, forwards bounded `Last-Event-ID` without logging the raw value), and ensures proper streaming response headers (conservative `Cache-Control` merge with `no-cache`, `X-Accel-Buffering: no`; no HTTP/1-only `Connection: keep-alive` on H2/H3). Optionally forces `text/event-stream` content type and wraps non-SSE responses into SSE event framing with terminal newline fidelity; wrapping implies a client-visible SSE media type and composes with content-type forcing.
 
 ### Transform Plugins
 

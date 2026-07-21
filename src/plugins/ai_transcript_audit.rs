@@ -2052,11 +2052,11 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
         Ok(resp) => {
             cfg.sink_healthy
                 .store(resp.status().is_success(), Ordering::Relaxed);
-            handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp))
+            handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp)).await
         }
         Err(err) => {
             cfg.sink_healthy.store(false, Ordering::Relaxed);
-            handle_http_batch_response("ai_transcript_audit", entry_count, Err(err))
+            handle_http_batch_response("ai_transcript_audit", entry_count, Err(err)).await
         }
     }
 }

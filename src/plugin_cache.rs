@@ -1074,6 +1074,17 @@ fn try_create_plugin(
             current_tcp_throttle_states,
             staged_tcp_throttle_states,
         )
+    } else if pc.plugin_name == "load_testing" {
+        // Share run-admission state across compatible reload generations for
+        // the same plugin-config identity so a replacement instance cannot
+        // start a second high-cost cohort while a prior detached run is active.
+        crate::plugins::load_testing::LoadTesting::new_with_instance_id(
+            &pc.config,
+            http_client.clone(),
+            &pc.namespace,
+            &pc.id,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else {
         create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
     };

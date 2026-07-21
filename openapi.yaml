@@ -11239,13 +11239,34 @@ components:
 
     TcpLoggingConfig:
       type: object
-      description: "Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent TCP or TCP+TLS connection."
+      additionalProperties: false
+      description: >-
+        Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent
+        TCP or TCP+TLS connection. Only the properties below are admitted;
+        unknown keys (for example a misspelled `tlls`) are rejected so transport
+        security cannot silently default to plaintext. `connect_timeout_ms`
+        bounds DNS, TCP connect, and TLS handshake when enabled.
+        `write_timeout_ms` bounds each batch write/flush; timeouts discard the
+        writer and use the shared retry/reconnect path. Delivery is
+        at-least-once after partial-write failure. Registration policy is
+        KeepLastKnownGood: an invalid enabled candidate rejects startup or
+        reload publication instead of silently removing or downgrading the
+        previously accepted logger.
       required:
         - host
         - port
+      allOf:
+        - if:
+            required: [tls_server_name]
+          then:
+            required: [tls]
+            properties:
+              tls:
+                const: true
       properties:
         host:
           type: string
+          minLength: 1
           description: Hostname or IP of the TCP log receiver
         port:
           type: integer
@@ -11258,10 +11279,18 @@ components:
           description: Enable TLS encryption for the connection
         tls_server_name:
           type: string
-          description: SNI server name override for TLS (defaults to host)
+          minLength: 1
+          pattern: '^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)$'
+          description: >-
+            DNS or IP identity for TLS SNI/certificate verification (defaults to
+            `host`). Allowed only when `tls` is true. The schema rejects URL
+            schemes, paths, queries, fragments, credentials, whitespace, and
+            host:port values; full rustls DNS/IP identity validation is enforced
+            during plugin admission.
         batch_size:
           type: integer
           default: 50
+          minimum: 1
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11271,38 +11300,91 @@ components:
         max_retries:
           type: integer
           default: 3
+          minimum: 0
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 0
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
           description: Channel capacity — new entries are dropped when full
         connect_timeout_ms:
           type: integer
           default: 5000
           minimum: 100
-          description: TCP connection timeout in milliseconds
+          maximum: 60000
+          description: >-
+            Connection establishment timeout in milliseconds. Covers DNS
+            resolution, TCP connect, and the TLS handshake when `tls` is true.
+        write_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          maximum: 60000
+          description: >-
+            Per-batch socket write_all + flush timeout in milliseconds. On
+            timeout the persistent writer is discarded and retries reconnect.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
           type: string
+          minLength: 1
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
             Mutually exclusive with `schema`. See docs/log_schema.md.
 
     UdpLoggingConfig:
       type: object
-      description: "Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in batches."
+      additionalProperties: false
+      description: >-
+        Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in
+        batches. Unknown top-level keys are rejected at construction / Admin
+        validation so transport typos (for example `dtsl`) cannot silently
+        fall back to plaintext. DTLS-only fields require `dtls: true` (omitted
+        or false rejects them) so Admin/spec admission cannot accept plaintext
+        configs that runtime would ignore. Registration policy is
+        OptionalFailOpen (invalid enabled instances are omitted from the
+        published cache).
       required:
         - host
         - port
+      allOf:
+        - if:
+            required: [dtls]
+            properties:
+              dtls:
+                const: true
+          then:
+            dependentRequired:
+              dtls_cert_path: [dtls_key_path]
+              dtls_key_path: [dtls_cert_path]
+          else:
+            not:
+              anyOf:
+                - required: [dtls_cert_path]
+                - required: [dtls_key_path]
+                - required: [dtls_ca_cert_path]
+                - required: [dtls_no_verify]
       properties:
         host:
           type: string
-          description: UDP endpoint hostname or IP address
+          minLength: 1
+          # Match runtime parse_socket_host: hostname or IP without scheme,
+          # path, query, fragment, credentials, or a single-colon host:port.
+          # Valid IPv6 literals necessarily contain at least two colons.
+          not:
+            anyOf:
+              - pattern: "://"
+              - pattern: "[/?#@\\s]"
+              - pattern: "^[^\\[\\]:]+:[^:]+$"
+          description: >-
+            UDP endpoint hostname or IP address. Must be a bare hostname or IP
+            without scheme, path, query, fragment, credentials, or port
+            (bracketed and unbracketed IPv6 literals are allowed).
         port:
           type: integer
           minimum: 1
@@ -11311,20 +11393,39 @@ components:
         dtls:
           type: boolean
           default: false
-          description: Enable DTLS encryption for log datagrams
+          description: >-
+            Enable DTLS encryption for log datagrams. Shared Admin / CP validation
+            checks configuration shape without opening node-local sources. On the
+            consuming node, certificate/key/CA sources are materialized and cached
+            for the plugin generation. When false or omitted, DTLS-only fields are
+            rejected.
         dtls_cert_path:
           type: string
-          description: PEM client certificate for DTLS mutual TLS
+          minLength: 1
+          description: >-
+            PEM client certificate for DTLS mutual TLS. Materialized during the
+            consuming node's dependency/construction phase when dtls is true; must
+            be paired with dtls_key_path. Rejected unless dtls is true.
         dtls_key_path:
           type: string
-          description: PEM private key for DTLS mutual TLS (must be paired with dtls_cert_path)
+          minLength: 1
+          description: >-
+            PEM private key for DTLS mutual TLS (ECDSA P-256 or P-384). Must be
+            paired with dtls_cert_path. Rejected unless dtls is true.
         dtls_ca_cert_path:
           type: string
-          description: PEM CA certificate for verifying the DTLS server
+          minLength: 1
+          description: >-
+            PEM CA certificate for verifying the DTLS server. Materialized on the
+            consuming node whenever set with dtls true, including when dtls_no_verify
+            is true (the source must still be valid even though verification is
+            disabled). Rejected unless dtls is true.
         dtls_no_verify:
           type: boolean
           default: false
-          description: Skip DTLS server certificate verification (testing only)
+          description: >-
+            Skip DTLS server certificate verification (testing only). Rejected
+            unless dtls is true.
         batch_size:
           type: integer
           default: 10
@@ -11356,16 +11457,59 @@ components:
 
     KafkaLoggingConfig:
       type: object
-      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries."
+      additionalProperties: false
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload."
       required:
         - broker_list
         - topic
+      allOf:
+        - if:
+            anyOf:
+              - required: [ssl_ca_location]
+              - required: [ssl_no_verify]
+              - required: [ssl_certificate_location]
+              - required: [ssl_key_location]
+          then:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [ssl, sasl_ssl]
+        - if:
+            anyOf:
+              - required: [sasl_mechanism]
+              - required: [sasl_username]
+              - required: [sasl_password]
+          then:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [sasl_plaintext, sasl_ssl]
+        - if:
+            required: [ssl_certificate_location]
+          then:
+            required: [ssl_key_location]
+        - if:
+            required: [ssl_key_location]
+          then:
+            required: [ssl_certificate_location]
+        - if:
+            required: [sasl_username]
+          then:
+            required: [sasl_password]
+        - if:
+            required: [sasl_password]
+          then:
+            required: [sasl_username]
       properties:
         broker_list:
           type: string
+          minLength: 1
+          pattern: '[^,\s]'
           description: Comma-separated Kafka broker addresses (e.g., broker1:9092,broker2:9092)
         topic:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: Kafka topic to produce messages to
         key_field:
           type: string
@@ -11376,7 +11520,29 @@ components:
           type: integer
           default: 10000
           minimum: 1
-          description: "Channel capacity — new entries are dropped when full. Each entry is ~1-2 KB, so 10,000 entries may use ~10-20 MB"
+          maximum: 100000
+          description: "Ferrum userspace channel capacity (record count). Zero is rejected. A channel slot is reserved before serialization. Hard maximum 100000."
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1
+          maximum: 1048576
+          description: >-
+            Maximum retained bytes for one pre-serialized Kafka payload plus its
+            optional partition key. Oversized entries are dropped before enqueue.
+            Hard maximum 1048576.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1
+          maximum: 268435456
+          description: >-
+            Aggregate Ferrum retained-content byte budget across queued records
+            awaiting librdkafka admission and transient serializers. Admission
+            reserves max_entry_bytes before serialization and shrinks that lease
+            to the exact retained record size. Must be at least max_entry_bytes.
+            Bytes are released when librdkafka send returns. Hard maximum
+            268435456.
         compression:
           type: string
           enum: [none, gzip, snappy, lz4, zstd]
@@ -11386,44 +11552,76 @@ components:
           type: integer
           default: 5
           minimum: 1
-          description: Seconds to wait for librdkafka to flush pending messages during graceful shutdown
+          maximum: 300
+          description: Total bounded seconds for blocking-pool scheduling and librdkafka flush during graceful shutdown and reload disposal after Ferrum admission is closed. Zero is rejected. Hard maximum 300.
         acks:
           type: string
           enum: ["0", "1", "all", "-1"]
-          description: "Delivery acknowledgment level: 0 (fire-and-forget), 1 (leader ack), all/-1 (full ISR ack)"
+          description: "Delivery acknowledgment level: 0 (fire-and-forget local completion still observed via delivery callback), 1 (leader ack), all/-1 (full ISR ack)"
         message_timeout_ms:
           type: integer
           description: Timeout for message delivery in milliseconds
         security_protocol:
           type: string
           enum: [plaintext, ssl, sasl_plaintext, sasl_ssl]
-          description: Kafka security protocol
+          default: plaintext
+          description: >-
+            Kafka security protocol. Unknown root keys are rejected so a
+            misspelled control cannot silently select PLAINTEXT. Explicit TLS
+            controls require ssl/sasl_ssl; explicit SASL controls require
+            sasl_plaintext/sasl_ssl; username and password must be paired.
         sasl_mechanism:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: SASL mechanism (e.g., PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
         sasl_username:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: SASL username
         sasl_password:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: SASL password
         ssl_ca_location:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: Path to CA certificate for broker TLS verification. Falls back to FERRUM_TLS_CA_BUNDLE_PATH
         ssl_no_verify:
           type: boolean
           description: Skip broker TLS certificate verification. Falls back to FERRUM_TLS_NO_VERIFY
         ssl_certificate_location:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: Path to client certificate for mTLS
         ssl_key_location:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: Path to client private key for mTLS
         producer_config:
           type: object
+          propertyNames:
+            type: string
+            minLength: 1
+            pattern: '^\S(?:[\s\S]*\S)?$'
           additionalProperties:
             type: string
-          description: "Escape hatch: arbitrary librdkafka producer properties as key-value pairs"
+            minLength: 1
+            pattern: '\S'
+          description: >-
+            Escape hatch: additional librdkafka producer properties as string
+            key-value pairs. Cannot override bootstrap.servers or authoritative
+            TLS/SASL controls, including official aliases, PEM/keystore identity
+            alternatives, or hostname-verification disablement. TLS-namespace
+            properties require ssl/sasl_ssl; SASL/HTTPS-auth properties require
+            sasl_plaintext/sasl_ssl. Queue/message budgets cannot exceed Ferrum
+            hard maxima. ssl.crl.location cannot conflict with gateway
+            file-backed gateway CRL source when verification is enabled.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -11436,20 +11634,52 @@ components:
 
     WsLoggingConfig:
       type: object
-      description: "Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in batches."
+      description: >-
+        Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in
+        batches with bounded establishment/write timeouts, per-entry and
+        queued-byte admission budgets, and structurally redacted endpoint
+        diagnostics.
       required:
         - endpoint_url
       properties:
         endpoint_url:
           type: string
-          description: WebSocket URL (ws:// or wss://) to send transaction logs to. Must include a hostname; malformed or non-WebSocket schemes are rejected at config load time.
+          description: >-
+            WebSocket URL (ws:// or wss://) to send transaction logs to. Must
+            include a hostname and must not include URL user information.
+            Path/query credentials are permitted for collectors that require
+            them, but operational diagnostics always use a structurally
+            redacted form (`scheme://host[:port]/redacted`). Malformed or
+            non-WebSocket schemes are rejected at config load time.
         reconnect_delay_ms:
           type: integer
           default: 5000
+          minimum: 1
+          maximum: 60000
           description: Delay in milliseconds before reconnecting after connection failure
+        connect_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          maximum: 60000
+          description: >-
+            Bound covering DNS, TCP, TLS, and WebSocket Upgrade establishment.
+            On timeout the partial transport is dropped and retry/reconnect
+            advances.
+        write_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          maximum: 60000
+          description: >-
+            Bound covering batch write/flush progress on an established socket.
+            On timeout the complete connection (writer and drain task) is
+            invalidated before retry/reconnect. Delivery is at-least-once.
         batch_size:
           type: integer
           default: 50
+          minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11459,15 +11689,39 @@ components:
         max_retries:
           type: integer
           default: 3
+          minimum: 0
+          maximum: 10
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 1
+          maximum: 60000
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
-          description: Channel capacity — new entries are dropped when full
+          minimum: 1
+          maximum: 1000000
+          description: >-
+            Channel slot capacity. Hot-path hooks reserve a slot before
+            serialization; new entries are dropped when full.
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: Maximum serialized size of one admitted log record
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 2050
+          maximum: 268435456
+          description: >-
+            Aggregate serialized-content budget across queued records,
+            contiguous batch assembly, and retries. Admission conservatively
+            reserves two copies plus JSON-array framing, so this value must be
+            greater than or equal to 2 * (max_entry_bytes + 1).
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -11480,7 +11734,9 @@ components:
             `ws_logging` opts into the WebSocket-disconnect capability, the
             named schema is recompiled under that capability at resolve time, so
             the WebSocket-disconnect native fields (`event`,
-            `frames_client_to_backend`, `frames_backend_to_client`, `direction`,
+            `frames_client_to_backend`, `frames_backend_to_client`,
+            `bytes_client_to_backend`, `bytes_backend_to_client`,
+            `timestamp_connected`, `timestamp_disconnected`, `direction`,
             `io_side`, …) are available in addition to the shared HTTP fields.
             See docs/log_schema.md.
 
@@ -13455,7 +13711,8 @@ components:
             Empty means enforce on every HTTP-family request that reaches
             the plugin (operator-managed default). Mesh auto-injection sets
             this to the outbound capture listener port so the global plugin
-            does not apply to inbound listeners.
+            does not apply to inbound listeners. Port `0` is rejected at
+            runtime construction; use `[]` for intentional global scope.
         namespace:
           type: string
           default: ferrum
@@ -14668,6 +14925,8 @@ components:
             - x-csrf-token
             - x-xsrf-token
             - x-forwarded-authorization
+            - x-loadtesting-key
+            - x-loadtesting-fanout
           description: >-
             Additional request headers to redact from `input.headers`. Built-in
             sensitive headers and active authentication credential headers are
@@ -15346,7 +15605,8 @@ components:
 
     SseConfig:
       type: object
-      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers."
+      additionalProperties: false
+      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers. Unknown keys and non-object configs are rejected. Explicit null members are rejected; omitted keys keep defaults. wrap_non_sse_responses implies client-visible text/event-stream for wrapped responses."
       properties:
         require_get_method:
           type: boolean
@@ -15371,7 +15631,8 @@ components:
         retry_ms:
           type: integer
           format: uint64
-          description: "EventSource reconnection hint in milliseconds"
+          minimum: 1
+          description: "EventSource reconnection hint in milliseconds (must be >= 1 when set)"
         force_sse_content_type:
           type: boolean
           default: false
@@ -15379,7 +15640,7 @@ components:
         wrap_non_sse_responses:
           type: boolean
           default: false
-          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering)"
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type."
 
     RateLimitingRuleConfig:
       type: object
@@ -16321,6 +16582,7 @@ components:
 
     RequestTerminationConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: request_termination — Returns a canned response without
         proxying to the backend. The response body and `content-type` are
@@ -16328,43 +16590,65 @@ components:
         allocation-light. Useful for maintenance windows, mocking, or
         path/header-based short-circuiting. Runs after CORS so browser
         preflight responses are still emitted correctly. HTTP-family only.
+        Configuration must be an object; unknown top-level and trigger keys
+        are rejected. Null/scalar/array configs and explicit null property
+        values are rejected; omit optional properties to select their defaults.
       properties:
         status_code:
           type: integer
           format: uint16
-          minimum: 100
+          minimum: 200
           maximum: 599
           default: 503
           description: >-
-            HTTP status code returned. Values outside 100–599 (or non-numeric
-            values) are coerced to 503.
+            Final HTTP status code returned. Must be an integer from 200 to 599;
+            informational statuses (including 101) and out-of-range values are
+            rejected at construction rather than coerced. Statuses 204, 205, and
+            304 force an empty body. A configured 2xx status never establishes a
+            CONNECT/Extended CONNECT tunnel — those requests fail closed with 403.
         content_type:
           type: string
           default: application/json
           description: >-
-            `Content-Type` header value. The default-body renderer uses this to
-            choose between JSON, XML, and plain-text formatting (substring
-            match for `json` / `xml`).
+            `Content-Type` header value. The default-body renderer classifies the
+            media subtype exactly as `json`/`xml` or an RFC 6838 structured
+            suffix (`+json`/`+xml`) after stripping parameters — not by arbitrary
+            substring match (so `application/notjson` is plain text).
         body:
           type: string
-          default: ""
           description: >-
-            Explicit response body. When set (non-empty) it is returned
-            verbatim and `message` is ignored.
+            Explicit response body. When the field is present — including an
+            explicit empty string — it is returned verbatim and `message` is
+            ignored. Omitting the field selects the default renderer built from
+            `message`. Must be empty or omitted for statuses 204, 205, and 304.
         message:
           type: string
           default: Service unavailable
           description: >-
-            Used to build the default body when `body` is empty. Rendered as a
+            Used to build the default body when `body` is omitted. Rendered as a
             JSON `message` field, an XML `<message>` element, or plain text
-            depending on `content_type`. JSON and XML escaping are applied
-            automatically.
+            depending on `content_type`. JSON escaping and XML 1.0 character
+            validation/escaping are applied automatically; XML-invalid control
+            characters in `message` are rejected when XML rendering is selected.
         trigger:
           type: object
+          additionalProperties: false
           description: >-
             Optional trigger condition. Without a trigger every request on the
             proxy is terminated (maintenance-mode default). Set only one of
-            `path_prefix` or `header`; configuring both is rejected.
+            `path_prefix` or `header`; configuring both is rejected. Unknown
+            nested keys are rejected. When `trigger` is present it must contain
+            exactly `path_prefix`, or `header` with optional `header_value`;
+            an empty trigger and a detached `header_value` are invalid.
+          oneOf:
+            - required: [path_prefix]
+              not:
+                anyOf:
+                  - required: [header]
+                  - required: [header_value]
+            - required: [header]
+              not:
+                required: [path_prefix]
           properties:
             path_prefix:
               type: string
@@ -16377,16 +16661,18 @@ components:
             header:
               type: string
               description: >-
-                Only terminate when this request header is present. The
-                comparison is case-insensitive on the header name. Mutually
-                exclusive with `path_prefix`.
+                Only terminate when this request header is present on any raw
+                field line (including non-UTF-8 values). The comparison is
+                case-insensitive on the header name. Mutually exclusive with
+                `path_prefix`.
             header_value:
               type: string
               default: ""
               description: >-
                 Optional exact value for `header`. Empty (default) matches
-                any value, so the trigger fires whenever the header is
-                present.
+                presence of any field line. A non-empty value matches when any
+                individual field line equals that value exactly — never against
+                a comma-folded multi-line serialization.
 
     ResponseMockConfig:
       type: object
@@ -16501,7 +16787,9 @@ components:
         constructor validation; serving-mode publication uses KeepLastKnownGood
         so an invalid candidate keeps the prior valid generation active.
         Omitted optional fields select defaults; runtime also treats explicit
-        null on optional fields as omitted.
+        null on optional fields as omitted. Matching replay bodies have a hard
+        10 MiB plugin-local ceiling and active local/fan-out replay work shares
+        a 64 MiB process-wide retained-body budget.
       required:
         - key
         - concurrent_clients
@@ -16509,8 +16797,15 @@ components:
       properties:
         key:
           type: string
-          minLength: 1
-          description: Secret value that the X-Loadtesting-Key header must match to trigger the load test
+          minLength: 32
+          pattern: '^[!-~][ -~]*[!-~]$'
+          description: >-
+            Secret value that the X-Loadtesting-Key header must match to trigger
+            the load test. Must be a randomly generated secret of at least 32
+            printable ASCII HTTP field-value characters with no leading or
+            trailing space. The gateway never echoes the value in validation
+            errors and strips this reserved header on matching and non-matching
+            paths before later deferred plugins or backend dispatch.
         concurrent_clients:
           type: integer
           format: uint64
@@ -16532,7 +16827,11 @@ components:
           format: uint64
           default: 30000
           minimum: 1
-          description: "Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll)"
+          maximum: 60000
+          description: >-
+            Per-request timeout in milliseconds (1–60000). Each attempt is also
+            capped to the remaining absolute run deadline so workers cannot
+            outlive duration_seconds.
         max_response_body_bytes:
           type: [integer, "null"]
           format: uint64
@@ -16546,7 +16845,13 @@ components:
         gateway_port:
           type: [integer, "null"]
           format: uint16
-          description: "Local gateway port for synthetic requests. Defaults to FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT when gateway_tls is enabled) or 8000/8443"
+          minimum: 1
+          maximum: 65535
+          description: >-
+            Local gateway port for synthetic requests (1–65535). Defaults to
+            FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT when gateway_tls
+            is enabled) or 8000/8443. A resolved port of 0 (disabled listener)
+            is rejected.
         gateway_tls:
           type: [boolean, "null"]
           default: false
@@ -16556,9 +16861,20 @@ components:
           description: "Skip TLS cert verification for loopback connections. Defaults to true when gateway_tls is enabled (gateway cert typically won't match 127.0.0.1)"
         gateway_addresses:
           type: [array, "null"]
+          minItems: 1
+          maxItems: 32
+          uniqueItems: true
           items:
             type: string
-          description: "Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test"
+            minLength: 1
+          description: >-
+            Remote gateway URLs for one-hop fan-out from the originating
+            controller (at most 32). Peers receive X-Loadtesting-Fanout and
+            never re-fanout. Entries must be unique http(s) URLs without
+            userinfo, query, or fragment. Local-loopback aliases of the
+            selected local target (127/8, IPv4-mapped loopback, ::1,
+            localhost, and names beneath .localhost with matching scheme and
+            effective port) are rejected.
 
     RequestMirrorConfig:
       type: object
@@ -16814,31 +17130,39 @@ components:
         max_entries:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
           default: 10000
-          description: Maximum number of cached entries before eviction of expired/oldest entries
+          description: Maximum number of cached entries before eviction of expired/oldest entries. Must be greater than zero.
         max_entry_size_bytes:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
           default: 1048576
-          description: Maximum size of a single cached response body (1 MiB by default). Larger responses are not cached.
+          description: Maximum size of a single cached response body (1 MiB by default). Larger responses are not cached. Must be greater than zero.
         max_total_size_bytes:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
           default: 104857600
-          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached.
+          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached. Must be greater than zero.
         cacheable_methods:
           type: array
+          minItems: 1
           items:
             type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: ["GET", "HEAD"]
-          description: HTTP methods eligible for caching (uppercased)
+          description: HTTP methods eligible for caching (uppercased). Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token.
         cacheable_status_codes:
           type: array
+          minItems: 1
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [200, 301, 404]
-          description: Response status codes eligible for caching
+          description: Response status codes eligible for caching. Must contain at least one entry, and every entry must be within 100-599.
         respect_cache_control:
           type: [boolean, "null"]
           default: true
@@ -16851,8 +17175,9 @@ components:
           type: array
           items:
             type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
-          description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header."
+          description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header. Every entry must be a valid RFC 9110 HTTP field-name token."
         cache_key_include_query:
           type: [boolean, "null"]
           default: true
@@ -16872,7 +17197,47 @@ components:
 
     GraphqlConfig:
       type: object
-      description: "Plugin: graphql — Query depth/complexity limiting, introspection control, per-operation rate limiting. Rate-limit counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      additionalProperties: false
+      description: >-
+        Plugin: graphql — Query depth/complexity limiting, introspection control,
+        and per-operation rate limiting. At least one effective protection rule is
+        required (`max_depth`, `max_complexity`, `max_aliases`,
+        `introspection_allowed: false`, a non-empty `type_rate_limits`, or a
+        non-empty `operation_rate_limits`). `introspection_allowed: true` alone is
+        not an effective rule. Unknown top-level keys are rejected. Rate-limit
+        counter storage supports only local memory and Redis; database-backed
+        counters are intentionally unsupported. When `sync_mode` is `redis`,
+        `redis_url` is required. Explicit Redis fields are validated even in
+        local mode so latent configuration cannot become invalid only when the
+        mode is changed. Runtime numeric fields require integer JSON encoding
+        (for example `2`, not `2.0`); JSON Schema treats those two encodings as
+        the same mathematical integer. Runtime also rejects invalid Redis URL
+        shapes that JSON Schema cannot fully cross-validate with every authoring
+        tool.
+      allOf:
+        - anyOf:
+            - required: [max_depth]
+            - required: [max_complexity]
+            - required: [max_aliases]
+            - required: [introspection_allowed]
+              properties:
+                introspection_allowed:
+                  const: false
+            - required: [type_rate_limits]
+              properties:
+                type_rate_limits:
+                  minProperties: 1
+            - required: [operation_rate_limits]
+              properties:
+                operation_rate_limits:
+                  minProperties: 1
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
       properties:
         max_depth:
           type: integer
@@ -16889,7 +17254,9 @@ components:
         introspection_allowed:
           type: boolean
           default: true
-          description: Whether introspection queries are permitted
+          description: >-
+            Whether introspection queries are permitted. Setting this to `false`
+            counts as an effective protection rule; the default `true` does not.
         limit_by:
           type: string
           enum: [ip, consumer]
@@ -16897,14 +17264,26 @@ components:
           description: Rate limit key
         type_rate_limits:
           type: object
-          additionalProperties:
-            $ref: "#/components/schemas/RateSpec"
-          description: "Rate limits by operation type (query, mutation, subscription)"
+          additionalProperties: false
+          properties:
+            query:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+            mutation:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+            subscription:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+          description: >-
+            Rate limits by operation type. Only `query`, `mutation`, and
+            `subscription` keys are accepted; unknown keys are rejected.
         operation_rate_limits:
           type: object
+          propertyNames:
+            pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
           additionalProperties:
-            $ref: "#/components/schemas/RateSpec"
-          description: Rate limits by named operation
+            $ref: "#/components/schemas/GraphqlRateSpec"
+          description: >-
+            Rate limits by named operation. Keys must be valid GraphQL Names
+            (`[_A-Za-z][_0-9A-Za-z]*`).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -16912,6 +17291,8 @@ components:
           description: "GraphQL rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
         redis_url:
           type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
           description: "Redis connection URL. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
@@ -16919,10 +17300,12 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "ferrum:graphql"
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
           description: Number of multiplexed Redis connections
         redis_username:
@@ -16933,10 +17316,12 @@ components:
           description: Redis password
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Health check ping interval when Redis is unavailable
 
@@ -18370,15 +18755,15 @@ components:
             response_tool_calls:
               type: boolean
               default: true
-              description: "Govern tool calls in buffered (non-streaming) responses."
+              description: "Govern tool calls in buffered (non-streaming) responses. At most 64 concrete tool calls are governed per request/response/SSE batch (unconditional; applies to allow/deny/redact_args/require_approval/dry_run)."
             streaming_response_tool_calls:
               type: boolean
               default: false
-              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
+              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. Duplicate choice/tool indexes, empty-string or non-string IDs, conflicting IDs, or an ID introduced after an untagged fragment are ungovernable and fail closed in enforce mode. JSON null for tool_calls[].id is treated as omitted (same as a missing field). At most 64 concrete tool calls are governed per SSE batch. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
             mcp_tool_calls:
               type: boolean
               default: false
-              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays."
+              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays. When params.arguments is omitted, the governor normalizes it to {} before required-arg / regex / hash / approval / JSON Schema evaluation (MCP zero-argument calls). Provider response shapes that omit function.arguments are not normalized."
             a2a_methods:
               type: boolean
               default: false
@@ -18407,7 +18792,7 @@ components:
               action:
                 type: string
                 enum: [allow, deny, redact_args, require_approval, dry_run]
-                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records ai_tool_governor.decision=dry_run distinctly from a real allow."
+                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records ai_tool_governor.decision=dry_run distinctly from a real allow. At most 64 concrete tool calls are governed per request/response/SSE batch regardless of action."
               risk:
                 type: string
                 enum: [low, medium, high, critical]
@@ -18425,6 +18810,7 @@ components:
                 description: "Deny when any listed key is absent from the parsed arguments object."
               blocked_arg_patterns:
                 type: array
+                maxItems: 32
                 items:
                   type: object
                   additionalProperties: false
@@ -18433,12 +18819,13 @@ components:
                     name:
                       type: string
                       minLength: 1
-                      description: "Pattern identifier; substituted into redaction_placeholder {name}."
+                      maxLength: 256
+                      description: "Pattern identifier; substituted into redaction_placeholder {name}. OpenAPI maxLength: 256 counts Unicode characters; runtime admission enforces a stricter 256 UTF-8 byte cap."
                     regex:
                       type: string
                       minLength: 1
-                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted."
-                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args."
+                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted. Patterns that match empty input are rejected at config load; contextual zero-length matches fail closed at runtime."
+                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args. At most 32 patterns per tool; every append is checked before allocation and redacted output is capped at the 4 MiB inspectable body limit."
               json_schema:
                 type: object
                 description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny. Intentionally open — arbitrary JSON Schema keywords are allowed; do not set additionalProperties: false here."
@@ -18457,8 +18844,9 @@ components:
             timeout_ms:
               type: integer
               minimum: 1
+              maximum: 30000
               default: 1500
-              description: "Per-request approval webhook timeout."
+              description: "Per-request approval webhook timeout (max 30000). A whole batch of approvals is also capped at 30s cumulative wait; after an enforce-mode block, further webhook calls in that batch are skipped. At most 64 concrete tool calls are governed per request/response/SSE batch. Dropping the governing future (client cancel) cancels any in-flight approval HTTP call."
             cache_ttl_seconds:
               type: integer
               minimum: 0
@@ -18486,8 +18874,9 @@ components:
               description: "HTTP error status (400-599) returned for a deterministic tool policy denial in enforce mode. Uninspectable governed bodies fail closed with 502."
             redaction_placeholder:
               type: string
+              maxLength: 256
               default: "[REDACTED_TOOL_ARG:{name}]"
-              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name."
+              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name. OpenAPI maxLength: 256 counts Unicode characters; runtime admission enforces a stricter 256 UTF-8 byte cap. Redacted argument output is capped at the 4 MiB inspectable body limit."
             streaming_deny_event:
               type: boolean
               default: true
@@ -19663,12 +20052,22 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
+      allOf:
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Explicitly supplied Redis fields are validated even in local mode so latent configuration cannot become invalid only when the mode is changed."
       properties:
         header_name:
           type: string
+          minLength: 1
+          pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: "Idempotency-Key"
-          description: Request header name containing the deduplication key
+          description: Request header name containing the deduplication key. Must be a valid RFC 9110 HTTP field-name token.
         ttl_seconds:
           type: integer
           minimum: 1
@@ -19699,10 +20098,12 @@ components:
           description: Exact maximum retained size across local completed response entries. Responses that would exceed this cap are returned normally and are not retained. In local mode, skipped responses clear in-flight state immediately; in Redis mode, a local-total-cap skip keeps local and distributed in-flight locks until inflight_ttl_seconds if Redis publication fails.
         applicable_methods:
           type: array
+          minItems: 1
           items:
             type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: ["POST", "PUT", "PATCH"]
-          description: HTTP methods that require deduplication
+          description: HTTP methods that require deduplication. Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token.
         scope_by_consumer:
           type: boolean
           default: true
@@ -19718,27 +20119,33 @@ components:
           description: "Dedup cache storage: 'local' (in-memory) or 'redis' (centralized completed responses plus distributed in-flight locks). Any RESP-compatible server works."
         redis_url:
           type: string
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'. Explicitly supplied values are validated even in local mode so latent configuration cannot become invalid only when the mode changes."
         redis_tls:
           type: boolean
           default: false
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "ferrum:dedup"
-          description: Key prefix for all Redis keys
+          description: Key prefix for all Redis keys. Must be non-empty when supplied.
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
-          description: Redis connection timeout in seconds
+          description: Redis connection timeout in seconds. Must be greater than zero.
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
-          description: Health check ping interval when Redis is unavailable
+          description: Health check ping interval when Redis is unavailable. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -19850,9 +20257,32 @@ components:
         case-insensitive and runtime storage is normalized to uppercase. Other
         reserved, user-assigned, deleted, and alias codes are rejected.
 
+    GraphqlRateSpec:
+      type: object
+      additionalProperties: false
+      description: >-
+        Closed GraphQL rate limit specification. Both fields are required and
+        must be positive integers; unknown keys are rejected.
+      required: [max_requests, window_seconds]
+      properties:
+        max_requests:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Maximum requests allowed in the window
+        window_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Time window in seconds
+
     RateSpec:
       type: object
-      description: Rate limit specification used by graphql and grpc_method_router plugins.
+      description: >-
+        Rate limit specification used by grpc_method_router. Both fields are
+        required and must be positive integers. The gRPC runtime currently
+        ignores additional keys, so this shared component remains open to
+        preserve schema/runtime parity.
       required: [max_requests, window_seconds]
       properties:
         max_requests:

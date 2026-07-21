@@ -34,6 +34,7 @@ const SENSITIVE_HEADERS: &[&str] = &[
     "x-xsrf-token",
     "www-authenticate",
     "x-forwarded-authorization",
+    "last-event-id",
 ];
 
 /// Redaction placeholder for sensitive header values.

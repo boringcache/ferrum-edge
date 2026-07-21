@@ -127,4 +127,5 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<SummaryLogEntry>) -> Resul
         entry_count,
         cfg.http_client.execute(req, "http_logging").await,
     )
+    .await
 }

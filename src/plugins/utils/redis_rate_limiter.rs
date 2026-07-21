@@ -109,7 +109,8 @@ pub struct RedisConfig {
 impl RedisConfig {
     /// Parse Redis configuration from a plugin's JSON config.
     ///
-    /// Returns `Ok(None)` if `sync_mode` is absent or `"local"`.
+    /// Returns `Ok(None)` if `sync_mode` is absent or `"local"`, after
+    /// validating every explicitly supplied Redis field.
     ///
     /// Unknown root keys are left for the calling plugin to reject against its
     /// own allowlist unioned with [`REDIS_PLUGIN_CONFIG_KEYS`]. This function
@@ -126,26 +127,31 @@ impl RedisConfig {
         let sync_mode = parse_optional_string(object, "sync_mode")?
             .unwrap_or("local")
             .to_ascii_lowercase();
-        match sync_mode.as_str() {
-            "local" => return Ok(None),
-            "redis" => {}
+        let redis_enabled = match sync_mode.as_str() {
+            "local" => false,
+            "redis" => true,
             other => {
                 return Err(format!(
                     "redis rate limiter: 'sync_mode' must be 'local' or 'redis', got: {other:?}"
                 ));
             }
-        }
+        };
 
-        let url = parse_optional_string(object, "redis_url")?.ok_or_else(|| {
-            "redis rate limiter: 'redis_url' is required when sync_mode='redis'".to_string()
-        })?;
-        if url.is_empty() {
+        // Validate every explicitly supplied Redis field even in local mode.
+        // This keeps latent configuration fail-closed: toggling sync_mode later
+        // cannot suddenly activate a malformed URL, wrong scalar type, or zero
+        // connection bound that admission previously ignored.
+        let url = parse_optional_string(object, "redis_url")?;
+        if let Some(url) = url {
+            if url.is_empty() {
+                return Err("redis rate limiter: 'redis_url' must be non-empty".to_string());
+            }
+            validate_redis_url(url)?;
+        } else if redis_enabled {
             return Err(
-                "redis rate limiter: 'redis_url' must be non-empty when sync_mode='redis'"
-                    .to_string(),
+                "redis rate limiter: 'redis_url' is required when sync_mode='redis'".to_string(),
             );
         }
-        validate_redis_url(url)?;
 
         let tls = parse_optional_bool(object, "redis_tls")?.unwrap_or(false);
         let key_prefix = parse_optional_string(object, "redis_key_prefix")?
@@ -184,6 +190,13 @@ impl RedisConfig {
 
         let username = parse_optional_string(object, "redis_username")?.map(ToString::to_string);
         let password = parse_optional_string(object, "redis_password")?.map(ToString::to_string);
+
+        if !redis_enabled {
+            return Ok(None);
+        }
+        let url = url.ok_or_else(|| {
+            "redis rate limiter: 'redis_url' is required when sync_mode='redis'".to_string()
+        })?;
 
         Ok(Some(RedisConfig {
             url: url.to_string(),
@@ -1432,6 +1445,45 @@ mod tests {
         .expect("redis mode with plugin keys must parse")
         .expect("redis mode must produce a config");
         assert_eq!(redis.url, "redis://127.0.0.1:6379/0");
+    }
+
+    #[test]
+    fn from_plugin_config_validates_explicit_redis_fields_in_local_mode() {
+        use super::RedisConfig;
+        use serde_json::json;
+
+        for config in [
+            json!({"sync_mode": "local", "redis_url": "garbage"}),
+            json!({"sync_mode": "local", "redis_tls": "yes"}),
+            json!({"sync_mode": "local", "redis_key_prefix": ""}),
+            json!({"sync_mode": "local", "redis_pool_size": 0}),
+            json!({"sync_mode": "local", "redis_connect_timeout_seconds": 0}),
+            json!({"sync_mode": "local", "redis_health_check_interval_seconds": 0}),
+        ] {
+            assert!(
+                RedisConfig::from_plugin_config(&config, "test").is_err(),
+                "malformed latent Redis config must be rejected: {config}"
+            );
+        }
+
+        assert!(
+            RedisConfig::from_plugin_config(
+                &json!({
+                    "sync_mode": "local",
+                    "redis_url": "redis://127.0.0.1:6379/0",
+                    "redis_tls": false,
+                    "redis_key_prefix": "test",
+                    "redis_pool_size": 1,
+                    "redis_connect_timeout_seconds": 1,
+                    "redis_health_check_interval_seconds": 1,
+                    "redis_username": "user",
+                    "redis_password": "secret",
+                }),
+                "test",
+            )
+            .expect("well-formed latent Redis config must parse")
+            .is_none()
+        );
     }
 
     #[test]
