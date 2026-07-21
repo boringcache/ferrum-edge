@@ -102,22 +102,6 @@ pub enum SummaryLogEntry {
     Stream(StreamTransactionSummary),
 }
 
-impl SummaryLogEntry {
-    pub fn client_ip(&self) -> &str {
-        match self {
-            Self::Http(summary) => &summary.client_ip,
-            Self::Stream(summary) => &summary.client_ip,
-        }
-    }
-
-    pub fn proxy_id(&self) -> Option<&str> {
-        match self {
-            Self::Http(summary) => summary.proxy_id.as_deref(),
-            Self::Stream(summary) => Some(&summary.proxy_id),
-        }
-    }
-}
-
 impl From<&TransactionSummary> for SummaryLogEntry {
     fn from(summary: &TransactionSummary) -> Self {
         Self::Http(summary.clone())

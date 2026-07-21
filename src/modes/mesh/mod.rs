@@ -13588,6 +13588,7 @@ async fn shutdown_and_join_mesh(
     tasks.handles.extend(tasks.mesh_background_handles);
 
     crate::modes::file::join_background_handles(tasks.handles, Duration::from_secs(5)).await;
+    crate::plugins::kafka_logging::finalize_all_generations().await;
 }
 
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {

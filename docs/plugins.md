@@ -686,23 +686,29 @@ config:
 
 ### `kafka_logging`
 
-Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async mpsc channel to decouple the proxy hot path from Kafka I/O, with librdkafka's `ThreadedProducer` handling batching, compression, delivery retries, and partition assignment.
+Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async mpsc channel of pre-serialized records to decouple the proxy hot path from Kafka I/O, with librdkafka's `ThreadedProducer` handling batching, compression, delivery retries, and partition assignment.
 
 **Priority:** 9150
 
-**Requires:** The `kafka` cargo feature (`--features kafka` or `--all-features`). Without it, plugin creation returns an error at runtime.
+**Availability:** Built into every default Ferrum Edge binary. `rdkafka` / librdkafka is an unconditional dependency — there is no `kafka` Cargo feature to enable or disable.
+
+**Admission:** Kafka is `KeepLastKnownGood`: invalid startup configuration is rejected, and an invalid reload candidate is not published, so the previously accepted producer generation continues serving. This prevents a misspelled security control or conflicting TLS/CRL setting from silently removing the configured audit sink.
+
+Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and a worst-case `max_entry_bytes` lease from the aggregate `buffer_max_bytes` budget before serializing or cloning attacker-shaped summary fields. It then enforces the exact per-entry limit, shrinks the lease to the purpose-built payload/key record's retained size, and queues that record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue (Ferrum then releases its retained-byte lease). Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one producer flush whose complete blocking-pool scheduling and librdkafka work is bounded by `flush_timeout_seconds`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `broker_list` | String | *(required)* | Comma-separated Kafka broker addresses (e.g., `broker1:9092,broker2:9092`) |
 | `topic` | String | *(required)* | Kafka topic to produce messages to |
-| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin). Any other value is rejected at plugin construction time so operator typos surface immediately instead of silently falling back to `client_ip` |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full. Each entry is a serialized JSON `TransactionSummary` (~1-2 KB), so the default 10,000 entries may use ~10-20 MB of memory |
+| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin). Any other value is rejected at plugin construction time so operator typos surface immediately instead of silently falling back to `client_ip`. Keys are derived from borrowed summary fields after channel reservation |
+| `buffer_capacity` | Integer | `10000` | Ferrum userspace channel capacity (record count). Minimum `1` (zero is rejected). Hard maximum `100000`. A slot is reserved before serialization |
+| `max_entry_bytes` | Integer | `65536` | Maximum retained bytes for one pre-serialized payload plus optional partition key. Oversized entries are dropped before enqueue. Hard maximum `1048576` |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate Ferrum retained-content byte budget across queued records awaiting librdkafka admission and transient serializers. Admission reserves `max_entry_bytes` before serialization and shrinks that lease to the exact retained record size. Must be `>= max_entry_bytes`. Bytes release when librdkafka `send` returns. Hard maximum `268435456` |
 | `compression` | String | `"lz4"` | Compression: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
-| `flush_timeout_seconds` | Integer | `5` | Seconds to wait for librdkafka to flush pending messages during graceful shutdown |
-| `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0`, `1`, `all` (or `-1`) |
+| `flush_timeout_seconds` | Integer | `5` | Total bounded seconds for blocking-pool scheduling and librdkafka `flush` during graceful shutdown and reload disposal after Ferrum admission is closed. Minimum `1` (zero is rejected). Hard maximum `300` |
+| `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0` (broker may never persist; Ferrum still observes the local delivery callback), `1`, `all` (or `-1`) |
 | `message_timeout_ms` | Integer | *(librdkafka default)* | Timeout for message delivery in milliseconds |
-| `security_protocol` | String | *(none)* | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl` |
+| `security_protocol` | String | `"plaintext"` | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl`. Unknown root keys (for example a misspelled `security_protcol`) are rejected so PLAINTEXT cannot be selected by typo. Explicit TLS controls require `ssl`/`sasl_ssl`; explicit SASL controls require `sasl_plaintext`/`sasl_ssl`; username and password must be paired |
 | `sasl_mechanism` | String | *(none)* | SASL mechanism (e.g., `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) |
 | `sasl_username` | String | *(none)* | SASL username |
 | `sasl_password` | String | *(none)* | SASL password |
@@ -710,7 +716,7 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 | `ssl_no_verify` | Boolean | *(gateway default)* | Skip broker TLS certificate verification. Falls back to `FERRUM_TLS_NO_VERIFY` |
 | `ssl_certificate_location` | String | *(none)* | Path to client certificate for mTLS |
 | `ssl_key_location` | String | *(none)* | Path to client private key for mTLS |
-| `producer_config` | Object | *(none)* | Escape hatch: arbitrary librdkafka producer properties as key-value pairs |
+| `producer_config` | Object | *(none)* | Escape hatch: additional librdkafka producer properties as string key-value pairs. Cannot override `bootstrap.servers` or top-level TLS/SASL controls, including official aliases (`sasl.mechanisms`), PEM/keystore identity alternatives, or hostname-verification disablement. TLS-namespace properties require `ssl`/`sasl_ssl`; SASL/HTTPS-auth properties require `sasl_plaintext`/`sasl_ssl`. Queue/message byte budgets cannot exceed Ferrum hard maxima. `ssl.crl.location` cannot conflict with the gateway CRL baseline when verification is enabled |
 
 #### Gateway TLS Integration
 
@@ -718,11 +724,10 @@ Kafka uses its own binary protocol over TCP/TLS (not HTTP), so TLS is handled by
 
 - **`FERRUM_TLS_CA_BUNDLE_PATH`** is applied as `ssl.ca.location` when `ssl_ca_location` is not set in the plugin config
 - **`FERRUM_TLS_NO_VERIFY`** is applied as `enable.ssl.certificate.verification=false` when `ssl_no_verify` is not set in the plugin config
-- Plugin-level fields always override the gateway defaults
+- **`FERRUM_TLS_CRL_FILE_PATH`**, or a file-backed **`FERRUM_TLS_CRL_SOURCE`**, is applied as `ssl.crl.location` whenever certificate verification is enabled. Plain paths and `file://` URIs normalize to the filesystem path expected by librdkafka. Inline and provider-backed CRL sources cannot be passed to librdkafka; a verified Kafka TLS configuration therefore fails admission closed when such a source is active, while `ssl_no_verify: true` does not require a filesystem identity. A conflicting `producer_config.ssl.crl.location` is rejected fail-closed; reload keeps last-known-good configuration
+- Plugin-level fields always override the gateway defaults except for the CRL baseline conflict rule above. `producer_config` cannot silently override top-level TLS/SASL security controls after they were validated, including through librdkafka aliases or alternate PEM/keystore inputs
 
-This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` for internal CAs do not need to duplicate the CA path in the kafka_logging plugin config.
-
-**Note:** `FERRUM_TLS_CRL_FILE_PATH` is **not** applied to Kafka connections — librdkafka manages CRL checking independently via its own `ssl.crl.location` property (configurable via `producer_config`).
+This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` and a file-backed gateway CRL for internal CAs do not need to duplicate those paths in the kafka_logging plugin config.
 
 ```yaml
 plugin_name: kafka_logging
@@ -732,6 +737,7 @@ config:
   compression: "lz4"
   acks: "1"
   key_field: "client_ip"
+  security_protocol: "ssl"
 ```
 
 #### Kafka with SASL/SSL Authentication
@@ -758,7 +764,7 @@ config:
   producer_config:
     linger.ms: "50"
     batch.num.messages: "1000"
-    queue.buffering.max.kbytes: "1048576"
+    queue.buffering.max.kbytes: "65536"
 ```
 
 ### Transaction Summary Reference

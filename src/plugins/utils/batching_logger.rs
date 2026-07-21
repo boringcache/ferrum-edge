@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 const DROP_WARN_EVERY: u64 = 100;
@@ -103,6 +104,23 @@ pub struct BatchConfig {
 }
 
 pub struct BatchingLogger<T: Send + 'static> {
+    sender: Option<mpsc::Sender<T>>,
+    worker: Option<JoinHandle<()>>,
+    plugin_name: &'static str,
+    dropped_count: Arc<AtomicU64>,
+    queue_depth: Arc<AtomicUsize>,
+    buffer_capacity: usize,
+    hooks: LoggerHooks<T>,
+}
+
+/// Cloneable, lock-free admission surface shared with a [`BatchingLogger`].
+///
+/// Hot-path callers can hold this handle (for example behind
+/// `ArcSwapOption`) without locking the worker owner. Closing admission is
+/// the caller's responsibility: drop every handle, then
+/// [`BatchingLogger::close_and_await`] the lifecycle owner.
+#[derive(Clone)]
+pub struct BatchingLoggerHandle<T: Send + 'static> {
     sender: mpsc::Sender<T>,
     plugin_name: &'static str,
     dropped_count: Arc<AtomicU64>,
@@ -139,7 +157,6 @@ type FailedBatchHook<T> = Arc<dyn Fn(Vec<T>, String) + Send + Sync>;
 type OverflowHook<T> = Arc<dyn Fn(T, &'static str) + Send + Sync>;
 type HighWaterHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
-#[derive(Clone)]
 pub struct LoggerHooks<T: Send + 'static> {
     pub on_failed_batch: Option<FailedBatchHook<T>>,
     pub on_overflow: Option<OverflowHook<T>>,
@@ -147,6 +164,17 @@ pub struct LoggerHooks<T: Send + 'static> {
     /// high-water mark. This hook is independent of `on_overflow`.
     pub on_high_water: Option<HighWaterHook>,
     pub high_watermark_percent: u8,
+}
+
+impl<T: Send + 'static> Clone for LoggerHooks<T> {
+    fn clone(&self) -> Self {
+        Self {
+            on_failed_batch: self.on_failed_batch.clone(),
+            on_overflow: self.on_overflow.clone(),
+            on_high_water: self.on_high_water.clone(),
+            high_watermark_percent: self.high_watermark_percent,
+        }
+    }
 }
 
 impl<T: Send + 'static> Default for LoggerHooks<T> {
@@ -205,7 +233,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
         };
         let (sender, receiver) = mpsc::channel(cfg.buffer_capacity);
         let queue_depth = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(run_flush_loop_with_hooks(
+        let worker = tokio::spawn(run_flush_loop_with_hooks(
             cfg,
             receiver,
             Arc::clone(&queue_depth),
@@ -214,7 +242,8 @@ impl<T: Send + 'static> BatchingLogger<T> {
         ));
 
         Self {
-            sender,
+            sender: Some(sender),
+            worker: Some(worker),
             plugin_name: cfg.plugin_name,
             dropped_count: Arc::new(AtomicU64::new(0)),
             queue_depth,
@@ -223,11 +252,152 @@ impl<T: Send + 'static> BatchingLogger<T> {
         }
     }
 
+    /// Cloneable admission handle sharing this logger's channel. Returns
+    /// `None` when admission was already closed on the lifecycle owner.
+    pub fn handle(&self) -> Option<BatchingLoggerHandle<T>> {
+        self.sender.as_ref().map(|sender| BatchingLoggerHandle {
+            sender: sender.clone(),
+            plugin_name: self.plugin_name,
+            dropped_count: Arc::clone(&self.dropped_count),
+            queue_depth: Arc::clone(&self.queue_depth),
+            buffer_capacity: self.buffer_capacity,
+            hooks: self.hooks.clone(),
+        })
+    }
+
+    /// Close admission and await the flush worker so pending Ferrum-side
+    /// batches finish before a downstream sink (for example librdkafka) is
+    /// flushed. Exact-once: subsequent calls are no-ops.
+    ///
+    /// Callers that published [`BatchingLoggerHandle`] clones must drop those
+    /// handles first; otherwise the channel stays open until every clone is
+    /// released.
+    pub async fn close_and_await(&mut self) -> bool {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            return worker.await.is_ok();
+        }
+        true
+    }
+
+    /// Close admission and cancel the flush worker when no asynchronous drain
+    /// can be awaited. This is intentionally lossy; lifecycle owners must
+    /// account the abandoned work before calling it.
+    pub fn close_and_abort(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
+    }
+
+    /// Non-blocking send. On full buffer, logs a warning once per N drops and
+    /// silently drops intermediate entries so the hot path never blocks.
+    pub fn try_send(&self, item: T) -> bool {
+        let Some(sender) = self.sender.as_ref() else {
+            record_drop(
+                &self.dropped_count,
+                self.plugin_name,
+                "worker unavailable during shutdown",
+            );
+            return false;
+        };
+        let depth = self.queue_depth.load(Ordering::Relaxed);
+        if is_high_water(
+            depth,
+            self.buffer_capacity,
+            self.hooks.high_watermark_percent,
+        ) {
+            if let Some(on_high_water) = self.hooks.on_high_water.as_ref() {
+                on_high_water(depth, self.buffer_capacity);
+            }
+            if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
+                on_overflow(item, "queue high water");
+                return false;
+            }
+        }
+
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        match sender.try_send(item) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                decrement_queue_depth(&self.queue_depth);
+                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
+                    on_overflow(item, "buffer full");
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                decrement_queue_depth(&self.queue_depth);
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    "worker unavailable during shutdown",
+                );
+                false
+            }
+        }
+    }
+
+    /// Atomically reserve one bounded-channel slot without constructing the
+    /// item yet. This supports fail-closed plugins that must guarantee enqueue
+    /// capacity before a response becomes immutable, while filling the record
+    /// only after later validators determine the final status and body.
+    pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
+        let Some(sender) = self.sender.as_ref() else {
+            record_drop(
+                &self.dropped_count,
+                self.plugin_name,
+                "worker unavailable while reserving a commit slot",
+            );
+            return None;
+        };
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        match sender.clone().try_reserve_owned() {
+            Ok(permit) => Some(BatchingLoggerPermit {
+                permit: Some(permit),
+                queue_depth: Arc::clone(&self.queue_depth),
+            }),
+            Err(mpsc::error::TrySendError::Full(_sender)) => {
+                decrement_queue_depth(&self.queue_depth);
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    "buffer full while reserving a commit slot",
+                );
+                None
+            }
+            Err(mpsc::error::TrySendError::Closed(_sender)) => {
+                decrement_queue_depth(&self.queue_depth);
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    "worker unavailable while reserving a commit slot",
+                );
+                None
+            }
+        }
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    pub fn buffer_capacity(&self) -> usize {
+        self.buffer_capacity
+    }
+}
+
+impl<T: Send + 'static> BatchingLoggerHandle<T> {
     /// Non-blocking send. On full buffer, logs a warning once per N drops and
     /// silently drops intermediate entries so the hot path never blocks.
     pub fn try_send(&self, item: T) -> bool {
         let depth = self.queue_depth.load(Ordering::Relaxed);
-        if self.is_high_water(depth) {
+        if is_high_water(
+            depth,
+            self.buffer_capacity,
+            self.hooks.high_watermark_percent,
+        ) {
             if let Some(on_high_water) = self.hooks.on_high_water.as_ref() {
                 on_high_water(depth, self.buffer_capacity);
             }
@@ -242,7 +412,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
-                self.record_drop("buffer full");
+                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
                     on_overflow(item, "buffer full");
                 }
@@ -250,16 +420,18 @@ impl<T: Send + 'static> BatchingLogger<T> {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 decrement_queue_depth(&self.queue_depth);
-                self.record_drop("worker unavailable during shutdown");
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    "worker unavailable during shutdown",
+                );
                 false
             }
         }
     }
 
     /// Atomically reserve one bounded-channel slot without constructing the
-    /// item yet. This supports fail-closed plugins that must guarantee enqueue
-    /// capacity before a response becomes immutable, while filling the record
-    /// only after later validators determine the final status and body.
+    /// item yet.
     pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         match self.sender.clone().try_reserve_owned() {
@@ -269,12 +441,20 @@ impl<T: Send + 'static> BatchingLogger<T> {
             }),
             Err(mpsc::error::TrySendError::Full(_sender)) => {
                 decrement_queue_depth(&self.queue_depth);
-                self.record_drop("buffer full while reserving a commit slot");
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    "buffer full while reserving a commit slot",
+                );
                 None
             }
             Err(mpsc::error::TrySendError::Closed(_sender)) => {
                 decrement_queue_depth(&self.queue_depth);
-                self.record_drop("worker unavailable while reserving a commit slot");
+                record_drop(
+                    &self.dropped_count,
+                    self.plugin_name,
+                    "worker unavailable while reserving a commit slot",
+                );
                 None
             }
         }
@@ -283,30 +463,24 @@ impl<T: Send + 'static> BatchingLogger<T> {
     pub fn queue_depth(&self) -> usize {
         self.queue_depth.load(Ordering::Relaxed)
     }
+}
 
-    pub fn buffer_capacity(&self) -> usize {
-        self.buffer_capacity
-    }
+fn is_high_water(depth: usize, buffer_capacity: usize, high_watermark_percent: u8) -> bool {
+    depth.saturating_mul(100)
+        >= buffer_capacity.saturating_mul(high_watermark_percent.max(1) as usize)
+}
 
-    fn is_high_water(&self, depth: usize) -> bool {
-        depth.saturating_mul(100)
-            >= self
-                .buffer_capacity
-                .saturating_mul(self.hooks.high_watermark_percent.max(1) as usize)
-    }
-
-    fn record_drop(&self, reason: &str) {
-        let dropped = self.dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if dropped == 1 || dropped.is_multiple_of(DROP_WARN_EVERY) {
-            warn!(
-                plugin = self.plugin_name,
-                "{}: dropping queued log entry because {} ({} dropped total; logging every {} drops)",
-                self.plugin_name,
-                reason,
-                dropped,
-                DROP_WARN_EVERY,
-            );
-        }
+fn record_drop(dropped_count: &AtomicU64, plugin_name: &'static str, reason: &str) {
+    let dropped = dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped == 1 || dropped.is_multiple_of(DROP_WARN_EVERY) {
+        warn!(
+            plugin = plugin_name,
+            "{}: dropping queued log entry because {} ({} dropped total; logging every {} drops)",
+            plugin_name,
+            reason,
+            dropped,
+            DROP_WARN_EVERY,
+        );
     }
 }
 

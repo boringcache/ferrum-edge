@@ -11457,16 +11457,59 @@ components:
 
     KafkaLoggingConfig:
       type: object
-      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries."
+      additionalProperties: false
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload."
       required:
         - broker_list
         - topic
+      allOf:
+        - if:
+            anyOf:
+              - required: [ssl_ca_location]
+              - required: [ssl_no_verify]
+              - required: [ssl_certificate_location]
+              - required: [ssl_key_location]
+          then:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [ssl, sasl_ssl]
+        - if:
+            anyOf:
+              - required: [sasl_mechanism]
+              - required: [sasl_username]
+              - required: [sasl_password]
+          then:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [sasl_plaintext, sasl_ssl]
+        - if:
+            required: [ssl_certificate_location]
+          then:
+            required: [ssl_key_location]
+        - if:
+            required: [ssl_key_location]
+          then:
+            required: [ssl_certificate_location]
+        - if:
+            required: [sasl_username]
+          then:
+            required: [sasl_password]
+        - if:
+            required: [sasl_password]
+          then:
+            required: [sasl_username]
       properties:
         broker_list:
           type: string
+          minLength: 1
+          pattern: '[^,\s]'
           description: Comma-separated Kafka broker addresses (e.g., broker1:9092,broker2:9092)
         topic:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: Kafka topic to produce messages to
         key_field:
           type: string
@@ -11477,7 +11520,29 @@ components:
           type: integer
           default: 10000
           minimum: 1
-          description: "Channel capacity — new entries are dropped when full. Each entry is ~1-2 KB, so 10,000 entries may use ~10-20 MB"
+          maximum: 100000
+          description: "Ferrum userspace channel capacity (record count). Zero is rejected. A channel slot is reserved before serialization. Hard maximum 100000."
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1
+          maximum: 1048576
+          description: >-
+            Maximum retained bytes for one pre-serialized Kafka payload plus its
+            optional partition key. Oversized entries are dropped before enqueue.
+            Hard maximum 1048576.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1
+          maximum: 268435456
+          description: >-
+            Aggregate Ferrum retained-content byte budget across queued records
+            awaiting librdkafka admission and transient serializers. Admission
+            reserves max_entry_bytes before serialization and shrinks that lease
+            to the exact retained record size. Must be at least max_entry_bytes.
+            Bytes are released when librdkafka send returns. Hard maximum
+            268435456.
         compression:
           type: string
           enum: [none, gzip, snappy, lz4, zstd]
@@ -11487,44 +11552,76 @@ components:
           type: integer
           default: 5
           minimum: 1
-          description: Seconds to wait for librdkafka to flush pending messages during graceful shutdown
+          maximum: 300
+          description: Total bounded seconds for blocking-pool scheduling and librdkafka flush during graceful shutdown and reload disposal after Ferrum admission is closed. Zero is rejected. Hard maximum 300.
         acks:
           type: string
           enum: ["0", "1", "all", "-1"]
-          description: "Delivery acknowledgment level: 0 (fire-and-forget), 1 (leader ack), all/-1 (full ISR ack)"
+          description: "Delivery acknowledgment level: 0 (fire-and-forget local completion still observed via delivery callback), 1 (leader ack), all/-1 (full ISR ack)"
         message_timeout_ms:
           type: integer
           description: Timeout for message delivery in milliseconds
         security_protocol:
           type: string
           enum: [plaintext, ssl, sasl_plaintext, sasl_ssl]
-          description: Kafka security protocol
+          default: plaintext
+          description: >-
+            Kafka security protocol. Unknown root keys are rejected so a
+            misspelled control cannot silently select PLAINTEXT. Explicit TLS
+            controls require ssl/sasl_ssl; explicit SASL controls require
+            sasl_plaintext/sasl_ssl; username and password must be paired.
         sasl_mechanism:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: SASL mechanism (e.g., PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
         sasl_username:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: SASL username
         sasl_password:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: SASL password
         ssl_ca_location:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: Path to CA certificate for broker TLS verification. Falls back to FERRUM_TLS_CA_BUNDLE_PATH
         ssl_no_verify:
           type: boolean
           description: Skip broker TLS certificate verification. Falls back to FERRUM_TLS_NO_VERIFY
         ssl_certificate_location:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: Path to client certificate for mTLS
         ssl_key_location:
           type: string
+          minLength: 1
+          pattern: '\S'
           description: Path to client private key for mTLS
         producer_config:
           type: object
+          propertyNames:
+            type: string
+            minLength: 1
+            pattern: '^\S(?:[\s\S]*\S)?$'
           additionalProperties:
             type: string
-          description: "Escape hatch: arbitrary librdkafka producer properties as key-value pairs"
+            minLength: 1
+            pattern: '\S'
+          description: >-
+            Escape hatch: additional librdkafka producer properties as string
+            key-value pairs. Cannot override bootstrap.servers or authoritative
+            TLS/SASL controls, including official aliases, PEM/keystore identity
+            alternatives, or hostname-verification disablement. TLS-namespace
+            properties require ssl/sasl_ssl; SASL/HTTPS-auth properties require
+            sasl_plaintext/sasl_ssl. Queue/message budgets cannot exceed Ferrum
+            hard maxima. ssl.crl.location cannot conflict with gateway
+            file-backed gateway CRL source when verification is enabled.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
