@@ -245,10 +245,10 @@ Dialect transactionality for custom-plugin migrations:
   enclosing transaction so statement/tracking boundaries never become
   ambiguously half-transactional. **All MySQL custom migrations — including
   DML-only bodies — are therefore non-atomic with the tracking insert and must
-  be idempotent / re-runnable.** For a plugin-owned index that must recover
+  be idempotent / re-runnable.** Pre-existing DML-only MySQL custom migrations written under the older per-migration atomic contract must be reviewed for re-run safety under this runner. For a plugin-owned index that must recover
   across every statement boundary, pair `DROP INDEX name ON table` immediately
   with the exact `CREATE INDEX` definition. The runner tolerates only
-  structured MySQL error `1091` (missing key) on the `DROP INDEX`; every
+  structured MySQL error `1091` (missing key) on a two-token `DROP INDEX name ON table` statement (the `ALTER TABLE ... DROP INDEX` spelling is not tolerated); every
   creation failure remains fatal. A retry then either removes the prior
   definition or observes a missing index before reconstructing the intended
   one. Prefer idempotent table DDL (`CREATE TABLE IF NOT EXISTS`) and

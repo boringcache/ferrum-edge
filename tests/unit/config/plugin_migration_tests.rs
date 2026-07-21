@@ -1103,7 +1103,7 @@ fn example_audit_plugin_mysql_overrides_rebuild_exact_indexes() {
         return;
     };
 
-    let v1 = example.iter().find(|m| m.version == 1).expect("v1");
+    let v1 = example.iter().find(|m| m.version == 3).expect("v3");
     let mysql = v1.sql_mysql.expect("mysql override");
     let postgres = v1.sql_postgres.expect("postgres override");
     assert!(postgres.contains("timestamp TEXT NOT NULL"));
@@ -1146,21 +1146,25 @@ fn example_audit_plugin_mysql_overrides_rebuild_exact_indexes() {
         );
     }
 
-    let v2 = example.iter().find(|m| m.version == 2).expect("v2");
-    let mysql_v2 = v2.sql_mysql.expect("mysql v2 override");
-    let v2_statements: Vec<_> = mysql_v2
+    let v4 = example.iter().find(|m| m.version == 4).expect("v4");
+    let mysql_v4 = v4.sql_mysql.expect("mysql v4 override");
+    let v4_statements: Vec<_> = mysql_v4
         .split(';')
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
         .collect();
     assert_eq!(
-        v2_statements,
+        v4_statements,
         [
             "DROP INDEX idx_example_audit_log_status_ts ON example_audit_log",
             "CREATE INDEX idx_example_audit_log_status_ts ON example_audit_log (response_status, timestamp)",
         ]
     );
-    assert!(!mysql_v2.to_ascii_uppercase().contains("IF NOT EXISTS"));
+    assert!(!mysql_v4.to_ascii_uppercase().contains("IF NOT EXISTS"));
+    assert!(
+        !example.iter().any(|m| m.version == 1 || m.version == 2),
+        "versions 1/2 are retired (old audit_log tracking collision)"
+    );
 }
 
 #[tokio::test]

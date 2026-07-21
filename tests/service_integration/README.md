@@ -36,6 +36,12 @@ cargo test --test service_integration ldap
 cargo test --test service_integration mysql
 ```
 
+The MySQL custom-plugin recovery test requires the pedagogical example at
+build time (`FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin`, which
+CI sets via `.github/actions/setup-rust-ci`). Without that opt-in the MySQL
+test prints `SKIP … example_audit_plugin not compiled in` before starting
+Docker.
+
 **With Docker:** the containers start and the assertions run.
 **Without Docker:** each test prints `SKIP <test>: <service> unavailable …` and
 returns green — the suite stays runnable on a developer machine with no Docker.

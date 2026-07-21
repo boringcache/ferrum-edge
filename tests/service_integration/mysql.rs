@@ -75,6 +75,20 @@ async fn index_definition(pool: &sqlx::AnyPool, index_name: &str) -> Vec<(String
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
+    // Check plugin presence before starting Docker so default local builds
+    // self-skip without waiting ~30-45s for a MySQL container.
+    let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
+    let Some((_, example)) = migrations
+        .into_iter()
+        .find(|(name, _)| *name == "example_audit_plugin")
+    else {
+        eprintln!(
+            "SKIP mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings: \
+             example_audit_plugin not compiled in (set FERRUM_CUSTOM_PLUGINS=example_audit_plugin)"
+        );
+        return;
+    };
+
     let fixture = match start_mysql().await {
         Ok(fixture) => fixture,
         Err(error) => {
@@ -87,11 +101,6 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
         }
     };
     let pool = &fixture.pool;
-    let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
-    let (_, example) = migrations
-        .into_iter()
-        .find(|(name, _)| *name == "example_audit_plugin")
-        .expect("service CI must opt example_audit_plugin in");
 
     // A partial V1 table is missing client_ip. The first attempt successfully
     // rebuilds the timestamp index, then fails on the later client_ip index.
@@ -147,15 +156,15 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
             .is_empty(),
         "the failing client index must remain absent"
     );
-    let tracked_v1: i64 = sqlx::query_scalar(
+    let tracked_v3: i64 = sqlx::query_scalar(
         "SELECT CAST(COUNT(*) AS SIGNED) FROM _ferrum_plugin_migrations \
-         WHERE plugin_name = ? AND version = 1",
+         WHERE plugin_name = ? AND version = 3",
     )
     .bind("example_audit_plugin")
     .fetch_one(pool)
     .await
-    .expect("inspect missing V1 tracking row");
-    assert_eq!(tracked_v1, 0);
+    .expect("inspect missing V3 tracking row");
+    assert_eq!(tracked_v3, 0);
 
     sqlx::query("ALTER TABLE example_audit_log ADD COLUMN client_ip VARCHAR(255) NOT NULL")
         .execute(pool)
@@ -170,8 +179,8 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
         .run_plugin_pending(&list)
         .await
         .expect("retry after partial MySQL DDL must succeed");
-    assert!(applied.iter().any(|record| record.version == 1));
-    assert!(applied.iter().any(|record| record.version == 2));
+    assert!(applied.iter().any(|record| record.version == 3));
+    assert!(applied.iter().any(|record| record.version == 4));
     assert_eq!(
         index_definition(pool, "idx_example_audit_log_timestamp").await,
         [("timestamp".to_string(), 1)]
@@ -211,21 +220,21 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
     .expect("read runtime text binding");
     assert_eq!(context.as_slice(), b"{\"redacted\":true}");
 
-    // Simulate V2 CREATE INDEX committing before its tracker insert.
+    // Simulate V4 CREATE INDEX committing before its tracker insert.
     sqlx::query(
         "DELETE FROM _ferrum_plugin_migrations \
-         WHERE plugin_name = ? AND version = 2",
+         WHERE plugin_name = ? AND version = 4",
     )
     .bind("example_audit_plugin")
     .execute(pool)
     .await
-    .expect("remove V2 tracker row");
-    let recovered_v2 = runner
+    .expect("remove V4 tracker row");
+    let recovered_v4 = runner
         .run_plugin_pending(&list)
         .await
-        .expect("V2 tracking-gap retry must succeed");
-    assert_eq!(recovered_v2.len(), 1);
-    assert_eq!(recovered_v2[0].version, 2);
+        .expect("V4 tracking-gap retry must succeed");
+    assert_eq!(recovered_v4.len(), 1);
+    assert_eq!(recovered_v4[0].version, 4);
     assert_eq!(
         index_definition(pool, "idx_example_audit_log_status_ts").await,
         [

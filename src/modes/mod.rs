@@ -187,17 +187,24 @@ pub(crate) async fn handle_startup_plugin_migrations(
         .await
 }
 
-/// Recovery variant of [`handle_startup_plugin_migrations`]. A pending-state
-/// probe failure must be retried before the recovered configuration is
-/// published, even in warn-only mode; ordinary startup retains its historical
-/// warn-and-continue behavior when auto-apply is disabled.
+/// Recovery variant of [`handle_startup_plugin_migrations`].
+///
+/// Warn-only mode (`auto_apply=false`) matches ordinary startup: a pending-state
+/// **probe failure** is logged and does not block recovered config publication
+/// (in-place recovery must not be strictly weaker than a process restart against
+/// the same database). Auto-apply mode stays fail-closed on probe/apply errors.
+/// A probe that **succeeds** and reports pending migrations still follows the
+/// warn-and-continue / auto-apply policy unchanged.
 pub(crate) async fn handle_recovery_plugin_migrations(
     db: &Arc<dyn DatabaseBackend>,
     auto_apply: bool,
     mode: &str,
 ) -> Result<(), anyhow::Error> {
     let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
-    handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations, true).await
+    // strict_probe only when auto-apply needs a definitive pending list; warn-only
+    // recovery uses the same non-strict probe path as startup.
+    handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations, auto_apply)
+        .await
 }
 
 pub(crate) fn start_acme_renewal_scheduler(

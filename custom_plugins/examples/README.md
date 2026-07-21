@@ -30,3 +30,9 @@ Custom plugin migrations have no automatic down path. If you previously opted
 the example in, applied migrations, then removed the plugin from the binary,
 `example_audit_log` / `_ferrum_plugin_migrations` rows remain until an operator
 drops them deliberately.
+
+An earlier default-compiled revision of this example created an unprefixed
+`audit_log` table under tracking versions 1/2. The current opt-in plugin uses
+versions **3/4** and `example_audit_log` so upgrades are not stuck on checksum
+mismatches. Operators may still see a leftover `audit_log` table; drop it
+deliberately if unused.

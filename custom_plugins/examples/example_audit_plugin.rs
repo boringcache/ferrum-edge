@@ -31,11 +31,16 @@
 //!
 //! This is a best-effort audit example (`OptionalFailOpen` at construction).
 //! Queue-full and flush failures are logged and dropped — not a compliance
-//! or durable-audit guarantee. Do not treat an empty table as proof that no
-//! traffic occurred when the sink was unavailable. Batch writes are
-//! transactional so a retry never encounters rows partially committed by its
-//! own previous attempt. The hourly retention task is aborted with the plugin
-//! generation, so repeated configuration reloads do not accumulate workers.
+//! or durable-audit guarantee. When the gateway SQL backend cannot be resolved
+//! at `start_background_tasks` (MongoDB, missing `FERRUM_DB_TYPE` /
+//! `FERRUM_DB_URL`, unsupported dialect), the plugin logs a loud warning,
+//! leaves the logger un-started, and returns `Ok(())` so admission cannot
+//! wedge config reload — records then drop on the hot path. Do not treat an
+//! empty table as proof that no traffic occurred when the sink was
+//! unavailable. Batch writes are transactional so a retry never encounters
+//! rows partially committed by its own previous attempt. The hourly retention
+//! task is aborted with the plugin generation, so repeated configuration
+//! reloads do not accumulate workers.
 //! Native and translated gRPC transactions retain their terminal gRPC status
 //! separately from the HTTP transport status. WebSocket uses its HTTP upgrade
 //! transaction; this example deliberately does not capture frame payloads.
@@ -120,6 +125,13 @@ const MAX_METADATA_KEY_CHARS: usize = 128;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
 const MAX_CONTEXT_BYTES: usize = 4096;
 const INSERT_COLUMN_COUNT: usize = 13;
+/// Cap multi-row INSERT binds under SQLite's 999-variable floor (13 × 76 = 988).
+const INSERT_MAX_ROWS_PER_STATEMENT: usize = 50;
+/// Chunk size for retention DELETE so a multi-million-row backlog cannot hold
+/// the shared configuration-database write lock for one unbounded statement.
+const RETENTION_DELETE_CHUNK_SIZE: u64 = 1_000;
+const RETENTION_DELETE_CHUNK_PAUSE: Duration = Duration::from_millis(50);
+const RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Per-connection SQLite setup for the audit pool. Must stay aligned with the
 /// primary gateway SQLite pool (`DatabaseStore` `after_connect`).
@@ -150,14 +162,13 @@ impl AuditSqlDialect {
         }
     }
 
-    /// INSERT statement for this dialect. PostgreSQL uses `$1..$13` because
-    /// `sqlx::Any` does not rewrite `?` placeholders; SQLite/MySQL keep `?`.
-    pub fn insert_sql(self) -> String {
-        let placeholders = match self {
+    fn row_placeholders(self, row_index: usize) -> String {
+        match self {
             Self::Postgres => {
+                let base = row_index * INSERT_COLUMN_COUNT;
                 let mut parts = Vec::with_capacity(INSERT_COLUMN_COUNT);
-                for index in 1..=INSERT_COLUMN_COUNT {
-                    parts.push(format!("${index}"));
+                for offset in 1..=INSERT_COLUMN_COUNT {
+                    parts.push(format!("${}", base + offset));
                 }
                 format!("({})", parts.join(", "))
             }
@@ -165,21 +176,49 @@ impl AuditSqlDialect {
                 let parts = vec!["?"; INSERT_COLUMN_COUNT];
                 format!("({})", parts.join(", "))
             }
-        };
+        }
+    }
+
+    /// Multi-row INSERT for this dialect. PostgreSQL uses `$1..$N` because
+    /// `sqlx::Any` does not rewrite `?` placeholders; SQLite/MySQL keep `?`.
+    pub fn insert_sql(self, row_count: usize) -> String {
+        let row_count = row_count.max(1);
+        let mut value_rows = Vec::with_capacity(row_count);
+        for row_index in 0..row_count {
+            value_rows.push(self.row_placeholders(row_index));
+        }
         format!(
             "INSERT INTO {TABLE_NAME} (\n\
                 id, timestamp, client_ip, protocol, http_method, request_path,\n\
                 response_status, grpc_status, latency_ms, consumer_username, proxy_id,\n\
                 request_context, connection_error\n\
-            ) VALUES {placeholders}"
+            ) VALUES {}",
+            value_rows.join(", ")
         )
     }
 
+    /// Chunked retention DELETE. Postgres deletes by `ctid` subquery; SQLite
+    /// uses `rowid` (plain `DELETE ... LIMIT` needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT);
+    /// MySQL supports `DELETE ... LIMIT` natively.
     pub fn retention_delete_sql(self) -> String {
         match self {
-            Self::Postgres => format!("DELETE FROM {TABLE_NAME} WHERE timestamp < $1"),
-            Self::Sqlite | Self::Mysql => {
-                format!("DELETE FROM {TABLE_NAME} WHERE timestamp < ?")
+            Self::Postgres => format!(
+                "DELETE FROM {TABLE_NAME} WHERE ctid IN (\
+                     SELECT ctid FROM {TABLE_NAME} WHERE timestamp < $1 \
+                     LIMIT {RETENTION_DELETE_CHUNK_SIZE}\
+                 )"
+            ),
+            Self::Sqlite => format!(
+                "DELETE FROM {TABLE_NAME} WHERE rowid IN (\
+                     SELECT rowid FROM {TABLE_NAME} WHERE timestamp < ? \
+                     LIMIT {RETENTION_DELETE_CHUNK_SIZE}\
+                 )"
+            ),
+            Self::Mysql => {
+                format!(
+                    "DELETE FROM {TABLE_NAME} WHERE timestamp < ? \
+                     LIMIT {RETENTION_DELETE_CHUNK_SIZE}"
+                )
             }
         }
     }
@@ -643,26 +682,33 @@ async fn insert_batch(
     dialect: AuditSqlDialect,
     batch: Vec<AuditRecord>,
 ) -> Result<(), String> {
-    let insert_sql = dialect.insert_sql();
+    if batch.is_empty() {
+        return Ok(());
+    }
     let mut transaction = pool
         .begin()
         .await
         .map_err(|e| format!("example_audit_plugin batch transaction failed: {e}"))?;
-    for record in batch {
-        sqlx::query(&insert_sql)
-            .bind(&record.id)
-            .bind(&record.timestamp)
-            .bind(&record.client_ip)
-            .bind(&record.protocol)
-            .bind(&record.http_method)
-            .bind(&record.request_path)
-            .bind(record.response_status)
-            .bind(record.grpc_status)
-            .bind(record.latency_ms)
-            .bind(&record.consumer_username)
-            .bind(&record.proxy_id)
-            .bind(&record.request_context)
-            .bind(&record.connection_error)
+    for chunk in batch.chunks(INSERT_MAX_ROWS_PER_STATEMENT) {
+        let insert_sql = dialect.insert_sql(chunk.len());
+        let mut query = sqlx::query(&insert_sql);
+        for record in chunk {
+            query = query
+                .bind(&record.id)
+                .bind(&record.timestamp)
+                .bind(&record.client_ip)
+                .bind(&record.protocol)
+                .bind(&record.http_method)
+                .bind(&record.request_path)
+                .bind(record.response_status)
+                .bind(record.grpc_status)
+                .bind(record.latency_ms)
+                .bind(&record.consumer_username)
+                .bind(&record.proxy_id)
+                .bind(&record.request_context)
+                .bind(&record.connection_error);
+        }
+        query
             .execute(&mut *transaction)
             .await
             .map_err(|e| format!("example_audit_plugin insert failed: {e}"))?;
@@ -675,31 +721,44 @@ async fn insert_batch(
 
 async fn run_retention(pool: AnyPool, dialect: AuditSqlDialect, retention_days: u64) {
     let delete_sql = dialect.retention_delete_sql();
-    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    // Skip the immediate first tick: plugin-cache rebuilds reconstruct this
+    // worker on global-plugin changes, and an immediate full-range DELETE on
+    // every rebuild would thrash the shared configuration database.
+    let start = tokio::time::Instant::now() + RETENTION_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, RETENTION_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        match sqlx::query(&delete_sql).bind(&cutoff).execute(&pool).await {
-            Ok(result) => {
-                let deleted = result.rows_affected();
-                if deleted > 0 {
-                    tracing::info!(
+        let mut total_deleted: u64 = 0;
+        loop {
+            match sqlx::query(&delete_sql).bind(&cutoff).execute(&pool).await {
+                Ok(result) => {
+                    let deleted = result.rows_affected();
+                    total_deleted = total_deleted.saturating_add(deleted);
+                    if deleted < RETENTION_DELETE_CHUNK_SIZE {
+                        break;
+                    }
+                    tokio::time::sleep(RETENTION_DELETE_CHUNK_PAUSE).await;
+                }
+                Err(e) => {
+                    warn!(
                         plugin = PLUGIN_NAME,
-                        deleted,
-                        retention_days,
-                        "example_audit_plugin: purged expired audit rows"
+                        error = %e,
+                        "example_audit_plugin: retention delete failed"
                     );
+                    break;
                 }
             }
-            Err(e) => {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    error = %e,
-                    "example_audit_plugin: retention delete failed"
-                );
-            }
+        }
+        if total_deleted > 0 {
+            tracing::info!(
+                plugin = PLUGIN_NAME,
+                deleted = total_deleted,
+                retention_days,
+                "example_audit_plugin: purged expired audit rows"
+            );
         }
     }
 }
@@ -743,7 +802,22 @@ impl Plugin for ExampleAuditPlugin {
             "example_audit_plugin: start_background_tasks requires a Tokio runtime".to_string()
         })?;
 
-        let GatewayAuditStore { pool, dialect } = connect_gateway_pool_lazy()?;
+        // Backend-resolution failure must not abort gateway startup / config
+        // reload (OptionalFailOpen). Degrade to an un-started logger so the
+        // hot path drops records with the documented best-effort contract.
+        let GatewayAuditStore { pool, dialect } = match connect_gateway_pool_lazy() {
+            Ok(store) => store,
+            Err(error) => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %error,
+                    "example_audit_plugin: SQL backend unavailable; audit logger \
+                     left un-started and records will be dropped until the next \
+                     successful plugin rebuild with a resolvable gateway SQL backend"
+                );
+                return Ok(());
+            }
+        };
         let flush_pool = pool.clone();
         let flush_dialect = dialect;
         let logger = BatchingLogger::spawn(self.batch_config, move |batch| {
@@ -803,9 +877,20 @@ pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
 /// `FERRUM_CUSTOM_PLUGINS`. Applied against the gateway configuration
 /// database by migrate mode / `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS`.
 ///
+/// ## Versioning note
+///
+/// Versions **1** and **2** are retired. An earlier default-compiled revision
+/// of this example used the same tracking name (`example_audit_plugin`) with
+/// versions 1/2 against a different table (`audit_log`). Reusing those
+/// version numbers would leave upgraded deployments with tracking rows but
+/// without `example_audit_log`. New installs and upgrades apply **3** / **4**
+/// (idempotent `CREATE TABLE IF NOT EXISTS`). Operators may still see a
+/// leftover `audit_log` table from the old revision; drop it deliberately if
+/// unused.
+///
 /// ## Guidelines
 ///
-/// - Version numbers are scoped to this plugin (start at 1, increment by 1)
+/// - Version numbers are scoped to this plugin (monotonic; 1/2 retired)
 /// - Table names are plugin-prefixed (`example_audit_log`) to avoid collisions
 /// - The `sql` field is the default SQL used for all databases
 /// - Use `sql_postgres` / `sql_mysql` for database-specific overrides
@@ -819,9 +904,9 @@ pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
 pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
     vec![
         CustomPluginMigration {
-            version: 1,
+            version: 3,
             name: "create_example_audit_log",
-            checksum: "v1_create_example_audit_log_7c2b31",
+            checksum: "v3_create_example_audit_log_7c2b31",
             sql: r#"
                 CREATE TABLE IF NOT EXISTS example_audit_log (
                     id TEXT PRIMARY KEY,
@@ -890,9 +975,9 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
             ),
         },
         CustomPluginMigration {
-            version: 2,
+            version: 4,
             name: "add_status_timestamp_index",
-            checksum: "v2_example_audit_status_ts_91e4c6",
+            checksum: "v4_example_audit_status_ts_91e4c6",
             sql: "CREATE INDEX IF NOT EXISTS idx_example_audit_log_status_ts ON example_audit_log (response_status, timestamp)",
             sql_postgres: None,
             sql_mysql: Some(

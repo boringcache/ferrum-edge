@@ -1988,6 +1988,20 @@ pub async fn run(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Replica reconnect/DNS-watermark maintenance must run even when
+                    // the plugin-migration gate later blocks publication.
+                    if let Some(ref replica_url) = replica_url_for_reconnect {
+                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
+                            db_poll.clone(),
+                            Some(replica_url.as_str()),
+                            replica_hostname.as_deref(),
+                            &dns_cache_for_poll,
+                            last_replica_ips.clone(),
+                            replica_reconnect_in_flight.clone(),
+                        )
+                        .await;
+                    }
+
                     // Check if the database FQDN now resolves to different IPs
                     if let Some(ref hostname) = db_hostname
                         && let Ok(ips) = dns_cache_for_poll.resolve_all(hostname, None, None).await
@@ -2009,6 +2023,10 @@ pub async fn run(
                             );
                             match db_poll.reconnect(&db_url_for_reconnect).await {
                                 Ok(_) => {
+                                    // Pool topology changed — re-probe plugin migrations
+                                    // on the next successful load (failback/failover safety).
+                                    plugin_migration_reconcile_state_poll
+                                        .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
                                     last_db_ips = Some(ips);
                                     force_full_reload = true;
                                 }
@@ -2027,28 +2045,28 @@ pub async fn run(
                     if force_full_reload {
                         match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
                             Ok((new_config, sequence)) => {
-                                if !mark_db_available_after_successful_poll_load(
+                                match try_publish_full_reload_after_gate(
                                     &db_poll,
                                     &db_available_poll,
+                                    &proxy_state_poll,
+                                    new_config,
                                     "full reload after DB DNS reconnect",
+                                    "after DB DNS reconnect",
                                     auto_apply_plugin_migrations_poll,
                                     &plugin_migration_reconcile_state_poll,
-                                )
-                                .await
-                                {
-                                    continue;
-                                }
-                                let outcome = proxy_state_poll.update_config(new_config);
-                                if commit_full_reload_poll_state(
-                                    "after DB DNS reconnect",
-                                    outcome,
                                     &mut last_change_sequence,
                                     sequence,
                                     &config_rejected_poll,
-                                ) {
-                                    force_full_reload = false;
-                                    rejected_delta_tracker.record_accepted();
-                                    debug!("Full config reload complete after DB DNS reconnect");
+                                )
+                                .await
+                                {
+                                    None => continue,
+                                    Some(true) => {
+                                        force_full_reload = false;
+                                        rejected_delta_tracker.record_accepted();
+                                        debug!("Full config reload complete after DB DNS reconnect");
+                                    }
+                                    Some(false) => {}
                                 }
                             }
                             Err(e) => {
@@ -2123,31 +2141,30 @@ pub async fn run(
                                             .await
                                             {
                                                 Ok((new_config, sequence)) => {
-                                                    if !mark_db_available_after_successful_poll_load(
+                                                    match try_publish_full_reload_after_gate(
                                                         &db_poll,
                                                         &db_available_poll,
+                                                        &proxy_state_poll,
+                                                        new_config,
                                                         "rejected-delta escalation full reload",
+                                                        "rejected delta escalation",
                                                         auto_apply_plugin_migrations_poll,
                                                         &plugin_migration_reconcile_state_poll,
-                                                    )
-                                                    .await
-                                                    {
-                                                        continue;
-                                                    }
-                                                    let outcome =
-                                                        proxy_state_poll.update_config(new_config);
-                                                    if commit_full_reload_poll_state(
-                                                        "rejected delta escalation",
-                                                        outcome,
                                                         &mut last_change_sequence,
                                                         sequence,
                                                         &config_rejected_poll,
-                                                    ) {
-                                                        rejected_delta_tracker.record_accepted();
-                                                        recovered_by_full_reload = true;
-                                                        info!(
-                                                            "Rejected database delta recovered by authoritative full reload"
-                                                        );
+                                                    )
+                                                    .await
+                                                    {
+                                                        None => continue,
+                                                        Some(true) => {
+                                                            rejected_delta_tracker.record_accepted();
+                                                            recovered_by_full_reload = true;
+                                                            info!(
+                                                                "Rejected database delta recovered by authoritative full reload"
+                                                            );
+                                                        }
+                                                        Some(false) => {}
                                                     }
                                                 }
                                                 Err(e) => {
@@ -2181,6 +2198,8 @@ pub async fn run(
                                                             .await
                                                         {
                                                             Ok(_url) => {
+                                                                plugin_migration_reconcile_state_poll
+                                                                    .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
                                                                 match load_full_config_with_sequence(
                                                                     &db_poll,
                                                                     &poll_namespace,
@@ -2188,33 +2207,32 @@ pub async fn run(
                                                                 .await
                                                                 {
                                                                     Ok((new_config, sequence)) => {
-                                                                        if !mark_db_available_after_successful_poll_load(
+                                                                        match try_publish_full_reload_after_gate(
                                                                             &db_poll,
                                                                             &db_available_poll,
+                                                                            &proxy_state_poll,
+                                                                            new_config,
                                                                             "rejected-delta escalation failover reload",
+                                                                            "rejected delta escalation failover",
                                                                             auto_apply_plugin_migrations_poll,
                                                                             &plugin_migration_reconcile_state_poll,
-                                                                        )
-                                                                        .await
-                                                                        {
-                                                                            continue;
-                                                                        }
-                                                                        let outcome = proxy_state_poll
-                                                                            .update_config(new_config);
-                                                                        if commit_full_reload_poll_state(
-                                                                            "rejected delta escalation failover",
-                                                                            outcome,
                                                                             &mut last_change_sequence,
                                                                             sequence,
                                                                             &config_rejected_poll,
-                                                                        ) {
-                                                                            rejected_delta_tracker
-                                                                                .record_accepted();
-                                                                            recovered_by_full_reload =
-                                                                                true;
-                                                                            info!(
-                                                                                "Rejected database delta recovered by authoritative failover full reload"
-                                                                            );
+                                                                        )
+                                                                        .await
+                                                                        {
+                                                                            None => continue,
+                                                                            Some(true) => {
+                                                                                rejected_delta_tracker
+                                                                                    .record_accepted();
+                                                                                recovered_by_full_reload =
+                                                                                    true;
+                                                                                info!(
+                                                                                    "Rejected database delta recovered by authoritative failover full reload"
+                                                                                );
+                                                                            }
+                                                                            Some(false) => {}
                                                                         }
                                                                     }
                                                                     Err(e2) => {
@@ -2277,26 +2295,26 @@ pub async fn run(
                                 match load_full_config_with_sequence(&db_poll, &poll_namespace).await
                                 {
                                     Ok((new_config, sequence)) => {
-                                        if !mark_db_available_after_successful_poll_load(
+                                        match try_publish_full_reload_after_gate(
                                             &db_poll,
                                             &db_available_poll,
+                                            &proxy_state_poll,
+                                            new_config,
                                             "full fallback reload",
+                                            "full fallback",
                                             auto_apply_plugin_migrations_poll,
                                             &plugin_migration_reconcile_state_poll,
-                                        )
-                                        .await
-                                        {
-                                            continue;
-                                        }
-                                        let outcome = proxy_state_poll.update_config(new_config);
-                                        if commit_full_reload_poll_state(
-                                            "full fallback",
-                                            outcome,
                                             &mut last_change_sequence,
                                             sequence,
                                             &config_rejected_poll,
-                                        ) {
-                                            rejected_delta_tracker.record_accepted();
+                                        )
+                                        .await
+                                        {
+                                            None => continue,
+                                            Some(true) => {
+                                                rejected_delta_tracker.record_accepted();
+                                            }
+                                            Some(false) => {}
                                         }
                                     }
                                     Err(e2) => {
@@ -2322,6 +2340,8 @@ pub async fn run(
                                                 .await
                                             {
                                                 Ok(_url) => {
+                                                    plugin_migration_reconcile_state_poll
+                                                        .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
                                                     match load_full_config_with_sequence(
                                                         &db_poll,
                                                         &poll_namespace,
@@ -2329,27 +2349,26 @@ pub async fn run(
                                                     .await
                                                     {
                                                         Ok((new_config, sequence)) => {
-                                                            if !mark_db_available_after_successful_poll_load(
+                                                            match try_publish_full_reload_after_gate(
                                                                 &db_poll,
                                                                 &db_available_poll,
+                                                                &proxy_state_poll,
+                                                                new_config,
                                                                 "failover full reload",
+                                                                "failover",
                                                                 auto_apply_plugin_migrations_poll,
                                                                 &plugin_migration_reconcile_state_poll,
-                                                            )
-                                                            .await
-                                                            {
-                                                                continue;
-                                                            }
-                                                            let outcome =
-                                                                proxy_state_poll.update_config(new_config);
-                                                            if commit_full_reload_poll_state(
-                                                                "failover",
-                                                                outcome,
                                                                 &mut last_change_sequence,
                                                                 sequence,
                                                                 &config_rejected_poll,
-                                                            ) {
-                                                                rejected_delta_tracker.record_accepted();
+                                                            )
+                                                            .await
+                                                            {
+                                                                None => continue,
+                                                                Some(true) => {
+                                                                    rejected_delta_tracker.record_accepted();
+                                                                }
+                                                                Some(false) => {}
                                                             }
                                                         }
                                                         Err(e3) => {
@@ -2391,26 +2410,26 @@ pub async fn run(
                     } else {
                         match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
                             Ok((new_config, sequence)) => {
-                                if !mark_db_available_after_successful_poll_load(
+                                match try_publish_full_reload_after_gate(
                                     &db_poll,
                                     &db_available_poll,
+                                    &proxy_state_poll,
+                                    new_config,
                                     "first full reload",
+                                    "initial full poll",
                                     auto_apply_plugin_migrations_poll,
                                     &plugin_migration_reconcile_state_poll,
-                                )
-                                .await
-                                {
-                                    continue;
-                                }
-                                let outcome = proxy_state_poll.update_config(new_config);
-                                if commit_full_reload_poll_state(
-                                    "initial full poll",
-                                    outcome,
                                     &mut last_change_sequence,
                                     sequence,
                                     &config_rejected_poll,
-                                ) {
-                                    rejected_delta_tracker.record_accepted();
+                                )
+                                .await
+                                {
+                                    None => continue,
+                                    Some(true) => {
+                                        rejected_delta_tracker.record_accepted();
+                                    }
+                                    Some(false) => {}
                                 }
                             }
                             Err(e) => {
@@ -2436,17 +2455,6 @@ pub async fn run(
                         }
                     }
 
-                    if let Some(ref replica_url) = replica_url_for_reconnect {
-                        crate::modes::schedule_admin_read_replica_reconnect_if_needed(
-                            db_poll.clone(),
-                            Some(replica_url.as_str()),
-                            replica_hostname.as_deref(),
-                            &dns_cache_for_poll,
-                            last_replica_ips.clone(),
-                            replica_reconnect_in_flight.clone(),
-                        )
-                        .await;
-                    }
                 }
                 _ = poll_shutdown.changed() => {
                     info!("Database polling shutting down");
@@ -2517,6 +2525,45 @@ async fn load_full_config_with_sequence(
     Ok((config, sequence))
 }
 
+/// Publication chokepoint for full-reload poll sites: run the recovery plugin-
+/// migration gate, then apply + commit. Returns `None` when the gate blocks
+/// publication (caller must `continue` the poll tick without publishing).
+/// Returns `Some(accepted)` after `update_config` + [`commit_full_reload_poll_state`].
+#[allow(clippy::too_many_arguments)]
+async fn try_publish_full_reload_after_gate(
+    db: &Arc<dyn DatabaseBackend>,
+    db_available: &AtomicBool,
+    proxy_state: &ProxyState,
+    new_config: GatewayConfig,
+    gate_context: &str,
+    commit_context: &str,
+    auto_apply_plugin_migrations: bool,
+    plugin_migration_reconcile_state: &AtomicU8,
+    last_change_sequence: &mut Option<u64>,
+    sequence: u64,
+    config_rejected: &AtomicBool,
+) -> Option<bool> {
+    if !mark_db_available_after_successful_poll_load(
+        db,
+        db_available,
+        gate_context,
+        auto_apply_plugin_migrations,
+        plugin_migration_reconcile_state,
+    )
+    .await
+    {
+        return None;
+    }
+    let outcome = proxy_state.update_config(new_config);
+    Some(commit_full_reload_poll_state(
+        commit_context,
+        outcome,
+        last_change_sequence,
+        sequence,
+        config_rejected,
+    ))
+}
+
 fn commit_full_reload_poll_state(
     context: &str,
     outcome: proxy::ConfigApplyOutcome,
@@ -2576,6 +2623,7 @@ fn initial_db_available(
         || (config_rejected && plugin_migration_reconcile_state == PLUGIN_MIGRATIONS_RECONCILED)
 }
 
+#[must_use = "gate failure must skip recovered config publication"]
 async fn mark_db_available_after_successful_poll_load(
     db: &Arc<dyn DatabaseBackend>,
     db_available: &AtomicBool,
@@ -2739,8 +2787,33 @@ mod tests {
             "offline bootstrap must initialize the reconcile state as pending"
         );
         assert!(
-            source.contains("if !mark_db_available_after_successful_poll_load("),
-            "poll paths must not publish a recovered config when reconciliation fails"
+            source.contains("async fn try_publish_full_reload_after_gate(")
+                && source.contains("mark_db_available_after_successful_poll_load("),
+            "full-reload publication must go through the gated publish chokepoint"
+        );
+        // Incremental applies are not full reloads; they still call the gate
+        // directly. Full-reload sites must not call update_config outside the
+        // chokepoint helper.
+        let poll_start = source
+            .find("let db_poll_handle = tokio::spawn(async move {")
+            .expect("database poll task must exist");
+        let poll_end = source[poll_start..]
+            .find("background_handles.push(db_poll_handle)")
+            .expect("poll task must be pushed onto background handles");
+        let poll_section = &source[poll_start..poll_start + poll_end];
+        assert!(
+            !poll_section.contains("proxy_state_poll.update_config("),
+            "poll-loop full reloads must publish only via try_publish_full_reload_after_gate"
+        );
+        assert!(
+            poll_section.contains("schedule_admin_read_replica_reconnect_if_needed")
+                && poll_section.find("schedule_admin_read_replica_reconnect_if_needed")
+                    < poll_section.find("try_publish_full_reload_after_gate"),
+            "replica maintenance must run before publication gates on each tick"
+        );
+        assert!(
+            poll_section.contains("PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release)"),
+            "topology reconnect must reset the plugin-migration reconcile gate"
         );
     }
 
@@ -2759,11 +2832,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_recovery_warn_only_retries_failed_plugin_probe_before_publication() {
+    async fn offline_recovery_warn_only_probe_failure_matches_startup_and_allows_publication() {
         let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         if plugin_migrations.is_empty() {
             // Default production builds deliberately compile no pedagogical
             // plugins. Hosted CI opts the examples in and exercises this path.
+            return;
+        }
+
+        let (store, _temp_dir) = offline_recovery_test_store();
+        let pool = store.pool();
+        sqlx::query("CREATE TABLE _ferrum_plugin_migrations (broken TEXT)")
+            .execute(&pool)
+            .await
+            .expect("malformed tracking table");
+        let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+        let db_available = AtomicBool::new(false);
+        let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
+
+        // Warn-only probe failure must not wedge harder than a process restart
+        // (startup uses the non-strict probe path and continues).
+        assert!(
+            mark_db_available_after_successful_poll_load(
+                &db,
+                &db_available,
+                "test failed custom-plugin probe",
+                false,
+                &reconcile_state,
+            )
+            .await,
+            "warn-only recovery must publish after a loud probe-failure warn"
+        );
+        assert!(db_available.load(Ordering::Relaxed));
+        assert_eq!(
+            reconcile_state.load(Ordering::Acquire),
+            PLUGIN_MIGRATIONS_RECONCILED
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_recovery_auto_apply_probe_failure_stays_fail_closed() {
+        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+        if plugin_migrations.is_empty() {
             return;
         }
 
@@ -2781,24 +2891,32 @@ mod tests {
             !mark_db_available_after_successful_poll_load(
                 &db,
                 &db_available,
-                "test failed custom-plugin probe",
-                false,
+                "test auto-apply probe failure",
+                true,
                 &reconcile_state,
             )
             .await,
-            "a failed pending-state probe must block recovered config publication"
+            "auto-apply recovery must stay fail-closed when the pending probe fails"
         );
         assert!(!db_available.load(Ordering::Relaxed));
         assert_eq!(
             reconcile_state.load(Ordering::Acquire),
-            PLUGIN_MIGRATIONS_NEED_RECONCILE,
-            "failed reconciliation must remain retryable"
+            PLUGIN_MIGRATIONS_NEED_RECONCILE
         );
+    }
 
-        sqlx::query("DROP TABLE _ferrum_plugin_migrations")
-            .execute(&pool)
-            .await
-            .expect("repair tracking table");
+    #[tokio::test]
+    async fn offline_recovery_warn_only_publishes_when_probe_succeeds_with_pending() {
+        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+        if plugin_migrations.is_empty() {
+            return;
+        }
+
+        let (store, _temp_dir) = offline_recovery_test_store();
+        let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+        let db_available = AtomicBool::new(false);
+        let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
+
         assert!(
             mark_db_available_after_successful_poll_load(
                 &db,
@@ -2854,37 +2972,20 @@ mod tests {
         )
         .await;
         assert!(config_rejected.load(Ordering::Relaxed));
+        // Warn-only probe failure matches startup (does not block writes); the
+        // independent config_rejected signal still prevents serving the bad
+        // snapshot while in-band repair remains available.
         assert!(
-            !db_available.load(Ordering::Relaxed),
-            "reachable validation rejection must not enable writes before plugin reconciliation"
-        );
-        assert_eq!(
-            reconcile_state.load(Ordering::Acquire),
-            PLUGIN_MIGRATIONS_NEED_RECONCILE
-        );
-
-        sqlx::query("DROP TABLE _ferrum_plugin_migrations")
-            .execute(&pool)
-            .await
-            .expect("repair tracking table");
-        record_config_validation_rejection_after_recovery_migration_gate(
-            &db,
-            &db_available,
-            &config_rejected,
-            false,
-            &reconcile_state,
-            &rejection,
-            "test rejected recovery snapshot after repair",
-        )
-        .await;
-        assert!(db_available.load(Ordering::Relaxed));
-        assert!(
-            config_rejected.load(Ordering::Relaxed),
-            "migration reconciliation must not clear the independent config rejection"
+            db_available.load(Ordering::Relaxed),
+            "warn-only probe failure must not wedge admin writes harder than restart"
         );
         assert_eq!(
             reconcile_state.load(Ordering::Acquire),
             PLUGIN_MIGRATIONS_RECONCILED
+        );
+        assert!(
+            config_rejected.load(Ordering::Relaxed),
+            "migration reconciliation must not clear the independent config rejection"
         );
     }
 

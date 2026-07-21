@@ -4,6 +4,7 @@
 //! plugin registry or schema. They live under `custom_plugins/examples/` and
 //! require an explicit `FERRUM_CUSTOM_PLUGINS` listing (CI sets this for tests).
 
+use std::fs;
 use std::path::Path;
 
 #[test]
@@ -42,6 +43,60 @@ fn build_script_requires_explicit_opt_in_for_examples() {
     assert!(
         build.contains("example_path") && build.contains("examples_dir.join"),
         "build.rs must resolve opted-in names from the examples directory"
+    );
+    assert!(
+        build.contains("lists unknown plugin stem") || build.contains("unknown plugin stem(s)"),
+        "build.rs must fail closed on unresolved FERRUM_CUSTOM_PLUGINS stems"
+    );
+}
+
+#[test]
+fn setup_rust_ci_custom_plugins_list_matches_examples_directory() {
+    // Guard against drifting the shared composite action's hardcoded stem list
+    // away from custom_plugins/examples/*.rs (F16).
+    let action = include_str!("../../.github/actions/setup-rust-ci/action.yml");
+    let export_line = action
+        .lines()
+        .find(|line| line.contains("FERRUM_CUSTOM_PLUGINS="))
+        .expect("setup-rust-ci must export FERRUM_CUSTOM_PLUGINS");
+    let assigned = export_line
+        .split("FERRUM_CUSTOM_PLUGINS=")
+        .nth(1)
+        .expect("assignment")
+        .trim()
+        .trim_matches('"')
+        .split(">>")
+        .next()
+        .expect("env assignment")
+        .trim()
+        .trim_matches('"');
+    let mut listed: Vec<&str> = assigned
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    listed.sort_unstable();
+
+    let mut on_disk: Vec<String> = fs::read_dir("custom_plugins/examples")
+        .expect("examples dir")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    on_disk.sort();
+
+    assert_eq!(
+        listed,
+        on_disk.iter().map(String::as_str).collect::<Vec<_>>(),
+        "setup-rust-ci FERRUM_CUSTOM_PLUGINS must list every custom_plugins/examples/*.rs stem"
     );
 }
 

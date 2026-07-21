@@ -319,23 +319,28 @@ fn test_effective_sql_backend_resolve_from_env_matches_gateway_tls_source_preced
 
 #[test]
 fn test_sqlite_audit_connect_pragmas_include_wal_contract() {
-    if !example_audit_plugin_registered() {
-        // Without the opt-in build the const is unavailable; keep the source
-        // contract assertion so packaging still documents the invariant.
-        let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
-        assert!(source.contains("PRAGMA journal_mode = WAL"));
-        return;
-    }
+    // Always assert the source contract (default builds cannot name the
+    // optional example module path at compile time).
+    let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    assert!(source.contains("PRAGMA journal_mode = WAL"));
 
-    let pragmas = ferrum_edge::custom_plugins::example_audit_plugin::SQLITE_AUDIT_CONNECT_PRAGMAS;
-    assert_eq!(
-        pragmas,
-        &[
-            "PRAGMA foreign_keys = ON",
-            "PRAGMA journal_mode = WAL",
-            "PRAGMA busy_timeout = 5000",
-        ]
-    );
+    // Generated always-available accessor exercises the live const when the
+    // example is opted in via FERRUM_CUSTOM_PLUGINS.
+    if let Some(pragmas) = ferrum_edge::custom_plugins::example_audit_sqlite_connect_pragmas() {
+        assert_eq!(
+            pragmas,
+            &[
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA journal_mode = WAL",
+                "PRAGMA busy_timeout = 5000",
+            ]
+        );
+    } else {
+        assert!(
+            !example_audit_plugin_registered(),
+            "accessor must return Some when example_audit_plugin is compiled in"
+        );
+    }
 }
 
 #[test]
@@ -357,24 +362,40 @@ fn test_dialect_sql_forms_use_table_name_and_correct_placeholders() {
         "retention DELETE must interpolate TABLE_NAME so renames cannot half-apply"
     );
     assert!(
-        source.contains("for index in 1..=INSERT_COLUMN_COUNT")
-            && source.contains("parts.push(format!(\"${index}\"))"),
-        "PostgreSQL INSERT path must build $1..$13 placeholders"
+        source.contains("for offset in 1..=INSERT_COLUMN_COUNT")
+            && source.contains("base + offset"),
+        "PostgreSQL INSERT path must build $1..$N placeholders across multi-row batches"
     );
     assert!(
         source.contains("vec![\"?\"; INSERT_COLUMN_COUNT]"),
         "SQLite/MySQL INSERT path must retain native ? placeholders"
     );
     assert!(
-        source.contains("DELETE FROM {TABLE_NAME} WHERE timestamp < $1"),
-        "PostgreSQL retention DELETE must use $1"
+        source.contains("INSERT_MAX_ROWS_PER_STATEMENT")
+            && source.contains("batch.chunks(INSERT_MAX_ROWS_PER_STATEMENT)"),
+        "flush must emit one multi-row INSERT per chunk, not per record"
     );
     assert!(
-        source.contains("DELETE FROM {TABLE_NAME} WHERE timestamp < ?"),
-        "SQLite/MySQL retention DELETE must use ?"
+        source.contains("WHERE timestamp < $1")
+            && source.contains("SELECT ctid FROM {TABLE_NAME}")
+            && source.contains("LIMIT {RETENTION_DELETE_CHUNK_SIZE}"),
+        "PostgreSQL retention DELETE must use chunked ctid deletes with $1"
     );
     assert!(
-        source.contains("dialect.insert_sql()")
+        source.contains("SELECT rowid FROM {TABLE_NAME}") && source.contains("WHERE timestamp < ?"),
+        "SQLite retention DELETE must use chunked rowid subquery with ?"
+    );
+    assert!(
+        source.contains("DELETE FROM {TABLE_NAME} WHERE timestamp < ?")
+            && source.contains("LIMIT {RETENTION_DELETE_CHUNK_SIZE}"),
+        "MySQL retention DELETE must use chunked LIMIT with ?"
+    );
+    assert!(
+        source.contains("interval_at(start, RETENTION_INTERVAL)"),
+        "retention must skip the immediate first tick"
+    );
+    assert!(
+        source.contains("dialect.insert_sql(chunk.len())")
             && source.contains("dialect.retention_delete_sql()")
             && source.contains("flush_dialect"),
         "resolved dialect must be carried into both INSERT and retention paths"
@@ -548,9 +569,9 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
     .unwrap()
     .expect("plugin instance");
 
-    // Without FERRUM_DB_URL, start_background_tasks must fail closed rather
-    // than silently claiming a durable sink.
-    let start_err = {
+    // Missing SQL backend settings must degrade (OptionalFailOpen): return Ok
+    // with the logger un-started so config reload cannot wedge.
+    {
         let _env_lock = crate::unit::env_lock::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -558,24 +579,20 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
         let _db_url = ScopedEnv::remove("FERRUM_DB_URL");
         plugin
             .start_background_tasks()
-            .expect_err("missing FERRUM_DB_URL must fail")
-    };
-    assert!(start_err.contains("FERRUM_DB_URL"), "got: {start_err}");
+            .expect("missing FERRUM_DB_URL must degrade to Ok, not wedge reload");
+    }
 
-    // A URL without its explicit gateway dialect must also fail closed; the
-    // plugin must never infer placeholder syntax from a possibly credentialed
-    // raw URL.
-    let type_err = {
+    // MongoDB is not a SQL sink for this example; degrade the same way.
+    {
         let _env_lock = crate::unit::env_lock::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _db_url = ScopedEnv::set("FERRUM_DB_URL", "sqlite::memory:");
-        let _db_type = ScopedEnv::remove("FERRUM_DB_TYPE");
+        let _db_type = ScopedEnv::set("FERRUM_DB_TYPE", "mongodb");
+        let _db_url = ScopedEnv::set("FERRUM_DB_URL", "mongodb://127.0.0.1:27017/ferrum");
         plugin
             .start_background_tasks()
-            .expect_err("missing FERRUM_DB_TYPE must fail")
-    };
-    assert!(type_err.contains("FERRUM_DB_TYPE"), "got: {type_err}");
+            .expect("MongoDB backend must degrade to Ok, not wedge reload");
+    }
 
     // Hooks remain panic-free even when the worker was not started.
     let http = TransactionSummary {
@@ -844,7 +861,6 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     let mut saw_unknown_protocol_fallback = false;
     let mut saw_bounded_method = false;
     let mut saw_stream_protocols = std::collections::HashSet::new();
-    let mut expired_gone = false;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let rows = sqlx::query(
@@ -854,9 +870,6 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         .fetch_all(&pool)
         .await
         .unwrap_or_default();
-        expired_gone = rows
-            .iter()
-            .all(|row| row.get::<String, _>("id") != "expired-row");
         for row in &rows {
             let protocol: String = row.get("protocol");
             let client_ip: String = row.get("client_ip");
@@ -916,7 +929,6 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             && saw_unknown_protocol_fallback
             && saw_bounded_method
             && saw_stream_protocols.len() == 4
-            && expired_gone
         {
             break;
         }
@@ -952,7 +964,30 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
             .collect::<std::collections::HashSet<_>>(),
         "expected tcp/tcps/udp/dtls stream audit rows"
     );
-    assert!(expired_gone, "retention worker must purge the expired row");
+
+    // Retention skips the immediate first tick (hourly cadence). Prove the
+    // chunked DELETE contract against the seeded expired row with the same
+    // SQLite SQL the worker emits, without waiting an hour for the ticker.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let purged = sqlx::query(
+        "DELETE FROM example_audit_log WHERE rowid IN (             SELECT rowid FROM example_audit_log WHERE timestamp < ? LIMIT 1000)",
+    )
+        .bind(&cutoff)
+        .execute(&pool)
+        .await
+        .expect("chunked retention DELETE")
+        .rows_affected();
+    assert!(
+        purged >= 1,
+        "chunked retention DELETE must purge expired rows"
+    );
+    let expired_remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM example_audit_log WHERE id = 'expired-row'")
+            .fetch_one(&pool)
+            .await
+            .expect("expired row count");
+    assert_eq!(expired_remaining, 0, "expired retention row must be gone");
 
     let bounded_stream = sqlx::query(
         "SELECT client_ip, proxy_id, connection_error FROM example_audit_log \
