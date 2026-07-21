@@ -828,17 +828,31 @@ async fn test_ws_logging_native_disconnect_preserves_bytes_and_timestamps() {
 #[tokio::test]
 async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
     // Accept TCP but never complete the WebSocket Upgrade. Establishment must
-    // fail within connect_timeout_ms so the worker can continue draining.
+    // fail within connect_timeout_ms; a later accept proves the delivery worker
+    // recovered enough to keep making queue progress.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let endpoint = format!("ws://{addr}/logs");
-    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
+    let (retry_tx, retry_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server = tokio::spawn(async move {
-        let (_stream, _) = listener.accept().await.expect("accept");
-        let _ = accepted_tx.send(());
-        // Hold the accepted socket open without speaking Upgrade.
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        // First TCP accept: hold the socket open without speaking Upgrade.
+        let (stream1, _) = listener.accept().await.expect("accept #1");
+        let _ = first_tx.send(());
+        let hold = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream1);
+        });
+
+        // Second accept is the observable recovery signal: establishment timed
+        // out and the worker advanced into another connect attempt.
+        let (stream2, _) = listener.accept().await.expect("accept #2");
+        let _ = retry_tx.send(());
+        hold.abort();
+        drop(stream2);
+        // Absorb any further reconnect attempts without racing test teardown.
+        while listener.accept().await.is_ok() {}
     });
 
     let plugin = WsLogging::new(
@@ -846,7 +860,8 @@ async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
             "endpoint_url": endpoint,
             "batch_size": 1,
             "flush_interval_ms": 100,
-            "max_retries": 0,
+            "max_retries": 1,
+            "retry_delay_ms": 50,
             "reconnect_delay_ms": 50,
             "connect_timeout_ms": 200,
             "buffer_capacity": 16,
@@ -855,21 +870,16 @@ async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
     )
     .expect("build plugin");
 
-    let started = std::time::Instant::now();
     plugin.log(&create_test_transaction_summary()).await;
-    await_within("silent TCP accept", accepted_rx)
+    await_within("silent TCP first accept", first_rx)
         .await
-        .expect("peer never accepted");
-    // Give the flush loop time to observe the connect timeout and return.
-    // Bound covers admitted flush_interval_ms (100) plus connect_timeout_ms (200).
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "connect timeout must bound establishment well under the silent-peer hang"
-    );
+        .expect("peer never accepted TCP");
+    await_within("silent TCP retry accept after connect_timeout", retry_rx)
+        .await
+        .expect("worker did not retry after Upgrade-phase connect timeout");
 
-    // A second enqueue after the timed-out attempt proves the worker recovered
-    // enough to keep accepting queue progress (it may still fail delivery).
+    // Another enqueue after bounded establishment failure proves the flush
+    // loop is still consuming the queue (not permanently wedged on Upgrade).
     plugin.log(&create_test_transaction_summary()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -962,8 +972,10 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
     let (pong_tx, pong_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
 
     let server = tokio::spawn(async move {
-        // Connection #1: read batch, send Text ack (stops drain), keep socket open.
-        {
+        // Generation 1: Text application ack. Keep the socket open so a hard
+        // TCP close cannot be mistaken for the invalidation signal; only the
+        // drain-completion path may cause a prompt reconnect.
+        let stale_gen1 = {
             let (stream, _) = listener.accept().await.expect("accept #1");
             let ws = tokio_tungstenite::accept_async(stream)
                 .await
@@ -973,13 +985,14 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
             sink.send(Message::Text("ack".into()))
                 .await
                 .expect("send ack");
-            // Keep first connection alive briefly; drain should have exited.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            drop(sink);
-            drop(read);
-        }
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(sink);
+                drop(read);
+            })
+        };
 
-        // Connection #2: after invalidation/reconnect, Ping must get a Pong.
+        // Generation 2: after Text-ack invalidation/reconnect, Ping must get a Pong.
         let (stream, _) = listener.accept().await.expect("accept #2");
         let ws = tokio_tungstenite::accept_async(stream)
             .await
@@ -993,9 +1006,11 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
         while let Some(msg) = read.next().await {
             if let Ok(Message::Pong(data)) = msg {
                 let _ = pong_tx.send(data.to_vec());
-                return;
+                break;
             }
         }
+
+        stale_gen1.abort();
     });
 
     let plugin = WsLogging::new(
@@ -1012,12 +1027,13 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
     )
     .expect("build plugin");
 
+    // Establish gen1 (Text ack), then pump until gen2 appears while gen1 stays
+    // physically open. Reconnect must be driven by drain-completion notification.
     plugin.log(&create_test_transaction_summary()).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    for _ in 0..5 {
+    for _ in 0..6 {
         plugin.log(&create_test_transaction_summary()).await;
         // Pace above the admitted flush interval so reconnect attempts can flush.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
     }
 
     await_within("reconnect after application frame", second_rx)
