@@ -52,6 +52,7 @@
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes read from a mirror response when sizing it (only consulted when the response has no `content-length`). Streaming aborts as soon as the limit is crossed; mirror task discards the bytes after sizing. |
+//! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. |
 
 use async_trait::async_trait;
 use serde_json::Value;

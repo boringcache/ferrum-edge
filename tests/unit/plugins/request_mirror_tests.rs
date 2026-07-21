@@ -371,6 +371,42 @@ fn test_max_in_flight_zero_is_error() {
     assert!(result.err().unwrap().contains("max_in_flight"));
 }
 
+#[test]
+fn max_in_flight_is_documented_across_source_guide_and_example() {
+    // Regression for #2476: the runtime has accepted `max_in_flight`
+    // (default 256, minimum 1) as the per-instance mirror concurrency bound
+    // since it was introduced, and OpenAPI models it, but the source
+    // configuration table, the public plugin guide, and the YAML example
+    // omitted it. Keep every operator-facing surface aligned so the setting
+    // cannot drift undocumented again.
+    let source = include_str!("../../../src/plugins/request_mirror.rs");
+    let guide = include_str!("../../../docs/plugins.md");
+    let section = guide
+        .split("### `request_mirror`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("request_mirror docs section");
+
+    // The runtime default both tables document.
+    assert!(source.contains("DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256"));
+    assert!(
+        source.contains("`max_in_flight` | u64 | `256`"),
+        "source configuration table must document max_in_flight"
+    );
+    assert!(
+        section.contains("`max_in_flight` | Integer | `256`"),
+        "public parameter table must document max_in_flight"
+    );
+    // The guide's YAML example shows the field, and the guide records the
+    // saturation contract: dropping a mirror attempt never affects the
+    // primary request.
+    assert!(
+        section.contains("max_in_flight: 64"),
+        "request_mirror YAML example must include max_in_flight"
+    );
+    assert!(section.contains("without affecting the primary request"));
+}
+
 // ---------------------------------------------------------------------------
 // Config defaults
 // ---------------------------------------------------------------------------
