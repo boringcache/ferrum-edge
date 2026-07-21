@@ -20020,12 +20020,22 @@ components:
 
     RequestDeduplicationConfig:
       type: object
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value."
+      allOf:
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Explicitly supplied Redis fields are validated even in local mode so latent configuration cannot become invalid only when the mode is changed."
       properties:
         header_name:
           type: string
+          minLength: 1
+          pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: "Idempotency-Key"
-          description: Request header name containing the deduplication key
+          description: Request header name containing the deduplication key. Must be a valid RFC 9110 HTTP field-name token.
         ttl_seconds:
           type: integer
           minimum: 1
@@ -20056,10 +20066,12 @@ components:
           description: Exact maximum retained size across local completed response entries. Responses that would exceed this cap are returned normally and are not retained. In local mode, skipped responses clear in-flight state immediately; in Redis mode, a local-total-cap skip keeps local and distributed in-flight locks until inflight_ttl_seconds if Redis publication fails.
         applicable_methods:
           type: array
+          minItems: 1
           items:
             type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: ["POST", "PUT", "PATCH"]
-          description: HTTP methods that require deduplication
+          description: HTTP methods that require deduplication. Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token.
         scope_by_consumer:
           type: boolean
           default: true
@@ -20075,27 +20087,33 @@ components:
           description: "Dedup cache storage: 'local' (in-memory) or 'redis' (centralized completed responses plus distributed in-flight locks). Any RESP-compatible server works."
         redis_url:
           type: string
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'. Explicitly supplied values are validated even in local mode so latent configuration cannot become invalid only when the mode changes."
         redis_tls:
           type: boolean
           default: false
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "ferrum:dedup"
-          description: Key prefix for all Redis keys
+          description: Key prefix for all Redis keys. Must be non-empty when supplied.
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
-          description: Redis connection timeout in seconds
+          description: Redis connection timeout in seconds. Must be greater than zero.
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
-          description: Health check ping interval when Redis is unavailable
+          description: Health check ping interval when Redis is unavailable. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL authentication
