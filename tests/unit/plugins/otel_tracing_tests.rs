@@ -1,10 +1,12 @@
 //! Tests for otel_tracing plugin
 
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
-    TransactionSummary, WsDisconnectContext, mesh::workload_metrics::WorkloadMetrics,
-    otel_tracing::OtelTracing, utils::PluginHttpClient,
+    ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, PluginResult, RequestContext,
+    StreamTransactionSummary, TransactionSummary, WsDisconnectContext,
+    mesh::workload_metrics::WorkloadMetrics, otel_tracing::OtelTracing,
+    utils::PluginHttpClient,
 };
+use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -150,6 +152,10 @@ fn otlp_string_attr<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
 
 fn otlp_bool_attr(span: &Value, key: &str) -> Option<bool> {
     otlp_attr_value(span, key).and_then(|value| value.get("boolValue")?.as_bool())
+}
+
+fn otlp_int_attr<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
+    otlp_attr_value(span, key).and_then(|value| value.get("intValue")?.as_str())
 }
 
 fn otlp_resource_string_attr<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
@@ -384,6 +390,112 @@ async fn test_otel_tracing_injects_headers_before_proxy() {
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     assert!(headers.contains_key("traceparent"));
+}
+
+#[tokio::test]
+async fn test_otel_tracing_prefers_validated_request_authority_without_host_header() {
+    let plugin = new_otel(&json!({}));
+    let mut ctx = make_ctx();
+    ctx.headers.remove("host");
+    ctx.request_authority = Some("Edge.Example:8443".to_string());
+
+    plugin.on_request_received(&mut ctx).await;
+
+    assert_eq!(
+        ctx.metadata.get("server_address").map(String::as_str),
+        Some("edge.example")
+    );
+    assert_eq!(
+        ctx.metadata.get("server_port").map(String::as_str),
+        Some("8443")
+    );
+}
+
+#[tokio::test]
+async fn test_otel_tracing_before_proxy_replaces_all_caller_trace_context_casings() {
+    let plugin = new_otel(&json!({"trace_context_trust": "untrusted"}));
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "TraceParent".to_string(),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+    );
+    ctx.headers
+        .insert("TraceState".to_string(), "vendor=caller".to_string());
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let trace_headers: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
+        .collect();
+    assert_eq!(trace_headers.len(), 1);
+    assert_eq!(
+        trace_headers[0].1,
+        ctx.metadata.get("traceparent").expect("generated traceparent")
+    );
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("tracestate"))
+    );
+}
+
+#[tokio::test]
+async fn test_otel_tracing_before_proxy_strips_untrusted_context_when_generation_is_disabled() {
+    let plugin = new_otel(&json!({
+        "trace_context_trust": "untrusted",
+        "generate_trace_id": false
+    }));
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "TraceParent".to_string(),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+    );
+    ctx.headers
+        .insert("tracestate".to_string(), "vendor=caller".to_string());
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(headers.keys().all(|name| {
+        !name.eq_ignore_ascii_case("traceparent")
+            && !name.eq_ignore_ascii_case("tracestate")
+    }));
+}
+
+#[tokio::test]
+async fn test_otel_tracing_trusted_context_is_forwarded_once_with_canonical_names() {
+    let plugin = new_otel_trusted(&json!({}));
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "TraceParent".to_string(),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+    );
+    ctx.headers
+        .insert("TraceState".to_string(), "vendor=trusted".to_string());
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(headers.get("tracestate").map(String::as_str), Some("vendor=trusted"));
+    assert_eq!(
+        headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("traceparent"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("tracestate"))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1013,9 +1125,14 @@ async fn test_otel_tracing_rich_span_attributes() {
     );
     assert_eq!(otlp_string_attr(span, "url.path"), Some("/api/llm/chat"));
     assert_eq!(
-        otlp_string_attr(span, "server.socket.address"),
+        otlp_string_attr(span, "gateway.backend.resolved_address"),
         Some("10.1.2.3")
     );
+    assert_eq!(
+        otlp_string_attr(span, "gateway.backend.target"),
+        Some("backend:8080")
+    );
+    assert!(otlp_string_attr(span, "server.socket.address").is_none());
     assert_eq!(
         otlp_bool_attr(span, "gateway.response.streamed"),
         Some(true)
@@ -1135,6 +1252,67 @@ async fn test_otel_tracing_rejects_unknown_config_keys() {
 }
 
 #[tokio::test]
+async fn test_otel_tracing_rejects_explicit_null_properties() {
+    for key in [
+        "endpoint",
+        "service_name",
+        "deployment_environment",
+        "generate_trace_id",
+        "headers",
+        "authorization",
+        "batch_size",
+        "flush_interval_ms",
+        "buffer_capacity",
+        "buffer_max_bytes",
+        "max_attribute_bytes",
+        "max_retries",
+        "retry_delay_ms",
+        "trace_context_trust",
+        "root_sampling",
+        "include_url_path",
+    ] {
+        let mut config = json!({"endpoint": "http://localhost:4318/v1/traces"});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert(key.to_string(), Value::Null);
+        let error = OtelTracing::new_with_http_client(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("explicit null for {key} must be rejected"));
+        assert!(error.contains(key), "{key}: {error}");
+    }
+
+    let error = OtelTracing::new_with_http_client(
+        &json!({"root_sampling": "ratio", "root_sampling_ratio": null}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("null sampling ratio must be rejected");
+    assert!(error.contains("root_sampling_ratio"), "got: {error}");
+}
+
+#[tokio::test]
+async fn test_otel_tracing_validates_exporter_controls_without_an_endpoint() {
+    for (key, value) in [
+        ("batch_size", json!(0)),
+        ("flush_interval_ms", json!(1)),
+        ("buffer_capacity", json!(0)),
+        ("authorization", json!(false)),
+        ("headers", json!([])),
+    ] {
+        let mut config = json!({});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert(key.to_string(), value);
+        let error = OtelTracing::new_with_http_client(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("invalid propagation-only {key} must be rejected"));
+        assert!(error.contains(key), "{key}: {error}");
+    }
+}
+
+#[tokio::test]
 async fn test_otel_tracing_rejects_out_of_range_batch_size() {
     let err = OtelTracing::new_with_http_client(
         &json!({
@@ -1182,7 +1360,12 @@ async fn test_otel_tracing_untrusted_parent_creates_fresh_root() {
     );
     assert!(!ctx.metadata.contains_key("parent_span_id"));
     assert!(!ctx.metadata.contains_key("tracestate"));
-    assert!(ctx.metadata.contains_key("untrusted_parent_digest"));
+    assert!(
+        ctx.metadata
+            .keys()
+            .all(|key| !key.starts_with("untrusted_parent")),
+        "attacker-chosen trace identity must not survive as export metadata"
+    );
     assert_eq!(
         ctx.metadata.get("trace_sampled").map(String::as_str),
         Some("true")
@@ -1202,6 +1385,34 @@ async fn test_otel_tracing_invalid_parent_drops_tracestate() {
 
     plugin.on_request_received(&mut ctx).await;
     assert!(ctx.metadata.contains_key("trace_id"));
+    assert!(!ctx.metadata.contains_key("tracestate"));
+}
+
+#[tokio::test]
+async fn test_otel_tracing_duplicate_traceparent_casings_are_rejected() {
+    let plugin = new_otel_trusted(&json!({}));
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "traceparent".to_string(),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+    );
+    ctx.headers.insert(
+        "TraceParent".to_string(),
+        "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string(),
+    );
+    ctx.headers
+        .insert("tracestate".to_string(), "vendor=old".to_string());
+
+    plugin.on_request_received(&mut ctx).await;
+
+    assert_ne!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736")
+    );
+    assert_ne!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
     assert!(!ctx.metadata.contains_key("tracestate"));
 }
 
@@ -1337,26 +1548,76 @@ async fn test_otel_tracing_body_error_is_error_status() {
 }
 
 #[tokio::test]
-async fn test_otel_tracing_stream_error_is_error_status() {
-    let mock_server = wiremock::MockServer::start().await;
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .respond_with(wiremock::ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+async fn test_otel_tracing_stream_failures_preserve_protocol_cause_and_direction() {
+    for (protocol, cause, direction, expected_cause, client_disconnected) in [
+        (
+            "tcp",
+            DisconnectCause::BackendError,
+            Some(Direction::BackendToClient),
+            "backend_error",
+            false,
+        ),
+        (
+            "udp",
+            DisconnectCause::RecvError,
+            Some(Direction::ClientToBackend),
+            "recv_error",
+            true,
+        ),
+        (
+            "dtls",
+            DisconnectCause::IdleTimeout,
+            None,
+            "idle_timeout",
+            false,
+        ),
+    ] {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let plugin = new_otel(&json!({
+            "endpoint": format!("{}/v1/traces", mock_server.uri()),
+            "batch_size": 1,
+            "flush_interval_ms": 100
+        }));
+        let mut summary = make_stream_summary(make_trace_metadata());
+        summary.protocol = protocol.to_string();
+        summary.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionTimeout);
+        summary.connection_error = Some("classified terminal failure".to_string());
+        summary.disconnect_cause = Some(cause);
+        summary.disconnect_direction = direction;
+        plugin.on_stream_disconnect(&summary).await;
 
-    let plugin = new_otel(&json!({
-        "endpoint": format!("{}/v1/traces", mock_server.uri()),
-        "batch_size": 1,
-        "flush_interval_ms": 100
-    }));
-    let mut summary = make_stream_summary(make_trace_metadata());
-    summary.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionTimeout);
-    plugin.on_stream_disconnect(&summary).await;
-
-    let payload = received_json(&mock_server).await;
-    let span = otlp_span(&payload);
-    assert_eq!(span["status"]["code"], 2);
+        let payload = received_json(&mock_server).await;
+        let span = otlp_span(&payload);
+        assert_eq!(span["status"]["code"], 2, "{protocol}");
+        assert_eq!(
+            otlp_string_attr(span, "network.protocol.name"),
+            Some(protocol)
+        );
+        assert_eq!(
+            otlp_string_attr(span, "gateway.disconnect.cause"),
+            Some(expected_cause)
+        );
+        assert_eq!(
+            otlp_bool_attr(span, "gateway.client.disconnected").unwrap_or(false),
+            client_disconnected
+        );
+        assert_eq!(otlp_int_attr(span, "gateway.stream.bytes_sent"), Some("128"));
+        assert_eq!(
+            otlp_int_attr(span, "gateway.stream.bytes_received"),
+            Some("512")
+        );
+        assert_eq!(
+            otlp_attr_value(span, "gateway.latency.total_ms")
+                .and_then(|value| value.get("doubleValue"))
+                .and_then(Value::as_f64),
+            Some(42.0)
+        );
+    }
 }
 
 #[tokio::test]
@@ -1404,6 +1665,103 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
     assert_eq!(span["name"], "WEBSOCKET chat");
     // Span id in payload is base64; parent should reference handshake span.
     assert!(span.get("parentSpanId").is_some());
+    assert!(
+        span["startTimeUnixNano"]
+            .as_str()
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|value| value > 0),
+        "WebSocket session start must be derived from teardown time instead of the Unix epoch"
+    );
+    assert_eq!(
+        otlp_string_attr(span, "gateway.disconnect.cause"),
+        Some("graceful_shutdown")
+    );
+    assert_eq!(
+        otlp_int_attr(span, "gateway.websocket.frames_client_to_backend"),
+        Some("2")
+    );
+    assert_eq!(
+        otlp_int_attr(span, "gateway.websocket.frames_backend_to_client"),
+        Some("3")
+    );
+    assert_eq!(
+        otlp_int_attr(span, "gateway.stream.bytes_sent"),
+        Some("10")
+    );
+    assert_eq!(
+        otlp_int_attr(span, "gateway.stream.bytes_received"),
+        Some("20")
+    );
+}
+
+#[tokio::test]
+async fn test_otel_tracing_ws_disconnect_distinguishes_client_and_backend_failures() {
+    for (direction, io_side, expected_cause, client_disconnected) in [
+        (
+            Direction::ClientToBackend,
+            StreamIoSide::Read,
+            "recv_error",
+            true,
+        ),
+        (
+            Direction::BackendToClient,
+            StreamIoSide::Read,
+            "backend_error",
+            false,
+        ),
+    ] {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let plugin = new_otel(&json!({
+            "endpoint": format!("{}/v1/traces", mock_server.uri()),
+            "batch_size": 1,
+            "flush_interval_ms": 100
+        }));
+        let ctx = WsDisconnectContext {
+            namespace: "ferrum".to_string(),
+            proxy_id: "ws-1".to_string(),
+            proxy_name: Some("chat".to_string()),
+            client_ip: "10.0.0.1".to_string(),
+            backend_target: "http://backend:8080/ws".to_string(),
+            listen_port: 443,
+            duration_ms: 12.0,
+            frames_client_to_backend: 2,
+            frames_backend_to_client: 3,
+            bytes_client_to_backend: 10,
+            bytes_backend_to_client: 20,
+            direction: Some(direction),
+            io_side: Some(io_side),
+            error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionReset),
+            consumer_username: None,
+            auth_method: None,
+            metadata: make_trace_metadata(),
+        };
+        plugin.on_ws_disconnect(&ctx).await;
+
+        let payload = received_json(&mock_server).await;
+        let span = otlp_span(&payload);
+        assert_eq!(span["status"]["code"], 2);
+        assert_eq!(
+            otlp_string_attr(span, "gateway.disconnect.cause"),
+            Some(expected_cause)
+        );
+        assert_eq!(
+            otlp_string_attr(span, "gateway.disconnect.direction"),
+            Some(match direction {
+                Direction::ClientToBackend => "client_to_backend",
+                Direction::BackendToClient => "backend_to_client",
+                Direction::Unknown => "unknown",
+            })
+        );
+        assert_eq!(
+            otlp_bool_attr(span, "gateway.client.disconnected").unwrap_or(false),
+            client_disconnected
+        );
+    }
 }
 
 #[tokio::test]
@@ -1431,6 +1789,76 @@ async fn test_otel_tracing_otlp_partial_success_is_logged_not_retried() {
     let _ = received_json(&mock_server).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_otel_tracing_otlp_success_body_variants_are_bounded_and_never_retried() {
+    let cases = vec![
+        (
+            "full-success",
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({})),
+        ),
+        (
+            "warning-only",
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "partialSuccess": {
+                    "rejectedSpans": "0",
+                    "errorMessage": "collector warning\nwith control text"
+                }
+            })),
+        ),
+        (
+            "malformed-json",
+            wiremock::ResponseTemplate::new(200).set_body_raw("not-json", "application/json"),
+        ),
+        (
+            "null-default-success",
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"partialSuccess": null})),
+        ),
+        (
+            "malformed-partial-success-shape",
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"partialSuccess": []})),
+        ),
+        (
+            "malformed-rejected-count",
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "partialSuccess": {"rejectedSpans": "not-a-count"}
+            })),
+        ),
+        (
+            "wrong-content-type",
+            wiremock::ResponseTemplate::new(200).set_body_raw("{}", "text/plain"),
+        ),
+        (
+            "oversized",
+            wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 64 * 1024 + 1]),
+        ),
+    ];
+
+    for (case, response) in cases {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let plugin = new_otel(&json!({
+            "endpoint": format!("{}/v1/traces", mock_server.uri()),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 3
+        }));
+        plugin.log(&make_summary(make_trace_metadata())).await;
+        let _ = received_json(&mock_server).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            1,
+            "{case}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -26,14 +26,14 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::modes::mesh::config::TracingProvider;
+use crate::util::accept_backoff::LogRateLimiter;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mesh::mesh_trace_attributes;
 use super::utils::PluginHttpClient;
-use super::utils::log_schema::view::extract_host_from_url;
 use super::{
-    Plugin, PluginResult, RequestContext, StreamTransactionSummary, TransactionSummary,
-    WsDisconnectContext,
+    Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
+    TransactionSummary, WsDisconnectContext,
 };
 
 const TRACEPARENT_HEADER: &str = "traceparent";
@@ -82,6 +82,7 @@ const MIN_RETRY_DELAY_MS: u64 = 0;
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
 const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
 const MAX_PARTIAL_SUCCESS_MESSAGE_BYTES: usize = 512;
+const MAX_OTLP_SUCCESS_BODY_BYTES: usize = 64 * 1024;
 const MAX_URL_PATH_BYTES: usize = 512;
 
 /// Whether inbound W3C parents are trusted as span parents.
@@ -109,6 +110,7 @@ pub struct OtelTracing {
     include_url_path: bool,
     max_attribute_bytes: usize,
     exporter: Option<Arc<dyn TraceExporter>>,
+    export_drop_log_limiter: Mutex<LogRateLimiter>,
 }
 
 /// OTLP-flavoured span kind. Mirrored to Zipkin / Datadog payloads with each
@@ -192,7 +194,11 @@ pub(crate) struct SpanData {
     pub(crate) stream_listen_port: Option<u16>,
     pub(crate) stream_bytes_sent: Option<u64>,
     pub(crate) stream_bytes_received: Option<u64>,
-    pub(crate) untrusted_parent_digest: Option<String>,
+    pub(crate) disconnect_direction: Option<String>,
+    pub(crate) disconnect_cause: Option<String>,
+    pub(crate) stream_io_side: Option<String>,
+    pub(crate) ws_frames_client_to_backend: Option<u64>,
+    pub(crate) ws_frames_backend_to_client: Option<u64>,
 }
 
 /// Queue-backed span exporter used by tracing plugins.
@@ -251,6 +257,11 @@ impl SpanData {
             .as_deref()
             .map(parse_backend_host_port)
             .unwrap_or((None, None));
+        let backend_target = gateway_backend_target(
+            backend_host.as_deref(),
+            backend_port,
+            max_attribute_bytes,
+        );
         let grpc_status = summary.grpc_status();
         let otlp_error = http_span_is_error(summary);
         let http_url = if include_url_path {
@@ -300,10 +311,7 @@ impl SpanData {
             namespace: Some(truncate_attr(&summary.namespace, max_attribute_bytes)),
             server_address: server_address.map(|v| truncate_attr(&v, max_attribute_bytes)),
             server_port,
-            backend_target: summary
-                .backend_target
-                .as_deref()
-                .map(|v| truncate_attr(v, max_attribute_bytes)),
+            backend_target,
             backend_host: backend_host.map(|v| truncate_attr(&v, max_attribute_bytes)),
             backend_port,
             backend_resolved_ip: summary
@@ -321,7 +329,11 @@ impl SpanData {
             stream_listen_port: None,
             stream_bytes_sent: None,
             stream_bytes_received: None,
-            untrusted_parent_digest: summary.metadata.get("untrusted_parent_digest").cloned(),
+            disconnect_direction: None,
+            disconnect_cause: None,
+            stream_io_side: None,
+            ws_frames_client_to_backend: None,
+            ws_frames_backend_to_client: None,
         })
     }
 
@@ -352,7 +364,16 @@ impl SpanData {
             .cloned()
             .unwrap_or_default();
         let (backend_host, backend_port) = parse_backend_host_port(&summary.backend_target);
-        let otlp_error = summary.error_class.is_some();
+        let backend_target = gateway_backend_target(
+            backend_host.as_deref(),
+            backend_port,
+            max_attribute_bytes,
+        );
+        let otlp_error = summary.error_class.is_some()
+            || summary.connection_error.is_some()
+            || summary
+                .disconnect_cause
+                .is_some_and(|cause| cause != DisconnectCause::GracefulShutdown);
         let route = summary
             .proxy_name
             .as_deref()
@@ -390,7 +411,7 @@ impl SpanData {
             namespace: Some(truncate_attr(&summary.namespace, max_attribute_bytes)),
             server_address: None,
             server_port: Some(summary.listen_port),
-            backend_target: Some(truncate_attr(&summary.backend_target, max_attribute_bytes)),
+            backend_target,
             backend_host: backend_host.map(|v| truncate_attr(&v, max_attribute_bytes)),
             backend_port,
             backend_resolved_ip: summary
@@ -401,14 +422,27 @@ impl SpanData {
             body_error_class: None,
             body_completed: true,
             response_streamed: false,
-            client_disconnected: summary.connection_error.is_some(),
+            client_disconnected: matches!(
+                summary.disconnect_cause,
+                Some(DisconnectCause::RecvError)
+            ),
             otlp_error,
             mesh_attributes: mesh_trace_attributes(&summary.metadata),
             stream_protocol: Some(summary.protocol.clone()),
             stream_listen_port: Some(summary.listen_port),
             stream_bytes_sent: Some(summary.bytes_sent),
             stream_bytes_received: Some(summary.bytes_received),
-            untrusted_parent_digest: summary.metadata.get("untrusted_parent_digest").cloned(),
+            disconnect_direction: summary
+                .disconnect_direction
+                .map(direction_label)
+                .map(str::to_string),
+            disconnect_cause: summary
+                .disconnect_cause
+                .map(disconnect_cause_label)
+                .map(str::to_string),
+            stream_io_side: None,
+            ws_frames_client_to_backend: None,
+            ws_frames_backend_to_client: None,
         })
     }
 
@@ -422,6 +456,12 @@ impl SpanData {
         let span_id = OtelTracing::generate_span_id();
         let parent_span_id = ctx.metadata.get("span_id").cloned().unwrap_or_default();
         let (backend_host, backend_port) = parse_backend_host_port(&ctx.backend_target);
+        let backend_target = gateway_backend_target(
+            backend_host.as_deref(),
+            backend_port,
+            max_attribute_bytes,
+        );
+        let disconnect_cause = websocket_disconnect_cause(ctx);
         let otlp_error = ctx.error_class.is_some();
         let route = ctx.proxy_name.as_deref().unwrap_or("websocket");
         Some(Self {
@@ -447,7 +487,7 @@ impl SpanData {
                 .consumer_username
                 .as_deref()
                 .map(|v| truncate_attr(v, max_attribute_bytes)),
-            timestamp_received: String::new(),
+            timestamp_received: timestamp_before_now(ctx.duration_ms),
             user_agent: None,
             proxy_id: Some(truncate_attr(&ctx.proxy_id, max_attribute_bytes)),
             matched_route: ctx
@@ -457,7 +497,7 @@ impl SpanData {
             namespace: Some(truncate_attr(&ctx.namespace, max_attribute_bytes)),
             server_address: None,
             server_port: Some(ctx.listen_port),
-            backend_target: Some(truncate_attr(&ctx.backend_target, max_attribute_bytes)),
+            backend_target,
             backend_host: backend_host.map(|v| truncate_attr(&v, max_attribute_bytes)),
             backend_port,
             backend_resolved_ip: None,
@@ -465,14 +505,21 @@ impl SpanData {
             body_error_class: None,
             body_completed: true,
             response_streamed: false,
-            client_disconnected: ctx.error_class.is_some(),
+            client_disconnected: websocket_client_disconnected(ctx),
             otlp_error,
             mesh_attributes: mesh_trace_attributes(&ctx.metadata),
             stream_protocol: Some("websocket".to_string()),
             stream_listen_port: Some(ctx.listen_port),
             stream_bytes_sent: Some(ctx.bytes_client_to_backend),
             stream_bytes_received: Some(ctx.bytes_backend_to_client),
-            untrusted_parent_digest: ctx.metadata.get("untrusted_parent_digest").cloned(),
+            disconnect_direction: ctx.direction.map(direction_label).map(str::to_string),
+            disconnect_cause: Some(disconnect_cause_label(disconnect_cause).to_string()),
+            stream_io_side: ctx
+                .io_side
+                .map(stream_io_side_label)
+                .map(str::to_string),
+            ws_frames_client_to_backend: Some(ctx.frames_client_to_backend),
+            ws_frames_backend_to_client: Some(ctx.frames_backend_to_client),
         })
     }
 
@@ -501,6 +548,17 @@ impl SpanData {
                 .unwrap_or(0)
             + self.error_class.as_ref().map(String::len).unwrap_or(0)
             + self.body_error_class.as_ref().map(String::len).unwrap_or(0)
+            + self
+                .disconnect_direction
+                .as_ref()
+                .map(String::len)
+                .unwrap_or(0)
+            + self
+                .disconnect_cause
+                .as_ref()
+                .map(String::len)
+                .unwrap_or(0)
+            + self.stream_io_side.as_ref().map(String::len).unwrap_or(0)
             + self
                 .mesh_attributes
                 .iter()
@@ -538,19 +596,21 @@ impl OtelTracing {
             MAX_MAX_ATTRIBUTE_BYTES,
         )?;
 
-        let deployment_environment = optional_string_config(config, "deployment_environment")?;
         let endpoint = optional_string_config(config, "endpoint")?;
+        let authorization = optional_string_config(config, "authorization")?;
+        let custom_headers = parse_custom_headers(config.get("headers"))?;
+        // Validate exporter controls even in propagation-only mode. A stored
+        // typo or invalid queue setting must not become latent until an
+        // endpoint is added later.
+        let options =
+            TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
 
         let exporter = if let Some(endpoint) = endpoint {
-            let options =
-                TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
-            let authorization = optional_string_config(config, "authorization")?;
-            let custom_headers = parse_custom_headers(config.get("headers"))?;
             Some(Arc::new(OtlpTraceExporter::new(
                 endpoint,
                 authorization,
                 custom_headers,
-                options.with_deployment_environment(deployment_environment),
+                options,
             )?) as Arc<dyn TraceExporter>)
         } else {
             None
@@ -564,6 +624,7 @@ impl OtelTracing {
             include_url_path,
             max_attribute_bytes,
             exporter,
+            export_drop_log_limiter: Mutex::new(LogRateLimiter::new()),
         })
     }
 
@@ -663,11 +724,19 @@ impl OtelTracing {
         if let Some(exporter) = &self.exporter
             && let Err(error) = exporter.try_export(span)
         {
-            warn!(
-                "{} export buffer full — dropping span: {}",
-                exporter.provider_name(),
-                error
-            );
+            let now_ms = crate::socket_opts::monotonic_now_ms();
+            let suppressed = match self.export_drop_log_limiter.lock() {
+                Ok(mut limiter) => limiter.on_event(now_ms),
+                Err(poisoned) => poisoned.into_inner().on_event(now_ms),
+            };
+            if let Some(suppressed) = suppressed {
+                warn!(
+                    provider = exporter.provider_name(),
+                    suppressed = suppressed,
+                    error = %error,
+                    "trace export buffer rejected a span"
+                );
+            }
         }
     }
 }
@@ -781,15 +850,20 @@ impl Plugin for OtelTracing {
                 .insert("frontend_listen_port".to_string(), port.to_string());
         }
         if let Some((address, port)) = ctx
-            .headers
-            .get("host")
+            .request_authority
+            .as_deref()
             .or_else(|| {
                 ctx.headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-                    .map(|(_, v)| v)
+                    .get("host")
+                    .or_else(|| {
+                        ctx.headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                            .map(|(_, v)| v)
+                    })
+                    .map(String::as_str)
             })
-            .and_then(|host| parse_host_header_authority(host))
+            .and_then(parse_host_header_authority)
         {
             ctx.metadata
                 .insert("server_address".to_string(), truncate_attr(&address, 256));
@@ -799,8 +873,19 @@ impl Plugin for OtelTracing {
             }
         }
 
-        let incoming = ctx.headers.get(TRACEPARENT_HEADER).cloned();
-        let incoming_tracestate = ctx.headers.get(TRACESTATE_HEADER).cloned();
+        let incoming = unique_header_value_case_insensitive(&ctx.headers, TRACEPARENT_HEADER)
+            .ok()
+            .flatten()
+            .map(str::to_owned);
+        let incoming_tracestate =
+            unique_header_value_case_insensitive(&ctx.headers, TRACESTATE_HEADER)
+                .ok()
+                .flatten()
+                .map(str::to_owned);
+        // A companion state is valid only when this hook accepts the parent.
+        // Clear any pre-existing metadata value before adjudicating the wire
+        // headers so another plugin cannot accidentally preserve stale state.
+        ctx.metadata.remove(TRACESTATE_HEADER);
 
         let traceparent = match incoming.as_deref().and_then(Self::parse_traceparent) {
             Some(parsed) => {
@@ -829,15 +914,11 @@ impl Plugin for OtelTracing {
                         )
                     }
                     TraceContextTrust::Untrusted => {
-                        // Fail closed: fresh root. Preserve a bounded digest for
-                        // correlation without adopting attacker-chosen parents.
+                        // Fail closed: create a fresh root and retain none of the
+                        // attacker-chosen identity as exported trace material.
                         if !self.generate_trace_id {
                             return PluginResult::Continue;
                         }
-                        let digest =
-                            bounded_untrusted_parent_digest(parsed.trace_id, parsed.parent_span_id);
-                        ctx.metadata
-                            .insert("untrusted_parent_digest".to_string(), digest);
                         // Drop companion tracestate — parent was not trusted.
                         self.apply_generated_root(&mut ctx.metadata)
                     }
@@ -866,6 +947,14 @@ impl Plugin for OtelTracing {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Request headers are case-insensitive but represented as a String map.
+        // Remove every casing first so invalid/untrusted caller context cannot
+        // survive when generation is disabled, and so replacement never leaves
+        // duplicate wire fields.
+        headers.retain(|name, _| {
+            !name.eq_ignore_ascii_case(TRACEPARENT_HEADER)
+                && !name.eq_ignore_ascii_case(TRACESTATE_HEADER)
+        });
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
@@ -1019,11 +1108,6 @@ impl TraceExporterOptions {
             deployment_environment: optional_string_config(config, "deployment_environment")?,
         })
     }
-
-    fn with_deployment_environment(mut self, deployment_environment: Option<String>) -> Self {
-        self.deployment_environment = deployment_environment;
-        self
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1128,6 +1212,22 @@ impl BufferedTraceExporter {
             }
         }
     }
+
+    fn try_reserve_queued_bytes(&self, bytes: usize) -> Result<(), String> {
+        self.queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= self.buffer_max_bytes)
+            })
+            .map(|_| ())
+            .map_err(|current| {
+                format!(
+                    "queued byte budget exceeded ({current}+{bytes} > {})",
+                    self.buffer_max_bytes
+                )
+            })
+    }
 }
 
 impl TraceExporter for BufferedTraceExporter {
@@ -1144,14 +1244,7 @@ impl TraceExporter for BufferedTraceExporter {
             self.ensure_started()?;
         }
         let bytes = span.approx_queued_bytes();
-        let current = self.queued_bytes.load(Ordering::Acquire);
-        if current.saturating_add(bytes) > self.buffer_max_bytes {
-            return Err(format!(
-                "queued byte budget exceeded ({current}+{bytes} > {})",
-                self.buffer_max_bytes
-            ));
-        }
-        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.try_reserve_queued_bytes(bytes)?;
         match self.sender.try_send(QueuedSpan { span, bytes }) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -1416,7 +1509,7 @@ fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, 
     };
     let Value::Object(map) = value else {
         if value.is_null() {
-            return Ok(Vec::new());
+            return Err("otel_tracing: 'headers' must be a non-null object".to_string());
         }
         return Err("otel_tracing: 'headers' must be an object".to_string());
     };
@@ -1569,58 +1662,154 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
 
 async fn handle_otlp_partial_success(
     cfg: &TraceHttpExporterConfig,
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     entry_count: usize,
 ) {
-    let body = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mut body = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(
+                    provider = cfg.provider_name,
+                    endpoint = %cfg.endpoint_for_logs,
+                    %error,
+                    "OTLP success body could not be read"
+                );
+                return;
+            }
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_OTLP_SUCCESS_BODY_BYTES {
             warn!(
-                "{} OTLP success body unread for {}: {error}",
-                cfg.provider_name, cfg.endpoint_for_logs
+                provider = cfg.provider_name,
+                endpoint = %cfg.endpoint_for_logs,
+                limit_bytes = MAX_OTLP_SUCCESS_BODY_BYTES,
+                "OTLP success body exceeded the bounded response limit"
             );
             return;
         }
-    };
+        body.extend_from_slice(&chunk);
+    }
     if body.is_empty() {
+        return;
+    }
+    if !content_type
+        .as_deref()
+        .map(otlp_json_content_type)
+        .unwrap_or(true)
+    {
+        warn!(
+            provider = cfg.provider_name,
+            endpoint = %cfg.endpoint_for_logs,
+            body_bytes = body.len(),
+            "OTLP success body used a non-JSON content type"
+        );
         return;
     }
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
         warn!(
-            "{} OTLP success body was not valid JSON ({} bytes) for {}",
-            cfg.provider_name,
-            body.len(),
-            cfg.endpoint_for_logs
+            provider = cfg.provider_name,
+            endpoint = %cfg.endpoint_for_logs,
+            body_bytes = body.len(),
+            "OTLP success body was not valid JSON"
         );
         return;
     };
-    let Some(partial) = value
+    let Some(partial_value) = value
         .get("partialSuccess")
         .or_else(|| value.get("partial_success"))
     else {
         return;
     };
-    let rejected = partial
+    if partial_value.is_null() {
+        return;
+    }
+    let Some(partial) = partial_value.as_object() else {
+        warn!(
+            provider = cfg.provider_name,
+            endpoint = %cfg.endpoint_for_logs,
+            body_bytes = body.len(),
+            "OTLP partial-success field was not a JSON object"
+        );
+        return;
+    };
+    let rejected_value = partial
         .get("rejectedSpans")
-        .or_else(|| partial.get("rejected_spans"))
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_u64().map(|n| n as i64))
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        })
-        .unwrap_or(0);
-    let message = partial
+        .or_else(|| partial.get("rejected_spans"));
+    let rejected = match rejected_value {
+        None | Some(Value::Null) => 0,
+        Some(value) => match value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+            .or_else(|| value.as_str().and_then(|number| number.parse::<u64>().ok()))
+        {
+            Some(rejected) => rejected,
+            None => {
+                warn!(
+                    provider = cfg.provider_name,
+                    endpoint = %cfg.endpoint_for_logs,
+                    body_bytes = body.len(),
+                    "OTLP partial-success rejected-spans field was invalid"
+                );
+                return;
+            }
+        },
+    };
+    let message_value = partial
         .get("errorMessage")
-        .or_else(|| partial.get("error_message"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let message = truncate_attr(message, MAX_PARTIAL_SUCCESS_MESSAGE_BYTES);
+        .or_else(|| partial.get("error_message"));
+    let message = match message_value {
+        None | Some(Value::Null) => "",
+        Some(Value::String(message)) => message.as_str(),
+        Some(_) => {
+            warn!(
+                provider = cfg.provider_name,
+                endpoint = %cfg.endpoint_for_logs,
+                body_bytes = body.len(),
+                "OTLP partial-success error-message field was invalid"
+            );
+            return;
+        }
+    };
+    let message = bounded_log_value(message, MAX_PARTIAL_SUCCESS_MESSAGE_BYTES);
     if rejected > 0 || !message.is_empty() {
         warn!(
-            "{} OTLP partial success: rejected_spans={rejected}/{} error_message={message}",
-            cfg.provider_name, entry_count
+            provider = cfg.provider_name,
+            endpoint = %cfg.endpoint_for_logs,
+            rejected_spans = rejected,
+            batch_spans = entry_count,
+            error_message = %message,
+            "OTLP partial success"
         );
     }
+}
+
+fn otlp_json_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
+}
+
+fn bounded_log_value(value: &str, max_bytes: usize) -> String {
+    let mut output = String::with_capacity(value.len().min(max_bytes));
+    for character in value.chars() {
+        let character = if character.is_control() { ' ' } else { character };
+        if output.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    output
 }
 
 fn build_otlp_payload(
@@ -1711,7 +1900,10 @@ fn build_otlp_payload(
                 attributes.push(otlp_attribute("gateway.backend.target", target));
             }
             if let Some(ref resolved) = s.backend_resolved_ip {
-                attributes.push(otlp_attribute("server.socket.address", resolved));
+                attributes.push(otlp_attribute(
+                    "gateway.backend.resolved_address",
+                    resolved,
+                ));
             }
             if let Some(ref protocol) = s.stream_protocol {
                 attributes.push(otlp_attribute("network.protocol.name", protocol));
@@ -1719,14 +1911,35 @@ fn build_otlp_payload(
             if let Some(bytes) = s.stream_bytes_sent {
                 attributes.push(otlp_attribute_int(
                     "gateway.stream.bytes_sent",
-                    bytes as i64,
+                    u64_to_i64(bytes),
                 ));
             }
             if let Some(bytes) = s.stream_bytes_received {
                 attributes.push(otlp_attribute_int(
                     "gateway.stream.bytes_received",
-                    bytes as i64,
+                    u64_to_i64(bytes),
                 ));
+            }
+            if let Some(frames) = s.ws_frames_client_to_backend {
+                attributes.push(otlp_attribute_int(
+                    "gateway.websocket.frames_client_to_backend",
+                    u64_to_i64(frames),
+                ));
+            }
+            if let Some(frames) = s.ws_frames_backend_to_client {
+                attributes.push(otlp_attribute_int(
+                    "gateway.websocket.frames_backend_to_client",
+                    u64_to_i64(frames),
+                ));
+            }
+            if let Some(ref direction) = s.disconnect_direction {
+                attributes.push(otlp_attribute("gateway.disconnect.direction", direction));
+            }
+            if let Some(ref cause) = s.disconnect_cause {
+                attributes.push(otlp_attribute("gateway.disconnect.cause", cause));
+            }
+            if let Some(ref io_side) = s.stream_io_side {
+                attributes.push(otlp_attribute("gateway.disconnect.io_side", io_side));
             }
             if s.response_streamed {
                 attributes.push(otlp_attribute_bool("gateway.response.streamed", true));
@@ -1737,14 +1950,14 @@ fn build_otlp_payload(
             if let Some(ref body_error) = s.body_error_class {
                 attributes.push(otlp_attribute("gateway.body.error_class", body_error));
             }
+            if let Some(ref error_class) = s.error_class {
+                attributes.push(otlp_attribute("gateway.error.class", error_class));
+            }
             if s.response_streamed {
                 attributes.push(otlp_attribute_bool(
                     "gateway.body.completed",
                     s.body_completed,
                 ));
-            }
-            if let Some(ref digest) = s.untrusted_parent_digest {
-                attributes.push(otlp_attribute("gateway.trace.untrusted_parent", digest));
             }
             for (key, value) in &s.mesh_attributes {
                 attributes.push(otlp_attribute(key, value));
@@ -1786,6 +1999,29 @@ fn build_otlp_payload(
                     "name": "client.disconnect",
                     "timeUnixNano": end_ns.to_string(),
                     "attributes": []
+                }));
+            }
+            if let Some(ref cause) = s.disconnect_cause {
+                let mut disconnect_attributes = vec![otlp_attribute(
+                    "gateway.disconnect.cause",
+                    cause,
+                )];
+                if let Some(ref direction) = s.disconnect_direction {
+                    disconnect_attributes.push(otlp_attribute(
+                        "gateway.disconnect.direction",
+                        direction,
+                    ));
+                }
+                if let Some(ref io_side) = s.stream_io_side {
+                    disconnect_attributes.push(otlp_attribute(
+                        "gateway.disconnect.io_side",
+                        io_side,
+                    ));
+                }
+                events.push(serde_json::json!({
+                    "name": "gateway.disconnect",
+                    "timeUnixNano": end_ns.to_string(),
+                    "attributes": disconnect_attributes
                 }));
             }
 
@@ -1877,11 +2113,63 @@ fn push_common_tags(tags: &mut serde_json::Map<String, Value>, span: &SpanData) 
     if let Some(ref host) = span.backend_host {
         insert_tag(tags, "gateway.backend.address", host);
     }
+    if let Some(port) = span.backend_port {
+        insert_tag(tags, "gateway.backend.port", &port.to_string());
+    }
     if let Some(ref target) = span.backend_target {
         insert_tag(tags, "gateway.backend.target", target);
     }
+    if let Some(ref resolved) = span.backend_resolved_ip {
+        insert_tag(tags, "gateway.backend.resolved_address", resolved);
+    }
     if let Some(ref protocol) = span.stream_protocol {
         insert_tag(tags, "network.protocol.name", protocol);
+    }
+    if let Some(bytes) = span.stream_bytes_sent {
+        insert_tag(tags, "gateway.stream.bytes_sent", &bytes.to_string());
+    }
+    if let Some(bytes) = span.stream_bytes_received {
+        insert_tag(tags, "gateway.stream.bytes_received", &bytes.to_string());
+    }
+    if let Some(frames) = span.ws_frames_client_to_backend {
+        insert_tag(
+            tags,
+            "gateway.websocket.frames_client_to_backend",
+            &frames.to_string(),
+        );
+    }
+    if let Some(frames) = span.ws_frames_backend_to_client {
+        insert_tag(
+            tags,
+            "gateway.websocket.frames_backend_to_client",
+            &frames.to_string(),
+        );
+    }
+    if let Some(ref direction) = span.disconnect_direction {
+        insert_tag(tags, "gateway.disconnect.direction", direction);
+    }
+    if let Some(ref cause) = span.disconnect_cause {
+        insert_tag(tags, "gateway.disconnect.cause", cause);
+    }
+    if let Some(ref io_side) = span.stream_io_side {
+        insert_tag(tags, "gateway.disconnect.io_side", io_side);
+    }
+    if let Some(ref error_class) = span.error_class {
+        insert_tag(tags, "gateway.error.class", error_class);
+    }
+    if let Some(ref body_error_class) = span.body_error_class {
+        insert_tag(tags, "gateway.body.error_class", body_error_class);
+    }
+    if span.response_streamed {
+        insert_tag(tags, "gateway.response.streamed", "true");
+        insert_tag(
+            tags,
+            "gateway.body.completed",
+            if span.body_completed { "true" } else { "false" },
+        );
+    }
+    if span.client_disconnected {
+        insert_tag(tags, "gateway.client.disconnected", "true");
     }
     for (key, value) in &span.mesh_attributes {
         insert_tag(tags, key, value);
@@ -2014,6 +2302,24 @@ fn timestamp_micros(timestamp: &str) -> i64 {
     timestamp_nanos(timestamp) / 1_000
 }
 
+fn timestamp_before_now(duration_ms: f64) -> String {
+    let now = chrono::Utc::now();
+    let bounded_ms = if duration_ms.is_finite() {
+        duration_ms.clamp(0.0, i64::MAX as f64 / 1_000.0)
+    } else {
+        0.0
+    };
+    now.checked_sub_signed(chrono::Duration::microseconds(
+        (bounded_ms * 1_000.0) as i64,
+    ))
+    .unwrap_or(now)
+    .to_rfc3339()
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 fn hex_low_u64(hex: &str) -> u64 {
     let start = hex.len().saturating_sub(16);
     u64::from_str_radix(&hex[start..], 16).unwrap_or(0)
@@ -2029,7 +2335,10 @@ fn datadog_high_trace_id(hex: &str) -> Option<&str> {
 
 fn string_config(config: &Value, key: &str, default: &str) -> Result<String, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(default.to_string()),
+        None => Ok(default.to_string()),
+        Some(Value::Null) => Err(format!(
+            "otel_tracing: '{key}' must be a non-null string"
+        )),
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -2046,11 +2355,14 @@ fn string_config(config: &Value, key: &str, default: &str) -> Result<String, Str
 
 fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
+        Some(Value::Null) => Err(format!(
+            "otel_tracing: '{key}' must be a non-null string"
+        )),
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                Ok(None)
+                Err(format!("otel_tracing: '{key}' must be a non-empty string"))
             } else {
                 Ok(Some(trimmed.to_string()))
             }
@@ -2063,7 +2375,10 @@ fn optional_string_config(config: &Value, key: &str) -> Result<Option<String>, S
 
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(default),
+        None => Ok(default),
+        Some(Value::Null) => Err(format!(
+            "otel_tracing: '{key}' must be a non-null boolean"
+        )),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
             "otel_tracing: '{key}' must be a boolean, got: {other}"
@@ -2079,7 +2394,12 @@ fn u64_config_range(
     max: u64,
 ) -> Result<u64, String> {
     let value = match config.get(key) {
-        None | Some(Value::Null) => default,
+        None => default,
+        Some(Value::Null) => {
+            return Err(format!(
+                "otel_tracing: '{key}' must be a non-null non-negative integer"
+            ));
+        }
         Some(Value::Number(value)) => value
             .as_u64()
             .ok_or_else(|| format!("otel_tracing: '{key}' must be a non-negative integer"))?,
@@ -2121,7 +2441,10 @@ fn u32_config_range(
 
 fn parse_trace_context_trust(config: &Value) -> Result<TraceContextTrust, String> {
     match config.get("trace_context_trust") {
-        None | Some(Value::Null) => Ok(TraceContextTrust::Untrusted),
+        None => Ok(TraceContextTrust::Untrusted),
+        Some(Value::Null) => Err(
+            "otel_tracing: 'trace_context_trust' must be a non-null string".to_string(),
+        ),
         Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
             "untrusted" => Ok(TraceContextTrust::Untrusted),
             "trusted" => Ok(TraceContextTrust::Trusted),
@@ -2137,7 +2460,10 @@ fn parse_trace_context_trust(config: &Value) -> Result<TraceContextTrust, String
 
 fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
     let mode = match config.get("root_sampling") {
-        None | Some(Value::Null) => "always_on".to_string(),
+        None => "always_on".to_string(),
+        Some(Value::Null) => {
+            return Err("otel_tracing: 'root_sampling' must be a non-null string".to_string());
+        }
         Some(Value::String(value)) => value.trim().to_ascii_lowercase(),
         Some(other) => {
             return Err(format!(
@@ -2145,32 +2471,39 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
             ));
         }
     };
-    match mode.as_str() {
-        "always_on" => Ok(RootSampling::AlwaysOn),
-        "always_off" => Ok(RootSampling::AlwaysOff),
-        "ratio" => {
-            let ratio = match config.get("root_sampling_ratio") {
-                None | Some(Value::Null) => {
-                    return Err(
-                        "otel_tracing: 'root_sampling_ratio' is required when root_sampling=ratio"
-                            .to_string(),
-                    );
-                }
-                Some(Value::Number(n)) => n.as_f64().ok_or_else(|| {
-                    "otel_tracing: 'root_sampling_ratio' must be a number between 0.0 and 1.0"
-                        .to_string()
-                })?,
-                Some(other) => {
-                    return Err(format!(
-                        "otel_tracing: 'root_sampling_ratio' must be a number, got: {other}"
-                    ));
-                }
-            };
-            if !(0.0..=1.0).contains(&ratio) || ratio.is_nan() {
+    let configured_ratio = match config.get("root_sampling_ratio") {
+        None => None,
+        Some(Value::Null) => {
+            return Err(
+                "otel_tracing: 'root_sampling_ratio' must be a non-null number".to_string(),
+            );
+        }
+        Some(Value::Number(n)) => {
+            let ratio = n.as_f64().ok_or_else(|| {
+                "otel_tracing: 'root_sampling_ratio' must be a number between 0.0 and 1.0"
+                    .to_string()
+            })?;
+            if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
                 return Err(format!(
                     "otel_tracing: 'root_sampling_ratio' must be between 0.0 and 1.0, got: {ratio}"
                 ));
             }
+            Some(ratio)
+        }
+        Some(other) => {
+            return Err(format!(
+                "otel_tracing: 'root_sampling_ratio' must be a number, got: {other}"
+            ));
+        }
+    };
+    match mode.as_str() {
+        "always_on" => Ok(RootSampling::AlwaysOn),
+        "always_off" => Ok(RootSampling::AlwaysOff),
+        "ratio" => {
+            let ratio = configured_ratio.ok_or_else(|| {
+                "otel_tracing: 'root_sampling_ratio' is required when root_sampling=ratio"
+                    .to_string()
+            })?;
             Ok(RootSampling::Ratio(ratio))
         }
         other => Err(format!(
@@ -2362,6 +2695,22 @@ fn header_value_case_insensitive<'a>(
     })
 }
 
+fn unique_header_value_case_insensitive<'a>(
+    headers: &'a HashMap<String, String>,
+    name: &str,
+) -> Result<Option<&'a str>, ()> {
+    let mut value = None;
+    for (key, candidate) in headers {
+        if key.eq_ignore_ascii_case(name) {
+            if value.is_some() {
+                return Err(());
+            }
+            value = Some(candidate.as_str());
+        }
+    }
+    Ok(value)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -2446,12 +2795,17 @@ fn truncate_attr(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
     }
-    let mut end = max_bytes;
+    const MARKER: &str = "...";
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let marker = &MARKER[..MARKER.len().min(max_bytes)];
+    let mut end = max_bytes - marker.len();
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
     let mut out = value[..end].to_string();
-    out.push_str("...");
+    out.push_str(marker);
     out
 }
 
@@ -2485,61 +2839,155 @@ fn server_authority_from_metadata(
 
 fn parse_host_header_authority(host: &str) -> Option<(String, Option<u16>)> {
     let host = host.trim();
-    if host.is_empty() || host.len() > 256 {
+    if host.is_empty()
+        || host.len() > 256
+        || host
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || host.contains(['/', '?', '#', '@', '\\'])
+    {
         return None;
     }
     if let Some(rest) = host.strip_prefix('[') {
         let end = rest.find(']')?;
-        let address = rest[..end].to_string();
-        if address.is_empty() {
-            return None;
-        }
-        let port = rest[end + 1..]
-            .strip_prefix(':')
-            .and_then(|p| p.parse().ok());
+        let address = rest[..end].parse::<std::net::Ipv6Addr>().ok()?.to_string();
+        let suffix = &rest[end + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':')?.parse().ok()?)
+        };
         return Some((address, port));
     }
-    match host.rsplit_once(':') {
-        Some((address, port)) if !address.contains(':') => {
-            let port = port.parse().ok();
-            Some((address.to_string(), port))
-        }
-        _ => Some((host.to_string(), None)),
+    if host.contains('[') || host.contains(']') {
+        return None;
     }
+    let (address, port) = match host.rsplit_once(':') {
+        Some((address, port)) if !address.contains(':') => {
+            if address.is_empty() {
+                return None;
+            }
+            (address, Some(port.parse().ok()?))
+        }
+        _ if host.parse::<std::net::Ipv6Addr>().is_ok() => (host, None),
+        _ if host.contains(':') => return None,
+        _ => (host, None),
+    };
+    if address.is_empty() {
+        return None;
+    }
+    let address = if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        ip.to_string()
+    } else {
+        match Host::parse(address) {
+            Ok(Host::Domain(domain)) if !domain.is_empty() => domain.to_ascii_lowercase(),
+            _ => return None,
+        }
+    };
+    Some((address, port))
 }
 
 fn parse_backend_host_port(target: &str) -> (Option<String>, Option<u16>) {
-    let host = extract_host_from_url(target).map(|h| h.to_string());
-    let port = extract_port_from_url_or_hostport(target);
-    (host, port)
-}
-
-fn extract_port_from_url_or_hostport(s: &str) -> Option<u16> {
-    if let Ok(url) = Url::parse(s) {
-        return url.port().or_else(|| match url.scheme() {
+    if target.contains("://") {
+        let Ok(url) = Url::parse(target) else {
+            return (None, None);
+        };
+        let host = match url.host() {
+            Some(Host::Domain(host)) => Some(host.to_string()),
+            Some(Host::Ipv4(host)) => Some(host.to_string()),
+            Some(Host::Ipv6(host)) => Some(host.to_string()),
+            None => None,
+        };
+        let port = url.port().or_else(|| match url.scheme() {
             "https" | "wss" => Some(443),
             "http" | "ws" => Some(80),
             _ => None,
         });
+        return (host, port);
     }
-    let after_scheme = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest.find(']')?;
-        return rest[end + 1..].strip_prefix(':')?.parse().ok();
-    }
-    authority
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse().ok())
+    parse_host_header_authority(target)
+        .map(|(host, port)| (Some(host), port))
+        .unwrap_or((None, None))
 }
 
-fn bounded_untrusted_parent_digest(trace_id: &str, parent_span_id: &str) -> String {
-    // Bound and avoid retaining full attacker-chosen IDs as parents.
-    let mut material = String::with_capacity(16);
-    material.push_str(&trace_id.chars().take(8).collect::<String>());
-    material.push(':');
-    material.push_str(&parent_span_id.chars().take(4).collect::<String>());
-    material
+fn gateway_backend_target(
+    host: Option<&str>,
+    port: Option<u16>,
+    max_attribute_bytes: usize,
+) -> Option<String> {
+    let host = host?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let mut target = String::with_capacity(host.len() + 8);
+    if host.contains(':') && !host.starts_with('[') {
+        target.push('[');
+        target.push_str(host);
+        target.push(']');
+    } else {
+        target.push_str(host);
+    }
+    if let Some(port) = port {
+        target.push(':');
+        target.push_str(&port.to_string());
+    }
+    Some(truncate_attr(&target, max_attribute_bytes))
+}
+
+const fn direction_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::ClientToBackend => "client_to_backend",
+        Direction::BackendToClient => "backend_to_client",
+        Direction::Unknown => "unknown",
+    }
+}
+
+const fn disconnect_cause_label(cause: DisconnectCause) -> &'static str {
+    match cause {
+        DisconnectCause::IdleTimeout => "idle_timeout",
+        DisconnectCause::RecvError => "recv_error",
+        DisconnectCause::BackendError => "backend_error",
+        DisconnectCause::GracefulShutdown => "graceful_shutdown",
+    }
+}
+
+const fn stream_io_side_label(
+    side: crate::proxy::tcp_proxy::StreamIoSide,
+) -> &'static str {
+    match side {
+        crate::proxy::tcp_proxy::StreamIoSide::Read => "read",
+        crate::proxy::tcp_proxy::StreamIoSide::Write => "write",
+    }
+}
+
+fn websocket_disconnect_cause(ctx: &WsDisconnectContext) -> DisconnectCause {
+    let Some(error_class) = ctx.error_class else {
+        return DisconnectCause::GracefulShutdown;
+    };
+    match ctx.direction {
+        Some(direction) => crate::proxy::tcp_proxy::disconnect_cause_for_failure(
+            direction,
+            &error_class,
+            ctx.io_side,
+        ),
+        None if error_class == crate::retry::ErrorClass::ReadWriteTimeout => {
+            DisconnectCause::IdleTimeout
+        }
+        None => DisconnectCause::RecvError,
+    }
+}
+
+fn websocket_client_disconnected(ctx: &WsDisconnectContext) -> bool {
+    matches!(
+        (ctx.direction, ctx.io_side),
+        (
+            Some(Direction::ClientToBackend),
+            Some(crate::proxy::tcp_proxy::StreamIoSide::Read)
+        ) | (
+            Some(Direction::BackendToClient),
+            Some(crate::proxy::tcp_proxy::StreamIoSide::Write)
+        )
+    )
 }
 
 #[cfg(test)]
@@ -2589,7 +3037,11 @@ mod tests {
             stream_listen_port: None,
             stream_bytes_sent: None,
             stream_bytes_received: None,
-            untrusted_parent_digest: None,
+            disconnect_direction: None,
+            disconnect_cause: None,
+            stream_io_side: None,
+            ws_frames_client_to_backend: None,
+            ws_frames_backend_to_client: None,
         }
     }
 
@@ -2646,6 +3098,31 @@ mod tests {
     }
 
     #[test]
+    fn buffered_trace_exporter_reserves_byte_budget_atomically() {
+        let exporter = Arc::new(
+            BufferedTraceExporter::new(test_trace_http_exporter_config(), 32, 1_024)
+                .expect("exporter config accepted"),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(33));
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let exporter = Arc::clone(&exporter);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                exporter.try_reserve_queued_bytes(128).is_ok()
+            }));
+        }
+        barrier.wait();
+        let admitted = workers
+            .into_iter()
+            .filter(|worker| worker.join().expect("reservation worker did not panic"))
+            .count();
+        assert_eq!(admitted, 8);
+        assert_eq!(exporter.queued_bytes.load(Ordering::Acquire), 1_024);
+    }
+
+    #[test]
     fn hex_to_base64_decodes_even_length_input() {
         let hex = "4bf92f3577b34da6a3ce929d0e0e4736";
         let encoded = hex_to_base64(hex);
@@ -2674,6 +3151,17 @@ mod tests {
     fn hex_to_base64_invalid_chars_filtered() {
         let encoded = hex_to_base64("XX");
         assert_eq!(encoded, "");
+    }
+
+    #[test]
+    fn attribute_truncation_never_exceeds_the_configured_byte_cap() {
+        assert_eq!(truncate_attr("abcdef", 5), "ab...");
+        assert_eq!(truncate_attr("éééé", 5), "é...");
+        assert_eq!(truncate_attr("abcdef", 2), "..");
+        assert_eq!(truncate_attr("abcdef", 0), "");
+        for max_bytes in 0..=8 {
+            assert!(truncate_attr("ééééé", max_bytes).len() <= max_bytes);
+        }
     }
 
     #[test]
@@ -2742,6 +3230,41 @@ mod tests {
     }
 
     #[test]
+    fn zipkin_and_datadog_preserve_backend_and_disconnect_tag_parity() {
+        let mut span = test_span("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7");
+        span.backend_target = Some("api.internal:8443".to_string());
+        span.backend_host = Some("api.internal".to_string());
+        span.backend_port = Some(8443);
+        span.backend_resolved_ip = Some("10.0.0.42".to_string());
+        span.stream_protocol = Some("websocket".to_string());
+        span.stream_bytes_sent = Some(1_024);
+        span.stream_bytes_received = Some(2_048);
+        span.ws_frames_client_to_backend = Some(7);
+        span.ws_frames_backend_to_client = Some(11);
+        span.disconnect_direction = Some("client_to_backend".to_string());
+        span.disconnect_cause = Some("recv_error".to_string());
+        span.stream_io_side = Some("read".to_string());
+        span.error_class = Some("connection_reset".to_string());
+        span.client_disconnected = true;
+
+        let zipkin = build_zipkin_payload("ferrum-edge", std::slice::from_ref(&span));
+        let datadog = build_datadog_payload("ferrum-edge", &[span]);
+        for tags in [&zipkin[0]["tags"], &datadog[0][0]["meta"]] {
+            assert_eq!(tags["gateway.backend.target"], "api.internal:8443");
+            assert_eq!(tags["gateway.backend.address"], "api.internal");
+            assert_eq!(tags["gateway.backend.port"], "8443");
+            assert_eq!(tags["gateway.backend.resolved_address"], "10.0.0.42");
+            assert_eq!(tags["gateway.disconnect.direction"], "client_to_backend");
+            assert_eq!(tags["gateway.disconnect.cause"], "recv_error");
+            assert_eq!(tags["gateway.disconnect.io_side"], "read");
+            assert_eq!(tags["gateway.error.class"], "connection_reset");
+            assert_eq!(tags["gateway.client.disconnected"], "true");
+            assert_eq!(tags["gateway.websocket.frames_client_to_backend"], "7");
+            assert_eq!(tags["gateway.websocket.frames_backend_to_client"], "11");
+        }
+    }
+
+    #[test]
     fn otlp_payload_includes_mesh_identity_attributes() {
         let mut span = test_span("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7");
         span.span_name = "GET /".to_string();
@@ -2786,8 +3309,67 @@ mod tests {
         let (host, port) = parse_backend_host_port("https://api.internal:8443/v1/orders");
         assert_eq!(host.as_deref(), Some("api.internal"));
         assert_eq!(port, Some(8443));
+        assert_eq!(
+            gateway_backend_target(host.as_deref(), port, 256).as_deref(),
+            Some("api.internal:8443")
+        );
         let (host6, port6) = parse_backend_host_port("http://[2001:db8::1]:8080/path");
         assert_eq!(host6.as_deref(), Some("2001:db8::1"));
         assert_eq!(port6, Some(8080));
+        assert_eq!(
+            gateway_backend_target(host6.as_deref(), port6, 256).as_deref(),
+            Some("[2001:db8::1]:8080")
+        );
+        let (credential_host, credential_port) =
+            parse_backend_host_port("https://user:secret@api.internal/orders?token=secret");
+        assert_eq!(credential_host.as_deref(), Some("api.internal"));
+        assert_eq!(credential_port, Some(443));
+        assert_eq!(
+            gateway_backend_target(credential_host.as_deref(), credential_port, 256).as_deref(),
+            Some("api.internal:443")
+        );
+        assert_eq!(
+            parse_backend_host_port("https://[not-an-ip/path"),
+            (None, None)
+        );
+        assert_eq!(
+            parse_backend_host_port("api.internal:8443"),
+            (Some("api.internal".to_string()), Some(8443))
+        );
+        for malformed_bare_target in [
+            "user:secret@api.internal:8443",
+            "api.internal:8443/path",
+            "api.internal:8443?token=secret",
+            "api.internal:not-a-port",
+        ] {
+            assert_eq!(
+                parse_backend_host_port(malformed_bare_target),
+                (None, None),
+                "{malformed_bare_target}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_header_authority_is_role_safe_and_structurally_valid() {
+        assert_eq!(
+            parse_host_header_authority("Edge.Example:8443"),
+            Some(("edge.example".to_string(), Some(8443)))
+        );
+        assert_eq!(
+            parse_host_header_authority("[2001:db8::1]:443"),
+            Some(("2001:db8::1".to_string(), Some(443)))
+        );
+        for invalid in [
+            "user:secret@edge.example",
+            "https://edge.example/path",
+            "edge.example?token=secret",
+            "edge.example#fragment",
+            "edge.example:not-a-port",
+            "[2001:db8::1]trailing",
+            "bad host",
+        ] {
+            assert_eq!(parse_host_header_authority(invalid), None, "{invalid}");
+        }
     }
 }

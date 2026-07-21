@@ -1371,17 +1371,17 @@ Supports two modes:
 
 #### Trace-context trust and sampling
 
-`trace_context_trust` defaults to `untrusted` (fail-closed). Untrusted ingress never adopts a caller-chosen parent; Ferrum creates a fresh root and may record only a bounded digest of the inbound IDs. Set `trusted` only for internal/mesh listeners that should parent under a valid W3C `traceparent`.
+`trace_context_trust` defaults to `untrusted` (fail-closed). Untrusted ingress never adopts or exports caller-chosen trace identity; Ferrum creates a fresh root and discards the inbound IDs and companion state. Set `trusted` only for internal/mesh listeners that should parent under a valid W3C `traceparent`.
 
-Wire parsing follows W3C Trace Context: lowercase hex only, version-`00` exact field count, forward-compatible higher versions, outgoing version always `00`, and `tracestate` is dropped whenever the parent is invalid or untrusted.
+Wire parsing follows W3C Trace Context: lowercase hex only, version-`00` exact field count, forward-compatible higher versions, outgoing version always `00`, and `tracestate` is dropped whenever the parent is invalid or untrusted. Before backend dispatch, every case-insensitive caller-supplied `traceparent`/`tracestate` field is removed and only the trusted or newly generated canonical context is inserted. When generation is disabled, rejected caller context is stripped rather than passed through unchanged.
 
 Sampling is parent-based for trusted parents (`sampled=0` suppresses export while still propagating flags). Root traces use `root_sampling` (`always_on` by default, or `always_off` / `ratio` with `root_sampling_ratio`).
 
 #### Span semantics
 
-Gateway spans are `SERVER`. `server.address` / `server.port` come from the client-facing Host/listener when known and are omitted otherwise. Upstream selection is emitted as `gateway.backend.*` and never as `server.address`. Span names use `METHOD <proxy_name|proxy_id>` (or method alone) — never the raw request path. Bounded `url.path` remains an attribute when `include_url_path` is true.
+Gateway spans are `SERVER`. `server.address` / `server.port` come from the client-facing Host/listener when known and are omitted otherwise. Upstream selection is emitted as `gateway.backend.*` and never as `server.address`; `gateway.backend.target` is a sanitized host/port authority, so schemes, paths, queries, fragments, and userinfo never enter that attribute. Span names use `METHOD <proxy_name|proxy_id>` (or method alone) — never the raw request path. Bounded `url.path` remains an attribute when `include_url_path` is true.
 
-Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/stream failures, and classified stream/WebSocket errors. Ordinary HTTP 4xx alone stays `OK`. WebSocket upgrades emit the HTTP handshake span from `log` and a separate disconnect span from `on_ws_disconnect` with a new span ID under the same trace.
+Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/stream failures, and classified stream/WebSocket errors. Ordinary HTTP 4xx alone stays `OK`. Stream and WebSocket teardown spans carry bounded byte/frame counts plus stable disconnect cause/direction/I/O-side attributes; client-side and backend-side failures remain distinct across OTLP, Zipkin, and Datadog. WebSocket upgrades emit the HTTP handshake span from `log` and a separate disconnect span from `on_ws_disconnect` with a new span ID under the same trace and a start time derived from the final session duration.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1403,7 +1403,7 @@ Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/st
 | `max_retries` | Integer | `2` | Retry attempts on export failure (`0`–`10`) |
 | `retry_delay_ms` | Integer | `1000` | Delay between retries (`0`–`60000`) |
 
-Unknown configuration keys and out-of-range numeric values are rejected. OTLP partial-success responses are recognized (not retried) and logged with a bounded collector message. Exported spans include `ferrum.namespace`, gateway latency attributes, and role-correct address mapping across OTLP, Zipkin, and Datadog.
+Unknown configuration keys, explicit `null` properties, empty configured strings, invalid types, and out-of-range numeric values are rejected, including exporter controls supplied while propagation-only mode is active. OTLP partial-success responses are recognized (not retried); success bodies are read with a 64 KiB ceiling and collector messages are control-sanitized and capped at 512 bytes. Count/byte queue admission is atomic under concurrency, and overflow diagnostics are rate-limited with suppressed-event summaries. Exported spans include `ferrum.namespace`, gateway latency and terminal-outcome attributes, and role-correct address mapping across OTLP, Zipkin, and Datadog.
 
 ---
 

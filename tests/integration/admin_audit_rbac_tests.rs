@@ -785,25 +785,59 @@ async fn otel_tracing_config_projections_redact_endpoint_auth_and_headers() {
     assert_eq!(status, 201, "otel plugin create failed: {body:?}");
     assert_eq!(body["config"]["endpoint"], endpoint);
 
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=otel-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_otel_config_projection_redacted(audit_config);
+
     let (status, projected) =
         get_json(&base, "/plugins/config/otel-redaction-config", &viewer).await;
     assert_eq!(status, 200, "viewer otel config read failed: {projected:?}");
+    assert_otel_config_projection_redacted(&projected["config"]);
+
+    let (status, list) = get_json(&base, "/plugins/config", &viewer).await;
+    assert_eq!(status, 200, "viewer otel config list failed: {list:?}");
+    let listed = list["data"]
+        .as_array()
+        .expect("plugin list data")
+        .iter()
+        .find(|item| item["id"] == "otel-redaction-config")
+        .expect("listed otel config");
+    assert_otel_config_projection_redacted(&listed["config"]);
+
+    let (status, raw) = get_json(&base, "/plugins/config/otel-redaction-config", &admin).await;
+    assert_eq!(status, 200, "admin otel config read failed: {raw:?}");
+    assert_eq!(raw["config"]["endpoint"], endpoint);
     assert_eq!(
-        projected["config"]["endpoint"],
-        "https://collector.example.com/redacted"
+        raw["config"]["authorization"],
+        format!("Bearer {auth_secret}")
     );
-    assert_eq!(projected["config"]["authorization"], "[REDACTED]");
     assert_eq!(
-        projected["config"]["headers"]["x-honeycomb-team"],
-        "[REDACTED]"
+        raw["config"]["headers"]["x-honeycomb-team"],
+        header_secret
     );
-    let serialized = projected["config"].to_string();
-    for secret in [path_secret, query_secret, auth_secret, header_secret] {
-        assert!(
-            !serialized.contains(secret),
-            "otel config projection leaked {secret}: {serialized}"
-        );
+
+    for projection in [audit_config, &projected["config"], &listed["config"]] {
+        let serialized = projection.to_string();
+        for secret in [path_secret, query_secret, auth_secret, header_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "otel config projection leaked {secret}: {serialized}"
+            );
+        }
     }
+}
+
+fn assert_otel_config_projection_redacted(config: &Value) {
+    assert_eq!(config["endpoint"], "https://collector.example.com/redacted");
+    assert_eq!(config["authorization"], "[REDACTED]");
+    assert_eq!(config["headers"]["x-honeycomb-team"], "[REDACTED]");
 }
 
 #[tokio::test]
