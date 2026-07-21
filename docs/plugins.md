@@ -215,7 +215,7 @@ The table below summarizes how to configure `http_logging` for popular log inges
 | **Datadog** | `https://http-intake.logs.datadoghq.com/api/v2/logs` | `DD-API-KEY: "<key>"` | Dedicated API key header | Yes | 1000 entries / 5MB | Regional endpoints: `.datadoghq.eu` (EU), `.us3.datadoghq.com` (US3), `.us5.datadoghq.com` (US5), `.ap1.datadoghq.com` (AP1) |
 | **New Relic** | `https://log-api.newrelic.com/log/v1` | `Api-Key: "<license-key>"` | Dedicated API key header | Yes | 1MB compressed | EU: `log-api.eu.newrelic.com` |
 | **Sumo Logic** | `https://<endpoint>.sumologic.com/receiver/v1/http/<token>` | `X-Sumo-Category`, `X-Sumo-Name`, `X-Sumo-Host` (optional metadata) | Token embedded in URL | Yes | 1MB default | No auth header needed — token is in the URL path |
-| **Elastic / OpenSearch** | `https://<host>:9200/<index>/_bulk` | `Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"` | Standard Authorization header | Yes (bulk API) | 100MB default | Consider using `_bulk` with NDJSON adapter or direct index API |
+| **Elastic / OpenSearch** | Requires intermediary (Logstash/Fluent Bit NDJSON transform) | `Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"` (at the intermediary) | Standard Authorization header | **No** — `_bulk` requires NDJSON action/source lines and `_doc` accepts one document object | N/A | Cannot POST the plugin's JSON array directly; see the Elastic / OpenSearch section below |
 | **Azure Monitor** | `https://<dce>.ingest.monitor.azure.com/dataCollectionRules/<dcr-id>/streams/<stream>?api-version=2023-01-01` | `Authorization: "Bearer <aad-token>"` | Azure AD OAuth2 bearer token | Yes (custom tables) | 1MB per call | Requires Data Collection Endpoint + Rule; fields map to custom table columns |
 | **AWS CloudWatch** | Requires intermediary (Fluent Bit/Firehose HTTP endpoint) | `Authorization: "Bearer <token>"` or custom | Varies by intermediary | **No** — needs `PutLogEvents` API format | N/A | Cannot POST directly; use a Firehose HTTP endpoint or Fluent Bit as intermediary |
 | **Google Cloud Logging** | Requires intermediary (Fluent Bit/custom) | `Authorization: "Bearer <token>"` | OAuth2 bearer token | **No** — needs `entries.write` format | N/A | Cannot POST directly; use Fluent Bit or a custom HTTP bridge |
@@ -342,19 +342,21 @@ config:
 
 #### Elastic / OpenSearch Integration
 
-For direct index ingestion, use the `_doc` endpoint with Basic or Bearer auth:
+Elasticsearch and OpenSearch cannot ingest this plugin's payload directly. The plugin always POSTs a JSON **array** of log-entry objects, while the index-document API (`/<index>/_doc`) accepts a **single** JSON document and the bulk API (`/<index>/_bulk`) requires newline-delimited action/source records (NDJSON), not a JSON array. Posting the array to either endpoint returns an ordinary 4xx, which the plugin treats as a terminal discard — the batch is dropped, not retried — so a direct configuration silently loses logs.
+
+Use a log shipper as an intermediary that accepts the JSON array and re-frames each entry into the NDJSON bulk format:
 
 ```yaml
 plugin_name: http_logging
 config:
-  endpoint_url: "https://elasticsearch.example.com:9200/ferrum-logs/_doc"
-  custom_headers:
-    Authorization: "Basic dXNlcjpwYXNzd29yZA=="
+  # Fluent Bit HTTP input listening for the plugin's JSON arrays; an
+  # Elasticsearch/OpenSearch output re-frames entries into _bulk NDJSON.
+  endpoint_url: "http://fluent-bit.internal:8888/ferrum"
   batch_size: 100
   flush_interval_ms: 2000
 ```
 
-> **Note:** The `_doc` endpoint accepts single documents. For bulk ingestion, use a log shipper (Logstash, Fluent Bit) as an intermediary that transforms the JSON array into Elasticsearch's NDJSON bulk format.
+> **Note:** Configure the intermediary with the target cluster's credentials (`Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"`). Do not point `endpoint_url` at `/<index>/_doc` or `/<index>/_bulk` directly — neither endpoint accepts the plugin's JSON array payload.
 
 #### Azure Monitor Integration
 
