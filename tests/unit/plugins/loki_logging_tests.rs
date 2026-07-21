@@ -18,6 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::{
     create_test_stream_transaction_summary, create_test_transaction_summary,
+    read_http11_request_headers,
 };
 
 fn default_client() -> PluginHttpClient {
@@ -1200,53 +1201,6 @@ async fn test_loki_logging_removed_listen_path_key_rejected() {
     assert!(err.contains("include_listen_path_label"), "got: {err}");
 }
 
-/// Read one HTTP/1.1 request and discard its body through `Content-Length`.
-///
-/// Keep-alive fixtures must drain the request body before responding; leaving
-/// unread body bytes on the socket breaks reuse for later POSTs on the connection.
-async fn read_loki_headers(socket: &mut tokio::net::TcpStream) -> bool {
-    use tokio::io::AsyncReadExt;
-    let mut request = Vec::new();
-    let mut buf = [0u8; 1024];
-    let header_end = loop {
-        let n = match socket.read(&mut buf).await {
-            Ok(0) => return false,
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        request.extend_from_slice(&buf[..n]);
-        if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if request.len() > 64 * 1024 {
-            return false;
-        }
-    };
-
-    let content_length = std::str::from_utf8(&request[..header_end])
-        .ok()
-        .and_then(|headers| {
-            headers.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-        })
-        .unwrap_or(0);
-
-    let mut body_read = request.len().saturating_sub(header_end);
-    while body_read < content_length {
-        let want = (content_length - body_read).min(buf.len());
-        match socket.read(&mut buf[..want]).await {
-            Ok(0) => return false,
-            Ok(n) => body_read += n,
-            Err(_) => return false,
-        }
-    }
-    true
-}
-
 async fn spawn_loki_keepalive_server(
     responses: Vec<(u16, &'static [u8])>,
 ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
@@ -1270,21 +1224,28 @@ async fn spawn_loki_keepalive_server(
             tokio::spawn(async move {
                 let mut index = 0usize;
                 loop {
-                    if !read_loki_headers(&mut socket).await {
+                    if !read_http11_request_headers(&mut socket).await {
                         break;
                     }
                     requests.fetch_add(1, Ordering::SeqCst);
                     let (status, body) = responses[index % responses.len()];
                     index = index.saturating_add(1);
-                    let headers = format!(
-                        "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-                        body.len()
-                    );
+                    // 204 must not carry a body; advertise Content-Length: 0 only.
+                    let headers = if status == 204 {
+                        format!(
+                            "HTTP/1.1 {status} No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                            body.len()
+                        )
+                    };
                     if socket.write_all(headers.as_bytes()).await.is_err() {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(15)).await;
-                    if socket.write_all(body).await.is_err() {
+                    if status != 204 && socket.write_all(body).await.is_err() {
                         break;
                     }
                 }
@@ -1313,7 +1274,9 @@ async fn wait_for_loki_count(counter: &AtomicUsize, expected: usize) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_loki_reuses_http11_connection_across_successful_batches() {
-    let (endpoint, connections, requests) = spawn_loki_keepalive_server(vec![(204, b"OK")]).await;
+    // Valid Loki success is 204 with an empty body; a 204+body fixture is
+    // protocol-invalid and can poison keep-alive framing in hyper.
+    let (endpoint, connections, requests) = spawn_loki_keepalive_server(vec![(204, b"")]).await;
     let mut config = delivery_config(endpoint);
     config["max_retries"] = json!(0);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
@@ -1349,26 +1312,56 @@ async fn test_loki_stalled_ack_drain_timeout_does_not_block_indefinitely() {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
+    // Use 200 (not 204): hyper ignores bodies on 204, so a stalled 204 never
+    // enters the shared drain timeout. A 200 + Content-Length body does.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_task = Arc::clone(&requests);
     tokio::spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let _ = read_loki_headers(&mut socket).await;
-        let _ = socket
-            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
-            .await;
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let requests = Arc::clone(&requests_task);
+            tokio::spawn(async move {
+                if !read_http11_request_headers(&mut socket).await {
+                    return;
+                }
+                let n = requests.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    // Stall forever — drain timeout must free the flush worker.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                } else {
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                }
+            });
+        }
     });
-    let started = std::time::Instant::now();
     let mut config = delivery_config(format!("http://{addr}/loki/api/v1/push"));
     config["max_retries"] = json!(0);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
+    // Second request only arrives if the drain timeout unblocks the worker
+    // instead of waiting out the peer's 30s stall.
     plugin.log(&create_test_transaction_summary()).await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "stalled Loki ACK must be bounded by the shared drain timeout"
+    plugin.log(&create_test_transaction_summary()).await;
+    for _ in 0..250 {
+        if requests.load(Ordering::SeqCst) >= 2 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "stalled Loki ACK must free the flush worker via the shared drain timeout; saw {} requests",
+        requests.load(Ordering::SeqCst)
     );
 }

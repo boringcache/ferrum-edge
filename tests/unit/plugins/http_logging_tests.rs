@@ -6,62 +6,16 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginHttpClient, http_logging::HttpLogging};
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 use super::plugin_utils::{
     create_test_stream_transaction_summary, create_test_transaction_summary,
+    read_http11_request_headers,
 };
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
-}
-
-/// Read one HTTP/1.1 request and discard its body through `Content-Length`.
-///
-/// Keep-alive fixtures must drain the request body before responding; leaving
-/// unread body bytes on the socket breaks reuse for the next pipelined POST
-/// (transaction-summary batches are larger than a single 1 KiB read).
-async fn read_headers(socket: &mut tokio::net::TcpStream) -> bool {
-    let mut request = Vec::new();
-    let mut buf = [0u8; 1024];
-    let header_end = loop {
-        let n = match socket.read(&mut buf).await {
-            Ok(0) => return false,
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        request.extend_from_slice(&buf[..n]);
-        if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if request.len() > 64 * 1024 {
-            return false;
-        }
-    };
-
-    let content_length = std::str::from_utf8(&request[..header_end])
-        .ok()
-        .and_then(|headers| {
-            headers.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-        })
-        .unwrap_or(0);
-
-    let mut body_read = request.len().saturating_sub(header_end);
-    while body_read < content_length {
-        let want = (content_length - body_read).min(buf.len());
-        match socket.read(&mut buf[..want]).await {
-            Ok(0) => return false,
-            Ok(n) => body_read += n,
-            Err(_) => return false,
-        }
-    }
-    true
 }
 
 async fn spawn_http_logging_keepalive_server(
@@ -84,7 +38,7 @@ async fn spawn_http_logging_keepalive_server(
             tokio::spawn(async move {
                 let mut index = 0usize;
                 loop {
-                    if !read_headers(&mut socket).await {
+                    if !read_http11_request_headers(&mut socket).await {
                         break;
                     }
                     requests.fetch_add(1, Ordering::SeqCst);
@@ -543,19 +497,29 @@ async fn test_http_logging_reuses_http11_connection_across_retry() {
 async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_task = Arc::clone(&requests);
     tokio::spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let _ = read_headers(&mut socket).await;
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            ferrum_edge::plugins::utils::HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES + 1
-        );
-        let _ = socket.write_all(headers.as_bytes()).await;
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let requests = Arc::clone(&requests_task);
+            tokio::spawn(async move {
+                if !read_http11_request_headers(&mut socket).await {
+                    return;
+                }
+                requests.fetch_add(1, Ordering::SeqCst);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    ferrum_edge::plugins::utils::HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES + 1
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                // Hang if the flush worker tries to stream the advertised body.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            });
+        }
     });
-    let started = std::time::Instant::now();
     let plugin = HttpLogging::new(
         &json!({
             "endpoint_url": format!("http://{addr}/logs"),
@@ -566,10 +530,9 @@ async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
         default_client(),
     )
     .unwrap();
+    // Two batches: the second request only arrives if the oversized ACK cap
+    // frees the flush worker instead of pinning it on the peer's delayed body.
     plugin.log(&create_test_transaction_summary()).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "oversized ACK must not pin the http_logging flush worker"
-    );
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_count(&requests, 2).await;
 }

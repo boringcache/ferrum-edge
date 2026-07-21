@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::{create_test_transaction_summary, read_http11_request_headers};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -3989,53 +3989,6 @@ async fn fail_closed_rejected_then_unsampled_keeps_rejected_sink_status() {
     );
 }
 
-/// Read one HTTP/1.1 request and discard its body through `Content-Length`.
-///
-/// Keep-alive fixtures must drain the request body before responding; leaving
-/// unread body bytes on the socket breaks reuse for the next pipelined POST.
-async fn read_audit_headers(socket: &mut tokio::net::TcpStream) -> bool {
-    use tokio::io::AsyncReadExt;
-    let mut request = Vec::new();
-    let mut buf = [0u8; 1024];
-    let header_end = loop {
-        let n = match socket.read(&mut buf).await {
-            Ok(0) => return false,
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        request.extend_from_slice(&buf[..n]);
-        if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if request.len() > 64 * 1024 {
-            return false;
-        }
-    };
-
-    let content_length = std::str::from_utf8(&request[..header_end])
-        .ok()
-        .and_then(|headers| {
-            headers.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-        })
-        .unwrap_or(0);
-
-    let mut body_read = request.len().saturating_sub(header_end);
-    while body_read < content_length {
-        let want = (content_length - body_read).min(buf.len());
-        match socket.read(&mut buf[..want]).await {
-            Ok(0) => return false,
-            Ok(n) => body_read += n,
-            Err(_) => return false,
-        }
-    }
-    true
-}
-
 async fn spawn_audit_keepalive_server(
     responses: Vec<(u16, &'static [u8])>,
 ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
@@ -4059,7 +4012,7 @@ async fn spawn_audit_keepalive_server(
             tokio::spawn(async move {
                 let mut index = 0usize;
                 loop {
-                    if !read_audit_headers(&mut socket).await {
+                    if !read_http11_request_headers(&mut socket).await {
                         break;
                     }
                     requests.fetch_add(1, Ordering::SeqCst);
@@ -4156,63 +4109,8 @@ async fn ai_transcript_audit_reuses_http11_connection_across_retry() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn ai_transcript_audit_chunked_oversized_ack_is_capped() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let finished = Arc::new(AtomicUsize::new(0));
-    let finished_task = Arc::clone(&finished);
-    tokio::spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let _ = read_audit_headers(&mut socket).await;
-        let _ = socket
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-            )
-            .await;
-        let chunk = vec![b'x'; 64 * 1024];
-        let header = format!("{:x}\r\n", chunk.len());
-        for _ in 0..((ferrum_edge::plugins::utils::HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES
-            / chunk.len())
-            + 2)
-        {
-            if socket.write_all(header.as_bytes()).await.is_err() {
-                break;
-            }
-            if socket.write_all(&chunk).await.is_err() {
-                break;
-            }
-            if socket.write_all(b"\r\n").await.is_err() {
-                break;
-            }
-        }
-        finished_task.store(1, Ordering::SeqCst);
-    });
-    let started = std::time::Instant::now();
-    let plugin = AiTranscriptAudit::new(
-        &config_with_sink(
-            &format!("http://{addr}/ingest"),
-            json!({ "mode": "metadata_only" }),
-        ),
-        loopback_http_client(),
-    )
-    .unwrap();
-    audit_roundtrip(&plugin).await;
-    for _ in 0..100 {
-        if finished.load(Ordering::SeqCst) == 1
-            || started.elapsed() > std::time::Duration::from_secs(4)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "chunked oversized audit ACK must abort at the shared drain cap"
-    );
-}
+// Chunked oversized ACK capping is covered directly by
+// `shared_helper_aborts_oversized_chunked_ack_body` in
+// `http_batch_response_drain_tests.rs` (asserts `HttpBatchDrainOutcome::LimitExceeded`).
+// A caller-level wall-clock check cannot distinguish capped abort from an
+// uncapped EOF read of ~1.1 MiB, so the redundant audit fixture was removed.

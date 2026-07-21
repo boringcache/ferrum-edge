@@ -10,55 +10,11 @@ use ferrum_edge::plugins::utils::{
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, HttpBatchDrainOutcome,
     PluginHttpClient, drain_http_batch_response_body, handle_http_batch_response,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-/// Read one HTTP/1.1 request and discard its body through `Content-Length`.
-///
-/// Keep-alive fixtures must drain the request body before responding; leaving
-/// unread body bytes on the socket breaks reuse for later POSTs on the connection.
-async fn read_http_request_headers(socket: &mut TcpStream) -> bool {
-    let mut request = Vec::new();
-    let mut buf = [0u8; 1024];
-    let header_end = loop {
-        let n = match socket.read(&mut buf).await {
-            Ok(0) => return false,
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        request.extend_from_slice(&buf[..n]);
-        if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if request.len() > 64 * 1024 {
-            return false;
-        }
-    };
-
-    let content_length = std::str::from_utf8(&request[..header_end])
-        .ok()
-        .and_then(|headers| {
-            headers.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-        })
-        .unwrap_or(0);
-
-    let mut body_read = request.len().saturating_sub(header_end);
-    while body_read < content_length {
-        let want = (content_length - body_read).min(buf.len());
-        match socket.read(&mut buf[..want]).await {
-            Ok(0) => return false,
-            Ok(n) => body_read += n,
-            Err(_) => return false,
-        }
-    }
-    true
-}
+use super::plugin_utils::read_http11_request_headers;
 
 /// HTTP/1.1 keep-alive receiver that answers each POST with a delayed body.
 ///
@@ -91,7 +47,7 @@ async fn spawn_keepalive_body_server(
             tokio::spawn(async move {
                 let mut index = 0usize;
                 loop {
-                    if !read_http_request_headers(&mut socket).await {
+                    if !read_http11_request_headers(&mut socket).await {
                         break;
                     }
                     let req_n = requests.fetch_add(1, Ordering::SeqCst);
@@ -117,7 +73,8 @@ async fn spawn_keepalive_body_server(
                     if socket.write_all(body).await.is_err() {
                         break;
                     }
-                    // Cap the accept loop so abandoned tests do not hang forever.
+                    // Cap requests on this connection so abandoned tests do not
+                    // leave a keep-alive task spinning forever.
                     if req_n + 1 >= 16 {
                         break;
                     }
@@ -136,7 +93,7 @@ async fn spawn_stalled_body_server() -> (SocketAddr, JoinHandle<()>) {
         let Ok((mut socket, _)) = listener.accept().await else {
             return;
         };
-        let _ = read_http_request_headers(&mut socket).await;
+        let _ = read_http11_request_headers(&mut socket).await;
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n";
         let _ = socket.write_all(headers).await;
         // Never send the body — the drain timeout must win.
@@ -152,7 +109,7 @@ async fn spawn_oversized_content_length_server() -> (SocketAddr, JoinHandle<()>)
         let Ok((mut socket, _)) = listener.accept().await else {
             return;
         };
-        let _ = read_http_request_headers(&mut socket).await;
+        let _ = read_http11_request_headers(&mut socket).await;
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES + 1
@@ -170,7 +127,7 @@ async fn spawn_oversized_chunked_server() -> (SocketAddr, JoinHandle<()>) {
         let Ok((mut socket, _)) = listener.accept().await else {
             return;
         };
-        let _ = read_http_request_headers(&mut socket).await;
+        let _ = read_http11_request_headers(&mut socket).await;
         let _ = socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
@@ -346,7 +303,7 @@ async fn shared_helper_transport_failure_is_classified_without_logging_body() {
         let Ok((mut socket, _)) = listener.accept().await else {
             return;
         };
-        let _ = read_http_request_headers(&mut socket).await;
+        let _ = read_http11_request_headers(&mut socket).await;
         let _ = socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nshort")
             .await;
