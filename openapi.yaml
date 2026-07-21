@@ -16975,7 +16975,47 @@ components:
 
     GraphqlConfig:
       type: object
-      description: "Plugin: graphql — Query depth/complexity limiting, introspection control, per-operation rate limiting. Rate-limit counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      additionalProperties: false
+      description: >-
+        Plugin: graphql — Query depth/complexity limiting, introspection control,
+        and per-operation rate limiting. At least one effective protection rule is
+        required (`max_depth`, `max_complexity`, `max_aliases`,
+        `introspection_allowed: false`, a non-empty `type_rate_limits`, or a
+        non-empty `operation_rate_limits`). `introspection_allowed: true` alone is
+        not an effective rule. Unknown top-level keys are rejected. Rate-limit
+        counter storage supports only local memory and Redis; database-backed
+        counters are intentionally unsupported. When `sync_mode` is `redis`,
+        `redis_url` is required. Explicit Redis fields are validated even in
+        local mode so latent configuration cannot become invalid only when the
+        mode is changed. Runtime numeric fields require integer JSON encoding
+        (for example `2`, not `2.0`); JSON Schema treats those two encodings as
+        the same mathematical integer. Runtime also rejects invalid Redis URL
+        shapes that JSON Schema cannot fully cross-validate with every authoring
+        tool.
+      allOf:
+        - anyOf:
+            - required: [max_depth]
+            - required: [max_complexity]
+            - required: [max_aliases]
+            - required: [introspection_allowed]
+              properties:
+                introspection_allowed:
+                  const: false
+            - required: [type_rate_limits]
+              properties:
+                type_rate_limits:
+                  minProperties: 1
+            - required: [operation_rate_limits]
+              properties:
+                operation_rate_limits:
+                  minProperties: 1
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
       properties:
         max_depth:
           type: integer
@@ -16992,7 +17032,9 @@ components:
         introspection_allowed:
           type: boolean
           default: true
-          description: Whether introspection queries are permitted
+          description: >-
+            Whether introspection queries are permitted. Setting this to `false`
+            counts as an effective protection rule; the default `true` does not.
         limit_by:
           type: string
           enum: [ip, consumer]
@@ -17000,14 +17042,26 @@ components:
           description: Rate limit key
         type_rate_limits:
           type: object
-          additionalProperties:
-            $ref: "#/components/schemas/RateSpec"
-          description: "Rate limits by operation type (query, mutation, subscription)"
+          additionalProperties: false
+          properties:
+            query:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+            mutation:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+            subscription:
+              $ref: "#/components/schemas/GraphqlRateSpec"
+          description: >-
+            Rate limits by operation type. Only `query`, `mutation`, and
+            `subscription` keys are accepted; unknown keys are rejected.
         operation_rate_limits:
           type: object
+          propertyNames:
+            pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
           additionalProperties:
-            $ref: "#/components/schemas/RateSpec"
-          description: Rate limits by named operation
+            $ref: "#/components/schemas/GraphqlRateSpec"
+          description: >-
+            Rate limits by named operation. Keys must be valid GraphQL Names
+            (`[_A-Za-z][_0-9A-Za-z]*`).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -17015,6 +17069,8 @@ components:
           description: "GraphQL rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
         redis_url:
           type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
           description: "Redis connection URL. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
@@ -17022,10 +17078,12 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "ferrum:graphql"
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
           description: Number of multiplexed Redis connections
         redis_username:
@@ -17036,10 +17094,12 @@ components:
           description: Redis password
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Health check ping interval when Redis is unavailable
 
@@ -19953,9 +20013,32 @@ components:
         case-insensitive and runtime storage is normalized to uppercase. Other
         reserved, user-assigned, deleted, and alias codes are rejected.
 
+    GraphqlRateSpec:
+      type: object
+      additionalProperties: false
+      description: >-
+        Closed GraphQL rate limit specification. Both fields are required and
+        must be positive integers; unknown keys are rejected.
+      required: [max_requests, window_seconds]
+      properties:
+        max_requests:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Maximum requests allowed in the window
+        window_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Time window in seconds
+
     RateSpec:
       type: object
-      description: Rate limit specification used by graphql and grpc_method_router plugins.
+      description: >-
+        Rate limit specification used by grpc_method_router. Both fields are
+        required and must be positive integers. The gRPC runtime currently
+        ignores additional keys, so this shared component remains open to
+        preserve schema/runtime parity.
       required: [max_requests, window_seconds]
       properties:
         max_requests:
