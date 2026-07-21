@@ -115,7 +115,8 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "load_testing" => json!({
             "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
-            "duration_seconds": 1
+            "duration_seconds": 1,
+            "gateway_port": 8000
         }),
         "fault_injection" => json!({
             "abort": {"status_code": 503, "percentage": 100.0},
@@ -3087,7 +3088,8 @@ fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good()
         "key": "stable-load-key-0123456789abcdef!",
         "concurrent_clients": 5,
         "duration_seconds": 10,
-        "ramp": true
+        "ramp": true,
+        "gateway_port": 8000
     });
     let config1 = make_config(
         vec![make_proxy("p1", "/api", vec!["pc-load"])],

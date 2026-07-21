@@ -2926,6 +2926,7 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
                 "key": "test-load-key-0123456789abcdef!!",
                 "concurrent_clients": 1,
                 "duration_seconds": 1,
+                "gateway_port": 8000,
                 "max_response_body_bytes": 1024
             }),
         ),
@@ -4391,6 +4392,18 @@ fn opa_schema_matches_runtime_validation_contract() {
             .is_none(),
         "runtime accepts positive timeout_ms values above 30000 and clamps the effective timeout"
     );
+    let default_redact_headers = component
+        .pointer("/properties/redact_headers/default")
+        .and_then(serde_json::Value::as_array)
+        .expect("OPA redact_headers default is an array");
+    for reserved in ["x-loadtesting-key", "x-loadtesting-fanout"] {
+        assert!(
+            default_redact_headers
+                .iter()
+                .any(|header| header.as_str() == Some(reserved)),
+            "OPA OpenAPI defaults must redact reserved load-testing header {reserved}"
+        );
+    }
 
     let base = json!({
         "opa_host": "http://opa.internal:8181",

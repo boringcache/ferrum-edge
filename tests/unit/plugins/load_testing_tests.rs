@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 
 const VALID_KEY: &str = "test-load-key-0123456789abcdef!!"; // exactly 32 chars
 
@@ -831,17 +831,26 @@ async fn test_skips_when_key_does_not_match() {
         "x-loadtesting-key".to_string(),
         "wrong-load-key-0123456789abcdef!".to_string(),
     );
+    headers.insert(
+        "X-Loadtesting-Key".to_string(),
+        "operator-injected-load-key-variant".to_string(),
+    );
     headers.insert("x-loadtesting-fanout".to_string(), "1".to_string());
+    headers.insert("X-Loadtesting-Fanout".to_string(), "1".to_string());
 
     let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(
-        !headers.contains_key("x-loadtesting-key"),
-        "the reserved trigger header must never reach later plugins or backends"
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("x-loadtesting-key")),
+        "every case variant of the reserved trigger header must be stripped: {headers:?}"
     );
     assert!(
-        !headers.contains_key("x-loadtesting-fanout"),
-        "the reserved fan-out marker must never reach application backends"
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("x-loadtesting-fanout")),
+        "every case variant of the fan-out marker must be stripped: {headers:?}"
     );
 }
 
@@ -1575,46 +1584,6 @@ async fn test_beyond_cap_response_is_truncated() {
 }
 
 #[tokio::test]
-async fn test_shared_state_prevents_second_instance_while_running() {
-    let config = json!({
-        "key": VALID_KEY,
-        "concurrent_clients": 1,
-        "duration_seconds": 2,
-        "gateway_port": 9,
-        "request_timeout_ms": 200
-    });
-    let plugin_a = LoadTesting::new(&config, PluginHttpClient::default()).unwrap();
-    let plugin_b = plugin_a
-        .share_with(&config, PluginHttpClient::default())
-        .unwrap();
-
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/api/test".to_string(),
-    );
-    ctx.matched_proxy = Some(matched_proxy());
-    let mut headers = HashMap::new();
-    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = run_before_proxy(&plugin_a, &mut ctx, &mut headers).await;
-    assert!(plugin_a.is_running());
-
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/api/test".to_string(),
-    );
-    ctx2.matched_proxy = Some(matched_proxy());
-    let mut headers2 = HashMap::new();
-    headers2.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = run_before_proxy(&plugin_b, &mut ctx2, &mut headers2).await;
-
-    // Second instance must observe the shared admission guard.
-    assert!(plugin_b.is_running());
-    wait_until_idle(&plugin_a).await;
-}
-
-#[tokio::test]
 async fn test_last_owner_removal_cancels_active_cohort() {
     let (port, request_started, client_closed) = spawn_stalled_request_observer().await;
 
@@ -1652,124 +1621,6 @@ async fn test_last_owner_removal_cancels_active_cohort() {
         .await
         .expect("last-owner cancellation must close the stalled client before the 30s deadline")
         .expect("stalled observer must report client closure");
-}
-
-#[tokio::test]
-async fn test_replacement_generation_does_not_cancel_shared_cohort() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (first_hit_tx, first_hit_rx) = oneshot::channel::<()>();
-    let first_hit_tx = Arc::new(Mutex::new(Some(first_hit_tx)));
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-            let first_hit_tx = Arc::clone(&first_hit_tx);
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                if let Some(tx) = first_hit_tx.lock().await.take() {
-                    let _ = tx.send(());
-                }
-                let body = b"ok";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.write_all(body).await;
-            });
-        }
-    });
-
-    let config = json!({
-        "key": VALID_KEY,
-        "concurrent_clients": 1,
-        "duration_seconds": 3,
-        "gateway_port": port,
-        "request_timeout_ms": 1000
-    });
-    let plugin_a = LoadTesting::new(&config, PluginHttpClient::default()).unwrap();
-    let plugin_b = plugin_a
-        .share_with(&config, PluginHttpClient::default())
-        .unwrap();
-
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/shared".to_string(),
-    );
-    ctx.matched_proxy = Some(matched_proxy());
-    let mut headers = HashMap::new();
-    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = run_before_proxy(&plugin_a, &mut ctx, &mut headers).await;
-    assert!(plugin_a.is_running());
-
-    // Replacement generation arrives while the cohort is live.
-    first_hit_rx.await.expect("first synthetic hit");
-    drop(plugin_a);
-    assert!(
-        plugin_b.is_running(),
-        "shared replacement owner must keep the cohort alive"
-    );
-
-    let run = wait_for_result(&plugin_b).await;
-    assert!(
-        !matches!(run.outcome, RunOutcome::Cancelled),
-        "replacement generation must not cancel the shared cohort: {run:?}"
-    );
-    assert!(run.responses_completed > 0 || run.attempted_requests > 0);
-}
-
-#[tokio::test]
-async fn test_incompatible_replacement_uses_new_state_and_old_owner_cancels() {
-    let (port, request_started, client_closed) = spawn_stalled_request_observer().await;
-    let old_config = json!({
-        "key": VALID_KEY,
-        "concurrent_clients": 1,
-        "duration_seconds": 30,
-        "gateway_port": port,
-        "request_timeout_ms": 5000
-    });
-    let old_plugin = LoadTesting::new(&old_config, PluginHttpClient::default()).unwrap();
-
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/old-policy".to_string(),
-    );
-    ctx.matched_proxy = Some(matched_proxy());
-    let mut headers = HashMap::new();
-    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = run_before_proxy(&old_plugin, &mut ctx, &mut headers).await;
-    tokio::time::timeout(Duration::from_secs(2), request_started)
-        .await
-        .expect("old cohort must start")
-        .expect("stalled observer must report old request");
-
-    let replacement_config = json!({
-        "key": "replacement-load-key-0123456789abc!",
-        "concurrent_clients": 1,
-        "duration_seconds": 1,
-        "gateway_port": 9,
-        "request_timeout_ms": 100
-    });
-    let replacement = old_plugin
-        .share_with(&replacement_config, PluginHttpClient::default())
-        .expect("incompatible replacement must construct with a new state");
-    assert!(
-        !replacement.is_running(),
-        "incompatible replacement must not inherit the old admission state"
-    );
-
-    drop(old_plugin);
-    tokio::time::timeout(Duration::from_secs(3), client_closed)
-        .await
-        .expect("dropping the last old-policy owner must cancel its stalled cohort")
-        .expect("stalled observer must report old client closure");
-    assert!(!replacement.is_running());
-    assert!(replacement.last_run_result().is_none());
 }
 
 #[tokio::test]

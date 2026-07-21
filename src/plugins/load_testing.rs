@@ -132,8 +132,12 @@ struct LoadTestingCompatibility {
 enum LoadTestingStateSelection {
     Isolated,
     Identity(String),
+    #[cfg(test)]
     Replacement(Arc<LoadTestingState>),
 }
+
+const MIN_WORKER_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+const MAX_WORKER_ERROR_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Stable run-admission state shared across compatible plugin-cache generations
 /// for one plugin-config identity.
@@ -179,9 +183,11 @@ impl LoadTestingState {
     }
 
     fn end_run(&self, result: RunResult) {
-        if let Ok(mut guard) = self.last_result.lock() {
-            *guard = Some(result);
-        }
+        let mut guard = self
+            .last_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(result);
         self.is_running.store(false, Ordering::Release);
     }
 
@@ -313,6 +319,40 @@ struct WorkerResult {
     cancelled: bool,
 }
 
+fn next_worker_error_backoff(current: Duration) -> Duration {
+    if current.is_zero() {
+        MIN_WORKER_ERROR_BACKOFF
+    } else {
+        current
+            .saturating_mul(2)
+            .min(MAX_WORKER_ERROR_BACKOFF)
+    }
+}
+
+fn record_worker_completion(
+    completion: Result<WorkerResult, tokio::task::JoinError>,
+    totals: &mut WorkerCounters,
+    worker_failures: &mut u64,
+    cancelled_workers: &mut u64,
+    aggregation_saturated: &mut bool,
+) {
+    match completion {
+        Ok(worker) => {
+            *aggregation_saturated |= worker.counters.saturating_add_into(totals);
+            if worker.cancelled {
+                *cancelled_workers = (*cancelled_workers).saturating_add(1);
+            }
+        }
+        Err(join_err) => {
+            if join_err.is_cancelled() {
+                *cancelled_workers = (*cancelled_workers).saturating_add(1);
+            } else {
+                *worker_failures = (*worker_failures).saturating_add(1);
+            }
+        }
+    }
+}
+
 fn saturating_add_assign(dst: &mut u64, src: u64) -> bool {
     let (sum, overflow) = dst.overflowing_add(src);
     *dst = if overflow { u64::MAX } else { sum };
@@ -363,8 +403,8 @@ impl LoadTesting {
         )
     }
 
-    #[allow(dead_code)] // used only by tests/ via `share_with`; dead code in the bin target
-    pub(crate) fn with_shared_state(
+    #[cfg(test)]
+    fn with_shared_state(
         config: &Value,
         http_client: PluginHttpClient,
         state: Arc<LoadTestingState>,
@@ -374,20 +414,6 @@ impl LoadTesting {
             http_client,
             LoadTestingStateSelection::Replacement(state),
         )
-    }
-
-    /// Construct a reload-like replacement. Compatible effective policy shares
-    /// this plugin's run-admission state; incompatible policy gets a new state.
-    ///
-    /// Used by unit tests (and mirrors plugin-cache reload sharing) so two
-    /// `LoadTesting` values observe the same `is_running` guard.
-    #[allow(dead_code)] // used only by tests/; dead code in the bin target
-    pub fn share_with(
-        &self,
-        config: &Value,
-        http_client: PluginHttpClient,
-    ) -> Result<Self, String> {
-        Self::with_shared_state(config, http_client, Arc::clone(&self.state))
     }
 
     /// Whether a cohort is currently admitted on this plugin identity.
@@ -402,8 +428,8 @@ impl LoadTesting {
         self.state
             .last_result
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn from_parts(
@@ -554,6 +580,7 @@ gateway_port in 1–65535"
             LoadTestingStateSelection::Identity(identity) => {
                 retain_shared_state(&identity, compatibility)
             }
+            #[cfg(test)]
             LoadTestingStateSelection::Replacement(existing) => {
                 if existing.compatibility == compatibility {
                     existing
@@ -887,8 +914,10 @@ impl Plugin for LoadTesting {
         // These names are reserved control-plane inputs. Strip them on every
         // path, including a wrong key, so attacker-chosen lookalikes never reach
         // later plugins or application backends.
-        headers.remove(HEADER_TRIGGER_KEY);
-        headers.remove(HEADER_FANOUT);
+        headers.retain(|name, _| {
+            !name.eq_ignore_ascii_case(HEADER_TRIGGER_KEY)
+                && !name.eq_ignore_ascii_case(HEADER_FANOUT)
+        });
 
         if !key_matches {
             return PluginResult::Continue;
@@ -1061,6 +1090,7 @@ impl Plugin for LoadTesting {
 
                     let mut counters = WorkerCounters::default();
                     let mut cancelled = false;
+                    let mut error_backoff = Duration::ZERO;
 
                     while Instant::now() < deadline {
                         if worker_cancel.is_cancelled() {
@@ -1085,6 +1115,20 @@ impl Plugin for LoadTesting {
                             Err(()) => {
                                 counters.transport_errors =
                                     counters.transport_errors.saturating_add(1);
+                                error_backoff = next_worker_error_backoff(error_backoff);
+                                let remaining =
+                                    deadline.saturating_duration_since(Instant::now());
+                                let delay = error_backoff.min(remaining);
+                                if delay.is_zero() {
+                                    break;
+                                }
+                                tokio::select! {
+                                    _ = worker_cancel.cancelled() => {
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
                                 continue;
                             }
                         };
@@ -1104,14 +1148,17 @@ impl Plugin for LoadTesting {
                                         BodyConsumeOutcome::Completed => {
                                             counters.responses_completed =
                                                 counters.responses_completed.saturating_add(1);
+                                            false
                                         }
                                         BodyConsumeOutcome::Truncated => {
                                             counters.responses_truncated =
                                                 counters.responses_truncated.saturating_add(1);
+                                            false
                                         }
                                         BodyConsumeOutcome::StreamError => {
                                             counters.response_body_errors =
                                                 counters.response_body_errors.saturating_add(1);
+                                            true
                                         }
                                     }
                                 }
@@ -1126,21 +1173,44 @@ impl Plugin for LoadTesting {
                                         counters.transport_errors =
                                             counters.transport_errors.saturating_add(1);
                                     }
+                                    true
                                 }
                             }
                         };
 
-                        tokio::select! {
+                        let attempt_failed = tokio::select! {
                             _ = worker_cancel.cancelled() => {
                                 cancelled = true;
                                 break;
                             }
                             result = tokio::time::timeout(attempt_timeout, send_fut) => {
-                                if result.is_err() {
-                                    counters.request_timeouts =
-                                        counters.request_timeouts.saturating_add(1);
+                                match result {
+                                    Ok(attempt_failed) => attempt_failed,
+                                    Err(_) => {
+                                        counters.request_timeouts =
+                                            counters.request_timeouts.saturating_add(1);
+                                        true
+                                    }
                                 }
                             }
+                        };
+
+                        if attempt_failed {
+                            error_backoff = next_worker_error_backoff(error_backoff);
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            let delay = error_backoff.min(remaining);
+                            if delay.is_zero() {
+                                break;
+                            }
+                            tokio::select! {
+                                _ = worker_cancel.cancelled() => {
+                                    cancelled = true;
+                                    break;
+                                }
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                        } else {
+                            error_backoff = Duration::ZERO;
                         }
                     }
 
@@ -1159,21 +1229,13 @@ impl Plugin for LoadTesting {
             let mut aggregation_saturated = false;
 
             for handle in handles {
-                match handle.await {
-                    Ok(worker) => {
-                        aggregation_saturated |= worker.counters.saturating_add_into(&mut totals);
-                        if worker.cancelled {
-                            cancelled_workers = cancelled_workers.saturating_add(1);
-                        }
-                    }
-                    Err(join_err) => {
-                        if join_err.is_cancelled() {
-                            cancelled_workers = cancelled_workers.saturating_add(1);
-                        } else {
-                            worker_failures = worker_failures.saturating_add(1);
-                        }
-                    }
-                }
+                record_worker_completion(
+                    handle.await,
+                    &mut totals,
+                    &mut worker_failures,
+                    &mut cancelled_workers,
+                    &mut aggregation_saturated,
+                );
             }
 
             let elapsed = start.elapsed();
@@ -1408,4 +1470,117 @@ async fn consume_response_with_cap(resp: reqwest::Response, max_bytes: u64) -> B
         }
     }
     BodyConsumeOutcome::Completed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const TEST_KEY: &str = "test-load-key-0123456789abcdef!!";
+
+    fn test_config(key: &str) -> Value {
+        json!({
+            "key": key,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 9,
+            "request_timeout_ms": 100
+        })
+    }
+
+    #[test]
+    fn replacement_state_shares_only_compatible_policy_and_cancels_on_last_owner() {
+        let config = test_config(TEST_KEY);
+        let first = LoadTesting::new(&config, PluginHttpClient::default()).expect("first plugin");
+        let shared_state = Arc::clone(&first.state);
+        let second = LoadTesting::with_shared_state(
+            &config,
+            PluginHttpClient::default(),
+            Arc::clone(&shared_state),
+        )
+        .expect("compatible replacement");
+        assert!(Arc::ptr_eq(&shared_state, &second.state));
+        assert_eq!(shared_state.live_owners.load(Ordering::SeqCst), 2);
+
+        let shared_token = shared_state.begin_run().expect("first admission");
+        assert!(shared_state.begin_run().is_none());
+        drop(first);
+        assert!(!shared_token.is_cancelled());
+        drop(second);
+        assert!(shared_token.is_cancelled());
+        shared_state.end_run(RunResult::default());
+
+        let original = LoadTesting::new(&config, PluginHttpClient::default()).expect("original");
+        let original_state = Arc::clone(&original.state);
+        let original_token = original_state.begin_run().expect("original admission");
+        let replacement = LoadTesting::with_shared_state(
+            &test_config("replacement-load-key-0123456789abc!"),
+            PluginHttpClient::default(),
+            Arc::clone(&original_state),
+        )
+        .expect("incompatible replacement");
+        assert!(!Arc::ptr_eq(&original_state, &replacement.state));
+        drop(original);
+        assert!(original_token.is_cancelled());
+        assert!(!replacement.state.run_cancel.lock().unwrap().is_cancelled());
+    }
+
+    #[test]
+    fn worker_error_backoff_is_bounded_and_exponential() {
+        let mut backoff = Duration::ZERO;
+        for expected_ms in [10, 20, 40, 80, 160, 250, 250] {
+            backoff = next_worker_error_backoff(backoff);
+            assert_eq!(backoff, Duration::from_millis(expected_ms));
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_completion_counts_cooperative_cancel_join_cancel_and_join_failure() {
+        let mut totals = WorkerCounters::default();
+        let mut failures = 0;
+        let mut cancelled = 0;
+        let mut saturated = false;
+
+        record_worker_completion(
+            Ok(WorkerResult {
+                counters: WorkerCounters::default(),
+                cancelled: true,
+            }),
+            &mut totals,
+            &mut failures,
+            &mut cancelled,
+            &mut saturated,
+        );
+
+        let cancelled_task = tokio::spawn(std::future::pending::<WorkerResult>());
+        cancelled_task.abort();
+        record_worker_completion(
+            cancelled_task.await,
+            &mut totals,
+            &mut failures,
+            &mut cancelled,
+            &mut saturated,
+        );
+
+        let failed_task = tokio::spawn(async {
+            panic!("intentional worker failure classification test");
+            #[allow(unreachable_code)]
+            WorkerResult {
+                counters: WorkerCounters::default(),
+                cancelled: false,
+            }
+        });
+        record_worker_completion(
+            failed_task.await,
+            &mut totals,
+            &mut failures,
+            &mut cancelled,
+            &mut saturated,
+        );
+
+        assert_eq!(cancelled, 2);
+        assert_eq!(failures, 1);
+        assert!(!saturated);
+    }
 }

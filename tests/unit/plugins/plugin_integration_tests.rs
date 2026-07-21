@@ -334,7 +334,8 @@ async fn test_plugin_creation_all_plugins() {
                 json!({
                     "key": "test-load-key-0123456789abcdef!!",
                     "concurrent_clients": 5,
-                    "duration_seconds": 10
+                    "duration_seconds": 10,
+                    "gateway_port": 8000
                 })
             }
             "response_mock" => json!({"rules": [{"path": "/test", "body": "mock"}]}),

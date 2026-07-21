@@ -14769,6 +14769,8 @@ components:
             - x-csrf-token
             - x-xsrf-token
             - x-forwarded-authorization
+            - x-loadtesting-key
+            - x-loadtesting-fanout
           description: >-
             Additional request headers to redact from `input.headers`. Built-in
             sensitive headers and active authentication credential headers are
