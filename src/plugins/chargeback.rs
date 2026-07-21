@@ -31,6 +31,11 @@ pub mod pricing {
     use serde_json::Value;
     use std::collections::HashMap;
 
+    use crate::util::unknown_keys::reject_unknown_keys;
+
+    /// Closed key set for each `pricing_tiers[]` object.
+    const PRICING_TIER_KEYS: &[&str] = &["status_codes", "price_per_call"];
+
     /// Resolved pricing configuration for chargeback plugins.
     #[derive(Debug, Clone, Default)]
     pub struct PricingConfig {
@@ -173,11 +178,17 @@ pub mod pricing {
 
         let mut price_by_status: HashMap<u16, f64> = HashMap::new();
         for (i, tier) in tiers.iter().enumerate() {
-            if !tier.is_object() {
-                return Err(format!(
+            let tier_obj = tier.as_object().ok_or_else(|| {
+                format!(
                     "{plugin_name}: pricing_tiers[{i}] must be an object"
-                ));
-            }
+                )
+            })?;
+            reject_unknown_keys(
+                tier_obj,
+                &format!("pricing_tiers[{i}]"),
+                PRICING_TIER_KEYS,
+                &format!("{plugin_name}: "),
+            )?;
 
             let status_codes = tier
                 .get("status_codes")
