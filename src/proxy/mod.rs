@@ -14983,13 +14983,15 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // metadata (Content-Length) but omits content bytes; 204/205/304 omit both
     // content and Content-Length. Applied here so H1/H2 finalize and every H3
     // path that runs this shared hook cannot diverge.
-    *body = crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+    if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
         &ctx.method,
         *status,
         headers,
-        body,
+        body.len(),
     )
-    .into_owned();
+    {
+        body.clear();
+    }
 }
 
 pub(crate) struct AfterProxyReject {

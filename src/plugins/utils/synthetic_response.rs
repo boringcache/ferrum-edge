@@ -5,7 +5,6 @@
 //! metadata (including `Content-Length`) but never emit a message body.
 //! Statuses 204/205/304 never carry content.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Statuses that must not carry a message body (RFC 9110).
@@ -20,20 +19,22 @@ pub fn synthetic_response_omits_body(method: &str, status: u16) -> bool {
     method.eq_ignore_ascii_case("HEAD") || status_forbids_response_body(status)
 }
 
-/// Prepare headers and return the bytes that may be written on the wire.
+/// Prepare headers and report whether the caller must omit content bytes.
 ///
 /// For `HEAD`, preserves (or installs) `Content-Length` equal to the
-/// representation size that a GET would have returned, then returns an empty
-/// wire body. For 204/205/304, strips `Content-Length` and returns an empty
-/// wire body. All other responses return `body` unchanged.
-pub fn prepare_synthetic_response_wire<'a>(
+/// representation size that a GET would have returned, then returns `true`.
+/// For 204/205/304, strips `Content-Length` and returns `true`. All other
+/// responses leave headers unchanged and return `false`. The caller clears or
+/// substitutes its body only when this returns `true`, avoiding a body clone on
+/// the ordinary response path.
+pub fn prepare_synthetic_response_wire(
     method: &str,
     status: u16,
     headers: &mut HashMap<String, String>,
-    body: &'a [u8],
-) -> Cow<'a, [u8]> {
+    representation_len: usize,
+) -> bool {
     if !synthetic_response_omits_body(method, status) {
-        return Cow::Borrowed(body);
+        return false;
     }
 
     // HEAD keeps representation metadata unless the status itself forbids a
@@ -43,13 +44,16 @@ pub fn prepare_synthetic_response_wire<'a>(
             .keys()
             .any(|name| name.eq_ignore_ascii_case("content-length"))
         {
-            headers.insert("content-length".to_string(), body.len().to_string());
+            headers.insert(
+                "content-length".to_string(),
+                representation_len.to_string(),
+            );
         }
     } else {
         remove_content_length(headers);
     }
 
-    Cow::Borrowed(&[])
+    true
 }
 
 fn remove_content_length(headers: &mut HashMap<String, String>) {

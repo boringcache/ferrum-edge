@@ -22,8 +22,12 @@ fn prepare_head_keeps_representation_content_length() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
     let body = br#"{"message":"down"}"#;
-    let wire = prepare_synthetic_response_wire("HEAD", 503, &mut headers, body);
-    assert!(wire.is_empty());
+    assert!(prepare_synthetic_response_wire(
+        "HEAD",
+        503,
+        &mut headers,
+        body.len()
+    ));
     assert_eq!(
         headers.get("content-length").map(String::as_str),
         Some("18")
@@ -38,8 +42,12 @@ fn prepare_head_keeps_representation_content_length() {
 fn prepare_head_preserves_existing_content_length_case_insensitively() {
     let mut headers = HashMap::new();
     headers.insert("Content-Length".to_string(), "18".to_string());
-    let wire = prepare_synthetic_response_wire("HEAD", 503, &mut headers, b"");
-    assert!(wire.is_empty());
+    assert!(prepare_synthetic_response_wire(
+        "HEAD",
+        503,
+        &mut headers,
+        0
+    ));
     assert_eq!(
         headers.get("Content-Length").map(String::as_str),
         Some("18")
@@ -52,8 +60,10 @@ fn prepare_no_body_status_strips_content_length() {
     for status in [204u16, 205, 304] {
         let mut headers = HashMap::new();
         headers.insert("content-length".to_string(), "99".to_string());
-        let wire = prepare_synthetic_response_wire("GET", status, &mut headers, b"x");
-        assert!(wire.is_empty(), "status {status}");
+        assert!(
+            prepare_synthetic_response_wire("GET", status, &mut headers, 1),
+            "status {status}"
+        );
         assert!(
             !headers
                 .keys()
@@ -66,7 +76,11 @@ fn prepare_no_body_status_strips_content_length() {
 #[test]
 fn prepare_get_with_body_is_passthrough() {
     let mut headers = HashMap::new();
-    let body = b"payload";
-    let wire = prepare_synthetic_response_wire("GET", 503, &mut headers, body);
-    assert_eq!(wire.as_ref(), body);
+    assert!(!prepare_synthetic_response_wire(
+        "GET",
+        503,
+        &mut headers,
+        b"payload".len()
+    ));
+    assert!(headers.is_empty());
 }
