@@ -211,6 +211,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/// Returns the example_audit_plugin SQLite connect pragmas when that \
          example is compiled in; otherwise `None`."
     )?;
+    // Consumed only by test targets; dead code in the bin target.
+    writeln!(registry, "#[allow(dead_code)]")?;
     writeln!(
         registry,
         "pub fn example_audit_sqlite_connect_pragmas() -> Option<&'static [&'static str]> {{"
