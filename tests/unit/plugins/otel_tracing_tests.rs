@@ -1941,9 +1941,7 @@ async fn test_otel_tracing_extension_methods_collapse_in_span_name() {
             bodies = Some(
                 requests
                     .into_iter()
-                    .map(|req| {
-                        serde_json::from_slice::<Value>(&req.body).expect("otlp json body")
-                    })
+                    .map(|req| serde_json::from_slice::<Value>(&req.body).expect("otlp json body"))
                     .collect::<Vec<_>>(),
             );
             break;
@@ -2036,9 +2034,8 @@ async fn test_workload_metrics_zipkin_sets_error_tag_on_failure() {
         if let Some(requests) = mock_server.received_requests().await
             && requests.len() >= 2
         {
-            failed_payload = Some(
-                serde_json::from_slice(&requests[1].body).expect("zipkin error payload"),
-            );
+            failed_payload =
+                Some(serde_json::from_slice(&requests[1].body).expect("zipkin error payload"));
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2119,7 +2116,10 @@ async fn test_otel_tracing_drops_non_hex_trace_ids_without_panic() {
 
     // Multibyte non-hex ID: slicing by byte offset would panic mid-char.
     let mut metadata = make_trace_metadata();
-    metadata.insert("trace_id".to_string(), "абвгдеёжзийклмнопрстуфхцчшщъыьэюя".to_string());
+    metadata.insert(
+        "trace_id".to_string(),
+        "абвгдеёжзийклмнопрстуфхцчшщъыьэюя".to_string(),
+    );
     let summary = make_summary(metadata);
     plugin.log(&summary).await;
     assert_no_requests(&mock_server).await;
