@@ -3212,3 +3212,57 @@ async fn stream_waf_disabled_signature_is_dropped() {
         PluginResult::Reject { .. }
     ));
 }
+
+#[test]
+fn waf_stream_metadata_ownership_documentation_matches_stream_support() {
+    // Regression for #2528: the canonical reserved-namespace note in
+    // docs/plugins.md described the pre-stream implementation — claiming the
+    // WAF runs only on HTTP-family protocols — even after TCP/UDP/DTLS
+    // inspection started writing authoritative `waf.*` decision fields into
+    // stream/session metadata for stream transaction summaries. Keep the
+    // documented ownership contract aligned with the conditional stream
+    // support so logging/schema authors do not treat stream `waf.*` values as
+    // unavailable or non-authoritative.
+    let docs = include_str!("../../../docs/plugins.md");
+    let note = docs
+        .split("Reserved log-metadata namespace")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("waf reserved-namespace note");
+
+    // The stale contract must stay gone.
+    assert!(
+        !note.contains("the WAF runs only on HTTP-family protocols"),
+        "reserved-namespace note regressed to the HTTP-only contract"
+    );
+
+    // The note documents conditional TCP/UDP/DTLS WAF support, the exact
+    // stream decision fields, and the ownership difference between the
+    // HTTP-family `clone_log_metadata` filter and direct stream/session
+    // metadata.
+    assert!(
+        note.contains("TCP/UDP/DTLS"),
+        "note must cover stream protocols"
+    );
+    for field in [
+        "waf.rule_hits",
+        "waf.target",
+        "waf.severity",
+        "waf.action",
+        "waf.block_reason",
+        "waf.would_block_reason",
+    ] {
+        assert!(
+            note.contains(field),
+            "note must document the stream metadata field `{field}`"
+        );
+    }
+    assert!(
+        note.contains("clone_log_metadata"),
+        "note must explain the HTTP-family ownership filter"
+    );
+    assert!(
+        note.contains("no equivalent ownership filter"),
+        "note must state that stream logs have no equivalent ownership filter"
+    );
+}
