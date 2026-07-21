@@ -16918,31 +16918,39 @@ components:
         max_entries:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
           default: 10000
-          description: Maximum number of cached entries before eviction of expired/oldest entries
+          description: Maximum number of cached entries before eviction of expired/oldest entries. Must be greater than zero.
         max_entry_size_bytes:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
           default: 1048576
-          description: Maximum size of a single cached response body (1 MiB by default). Larger responses are not cached.
+          description: Maximum size of a single cached response body (1 MiB by default). Larger responses are not cached. Must be greater than zero.
         max_total_size_bytes:
           type: [integer, "null"]
           format: uint64
+          minimum: 1
           default: 104857600
-          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached.
+          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached. Must be greater than zero.
         cacheable_methods:
           type: array
+          minItems: 1
           items:
             type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: ["GET", "HEAD"]
-          description: HTTP methods eligible for caching (uppercased)
+          description: HTTP methods eligible for caching (uppercased). Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token.
         cacheable_status_codes:
           type: array
+          minItems: 1
           items:
             type: integer
             format: uint16
+            minimum: 100
+            maximum: 599
           default: [200, 301, 404]
-          description: Response status codes eligible for caching
+          description: Response status codes eligible for caching. Must contain at least one entry, and every entry must be within 100-599.
         respect_cache_control:
           type: [boolean, "null"]
           default: true
@@ -16955,8 +16963,9 @@ components:
           type: array
           items:
             type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
-          description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header."
+          description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header. Every entry must be a valid RFC 9110 HTTP field-name token."
         cache_key_include_query:
           type: [boolean, "null"]
           default: true

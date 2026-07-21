@@ -3364,14 +3364,14 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `ttl_seconds` | u64 | `300` | Default freshness lifetime when the backend response does not provide `max-age` or `s-maxage`; upstream `Age` and `Date` still reduce remaining freshness |
-| `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries before eviction |
-| `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body |
-| `max_total_size_bytes` | u64 | `104857600` | Maximum total in-memory cache size across all entries |
-| `cacheable_methods` | String[] | `["GET","HEAD"]` | Methods eligible for caching |
-| `cacheable_status_codes` | u16[] | `[200,301,404]` | Response status codes eligible for caching |
+| `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries before eviction (must be > 0) |
+| `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body (must be > 0) |
+| `max_total_size_bytes` | u64 | `104857600` | Maximum total in-memory cache size across all entries (must be > 0) |
+| `cacheable_methods` | String[] | `["GET","HEAD"]` | Methods eligible for caching. Must contain at least one entry, and every entry must be a valid HTTP method token |
+| `cacheable_status_codes` | u16[] | `[200,301,404]` | Response status codes eligible for caching. Must contain at least one entry, and every entry must be within 100-599 |
 | `respect_cache_control` | bool | `true` | Honor backend `Cache-Control` directives such as `no-store`, `private`, `max-age`, and `s-maxage` |
 | `respect_no_cache` | bool | `true` | Bypass cache lookup when the client sends `Cache-Control: no-cache` or `no-store` |
-| `vary_by_headers` | String[] | `[]` | Additional request headers to include in the cache key even when the backend does not send `Vary` |
+| `vary_by_headers` | String[] | `[]` | Additional request headers to include in the cache key even when the backend does not send `Vary`. Every entry must be a valid HTTP header-name token |
 | `cache_key_include_query` | bool | `true` | Include the exact raw query string in the cache key as a SHA-256 hash |
 | `cache_key_include_consumer` | bool | `false` | Allow caching authenticated responses under their isolated identity key even when the backend does not send `public`, `must-revalidate`, or `s-maxage`; also add an `_anon` key partition for unauthenticated requests. Authenticated requests are always keyed by the hashed effective identity. |
 | `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses |
