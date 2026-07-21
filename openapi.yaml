@@ -12435,7 +12435,9 @@ components:
           type: number
           minimum: 0
           maximum: 1
-          description: Required when root_sampling=ratio; fraction of roots sampled
+          description: >-
+            Required when root_sampling=ratio; fraction of roots sampled.
+            Rejected when set with any other root_sampling mode.
         include_url_path:
           type: boolean
           default: true

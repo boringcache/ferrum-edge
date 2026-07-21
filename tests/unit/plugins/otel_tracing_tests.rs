@@ -1909,3 +1909,257 @@ async fn test_otel_tracing_span_name_ignores_high_cardinality_path() {
     assert_eq!(span["name"], "GET");
     assert_eq!(otlp_string_attr(span, "url.path"), Some("/probe/00000001"));
 }
+
+#[tokio::test]
+async fn test_otel_tracing_extension_methods_collapse_in_span_name() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(3)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    let extensions = ["METH1", "METH2", "FOOBAR"];
+    for extension in extensions {
+        let mut summary = make_summary(make_trace_metadata());
+        summary.http_method = extension.to_string();
+        summary.proxy_name = Some("api".to_string());
+        plugin.log(&summary).await;
+    }
+
+    let mut bodies = None;
+    for _ in 0..50 {
+        if let Some(requests) = mock_server.received_requests().await
+            && requests.len() >= extensions.len()
+        {
+            bodies = Some(
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        serde_json::from_slice::<Value>(&req.body).expect("otlp json body")
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let bodies = bodies.expect("expected three span exports");
+    let mut names = Vec::new();
+    let mut methods = Vec::new();
+    for payload in &bodies {
+        let span = otlp_span(payload);
+        names.push(span["name"].as_str().expect("span name").to_string());
+        methods.push(
+            otlp_string_attr(span, "http.request.method")
+                .expect("http.request.method")
+                .to_string(),
+        );
+    }
+
+    assert!(
+        names.iter().all(|name| name == "_OTHER api"),
+        "extension methods must share one span name, got {names:?}"
+    );
+    assert_eq!(methods, vec!["METH1", "METH2", "FOOBAR"]);
+}
+
+#[tokio::test]
+async fn test_otel_tracing_standard_method_case_normalized_in_span_name() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+    let mut summary = make_summary(make_trace_metadata());
+    summary.http_method = "get".to_string();
+    summary.proxy_name = Some("api".to_string());
+    plugin.log(&summary).await;
+    let payload = received_json(&mock_server).await;
+    let span = otlp_span(&payload);
+    assert_eq!(span["name"], "GET api");
+    assert_eq!(otlp_string_attr(span, "http.request.method"), Some("get"));
+}
+
+#[tokio::test]
+async fn test_workload_metrics_zipkin_sets_error_tag_on_failure() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/v2/spans"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {
+                "url": format!("{}/api/v2/spans", mock_server.uri())
+            }
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+
+    let mut ok = make_summary(make_trace_metadata());
+    ok.response_status_code = 200;
+    plugin.log(&ok).await;
+    let ok_payload = received_json(&mock_server).await;
+    assert!(
+        ok_payload[0]["tags"].get("error").is_none(),
+        "successful Zipkin span must omit error tag"
+    );
+
+    let mut failed = make_summary(make_trace_metadata());
+    failed.response_status_code = 502;
+    failed.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionTimeout);
+    plugin.log(&failed).await;
+    // Wait until a second request arrives (first success already counted).
+    let mut failed_payload = None;
+    for _ in 0..50 {
+        if let Some(requests) = mock_server.received_requests().await
+            && requests.len() >= 2
+        {
+            failed_payload = Some(
+                serde_json::from_slice(&requests[1].body).expect("zipkin error payload"),
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let failed_payload = failed_payload.expect("failed span export");
+    assert!(
+        failed_payload[0]["tags"].get("error").is_some(),
+        "failed Zipkin span must set error tag, got {}",
+        failed_payload[0]["tags"]
+    );
+}
+
+#[tokio::test]
+async fn test_otel_tracing_rejects_inert_root_sampling_ratio() {
+    let err = OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "http://localhost:4318/v1/traces",
+            "root_sampling_ratio": 0.01
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("ratio without root_sampling=ratio must be rejected");
+    assert!(
+        err.contains("root_sampling_ratio") && err.contains("root_sampling"),
+        "got: {err}"
+    );
+
+    let err = OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "http://localhost:4318/v1/traces",
+            "root_sampling": "always_off",
+            "root_sampling_ratio": 0.5
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("ratio with always_off must be rejected");
+    assert!(
+        err.contains("root_sampling_ratio") && err.contains("root_sampling"),
+        "got: {err}"
+    );
+
+    OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "http://localhost:4318/v1/traces",
+            "root_sampling": "ratio",
+            "root_sampling_ratio": 0.01
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("ratio mode with ratio must be accepted");
+
+    OtelTracing::new_with_http_client(
+        &json!({
+            "endpoint": "http://localhost:4318/v1/traces",
+            "root_sampling": "always_on"
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("always_on without ratio must be accepted");
+}
+
+#[tokio::test]
+async fn test_otel_tracing_drops_non_hex_trace_ids_without_panic() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    // Multibyte non-hex ID: slicing by byte offset would panic mid-char.
+    let mut metadata = make_trace_metadata();
+    metadata.insert("trace_id".to_string(), "абвгдеёжзийклмнопрстуфхцчшщъыьэюя".to_string());
+    let summary = make_summary(metadata);
+    plugin.log(&summary).await;
+    assert_no_requests(&mock_server).await;
+
+    let mut metadata = make_trace_metadata();
+    metadata.insert("span_id".to_string(), "not-hex!!!!!!!!".to_string());
+    let summary = make_summary(metadata);
+    plugin.log(&summary).await;
+    assert_no_requests(&mock_server).await;
+}
+
+#[tokio::test]
+async fn test_otel_tracing_gateway_4xx_reject_is_not_span_error() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+    let mut summary = make_summary(make_trace_metadata());
+    summary.response_status_code = 403;
+    summary
+        .metadata
+        .insert("rejection_phase".to_string(), "auth".to_string());
+    summary.proxy_name = Some("api".to_string());
+    assert!(
+        summary.is_terminal_failure(),
+        "shared logging predicate still treats rejects as terminal"
+    );
+    plugin.log(&summary).await;
+    let payload = received_json(&mock_server).await;
+    let span = otlp_span(&payload);
+    assert_eq!(
+        span["status"]["code"], 1,
+        "gateway 4xx rejects must not be OTLP ERROR spans"
+    );
+}

@@ -1375,13 +1375,13 @@ Supports two modes:
 
 Wire parsing follows W3C Trace Context: lowercase hex only, version-`00` exact field count, forward-compatible higher versions, outgoing version always `00`, and `tracestate` is dropped whenever the parent is invalid or untrusted. Before backend dispatch, every case-insensitive caller-supplied `traceparent`/`tracestate` field is removed and only the trusted or newly generated canonical context is inserted. When generation is disabled, rejected caller context is stripped rather than passed through unchanged.
 
-Sampling is parent-based for trusted parents (`sampled=0` suppresses export while still propagating flags). Root traces use `root_sampling` (`always_on` by default, or `always_off` / `ratio` with `root_sampling_ratio`).
+Sampling is parent-based for trusted parents (`sampled=0` suppresses export while still propagating flags). Root traces use `root_sampling` (`always_on` by default, or `always_off` / `ratio` with `root_sampling_ratio`). `root_sampling_ratio` is accepted only when `root_sampling=ratio`; setting it with any other mode is rejected.
 
 #### Span semantics
 
-Gateway spans are `SERVER`. `server.address` / `server.port` come from the client-facing Host/listener when known and are omitted otherwise. Upstream selection is emitted as `gateway.backend.*` and never as `server.address`; `gateway.backend.target` is a sanitized host/port authority, so schemes, paths, queries, fragments, and userinfo never enter that attribute. Span names use `METHOD <proxy_name|proxy_id>` (or method alone) — never the raw request path. Bounded `url.path` remains an attribute when `include_url_path` is true.
+Gateway spans are `SERVER`. `server.address` / `server.port` come from the client-facing Host/listener when known and are omitted otherwise. Upstream selection is emitted as `gateway.backend.*` and never as `server.address`; `gateway.backend.target` is a sanitized host/port authority, so schemes, paths, queries, fragments, and userinfo never enter that attribute. Span names use `METHOD <proxy_name|proxy_id>` (or method alone) — never the raw request path. Method tokens in the span name are bounded to the standard HTTP set (case-insensitive); extension methods collapse to `_OTHER`. Bounded `url.path` remains an attribute when `include_url_path` is true.
 
-Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/stream failures, and classified stream/WebSocket errors. Ordinary HTTP 4xx alone stays `OK`. Stream and WebSocket teardown spans carry bounded byte/frame counts plus stable disconnect cause/direction/I/O-side attributes; client-side and backend-side failures remain distinct across OTLP, Zipkin, and Datadog. WebSocket upgrades emit the HTTP handshake span from `log` and a separate disconnect span from `on_ws_disconnect` with a new span ID under the same trace and a start time derived from the final session duration.
+Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/stream failures, and classified stream/WebSocket errors. HTTP 4xx responses — including gateway rejects that set `rejection_phase` — stay `OK` on SERVER spans. Stream and WebSocket teardown spans carry bounded byte/frame counts plus stable disconnect cause/direction/I/O-side attributes; client-side and backend-side failures remain distinct across OTLP, Zipkin, and Datadog. WebSocket upgrades emit the HTTP handshake span from `log` and a separate disconnect span from `on_ws_disconnect` with a new span ID under the same trace and a start time derived from the final session duration.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1391,7 +1391,7 @@ Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/st
 | `generate_trace_id` | Boolean | `true` | Generate trace IDs when no usable incoming context exists |
 | `trace_context_trust` | String | `untrusted` | `untrusted` or `trusted` inbound parent policy |
 | `root_sampling` | String | `always_on` | `always_on`, `always_off`, or `ratio` for locally created roots |
-| `root_sampling_ratio` | Number | _(required for ratio)_ | Fraction in `[0.0, 1.0]` when `root_sampling=ratio` |
+| `root_sampling_ratio` | Number | _(required for ratio)_ | Fraction in `[0.0, 1.0]` when `root_sampling=ratio`; rejected if set with any other `root_sampling` mode |
 | `include_url_path` | Boolean | `true` | Include bounded `url.path` attribute |
 | `headers` | Object | `{}` | Custom HTTP headers sent with exports (values treated as secrets) |
 | `authorization` | String | _(none)_ | Authorization header value for OTLP exports (secret) |

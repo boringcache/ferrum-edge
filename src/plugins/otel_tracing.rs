@@ -10,6 +10,8 @@
 //! - Trace-context trust is explicit and fail-closed (`trace_context_trust`).
 //! - Parent-based sampling is honored; root sampling is configurable.
 //! - Span names use low-cardinality route/proxy identifiers, never raw paths.
+//!   HTTP methods in span names are bounded to the standard set (`_OTHER`
+//!   for extensions); `http.request.method` retains the observed token.
 //! - Exporter queues are count- and byte-bounded; diagnostics use redacted URLs.
 
 use async_trait::async_trait;
@@ -17,7 +19,7 @@ use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -244,13 +246,15 @@ impl SpanData {
         include_url_path: bool,
         max_attribute_bytes: usize,
     ) -> Option<Self> {
-        let trace_id = summary.metadata.get("trace_id")?.clone();
-        let span_id = summary.metadata.get("span_id")?.clone();
-        let parent_span_id = summary
-            .metadata
-            .get("parent_span_id")
-            .cloned()
-            .unwrap_or_default();
+        let (trace_id, span_id, parent_span_id) = take_w3c_trace_ids(
+            summary.metadata.get("trace_id")?,
+            summary.metadata.get("span_id")?,
+            summary
+                .metadata
+                .get("parent_span_id")
+                .map(String::as_str)
+                .unwrap_or(""),
+        )?;
         let (server_address, server_port) = server_authority_from_metadata(&summary.metadata);
         let (backend_host, backend_port) = summary
             .backend_target
@@ -270,9 +274,9 @@ impl SpanData {
             String::new()
         };
         Some(Self {
-            trace_id: truncate_attr(&trace_id, 64),
-            span_id: truncate_attr(&span_id, 32),
-            parent_span_id: truncate_attr(&parent_span_id, 32),
+            trace_id,
+            span_id,
+            parent_span_id,
             service_name: service_name.to_string(),
             span_name: http_span_name(summary),
             span_kind: kind.otlp_code(),
@@ -353,13 +357,15 @@ impl SpanData {
         kind: SpanKind,
         max_attribute_bytes: usize,
     ) -> Option<Self> {
-        let trace_id = summary.metadata.get("trace_id")?.clone();
-        let span_id = summary.metadata.get("span_id")?.clone();
-        let parent_span_id = summary
-            .metadata
-            .get("parent_span_id")
-            .cloned()
-            .unwrap_or_default();
+        let (trace_id, span_id, parent_span_id) = take_w3c_trace_ids(
+            summary.metadata.get("trace_id")?,
+            summary.metadata.get("span_id")?,
+            summary
+                .metadata
+                .get("parent_span_id")
+                .map(String::as_str)
+                .unwrap_or(""),
+        )?;
         let (backend_host, backend_port) = parse_backend_host_port(&summary.backend_target);
         let backend_target =
             gateway_backend_target(backend_host.as_deref(), backend_port, max_attribute_bytes);
@@ -373,9 +379,9 @@ impl SpanData {
             .as_deref()
             .unwrap_or(summary.protocol.as_str());
         Some(Self {
-            trace_id: truncate_attr(&trace_id, 64),
-            span_id: truncate_attr(&span_id, 32),
-            parent_span_id: truncate_attr(&parent_span_id, 32),
+            trace_id,
+            span_id,
+            parent_span_id,
             service_name: service_name.to_string(),
             span_name: format!("{} {}", summary.protocol, route),
             span_kind: kind.otlp_code(),
@@ -445,10 +451,16 @@ impl SpanData {
         service_name: &str,
         max_attribute_bytes: usize,
     ) -> Option<Self> {
-        let trace_id = ctx.metadata.get("trace_id")?.clone();
+        let raw_trace_id = ctx.metadata.get("trace_id")?;
         // Never reuse the HTTP upgrade span identity for the session span.
         let span_id = OtelTracing::generate_span_id();
-        let parent_span_id = ctx.metadata.get("span_id").cloned().unwrap_or_default();
+        let raw_parent = ctx
+            .metadata
+            .get("span_id")
+            .map(String::as_str)
+            .unwrap_or("");
+        let (trace_id, span_id, parent_span_id) =
+            take_w3c_trace_ids(raw_trace_id, &span_id, raw_parent)?;
         let (backend_host, backend_port) = parse_backend_host_port(&ctx.backend_target);
         let backend_target =
             gateway_backend_target(backend_host.as_deref(), backend_port, max_attribute_bytes);
@@ -456,9 +468,9 @@ impl SpanData {
         let otlp_error = ctx.error_class.is_some();
         let route = ctx.proxy_name.as_deref().unwrap_or("websocket");
         Some(Self {
-            trace_id: truncate_attr(&trace_id, 64),
+            trace_id,
             span_id,
-            parent_span_id: truncate_attr(&parent_span_id, 32),
+            parent_span_id,
             service_name: service_name.to_string(),
             span_name: format!("WEBSOCKET {route}"),
             span_kind: SpanKind::Server.otlp_code(),
@@ -909,9 +921,6 @@ impl Plugin for OtelTracing {
             }
             None => {
                 // Invalid/absent parent: never carry companion tracestate into a new trace.
-                if !self.generate_trace_id && incoming.is_none() {
-                    return PluginResult::Continue;
-                }
                 if !self.generate_trace_id {
                     return PluginResult::Continue;
                 }
@@ -1414,11 +1423,6 @@ pub(crate) fn trace_exporters_from_providers(
 ) -> Result<Vec<Arc<dyn TraceExporter>>, String> {
     if providers.is_empty() {
         return Ok(Vec::new());
-    }
-    if let Some(object) = config.as_object() {
-        // Mesh provider configs may only carry a subset of keys; tolerate unknowns
-        // only when the object is empty of disallowed otel keys that conflict.
-        let _ = object;
     }
     let service_name = string_config(config, "service_name", default_service_name)?;
     let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
@@ -2162,6 +2166,14 @@ fn build_zipkin_payload(service_name: &str, spans: &[SpanData]) -> Value {
             let duration_us = (span.duration_ms.max(0.0) * 1_000.0) as i64;
             let mut tags = serde_json::Map::new();
             push_common_tags(&mut tags, span);
+            if span.otlp_error {
+                let reason = span
+                    .error_class
+                    .as_deref()
+                    .or(span.body_error_class.as_deref())
+                    .unwrap_or("true");
+                insert_tag(&mut tags, "error", reason);
+            }
 
             let mut value = serde_json::json!({
                 "traceId": span.trace_id.clone(),
@@ -2468,6 +2480,12 @@ fn parse_root_sampling(config: &Value) -> Result<RootSampling, String> {
             ));
         }
     };
+    if configured_ratio.is_some() && mode != "ratio" {
+        return Err(format!(
+            "otel_tracing: 'root_sampling_ratio' requires root_sampling=ratio \
+             (got root_sampling={mode})"
+        ));
+    }
     match mode.as_str() {
         "always_on" => Ok(RootSampling::AlwaysOn),
         "always_off" => Ok(RootSampling::AlwaysOff),
@@ -2746,6 +2764,44 @@ fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Accept only W3C-shaped lowercase hex IDs before export helpers slice by
+/// byte offset (non-hex / non-ASCII values would panic mid-char).
+fn take_w3c_trace_ids(
+    trace_id: &str,
+    span_id: &str,
+    parent_span_id: &str,
+) -> Option<(String, String, String)> {
+    if !is_lowercase_hex(trace_id, 32) || !is_lowercase_hex(span_id, 16) {
+        warn_invalid_trace_identity();
+        return None;
+    }
+    if !parent_span_id.is_empty() && !is_lowercase_hex(parent_span_id, 16) {
+        warn_invalid_trace_identity();
+        return None;
+    }
+    Some((
+        trace_id.to_string(),
+        span_id.to_string(),
+        parent_span_id.to_string(),
+    ))
+}
+
+fn warn_invalid_trace_identity() {
+    static LIMITER: OnceLock<Mutex<LogRateLimiter>> = OnceLock::new();
+    let limiter = LIMITER.get_or_init(|| Mutex::new(LogRateLimiter::new()));
+    let now_ms = crate::socket_opts::monotonic_now_ms();
+    let suppressed = match limiter.lock() {
+        Ok(mut limiter) => limiter.on_event(now_ms),
+        Err(poisoned) => poisoned.into_inner().on_event(now_ms),
+    };
+    if let Some(suppressed) = suppressed {
+        warn!(
+            suppressed,
+            "dropping span with non-hex trace_id/span_id metadata"
+        );
+    }
+}
+
 fn flags_sampled(flags: &str) -> bool {
     u8::from_str_radix(flags, 16)
         .map(|flags| flags & 0x01 == 0x01)
@@ -2782,7 +2838,7 @@ fn truncate_attr(value: &str, max_bytes: usize) -> String {
 }
 
 fn http_span_name(summary: &TransactionSummary) -> String {
-    let method = summary.http_method.as_str();
+    let method = http_method_for_span_name(&summary.http_method);
     if let Some(route) = summary.proxy_name.as_deref().filter(|v| !v.is_empty()) {
         format!("{method} {route}")
     } else if let Some(proxy_id) = summary.proxy_id.as_deref().filter(|v| !v.is_empty()) {
@@ -2792,10 +2848,43 @@ fn http_span_name(summary: &TransactionSummary) -> String {
     }
 }
 
+/// Bound span-name method tokens to the HTTP registry set (OTel `_OTHER`).
+fn http_method_for_span_name(method: &str) -> &'static str {
+    if method.eq_ignore_ascii_case("GET") {
+        "GET"
+    } else if method.eq_ignore_ascii_case("HEAD") {
+        "HEAD"
+    } else if method.eq_ignore_ascii_case("POST") {
+        "POST"
+    } else if method.eq_ignore_ascii_case("PUT") {
+        "PUT"
+    } else if method.eq_ignore_ascii_case("DELETE") {
+        "DELETE"
+    } else if method.eq_ignore_ascii_case("CONNECT") {
+        "CONNECT"
+    } else if method.eq_ignore_ascii_case("OPTIONS") {
+        "OPTIONS"
+    } else if method.eq_ignore_ascii_case("TRACE") {
+        "TRACE"
+    } else if method.eq_ignore_ascii_case("PATCH") {
+        "PATCH"
+    } else {
+        "_OTHER"
+    }
+}
+
 fn http_span_is_error(summary: &TransactionSummary) -> bool {
-    summary.is_terminal_failure()
-        || summary.response_status_code >= 500
-        || summary.grpc_status().is_some_and(|status| status != 0)
+    // Nonzero gRPC status is always an error (#2585), even over HTTP 200/4xx.
+    if summary.grpc_status().is_some_and(|status| status != 0) {
+        return true;
+    }
+    let status = summary.response_status_code;
+    // OTel SERVER semconv: HTTP 4xx is not span ERROR (incl. gateway rejects).
+    if (400..500).contains(&status) {
+        return false;
+    }
+    // HTTP 5xx and terminal transport/body failures (status 0, disconnect, …).
+    status >= 500 || summary.is_terminal_failure()
 }
 
 fn server_authority_from_metadata(
