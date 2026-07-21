@@ -44,10 +44,7 @@ pub fn prepare_synthetic_response_wire(
             .keys()
             .any(|name| name.eq_ignore_ascii_case("content-length"))
         {
-            headers.insert(
-                "content-length".to_string(),
-                representation_len.to_string(),
-            );
+            headers.insert("content-length".to_string(), representation_len.to_string());
         }
     } else {
         remove_content_length(headers);

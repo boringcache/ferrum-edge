@@ -1316,9 +1316,11 @@ async fn request_termination_invalid_reload_keeps_last_known_good_policy() {
     let ConfigApplyOutcome::Rejected { errors } = outcome else {
         panic!("misspelled request_termination trigger must reject reload");
     };
-    assert!(errors.iter().any(|error| {
-        error.contains("request_termination") && error.contains("triger")
-    }));
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.contains("request_termination") && error.contains("triger") })
+    );
     assert_eq!(
         state.config.load().plugin_configs[0].config["trigger"]["path_prefix"],
         "/maintenance"
