@@ -216,14 +216,16 @@ fn test_plugin_name() {
 fn test_plugin_priority_before_request_mirror() {
     let plugin = make_plugin();
     assert_eq!(plugin.priority(), priority::LOAD_TESTING);
-    assert!(
-        priority::LOAD_TESTING < priority::REQUEST_MIRROR,
-        "load_testing must strip the trigger key before request_mirror can observe it"
-    );
-    assert!(
-        priority::GRPC_DEADLINE < priority::LOAD_TESTING,
-        "load_testing remains after grpc_deadline in the deferred transform band"
-    );
+    const {
+        assert!(
+            priority::LOAD_TESTING < priority::REQUEST_MIRROR,
+            "load_testing must strip the trigger key before request_mirror can observe it"
+        );
+        assert!(
+            priority::GRPC_DEADLINE < priority::LOAD_TESTING,
+            "load_testing remains after grpc_deadline in the deferred transform band"
+        );
+    }
 }
 
 #[test]
