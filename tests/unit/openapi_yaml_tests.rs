@@ -1826,10 +1826,7 @@ fn request_deduplication_schema_matches_runtime_validation() {
 
     // Issue #2604: the published schema must reject the same malformed
     // configurations the runtime constructor rejects.
-    assert_eq!(
-        schema["properties"]["header_name"]["minLength"],
-        json!(1)
-    );
+    assert_eq!(schema["properties"]["header_name"]["minLength"], json!(1));
     assert_eq!(
         schema["properties"]["header_name"]["pattern"],
         json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -1860,9 +1857,7 @@ fn request_deduplication_schema_matches_runtime_validation() {
         .as_array()
         .expect("RequestDeduplicationConfig allOf")
         .iter()
-        .find(|guard| {
-            guard["if"]["properties"]["sync_mode"]["const"] == json!("redis")
-        })
+        .find(|guard| guard["if"]["properties"]["sync_mode"]["const"] == json!("redis"))
         .expect("sync_mode=redis conditional guard");
     assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
     assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
