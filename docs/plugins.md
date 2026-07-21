@@ -3456,7 +3456,9 @@ Compression note:
 
 GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-operation rate limiting.
 
-Request buffering is only enabled when at least one GraphQL policy is configured and the incoming request is a JSON `POST`.
+Request buffering is only enabled when at least one GraphQL policy is configured and the incoming request is a JSON `POST`. The inspectable transport is POST with a JSON content type and a JSON object body containing a non-empty string `query`. Other HTTP representations fail closed with HTTP 400 GraphQL-style JSON errors: GraphQL GET (`?query=`), GraphQL-over-SSE GET, raw `application/graphql`, JSON batch arrays, automatic persisted query (APQ) hash-only envelopes, multipart `operations`, and missing/unparseable bodies.
+
+**Protocols:** HTTP and WebSocket. On WebSocket proxies the plugin runs during the HTTP upgrade handshake and rejects the GET upgrade so uninspectable GraphQL-over-WebSocket frames are never admitted. It does not inspect WebSocket frames after upgrade. gRPC, TCP, and UDP are unsupported.
 
 **Priority:** 2850
 
