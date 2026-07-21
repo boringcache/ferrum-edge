@@ -4,6 +4,10 @@
 //! automatically discovers it, declares the module, and registers it in
 //! the plugin factory.
 //!
+//! Pedagogical examples live under `custom_plugins/examples/` and are **not**
+//! compiled unless listed in `FERRUM_CUSTOM_PLUGINS` (see
+//! `custom_plugins/examples/README.md`).
+//!
 //! # Convention
 //!
 //! Each plugin file must export a factory function with this signature:
@@ -32,11 +36,13 @@
 //! # Filtering (optional)
 //!
 //! Set `FERRUM_CUSTOM_PLUGINS=plugin_a,plugin_b` at **build time** to
-//! include only specific plugins. If unset, all `.rs` files in this
-//! directory are included.
+//! include only specific plugins. If unset, all `.rs` files directly in this
+//! directory are included. Example plugins under `examples/` require an
+//! explicit listing (for example
+//! `FERRUM_CUSTOM_PLUGINS=example_audit_plugin`).
 //!
 //! See `CUSTOM_PLUGINS.md` for the full developer guide and
-//! `example_plugin.rs` for a working example.
+//! `examples/example_plugin.rs` for a working example.
 
 // Auto-generated module declarations (one `pub mod X;` per plugin file)
 include!(concat!(env!("OUT_DIR"), "/custom_plugin_mods.rs"));

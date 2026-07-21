@@ -1061,3 +1061,137 @@ async fn apply_plugin_migrations_is_idempotent() {
         "second apply should be a no-op when nothing is pending"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MySQL partial-DDL recovery helpers + example_audit_plugin migration shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mysql_missing_index_error_is_benign_only_for_drop_index() {
+    use ferrum_edge::config::migrations::mysql_drop_index_missing_is_benign;
+
+    assert!(mysql_drop_index_missing_is_benign(
+        "DROP INDEX idx_example_audit_log_timestamp ON example_audit_log",
+        Some(1091),
+    ));
+    assert!(mysql_drop_index_missing_is_benign(
+        "  drop index idx_u ON t",
+        Some(1091),
+    ));
+    assert!(!mysql_drop_index_missing_is_benign(
+        "CREATE INDEX idx_x ON t (id)",
+        Some(1091),
+    ));
+    assert!(!mysql_drop_index_missing_is_benign(
+        "DROP INDEX idx_x ON t",
+        Some(1061),
+    ));
+    assert!(!mysql_drop_index_missing_is_benign(
+        "DROP INDEX idx_x ON t",
+        None,
+    ));
+}
+
+#[test]
+fn example_audit_plugin_mysql_overrides_rebuild_exact_indexes() {
+    let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
+    let Some((_, example)) = migrations
+        .into_iter()
+        .find(|(name, _)| *name == "example_audit_plugin")
+    else {
+        // Default builds exclude the pedagogical example.
+        return;
+    };
+
+    let v1 = example.iter().find(|m| m.version == 3).expect("v3");
+    let mysql = v1.sql_mysql.expect("mysql override");
+    let postgres = v1.sql_postgres.expect("postgres override");
+    assert!(postgres.contains("timestamp TEXT NOT NULL"));
+    assert!(postgres.contains("request_context TEXT"));
+    assert!(postgres.contains("grpc_status BIGINT"));
+    assert!(
+        mysql.contains("CREATE TABLE IF NOT EXISTS example_audit_log"),
+        "table DDL should stay idempotent"
+    );
+    assert!(mysql.contains("timestamp VARCHAR(32) NOT NULL"));
+    assert!(mysql.contains("request_context TEXT"));
+    assert!(mysql.contains("grpc_status BIGINT"));
+    assert!(
+        !mysql.to_ascii_uppercase().contains("IF NOT EXISTS IDX_"),
+        "MySQL index DDL must not rely on IF NOT EXISTS"
+    );
+    let statements: Vec<_> = mysql
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .collect();
+    for (drop, create) in [
+        (
+            "DROP INDEX idx_example_audit_log_timestamp ON example_audit_log",
+            "CREATE INDEX idx_example_audit_log_timestamp ON example_audit_log (timestamp)",
+        ),
+        (
+            "DROP INDEX idx_example_audit_log_client_ip ON example_audit_log",
+            "CREATE INDEX idx_example_audit_log_client_ip ON example_audit_log (client_ip)",
+        ),
+    ] {
+        let drop_position = statements
+            .iter()
+            .position(|statement| *statement == drop)
+            .expect("MySQL migration must drop its plugin-owned index");
+        assert_eq!(
+            statements.get(drop_position + 1),
+            Some(&create),
+            "DROP INDEX must be immediately followed by the exact CREATE INDEX definition"
+        );
+    }
+
+    let v4 = example.iter().find(|m| m.version == 4).expect("v4");
+    let mysql_v4 = v4.sql_mysql.expect("mysql v4 override");
+    let v4_statements: Vec<_> = mysql_v4
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .collect();
+    assert_eq!(
+        v4_statements,
+        [
+            "DROP INDEX idx_example_audit_log_status_ts ON example_audit_log",
+            "CREATE INDEX idx_example_audit_log_status_ts ON example_audit_log (response_status, timestamp)",
+        ]
+    );
+    assert!(!mysql_v4.to_ascii_uppercase().contains("IF NOT EXISTS"));
+    assert!(
+        !example.iter().any(|m| m.version == 1 || m.version == 2),
+        "versions 1/2 are retired (old audit_log tracking collision)"
+    );
+}
+
+#[tokio::test]
+async fn example_audit_plugin_migrations_apply_idempotently_on_sqlite() {
+    let migrations = ferrum_edge::custom_plugins::collect_all_custom_plugin_migrations();
+    if !migrations
+        .iter()
+        .any(|(name, _)| *name == "example_audit_plugin")
+    {
+        return;
+    }
+
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let list = migrations;
+
+    let first = runner.run_plugin_pending(&list).await.unwrap();
+    assert_eq!(first.len(), 2);
+    let second = runner.run_plugin_pending(&list).await.unwrap();
+    assert!(second.is_empty());
+
+    sqlx::query(
+        "INSERT INTO example_audit_log (id, timestamp, client_ip, protocol, latency_ms) \
+         VALUES ('1', '2026-01-01T00:00:00Z', '127.0.0.1', 'http', 1.0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("example_audit_log must exist after migrations");
+}

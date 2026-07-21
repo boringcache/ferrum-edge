@@ -23,6 +23,7 @@ their *failure* path, leaving the real client logic uncovered:
 | **Consul** (`src/service_discovery/consul.rs`) | `ConsulDiscoverer::discover()` — health-API JSON parsing | inline unit tests covered only `build_url()` | live Consul: Service-vs-Node address fallback, port/weight/tag extraction, `passing=true` health filter, per-tag filtering, unknown-service empty result |
 | **LDAP** (`src/plugins/ldap_auth.rs`) | `ldap3` bind / search-then-bind / group membership, via `create_plugin` → `authenticate` | functional test only pointed the plugin at an *unreachable* server (500 / 401 paths) | live OpenLDAP: valid/invalid direct bind, search-then-bind, group-membership allow (Continue) vs deny (403) |
 | **Kafka** (`src/plugins/kafka_logging.rs`) | librdkafka produce, delivery callbacks, consume-back, bounded finalize | deterministic unit tests for admission/CRL/budgets/finalize ownership; ignored optional broker harness | live Redpanda: successful ack + key/record consume, unknown-topic reject after admission, broker oversized reject, paused-broker delivery timeout, producer-queue saturation, successful and stalled finalize, multi-instance generation isolation, Drop/reload disposal with pending records |
+| **MySQL** (`src/config/migrations/mod.rs`) | custom-plugin DDL plus tracking under MySQL's implicit-commit rules | SQLite covered atomic migration behavior; MySQL SQL was previously inspected only as strings | live MySQL 8.4: failure after committed V1 DDL, exact index reconstruction on retry, V2 index/tracker-gap recovery, and SQLx Any text bindings used by `example_audit_plugin` |
 
 ## Running locally
 
@@ -34,7 +35,14 @@ cargo test --test service_integration
 cargo test --test service_integration consul
 cargo test --test service_integration ldap
 cargo test --test service_integration kafka
+cargo test --test service_integration mysql
 ```
+
+The MySQL custom-plugin recovery test requires the pedagogical example at
+build time (`FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin`, which
+CI sets via `.github/actions/setup-rust-ci`). Without that opt-in the MySQL
+test prints `SKIP … example_audit_plugin not compiled in` before starting
+Docker.
 
 **With Docker:** the containers start and the assertions run.
 **Without Docker:** each test prints `SKIP <test>: <service> unavailable …` and
@@ -52,15 +60,17 @@ rather than silently passing.
 | Consul | `hashicorp/consul:1.19` | `agent -dev`; readiness polled via `/v1/status/leader` |
 | OpenLDAP | `osixia/openldap:1.5.0` | base `dc=example,dc=org`; test tree seeded via `ldapadd` exec (readiness handled by retry) |
 | Redpanda | `redpandadata/redpanda:v24.2.4` | Kafka API on external listener `127.0.0.1:<mapped-port>`; auto-topic-create disabled; readiness via librdkafka metadata; topics created with `rpk` |
+| MySQL | `mysql:8.4` | isolated `ferrum` database; readiness polled with the same SQLx Any driver used by migrations/runtime persistence |
 
 Readiness is confirmed by **active polling** (Consul leader endpoint; LDAP
-`ldapadd` retry; Redpanda metadata fetch), not by matching a startup log line —
+`ldapadd` retry; Redpanda metadata fetch; a MySQL connection), not by matching a
+startup log line —
 so the helpers do not depend on which stream a given image logs to.
 
 ## CI
 
 `.github/workflows/ci.yml` job `test-service-integration` runs on
-`ubuntu-latest` (Docker available). Consul, LDAP, and Kafka run in one nextest
+`ubuntu-latest` (Docker available). Consul, LDAP, Kafka, and MySQL run in one nextest
 `--no-fail-fast` invocation, which preserves per-test reporting and continues
 after one backend fails without allocating a second runner. It is wired into
 the `test` aggregation gate, so it blocks merge on failure.

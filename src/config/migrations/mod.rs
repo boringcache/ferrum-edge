@@ -244,6 +244,49 @@ pub struct CustomPluginMigration {
     pub sql_mysql: Option<&'static str>,
 }
 
+/// Whether a MySQL statement failure is a benign missing-index error (1091).
+///
+/// MySQL implicitly commits around index DDL. A custom-plugin migration can
+/// therefore pair `DROP INDEX` with `CREATE INDEX` to reconstruct an exact,
+/// plugin-owned index definition on every retry. Only the structured server
+/// code for a missing key is tolerated, and only on the drop half of that
+/// pair; creation failures remain fatal rather than blessing an unknown index.
+pub fn mysql_drop_index_missing_is_benign(statement: &str, error_number: Option<u16>) -> bool {
+    let mut words = statement.split_whitespace();
+    let is_drop_index = matches!(
+        (words.next(), words.next()),
+        (Some(drop), Some(index))
+            if drop.eq_ignore_ascii_case("DROP") && index.eq_ignore_ascii_case("INDEX")
+    );
+    is_drop_index && error_number == Some(1091)
+}
+
+fn map_plugin_statement_result<T>(
+    db_type: &str,
+    statement: &str,
+    result: Result<T, sqlx::Error>,
+) -> Result<(), sqlx::Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let missing_index_is_benign = {
+                let error_number = e
+                    .as_database_error()
+                    .and_then(|database_error| {
+                        database_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                    })
+                    .map(sqlx::mysql::MySqlDatabaseError::number);
+                db_type == "mysql" && mysql_drop_index_missing_is_benign(statement, error_number)
+            };
+            if missing_index_is_benign {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 impl CustomPluginMigration {
     /// Returns the SQL appropriate for the given database type.
     pub fn sql_for_db(&self, db_type: &str) -> &str {
@@ -751,7 +794,11 @@ impl MigrationRunner {
                     for statement in sql.split(';') {
                         let trimmed = statement.trim();
                         if !trimmed.is_empty() {
-                            sqlx::query(trimmed).execute(&mut *connection).await?;
+                            map_plugin_statement_result(
+                                &self.db_type,
+                                trimmed,
+                                sqlx::query(trimmed).execute(&mut *connection).await,
+                            )?;
                         }
                     }
                     now = Utc::now().to_rfc3339();
@@ -775,7 +822,41 @@ impl MigrationRunner {
                     for statement in sql.split(';') {
                         let trimmed = statement.trim();
                         if !trimmed.is_empty() {
-                            sqlx::query(trimmed).execute(&mut *connection).await?;
+                            map_plugin_statement_result(
+                                &self.db_type,
+                                trimmed,
+                                sqlx::query(trimmed).execute(&mut *connection).await,
+                            )?;
+                        }
+                    }
+                    now = Utc::now().to_rfc3339();
+                    let elapsed_ms = start.elapsed().as_millis() as i64;
+                    let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
+                    sqlx::query(&insert_sql)
+                        .bind(*plugin_name)
+                        .bind(migration.version as i32)
+                        .bind(migration.name)
+                        .bind(&now)
+                        .bind(migration.checksum)
+                        .bind(elapsed_ms as i32)
+                        .execute(&mut *connection)
+                        .await?;
+                } else if self.db_type == "mysql" {
+                    // MySQL implicitly commits around DDL
+                    // (https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html),
+                    // so statements + tracking are NOT one atomic unit. Execute
+                    // each statement with structured missing-index (1091)
+                    // tolerance for DROP INDEX, then insert the tracking row.
+                    // Paired DROP/CREATE statements can therefore reconstruct
+                    // an exact plugin-owned index after any partial DDL retry.
+                    for statement in sql.split(';') {
+                        let trimmed = statement.trim();
+                        if !trimmed.is_empty() {
+                            map_plugin_statement_result(
+                                "mysql",
+                                trimmed,
+                                sqlx::query(trimmed).execute(&mut *connection).await,
+                            )?;
                         }
                     }
                     now = Utc::now().to_rfc3339();
@@ -791,14 +872,17 @@ impl MigrationRunner {
                         .execute(&mut *connection)
                         .await?;
                 } else {
-                    // Default path: migration statements and tracking remain
-                    // atomic in one transaction on the same session that owns
-                    // the PostgreSQL/MySQL migration lock.
+                    // PostgreSQL transactional path: statements and tracking
+                    // remain atomic in one transaction on the lock session.
                     let mut tx = connection.begin().await?;
                     for statement in sql.split(';') {
                         let trimmed = statement.trim();
                         if !trimmed.is_empty() {
-                            sqlx::query(trimmed).execute(&mut *tx).await?;
+                            map_plugin_statement_result(
+                                &self.db_type,
+                                trimmed,
+                                sqlx::query(trimmed).execute(&mut *tx).await,
+                            )?;
                         }
                     }
                     now = Utc::now().to_rfc3339();

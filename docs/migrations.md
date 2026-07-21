@@ -224,16 +224,36 @@ sql: r#"
 "#,
 ```
 
-By default, all statements in one custom-plugin migration and its tracking-row
-insert execute in a single transaction. PostgreSQL statements that must run at
-top level are detected automatically, including `CREATE INDEX CONCURRENTLY`,
-`DROP INDEX CONCURRENTLY`, concurrent `REINDEX`, `VACUUM`, database creation or
-deletion, and `ALTER SYSTEM`. For those migrations, Ferrum executes every
-statement first and records `_ferrum_plugin_migrations` only after all
-statements succeed. A failed statement therefore never creates a tracking row;
-because PostgreSQL cannot roll back this class of DDL as one unit, authors
-should keep these migrations idempotent and use one top-level operation per
-migration where practical.
+Dialect transactionality for custom-plugin migrations:
+
+- **SQLite:** statements and the tracking-row insert run inside the migration
+  lock transaction and roll back together on failure.
+- **PostgreSQL (ordinary DDL):** statements and the tracking-row insert run in
+  one explicit transaction on the lock session.
+- **PostgreSQL (top-level DDL):** statements that must run outside a
+  transaction are detected automatically, including `CREATE INDEX CONCURRENTLY`,
+  `DROP INDEX CONCURRENTLY`, concurrent `REINDEX`, `VACUUM`, database creation
+  or deletion, and `ALTER SYSTEM`. Ferrum executes every statement first and
+  records `_ferrum_plugin_migrations` only after all statements succeed. A
+  failed statement therefore never creates a tracking row; because PostgreSQL
+  cannot roll back this class of DDL as one unit, authors should keep these
+  migrations idempotent and use one top-level operation per migration where
+  practical.
+- **MySQL:** DDL implicitly commits
+  ([MySQL manual](https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html)),
+  and the runner always executes MySQL custom-plugin migrations outside an
+  enclosing transaction so statement/tracking boundaries never become
+  ambiguously half-transactional. **All MySQL custom migrations — including
+  DML-only bodies — are therefore non-atomic with the tracking insert and must
+  be idempotent / re-runnable.** Pre-existing DML-only MySQL custom migrations written under the older per-migration atomic contract must be reviewed for re-run safety under this runner. For a plugin-owned index that must recover
+  across every statement boundary, pair `DROP INDEX name ON table` immediately
+  with the exact `CREATE INDEX` definition. The runner tolerates only
+  structured MySQL error `1091` (missing key) on a two-token `DROP INDEX name ON table` statement (the `ALTER TABLE ... DROP INDEX` spelling is not tolerated); every
+  creation failure remains fatal. A retry then either removes the prior
+  definition or observes a missing index before reconstructing the intended
+  one. Prefer idempotent table DDL (`CREATE TABLE IF NOT EXISTS`) and
+  plugin-prefixed names, and do not use this pattern to replace indexes owned
+  by another plugin or by the gateway core.
 
 ### Checksum Validation
 
@@ -245,7 +265,10 @@ Prefix custom tables to avoid collisions with core gateway tables (`proxies`, `c
 
 ### Complete Example
 
-See `custom_plugins/example_audit_plugin.rs` for a full working example with multi-version migrations, PostgreSQL/MySQL overrides, and multi-statement SQL.
+See `custom_plugins/examples/example_audit_plugin.rs` for a full working
+example with multi-version migrations, PostgreSQL/MySQL overrides, and
+multi-statement SQL. Build with
+`FERRUM_CUSTOM_PLUGINS=example_audit_plugin` (examples are opt-in).
 
 See [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md#database-migrations) for the complete developer guide.
 
@@ -460,8 +483,14 @@ This is a data integrity error, not a migration error. It means two proxies in t
 If a migration fails partway through:
 1. Check the error message for the specific SQL that failed
 2. Inspect the database to see what state it's in
-3. Fix the underlying issue (e.g., data that violates a new constraint)
-4. Re-run the migration — it will skip already-applied migrations and retry the failed one
+3. For **MySQL custom-plugin** migrations, remember DDL auto-commits: indexes
+   may already exist without a `_ferrum_plugin_migrations` row. Re-running
+   `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` is the supported recovery.
+   Migrations using the documented paired `DROP INDEX` / exact `CREATE INDEX`
+   pattern rebuild their plugin-owned definitions; the runner tolerates only a
+   structured missing-key error (`1091`) on the drop before continuing
+4. Fix any remaining underlying issue (e.g., data that violates a new constraint)
+5. Re-run the migration — it will skip already-applied migrations and retry the failed one
 
 For config files, restore from the `.backup.*` file that was created before the migration started.
 

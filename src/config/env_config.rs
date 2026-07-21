@@ -27,6 +27,27 @@ pub fn tls_managed_store_path_from_env() -> String {
         .unwrap_or_else(|| DEFAULT_TLS_MANAGED_STORE_PATH.to_string())
 }
 
+/// SQL connection target for secondary consumers that must track the gateway
+/// configuration database (`FERRUM_DB_TYPE` + effective `FERRUM_DB_URL`).
+///
+/// `effective_url` includes canonical `FERRUM_DB_TLS_*` query parameters for
+/// PostgreSQL and MySQL. Callers must never log or echo it — the value may
+/// embed credentials. `Debug` redacts the URL for the same reason.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EffectiveSqlBackend {
+    pub db_type: String,
+    pub effective_url: String,
+}
+
+impl std::fmt::Debug for EffectiveSqlBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EffectiveSqlBackend")
+            .field("db_type", &self.db_type)
+            .field("effective_url", &redact_url(&self.effective_url))
+            .finish()
+    }
+}
+
 /// The operating mode of the gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatingMode {
@@ -760,6 +781,26 @@ fn resolve_tls_source_override(
     path_value: Option<String>,
 ) -> Option<String> {
     match resolve_var(conf, source_key) {
+        Some(source_value) => {
+            if path_value.as_ref().is_some_and(|value| !value.is_empty()) {
+                tracing::warn!(
+                    source_key,
+                    path_key,
+                    "{source_key} is set; it overrides {path_key}"
+                );
+            }
+            Some(source_value)
+        }
+        None => path_value,
+    }
+}
+
+/// Resolve the same source-over-path contract through the process-wide
+/// conf-aware resolver for consumers that do not hold the `ConfFile` used by
+/// `EnvConfig::from_env_with_conf`.
+fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Option<String> {
+    let path_value = crate::config::conf_file::resolve_ferrum_var(path_key);
+    match crate::config::conf_file::resolve_ferrum_var(source_key) {
         Some(source_value) => {
             if path_value.as_ref().is_some_and(|value| !value.is_empty()) {
                 tracing::warn!(
@@ -4118,6 +4159,94 @@ impl EnvConfig {
         let db_type = self.db_type.as_deref().unwrap_or("");
         self.append_db_tls_params_to_url(base_url, db_type)
             .map(Some)
+    }
+
+    /// Resolve the gateway SQL backend for secondary SQL consumers that must
+    /// track the configuration database.
+    ///
+    /// Reads only `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, and `FERRUM_DB_TLS_*`
+    /// through the same environment-over-`ferrum.conf` path as
+    /// [`Self::from_env`], then applies [`Self::effective_db_url`] so PostgreSQL
+    /// and MySQL receive the canonical TLS query parameters. Unlike
+    /// [`Self::from_env`], this does **not** require a complete gateway mode
+    /// configuration (JWT secrets, file paths, CP/DP settings, etc.).
+    ///
+    /// MongoDB is rejected because callers need a SQL pool. Errors never include
+    /// the raw database URL or credentials.
+    pub fn resolve_effective_sql_backend() -> Result<EffectiveSqlBackend, String> {
+        use env_config_macro::EnvValue;
+
+        let db_tls_mode = match crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TLS_MODE") {
+            Some(raw) => Some(DbTlsMode::parse_env(&raw, "FERRUM_DB_TLS_MODE")?),
+            None => None,
+        };
+
+        let cfg = Self {
+            db_type: crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_TYPE"),
+            db_url: crate::config::conf_file::resolve_ferrum_var("FERRUM_DB_URL"),
+            db_tls_mode,
+            db_tls_ca_cert_path: resolve_cached_tls_source_override(
+                "FERRUM_DB_TLS_CA_CERT_SOURCE",
+                "FERRUM_DB_TLS_CA_CERT_PATH",
+            ),
+            db_tls_client_cert_path: resolve_cached_tls_source_override(
+                "FERRUM_DB_TLS_CLIENT_CERT_SOURCE",
+                "FERRUM_DB_TLS_CLIENT_CERT_PATH",
+            ),
+            db_tls_client_key_path: resolve_cached_tls_source_override(
+                "FERRUM_DB_TLS_CLIENT_KEY_SOURCE",
+                "FERRUM_DB_TLS_CLIENT_KEY_PATH",
+            ),
+            ..Self::default()
+        };
+
+        cfg.effective_sql_backend()
+    }
+
+    /// Derive an [`EffectiveSqlBackend`] from an already-populated config.
+    ///
+    /// Prefer [`Self::resolve_effective_sql_backend`] when loading from the
+    /// process environment / `ferrum.conf`. This method is useful for tests that
+    /// construct a partial [`EnvConfig`] without opening a network connection.
+    pub fn effective_sql_backend(&self) -> Result<EffectiveSqlBackend, String> {
+        let db_type = self
+            .db_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "FERRUM_DB_TYPE is required for SQL gateway database consumers".to_string()
+            })?;
+
+        if db_type == "mongodb" {
+            return Err(
+                "MongoDB is not supported for SQL-only gateway database consumers; \
+                 use postgres, mysql, or sqlite"
+                    .into(),
+            );
+        }
+
+        match db_type {
+            "postgres" | "mysql" | "sqlite" => {}
+            other => {
+                return Err(format!(
+                    "unsupported FERRUM_DB_TYPE {} for SQL gateway database consumers \
+                     (expected sqlite, postgres, or mysql)",
+                    crate::secrets::quoted_env_value("FERRUM_DB_TYPE", other)
+                ));
+            }
+        }
+
+        self.validate_db_tls_config()?;
+
+        let effective_url = self.effective_db_url()?.ok_or_else(|| {
+            "FERRUM_DB_URL is required for SQL gateway database consumers".to_string()
+        })?;
+
+        Ok(EffectiveSqlBackend {
+            db_type: db_type.to_string(),
+            effective_url,
+        })
     }
 
     /// Returns the read replica URL with database TLS query parameters appended,

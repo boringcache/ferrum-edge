@@ -30,6 +30,18 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Opt pedagogical example plugins into CI/test builds
+      shell: bash
+      run: |
+        # Examples under custom_plugins/examples/ are excluded from default /
+        # Docker / release builds. Jobs that use this action (unit, lint,
+        # coverage, test-artifact archives, etc.) opt them in here so their
+        # tests and clippy coverage exercise the templates. The protected
+        # ARM64 Cross job does not use this action and keeps examples out.
+        # Append production custom_plugins/*.rs stems here if operator plugins
+        # must also compile in the same CI jobs.
+        echo "FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin" >> "$GITHUB_ENV"
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       with:
