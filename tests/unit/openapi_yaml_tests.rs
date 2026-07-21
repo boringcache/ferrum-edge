@@ -6750,6 +6750,43 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         "response_caching OpenAPI/runtime key drift"
     );
 
+    // Issue #2454: the published schema must express the runtime value domain.
+    assert_eq!(schema["properties"]["max_entries"]["minimum"], json!(1));
+    assert_eq!(
+        schema["properties"]["max_entry_size_bytes"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["max_total_size_bytes"]["minimum"],
+        json!(1)
+    );
+    // ttl_seconds intentionally has no minimum: the runtime accepts 0.
+    assert!(schema["properties"]["ttl_seconds"]["minimum"].is_null());
+    assert_eq!(
+        schema["properties"]["cacheable_methods"]["minItems"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["cacheable_methods"]["items"]["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
+    assert_eq!(
+        schema["properties"]["cacheable_status_codes"]["minItems"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["cacheable_status_codes"]["items"]["minimum"],
+        json!(100)
+    );
+    assert_eq!(
+        schema["properties"]["cacheable_status_codes"]["items"]["maximum"],
+        json!(599)
+    );
+    assert_eq!(
+        schema["properties"]["vary_by_headers"]["items"]["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
+
     let plugin_docs = include_str!("../../docs/plugins.md");
     let docs = plugin_docs
         .split("### `response_caching`")
@@ -6768,6 +6805,16 @@ fn response_caching_schema_matches_strict_runtime_contract() {
     for valid in [
         json!({}),
         json!({"ttl_seconds": 60}),
+        // Zero TTL remains supported by the runtime.
+        json!({"ttl_seconds": 0}),
+        // Positive capacity boundary values.
+        json!({"max_entries": 1, "max_entry_size_bytes": 1, "max_total_size_bytes": 1}),
+        // Extension-method casing is accepted and uppercased by the runtime.
+        json!({"cacheable_methods": ["get"]}),
+        // Status-code boundary values.
+        json!({"cacheable_status_codes": [100, 599]}),
+        // An explicitly empty Vary list is accepted (no extra key dimensions).
+        json!({"vary_by_headers": []}),
         json!({
             "ttl_seconds": 60,
             "max_entries": 100,
@@ -6811,6 +6858,19 @@ fn response_caching_schema_matches_strict_runtime_contract() {
             "aaa_extra": true,
             "zzz_extra": false
         }),
+        // Issue #2454 reproduction shapes: values the runtime constructor
+        // rejects must also fail schema validation.
+        json!({"max_entries": 0}),
+        json!({"max_entry_size_bytes": 0}),
+        json!({"max_total_size_bytes": 0}),
+        json!({"cacheable_methods": []}),
+        json!({"cacheable_methods": [""]}),
+        json!({"cacheable_methods": ["bad method"]}),
+        json!({"cacheable_status_codes": []}),
+        json!({"cacheable_status_codes": [99]}),
+        json!({"cacheable_status_codes": [600]}),
+        json!({"vary_by_headers": [""]}),
+        json!({"vary_by_headers": ["bad header"]}),
     ] {
         assert_component_validity(&spec, "ResponseCachingConfig", &invalid, false);
         assert!(
