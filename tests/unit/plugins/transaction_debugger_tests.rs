@@ -213,7 +213,7 @@ where
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_transaction_debugger_redacts_provider_api_key_headers_in_both_directions() {
+async fn test_transaction_debugger_redacts_builtin_sensitive_headers_in_both_directions() {
     let writer = SharedLogWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .without_time()
@@ -229,6 +229,10 @@ async fn test_transaction_debugger_redacts_provider_api_key_headers_in_both_dire
     ctx.headers.insert(
         "x-goog-api-key".to_string(),
         "google-request-secret".to_string(),
+    );
+    ctx.headers.insert(
+        "Last-Event-ID".to_string(),
+        "opaque-resume-cursor".to_string(),
     );
     ctx.headers.insert(
         "x-safe-header".to_string(),
@@ -262,6 +266,7 @@ async fn test_transaction_debugger_redacts_provider_api_key_headers_in_both_dire
     for secret in [
         "azure-request-secret",
         "google-request-secret",
+        "opaque-resume-cursor",
         "azure-response-secret",
         "google-response-secret",
     ] {
@@ -481,6 +486,8 @@ fn websocket_summary() -> WsDisconnectContext {
         frames_backend_to_client: 5,
         bytes_client_to_backend: 128,
         bytes_backend_to_client: 512,
+        timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
         direction: None,
         io_side: None,
         error_class: None,

@@ -406,10 +406,10 @@ jobs:
           tool: cargo-nextest
 
       - name: Run service-integration tests
-        # Both suites run real third-party software through testcontainers.
-        # Nextest reports each test independently and keeps running after a
-        # Consul or LDAP failure so one middleware cannot mask the other.
-        run: cargo nextest run --test service_integration --no-fail-fast consul ldap
+        # Consul, LDAP, and Kafka/Redpanda run real third-party software through
+        # testcontainers. Nextest reports each test independently and keeps
+        # running after one backend fails so one middleware cannot mask another.
+        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka
         env:
           RUST_BACKTRACE: 1
 
@@ -594,6 +594,7 @@ jobs:
               integration::log_schema_integration_tests
               integration::log_schema_registry_tests
               integration::deferred_log_tests
+              integration::kafka_logging_broker_tests
               integration::example_plugin_contract_tests
               integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
@@ -606,6 +607,7 @@ jobs:
               integration::mesh_multicluster_discovery_tests
               integration::mesh_cross_cluster_egress_tests
               integration::mesh_proxy_config_tests
+              integration::mesh_outbound_registry_route_miss_tests
               integration::mesh_outbound_registry_stream_tests
               integration::mesh_node_waypoint_stream_scope_tests
               integration::mesh_runtime_overlay_consumers_tests
@@ -921,6 +923,7 @@ jobs:
               functional_cors_protocol_test
               functional_grpc_test
               functional_key_auth_query_test
+              functional_load_testing_replay_test
               functional_passthrough_test
               functional_sse_test
               functional_stream_listener_failure_test
@@ -964,6 +967,7 @@ jobs:
               functional_h3_local_policy_test
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
+              functional_request_termination_h3_test
               functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and

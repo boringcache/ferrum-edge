@@ -8948,15 +8948,19 @@ impl GatewayConfig {
     }
 
     /// Validate file dependencies for plugins that reference external files
-    /// (e.g., geo_restriction `.mmdb` databases).
+    /// (e.g., geo_restriction `.mmdb` databases, `udp_logging` DTLS sources).
     ///
     /// This is separate from `validate_all_fields_with_ip_policy()` so that
     /// each mode can handle missing files independently:
     /// - **File mode**: fatal (bail)
     /// - **DB mode**: warn (data already in DB)
-    /// - **DP mode**: skip (plugin degrades gracefully with `reader: None`)
+    /// - **DP mode**: skip (callers omit this phase; node-local material is
+    ///   still checked when the DP constructs the plugin instance)
     ///
-    /// Deduplicates paths so each file is checked at most once.
+    /// Deduplicates paths so each file is checked at most once. Enabled
+    /// `udp_logging` DTLS validation caches by the full validation-input tuple
+    /// (host / no_verify / source paths) so identical rows share one
+    /// materialization while still attaching errors per PluginConfig id.
     pub fn validate_plugin_file_dependencies(&self) -> Vec<String> {
         self.validate_plugin_file_dependencies_inner(None)
     }
@@ -8990,6 +8994,10 @@ impl GatewayConfig {
     ) -> Vec<String> {
         let mut errors = Vec::new();
         let mut validated_paths = std::collections::HashSet::new();
+        // Identical enabled UDP DTLS validation inputs share one materialization
+        // (provider/file read) per pass; cached errors are still attached to
+        // each affected PluginConfig id.
+        let mut udp_dtls_cache = std::collections::HashMap::new();
         for pc in &self.plugin_configs {
             if !pc.enabled {
                 continue;
@@ -9082,6 +9090,19 @@ impl GatewayConfig {
                     {
                         errors.push(format!("PluginConfig '{}': {}", pc.id, e));
                     }
+                }
+            }
+            if pc.plugin_name == "udp_logging"
+                && let Some(config) = pc.config.as_object()
+                && let Err(e) = crate::plugins::udp_logging::validate_dtls_file_dependencies_cached(
+                    config,
+                    &mut udp_dtls_cache,
+                )
+            {
+                // Attach the (possibly cached) error to each PluginConfig row.
+                let message = format!("PluginConfig '{}': {}", pc.id, e);
+                if !errors.iter().any(|existing| existing == &message) {
+                    errors.push(message);
                 }
             }
         }

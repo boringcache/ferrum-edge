@@ -37,20 +37,25 @@ pub mod session_cookie;
 pub mod size_limit;
 pub mod socket_host;
 pub mod sse;
+pub mod synthetic_response;
 pub mod tcp_endpoint;
 pub mod token_extract;
 pub mod transformer_gate;
 pub mod udp_endpoint;
 
 pub use batching_logger::{
-    BatchConfig, BatchingLogger, BatchingLoggerPermit, LoggerHooks, MAX_BATCH_SIZE,
-    MAX_BUFFER_CAPACITY, RetryPolicy,
+    BatchConfig, BatchingLogger, BatchingLoggerHandle, BatchingLoggerPermit, LoggerHooks,
+    MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
 };
 pub use http_client::PluginHttpClient;
 pub use log_helpers::{
-    BatchConfigDefaults, SummaryLogEntry, build_batch_config, handle_http_batch_response,
-    parse_custom_headers, parse_http_endpoint, validate_batch_config,
+    BatchConfigDefaults, HttpBatchDrainOutcome, SummaryLogEntry, build_batch_config,
+    drain_http_batch_response_body, handle_http_batch_response, parse_custom_headers,
+    parse_http_endpoint, validate_batch_config,
 };
+// Re-exported for external unit tests; unused inside the binary target.
+#[allow(unused_imports)]
+pub use log_helpers::{HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT};
 pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
 pub use tcp_endpoint::resolve_tcp_endpoint;
 pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, resolve_udp_endpoint};

@@ -47,6 +47,7 @@
 //! - HTTP/2 request-side hop-by-hop header stripping (backend must not see valid H2 `TE`)
 //! - Response-side hop-by-hop header stripping (client must not see `Proxy-Authenticate`,
 //!   `Keep-Alive`, `Trailer`, etc. from the backend) on H1, H2, and H3
+//! - Final H3 stripping of hop-by-hop fields reintroduced by response plugins
 //! - Response-side hop-by-hop header stripping on H1 and H3 (client must not see
 //! - Response-side hop-by-hop header stripping on H1 and H2 (client must not see
 //!   `Proxy-Authenticate`, `Keep-Alive`, `Trailer`, etc. from the backend)
@@ -494,6 +495,51 @@ fn build_config_with_h3_gateway_policy(echo_port: u16) -> String {
          \x20       Content-Type: text/plain\n\
          \x20       Content-Length: \"999\"\n\
          \x20       Transfer-Encoding: chunked\n",
+    )
+}
+
+fn build_config_with_h3_sse_plugin_hop_headers(echo_port: u16) -> String {
+    format!(
+        r#"version: "1"
+proxies:
+  - id: "echo-http"
+    listen_path: "/"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {echo_port}
+    strip_listen_path: false
+    plugins:
+      - plugin_config_id: "sse-h3"
+      - plugin_config_id: "response-hop-headers"
+consumers: []
+plugin_configs:
+  - id: "sse-h3"
+    plugin_name: sse
+    scope: proxy
+    proxy_id: "echo-http"
+    enabled: true
+    config:
+      force_sse_content_type: true
+  - id: "response-hop-headers"
+    plugin_name: response_transformer
+    scope: proxy
+    proxy_id: "echo-http"
+    enabled: true
+    config:
+      rules:
+        - operation: update
+          target: header
+          key: Connection
+          value: "X-Plugin-Hop, Keep-Alive"
+        - operation: update
+          target: header
+          key: X-Plugin-Hop
+          value: "must-not-reach-h3"
+        - operation: update
+          target: header
+          key: X-Plugin-Kept
+          value: "response-transformer-ran"
+"#,
     )
 }
 
@@ -2623,6 +2669,50 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
         "non-hop-by-hop backend header should pass through on H3; headers={:?}",
         resp.headers
     );
+
+    gateway.shutdown();
+    echo_task.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_h3_strips_plugin_reintroduced_hop_headers() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(150)).await;
+
+    let config = build_config_with_h3_sse_plugin_hop_headers(echo_port);
+    let (mut gateway, https_port) = start_h3_validation_gateway_with_config(config, &[]).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{https_port}/");
+    let options = GetOptions::default().header("accept", "text/event-stream");
+    let resp = h3_get_with_startup_retry(&client, &url, options).await;
+
+    assert_eq!(resp.status.as_u16(), 200, "body={}", resp.body_text());
+    assert_eq!(
+        resp.headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "SSE plugin must relabel the response before the final H3 boundary: {:?}",
+        resp.headers
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-plugin-kept")
+            .and_then(|value| value.to_str().ok()),
+        Some("response-transformer-ran"),
+        "the response transformer must run so this test exercises post-plugin sanitation"
+    );
+    for banned in ["connection", "keep-alive", "x-plugin-hop"] {
+        assert!(
+            resp.headers.get(banned).is_none(),
+            "plugin-reintroduced hop-by-hop header `{banned}` leaked to H3; headers={:?}",
+            resp.headers
+        );
+    }
 
     gateway.shutdown();
     echo_task.abort();

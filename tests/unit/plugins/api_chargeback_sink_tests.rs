@@ -170,6 +170,33 @@ fn grpc_snapshot_keeps_terminal_statuses_that_share_a_billing_bucket_separate() 
     assert_eq!(events[1].grpc_status, Some(13));
 }
 
+#[test]
+fn grpc_snapshot_bounds_non_standard_terminal_status_cardinality() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.08,
+        charge_total: 0.08,
+        ..ChargeComputation::default()
+    };
+
+    accumulator.record_http_for_test(&grpc_summary("grpc-nonstandard", "17"), "alice", charge);
+    accumulator.record_http_for_test(&grpc_summary("grpc-nonstandard", "18"), "alice", charge);
+
+    let events = accumulator.compute_deltas(&config, "node-a", 100, "snap-grpc");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].status_code, 500);
+    assert_eq!(events[0].http_status_code, Some(200));
+    assert_eq!(events[0].grpc_status, Some(u32::MAX));
+    assert_eq!(events[0].call_count, 2);
+}
+
 #[tokio::test]
 async fn config_validation_accepts_valid_config() {
     let temp = tempfile::tempdir().unwrap();
@@ -481,6 +508,8 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
             frames_backend_to_client: 1,
             bytes_client_to_backend: 300,
             bytes_backend_to_client: 400,
+            timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+            timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
             direction: None,
             io_side: None,
             error_class: None,

@@ -255,8 +255,8 @@ fn parse_custom_headers_rejects_invalid_shapes() {
     }
 }
 
-#[test]
-fn handle_http_batch_response_classifies_retryable_and_discarded_statuses() {
+#[tokio::test(flavor = "current_thread")]
+async fn handle_http_batch_response_classifies_retryable_and_discarded_statuses() {
     for status in [
         reqwest::StatusCode::OK,
         reqwest::StatusCode::CREATED,
@@ -271,7 +271,9 @@ fn handle_http_batch_response_classifies_retryable_and_discarded_statuses() {
             .unwrap()
             .into();
         assert!(
-            handle_http_batch_response("batching_logger_http", 3, Ok(response)).is_ok(),
+            handle_http_batch_response("batching_logger_http", 3, Ok(response))
+                .await
+                .is_ok(),
             "expected status {status} to be accepted or discarded without retry"
         );
     }
@@ -288,10 +290,15 @@ fn handle_http_batch_response_classifies_retryable_and_discarded_statuses() {
             .unwrap()
             .into();
         let err = handle_http_batch_response("batching_logger_http", 3, Ok(response))
+            .await
             .expect_err("expected retryable status to be returned as an error");
         assert!(
             err.contains(&status.to_string()),
             "error should include retryable status {status}: {err}"
+        );
+        assert!(
+            err.contains("response body drained"),
+            "retryable errors should include the drain diagnostic: {err}"
         );
     }
 }

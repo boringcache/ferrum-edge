@@ -28,7 +28,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::modes::mesh::slice::MeshSlice;
-use crate::plugins::mesh::outbound_registry::OutboundRegistry;
+use crate::plugins::mesh::outbound_registry::{DENIED_HOST_BUCKET, OutboundRegistry};
 
 /// Pre-interned protocol label values for the stream decision counter.
 ///
@@ -68,6 +68,11 @@ pub struct MeshOutboundEnforcement {
     /// + de-duped at construction so the hot-path lookup is a small
     ///   binary search.
     outbound_listen_ports: Vec<u16>,
+    /// HTTP reject status mirrored from
+    /// `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS` so outbound-capture
+    /// route misses under REGISTRY_ONLY return the same configured status
+    /// as the auto-injected HTTP plugin.
+    reject_status: u16,
     /// Registry of admitted destinations, derived from the slice's
     /// services / service entries / workload addresses (the same set
     /// the HTTP plugin sees). Wrapped in `Arc` to keep clones cheap when
@@ -97,6 +102,7 @@ impl MeshOutboundEnforcement {
         cluster_domain: &str,
         namespace: String,
         outbound_listen_ports: Vec<u16>,
+        reject_status: u16,
     ) -> Option<Self> {
         if outbound_listen_ports.is_empty() {
             // No mesh outbound capture listener on this gateway, so even
@@ -117,6 +123,7 @@ impl MeshOutboundEnforcement {
         Some(Self {
             namespace,
             outbound_listen_ports,
+            reject_status,
             registry: Arc::new(registry),
         })
     }
@@ -133,6 +140,18 @@ impl MeshOutboundEnforcement {
         outbound_listen_ports: Vec<u16>,
         registry: OutboundRegistry,
     ) -> Self {
+        Self::from_registry_with_reject_status(namespace, outbound_listen_ports, registry, 502)
+    }
+
+    /// Like [`Self::from_registry`] but with an explicit HTTP reject status
+    /// for outbound-capture route-miss evaluation.
+    #[allow(dead_code)] // Public API; exercised by route-miss coverage.
+    pub fn from_registry_with_reject_status(
+        namespace: impl Into<String>,
+        outbound_listen_ports: Vec<u16>,
+        registry: OutboundRegistry,
+        reject_status: u16,
+    ) -> Self {
         let mut outbound_listen_ports = outbound_listen_ports;
         outbound_listen_ports.retain(|port| *port != 0);
         outbound_listen_ports.sort_unstable();
@@ -140,6 +159,7 @@ impl MeshOutboundEnforcement {
         Self {
             namespace: namespace.into(),
             outbound_listen_ports,
+            reject_status,
             registry: Arc::new(registry),
         }
     }
@@ -193,6 +213,42 @@ impl MeshOutboundEnforcement {
         };
         crate::plugins::prometheus_metrics::global_registry()
             .record_mesh_outbound_registry_stream_decision(&self.namespace, protocol, label);
+    }
+
+    /// Evaluate REGISTRY_ONLY for an HTTP route miss on an outbound capture
+    /// listener.
+    ///
+    /// Returns `Some(reject_status)` when the destination must be denied and
+    /// records the fixed-cardinality HTTP deny metric
+    /// (`host="<denied>"`). Returns `None` when enforcement does not apply
+    /// to `listen_port` or the destination is admitted — the caller keeps
+    /// the generic route-miss response. Inbound listeners, HBONE relay
+    /// synthesis, and other fail-closed routing gates are unaffected
+    /// because they never consult this helper (or hit `Decision::Skip`
+    /// via the capture-port gate).
+    pub fn http_route_miss_reject_status(
+        &self,
+        listen_port: u16,
+        host: Option<&str>,
+        port: Option<u16>,
+    ) -> Option<u16> {
+        if self
+            .outbound_listen_ports
+            .binary_search(&listen_port)
+            .is_err()
+        {
+            return None;
+        }
+        let denied = match host {
+            None | Some("") => true,
+            Some(host) => !self.registry.contains(host, port),
+        };
+        if !denied {
+            return None;
+        }
+        crate::plugins::prometheus_metrics::global_registry()
+            .record_mesh_outbound_registry_decision(&self.namespace, DENIED_HOST_BUCKET, "deny");
+        Some(self.reject_status)
     }
 
     /// Borrow the inner registry for admin / debug paths.
@@ -290,6 +346,7 @@ mod tests {
             "cluster.local",
             "default".to_string(),
             Vec::new(),
+            502,
         );
         assert!(result.is_none(), "no capture ports → no enforcement");
     }
@@ -304,6 +361,7 @@ mod tests {
             "cluster.local",
             "default".to_string(),
             vec![0],
+            502,
         );
         assert!(result.is_none());
     }
@@ -322,6 +380,7 @@ mod tests {
             "cluster.local",
             "default".to_string(),
             vec![15001],
+            502,
         )
         .expect("enforcement should be present even with empty registry");
         let decision = enforcement.check_destination(15001, "anywhere.io", 443);
@@ -426,6 +485,7 @@ mod tests {
             "cluster.local",
             "default".to_string(),
             vec![15001],
+            502,
         )
         .expect("enforcement present");
         assert_eq!(
@@ -436,6 +496,53 @@ mod tests {
             enforcement.check_destination(15001, "10.0.0.2", 27017),
             Decision::Deny
         );
+    }
+
+    #[test]
+    fn http_route_miss_rejects_unknown_with_configured_status_and_metric() {
+        let enforcement = MeshOutboundEnforcement::from_registry_with_reject_status(
+            "route-miss-ns",
+            vec![15001],
+            registry(&["reviews.svc"]),
+            403,
+        );
+        assert_eq!(
+            enforcement.http_route_miss_reject_status(15001, Some("unknown.example"), None),
+            Some(403)
+        );
+        // Admitted hosts keep the generic route-miss path (no deny status).
+        assert_eq!(
+            enforcement.http_route_miss_reject_status(15001, Some("reviews.svc"), None),
+            None
+        );
+        // Inbound / non-capture listeners are skipped.
+        assert_eq!(
+            enforcement.http_route_miss_reject_status(15006, Some("unknown.example"), None),
+            None
+        );
+        // Empty registry fails closed on the route-miss path too.
+        let empty = MeshOutboundEnforcement::from_registry_with_reject_status(
+            "empty-route-miss",
+            vec![15001],
+            registry(&[]),
+            502,
+        );
+        assert_eq!(
+            empty.http_route_miss_reject_status(15001, Some("reviews.svc"), None),
+            Some(502)
+        );
+        assert_eq!(
+            empty.http_route_miss_reject_status(15001, None, None),
+            Some(502)
+        );
+
+        let rendered = crate::plugins::prometheus_metrics::global_registry().render_uncached();
+        assert!(rendered.contains(
+            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"route-miss-ns\",host=\"<denied>\",decision=\"deny\""
+        ));
+        assert!(rendered.contains(
+            "ferrum_mesh_outbound_registry_decisions_total{mesh_namespace=\"empty-route-miss\",host=\"<denied>\",decision=\"deny\""
+        ));
     }
 
     #[test]

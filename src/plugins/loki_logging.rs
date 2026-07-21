@@ -34,10 +34,10 @@ use tracing::warn;
 use crate::config::types::MAX_ID_LENGTH;
 
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
-use super::utils::response_body::{BoundedReadError, measure_response_body_bounded};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, BatchingLogger, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
-    PluginHttpClient, RetryPolicy, build_batch_config, parse_custom_headers, parse_http_endpoint,
+    BatchConfig, BatchConfigDefaults, BatchingLogger, HttpBatchDrainOutcome, MAX_BATCH_SIZE,
+    MAX_BUFFER_CAPACITY, PluginHttpClient, RetryPolicy, build_batch_config,
+    drain_http_batch_response_body, parse_custom_headers, parse_http_endpoint,
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
@@ -72,8 +72,6 @@ pub const LOKI_MAX_CUSTOM_HEADER_NAME_BYTES: usize = u16::MAX as usize;
 const LOKI_MIN_RESOURCE_BYTES: usize = 1024;
 const LOKI_MAX_LABEL_NAME_CHARS: usize = 1024;
 const LOKI_MAX_LABEL_VALUE_CHARS: usize = 2048;
-const LOKI_RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
-const LOKI_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const LOKI_DROP_WARN_EVERY: u64 = 100;
 const LOKI_EMITTER_LABEL: &str = "ferrum_emitter";
 // Random prefix (32 hex bytes), separator, and fixed-width u64 counter (16 hex bytes).
@@ -970,43 +968,10 @@ enum LokiAttemptOutcome {
     Terminal(String),
 }
 
-enum LokiDrainOutcome {
-    Complete(u64),
-    LimitExceeded,
-    Timeout,
-    TransportFailure,
-}
-
-impl LokiDrainOutcome {
-    fn diagnostic(&self) -> String {
-        match self {
-            Self::Complete(bytes) => format!("{bytes} response bytes discarded"),
-            Self::LimitExceeded => {
-                format!("response body exceeded the {LOKI_RESPONSE_BODY_LIMIT}-byte drain limit")
-            }
-            Self::Timeout => "response body drain timed out".to_string(),
-            Self::TransportFailure => "response body drain had a transport failure".to_string(),
-        }
-    }
-}
-
-async fn drain_loki_response(response: reqwest::Response) -> LokiDrainOutcome {
-    if response
-        .content_length()
-        .is_some_and(|length| length > LOKI_RESPONSE_BODY_LIMIT as u64)
-    {
-        return LokiDrainOutcome::LimitExceeded;
-    }
-    match tokio::time::timeout(
-        LOKI_RESPONSE_DRAIN_TIMEOUT,
-        measure_response_body_bounded(response, LOKI_RESPONSE_BODY_LIMIT),
-    )
-    .await
-    {
-        Err(_) => LokiDrainOutcome::Timeout,
-        Ok(Ok(bytes)) => LokiDrainOutcome::Complete(bytes),
-        Ok(Err(BoundedReadError::LimitExceeded { .. })) => LokiDrainOutcome::LimitExceeded,
-        Ok(Err(BoundedReadError::Stream(_))) => LokiDrainOutcome::TransportFailure,
+fn loki_drain_diagnostic(drain: HttpBatchDrainOutcome) -> String {
+    match drain {
+        HttpBatchDrainOutcome::Complete(bytes) => format!("{bytes} response bytes discarded"),
+        other => other.diagnostic().to_string(),
     }
 }
 
@@ -1041,18 +1006,22 @@ async fn send_batch_once(
         Err(error) => return LokiAttemptOutcome::Retryable(error),
     };
     let status = response.status();
-    let drain = drain_loki_response(response).await;
+    // Shared HTTP batch helper: bounded discard drain before status classification.
+    let drain = drain_http_batch_response_body(response).await;
     classify_loki_response(status, drain)
 }
 
-fn classify_loki_response(status: http::StatusCode, drain: LokiDrainOutcome) -> LokiAttemptOutcome {
+fn classify_loki_response(
+    status: http::StatusCode,
+    drain: HttpBatchDrainOutcome,
+) -> LokiAttemptOutcome {
     if status.as_u16() == 204 {
         // A received 204 is Loki's committed success signal. Retrying merely
         // because connection cleanup failed can duplicate an already-ingested
         // batch, so the bounded drain is best-effort after this status.
         return LokiAttemptOutcome::Delivered;
     }
-    let drain_diagnostic = drain.diagnostic();
+    let drain_diagnostic = loki_drain_diagnostic(drain);
     if status.as_u16() == 260 {
         return LokiAttemptOutcome::Terminal(format!(
             "Loki blocked ingestion with status 260; {drain_diagnostic}"
@@ -1066,8 +1035,8 @@ fn classify_loki_response(status: http::StatusCode, drain: LokiDrainOutcome) -> 
     }
     if status.is_success() {
         return match drain {
-            LokiDrainOutcome::Complete(0) => LokiAttemptOutcome::Delivered,
-            LokiDrainOutcome::Complete(bytes) => LokiAttemptOutcome::Terminal(format!(
+            HttpBatchDrainOutcome::Complete(0) => LokiAttemptOutcome::Delivered,
+            HttpBatchDrainOutcome::Complete(bytes) => LokiAttemptOutcome::Terminal(format!(
                 "Loki-compatible receiver returned status {} with an unexpected non-empty response ({bytes} bytes discarded)",
                 status.as_u16()
             )),
@@ -1194,7 +1163,7 @@ mod tests {
         assert!(matches!(
             classify_loki_response(
                 http::StatusCode::NO_CONTENT,
-                LokiDrainOutcome::TransportFailure,
+                HttpBatchDrainOutcome::TransportFailure,
             ),
             LokiAttemptOutcome::Delivered
         ));

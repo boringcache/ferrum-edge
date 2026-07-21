@@ -736,6 +736,12 @@ async fn opa_redacts_sensitive_request_headers_by_default() {
     );
     ctx.headers
         .insert("Cookie".to_string(), "session=secret".to_string());
+    ctx.headers.insert(
+        "X-Loadtesting-Key".to_string(),
+        "load-test-secret-0123456789abcdef".to_string(),
+    );
+    ctx.headers
+        .insert("X-Loadtesting-Fanout".to_string(), "1".to_string());
     ctx.headers
         .insert("X-Request-ID".to_string(), "req-456".to_string());
 
@@ -745,6 +751,8 @@ async fn opa_redacts_sensitive_request_headers_by_default() {
     let headers = &payload["input"]["headers"];
     assert!(headers.get("authorization").is_none());
     assert!(headers.get("cookie").is_none());
+    assert!(headers.get("x-loadtesting-key").is_none());
+    assert!(headers.get("x-loadtesting-fanout").is_none());
     assert_eq!(headers["x-request-id"], "req-456");
 }
 

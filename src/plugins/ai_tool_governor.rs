@@ -23,8 +23,13 @@
 //!   tool-call frames are HELD until
 //!   the call is complete and policy/approval clears it, then released — or the
 //!   stream is terminated with an SSE error event, never leaking the held call.
+//!   Duplicate indexes in one frame or conflicting call ids for one slot are
+//!   ungovernable (fail closed in enforce) on both live and buffered SSE paths.
+//!   JSON null for a streamed `tool_calls[].id` is treated as omitted.
 //! - **MCP `tools/call`** and **A2A JSON-RPC methods** (optional, off by
-//!   default): direct JSON-RPC body parsing on the request path.
+//!   default): direct JSON-RPC body parsing on the request path. Omitted MCP
+//!   `params.arguments` normalize to `{}`; provider response argument omissions
+//!   are not coerced.
 //!
 //! Actions per tool: `allow`, `deny`, `redact_args`, `require_approval`,
 //! `dry_run`. In `mode: dry_run` the plugin evaluates and emits metadata but
@@ -78,10 +83,10 @@ use dashmap::DashMap;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 use url::Url;
@@ -173,11 +178,36 @@ const MAX_APPROVAL_RESPONSE_BYTES: usize = 64 * 1024;
 /// Maximum approval cache TTL. Larger values risk overflowing `Instant`
 /// arithmetic on some platforms and keep stale approvals alive too long.
 const MAX_APPROVAL_CACHE_TTL_S: u64 = 30 * 24 * 60 * 60;
+/// Upper bound on a single approval webhook timeout. Without a ceiling,
+/// `timeout_ms × call_count` can pin a proxy task for arbitrarily long.
+const MAX_APPROVAL_TIMEOUT_MS: u64 = 30_000;
+/// Hard ceiling on cumulative approval wait for one governed batch, including
+/// sequential webhook calls. Client cancellation still drops the awaiting
+/// future (and therefore the in-flight reqwest call) immediately.
+const MAX_APPROVAL_BATCH_DEADLINE: Duration = Duration::from_secs(30);
+/// Maximum concrete tool calls governed in one request, response, or SSE
+/// batch. Attacker-selected unique argument sets cannot otherwise force an
+/// unbounded approval fan-out within the 4 MiB parse window.
+const MAX_GOVERNABLE_CALLS: usize = 64;
+/// Maximum `blocked_arg_patterns` entries per tool. Each pattern runs
+/// `replace_all` over the prior result during `redact_args`.
+const MAX_BLOCKED_ARG_PATTERNS: usize = 32;
+/// Maximum `response.redaction_placeholder` template length in UTF-8 bytes.
+/// OpenAPI `maxLength: 256` counts Unicode scalar values; runtime admission is
+/// intentionally stricter and counts encoded bytes.
+const MAX_REDACTION_PLACEHOLDER_BYTES: usize = 256;
+/// Maximum `blocked_arg_patterns[].name` length in UTF-8 bytes. Pattern names
+/// are substituted into `redaction_placeholder` `{name}` and must stay bounded
+/// independently of regex count/pattern constraints. OpenAPI `maxLength: 256`
+/// counts Unicode characters; runtime admission counts UTF-8 bytes.
+const MAX_BLOCKED_ARG_PATTERN_NAME_BYTES: usize = 256;
 /// Upper bound on the body size this plugin will parse for tool calls, so an
 /// oversized (already-buffered) body cannot spend unbounded CPU in serde. In
 /// `enforce` mode a governed body past this limit is REJECTED (fail closed —
 /// padding a request/response past the parse limit must not smuggle a governed
-/// call past policy); in `dry_run` it is forwarded uninspected.
+/// call past policy); in `dry_run` it is forwarded uninspected. The same cap
+/// bounds redacted argument / response growth so zero-width patterns cannot
+/// amplify past the inspectable window.
 const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
 /// Upper bound on bytes the streaming inspector may retain (held tool-call
 /// frames plus the partial-event carry buffer). A backend that streams
@@ -198,9 +228,9 @@ pub(crate) const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
 // Internal correlation state (the governed-body hashes and the per-call
 // identity multiset) lives on NON-SERIALIZED `RequestContext` fields
 // (`ai_tool_governor_request_hashes` / `ai_tool_governor_response_hashes` /
-// `ai_tool_governor_call_hashes`), NOT in `ctx.metadata`. The maps are keyed by
-// a process-unique plugin-instance ID so multiple governors on one proxy never
-// consume each other's dedup state. The
+// `ai_tool_governor_call_hashes` / `ai_tool_governor_redaction_memos`), NOT in
+// `ctx.metadata`. The maps are keyed by a process-unique plugin-instance ID so
+// multiple governors on one proxy never consume each other's dedup state. The
 // `on_final_request_body` / `on_final_response_body` re-checks read them so an
 // unchanged body is not governed twice (avoids duplicate approval webhooks)
 // while a body a later `request_transformer` / `response_transformer` rewrote
@@ -404,6 +434,10 @@ struct GovernorEngine {
     /// completed), NOT the per-request proxy hot path, so the hot-path
     /// no-locks invariant does not apply.
     approval_cache_insert_lock: std::sync::Mutex<()>,
+    /// Test-only monotonic offset applied to approval-batch deadline arithmetic.
+    /// Production construction leaves this at zero so the ceiling stays exactly
+    /// [`MAX_APPROVAL_BATCH_DEADLINE`]. Cache TTLs continue to use wall time.
+    approval_clock_offset_ms: AtomicU64,
 }
 
 /// A concrete tool call to evaluate (name + arguments).
@@ -425,6 +459,15 @@ enum PolicyOutcome {
     Redact(Vec<String>),
     RequireApproval,
     DryRun,
+}
+
+/// Outcome of a buffered `redact_args` body rewrite attempt.
+enum RedactTransform {
+    Unchanged,
+    Changed,
+    /// Redaction would exceed [`MAX_PARSE_BYTES`]; refuse to emit amplified
+    /// bytes and force a fail-closed final re-check.
+    AmplificationFailed,
 }
 
 /// Name-only policy outcome for a tool definition exposed to the model.
@@ -482,6 +525,11 @@ struct BatchDecision {
     overall_label: &'static str,
     max_risk: RiskLevel,
     deny_reason: Option<String>,
+    /// Successful buffered `redact_args` rewrites computed during amplification
+    /// preflight (keyed by [`redaction_memo_key`]). Aggregate value bytes are
+    /// capped at [`MAX_PARSE_BYTES`] so the transform path can reuse them
+    /// without retaining more than one inspectable window of hostile data.
+    redaction_memos: HashMap<String, String>,
 }
 
 fn label_rank(label: &str) -> u8 {
@@ -582,6 +630,15 @@ fn set_ranked_risk_metadata(
 }
 
 impl GovernorEngine {
+    /// Instant used for the whole-batch approval deadline. Production offset is
+    /// zero; tests may advance it without sleeping the real 30s ceiling.
+    fn approval_now(&self) -> Instant {
+        let offset = Duration::from_millis(self.approval_clock_offset_ms.load(Ordering::Relaxed));
+        Instant::now()
+            .checked_add(offset)
+            .unwrap_or_else(Instant::now)
+    }
+
     /// Deterministic evaluation of one tool call. Returns the outcome, whether
     /// an explicit policy matched, and the call's risk.
     fn evaluate(
@@ -741,6 +798,42 @@ impl GovernorEngine {
         ns: &AtomicU64,
         redaction_unavailable: bool,
     ) -> BatchDecision {
+        if calls.len() > MAX_GOVERNABLE_CALLS {
+            // Fail closed before any approval fan-out: a 4 MiB body can encode
+            // far more unique calls than a single request should resolve.
+            let reason = format!(
+                "tool call batch exceeds the governable call limit ({MAX_GOVERNABLE_CALLS})"
+            );
+            let per_call = calls
+                .iter()
+                .take(MAX_GOVERNABLE_CALLS.saturating_add(1))
+                .map(|call| CallDecision {
+                    name: call.name.clone(),
+                    matched_policy: false,
+                    risk: RiskLevel::High,
+                    label: "deny",
+                    blocks: true,
+                    fail_closed: true,
+                    redact_patterns: Vec::new(),
+                    approval_id: None,
+                    arguments_hash: self
+                        .observability
+                        .hash_arguments
+                        .then(|| sha256_hex(&call.raw_args)),
+                    reason: Some(reason.clone()),
+                })
+                .collect();
+            return BatchDecision {
+                per_call,
+                enforce_blocks: self.mode == Mode::Enforce,
+                fail_closed: true,
+                overall_label: "deny",
+                max_risk: RiskLevel::High,
+                deny_reason: Some(reason),
+                redaction_memos: HashMap::new(),
+            };
+        }
+
         let mut per_call = Vec::with_capacity(calls.len());
         // Evaluation can run JSON Schema validation and every configured
         // blocked-argument regex. Cache it for the deterministic-denial
@@ -749,14 +842,67 @@ impl GovernorEngine {
             .iter()
             .map(|call| self.evaluate(&call.name, &call.raw_args, call.parsed_args.as_ref()))
             .collect();
-        let skip_approvals = self.mode == Mode::Enforce
-            && evaluations.iter().any(|(outcome, _, _)| match outcome {
+        // Preflight every deterministic redaction once before resolving any
+        // approval. Keep successful rewrites (aggregate-capped) so the
+        // buffered transform reuses them instead of recomputing hostile
+        // argument expansions. An earlier require_approval call must not fan
+        // out when a later redaction already makes the batch unshippable.
+        let mut redaction_memos = HashMap::new();
+        let mut redacted_argument_bytes = 0usize;
+        let mut redaction_amplification = vec![false; calls.len()];
+        for (index, (call, (outcome, _, _))) in calls.iter().zip(evaluations.iter()).enumerate() {
+            let PolicyOutcome::Redact(patterns) = outcome else {
+                continue;
+            };
+            if redaction_unavailable || patterns.is_empty() {
+                continue;
+            }
+            let Some(policy) = self.tools.get(&call.name) else {
+                continue;
+            };
+            let Ok((redacted, changed)) = redact_arguments(
+                &call.raw_args,
+                &policy.blocked_arg_patterns,
+                &self.response.redaction_placeholder,
+            ) else {
+                // The enforce-mode batch is already unshippable. Mark later
+                // redactions unavailable and stop before hostile siblings can
+                // each force another bounded-but-expensive expansion.
+                redaction_amplification[index..].fill(true);
+                break;
+            };
+            if !changed {
+                continue;
+            }
+            let Some(next_total) = redacted_argument_bytes.checked_add(redacted.len()) else {
+                redaction_amplification[index..].fill(true);
+                break;
+            };
+            if next_total > MAX_PARSE_BYTES {
+                redaction_amplification[index..].fill(true);
+                break;
+            }
+            redacted_argument_bytes = next_total;
+            redaction_memos.insert(redaction_memo_key(&call.name, &call.raw_args), redacted);
+        }
+        let mut skip_approvals = self.mode == Mode::Enforce
+            && (evaluations.iter().any(|(outcome, _, _)| match outcome {
                 PolicyOutcome::Deny(_) => true,
                 PolicyOutcome::Redact(patterns) => redaction_unavailable && !patterns.is_empty(),
                 _ => false,
-            });
+            }) || redaction_amplification.iter().any(|failed| *failed));
+        // Whole-batch approval deadline: sequential webhook waits cannot exceed
+        // this ceiling even when every call misses the cache.
+        let approval_deadline = self
+            .approval_now()
+            .checked_add(MAX_APPROVAL_BATCH_DEADLINE)
+            .unwrap_or_else(|| self.approval_now());
 
-        for (call, (outcome, matched, risk)) in calls.iter().zip(evaluations) {
+        for ((call, (outcome, matched, risk)), amplification) in calls
+            .iter()
+            .zip(evaluations)
+            .zip(redaction_amplification.iter().copied())
+        {
             let arguments_hash = self
                 .observability
                 .hash_arguments
@@ -795,24 +941,35 @@ impl GovernorEngine {
                             "tool '{}' matched a redact_args policy on a path where arguments cannot be redacted in place (failing closed)",
                             call.name
                         ));
+                    } else if !patterns.is_empty() {
+                        if amplification {
+                            cd.label = "deny";
+                            cd.blocks = true;
+                            cd.fail_closed = true;
+                            cd.reason = Some(format!(
+                                "tool '{}' redact_args output would exceed the inspectable size limit",
+                                call.name
+                            ));
+                        } else {
+                            cd.label = "allow";
+                            cd.redact_patterns = patterns;
+                        }
                     } else {
                         cd.label = "allow";
-                        cd.redact_patterns = patterns;
                     }
                 }
                 PolicyOutcome::RequireApproval => {
                     if skip_approvals {
                         cd.label = "require_approval";
                     } else {
-                        self.resolve_require_approval(
-                            corr,
-                            call,
-                            &arguments_hash,
-                            risk,
-                            ns,
-                            &mut cd,
-                        )
-                        .await;
+                        self.resolve_require_approval(corr, call, ns, approval_deadline, &mut cd)
+                            .await;
+                        // Stop further webhook fan-out once enforce mode has a
+                        // blocking decision; remaining calls keep an
+                        // observational require_approval label.
+                        if cd.blocks && self.mode == Mode::Enforce {
+                            skip_approvals = true;
+                        }
                     }
                 }
             }
@@ -850,6 +1007,15 @@ impl GovernorEngine {
             .iter()
             .find(|c| c.blocks)
             .and_then(|c| c.reason.clone());
+        // Drop preflight rewrites when the batch cannot ship them (deny) or
+        // when dry-run will not run the transform: avoids retaining hostile
+        // redacted argument bytes with no consumer.
+        if self.mode == Mode::DryRun
+            || enforce_blocks
+            || redaction_amplification.iter().any(|failed| *failed)
+        {
+            redaction_memos.clear();
+        }
 
         BatchDecision {
             per_call,
@@ -858,18 +1024,21 @@ impl GovernorEngine {
             overall_label,
             max_risk,
             deny_reason,
+            redaction_memos,
         }
     }
 
     /// Resolve a `require_approval` outcome onto `cd`, honoring dry-run mode,
     /// the approval cache, the webhook, and `fail_on_error`.
+    ///
+    /// Risk and arguments hash are read from `cd` (already populated by the
+    /// caller) so this helper stays under clippy's `too_many_arguments` limit.
     async fn resolve_require_approval(
         &self,
         corr: &CorrelationMeta,
         call: &ToolCall,
-        arguments_hash: &Option<String>,
-        risk: RiskLevel,
         ns: &AtomicU64,
+        approval_deadline: Instant,
         cd: &mut CallDecision,
     ) {
         // Dry-run never calls the webhook (a rollout must have no side effects);
@@ -889,7 +1058,19 @@ impl GovernorEngine {
             return;
         };
 
-        let hash = arguments_hash
+        let remaining = approval_deadline.saturating_duration_since(self.approval_now());
+        if remaining.is_zero() {
+            cd.label = "approval_denied";
+            cd.blocks = true;
+            cd.fail_closed = true;
+            cd.reason = Some("approval batch deadline exceeded".to_string());
+            return;
+        }
+
+        // Copy fields needed for ApprovalInput before further &mut cd writes.
+        let risk = cd.risk;
+        let hash = cd
+            .arguments_hash
             .clone()
             .unwrap_or_else(|| sha256_hex(&call.raw_args));
         let input = ApprovalInput {
@@ -900,7 +1081,10 @@ impl GovernorEngine {
             risk,
             ns,
         };
-        match self.resolve_approval(approval, &input).await {
+        match self
+            .resolve_approval(approval, &input, approval.timeout.min(remaining))
+            .await
+        {
             Ok((true, id)) => {
                 cd.label = "approved";
                 cd.approval_id = id;
@@ -935,10 +1119,15 @@ impl GovernorEngine {
 
     /// Check the approval cache, then the webhook. Caches the fresh decision for
     /// `cache_ttl`. Returns `(allowed, approval_id)`.
+    ///
+    /// `timeout` is the effective per-call wait (min of configured timeout and
+    /// remaining batch deadline). Dropping this future — e.g. client cancel —
+    /// cancels the in-flight reqwest call.
     async fn resolve_approval(
         &self,
         approval: &ApprovalConfig,
         input: &ApprovalInput<'_>,
+        timeout: Duration,
     ) -> Result<(bool, Option<String>), String> {
         // Hash a JSON array rather than a delimiter-joined string: tool/method
         // names and A2A/MCP argument JSON are not restricted from containing the
@@ -975,7 +1164,7 @@ impl GovernorEngine {
             self.approval_cache.remove(&cache_key);
         }
 
-        let (allowed, approval_id) = self.call_approval(approval, input).await?;
+        let (allowed, approval_id) = self.call_approval(approval, input, timeout).await?;
 
         if approval.cache_ttl > Duration::ZERO {
             // Serialize capacity check + eviction + insert behind a mutex:
@@ -1015,6 +1204,7 @@ impl GovernorEngine {
         &self,
         approval: &ApprovalConfig,
         input: &ApprovalInput<'_>,
+        timeout: Duration,
     ) -> Result<(bool, Option<String>), String> {
         let corr = input.corr;
         let mut body = json!({
@@ -1046,7 +1236,7 @@ impl GovernorEngine {
             .http_client
             .get()
             .post(&approval.endpoint_url)
-            .timeout(approval.timeout)
+            .timeout(timeout)
             .json(&body);
 
         let response = self
@@ -1150,6 +1340,7 @@ impl AiToolGovernor {
                 http_client,
                 approval_cache: DashMap::with_shard_amount(approval_cache_shard_amount),
                 approval_cache_insert_lock: std::sync::Mutex::new(()),
+                approval_clock_offset_ms: AtomicU64::new(0),
             };
             return Ok(Self {
                 instance_id,
@@ -1285,6 +1476,7 @@ impl AiToolGovernor {
             http_client,
             approval_cache: DashMap::with_shard_amount(approval_cache_shard_amount),
             approval_cache_insert_lock: std::sync::Mutex::new(()),
+            approval_clock_offset_ms: AtomicU64::new(0),
         };
 
         Ok(Self {
@@ -1360,6 +1552,11 @@ impl AiToolGovernor {
     fn set_response_hash(&self, ctx: &mut RequestContext, hash: String) {
         ctx.ai_tool_governor_response_hashes
             .insert(self.instance_id, hash);
+    }
+
+    fn clear_response_hash(&self, ctx: &mut RequestContext) {
+        ctx.ai_tool_governor_response_hashes
+            .remove(&self.instance_id);
     }
 
     fn request_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
@@ -1807,10 +2004,23 @@ impl AiToolGovernor {
 
     /// Redact `redact_args` matches in a buffered response body. Deterministic
     /// (no approval), so it runs standalone on the transform path.
-    fn redact_response(&self, json: &mut Value) -> bool {
+    ///
+    /// `redaction_memos` carries successful rewrites already computed during
+    /// governance preflight (aggregate-capped at [`MAX_PARSE_BYTES`]). Hits
+    /// reuse that exact string; misses fall back to a fresh `redact_arguments`
+    /// for shapes that were not preflighted.
+    fn redact_response(
+        &self,
+        json: &mut Value,
+        redaction_memos: Option<&HashMap<String, String>>,
+    ) -> RedactTransform {
         let mut modified = false;
+        // Cap the aggregate owned strings installed into the parsed response.
+        // Per-call bounds alone would still allow 64 individually valid
+        // redactions to retain hundreds of MiB before serialization.
+        let mut redacted_argument_bytes = 0usize;
         let Some(choices) = json.get_mut("choices").and_then(Value::as_array_mut) else {
-            return false;
+            return RedactTransform::Unchanged;
         };
         for choice in choices.iter_mut() {
             let Some(message) = choice.get_mut("message") else {
@@ -1818,48 +2028,92 @@ impl AiToolGovernor {
             };
             if let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for tc in tool_calls.iter_mut() {
-                    if self.redact_tool_call_function(tc.get_mut("function")) {
-                        modified = true;
+                    match self.redact_tool_call_function(
+                        tc.get_mut("function"),
+                        &mut redacted_argument_bytes,
+                        redaction_memos,
+                    ) {
+                        RedactTransform::Changed => modified = true,
+                        RedactTransform::AmplificationFailed => {
+                            return RedactTransform::AmplificationFailed;
+                        }
+                        RedactTransform::Unchanged => {}
                     }
                 }
             }
-            if self.redact_tool_call_function(message.get_mut("function_call")) {
-                modified = true;
+            match self.redact_tool_call_function(
+                message.get_mut("function_call"),
+                &mut redacted_argument_bytes,
+                redaction_memos,
+            ) {
+                RedactTransform::Changed => modified = true,
+                RedactTransform::AmplificationFailed => {
+                    return RedactTransform::AmplificationFailed;
+                }
+                RedactTransform::Unchanged => {}
             }
         }
-        modified
+        if modified {
+            RedactTransform::Changed
+        } else {
+            RedactTransform::Unchanged
+        }
     }
 
     /// Redact one `function`/`function_call` object's `arguments` string in place.
-    fn redact_tool_call_function(&self, function: Option<&mut Value>) -> bool {
+    fn redact_tool_call_function(
+        &self,
+        function: Option<&mut Value>,
+        redacted_argument_bytes: &mut usize,
+        redaction_memos: Option<&HashMap<String, String>>,
+    ) -> RedactTransform {
         let Some(function) = function else {
-            return false;
+            return RedactTransform::Unchanged;
         };
         let Some(name) = function.get("name").and_then(Value::as_str) else {
-            return false;
+            return RedactTransform::Unchanged;
         };
         let Some(policy) = self.engine.tools.get(name) else {
-            return false;
+            return RedactTransform::Unchanged;
         };
         if policy.action != ToolAction::RedactArgs || policy.blocked_arg_patterns.is_empty() {
-            return false;
+            return RedactTransform::Unchanged;
         }
         let Some(args_value) = function.get("arguments") else {
-            return false;
+            return RedactTransform::Unchanged;
         };
         let args = match args_value {
             Value::String(s) => Cow::Borrowed(s.as_str()),
             value => Cow::Owned(value.to_string()),
         };
-        let (redacted, changed) = redact_arguments(
-            &args,
-            &policy.blocked_arg_patterns,
-            &self.redaction_placeholder,
-        );
+        let memo_key = redaction_memo_key(name, &args);
+        let (redacted, changed) =
+            if let Some(redacted) = redaction_memos.and_then(|memos| memos.get(&memo_key)) {
+                // Preflight already enforced per-call and aggregate bounds.
+                (redacted.clone(), true)
+            } else {
+                let Ok(result) = redact_arguments(
+                    &args,
+                    &policy.blocked_arg_patterns,
+                    &self.redaction_placeholder,
+                ) else {
+                    return RedactTransform::AmplificationFailed;
+                };
+                result
+            };
         if changed {
+            let Some(next_total) = redacted_argument_bytes.checked_add(redacted.len()) else {
+                return RedactTransform::AmplificationFailed;
+            };
+            if next_total > MAX_PARSE_BYTES {
+                return RedactTransform::AmplificationFailed;
+            }
+            *redacted_argument_bytes = next_total;
             function["arguments"] = Value::String(redacted);
+            RedactTransform::Changed
+        } else {
+            RedactTransform::Unchanged
         }
-        changed
     }
 
     /// Govern the tool calls in a FINAL (post-transform) response body. Redaction
@@ -2686,6 +2940,8 @@ impl Plugin for AiToolGovernor {
                 "rejecting response: {}",
                 batch.deny_reason.as_deref().unwrap_or("blocked")
             );
+            ctx.ai_tool_governor_redaction_memos
+                .remove(&self.instance_id);
             return self.reject(&batch);
         }
         if ctx.deduplication_replay_response_finalized
@@ -2697,6 +2953,19 @@ impl Plugin for AiToolGovernor {
         {
             ctx.ai_tool_governor_replay_redactions
                 .insert(self.instance_id);
+        }
+        // Stage preflighted redaction rewrites for the transform hook. One
+        // instance's aggregate value bytes are capped at MAX_PARSE_BYTES during
+        // govern_calls, and the context retains at most ONE instance's memo set
+        // at a time. Otherwise many configured governor instances could each
+        // stage another inspectable window before any transform hook runs.
+        // Instances that do not win this bounded slot safely recompute during
+        // their transform instead of multiplying per-request memory.
+        ctx.ai_tool_governor_redaction_memos
+            .remove(&self.instance_id);
+        if !batch.redaction_memos.is_empty() && ctx.ai_tool_governor_redaction_memos.is_empty() {
+            ctx.ai_tool_governor_redaction_memos
+                .insert(self.instance_id, batch.redaction_memos);
         }
         // Record the governed calls with multiset counts so the final re-check
         // skips them one-for-one. Approval-capable calls use correlation-aware
@@ -2757,28 +3026,69 @@ impl Plugin for AiToolGovernor {
         // redactable rather than forwarded unredacted; the re-serialized output
         // is BOM-free valid JSON.
         let mut json: Value = serde_json::from_slice(strip_json_bom(body)).ok()?;
-        if self.redact_response(&mut json) {
-            let rewritten = serde_json::to_vec(&json).ok()?;
-            // Record the redacted body's hash so `on_final_response_body` treats
-            // this plugin's own redaction as already-governed and skips it when
-            // no later transform runs. Also re-record the redacted calls'
-            // identity hashes (with the same per-policy identity rules and
-            // counts as `on_response_body`) so that even if a later transform
-            // changes the body hash or only the model/provider, the final
-            // re-check skips these already-redacted calls. Approval-capable
-            // siblings keep their correlation-aware identities and still
-            // require re-approval when those fields change.
-            self.set_response_hash(ctx, sha256_hex_bytes(&rewritten));
-            let provider = self.resolve_response_provider(ctx, &json);
-            let model = json
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let corr = self.correlation(ctx, model, provider.as_deref());
-            self.record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).0);
-            return Some(rewritten);
+        // Consume the preflight memo with the rewrite attempt so hostile
+        // redacted arguments are not retained after the transform installs
+        // them (or after AmplificationFailed clears skip state).
+        let redaction_memos = ctx
+            .ai_tool_governor_redaction_memos
+            .remove(&self.instance_id);
+        match self.redact_response(&mut json, redaction_memos.as_ref()) {
+            RedactTransform::Changed => {
+                let rewritten = match serialize_json_bounded(&json) {
+                    Ok(rewritten) => rewritten,
+                    Err(()) => {
+                        // A JSON string may require escaping on serialization,
+                        // so even an aggregate argument payload at the byte cap
+                        // can exceed the final body limit. Clear the skip state
+                        // and let the terminal re-check fail closed.
+                        self.clear_response_hash(ctx);
+                        ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
+                        return None;
+                    }
+                };
+                // Record the redacted body's hash so `on_final_response_body` treats
+                // this plugin's own redaction as already-governed and skips it when
+                // no later transform runs. Also re-record the redacted calls'
+                // identity hashes (with the same per-policy identity rules and
+                // counts as `on_response_body`) so that even if a later transform
+                // changes the body hash or only the model/provider, the final
+                // re-check skips these already-redacted calls. Approval-capable
+                // siblings keep their correlation-aware identities and still
+                // require re-approval when those fields change.
+                self.set_response_hash(ctx, sha256_hex_bytes(&rewritten));
+                let provider = self.resolve_response_provider(ctx, &json);
+                let model = json
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let corr = self.correlation(ctx, model, provider.as_deref());
+                self.record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).0);
+                Some(rewritten)
+            }
+            RedactTransform::AmplificationFailed => {
+                // Do not forward unredacted secrets under a skipped final
+                // re-check: clear the governed hash and call-identity ledger so
+                // `on_final_response_body` re-evaluates with redaction
+                // unavailable and fails closed.
+                self.clear_response_hash(ctx);
+                ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
+                None
+            }
+            RedactTransform::Unchanged => None,
         }
-        None
+    }
+
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        // Lifecycle `finalize_response_body_transformation` already invalidates
+        // content-bound validators before this hook. Re-run for defense in depth
+        // and for direct unit-test callers that exercise the plugin hook alone:
+        // a `redact_args` rewrite must never leave ETag / Content-Digest /
+        // Repr-Digest / Last-Modified describing the pre-redaction bytes.
+        super::invalidate_content_bound_response_headers(response_headers);
     }
 
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
@@ -3163,6 +3473,23 @@ impl AiToolGovernor {
     pub fn pending_stream_metadata_len(&self) -> usize {
         self.pending_stream_metadata.len()
     }
+
+    /// Production whole-batch approval deadline ceiling (exactly 30s).
+    pub fn max_approval_batch_deadline() -> Duration {
+        MAX_APPROVAL_BATCH_DEADLINE
+    }
+
+    /// Advance the approval-batch deadline clock without sleeping. Used to
+    /// prove cumulative budget exhaustion deterministically while the
+    /// production ceiling remains [`MAX_APPROVAL_BATCH_DEADLINE`].
+    pub fn advance_approval_clock_for_tests(&self, duration: Duration) {
+        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let _ = self.engine.approval_clock_offset_ms.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(millis)),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3199,10 +3526,20 @@ struct StreamingToolCallAccumulator {
 struct StreamingCall {
     name: String,
     arguments: String,
+    /// Stable protocol call id observed for this slot, when present.
+    call_id: Option<String>,
+    /// Whether any fragment has already been accumulated for this slot. An ID
+    /// introduced only after an untagged fragment is an identity change, not a
+    /// stable initial identity; fail closed rather than merge the two shapes.
+    saw_fragment: bool,
     /// A tool-call delta supplied `function.arguments` as a non-string JSON
     /// value (object/array/number). Those bytes are not accumulated, so the
     /// call cannot be policy-checked and must be treated as ungovernable.
     non_string_args: bool,
+    /// True when this slot saw conflicting call ids, an id change, or a
+    /// duplicate index in a single frame — fail closed rather than merging
+    /// distinct calls into one synthetic policy identity.
+    ambiguous_identity: bool,
 }
 
 impl StreamingToolCallAccumulator {
@@ -3210,12 +3547,20 @@ impl StreamingToolCallAccumulator {
         let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
             return;
         };
+        // Length ≤ 1 cannot contain a duplicate index; skip the set entirely.
+        let mut seen_choice_indexes =
+            (choices.len() > 1).then(|| HashSet::with_capacity(choices.len()));
         for (cpos, choice) in choices.iter().enumerate() {
             let cidx = choice
                 .get("index")
                 .and_then(Value::as_u64)
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(cpos);
+            if let Some(seen) = seen_choice_indexes.as_mut()
+                && !seen.insert(cidx)
+            {
+                self.malformed = true;
+            }
             let delta = choice.get("delta");
             let tool_calls =
                 match classify_tool_calls_container(delta.and_then(|d| d.get("tool_calls"))) {
@@ -3229,16 +3574,41 @@ impl StreamingToolCallAccumulator {
                     }
                     ToolCallsContainer::None => &[],
                 };
+            // Duplicate `(choice, tool_index)` entries inside one frame are
+            // ambiguous: concatenating them would merge independently addressed
+            // calls (often with distinct ids) into one synthetic identity.
+            // Length ≤ 1 cannot duplicate; skip the set allocation.
+            let mut seen_indexes =
+                (tool_calls.len() > 1).then(|| HashSet::with_capacity(tool_calls.len()));
             for (tpos, tc) in tool_calls.iter().enumerate() {
                 let tidx = tc
                     .get("index")
                     .and_then(Value::as_u64)
                     .and_then(|v| usize::try_from(v).ok())
                     .unwrap_or(tpos);
+                if let Some(seen) = seen_indexes.as_mut()
+                    && !seen.insert(tidx)
+                {
+                    self.malformed = true;
+                }
                 let function = tc.get("function");
+                let call_id = match tc.get("id") {
+                    // Omitted and JSON null are the same continuation shape.
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+                    // A present but empty/non-string identity is not the same as
+                    // an omitted continuation fragment. Treat it as malformed
+                    // so a backend cannot hide an index reuse behind an id the
+                    // downstream runtime may interpret differently.
+                    Some(_) => {
+                        self.malformed = true;
+                        None
+                    }
+                };
                 self.push_delta(
                     cidx,
                     ToolSlot::Indexed(tidx),
+                    call_id,
                     function.and_then(|f| f.get("name")),
                     function.and_then(|f| f.get("arguments")),
                 );
@@ -3255,6 +3625,7 @@ impl StreamingToolCallAccumulator {
                 self.push_delta(
                     cidx,
                     ToolSlot::LegacyFunctionCall,
+                    None,
                     fc.get("name"),
                     fc.get("arguments"),
                 );
@@ -3266,11 +3637,13 @@ impl StreamingToolCallAccumulator {
     /// A non-string name is ignored (the call stays never-named and therefore
     /// ungovernable); arguments present but not a string mean the bytes are not
     /// accumulated, so the call is marked ungovernable rather than evaluated
-    /// against empty args.
+    /// against empty args. Conflicting or changing call ids mark the slot
+    /// ambiguous so enforce mode fails closed instead of merging identities.
     fn push_delta(
         &mut self,
         choice: usize,
         slot: ToolSlot,
+        call_id: Option<&str>,
         name: Option<&Value>,
         args: Option<&Value>,
     ) {
@@ -3278,6 +3651,18 @@ impl StreamingToolCallAccumulator {
         let args_str = args.and_then(Value::as_str);
         let non_string_args = args.is_some() && args_str.is_none();
         let entry = self.entry(choice, slot);
+        if let Some(id) = call_id.filter(|id| !id.is_empty()) {
+            match &entry.call_id {
+                None => {
+                    if entry.saw_fragment {
+                        entry.ambiguous_identity = true;
+                    }
+                    entry.call_id = Some(id.to_string());
+                }
+                Some(existing) if existing == id => {}
+                Some(_) => entry.ambiguous_identity = true,
+            }
+        }
         if let Some(name) = name_str {
             entry.name.push_str(name);
         }
@@ -3287,6 +3672,7 @@ impl StreamingToolCallAccumulator {
         if non_string_args {
             entry.non_string_args = true;
         }
+        entry.saw_fragment = true;
     }
 
     fn entry(&mut self, choice: usize, slot: ToolSlot) -> &mut StreamingCall {
@@ -3315,17 +3701,18 @@ impl StreamingToolCallAccumulator {
 
     /// Whether any accumulated tool call cannot be policy-checked: it never
     /// received a `function.name`, its `function.arguments` arrived as a
-    /// non-string JSON value, or a frame carried a MALFORMED `tool_calls`
-    /// container (present but not an array). `build_calls()` silently drops
-    /// unnamed calls and `push_frame` cannot accumulate a non-array container,
-    /// so a governable named call in the same batch must not carry an
-    /// ungovernable sibling past policy.
+    /// non-string JSON value, a frame carried a MALFORMED `tool_calls`
+    /// container (present but not an array), or its streaming identity is
+    /// ambiguous (duplicate indexes / conflicting ids). `build_calls()`
+    /// silently drops unnamed calls and `push_frame` cannot accumulate a
+    /// non-array container, so a governable named call in the same batch must
+    /// not carry an ungovernable sibling past policy.
     fn has_ungovernable_call(&self) -> bool {
         self.malformed
             || self
                 .calls
                 .iter()
-                .any(|(_, c)| c.name.is_empty() || c.non_string_args)
+                .any(|(_, c)| c.name.is_empty() || c.non_string_args || c.ambiguous_identity)
     }
 
     fn build_calls(&self) -> Vec<ToolCall> {
@@ -4439,6 +4826,12 @@ enum McpToolCallExtraction {
 /// Extract a single tool call from an MCP JSON-RPC `tools/call` request while
 /// preserving the distinction between an unrelated JSON-RPC method and a
 /// governed call whose name cannot be policy-checked.
+///
+/// MCP permits omitting `params.arguments` for zero-argument tools; that case
+/// is normalized to an empty JSON object before required-arg / regex / hash /
+/// approval / JSON Schema evaluation (matching `mcp_gateway`). Provider
+/// response shapes that omit `function.arguments` keep their distinct
+/// semantics via [`tool_call_from`] and are not normalized here.
 fn extract_mcp_tool_call(json: &Value) -> McpToolCallExtraction {
     if json.get("method").and_then(Value::as_str) != Some("tools/call") {
         return McpToolCallExtraction::Absent;
@@ -4453,7 +4846,14 @@ fn extract_mcp_tool_call(json: &Value) -> McpToolCallExtraction {
     else {
         return McpToolCallExtraction::Malformed;
     };
-    McpToolCallExtraction::Call(tool_call_from(name, params.get("arguments")))
+    match params.get("arguments") {
+        None => McpToolCallExtraction::Call(ToolCall {
+            name: name.to_string(),
+            raw_args: "{}".to_string(),
+            parsed_args: Some(json!({})),
+        }),
+        Some(arguments) => McpToolCallExtraction::Call(tool_call_from(name, Some(arguments))),
+    }
 }
 
 /// Extract an A2A JSON-RPC method as a name-governed "tool" (params as args).
@@ -4598,23 +4998,124 @@ fn redacted_approval_url(parsed: &Url) -> String {
     redacted.to_string()
 }
 
+/// Stable key for staging a preflighted redaction rewrite between buffered
+/// governance and the response-body transform. Uses a digest so the map does
+/// not retain a second copy of raw hostile arguments as the key. A fixed-width
+/// name-length prefix keeps arbitrary JSON strings unambiguous (tool names and
+/// arguments may both contain NUL or any other delimiter candidate).
+fn redaction_memo_key(name: &str, raw_args: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.len().to_be_bytes());
+    hasher.update(name.as_bytes());
+    hasher.update(raw_args.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Replace each blocked-pattern match in a raw arguments string with the
-/// rendered redaction placeholder. `NoExpand` keeps `$`-sequences literal.
+/// rendered redaction placeholder. Apply every blocked-argument pattern while
+/// checking each append before allocation, failing closed when the redacted
+/// output would exceed [`MAX_PARSE_BYTES`]. Patterns that match empty input are
+/// rejected at config load; the per-match zero-width check also catches
+/// contextual assertions (for example `\b`) that can match an empty span only
+/// beside non-empty input.
 fn redact_arguments(
     args: &str,
     patterns: &[BlockedArgPattern],
     placeholder: &str,
-) -> (String, bool) {
+) -> Result<(String, bool), ()> {
+    if args.len() > MAX_PARSE_BYTES {
+        return Err(());
+    }
     let mut result = args.to_string();
     for pattern in patterns {
-        let rendered = placeholder.replace("{name}", &pattern.name);
-        result = pattern
-            .regex
-            .replace_all(&result, regex::NoExpand(rendered.as_str()))
-            .into_owned();
+        // Defense in depth: config admission rejects patterns that match empty
+        // input. Contextual assertions can still produce a zero-length match
+        // only beside non-empty input, so reject those spans below as well.
+        if pattern.regex.is_match("") {
+            return Err(());
+        }
+        let rendered = render_redaction_placeholder(placeholder, &pattern.name)?;
+        let mut matches = pattern.regex.find_iter(&result);
+        let Some(first_match) = matches.next() else {
+            continue;
+        };
+        let mut replaced = String::with_capacity(result.len());
+        let mut cursor = 0;
+        for matched in std::iter::once(first_match).chain(matches) {
+            if matched.start() == matched.end() {
+                return Err(());
+            }
+            push_redaction_bytes(&mut replaced, &result[cursor..matched.start()])?;
+            push_redaction_bytes(&mut replaced, &rendered)?;
+            cursor = matched.end();
+        }
+        push_redaction_bytes(&mut replaced, &result[cursor..])?;
+        result = replaced;
     }
     let changed = result != args;
-    (result, changed)
+    Ok((result, changed))
+}
+
+/// Render `{name}` without allowing an unbounded intermediate allocation from
+/// an operator-supplied pattern name.
+fn render_redaction_placeholder(placeholder: &str, name: &str) -> Result<String, ()> {
+    let mut rendered = String::with_capacity(placeholder.len());
+    let mut cursor = 0;
+    for (start, token) in placeholder.match_indices("{name}") {
+        push_redaction_bytes(&mut rendered, &placeholder[cursor..start])?;
+        push_redaction_bytes(&mut rendered, name)?;
+        cursor = start + token.len();
+    }
+    push_redaction_bytes(&mut rendered, &placeholder[cursor..])?;
+    Ok(rendered)
+}
+
+fn push_redaction_bytes(output: &mut String, value: &str) -> Result<(), ()> {
+    let next_len = output.len().checked_add(value.len()).ok_or(())?;
+    if next_len > MAX_PARSE_BYTES {
+        return Err(());
+    }
+    output.push_str(value);
+    Ok(())
+}
+
+/// Serialize a transformed JSON response without ever retaining more than the
+/// inspectable body limit. `serde_json::to_vec` would allocate the complete
+/// escaped representation before the caller could reject an oversized result.
+fn serialize_json_bounded(value: &Value) -> Result<Vec<u8>, ()> {
+    struct BoundedWriter {
+        output: Vec<u8>,
+    }
+
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let next_len = self.output.len().checked_add(bytes.len()).ok_or_else(|| {
+                std::io::Error::other("ai_tool_governor JSON output length overflow")
+            })?;
+            if next_len > MAX_PARSE_BYTES {
+                return Err(std::io::Error::other(
+                    "ai_tool_governor JSON output exceeds inspectable limit",
+                ));
+            }
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = BoundedWriter {
+        output: Vec::with_capacity(64 * 1024),
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|_| ())?;
+    Ok(writer.output)
 }
 
 /// Borrow the leading `max_bytes` bytes of `s`, snapped down to a char boundary
@@ -4946,6 +5447,11 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         let arr = v.as_array().ok_or_else(|| {
             format!("ai_tool_governor: tool '{name}' 'blocked_arg_patterns' must be an array")
         })?;
+        if arr.len() > MAX_BLOCKED_ARG_PATTERNS {
+            return Err(format!(
+                "ai_tool_governor: tool '{name}' 'blocked_arg_patterns' must have at most {MAX_BLOCKED_ARG_PATTERNS} entries"
+            ));
+        }
         for (idx, entry) in arr.iter().enumerate() {
             let entry_obj = entry.as_object().ok_or_else(|| {
                 format!(
@@ -4967,6 +5473,11 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                         "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}].name' is required"
                     )
                 })?;
+            if pattern_name.len() > MAX_BLOCKED_ARG_PATTERN_NAME_BYTES {
+                return Err(format!(
+                    "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}].name' must be <= {MAX_BLOCKED_ARG_PATTERN_NAME_BYTES} UTF-8 bytes"
+                ));
+            }
             let regex_str = entry_obj
                 .get("regex")
                 .and_then(Value::as_str)
@@ -4981,6 +5492,13 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                     "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}]' invalid regex: {e}"
                 )
             })?;
+            // Zero-width matches let `replace_all` insert the placeholder at
+            // every position and amplify a bounded argument into gigabytes.
+            if regex.is_match("") {
+                return Err(format!(
+                    "ai_tool_governor: tool '{name}' 'blocked_arg_patterns[{idx}].regex' must not match the empty string (zero-width redaction is rejected)"
+                ));
+            }
             blocked_arg_patterns.push(BlockedArgPattern {
                 name: pattern_name.to_string(),
                 regex,
@@ -5066,9 +5584,17 @@ fn parse_approval(
 
     let timeout_ms = match obj.get("timeout_ms") {
         None => DEFAULT_APPROVAL_TIMEOUT_MS,
-        Some(v) => v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-            "ai_tool_governor: 'approval.timeout_ms' must be a positive integer".to_string()
-        })?,
+        Some(v) => {
+            let n = v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                "ai_tool_governor: 'approval.timeout_ms' must be a positive integer".to_string()
+            })?;
+            if n > MAX_APPROVAL_TIMEOUT_MS {
+                return Err(format!(
+                    "ai_tool_governor: 'approval.timeout_ms' must be <= {MAX_APPROVAL_TIMEOUT_MS}"
+                ));
+            }
+            n
+        }
     };
 
     let cache_ttl_seconds = match obj.get("cache_ttl_seconds") {
@@ -5154,6 +5680,11 @@ fn parse_response(config: &Value) -> Result<ResponseConfig, String> {
         })
         .transpose()?
         .unwrap_or_else(|| DEFAULT_REDACTION_PLACEHOLDER.to_string());
+    if redaction_placeholder.len() > MAX_REDACTION_PLACEHOLDER_BYTES {
+        return Err(format!(
+            "ai_tool_governor: 'response.redaction_placeholder' must be <= {MAX_REDACTION_PLACEHOLDER_BYTES} UTF-8 bytes"
+        ));
+    }
 
     let streaming_deny_event = match response.and_then(|r| r.get("streaming_deny_event")) {
         None => true,

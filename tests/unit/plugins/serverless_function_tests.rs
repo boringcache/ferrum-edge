@@ -2185,7 +2185,11 @@ async fn test_terminate_preserves_head_no_body_semantics() {
                 headers.get("etag").map(String::as_str),
                 Some("\"head-version\"")
             );
-            assert!(!headers.contains_key("content-length"));
+            // HEAD keeps representation Content-Length while omitting content.
+            assert_eq!(
+                headers.get("content-length").map(String::as_str),
+                Some("13")
+            );
         }
         other => panic!("expected HEAD terminal response, got {other:?}"),
     }

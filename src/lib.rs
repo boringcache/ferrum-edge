@@ -674,6 +674,34 @@ pub mod _test_support {
         plugin.redis_payload_for_tests(status_code, headers, body)
     }
 
+    // ── plugins/kafka_logging ───────────────────────────────────────────────
+    /// Pure producer-configuration / CRL admission boundary. External unit
+    /// tests use this so TLS-policy coverage does not require constructing a
+    /// librdkafka producer (OpenSSL may be unavailable in CI builds).
+    pub fn kafka_logging_validate_producer_admission_for_test(
+        config: &serde_json::Value,
+        http_client: &crate::plugins::PluginHttpClient,
+    ) -> Result<(), String> {
+        crate::plugins::kafka_logging::validate_producer_admission(config, http_client)
+    }
+
+    /// Deterministic probe: channel reservation must precede serialization so
+    /// an oversized summary rejected by a full Ferrum channel never increments
+    /// the oversize counter.
+    pub async fn kafka_logging_probe_reserve_before_serialize_for_test(
+        oversized: &crate::plugins::TransactionSummary,
+    ) -> (u64, u64) {
+        crate::plugins::kafka_logging::probe_reserve_before_serialize_for_test(oversized).await
+    }
+
+    /// Deterministic probe: aggregate byte-budget reservation must precede
+    /// serialization so budget denial cannot allocate an attacker-sized entry.
+    pub async fn kafka_logging_probe_byte_budget_before_serialize_for_test(
+        oversized: &crate::plugins::TransactionSummary,
+    ) -> (u64, u64) {
+        crate::plugins::kafka_logging::probe_byte_budget_before_serialize_for_test(oversized).await
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
@@ -2140,5 +2168,102 @@ pub mod _test_support {
         grpc_web_request: bool,
     ) -> crate::plugins::ProxyProtocol {
         crate::http3::server::h3_plugin_protocol_for_request(flavor, grpc_web_request)
+    }
+
+    pub fn udp_logging_should_replace_sender_on_resolve_for_test(
+        elapsed: Duration,
+        current_addr: Option<std::net::SocketAddr>,
+        new_addr: std::net::SocketAddr,
+        interval: Duration,
+    ) -> bool {
+        crate::plugins::udp_logging::should_replace_sender_on_resolve(
+            elapsed,
+            current_addr,
+            new_addr,
+            interval,
+        )
+    }
+
+    pub fn udp_logging_classify_dtls_batch_size_for_test(
+        dtls_enabled: bool,
+        payload_len: usize,
+        batch_len: usize,
+        max_plaintext: usize,
+    ) -> &'static str {
+        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
+        match crate::plugins::udp_logging::classify_dtls_batch_size(
+            dtls_enabled,
+            payload_len,
+            batch_len,
+            max_plaintext,
+        ) {
+            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
+            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+        }
+    }
+
+    pub fn udp_logging_classify_serialized_summaries_for_test(
+        summaries: &[crate::plugins::TransactionSummary],
+        max_plaintext: usize,
+    ) -> Result<(&'static str, usize), String> {
+        use crate::plugins::udp_logging::DtlsBatchSizeDecision;
+        let entries: Vec<crate::plugins::utils::SummaryLogEntry> =
+            summaries.iter().map(Into::into).collect();
+        let (decision, payload_len) =
+            crate::plugins::udp_logging::classify_serialized_dtls_batch_for_test(
+                &entries,
+                max_plaintext,
+            )?;
+        let label = match decision {
+            DtlsBatchSizeDecision::SendAsIs => "send_as_is",
+            DtlsBatchSizeDecision::RejectOversizedSingle => "reject_oversized_single",
+            DtlsBatchSizeDecision::SplitPerEntry => "split_per_entry",
+        };
+        Ok((label, payload_len))
+    }
+
+    pub fn udp_logging_validate_dtls_file_dependencies_for_test(
+        config: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        crate::plugins::udp_logging::validate_dtls_file_dependencies(config)
+    }
+
+    pub fn udp_logging_duplicate_dtls_materialization_probe_for_test(
+        config: &serde_json::Map<String, serde_json::Value>,
+    ) -> (Result<(), String>, Result<(), String>, usize, usize) {
+        crate::plugins::udp_logging::duplicate_dtls_materialization_probe_for_test(config)
+    }
+
+    pub fn dtls_client_send_output_drain_needs_another_round_for_test(
+        has_pending_completion: bool,
+        wrote_ciphertext_datagram: bool,
+        socket_send_failed: bool,
+        fatal_send_failed: bool,
+        drain_round_exhausted: bool,
+    ) -> bool {
+        crate::dtls::client_send_output_drain_needs_another_round_for_test(
+            has_pending_completion,
+            wrote_ciphertext_datagram,
+            socket_send_failed,
+            fatal_send_failed,
+            drain_round_exhausted,
+        )
+    }
+
+    pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
+        crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
+    }
+
+    pub fn udp_logging_local_dtls_size_rejection_preserves_sender_for_test() -> bool {
+        crate::plugins::udp_logging::local_dtls_size_rejection_preserves_sender_for_test()
+    }
+
+    pub fn udp_logging_transport_dtls_failure_requires_sender_reset_for_test() -> bool {
+        crate::plugins::udp_logging::transport_dtls_failure_requires_sender_reset_for_test()
+    }
+
+    pub fn udp_logging_dtls_send_timeout_secs_for_test() -> u64 {
+        crate::plugins::udp_logging::UDP_LOGGING_DTLS_SEND_TIMEOUT.as_secs()
     }
 }
