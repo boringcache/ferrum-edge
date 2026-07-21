@@ -1815,6 +1815,150 @@ fn graphql_config_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn request_deduplication_schema_matches_runtime_validation() {
+    use ferrum_edge::plugins::create_plugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/RequestDeduplicationConfig")
+        .expect("RequestDeduplicationConfig component exists");
+
+    // Issue #2604: the published schema must reject the same malformed
+    // configurations the runtime constructor rejects.
+    assert_eq!(
+        schema["properties"]["header_name"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["header_name"]["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
+    assert_eq!(
+        schema["properties"]["applicable_methods"]["minItems"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["applicable_methods"]["items"]["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
+    assert_eq!(
+        schema["properties"]["redis_key_prefix"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(schema["properties"]["redis_pool_size"]["minimum"], json!(1));
+    assert_eq!(
+        schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["redis_health_check_interval_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(schema["properties"]["redis_url"]["minLength"], json!(1));
+    let redis_guard = schema["allOf"]
+        .as_array()
+        .expect("RequestDeduplicationConfig allOf")
+        .iter()
+        .find(|guard| {
+            guard["if"]["properties"]["sync_mode"]["const"] == json!("redis")
+        })
+        .expect("sync_mode=redis conditional guard");
+    assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
+    assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
+
+    let validator_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/RequestDeduplicationConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&validator_schema)
+        .expect("RequestDeduplicationConfig schema compiles");
+
+    let accepted = [
+        json!({}),
+        json!({"header_name": "X-Idempotency-Key"}),
+        json!({"applicable_methods": ["GET", "POST"]}),
+        json!({"applicable_methods": ["get"]}),
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_key_prefix": "ferrum:dedup",
+            "redis_pool_size": 1,
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 1
+        }),
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "rediss://cache.internal:6390"
+        }),
+        json!({
+            "sync_mode": "local",
+            "redis_url": "redis://cache.internal:6379"
+        }),
+    ];
+    for config in &accepted {
+        assert!(
+            validator.validate(config).is_ok(),
+            "config should be schema-valid: {config}"
+        );
+        assert!(
+            create_plugin("request_deduplication", config).is_ok(),
+            "config should be runtime-valid: {config}"
+        );
+    }
+
+    // Issue #2604 reproduction shapes: every case is rejected by both the
+    // published schema and the runtime constructor.
+    let rejected = [
+        json!({"header_name": "not a header"}),
+        json!({"header_name": ""}),
+        json!({"header_name": null}),
+        json!({"applicable_methods": []}),
+        json!({"applicable_methods": ["bad method"]}),
+        json!({"applicable_methods": [""]}),
+        json!({"applicable_methods": null}),
+        json!({"sync_mode": "redis"}),
+        json!({"sync_mode": "redis", "redis_url": ""}),
+        json!({"sync_mode": "redis", "redis_url": "https://example.invalid"}),
+        json!({"sync_mode": "redis", "redis_url": null}),
+        json!({"sync_mode": "local", "redis_url": "https://example.invalid"}),
+        json!({"sync_mode": "local", "redis_url": "redis://"}),
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://host:6379",
+            "redis_key_prefix": ""
+        }),
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://host:6379",
+            "redis_pool_size": 0
+        }),
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://host:6379",
+            "redis_connect_timeout_seconds": 0
+        }),
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://host:6379",
+            "redis_health_check_interval_seconds": 0
+        }),
+    ];
+    for config in &rejected {
+        assert!(
+            validator.validate(config).is_err(),
+            "config should be schema-invalid: {config}"
+        );
+        assert!(
+            create_plugin("request_deduplication", config).is_err(),
+            "config should be runtime-invalid: {config}"
+        );
+    }
+}
+
+#[test]
 fn key_auth_location_schema_matches_runtime_whitespace_contract() {
     use ferrum_edge::plugins::key_auth::KeyAuth;
 

@@ -2392,22 +2392,22 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `header_name` | String | `"Idempotency-Key"` | Header name to read the idempotency key from (case-insensitive) |
+| `header_name` | String | `"Idempotency-Key"` | Header name to read the idempotency key from (case-insensitive). Must be a valid RFC 9110 HTTP field-name token |
 | `ttl_seconds` | u64 | `300` | Time-to-live for cached responses (must be > 0) |
 | `inflight_ttl_seconds` | u64 | `ttl_seconds` | How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request (must be > 0). Set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to `ttl_seconds` |
 | `max_entries` | u64 | `10000` | Maximum number of tracked local entries. Active in-flight markers and fail-closed terminal tombstones count toward this limit but are not evicted while live |
 | `max_entry_size_bytes` | u64 | `1048576` | Maximum retained size of one completed response entry. Oversized retained responses are returned normally, clear the in-flight marker, and are not retained locally or serialized for Redis. Redis payloads are also skipped when their serialized value exceeds this cap |
 | `max_total_size_bytes` | u64 | `104857600` | Exact maximum retained size across local completed response entries. Responses that would exceed this cap are returned normally and are not retained. In local mode they clear the in-flight marker immediately; in Redis mode, Redis publish failures leave local and distributed locks to expire |
-| `applicable_methods` | String[] | `["POST", "PUT", "PATCH"]` | HTTP methods to apply deduplication to |
+| `applicable_methods` | String[] | `["POST", "PUT", "PATCH"]` | HTTP methods to apply deduplication to. Must contain at least one entry, and every entry must be a valid HTTP method token |
 | `scope_by_consumer` | bool | `true` | Scope keys by authenticated consumer identity |
 | `enforce_required` | bool | `false` | Reject requests missing the idempotency header with 400 |
 | `sync_mode` | String | `"local"` | `local` (in-memory) or `redis` (centralized) |
-| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must use the `redis://` or `rediss://` scheme with a hostname. Explicitly supplied values are validated even in `local` mode |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:dedup"` | Redis key namespace prefix. Defaults to `ferrum:dedup` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout |
-| `redis_health_check_interval_seconds` | u64 | `5` | Health check interval when Redis is unavailable |
+| `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:dedup"` | Redis key namespace prefix. Defaults to `ferrum:dedup` when namespace is `"ferrum"`. Must be non-empty when supplied |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be > 0) |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout (must be > 0) |
+| `redis_health_check_interval_seconds` | u64 | `5` | Health check interval when Redis is unavailable (must be > 0) |
 | `redis_username` | String (optional) | — | Redis ACL username |
 | `redis_password` | String (optional) | — | Redis password |
 
