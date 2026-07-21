@@ -3298,12 +3298,22 @@ async fn handle_h3_request(
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                     record_request(&state, 500);
+                    let mut body = b"Internal Server Error".to_vec();
+                    let mut headers = HashMap::new();
+                    if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+                        &ctx.method,
+                        StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        &mut headers,
+                        body.len(),
+                    ) {
+                        body.clear();
+                    }
                     send_h3_reject_flavor_aware(
                         &mut stream,
                         http_flavor,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
-                        &HashMap::new(),
+                        &body,
+                        &headers,
                     )
                     .await?;
                     return Ok(());
@@ -5580,11 +5590,21 @@ async fn handle_h3_request(
             let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                 tracing::error!("Plugin result could not be converted to rejection parts");
                 record_request(&state, 500);
+                let mut body = b"Internal Server Error".to_vec();
+                let mut headers = HashMap::new();
+                if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+                    &ctx.method,
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    &mut headers,
+                    body.len(),
+                ) {
+                    body.clear();
+                }
                 send_h3_reject_response(
                     &mut stream,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Internal Server Error",
-                    &HashMap::new(),
+                    &body,
+                    &headers,
                 )
                 .await?;
                 return Ok(());
@@ -7517,7 +7537,17 @@ async fn run_h3_streaming_after_proxy_hooks(
     plugin_execution_ns: &mut u64,
 ) -> Option<crate::proxy::AfterProxyReject> {
     let phase_start = std::time::Instant::now();
-    let reject = run_after_proxy_hooks(plugins, ctx, response_status, response_headers).await;
+    let mut reject = run_after_proxy_hooks(plugins, ctx, response_status, response_headers).await;
+    if let Some(reject) = reject.as_mut()
+        && crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+            &ctx.method,
+            reject.status_code,
+            &mut reject.headers,
+            reject.body.len(),
+        )
+    {
+        reject.body.clear();
+    }
     *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     reject
 }
