@@ -18209,6 +18209,50 @@ async fn handle_proxy_request_inner(
                     (relay_proxy, 0)
                 }
                 None => {
+                    // Outbound-capture route misses under effective
+                    // REGISTRY_ONLY must take the same configured deny /
+                    // metric path as the auto-injected
+                    // `mesh_outbound_registry` plugin. Routing completes
+                    // before the plugin chain, so without this gate an
+                    // unknown destination would return a generic 404 and
+                    // skip `FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS`
+                    // plus the fixed-cardinality deny counter. Inbound
+                    // listeners and HBONE relay synthesis above are
+                    // unchanged (capture-port Skip / inbound-only relay).
+                    if let Some(listen_port) = ctx.frontend_listen_port
+                        && let Some(enforcement) =
+                            state.mesh_outbound_enforcement.load_full().as_ref()
+                        && let Some(reject_status) = enforcement.http_route_miss_reject_status(
+                            listen_port,
+                            request_host.as_deref(),
+                            authority_port,
+                        )
+                    {
+                        debug!(
+                            path = %path,
+                            host = %request_host.as_deref().unwrap_or("<missing>"),
+                            client_ip = %ctx.client_ip,
+                            reject_status,
+                            "Mesh REGISTRY_ONLY: rejecting outbound route miss for unadmitted destination"
+                        );
+                        state.request_count.fetch_add(1, Ordering::Relaxed);
+                        let status =
+                            StatusCode::from_u16(reject_status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        let body: &[u8] = if request_host.as_deref().is_none_or(|h| h.is_empty()) {
+                            br#"{"error":"host header required"}"#
+                        } else {
+                            br#"{"error":"destination not in mesh registry (REGISTRY_ONLY policy)"}"#
+                        };
+                        let response = build_pre_plugin_reject_response(
+                            status,
+                            body,
+                            &EMPTY_HEADERS,
+                            request_uses_grpc_content_type,
+                            grpc_web_response_content_type,
+                        );
+                        record_status(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
                     debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
                     state.request_count.fetch_add(1, Ordering::Relaxed);
                     let response = build_pre_plugin_reject_response(
@@ -38547,6 +38591,34 @@ mod tests {
             build_xff_value(Some("2001:DB8::1"), "2001:db8::1", "10.0.0.7", &lb_trusted),
             "2001:DB8::1, 10.0.0.7",
             "IPv6 case differences must not duplicate the client in the chain"
+        );
+    }
+
+    /// Complementary ordering guard for the inbound HBONE relay synthesis that
+    /// must stay ahead of the REGISTRY_ONLY route-miss gate in the same arm.
+    /// Executable request-path coverage for the gate itself lives in
+    /// `tests/integration/mesh_outbound_registry_route_miss_tests.rs`; this
+    /// fingerprint only asserts the hard-to-drive HBONE-vs-gate source order.
+    #[test]
+    fn registry_only_route_miss_gate_precedes_generic_not_found() {
+        let src = include_str!("mod.rs");
+        let gate_pos = src
+            .find("enforcement.http_route_miss_reject_status")
+            .expect("REGISTRY_ONLY route-miss gate helper call not found");
+        let not_found_pos = gate_pos
+            + src[gate_pos..]
+                .find("No route matched for request path")
+                .expect("generic route-miss log after the REGISTRY_ONLY gate not found");
+        assert!(
+            gate_pos < not_found_pos,
+            "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
+        );
+        let relay_pos = src[..not_found_pos]
+            .rfind("build_inbound_hbone_relay_proxy(req.uri().authority()")
+            .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
+        assert!(
+            relay_pos < gate_pos,
+            "inbound HBONE relay synthesis must stay ahead of the REGISTRY_ONLY route-miss gate"
         );
     }
 

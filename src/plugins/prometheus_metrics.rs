@@ -603,9 +603,9 @@ pub struct MetricsRegistry {
     /// Mesh outbound registry decisions keyed by mesh namespace and host.
     ///
     /// Cardinality contract: caller must never pass attacker-controllable
-    /// values as `host`. The admit path uses the actual destination (bounded
-    /// by the configured registry); the deny path always passes the constant
-    /// `<denied>` bucket so /metrics stays bounded under hostile traffic.
+    /// values as `host`. Callers must pass only the fixed `<admit_explicit>`,
+    /// `<admit_wildcard>`, or `<denied>` buckets so /metrics stays bounded
+    /// under hostile traffic.
     pub mesh_outbound_registry_decisions:
         DashMap<Arc<str>, DashMap<Arc<str>, MeshOutboundRegistryDecisionCounters>>,
     /// Mesh outbound registry decisions for stream-family egress, keyed by
@@ -1986,7 +1986,7 @@ impl MetricsRegistry {
 
         if !self.mesh_outbound_registry_decisions.is_empty() {
             output.push_str(
-                "# HELP ferrum_mesh_outbound_registry_decisions_total Mesh outbound registry decisions by destination host.\n",
+                "# HELP ferrum_mesh_outbound_registry_decisions_total Mesh outbound registry decisions with bounded host buckets (<admit_explicit>, <admit_wildcard>, <denied>).\n",
             );
             output.push_str("# TYPE ferrum_mesh_outbound_registry_decisions_total counter\n");
             for namespace_entry in self.mesh_outbound_registry_decisions.iter() {

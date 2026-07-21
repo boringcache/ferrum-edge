@@ -13556,7 +13556,8 @@ components:
             Empty means enforce on every HTTP-family request that reaches
             the plugin (operator-managed default). Mesh auto-injection sets
             this to the outbound capture listener port so the global plugin
-            does not apply to inbound listeners.
+            does not apply to inbound listeners. Port `0` is rejected at
+            runtime construction; use `[]` for intentional global scope.
         namespace:
           type: string
           default: ferrum

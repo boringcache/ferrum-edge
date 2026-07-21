@@ -8834,6 +8834,7 @@ fn refresh_mesh_outbound_enforcement(
             &runtime.cluster_domain,
             runtime.namespace.clone(),
             ports,
+            runtime.outbound_registry_reject_status,
         )
         .map(Arc::new)
     } else {

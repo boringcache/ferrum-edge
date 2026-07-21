@@ -60,6 +60,7 @@ mod mesh_k8s_pod_discovery_tests;
 mod mesh_l7_routing_tests;
 mod mesh_multicluster_discovery_tests;
 mod mesh_node_waypoint_stream_scope_tests;
+mod mesh_outbound_registry_route_miss_tests;
 mod mesh_outbound_registry_stream_tests;
 mod mesh_peer_auth_live_reload_tests;
 mod mesh_proxy_config_tests;
