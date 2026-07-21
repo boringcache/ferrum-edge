@@ -18391,8 +18391,7 @@ components:
         token_limit:
           type: integer
           minimum: 1
-          default: 100000
-          description: Maximum tokens allowed per window
+          description: Required maximum tokens allowed per window. Omission is rejected at construction; there is no default.
         window_seconds:
           type: integer
           minimum: 1
