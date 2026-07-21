@@ -63,8 +63,8 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         for (key, value) in &self.saved {
-            // SAFETY: `_lock` is declared before `saved`, so it remains held
-            // while every original value is restored.
+            // SAFETY: `Drop::drop` runs while all fields, including `_lock`,
+            // remain alive, so restoration is still serialized by ENV_LOCK.
             unsafe {
                 match value {
                     Some(value) => std::env::set_var(*key, value),

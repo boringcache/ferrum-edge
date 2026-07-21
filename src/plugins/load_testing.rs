@@ -6,9 +6,9 @@
 //!
 //! ## How it works
 //!
-//! When a matching key is received in `before_proxy`, the plugin strips the
-//! trigger key from the original request before later deferred transforms
-//! (notably `request_mirror`) or backends can observe it, then spawns a
+//! In `before_proxy`, the plugin strips both reserved load-testing control
+//! headers from the effective request before later deferred transforms (notably
+//! `request_mirror`) or backends can observe them. A matching key then spawns a
 //! background load test that sends concurrent requests back through the
 //! gateway's local listener (`127.0.0.1:{gateway_port}`). Synthetic requests
 //! omit the trigger key, so they flow through the full proxy pipeline without
@@ -85,7 +85,7 @@ pub const LOAD_TESTING_CONFIG_KEYS: &[&str] = &[
 /// Minimum accepted trigger-key length. Keys are additionally restricted to a
 /// stable printable-ASCII HTTP field value so they can traverse every frontend
 /// and the reqwest fan-out path without normalization or rejection.
-pub const MIN_TRIGGER_KEY_LEN: usize = 16;
+pub const MIN_TRIGGER_KEY_LEN: usize = 32;
 
 /// Hard ceiling for per-request timeout (independent of run duration).
 pub const MAX_REQUEST_TIMEOUT_MS: u64 = 60_000;
@@ -97,12 +97,20 @@ pub const MAX_GATEWAY_ADDRESSES: usize = 32;
 /// Process-wide admission budget across every effective load_testing instance.
 const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
 
+/// A matching trigger may retain one shared request body for its local cohort
+/// and bounded fan-out work. Keep that body bounded even when the global
+/// request-body limit is configured as unlimited, and cap aggregate retained
+/// replay bodies across plugin instances.
+pub const MAX_REPLAY_REQUEST_BODY_BYTES: usize = 10_485_760;
+const MAX_PROCESS_RETAINED_BODY_BYTES: u64 = 67_108_864;
+
 const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
 const HEADER_FANOUT: &str = "x-loadtesting-fanout";
 const FANOUT_MARKER: &str = "1";
 const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 
 static PROCESS_ACTIVE_CLIENTS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_RETAINED_BODY_BYTES: AtomicU64 = AtomicU64::new(0);
 static SHARED_STATES: OnceLock<Mutex<HashMap<String, Weak<LoadTestingState>>>> = OnceLock::new();
 
 /// Effective policy fields that determine whether a reload generation may
@@ -229,6 +237,7 @@ pub struct RunResult {
     pub responses_completed: u64,
     pub responses_truncated: u64,
     pub response_body_errors: u64,
+    pub request_timeouts: u64,
     pub transport_errors: u64,
     pub status_2xx: u64,
     pub status_3xx: u64,
@@ -268,6 +277,7 @@ struct WorkerCounters {
     responses_completed: u64,
     responses_truncated: u64,
     response_body_errors: u64,
+    request_timeouts: u64,
     transport_errors: u64,
     status_2xx: u64,
     status_3xx: u64,
@@ -287,6 +297,7 @@ impl WorkerCounters {
             saturating_add_assign(&mut total.responses_truncated, self.responses_truncated);
         saturated |=
             saturating_add_assign(&mut total.response_body_errors, self.response_body_errors);
+        saturated |= saturating_add_assign(&mut total.request_timeouts, self.request_timeouts);
         saturated |= saturating_add_assign(&mut total.transport_errors, self.transport_errors);
         saturated |= saturating_add_assign(&mut total.status_2xx, self.status_2xx);
         saturated |= saturating_add_assign(&mut total.status_3xx, self.status_3xx);
@@ -295,6 +306,11 @@ impl WorkerCounters {
         saturated |= saturating_add_assign(&mut total.status_other, self.status_other);
         saturated
     }
+}
+
+struct WorkerResult {
+    counters: WorkerCounters,
+    cancelled: bool,
 }
 
 fn saturating_add_assign(dst: &mut u64, src: u64) -> bool {
@@ -660,9 +676,8 @@ fn parse_gateway_addresses(
 }
 
 fn validate_gateway_address(url: &str) -> Result<Url, String> {
-    let parsed = Url::parse(url).map_err(|_| {
-        format!("load_testing: invalid gateway address ({INVALID_ADDRESS_LABEL})")
-    })?;
+    let parsed = Url::parse(url)
+        .map_err(|_| format!("load_testing: invalid gateway address ({INVALID_ADDRESS_LABEL})"))?;
     if !matches!(parsed.scheme(), "http" | "https")
         || !has_non_empty_authority(url)
         || parsed.host_str().is_none()
@@ -786,6 +801,26 @@ fn release_process_clients(count: u64) {
     PROCESS_ACTIVE_CLIENTS.fetch_sub(count, Ordering::SeqCst);
 }
 
+fn try_reserve_process_body_bytes(count: u64) -> bool {
+    loop {
+        let current = PROCESS_RETAINED_BODY_BYTES.load(Ordering::Relaxed);
+        if current.saturating_add(count) > MAX_PROCESS_RETAINED_BODY_BYTES {
+            return false;
+        }
+        if PROCESS_RETAINED_BODY_BYTES
+            .compare_exchange_weak(
+                current,
+                current + count,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
 #[async_trait]
 impl Plugin for LoadTesting {
     fn name(&self) -> &str {
@@ -816,10 +851,14 @@ impl Plugin for LoadTesting {
         false
     }
 
+    fn request_body_buffer_limit(&self) -> Option<usize> {
+        Some(MAX_REPLAY_REQUEST_BODY_BYTES)
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        // Preserve the ordinary non-trigger hot path: buffer only when the
-        // trigger header is present (matched later in before_proxy).
-        ctx.headers.contains_key(HEADER_TRIGGER_KEY)
+        // Preserve the ordinary and wrong-key hot paths: an unauthenticated
+        // caller must not force body retention merely by naming the header.
+        self.trigger_key_present_and_matches(&ctx.headers)
     }
 
     fn request_headers_to_redact(&self) -> &[String] {
@@ -835,18 +874,25 @@ impl Plugin for LoadTesting {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let key_matches = self.trigger_key_present_and_matches(headers);
+        // Authentication is anchored to the original ingress map used by the
+        // request-body admission decision. Requiring the effective map to match
+        // as well prevents an earlier transformer from manufacturing the
+        // administrative trigger or changing it after admission.
+        let key_matches = self.trigger_key_present_and_matches(&ctx.headers)
+            && self.trigger_key_present_and_matches(headers);
+        // The one-hop marker is likewise ingress provenance: a transformer may
+        // not manufacture it, and removing it must not re-enable peer fan-out.
+        let is_fanout = Self::is_fanout_control_request(&ctx.headers);
+
+        // These names are reserved control-plane inputs. Strip them on every
+        // path, including a wrong key, so attacker-chosen lookalikes never reach
+        // later plugins or application backends.
+        headers.remove(HEADER_TRIGGER_KEY);
+        headers.remove(HEADER_FANOUT);
+
         if !key_matches {
             return PluginResult::Continue;
         }
-
-        let is_fanout = Self::is_fanout_control_request(headers);
-
-        // Never forward the reusable administrative trigger key to later
-        // plugins or backends. Strip before any early-return admission path.
-        headers.remove(HEADER_TRIGGER_KEY);
-        // Fanout marker is control-plane only.
-        headers.remove(HEADER_FANOUT);
 
         let Some(run_cancel) = self.state.begin_run() else {
             tracing::warn!("load_testing: test already in progress, ignoring trigger");
@@ -873,6 +919,23 @@ impl Plugin for LoadTesting {
             };
         }
         let client_budget = ProcessClientBudget::new(u64::from(self.concurrent_clients));
+        let Some(request_body) =
+            RetainedRequestBody::try_new(ctx.request_body_bytes.clone())
+        else {
+            tracing::warn!(
+                requested_bytes = ctx.request_body_bytes.as_ref().map_or(0, Bytes::len),
+                "load_testing: process-wide retained request-body budget exhausted; ignoring trigger"
+            );
+            self.state.end_run(RunResult {
+                outcome: RunOutcome::Failed,
+                ..RunResult::default()
+            });
+            return if is_fanout {
+                fanout_ack_result()
+            } else {
+                PluginResult::Continue
+            };
+        };
 
         let proxy_name = ctx
             .matched_proxy
@@ -884,10 +947,12 @@ impl Plugin for LoadTesting {
         let path = ctx.path.clone();
         let raw_query = ctx.raw_query_string().map(str::to_owned);
         let method = ctx.method.clone();
-        let body_bytes: Option<Bytes> = ctx.request_body_bytes.clone();
 
-        let synthetic_headers = filter_outbound_headers(headers, /*keep_trigger_key=*/ false);
-        let fanout_headers = filter_outbound_headers(headers, /*keep_trigger_key=*/ true);
+        let synthetic_headers = filter_outbound_headers(headers);
+        // Fan-out starts from the same fully sanitized snapshot and appends one
+        // canonical key/marker pair below. Never preserve a transformed alias
+        // of either reserved control header.
+        let fanout_headers = synthetic_headers.clone();
 
         let concurrent_clients = self.concurrent_clients;
         let duration = Duration::from_secs(self.duration_seconds);
@@ -913,7 +978,7 @@ impl Plugin for LoadTesting {
                 fanout_hdrs.push((HEADER_FANOUT.to_string(), FANOUT_MARKER.to_string()));
                 let client = http_client.clone();
                 let remote_label = sanitize_gateway_label(addr);
-                let body = body_bytes.clone();
+                let body = Arc::clone(&request_body);
 
                 tokio::spawn(async move {
                     let Ok(mut req) =
@@ -925,8 +990,8 @@ impl Plugin for LoadTesting {
                         );
                         return;
                     };
-                    if let Some(bytes) = body {
-                        req = req.body(bytes);
+                    if let Some(bytes) = &body.bytes {
+                        req = req.body(bytes.clone());
                     }
                     if let Err(err) = client
                         .execute_redacted(req, "load_testing_fanout", &remote_label)
@@ -941,6 +1006,16 @@ impl Plugin for LoadTesting {
                 });
             }
         }
+
+        // Every local worker replays the same immutable request. Share one URL,
+        // method, sanitized header snapshot, and retained body across the cohort
+        // instead of cloning attacker-sized metadata up to 10,000 times.
+        let replay_request = Arc::new(ReplayRequest {
+            url: build_url(&gateway_base_url, &path, raw_query.as_deref()),
+            method,
+            headers: synthetic_headers,
+            body: request_body,
+        });
 
         info!(
             proxy = %proxy_name,
@@ -968,12 +1043,7 @@ impl Plugin for LoadTesting {
                 };
 
                 let client = load_test_client.clone();
-                let base_url = gateway_base_url.clone();
-                let path = path.clone();
-                let raw_query = raw_query.clone();
-                let method = method.clone();
-                let req_headers = synthetic_headers.clone();
-                let body = body_bytes.clone();
+                let replay_request = Arc::clone(&replay_request);
                 let worker_cancel = run_cancel.clone();
                 let per_request_timeout = Duration::from_millis(request_timeout_ms);
 
@@ -981,16 +1051,21 @@ impl Plugin for LoadTesting {
                     if !ramp_delay.is_zero() {
                         tokio::select! {
                             _ = worker_cancel.cancelled() => {
-                                return Ok(WorkerCounters::default());
+                                return WorkerResult {
+                                    counters: WorkerCounters::default(),
+                                    cancelled: true,
+                                };
                             }
                             _ = tokio::time::sleep(ramp_delay) => {}
                         }
                     }
 
                     let mut counters = WorkerCounters::default();
+                    let mut cancelled = false;
 
                     while Instant::now() < deadline {
                         if worker_cancel.is_cancelled() {
+                            cancelled = true;
                             break;
                         }
 
@@ -1001,8 +1076,12 @@ impl Plugin for LoadTesting {
                         let attempt_timeout = per_request_timeout.min(remaining);
                         counters.attempted_requests = counters.attempted_requests.saturating_add(1);
 
-                        let url = build_url(&base_url, &path, raw_query.as_deref());
-                        let mut req = match build_request(&client, &method, &url, &req_headers) {
+                        let mut req = match build_request(
+                            &client,
+                            &replay_request.method,
+                            &replay_request.url,
+                            &replay_request.headers,
+                        ) {
                             Ok(req) => req,
                             Err(()) => {
                                 counters.transport_errors =
@@ -1010,7 +1089,7 @@ impl Plugin for LoadTesting {
                                 continue;
                             }
                         };
-                        if let Some(ref bytes) = body {
+                        if let Some(bytes) = &replay_request.body.bytes {
                             req = req.body(bytes.clone());
                         }
 
@@ -1041,24 +1120,35 @@ impl Plugin for LoadTesting {
                                     // Classify without logging the raw reqwest error (URL/query
                                     // credentials must never reach structured logs).
                                     let _ = classify_reqwest_error(&err);
-                                    counters.transport_errors =
-                                        counters.transport_errors.saturating_add(1);
+                                    if err.is_timeout() {
+                                        counters.request_timeouts =
+                                            counters.request_timeouts.saturating_add(1);
+                                    } else {
+                                        counters.transport_errors =
+                                            counters.transport_errors.saturating_add(1);
+                                    }
                                 }
                             }
                         };
 
                         tokio::select! {
-                            _ = worker_cancel.cancelled() => break,
+                            _ = worker_cancel.cancelled() => {
+                                cancelled = true;
+                                break;
+                            }
                             result = tokio::time::timeout(attempt_timeout, send_fut) => {
                                 if result.is_err() {
-                                    counters.transport_errors =
-                                        counters.transport_errors.saturating_add(1);
+                                    counters.request_timeouts =
+                                        counters.request_timeouts.saturating_add(1);
                                 }
                             }
                         }
                     }
 
-                    Ok::<WorkerCounters, ()>(counters)
+                    WorkerResult {
+                        counters,
+                        cancelled,
+                    }
                 });
 
                 handles.push(handle);
@@ -1071,11 +1161,12 @@ impl Plugin for LoadTesting {
 
             for handle in handles {
                 match handle.await {
-                    Ok(Ok(counters)) => {
-                        aggregation_saturated |= counters.saturating_add_into(&mut totals);
-                    }
-                    Ok(Err(())) => {
-                        worker_failures = worker_failures.saturating_add(1);
+                    Ok(worker) => {
+                        aggregation_saturated |=
+                            worker.counters.saturating_add_into(&mut totals);
+                        if worker.cancelled {
+                            cancelled_workers = cancelled_workers.saturating_add(1);
+                        }
                     }
                     Err(join_err) => {
                         if join_err.is_cancelled() {
@@ -1094,12 +1185,14 @@ impl Plugin for LoadTesting {
             } else if totals.responses_completed == 0 || worker_failures > 0 {
                 RunOutcome::Failed
             } else if totals.transport_errors > 0
+                || totals.request_timeouts > 0
                 || totals.response_body_errors > 0
                 || totals.responses_truncated > 0
                 || cancelled_workers > 0
                 || aggregation_saturated
                 || totals.status_4xx > 0
                 || totals.status_5xx > 0
+                || totals.status_other > 0
             {
                 RunOutcome::Degraded
             } else {
@@ -1124,6 +1217,7 @@ impl Plugin for LoadTesting {
                 responses_completed: totals.responses_completed,
                 responses_truncated: totals.responses_truncated,
                 response_body_errors: totals.response_body_errors,
+                request_timeouts: totals.request_timeouts,
                 transport_errors: totals.transport_errors,
                 status_2xx: totals.status_2xx,
                 status_3xx: totals.status_3xx,
@@ -1144,6 +1238,7 @@ impl Plugin for LoadTesting {
                 responses_completed = result.responses_completed,
                 responses_truncated = result.responses_truncated,
                 response_body_errors = result.response_body_errors,
+                request_timeouts = result.request_timeouts,
                 transport_errors = result.transport_errors,
                 status_2xx = result.status_2xx,
                 status_3xx = result.status_3xx,
@@ -1175,6 +1270,37 @@ struct ProcessClientBudget {
     count: u64,
 }
 
+struct ReplayRequest {
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Arc<RetainedRequestBody>,
+}
+
+struct RetainedRequestBody {
+    bytes: Option<Bytes>,
+    reserved_bytes: u64,
+}
+
+impl RetainedRequestBody {
+    fn try_new(bytes: Option<Bytes>) -> Option<Arc<Self>> {
+        let reserved_bytes = bytes.as_ref().map_or(0, |body| body.len() as u64);
+        if !try_reserve_process_body_bytes(reserved_bytes) {
+            return None;
+        }
+        Some(Arc::new(Self {
+            bytes,
+            reserved_bytes,
+        }))
+    }
+}
+
+impl Drop for RetainedRequestBody {
+    fn drop(&mut self) {
+        PROCESS_RETAINED_BODY_BYTES.fetch_sub(self.reserved_bytes, Ordering::SeqCst);
+    }
+}
+
 impl ProcessClientBudget {
     fn new(count: u64) -> Self {
         Self { count }
@@ -1195,10 +1321,7 @@ fn fanout_ack_result() -> PluginResult {
     }
 }
 
-fn filter_outbound_headers(
-    headers: &HashMap<String, String>,
-    keep_trigger_key: bool,
-) -> Vec<(String, String)> {
+fn filter_outbound_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
     // Snapshot Connection-listed names before filtering so RFC 9110 dynamic
     // hop-by-hop tokens are removed even though `connection` itself is stripped.
     let connection_listed: HashSet<String> = parse_connection_listed_from_str_map(headers)
@@ -1210,16 +1333,18 @@ fn filter_outbound_headers(
         .filter(|(k, _)| {
             let name = k.as_str();
             let name_lower = name.to_ascii_lowercase();
-            if name == HEADER_FANOUT {
+            if name_lower == HEADER_FANOUT {
                 return false;
             }
-            if name == HEADER_TRIGGER_KEY {
-                return keep_trigger_key;
+            if name_lower == HEADER_TRIGGER_KEY {
+                return false;
             }
             if connection_listed.contains(&name_lower) {
                 return false;
             }
-            if is_backend_request_strip_header(name) || is_proxy_generated_forwarding_header(name) {
+            if is_backend_request_strip_header(&name_lower)
+                || is_proxy_generated_forwarding_header(&name_lower)
+            {
                 return false;
             }
             // Keep Host for host-based routing on synthetic/fan-out requests.

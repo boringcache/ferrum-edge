@@ -16604,7 +16604,9 @@ components:
         constructor validation; serving-mode publication uses KeepLastKnownGood
         so an invalid candidate keeps the prior valid generation active.
         Omitted optional fields select defaults; runtime also treats explicit
-        null on optional fields as omitted.
+        null on optional fields as omitted. Matching replay bodies have a hard
+        10 MiB plugin-local ceiling and active local/fan-out replay work shares
+        a 64 MiB process-wide retained-body budget.
       required:
         - key
         - concurrent_clients
@@ -16612,15 +16614,15 @@ components:
       properties:
         key:
           type: string
-          minLength: 16
+          minLength: 32
           pattern: '^[!-~][ -~]*[!-~]$'
           description: >-
             Secret value that the X-Loadtesting-Key header must match to trigger
-            the load test. Must be at least 16 printable ASCII HTTP field-value
-            characters with no leading or trailing space. The gateway never
-            echoes the value in validation errors and strips this header from
-            the original request before later deferred plugins or backend
-            dispatch.
+            the load test. Must be a randomly generated secret of at least 32
+            printable ASCII HTTP field-value characters with no leading or
+            trailing space. The gateway never echoes the value in validation
+            errors and strips this reserved header on matching and non-matching
+            paths before later deferred plugins or backend dispatch.
         concurrent_clients:
           type: integer
           format: uint64

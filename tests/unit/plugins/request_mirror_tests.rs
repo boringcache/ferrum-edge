@@ -491,6 +491,69 @@ async fn test_before_proxy_returns_continue() {
 }
 
 #[tokio::test]
+async fn test_mirror_never_forwards_load_testing_trigger_even_if_it_runs_first() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (captured_tx, captured_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 2048];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "mirror closed before completing request headers");
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = captured_tx.send(String::from_utf8_lossy(&request).to_ascii_lowercase());
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "percentage": 100,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "X-Loadtesting-Key".to_string(),
+        "test-load-key-0123456789abcdef!!".to_string(),
+    );
+    headers.insert("X-Loadtesting-Fanout".to_string(), "1".to_string());
+    headers.insert("x-keep".to_string(), "preserved".to_string());
+
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let _ = ctx.collect_mirror_result().await;
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(2), captured_rx)
+        .await
+        .expect("mirror request timeout")
+        .expect("mirror capture task");
+    assert!(
+        !captured.contains("\r\nx-loadtesting-key:"),
+        "the load-testing control secret reached the mirror: {captured}"
+    );
+    assert!(
+        !captured.contains("\r\nx-loadtesting-fanout:"),
+        "the load-testing one-hop marker reached the mirror: {captured}"
+    );
+    assert!(captured.contains("\r\nx-keep: preserved"));
+}
+
+#[tokio::test]
 async fn test_before_proxy_with_zero_percentage_returns_continue() {
     let plugin = RequestMirror::new(
         &json!({ "mirror_host": "mirror.local", "percentage": 0.0 }),

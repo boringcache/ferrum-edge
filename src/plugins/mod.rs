@@ -4985,8 +4985,8 @@ pub mod priority {
     pub const SERVERLESS_FUNCTION: u16 = 3025;
     pub const RESPONSE_MOCK: u16 = 3030;
     pub const GRPC_DEADLINE: u16 = 3050;
-    /// `load_testing`: strips the matching trigger secret before later
-    /// deferred transforms (notably `request_mirror`) can observe or copy it.
+    /// `load_testing`: strips the reserved trigger header on every path before
+    /// later deferred transforms (notably `request_mirror`) can observe it.
     pub const LOAD_TESTING: u16 = 3070;
     pub const REQUEST_MIRROR: u16 = 3075;
     pub const RESPONSE_SIZE_LIMITING: u16 = 3490;

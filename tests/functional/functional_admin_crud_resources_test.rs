@@ -1635,7 +1635,11 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         "loki_logging" => json!({"endpoint_url": "http://localhost:3100/loki/api/v1/push"}),
         "request_mirror" => json!({"mirror_host": "mirror.local"}),
         "load_testing" => {
-            json!({"key": "test-key-16chars!", "concurrent_clients": 5, "duration_seconds": 10})
+            json!({
+                "key": "test-load-key-0123456789abcdef!!",
+                "concurrent_clients": 5,
+                "duration_seconds": 10
+            })
         }
         "geo_restriction" => {
             json!({"db_path": "/nonexistent/path/to/GeoLite2-Country.mmdb", "allow_countries": ["US"]})

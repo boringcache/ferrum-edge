@@ -113,7 +113,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         }
         "request_mirror" => json!({"mirror_host": "mirror.local"}),
         "load_testing" => json!({
-            "key": "test-key-16chars!",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1
         }),
@@ -3084,7 +3084,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
 #[test]
 fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good() {
     let good = json!({
-        "key": "stable-key-16chr!",
+        "key": "stable-load-key-0123456789abcdef!",
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "ramp": true
@@ -3114,7 +3114,7 @@ fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good()
             "pc-load",
             "load_testing",
             json!({
-                "key": "must-not-publish!",
+                "key": "must-not-publish-load-key-0123456789!",
                 "concurrent_clients": 50,
                 "duration_seconds": 30,
                 "request_timeot_ms": 5000

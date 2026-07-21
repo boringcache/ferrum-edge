@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use ferrum_edge::plugins::load_testing::{
-    LOAD_TESTING_CONFIG_KEYS, LoadTesting, MAX_GATEWAY_ADDRESSES, MIN_TRIGGER_KEY_LEN, RunOutcome,
+    LOAD_TESTING_CONFIG_KEYS, LoadTesting, MAX_GATEWAY_ADDRESSES, MAX_REPLAY_REQUEST_BODY_BYTES,
+    MIN_TRIGGER_KEY_LEN, RunOutcome,
 };
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
@@ -13,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 
-const VALID_KEY: &str = "test-secret-key!!"; // >= 16 chars
+const VALID_KEY: &str = "test-load-key-0123456789abcdef!!"; // exactly 32 chars
 
 type StalledRequestObserver = (u16, oneshot::Receiver<()>, oneshot::Receiver<()>);
 
@@ -28,6 +29,18 @@ fn make_valid_config() -> serde_json::Value {
 
 fn make_plugin() -> LoadTesting {
     LoadTesting::new(&make_valid_config(), PluginHttpClient::default()).unwrap()
+}
+
+async fn run_before_proxy(
+    plugin: &LoadTesting,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    // Production keeps `ctx.headers` as the immutable ingress view and passes a
+    // clone through header-transforming hooks. Mirror that contract in direct
+    // plugin tests so trigger authentication exercises both views.
+    ctx.headers = headers.clone();
+    plugin.before_proxy(ctx, headers).await
 }
 
 fn matched_proxy() -> Arc<ferrum_edge::config::types::Proxy> {
@@ -49,6 +62,10 @@ async fn wait_until_idle(plugin: &LoadTesting) {
     while plugin.is_running() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        !plugin.is_running(),
+        "timed out waiting for load_testing cohort to stop"
+    );
 }
 
 async fn wait_for_result(plugin: &LoadTesting) -> ferrum_edge::plugins::load_testing::RunResult {
@@ -114,7 +131,10 @@ async fn spawn_stalled_request_observer() -> StalledRequestObserver {
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept stalled request");
         let mut request = [0u8; 4096];
-        let read = socket.read(&mut request).await.expect("read stalled request");
+        let read = socket
+            .read(&mut request)
+            .await
+            .expect("read stalled request");
         assert!(read > 0, "stalled request must send bytes");
         let _ = request_started_tx.send(());
 
@@ -216,6 +236,11 @@ fn test_declares_header_mutation_and_trigger_redaction() {
     let plugin = make_plugin();
     assert!(plugin.modifies_request_headers());
     assert_eq!(plugin.request_headers_to_redact(), &["x-loadtesting-key"]);
+    assert_eq!(
+        plugin.request_body_buffer_limit(),
+        Some(MAX_REPLAY_REQUEST_BODY_BYTES),
+        "load-testing replay bodies must remain bounded when the global limit is unlimited"
+    );
 }
 
 #[test]
@@ -273,7 +298,7 @@ fn test_valid_config_with_gateway_addresses() {
 #[test]
 fn test_valid_config_boundary_values() {
     let config = json!({
-        "key": "sixteen-char-key",
+        "key": "test-load-key-0123456789abcdef!!",
         "concurrent_clients": 1,
         "duration_seconds": 1,
         "gateway_port": 8000
@@ -281,7 +306,7 @@ fn test_valid_config_boundary_values() {
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 
     let config = json!({
-        "key": "sixteen-char-key",
+        "key": "test-load-key-0123456789abcdef!!",
         "concurrent_clients": 10000,
         "duration_seconds": 3600,
         "gateway_port": 8000
@@ -292,7 +317,7 @@ fn test_valid_config_boundary_values() {
 #[test]
 fn test_valid_config_with_every_supported_field() {
     let config = json!({
-        "key": "full-surface-key!",
+        "key": "full-surface-load-key-0123456789!",
         "concurrent_clients": 25,
         "duration_seconds": 45,
         "ramp": true,
@@ -317,7 +342,7 @@ fn test_optional_null_fields_still_select_defaults() {
     let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
     env.unset("FERRUM_PROXY_HTTP_PORT");
     let config = json!({
-        "key": "null-defaults-key",
+        "key": "null-defaults-key-0123456789abcdef!",
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "ramp": null,
@@ -342,7 +367,7 @@ fn test_rejects_short_trigger_key() {
     let err = LoadTesting::new(&config, PluginHttpClient::default())
         .err()
         .unwrap();
-    assert!(err.contains("at least 16 characters"), "got: {err}");
+    assert!(err.contains("at least 32 characters"), "got: {err}");
 }
 
 #[test]
@@ -375,7 +400,7 @@ fn test_trigger_key_must_be_a_stable_printable_ascii_header_value() {
     }
 
     let internal_space = json!({
-        "key": "sixteen char key!",
+        "key": "test load key 0123456789abcdef!!",
         "concurrent_clients": 1,
         "duration_seconds": 1,
         "gateway_port": 8000
@@ -752,7 +777,7 @@ fn test_env_derived_enabled_http_port_is_accepted() {
 }
 
 #[test]
-fn test_should_buffer_only_when_trigger_header_present() {
+fn test_should_buffer_only_when_trigger_key_matches() {
     let plugin = make_plugin();
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -760,6 +785,14 @@ fn test_should_buffer_only_when_trigger_header_present() {
         "/orders".to_string(),
     );
     assert!(!plugin.should_buffer_request_body(&ctx));
+    ctx.headers.insert(
+        "x-loadtesting-key".to_string(),
+        "wrong-key-value!!".to_string(),
+    );
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "a wrong key must not let unauthenticated callers force body buffering"
+    );
     ctx.headers
         .insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
     assert!(plugin.should_buffer_request_body(&ctx));
@@ -779,7 +812,7 @@ async fn test_skips_when_no_key_header() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -794,13 +827,64 @@ async fn test_skips_when_key_does_not_match() {
     let mut headers = HashMap::new();
     headers.insert(
         "x-loadtesting-key".to_string(),
-        "wrong-key-value!!".to_string(),
+        "wrong-load-key-0123456789abcdef!".to_string(),
     );
+    headers.insert("x-loadtesting-fanout".to_string(), "1".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    // Non-matching keys are left in place (not a trigger admission).
-    assert!(headers.contains_key("x-loadtesting-key"));
+    assert!(
+        !headers.contains_key("x-loadtesting-key"),
+        "the reserved trigger header must never reach later plugins or backends"
+    );
+    assert!(
+        !headers.contains_key("x-loadtesting-fanout"),
+        "the reserved fan-out marker must never reach application backends"
+    );
+}
+
+#[tokio::test]
+async fn test_header_transformers_cannot_manufacture_or_change_trigger_authentication() {
+    let plugin = make_plugin();
+
+    // A matching value introduced only into the mutable hook map was not
+    // present when body admission ran and must not start a cohort.
+    let mut injected_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    let mut injected_headers = HashMap::from([(
+        "x-loadtesting-key".to_string(),
+        VALID_KEY.to_string(),
+    )]);
+    let injected_result = plugin
+        .before_proxy(&mut injected_ctx, &mut injected_headers)
+        .await;
+    assert!(matches!(injected_result, PluginResult::Continue));
+    assert!(!plugin.is_running());
+    assert!(!injected_headers.contains_key("x-loadtesting-key"));
+
+    // Likewise, a client key that an earlier hook changed no longer has the
+    // same authenticated value and must fail closed.
+    let mut changed_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    changed_ctx
+        .headers
+        .insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    let mut changed_headers = HashMap::from([(
+        "x-loadtesting-key".to_string(),
+        "changed-load-key-0123456789abcdef!".to_string(),
+    )]);
+    let changed_result = plugin
+        .before_proxy(&mut changed_ctx, &mut changed_headers)
+        .await;
+    assert!(matches!(changed_result, PluginResult::Continue));
+    assert!(!plugin.is_running());
+    assert!(!changed_headers.contains_key("x-loadtesting-key"));
 }
 
 #[tokio::test]
@@ -826,7 +910,7 @@ async fn test_matching_paths_strip_trigger_before_continue_or_ack() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(!headers.contains_key("x-loadtesting-key"));
     assert!(plugin.is_running());
 
@@ -838,7 +922,7 @@ async fn test_matching_paths_strip_trigger_before_continue_or_ack() {
     ctx2.matched_proxy = Some(matched_proxy());
     let mut headers2 = HashMap::new();
     headers2.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let result2 = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result2 = run_before_proxy(&plugin, &mut ctx2, &mut headers2).await;
     assert!(matches!(result2, PluginResult::Continue));
     assert!(
         !headers2.contains_key("x-loadtesting-key"),
@@ -869,7 +953,7 @@ async fn test_strips_trigger_key_from_original_request() {
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
     headers.insert("x-forwarded-for".to_string(), "203.0.113.9".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!headers.contains_key("x-loadtesting-key"));
     wait_until_idle(&plugin).await;
@@ -897,13 +981,51 @@ async fn test_fanout_control_request_terminates_before_backend() {
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
     headers.insert("x-loadtesting-fanout".to_string(), "1".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     match result {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 204),
         other => panic!("expected fanout ack reject, got {other:?}"),
     }
     assert!(!headers.contains_key("x-loadtesting-key"));
     assert!(!headers.contains_key("x-loadtesting-fanout"));
+    wait_until_idle(&plugin).await;
+}
+
+#[tokio::test]
+async fn test_ingress_fanout_marker_cannot_be_removed_to_reenable_fanout() {
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 9
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.headers
+        .insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    ctx.headers
+        .insert("x-loadtesting-fanout".to_string(), "1".to_string());
+
+    // Model an earlier transformer removing only the one-hop marker from the
+    // effective map. Ingress provenance must still force the terminal 204 ack.
+    let mut headers = HashMap::from([(
+        "x-loadtesting-key".to_string(),
+        VALID_KEY.to_string(),
+    )]);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 204),
+        other => panic!("expected fanout ack reject, got {other:?}"),
+    }
+    assert!(!headers.contains_key("x-loadtesting-key"));
     wait_until_idle(&plugin).await;
 }
 
@@ -929,7 +1051,7 @@ async fn test_connection_refusal_is_not_reported_as_completed_throughput() {
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
 
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     let result = wait_for_result(&plugin).await;
     assert!(result.attempted_requests > 0);
     assert_eq!(result.responses_completed, 0);
@@ -939,6 +1061,130 @@ async fn test_connection_refusal_is_not_reported_as_completed_throughput() {
         result.outcome,
         RunOutcome::Failed | RunOutcome::Degraded | RunOutcome::Cancelled
     ));
+}
+
+#[tokio::test]
+async fn test_request_timeouts_are_distinct_from_transport_errors() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept stalled request");
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": port,
+            "request_timeout_ms": 100
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/timeout".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    let result = wait_for_result(&plugin).await;
+    assert!(result.request_timeouts > 0, "got: {result:?}");
+    assert_eq!(result.responses_completed, 0);
+    assert_eq!(result.completed_requests_per_second(), 0.0);
+    assert_eq!(result.outcome, RunOutcome::Failed);
+}
+
+#[tokio::test]
+async fn test_non_success_status_is_counted_and_degrades_a_completed_run() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept error response");
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        let _ = socket
+            .write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+    });
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": port,
+            "request_timeout_ms": 200
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/unavailable".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    let result = wait_for_result(&plugin).await;
+    assert!(result.status_5xx >= 1, "got: {result:?}");
+    assert!(result.responses_completed >= 1, "got: {result:?}");
+    assert_eq!(result.outcome, RunOutcome::Degraded);
+}
+
+#[tokio::test]
+async fn test_truncated_chunk_stream_is_a_body_error_not_a_completed_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept broken response");
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        let _ = socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nabc",
+            )
+            .await;
+    });
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": port,
+            "request_timeout_ms": 200
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/broken-body".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    let result = wait_for_result(&plugin).await;
+    assert!(result.responses_received >= 1, "got: {result:?}");
+    assert!(result.response_body_errors >= 1, "got: {result:?}");
+    assert_eq!(result.responses_completed, 0);
+    assert_eq!(result.outcome, RunOutcome::Failed);
 }
 
 #[tokio::test]
@@ -970,18 +1216,24 @@ async fn test_generated_request_fidelity_and_header_sanitization() {
     ctx.request_body_bytes = Some(body.clone());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    headers.insert("content-type".to_string(), "application/octet-stream".to_string());
+    headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    );
     headers.insert("content-length".to_string(), "999".to_string()); // stale framing
     headers.insert("transfer-encoding".to_string(), "chunked".to_string());
     headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
     headers.insert("x-forwarded-proto".to_string(), "https".to_string());
     headers.insert("x-forwarded-host".to_string(), "evil.example".to_string());
-    headers.insert("connection".to_string(), "x-sensitive, keep-alive".to_string());
+    headers.insert(
+        "connection".to_string(),
+        "x-sensitive, keep-alive".to_string(),
+    );
     headers.insert("x-sensitive".to_string(), "should-not-forward".to_string());
     headers.insert("x-custom".to_string(), "keep-me".to_string());
     headers.insert("host".to_string(), "gateway.example".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!headers.contains_key("x-loadtesting-key"));
 
@@ -1026,14 +1278,54 @@ async fn test_generated_request_fidelity_and_header_sanitization() {
 }
 
 #[tokio::test]
+async fn test_empty_request_body_replays_with_consistent_framing() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let capture = tokio::spawn(capture_one_http_request(listener));
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": port,
+            "request_timeout_ms": 500
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/empty".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.request_body_bytes = Some(Bytes::new());
+    let mut headers = HashMap::from([
+        ("x-loadtesting-key".to_string(), VALID_KEY.to_string()),
+        ("content-length".to_string(), "0".to_string()),
+    ]);
+
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let raw = capture.await.expect("capture task");
+    let (request_line, request_headers, request_body) = parse_captured_request(&raw);
+    assert_eq!(request_line, "POST /empty HTTP/1.1");
+    assert!(request_body.is_empty());
+    assert!(
+        request_headers
+            .get("content-length")
+            .is_none_or(|value| value == "0"),
+        "empty replay advertised nonzero framing: {request_headers:?}"
+    );
+    wait_until_idle(&plugin).await;
+}
+
+#[tokio::test]
 async fn test_fanout_request_replays_body_query_and_sanitized_headers_on_wire() {
-    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_port = local_listener.local_addr().unwrap().port();
-    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote_port = remote_listener.local_addr().unwrap().port();
     let local_capture = tokio::spawn(capture_one_http_request(local_listener));
     let remote_capture = tokio::spawn(capture_one_http_request(remote_listener));
@@ -1070,7 +1362,7 @@ async fn test_fanout_request_replays_body_query_and_sanitized_headers_on_wire() 
     headers.insert("x-keep".to_string(), "present".to_string());
     headers.insert("host".to_string(), "gateway.example".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!headers.contains_key("x-loadtesting-key"));
 
@@ -1085,9 +1377,7 @@ async fn test_fanout_request_replays_body_query_and_sanitized_headers_on_wire() 
     );
     assert_eq!(fanout_body, body.as_ref());
     assert_eq!(
-        fanout_headers
-            .get("x-loadtesting-key")
-            .map(String::as_str),
+        fanout_headers.get("x-loadtesting-key").map(String::as_str),
         Some(VALID_KEY)
     );
     assert_eq!(
@@ -1158,7 +1448,7 @@ async fn test_extension_method_body_replay_and_invalid_method_accounting() {
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     let raw = capture.await.expect("capture task");
     let (request_line, _, req_body) = parse_captured_request(&raw);
     assert!(
@@ -1188,7 +1478,7 @@ async fn test_extension_method_body_replay_and_invalid_method_accounting() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     let run = wait_for_result(&plugin).await;
     assert!(run.attempted_requests > 0);
     assert_eq!(run.responses_completed, 0);
@@ -1232,7 +1522,7 @@ async fn test_exactly_at_cap_response_is_completed_not_truncated() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     let run = wait_for_result(&plugin).await;
     assert!(
         run.responses_completed >= 1,
@@ -1278,7 +1568,7 @@ async fn test_beyond_cap_response_is_truncated() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     let run = wait_for_result(&plugin).await;
     assert!(
         run.responses_truncated >= 1,
@@ -1309,7 +1599,7 @@ async fn test_shared_state_prevents_second_instance_while_running() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = plugin_a.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin_a, &mut ctx, &mut headers).await;
     assert!(plugin_a.is_running());
 
     let mut ctx2 = RequestContext::new(
@@ -1320,7 +1610,7 @@ async fn test_shared_state_prevents_second_instance_while_running() {
     ctx2.matched_proxy = Some(matched_proxy());
     let mut headers2 = HashMap::new();
     headers2.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = plugin_b.before_proxy(&mut ctx2, &mut headers2).await;
+    let _ = run_before_proxy(&plugin_b, &mut ctx2, &mut headers2).await;
 
     // Second instance must observe the shared admission guard.
     assert!(plugin_b.is_running());
@@ -1351,7 +1641,7 @@ async fn test_last_owner_removal_cancels_active_cohort() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(plugin.is_running());
 
     tokio::time::timeout(Duration::from_secs(2), request_started)
@@ -1416,7 +1706,7 @@ async fn test_replacement_generation_does_not_cancel_shared_cohort() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = plugin_a.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&plugin_a, &mut ctx, &mut headers).await;
     assert!(plugin_a.is_running());
 
     // Replacement generation arrives while the cohort is live.
@@ -1455,14 +1745,14 @@ async fn test_incompatible_replacement_uses_new_state_and_old_owner_cancels() {
     ctx.matched_proxy = Some(matched_proxy());
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let _ = old_plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = run_before_proxy(&old_plugin, &mut ctx, &mut headers).await;
     tokio::time::timeout(Duration::from_secs(2), request_started)
         .await
         .expect("old cohort must start")
         .expect("stalled observer must report old request");
 
     let replacement_config = json!({
-        "key": "replacement-key!!",
+        "key": "replacement-load-key-0123456789abc!",
         "concurrent_clients": 1,
         "duration_seconds": 1,
         "gateway_port": 9,
@@ -1507,7 +1797,7 @@ async fn test_triggers_when_key_matches_and_blocks_concurrent_trigger() {
     let mut headers = HashMap::new();
     headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(plugin.is_running());
 
@@ -1519,7 +1809,7 @@ async fn test_triggers_when_key_matches_and_blocks_concurrent_trigger() {
     ctx2.matched_proxy = Some(matched_proxy());
     let mut headers2 = HashMap::new();
     headers2.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    let result2 = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result2 = run_before_proxy(&plugin, &mut ctx2, &mut headers2).await;
     assert!(matches!(result2, PluginResult::Continue));
     wait_until_idle(&plugin).await;
 }

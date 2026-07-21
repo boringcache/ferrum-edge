@@ -2923,7 +2923,7 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         (
             "load_testing",
             json!({
-                "key": "test-key-16chars!",
+                "key": "test-load-key-0123456789abcdef!!",
                 "concurrent_clients": 1,
                 "duration_seconds": 1,
                 "max_response_body_bytes": 1024
@@ -3778,7 +3778,9 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
 #[tokio::test]
 async fn load_testing_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::PluginHttpClient;
-    use ferrum_edge::plugins::load_testing::{LOAD_TESTING_CONFIG_KEYS, LoadTesting};
+    use ferrum_edge::plugins::load_testing::{
+        LOAD_TESTING_CONFIG_KEYS, LoadTesting, MAX_GATEWAY_ADDRESSES, MIN_TRIGGER_KEY_LEN,
+    };
 
     let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
     env.unset("FERRUM_PROXY_HTTP_PORT");
@@ -3821,7 +3823,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert!(load_testing_docs.contains("Unknown top-level keys"));
     assert_eq!(
         schema["properties"]["gateway_addresses"]["maxItems"],
-        json!(32),
+        json!(MAX_GATEWAY_ADDRESSES),
         "OpenAPI maxItems must match runtime MAX_GATEWAY_ADDRESSES"
     );
     assert_eq!(
@@ -3838,7 +3840,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     );
     assert_eq!(
         schema["properties"]["key"]["minLength"],
-        json!(16),
+        json!(MIN_TRIGGER_KEY_LEN),
         "OpenAPI minLength must match runtime MIN_TRIGGER_KEY_LEN"
     );
     assert_eq!(
@@ -3848,7 +3850,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     );
 
     let valid = json!({
-        "key": "parity-key-16chr",
+        "key": "test-load-key-0123456789abcdef!!",
         "concurrent_clients": 10,
         "duration_seconds": 30,
         "ramp": true,
@@ -3863,7 +3865,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert!(LoadTesting::new(&valid, PluginHttpClient::default()).is_ok());
 
     let valid_internal_space = json!({
-        "key": "sixteen char key!",
+        "key": "test load key 0123456789abcdef!!",
         "concurrent_clients": 1,
         "duration_seconds": 1,
         "gateway_port": 8000
@@ -3872,7 +3874,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert!(LoadTesting::new(&valid_internal_space, PluginHttpClient::default()).is_ok());
 
     let valid_minima = json!({
-        "key": "sixteen-char-key",
+        "key": "test-load-key-0123456789abcdef!!",
         "concurrent_clients": 1,
         "duration_seconds": 1
     });
@@ -3880,7 +3882,7 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert!(LoadTesting::new(&valid_minima, PluginHttpClient::default()).is_ok());
 
     let valid_null_defaults = json!({
-        "key": "null-defaults-key",
+        "key": "null-defaults-key-0123456789abcdef!",
         "concurrent_clients": 1,
         "duration_seconds": 1,
         "ramp": null,
@@ -3896,20 +3898,20 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
 
     let runtime_and_schema_invalid = [
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "request_timeot_ms": 5000
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "rmap": true,
             "gateway_adresses": ["https://10.0.0.2:8443"]
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "aaa_extra": 1,
@@ -3917,12 +3919,12 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
         }),
         json!({}),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 0,
             "duration_seconds": 1
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 0
         }),
@@ -3932,19 +3934,19 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
             "duration_seconds": 1
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "request_timeout_ms": 60001
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "gateway_port": 0
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "gateway_addresses": (0..33)
@@ -3952,34 +3954,34 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
                 .collect::<Vec<_>>()
         }),
         json!({
-            "key": "😀".repeat(16),
+            "key": "😀".repeat(32),
             "concurrent_clients": 1,
             "duration_seconds": 1
         }),
         json!({
-            "key": " sixteen-char-key",
+            "key": " test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1
         }),
         json!({
-            "key": "sixteen-char-key ",
+            "key": "test-load-key-0123456789abcdef!! ",
             "concurrent_clients": 1,
             "duration_seconds": 1
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "gateway_addresses": []
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "gateway_addresses": [""]
         }),
         json!({
-            "key": "sixteen-char-key",
+            "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "gateway_addresses": [

@@ -75,6 +75,8 @@ use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestC
 /// response over a fire-and-forget task.
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
+const LOAD_TESTING_TRIGGER_HEADER: &str = "x-loadtesting-key";
+const LOAD_TESTING_FANOUT_HEADER: &str = "x-loadtesting-fanout";
 
 fn strip_query_params(url: &str) -> &str {
     url.split_once('?').map_or(url, |(base, _)| base)
@@ -479,6 +481,14 @@ impl Plugin for RequestMirror {
 
             // Forward all headers from the original (transformed) request
             for (key, value) in &mirror_headers {
+                // Defense in depth for chains with a priority override: the
+                // reusable load-testing controls are never mirror data, even if
+                // request_mirror executes before load_testing strips them.
+                if key.eq_ignore_ascii_case(LOAD_TESTING_TRIGGER_HEADER)
+                    || key.eq_ignore_ascii_case(LOAD_TESTING_FANOUT_HEADER)
+                {
+                    continue;
+                }
                 // Skip hop-by-hop and connection-specific headers. Also skip
                 // `content-length`: when the body is not mirrored
                 // (`mirror_request_body = false`) or simply unavailable, no

@@ -178,9 +178,11 @@ without a backend-path policy retain the ordinary single `before_proxy` pass.
 Deferred hooks generally observe the original client path, preserving their
 normal request semantics even when mesh routing rewrote the backend path.
 Within that deferred transform band, `load_testing` (3070) runs before
-`request_mirror` (3075) so a matching `X-Loadtesting-Key` is stripped before
-mirror can copy it; both plugins still require backend-path resolution and
-pre-`before_proxy` body availability when they opt in. `request_mirror` is
+`request_mirror` (3075) so the reserved `X-Loadtesting-Key` is stripped on both
+matching and non-matching paths before mirror can copy it. As defense in depth,
+`request_mirror` also excludes both load-testing control headers if priority
+overrides reverse the order. Both plugins still require backend-path resolution
+and pre-`before_proxy` body availability when they opt in. `request_mirror` is
 also the security-sensitive path exception: when backend-path policy is active
 and `mirror_path` is unset, it mirrors the exact effective path that passed
 final authorization. An explicit operator-configured `mirror_path` still wins.
