@@ -9,12 +9,13 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 
-const VALID_KEY: &str = "test-secret-key!!"; // 16 chars
+const VALID_KEY: &str = "test-secret-key!!"; // >= 16 chars
+
+type StalledRequestObserver = (u16, oneshot::Receiver<()>, oneshot::Receiver<()>);
 
 fn make_valid_config() -> serde_json::Value {
     json!({
@@ -100,6 +101,36 @@ async fn capture_one_http_request(listener: tokio::net::TcpListener) -> Vec<u8> 
         }
         assert!(buf.len() < 64 * 1024, "request grew too large");
     }
+}
+
+async fn spawn_stalled_request_observer() -> StalledRequestObserver {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let (request_started_tx, request_started_rx) = oneshot::channel();
+    let (client_closed_tx, client_closed_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept stalled request");
+        let mut request = [0u8; 4096];
+        let read = socket.read(&mut request).await.expect("read stalled request");
+        assert!(read > 0, "stalled request must send bytes");
+        let _ = request_started_tx.send(());
+
+        // Never send a response. Cancellation must drop the in-flight reqwest
+        // future and close its HTTP/1.1 connection before the run deadline.
+        let mut byte = [0u8; 1];
+        loop {
+            match socket.read(&mut byte).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = client_closed_tx.send(());
+    });
+
+    (port, request_started_rx, client_closed_rx)
 }
 
 fn parse_captured_request(raw: &[u8]) -> (String, HashMap<String, String>, Vec<u8>) {
@@ -315,39 +346,41 @@ fn test_rejects_short_trigger_key() {
 }
 
 #[test]
-fn test_trigger_key_length_uses_unicode_characters_not_bytes() {
-    // 8 emoji × 4 UTF-8 bytes each = 32 bytes, but only 8 Unicode scalar values.
-    let short_chars = "😀".repeat(8);
-    assert!(short_chars.len() > MIN_TRIGGER_KEY_LEN);
-    assert_eq!(short_chars.chars().count(), 8);
-    let err = LoadTesting::new(
-        &json!({
-            "key": short_chars,
-            "concurrent_clients": 1,
-            "duration_seconds": 1,
-            "gateway_port": 8000
-        }),
-        PluginHttpClient::default(),
-    )
-    .err()
-    .expect("byte-long but character-short key must fail");
-    assert!(err.contains("at least 16 characters"), "got: {err}");
+fn test_trigger_key_must_be_a_stable_printable_ascii_header_value() {
+    let invalid = [
+        "😀".repeat(MIN_TRIGGER_KEY_LEN),
+        format!(" {VALID_KEY}"),
+        format!("{VALID_KEY} "),
+        format!("{VALID_KEY}\r\ninjected"),
+        format!("{VALID_KEY}\tmore"),
+    ];
 
-    // 16 emoji characters should pass the character-count contract.
-    let long_chars = "😀".repeat(MIN_TRIGGER_KEY_LEN);
-    assert_eq!(long_chars.chars().count(), MIN_TRIGGER_KEY_LEN);
-    assert!(
-        LoadTesting::new(
+    for key in invalid {
+        let err = LoadTesting::new(
             &json!({
-                "key": long_chars,
+                "key": key.clone(),
                 "concurrent_clients": 1,
                 "duration_seconds": 1,
                 "gateway_port": 8000
             }),
             PluginHttpClient::default(),
         )
-        .is_ok()
-    );
+        .err()
+        .expect("non-header-safe trigger key must fail");
+        assert!(err.contains("printable ASCII"), "got: {err}");
+        assert!(
+            !err.contains(key.as_str()),
+            "trigger key leaked in error: {err}"
+        );
+    }
+
+    let internal_space = json!({
+        "key": "sixteen char key!",
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 8000
+    });
+    assert!(LoadTesting::new(&internal_space, PluginHttpClient::default()).is_ok());
 }
 
 #[test]
@@ -624,7 +657,11 @@ fn test_self_loopback_gateway_aliases_are_rejected() {
         "http://127.0.0.9:8000",
         "http://localhost:8000",
         "http://LOCALHOST:8000",
+        "http://localhost.:8000",
+        "http://node.localhost:8000",
+        "http://NODE.LOCALHOST.:8000",
         "http://[::1]:8000",
+        "http://[::ffff:127.0.0.1]:8000",
     ] {
         let config = json!({
             "key": VALID_KEY,
@@ -948,7 +985,7 @@ async fn test_generated_request_fidelity_and_header_sanitization() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(!headers.contains_key("x-loadtesting-key"));
 
-    let raw = capture.await.expect("capture task").expect("request bytes");
+    let raw = capture.await.expect("capture task");
     let (request_line, req_headers, req_body) = parse_captured_request(&raw);
 
     assert_eq!(
@@ -973,11 +1010,10 @@ async fn test_generated_request_fidelity_and_header_sanitization() {
         req_headers.get("x-custom").map(String::as_str),
         Some("keep-me")
     );
-    // Host is retained by outbound filtering for host-based routing; reqwest may
-    // still derive the wire Host from the target URL, so only require presence.
-    assert!(
-        req_headers.contains_key("host"),
-        "synthetic requests must carry a Host header"
+    assert_eq!(
+        req_headers.get("host").map(String::as_str),
+        Some("gateway.example"),
+        "synthetic requests must preserve the original Host for routing"
     );
 
     let run = wait_for_result(&plugin).await;
@@ -987,6 +1023,109 @@ async fn test_generated_request_fidelity_and_header_sanitization() {
         run.outcome,
         RunOutcome::Success | RunOutcome::Degraded
     ));
+}
+
+#[tokio::test]
+async fn test_fanout_request_replays_body_query_and_sanitized_headers_on_wire() {
+    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let local_port = local_listener.local_addr().unwrap().port();
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap();
+    let remote_port = remote_listener.local_addr().unwrap().port();
+    let local_capture = tokio::spawn(capture_one_http_request(local_listener));
+    let remote_capture = tokio::spawn(capture_one_http_request(remote_listener));
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 2,
+            "gateway_port": local_port,
+            "gateway_addresses": [format!("http://127.0.0.1:{remote_port}")],
+            "request_timeout_ms": 1000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let body = Bytes::from_static(&[0x00, 0xff, 0x41, 0x42]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "DELETE".to_string(),
+        "/fanout".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.set_raw_query_string("raw=a+b&encoded=%2Froot&flag".to_string());
+    ctx.request_body_bytes = Some(body.clone());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    headers.insert("content-length".to_string(), "999".to_string());
+    headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+    headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
+    headers.insert("connection".to_string(), "x-private".to_string());
+    headers.insert("x-private".to_string(), "must-strip".to_string());
+    headers.insert("x-keep".to_string(), "present".to_string());
+    headers.insert("host".to_string(), "gateway.example".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("x-loadtesting-key"));
+
+    let remote_raw = tokio::time::timeout(Duration::from_secs(3), remote_capture)
+        .await
+        .expect("fan-out request timeout")
+        .expect("fan-out capture task");
+    let (request_line, fanout_headers, fanout_body) = parse_captured_request(&remote_raw);
+    assert_eq!(
+        request_line,
+        "DELETE /fanout?raw=a+b&encoded=%2Froot&flag HTTP/1.1"
+    );
+    assert_eq!(fanout_body, body.as_ref());
+    assert_eq!(
+        fanout_headers
+            .get("x-loadtesting-key")
+            .map(String::as_str),
+        Some(VALID_KEY)
+    );
+    assert_eq!(
+        fanout_headers
+            .get("x-loadtesting-fanout")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        fanout_headers.get("content-length").map(String::as_str),
+        Some("4")
+    );
+    assert_eq!(
+        fanout_headers.get("host").map(String::as_str),
+        Some("gateway.example")
+    );
+    assert_eq!(
+        fanout_headers.get("x-keep").map(String::as_str),
+        Some("present")
+    );
+    for stripped in [
+        "connection",
+        "x-private",
+        "transfer-encoding",
+        "x-forwarded-for",
+    ] {
+        assert!(
+            !fanout_headers.contains_key(stripped),
+            "fan-out leaked stripped header {stripped}: {fanout_headers:?}"
+        );
+    }
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), local_capture)
+        .await
+        .expect("local synthetic request timeout")
+        .expect("local capture task");
+    let run = wait_for_result(&plugin).await;
+    assert!(run.attempted_requests > 0);
 }
 
 #[tokio::test]
@@ -1020,7 +1159,7 @@ async fn test_extension_method_body_replay_and_invalid_method_accounting() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-    let raw = capture.await.expect("capture task").expect("request bytes");
+    let raw = capture.await.expect("capture task");
     let (request_line, _, req_body) = parse_captured_request(&raw);
     assert!(
         request_line.starts_with("PURGE /cache HTTP/1.1"),
@@ -1190,24 +1329,7 @@ async fn test_shared_state_prevents_second_instance_while_running() {
 
 #[tokio::test]
 async fn test_last_owner_removal_cancels_active_cohort() {
-    let accept_count = Arc::new(AtomicUsize::new(0));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let accept_count_task = Arc::clone(&accept_count);
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-            accept_count_task.fetch_add(1, Ordering::SeqCst);
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                let _ = socket.read(&mut buf).await;
-                // Stall long enough that cancellation can interrupt the cohort.
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            });
-        }
-    });
+    let (port, request_started, client_closed) = spawn_stalled_request_observer().await;
 
     let plugin = LoadTesting::new(
         &json!({
@@ -1232,56 +1354,17 @@ async fn test_last_owner_removal_cancels_active_cohort() {
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(plugin.is_running());
 
-    // Wait until the worker has entered the request path, then drop the only owner.
-    let start = tokio::time::Instant::now();
-    while accept_count.load(Ordering::SeqCst) == 0
-        && tokio::time::Instant::now() < start + Duration::from_secs(2)
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(
-        accept_count.load(Ordering::SeqCst) >= 1,
-        "worker must have started before owner drop"
-    );
+    tokio::time::timeout(Duration::from_secs(2), request_started)
+        .await
+        .expect("worker must start before owner drop")
+        .expect("stalled observer must report request start");
 
     drop(plugin);
 
-    // Cancellation should finish without waiting for the full 30s duration.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    // We cannot call last_run_result on the dropped plugin; instead, observe that
-    // the process budget is released by admitting a fresh short run quickly.
-    let probe = LoadTesting::new(
-        &json!({
-            "key": VALID_KEY,
-            "concurrent_clients": 1,
-            "duration_seconds": 1,
-            "gateway_port": 9,
-            "request_timeout_ms": 100
-        }),
-        PluginHttpClient::default(),
-    )
-    .unwrap();
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/probe".to_string(),
-    );
-    ctx.matched_proxy = Some(matched_proxy());
-    let mut headers = HashMap::new();
-    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-    while tokio::time::Instant::now() < deadline {
-        let _ = probe.before_proxy(&mut ctx, &mut headers).await;
-        if probe.is_running() || probe.last_run_result().is_some() {
-            break;
-        }
-        headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    wait_until_idle(&probe).await;
-    assert!(
-        probe.last_run_result().is_some(),
-        "process budget must be leak-free after last-owner cancellation"
-    );
+    tokio::time::timeout(Duration::from_secs(3), client_closed)
+        .await
+        .expect("last-owner cancellation must close the stalled client before the 30s deadline")
+        .expect("stalled observer must report client closure");
 }
 
 #[tokio::test]
@@ -1350,6 +1433,56 @@ async fn test_replacement_generation_does_not_cancel_shared_cohort() {
         "replacement generation must not cancel the shared cohort: {run:?}"
     );
     assert!(run.responses_completed > 0 || run.attempted_requests > 0);
+}
+
+#[tokio::test]
+async fn test_incompatible_replacement_uses_new_state_and_old_owner_cancels() {
+    let (port, request_started, client_closed) = spawn_stalled_request_observer().await;
+    let old_config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 30,
+        "gateway_port": port,
+        "request_timeout_ms": 5000
+    });
+    let old_plugin = LoadTesting::new(&old_config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/old-policy".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    let _ = old_plugin.before_proxy(&mut ctx, &mut headers).await;
+    tokio::time::timeout(Duration::from_secs(2), request_started)
+        .await
+        .expect("old cohort must start")
+        .expect("stalled observer must report old request");
+
+    let replacement_config = json!({
+        "key": "replacement-key!!",
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 9,
+        "request_timeout_ms": 100
+    });
+    let replacement = old_plugin
+        .share_with(&replacement_config, PluginHttpClient::default())
+        .expect("incompatible replacement must construct with a new state");
+    assert!(
+        !replacement.is_running(),
+        "incompatible replacement must not inherit the old admission state"
+    );
+
+    drop(old_plugin);
+    tokio::time::timeout(Duration::from_secs(3), client_closed)
+        .await
+        .expect("dropping the last old-policy owner must cancel its stalled cohort")
+        .expect("stalled observer must report old client closure");
+    assert!(!replacement.is_running());
+    assert!(replacement.last_run_result().is_none());
 }
 
 #[tokio::test]

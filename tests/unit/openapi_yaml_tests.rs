@@ -3461,9 +3461,26 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
         "OpenAPI maxItems must match runtime MAX_GATEWAY_ADDRESSES"
     );
     assert_eq!(
+        schema["properties"]["gateway_addresses"]["minItems"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["gateway_addresses"]["uniqueItems"],
+        json!(true)
+    );
+    assert_eq!(
+        schema["properties"]["gateway_addresses"]["items"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
         schema["properties"]["key"]["minLength"],
         json!(16),
-        "OpenAPI minLength must match runtime character-count MIN_TRIGGER_KEY_LEN"
+        "OpenAPI minLength must match runtime MIN_TRIGGER_KEY_LEN"
+    );
+    assert_eq!(
+        schema["properties"]["key"]["pattern"],
+        json!("^[!-~][ -~]*[!-~]$"),
+        "OpenAPI pattern must match runtime printable-ASCII header-value admission"
     );
 
     let valid = json!({
@@ -3481,16 +3498,14 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
     assert_component_validity(&spec, "LoadTestingConfig", &valid, true);
     assert!(LoadTesting::new(&valid, PluginHttpClient::default()).is_ok());
 
-    // Unicode character-count parity: 16 scalar values (multi-byte) must pass both.
-    let unicode_key = "😀".repeat(16);
-    let valid_unicode = json!({
-        "key": unicode_key,
+    let valid_internal_space = json!({
+        "key": "sixteen char key!",
         "concurrent_clients": 1,
         "duration_seconds": 1,
         "gateway_port": 8000
     });
-    assert_component_validity(&spec, "LoadTestingConfig", &valid_unicode, true);
-    assert!(LoadTesting::new(&valid_unicode, PluginHttpClient::default()).is_ok());
+    assert_component_validity(&spec, "LoadTestingConfig", &valid_internal_space, true);
+    assert!(LoadTesting::new(&valid_internal_space, PluginHttpClient::default()).is_ok());
 
     let valid_minima = json!({
         "key": "sixteen-char-key",
@@ -3571,6 +3586,42 @@ async fn load_testing_schema_matches_strict_runtime_config_contract() {
             "gateway_addresses": (0..33)
                 .map(|i| format!("https://10.0.0.{}:8443", i + 2))
                 .collect::<Vec<_>>()
+        }),
+        json!({
+            "key": "😀".repeat(16),
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": " sixteen-char-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": "sixteen-char-key ",
+            "concurrent_clients": 1,
+            "duration_seconds": 1
+        }),
+        json!({
+            "key": "sixteen-char-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": []
+        }),
+        json!({
+            "key": "sixteen-char-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": [""]
+        }),
+        json!({
+            "key": "sixteen-char-key",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_addresses": [
+                "https://10.0.0.2:8443",
+                "https://10.0.0.2:8443"
+            ]
         }),
     ];
     for config in runtime_and_schema_invalid {

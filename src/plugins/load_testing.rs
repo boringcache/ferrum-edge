@@ -82,8 +82,9 @@ pub const LOAD_TESTING_CONFIG_KEYS: &[&str] = &[
     "request_timeout_ms",
 ];
 
-/// Minimum accepted trigger-key length in Unicode scalar values (matches
-/// OpenAPI `minLength`, which is character-count based — not UTF-8 bytes).
+/// Minimum accepted trigger-key length. Keys are additionally restricted to a
+/// stable printable-ASCII HTTP field value so they can traverse every frontend
+/// and the reqwest fan-out path without normalization or rejection.
 pub const MIN_TRIGGER_KEY_LEN: usize = 16;
 
 /// Hard ceiling for per-request timeout (independent of run duration).
@@ -104,12 +105,35 @@ const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 static PROCESS_ACTIVE_CLIENTS: AtomicU64 = AtomicU64::new(0);
 static SHARED_STATES: OnceLock<Mutex<HashMap<String, Weak<LoadTestingState>>>> = OnceLock::new();
 
+/// Effective policy fields that determine whether a reload generation may
+/// safely inherit an in-flight cohort. Deliberately has no `Debug` or
+/// serialization implementation because `key` is secret-bearing.
+#[derive(Clone, PartialEq, Eq)]
+struct LoadTestingCompatibility {
+    key: String,
+    concurrent_clients: u32,
+    duration_seconds: u64,
+    request_timeout_ms: u64,
+    ramp: bool,
+    max_response_body_bytes: u64,
+    gateway_base_url: String,
+    gateway_addresses: Vec<String>,
+    gateway_tls_no_verify: bool,
+}
+
+enum LoadTestingStateSelection {
+    Isolated,
+    Identity(String),
+    Replacement(Arc<LoadTestingState>),
+}
+
 /// Stable run-admission state shared across compatible plugin-cache generations
 /// for one plugin-config identity.
 ///
 /// Detached cohort tasks may hold `Arc<Self>` without counting as plugin
 /// owners. Cancellation on plugin removal is driven by [`LoadTestingOwner`].
 pub(crate) struct LoadTestingState {
+    compatibility: LoadTestingCompatibility,
     is_running: AtomicBool,
     run_cancel: Mutex<CancellationToken>,
     last_result: Mutex<Option<RunResult>>,
@@ -117,8 +141,9 @@ pub(crate) struct LoadTestingState {
 }
 
 impl LoadTestingState {
-    fn new() -> Arc<Self> {
+    fn new(compatibility: LoadTestingCompatibility) -> Arc<Self> {
         Arc::new(Self {
+            compatibility,
             is_running: AtomicBool::new(false),
             run_cancel: Mutex::new(CancellationToken::new()),
             last_result: Mutex::new(None),
@@ -303,7 +328,7 @@ pub struct LoadTesting {
 
 impl LoadTesting {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        Self::from_parts(config, http_client, LoadTestingState::new())
+        Self::from_parts(config, http_client, LoadTestingStateSelection::Isolated)
     }
 
     /// Construct with state shared across reload generations for one plugin
@@ -315,8 +340,11 @@ impl LoadTesting {
         plugin_config_id: &str,
     ) -> Result<Self, String> {
         let identity = format!("{namespace}\0{plugin_config_id}");
-        let state = retain_shared_state(&identity);
-        Self::from_parts(config, http_client, state)
+        Self::from_parts(
+            config,
+            http_client,
+            LoadTestingStateSelection::Identity(identity),
+        )
     }
 
     #[allow(dead_code)] // used only by tests/ via `share_with`; dead code in the bin target
@@ -325,10 +353,15 @@ impl LoadTesting {
         http_client: PluginHttpClient,
         state: Arc<LoadTestingState>,
     ) -> Result<Self, String> {
-        Self::from_parts(config, http_client, state)
+        Self::from_parts(
+            config,
+            http_client,
+            LoadTestingStateSelection::Replacement(state),
+        )
     }
 
-    /// Construct another instance that shares this plugin's run-admission state.
+    /// Construct a reload-like replacement. Compatible effective policy shares
+    /// this plugin's run-admission state; incompatible policy gets a new state.
     ///
     /// Used by unit tests (and mirrors plugin-cache reload sharing) so two
     /// `LoadTesting` values observe the same `is_running` guard.
@@ -360,7 +393,7 @@ impl LoadTesting {
     fn from_parts(
         config: &Value,
         http_client: PluginHttpClient,
-        state: Arc<LoadTestingState>,
+        state_selection: LoadTestingStateSelection,
     ) -> Result<Self, String> {
         let config_obj = config
             .as_object()
@@ -381,6 +414,15 @@ impl LoadTesting {
             return Err(format!(
                 "load_testing: 'key' must be at least {MIN_TRIGGER_KEY_LEN} characters"
             ));
+        }
+        if key.as_bytes().first() == Some(&b' ')
+            || key.as_bytes().last() == Some(&b' ')
+            || !key.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+        {
+            return Err(
+                "load_testing: 'key' must contain only printable ASCII HTTP header-value characters and must not start or end with a space"
+                    .to_string(),
+            );
         }
 
         let concurrent_clients = optional_u64(config, "concurrent_clients")?
@@ -480,6 +522,30 @@ gateway_port in 1–65535"
             .map_err(|_| "load_testing: failed to build HTTP client".to_string())?;
 
         let gateway_addresses = parse_gateway_addresses(config, &http_client, &gateway_base_url)?;
+        let compatibility = LoadTestingCompatibility {
+            key: key.clone(),
+            concurrent_clients: concurrent_clients as u32,
+            duration_seconds,
+            request_timeout_ms,
+            ramp,
+            max_response_body_bytes,
+            gateway_base_url: gateway_base_url.clone(),
+            gateway_addresses: gateway_addresses.clone(),
+            gateway_tls_no_verify,
+        };
+        let state = match state_selection {
+            LoadTestingStateSelection::Isolated => LoadTestingState::new(compatibility),
+            LoadTestingStateSelection::Identity(identity) => {
+                retain_shared_state(&identity, compatibility)
+            }
+            LoadTestingStateSelection::Replacement(existing) => {
+                if existing.compatibility == compatibility {
+                    existing
+                } else {
+                    LoadTestingState::new(compatibility)
+                }
+            }
+        };
         let owner = LoadTestingOwner::acquire(Arc::clone(&state));
 
         Ok(Self {
@@ -513,15 +579,20 @@ gateway_port in 1–65535"
     }
 }
 
-fn retain_shared_state(identity: &str) -> Arc<LoadTestingState> {
+fn retain_shared_state(
+    identity: &str,
+    compatibility: LoadTestingCompatibility,
+) -> Arc<LoadTestingState> {
     let registry = SHARED_STATES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(existing) = guard.get(identity).and_then(|weak| weak.upgrade()) {
+    if let Some(existing) = guard.get(identity).and_then(|weak| weak.upgrade())
+        && existing.compatibility == compatibility
+    {
         return existing;
     }
-    let state = LoadTestingState::new();
+    let state = LoadTestingState::new(compatibility);
     guard.insert(identity.to_string(), Arc::downgrade(&state));
     // Opportunistically prune dead weak entries.
     guard.retain(|_, weak| weak.strong_count() > 0);
@@ -650,8 +721,16 @@ fn is_local_loopback_alias(candidate: &Url, local: &Url) -> bool {
     }
     match candidate.host() {
         Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
-        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv6(addr)) => {
+            addr.is_loopback()
+                || addr
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+        Some(url::Host::Domain(name)) => {
+            let normalized = name.trim_end_matches('.').to_ascii_lowercase();
+            normalized == "localhost" || normalized.ends_with(".localhost")
+        }
         None => false,
     }
 }
@@ -793,6 +872,7 @@ impl Plugin for LoadTesting {
                 PluginResult::Continue
             };
         }
+        let client_budget = ProcessClientBudget::new(u64::from(self.concurrent_clients));
 
         let proxy_name = ctx
             .matched_proxy
@@ -872,7 +952,10 @@ impl Plugin for LoadTesting {
         );
 
         tokio::spawn(async move {
-            let _client_budget = ProcessClientBudget::new(u64::from(concurrent_clients));
+            // Move the already-created guard into the future. If the runtime
+            // drops this future before its first poll, the reservation is still
+            // released by `Drop`.
+            let _client_budget = client_budget;
             let start = Instant::now();
             let deadline = start + duration;
             let mut handles = Vec::with_capacity(concurrent_clients as usize);

@@ -16510,12 +16510,14 @@ components:
         key:
           type: string
           minLength: 16
+          pattern: '^[!-~][ -~]*[!-~]$'
           description: >-
             Secret value that the X-Loadtesting-Key header must match to trigger
-            the load test. Must be at least 16 Unicode characters (OpenAPI
-            minLength / runtime `chars().count()` parity — not UTF-8 bytes).
-            The gateway strips this header from the original request before
-            later deferred plugins or backend dispatch.
+            the load test. Must be at least 16 printable ASCII HTTP field-value
+            characters with no leading or trailing space. The gateway never
+            echoes the value in validation errors and strips this header from
+            the original request before later deferred plugins or backend
+            dispatch.
         concurrent_clients:
           type: integer
           format: uint64
@@ -16571,16 +16573,20 @@ components:
           description: "Skip TLS cert verification for loopback connections. Defaults to true when gateway_tls is enabled (gateway cert typically won't match 127.0.0.1)"
         gateway_addresses:
           type: [array, "null"]
+          minItems: 1
           maxItems: 32
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
           description: >-
             Remote gateway URLs for one-hop fan-out from the originating
             controller (at most 32). Peers receive X-Loadtesting-Fanout and
             never re-fanout. Entries must be unique http(s) URLs without
             userinfo, query, or fragment. Local-loopback aliases of the
-            selected local target (127/8, ::1, localhost with matching scheme
-            and effective port) are rejected.
+            selected local target (127/8, IPv4-mapped loopback, ::1,
+            localhost, and names beneath .localhost with matching scheme and
+            effective port) are rejected.
 
     RequestMirrorConfig:
       type: object

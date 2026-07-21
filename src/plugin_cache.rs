@@ -1075,9 +1075,9 @@ fn try_create_plugin(
             staged_tcp_throttle_states,
         )
     } else if pc.plugin_name == "load_testing" {
-        // Share run-admission state across reload generations for the same
-        // plugin-config identity so a replacement instance cannot start a
-        // second high-cost cohort while a prior detached run is still active.
+        // Share run-admission state across compatible reload generations for
+        // the same plugin-config identity so a replacement instance cannot
+        // start a second high-cost cohort while a prior detached run is active.
         crate::plugins::load_testing::LoadTesting::new_with_instance_id(
             &pc.config,
             http_client.clone(),
