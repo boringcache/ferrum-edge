@@ -171,18 +171,28 @@ fn materialize_headers_skips_reserved_path_param_headers_even_when_repeated() {
 }
 
 #[test]
-fn raw_header_get_returns_none_after_materialization() {
+fn raw_header_get_remains_available_after_materialization() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     let mut raw = HeaderMap::new();
     raw.insert("host", "example.com".parse().unwrap());
+    raw.append("x-policy", http::HeaderValue::from_bytes(&[0x80]).unwrap());
     ctx.set_raw_headers(raw);
 
     ctx.materialize_headers();
 
-    // raw_headers is consumed, so raw_header_get returns None
-    assert_eq!(ctx.raw_header_get("host"), None);
-    // but the materialized map has it
+    // Raw field lines stay available for fail-closed security decisions even
+    // after the lossy materialized map is built.
+    assert!(ctx.has_raw_headers());
+    assert_eq!(ctx.raw_header_get("host"), Some("example.com"));
+    assert_eq!(
+        ctx.raw_header_value_bytes("x-policy").collect::<Vec<_>>(),
+        vec![&[0x80u8][..]]
+    );
     assert_eq!(ctx.headers.get("host").unwrap(), "example.com");
+    assert!(
+        !ctx.headers.contains_key("x-policy"),
+        "non-UTF-8 values stay omitted from the materialized map"
+    );
 }
 
 #[test]

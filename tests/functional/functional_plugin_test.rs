@@ -799,6 +799,36 @@ async fn test_plugin_request_termination() {
     assert_eq!(resp.status().as_u16(), 451, "Should return 451");
     let body = resp.text().await.unwrap();
     assert_eq!(body, "Unavailable for legal reasons");
+
+    // HEAD keeps representation metadata but must not carry content bytes.
+    let get_resp = client
+        .get(format!("{}/maintenance/anything", harness.proxy_base_url))
+        .send()
+        .await
+        .expect("GET control request failed");
+    assert_eq!(get_resp.status().as_u16(), 503);
+    let get_body = get_resp.bytes().await.expect("GET body");
+    assert!(get_body.windows(11).any(|w| w == b"maintenance"));
+    let representation_len = get_body.len();
+
+    let head_resp = client
+        .head(format!("{}/maintenance/anything", harness.proxy_base_url))
+        .send()
+        .await
+        .expect("HEAD request failed");
+    assert_eq!(head_resp.status().as_u16(), 503);
+    assert_eq!(
+        head_resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(representation_len)
+    );
+    assert!(
+        head_resp.bytes().await.expect("HEAD body").is_empty(),
+        "HEAD must not receive response content"
+    );
 }
 
 #[tokio::test]

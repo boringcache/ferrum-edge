@@ -14620,7 +14620,7 @@ fn should_apply_synthetic_response_body_hooks(
         || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
     !is_grpc_request
         && governed_synthetic_status
-        && !matches!(status_code, 204 | 205 | 304)
+        && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
         && !response_body.is_empty()
         && plugins.iter().any(|plugin| {
             plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
@@ -14853,8 +14853,11 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
 /// `before_proxy` rejection path, so AI guardrails (`ai_response_guard` /
 /// `ai_semantic_firewall`) see synthetic 2xx bodies (e.g. `ai_federation` /
 /// `ai_semantic_cache` hits surfaced via `RejectBinary{200}`) identically
-/// across all frontends. It mutates `status`, `headers`, and `body` in place;
-/// any normalization of the final wire form (gRPC trailers, content-length) is
+/// across all frontends. It mutates `status`, `headers`, and `body` in place.
+/// After body guardrails and reject-path `after_proxy` hooks, it applies shared
+/// HEAD/204/205/304 wire preparation so H1/H2 finalize and every H3 reject
+/// writer omit content bytes together (HEAD keeps representation
+/// `Content-Length`). Remaining wire normalization (gRPC trailers) is still
 /// the caller's responsibility.
 ///
 /// Ordering: the synthetic body hooks run first (they may *replace* the
@@ -14984,6 +14987,19 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             );
             break;
         }
+    }
+
+    // Final wire shape for synthetic/reject responses: HEAD keeps representation
+    // metadata (Content-Length) but omits content bytes; 204/205/304 omit both
+    // content and Content-Length. Applied here so H1/H2 finalize and every H3
+    // path that runs this shared hook cannot diverge.
+    if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+        &ctx.method,
+        *status,
+        headers,
+        body.len(),
+    ) {
+        body.clear();
     }
 }
 
@@ -34365,8 +34381,20 @@ mod tests {
         )
         .await;
 
+        // Guardrails inspected the GET representation and replaced it; the
+        // shared finalizer then restores HEAD and applies wire omission so the
+        // client receives representation metadata without content bytes.
+        const BLOCKED_REPRESENTATION: &[u8] = b"blocked synthetic representation";
+        let expected_content_length = BLOCKED_REPRESENTATION.len().to_string();
         assert_eq!(status, 451);
-        assert_eq!(body, b"blocked synthetic representation");
+        assert!(
+            body.is_empty(),
+            "HEAD final wire body must be empty after shared no-body preparation"
+        );
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(expected_content_length.as_str())
+        );
         assert_eq!(
             ctx.metadata
                 .get("test:synthetic_body_method")

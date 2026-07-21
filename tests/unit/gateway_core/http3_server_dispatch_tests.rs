@@ -26,6 +26,35 @@ fn h3_native_mesh_refusal_screens_plain_and_grpc_before_dispatch() {
 }
 
 #[test]
+fn h3_reject_writer_skips_empty_data_frames() {
+    let src = include_str!("../../../src/http3/server.rs");
+    let helper = src
+        .find("async fn send_h3_finalized_reject_response(")
+        .expect("H3 finalized reject writer must remain present");
+    let body = &src[helper..];
+    assert!(
+        body.contains("if !body.is_empty()") && body.contains("stream.send_data("),
+        "H3 reject writer must skip DATA when the shared no-body preparation emptied the body"
+    );
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy_src.contains("prepare_synthetic_response_wire("),
+        "shared reject finalizer must centralize HEAD/204/205/304 wire preparation"
+    );
+    let streaming_start = src
+        .find("async fn run_h3_streaming_after_proxy_hooks(")
+        .expect("H3 streaming after_proxy helper must remain present");
+    let streaming_tail = &src[streaming_start..];
+    let streaming_end = streaming_tail
+        .find("\n#[allow(clippy::too_many_arguments)]\nasync fn proxy_to_backend_h3_refined_response(")
+        .expect("H3 streaming after_proxy helper boundary must remain present");
+    assert!(
+        streaming_tail[..streaming_end].contains("prepare_synthetic_response_wire("),
+        "streaming after_proxy rejections must also apply shared HEAD/no-body wire preparation"
+    );
+}
+
+#[test]
 fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
     let src = include_str!("../../../src/http3/server.rs");
     let request_scoped_gate = src

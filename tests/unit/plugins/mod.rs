@@ -92,6 +92,7 @@ mod sse_tests;
 mod statsd_logging_tests;
 mod stdout_logging_tests;
 mod stream_plugin_tests;
+mod synthetic_response_tests;
 mod tcp_connection_throttle_tests;
 mod tcp_endpoint_tests;
 mod tcp_logging_tests;

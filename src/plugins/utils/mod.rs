@@ -37,6 +37,7 @@ pub mod session_cookie;
 pub mod size_limit;
 pub mod socket_host;
 pub mod sse;
+pub mod synthetic_response;
 pub mod tcp_endpoint;
 pub mod token_extract;
 pub mod transformer_gate;
