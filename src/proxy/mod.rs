@@ -11693,7 +11693,7 @@ pub(crate) fn emit_ws_frame_deliveries(
     direction: WebSocketFrameDirection,
     prepared: WsFrameDeliveryBatch,
 ) {
-    let emit = |index, observation| {
+    let emit = |index: usize, observation: crate::plugins::WsFrameDeliveryObservation| {
         if let Some(plugin) = plugins.get(index) {
             plugin.emit_ws_frame_delivery(proxy_id, connection_id, direction, observation);
         }
