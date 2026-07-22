@@ -928,8 +928,7 @@ fn test_sampling_concurrent_calls_preserve_exact_cycle_count() {
 
     assert_eq!(
         selected.load(Ordering::Relaxed) as u64,
-        (total as u64 / SAMPLE_PERIOD)
-            * request_mirror_sample_threshold_for_test(&plugin),
+        (total as u64 / SAMPLE_PERIOD) * request_mirror_sample_threshold_for_test(&plugin),
         "concurrent selection must preserve exact long-run counts"
     );
     assert!(request_mirror_sample_phase_for_test(&plugin) < SAMPLE_PERIOD);
