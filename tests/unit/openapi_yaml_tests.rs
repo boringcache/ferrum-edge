@@ -7237,6 +7237,21 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         mode_enum,
         &json!(["database", "file", "cp", "dp", "mesh", "node_agent"])
     );
+    let config_source_status_enum = spec
+        .pointer(
+            "/components/schemas/AdminMetricsGateway/properties/config_source_status/enum",
+        )
+        .expect("AdminMetricsGateway.config_source_status enum");
+    assert_eq!(
+        config_source_status_enum,
+        &json!(["online", "offline", "n/a"])
+    );
+    assert!(
+        docs.contains("\"offline\"")
+            && docs.contains("db_available")
+            && docs.contains("no DB-backed config source"),
+        "docs/admin_metrics.md must document online/offline/n/a via db_available"
+    );
     for mode in ADMIN_METRICS_MODES {
         assert!(
             docs.contains(mode),

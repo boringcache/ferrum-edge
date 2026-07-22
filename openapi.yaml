@@ -10647,10 +10647,14 @@ components:
           description: RFC 3339 timestamp of the last successful config load/reload
         config_source_status:
           type: string
-          enum: [online, "n/a"]
+          enum: [online, offline, "n/a"]
           description: |
-            "online" when a database is configured and reachable,
-            "n/a" for file mode or CP mode without a database
+            Lock-free snapshot of the configured database config source.
+            "online" when a DB-backed mode has `db_available=true` (configured and
+            dynamically reachable), "offline" when a configured DB is currently
+            unavailable (`db_available=false`), and "n/a" when the mode has no
+            DB-backed config source (file, dp, mesh, node_agent). Control-plane
+            mode reports online/offline even though `proxy_state` is absent.
         proxy_count:
           type: integer
           description: Number of proxy routes in the active config
