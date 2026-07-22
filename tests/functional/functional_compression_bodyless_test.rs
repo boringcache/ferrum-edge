@@ -17,8 +17,7 @@ use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 const HEAD_REPR_LEN: usize = 1024;
-const CONTROL_BODY: &str =
-    r#"{"ok":true,"padding":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#;
+const CONTROL_BODY: &str = r#"{"ok":true,"padding":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#;
 
 fn build_config(backend_port: u16) -> String {
     format!(
@@ -69,21 +68,17 @@ async fn spawn_bodyless_backend(listener: TcpListener) {
             let path = parts.next().unwrap_or("");
 
             let response = match (method, path) {
-                ("GET", "/reset-absent") => {
-                    "HTTP/1.1 205 Reset Content\r\n\
+                ("GET", "/reset-absent") => "HTTP/1.1 205 Reset Content\r\n\
                      Content-Type: application/json\r\n\
                      Connection: close\r\n\
                      \r\n"
-                        .to_string()
-                }
-                ("GET", "/reset-zero") => {
-                    "HTTP/1.1 205 Reset Content\r\n\
+                    .to_string(),
+                ("GET", "/reset-zero") => "HTTP/1.1 205 Reset Content\r\n\
                      Content-Type: application/json\r\n\
                      Content-Length: 0\r\n\
                      Connection: close\r\n\
                      \r\n"
-                        .to_string()
-                }
+                    .to_string(),
                 ("HEAD", "/head-present") => {
                     format!(
                         "HTTP/1.1 200 OK\r\n\
@@ -93,13 +88,11 @@ async fn spawn_bodyless_backend(listener: TcpListener) {
                          \r\n"
                     )
                 }
-                ("HEAD", "/head-absent") => {
-                    "HTTP/1.1 200 OK\r\n\
+                ("HEAD", "/head-absent") => "HTTP/1.1 200 OK\r\n\
                      Content-Type: application/json\r\n\
                      Connection: close\r\n\
                      \r\n"
-                        .to_string()
-                }
+                    .to_string(),
                 ("GET", "/control") => {
                     format!(
                         "HTTP/1.1 200 OK\r\n\
@@ -111,13 +104,11 @@ async fn spawn_bodyless_backend(listener: TcpListener) {
                         CONTROL_BODY.len()
                     )
                 }
-                _ => {
-                    "HTTP/1.1 404 Not Found\r\n\
+                _ => "HTTP/1.1 404 Not Found\r\n\
                      Content-Length: 0\r\n\
                      Connection: close\r\n\
                      \r\n"
-                        .to_string()
-                }
+                    .to_string(),
             };
 
             let _ = stream.write_all(response.as_bytes()).await;
@@ -220,11 +211,7 @@ fn h3_has_accept_encoding_vary(headers: &http::HeaderMap) -> bool {
         .any(|member| member.trim().eq_ignore_ascii_case("accept-encoding"))
 }
 
-async fn h3_request_until_ready(
-    client: &Http3Client,
-    url: &str,
-    method: Method,
-) -> Http3Response {
+async fn h3_request_until_ready(client: &Http3Client, url: &str, method: Method) -> Http3Response {
     let deadline = Instant::now() + Duration::from_secs(15);
     let options = GetOptions::default()
         .method(method.clone())
@@ -395,11 +382,7 @@ async fn functional_compression_skips_head_and_205_across_h1_h2_h3() {
         "control GET must still be gateway-compressed"
     );
     assert!(
-        !control_resp
-            .bytes()
-            .await
-            .expect("control body")
-            .is_empty(),
+        !control_resp.bytes().await.expect("control body").is_empty(),
         "control GET must emit a compressed body"
     );
 
@@ -449,7 +432,10 @@ async fn functional_compression_skips_head_and_205_across_h1_h2_h3() {
 
     let h3_head = h3_request_until_ready(&h3, &h3_head_present, Method::HEAD).await;
     assert_eq!(h3_head.status, StatusCode::OK);
-    assert!(h3_head.body_bytes.is_empty(), "H3 HEAD present must omit DATA");
+    assert!(
+        h3_head.body_bytes.is_empty(),
+        "H3 HEAD present must omit DATA"
+    );
     assert!(h3_content_encoding(&h3_head.headers).is_none());
     assert!(!h3_has_accept_encoding_vary(&h3_head.headers));
     assert_eq!(h3_content_length(&h3_head.headers), Some(HEAD_REPR_LEN));

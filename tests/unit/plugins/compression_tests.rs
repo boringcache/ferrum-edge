@@ -2493,7 +2493,9 @@ async fn test_ineligible_identity_does_not_nominate_vary() {
         let mut resp_headers = HashMap::new();
         resp_headers.insert("content-type".to_string(), "application/json".to_string());
         resp_headers.insert("content-length".to_string(), "1000".to_string());
-        plugin.after_proxy(&mut ctx, status, &mut resp_headers).await;
+        plugin
+            .after_proxy(&mut ctx, status, &mut resp_headers)
+            .await;
         assert!(
             !resp_headers.contains_key("vary"),
             "{status} hard skip must not nominate Vary"
