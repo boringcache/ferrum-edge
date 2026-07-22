@@ -91,6 +91,14 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    /// Report private compression ownership without exposing it through public
+    /// transaction metadata in production.
+    pub fn compression_ownership_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> (Option<u64>, Option<u64>) {
+        ctx.compression_ownership_for_test()
+    }
+
     pub fn validate_correlation_id_composition_for_test(
         plugins: &[Arc<dyn Plugin>],
     ) -> Result<(), String> {

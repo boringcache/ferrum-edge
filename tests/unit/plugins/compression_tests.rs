@@ -3611,8 +3611,9 @@ async fn test_request_no_transform_metadata_does_not_skip_context_aware_decode()
         PluginResult::Continue
     ));
     assert!(
-        ctx.metadata
-            .contains_key("compression:request_decode_owner")
+        ferrum_edge::_test_support::compression_ownership_for_test(&ctx)
+            .0
+            .is_some()
     );
 
     let transformed = plugin
@@ -4442,8 +4443,9 @@ async fn test_multi_instance_response_single_coding_layer() {
         "first committing instance wins; later configs must not stack encodings"
     );
     assert!(
-        ctx.metadata
-            .contains_key("compression:response_encode_owner")
+        ferrum_edge::_test_support::compression_ownership_for_test(&ctx)
+            .1
+            .is_some()
     );
     assert_eq!(
         ctx.metadata
@@ -4608,8 +4610,9 @@ async fn test_multi_instance_request_decode_exactly_once() {
         "siblings must not delete the owner's internal marker"
     );
     assert!(
-        ctx.metadata
-            .contains_key("compression:request_decode_owner")
+        ferrum_edge::_test_support::compression_ownership_for_test(&ctx)
+            .0
+            .is_some()
     );
 
     let decoded = run_request_body_transform_loop(&plugins, &mut ctx, &headers, compressed).await;
@@ -4662,8 +4665,9 @@ async fn test_multi_instance_malformed_upload_rejects_without_stripping() {
         "failed claim must not strip encoding metadata"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("compression:request_decode_owner")
+        ferrum_edge::_test_support::compression_ownership_for_test(&ctx)
+            .0
+            .is_none()
     );
 }
 

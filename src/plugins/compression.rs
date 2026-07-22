@@ -103,21 +103,6 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
-/// Request-scoped owner of the one-shot request decode (instance id string).
-///
-/// Multiple `compression` instances may coexist on one proxy. Body decode is
-/// not idempotent: the first effective instance that claims a supported
-/// `Content-Encoding` owns strip + transform exactly once. Siblings must not
-/// delete the owner's internal marker or re-decode.
-const REQUEST_DECODE_OWNER_METADATA_KEY: &str = "compression:request_decode_owner";
-
-/// Request-scoped owner of the one-shot response encode (instance id string).
-///
-/// The first instance that commits a gateway `Content-Encoding` owns the single
-/// coding layer. Sibling transforms see the committed encoding but must not
-/// compress again.
-const RESPONSE_ENCODE_OWNER_METADATA_KEY: &str = "compression:response_encode_owner";
-
 /// Process-unique instance ids so ownership tokens cannot collide across
 /// reload generations that temporarily overlap in flight.
 static NEXT_COMPRESSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -155,7 +140,7 @@ struct CompressionConfig {
 pub struct CompressionPlugin {
     config: CompressionConfig,
     /// Process-unique id for multi-instance ownership tokens.
-    instance_id_str: String,
+    instance_id: u64,
 }
 
 impl CompressionPlugin {
@@ -270,20 +255,16 @@ impl CompressionPlugin {
                 gzip_level,
                 brotli_quality,
             },
-            instance_id_str: instance_id.to_string(),
+            instance_id,
         })
     }
 
     fn is_request_decode_owner(&self, ctx: &RequestContext) -> bool {
-        ctx.metadata
-            .get(REQUEST_DECODE_OWNER_METADATA_KEY)
-            .is_some_and(|owner| owner == &self.instance_id_str)
+        ctx.owns_compression_request_decode(self.instance_id)
     }
 
     fn is_response_encode_owner(&self, ctx: &RequestContext) -> bool {
-        ctx.metadata
-            .get(RESPONSE_ENCODE_OWNER_METADATA_KEY)
-            .is_some_and(|owner| owner == &self.instance_id_str)
+        ctx.owns_compression_response_encode(self.instance_id)
     }
 
     /// Parse `Accept-Encoding` and negotiate the representation coding among
@@ -1113,7 +1094,7 @@ impl Plugin for CompressionPlugin {
         // Once claimed, siblings must leave the owner's handoff intact —
         // deleting the marker here is what previously left encoded uploads
         // with no Content-Encoding and no decoder.
-        if !ctx.metadata.contains_key(REQUEST_DECODE_OWNER_METADATA_KEY) {
+        if !ctx.has_compression_request_decode_owner() {
             headers.remove("x-ferrum-original-content-encoding");
         }
 
@@ -1156,7 +1137,7 @@ impl Plugin for CompressionPlugin {
         // stripping without a guaranteed owner transform would forward encoded
         // bytes without Content-Encoding.
         if self.config.decompress_request
-            && !ctx.metadata.contains_key(REQUEST_DECODE_OWNER_METADATA_KEY)
+            && !ctx.has_compression_request_decode_owner()
             && let Some(ce) = headers.get("content-encoding")
             && let Some(encoding) = supported_request_encoding(ce)
         {
@@ -1197,9 +1178,10 @@ impl Plugin for CompressionPlugin {
                 }
             }
 
-            ctx.metadata.insert(
-                REQUEST_DECODE_OWNER_METADATA_KEY.to_string(),
-                self.instance_id_str.clone(),
+            let claimed = ctx.claim_compression_request_decode(self.instance_id);
+            debug_assert!(
+                claimed,
+                "request decode owner changed within a sequential hook chain"
             );
             ctx.metadata.insert(
                 "compression:request_encoding".to_string(),
@@ -1274,6 +1256,7 @@ impl Plugin for CompressionPlugin {
             Some(CodingSelection::Compress(algo)) => {
                 let can_encode = !on_rejection
                     && !range_or_delta
+                    && !ctx.has_compression_response_encode_owner()
                     && !Self::response_forbids_transform(ctx, response_headers)
                     && self.is_compression_eligible(response_headers);
                 if can_encode {
@@ -1284,9 +1267,10 @@ impl Plugin for CompressionPlugin {
 
                     // First instance to commit Content-Encoding owns the single
                     // coding layer. Sibling transforms must not compress again.
-                    ctx.metadata.insert(
-                        RESPONSE_ENCODE_OWNER_METADATA_KEY.to_string(),
-                        self.instance_id_str.clone(),
+                    let claimed = ctx.claim_compression_response_encode(self.instance_id);
+                    debug_assert!(
+                        claimed,
+                        "response encode owner changed within a sequential hook chain"
                     );
 
                     // Retain the existing observable decision metadata.
