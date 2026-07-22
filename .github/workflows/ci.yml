@@ -3275,6 +3275,7 @@ jobs:
         if: steps.perf_changes.outputs.run_wrr_benchmark == 'true'
         run: |
           cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench wrr_selection
+          python3 .github/scripts/verify_wrr_selection_benchmark.py --self-test
           python3 .github/scripts/verify_wrr_selection_benchmark.py \
             --criterion-root tests/performance/mesh/target/criterion \
             --min-parallel-speedup 1.25

@@ -1,9 +1,14 @@
 //! Concurrent WRR selection microbenchmark for hosted CI regression (#2413).
 //!
 //! Measures single-thread and multi-thread smooth weighted round-robin
-//! selection across small and large target cardinalities. The verify script
-//! asserts that parallel throughput exceeds a serialization floor that a
-//! single-lane `Mutex` hot path cannot clear on multi-core runners.
+//! selection across small and large target cardinalities.
+//!
+//! Each Criterion custom iteration's mean is wall-clock time for:
+//!   - 1 thread:  ITERATIONS_PER_THREAD selections
+//!   - N threads: N * ITERATIONS_PER_THREAD selections
+//! The verify script converts those wall times into throughput speedup
+//! (`N * serial_ns / parallel_ns`) and asserts against a serialization floor
+//! that a single-lane `Mutex` hot path cannot clear on multi-core runners.
 
 use std::collections::HashMap;
 use std::hint::black_box;
