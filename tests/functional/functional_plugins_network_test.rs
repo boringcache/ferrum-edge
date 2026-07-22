@@ -743,22 +743,64 @@ async fn assert_misbehaving_mirror_does_not_delay_primary(behavior: &'static str
             .step(HttpStep::Sleep(Duration::from_secs(30)))
             .spawn()
             .expect("spawn stalled mirror"),
+        "slow" => ScriptedHttp1Backend::builder(mirror_reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .step(HttpStep::Sleep(Duration::from_secs(6)))
+            .step(HttpStep::RespondStatus {
+                status: 204,
+                reason: "No Content".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "Content-Length".into(),
+                value: "0".into(),
+            })
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn slow mirror"),
         _ => unreachable!(),
     };
 
-    let yaml = yaml_with_plugin(
-        primary_port,
-        "request-mirror-network",
-        "request_mirror",
-        json!({
-            "mirror_host": "127.0.0.1",
-            "mirror_port": mirror_port,
-            "mirror_protocol": "http",
-            "percentage": 100.0,
-        }),
-    );
+    let yaml = serde_yaml::to_string(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "phase8-plugin",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": primary_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 1000,
+            "backend_read_timeout_ms": if behavior == "slow" { 10_000 } else { 6_000 },
+            "backend_write_timeout_ms": 5000,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "request-mirror-network",
+                "plugin_name": "request_mirror",
+                "scope": "global",
+                "enabled": true,
+                "config": {
+                    "mirror_host": "127.0.0.1",
+                    "mirror_port": mirror_port,
+                    "mirror_protocol": "http",
+                    "percentage": 100.0,
+                },
+            },
+            {
+                "id": "request-mirror-stdout",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {},
+            }
+        ],
+    }))
+    .expect("mirror YAML");
     let harness = GatewayHarness::builder()
-        .mode_in_process()
+        .mode_binary()
+        .capture_output()
         .file_config(yaml)
         .pool_warmup_enabled(false)
         .spawn()
@@ -790,7 +832,79 @@ async fn assert_misbehaving_mirror_does_not_delay_primary(behavior: &'static str
     })
     .await
     .unwrap_or_else(|_| panic!("{behavior} mirror never received the copied request"));
-    assert_eq!(primary.received_requests().await.len(), 1);
+    let primary_requests = primary.received_requests().await;
+    let expected_path = format!("/mirror-{behavior}");
+    assert_eq!(
+        primary_requests
+            .iter()
+            .filter(|request| request.path == expected_path)
+            .count(),
+        1,
+        "client request must reach the primary exactly once; requests={primary_requests:?}"
+    );
+
+    let logs = harness
+        .wait_for_log_contains(
+            |raw| {
+                raw.lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|entry| {
+                        entry.get("mirror").and_then(Value::as_bool) == Some(true)
+                            && match behavior {
+                                "slow" => {
+                                    entry.get("response_status_code").and_then(Value::as_u64)
+                                        == Some(204)
+                                }
+                                "stall" => entry
+                                    .get("metadata")
+                                    .and_then(|metadata| metadata.get("mirror_error"))
+                                    .and_then(Value::as_str)
+                                    .is_some(),
+                                "reset" => {
+                                    entry.get("response_status_code").and_then(Value::as_u64)
+                                        == Some(200)
+                                        || entry
+                                            .get("metadata")
+                                            .and_then(|metadata| metadata.get("mirror_error"))
+                                            .and_then(Value::as_str)
+                                            .is_some()
+                                }
+                                _ => false,
+                            }
+                    })
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    let mirror_logged = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|entry| {
+            entry.get("mirror").and_then(Value::as_bool) == Some(true)
+                && match behavior {
+                    "slow" => {
+                        entry.get("response_status_code").and_then(Value::as_u64) == Some(204)
+                    }
+                    "stall" => entry
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("mirror_error"))
+                        .and_then(Value::as_str)
+                        .is_some(),
+                    "reset" => {
+                        entry.get("response_status_code").and_then(Value::as_u64) == Some(200)
+                            || entry
+                                .get("metadata")
+                                .and_then(|metadata| metadata.get("mirror_error"))
+                                .and_then(Value::as_str)
+                                .is_some()
+                    }
+                    _ => false,
+                }
+        });
+    assert!(
+        mirror_logged,
+        "{behavior} mirror completion was not eventually logged; logs:\n{logs}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -803,6 +917,12 @@ async fn request_mirror_reset_never_delays_primary_response() {
 #[ignore]
 async fn request_mirror_stall_never_delays_primary_response() {
     assert_misbehaving_mirror_does_not_delay_primary("stall").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn request_mirror_slow_success_after_five_seconds_is_eventually_logged() {
+    assert_misbehaving_mirror_does_not_delay_primary("slow").await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

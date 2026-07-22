@@ -1910,6 +1910,13 @@ pub struct RequestContext {
     /// details cannot enter transaction logs, while the response hook can
     /// preserve the public URI spelling the client actually requested.
     pub(crate) mcp_response_resource_binding: Option<(String, String)>,
+    /// Gateway-authenticated public→upstream tool-name rewrite staged by
+    /// `mcp_gateway` aggregate routing for a `tools/call`. Kept out of public
+    /// metadata so forgeable `mcp.*` keys cannot mint policy identity, while
+    /// `ai_tool_governor`'s final-body recheck can evaluate the routed call
+    /// under the public name only when the final wire name exactly matches
+    /// this trusted upstream alias.
+    pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -2269,6 +2276,7 @@ impl RequestContext {
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
             mcp_response_resource_binding: None,
+            mcp_trusted_tool_name_rewrite: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -2966,6 +2974,7 @@ impl RequestContext {
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
+            mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),
@@ -3597,11 +3606,11 @@ impl RequestContext {
 
     /// Collect mirror response metadata from the `request_mirror` plugin.
     ///
-    /// Returns `Some(meta)` if a mirror request was dispatched and completed
-    /// before the timeout. The 5-second timeout is a safety net — the mirror
-    /// task always completes within the proxy's `backend_read_timeout_ms`
-    /// (set via `reqwest::RequestBuilder::timeout`). Callers on a client-visible
-    /// response path must run this in a detached task.
+    /// Returns `Some(meta)` when a selected mirror attempt completes or emits
+    /// an explicit bounded failure/drop outcome. Collection follows the actual
+    /// mirror task/request lifetime; it has no shorter independent cutoff.
+    /// Callers on a client-visible response path must run this in a detached
+    /// task.
     pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
         collect_mirror_result(self.mirror_result_rx.clone()?).await
     }
@@ -4316,7 +4325,8 @@ pub struct MirrorResponseMeta {
     /// URL the mirror request was sent to.
     pub mirror_target_url: String,
     /// HTTP status code from the mirror target. `None` when the request failed
-    /// before a response was received (DNS, connect, timeout errors).
+    /// before a response was received or was dropped/cancelled (DNS, connect,
+    /// timeout, task, and concurrency errors).
     pub mirror_response_status_code: Option<u16>,
     /// Response body size in bytes from the mirror target. Derived from
     /// `content-length` header when present, otherwise from reading the body.
@@ -4801,11 +4811,14 @@ pub async fn log_with_mirror_before_buffered_response(
 async fn collect_mirror_result(
     mut rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
 ) -> Option<MirrorResponseMeta> {
-    match tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await {
-        Ok(Ok(())) => rx.borrow().clone(),
-        // Timeout or sender dropped — return whatever is currently available.
-        _ => rx.borrow().clone(),
-    }
+    // The request task itself is bounded by backend_read_timeout_ms when that
+    // proxy timeout is configured. Waiting here stays fully detached from the
+    // client response and preserves late-but-valid results. Production mirror
+    // channels are seeded with a sanitized failure outcome, so sender closure
+    // (task cancellation/panic) remains observable too. Tokio runtime shutdown
+    // cancels both detached tasks together rather than extending shutdown.
+    let _ = rx.changed().await;
+    rx.borrow().clone()
 }
 
 /// Opaque release action for state acquired by a stream admission plugin.
