@@ -3142,6 +3142,12 @@ On-the-fly response compression and request decompression. Negotiates the best a
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
 - Strong origin `ETag` validators are preserved by skipping compression; when a weak-ETag response is compressed, the shared body-transform lifecycle removes that upstream validator because the client-visible bytes changed
 
+**Multiple instances:** A proxy may carry several `compression` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Request decompression and response compression are not idempotent, so each one-shot coding decision is tied to exactly one effective instance in configured order:
+
+- **Request decode.** The first instance with `decompress_request: true` that recognizes a supported `Content-Encoding` claims request-scoped ownership, validates the body when buffered, strips public `Content-Encoding`/`Content-Length` only after that claim, and performs the body decode exactly once. Sibling instances must not delete the owner's internal saved-encoding marker or strip encoding metadata without owning the decode. Missing owner staging fails closed (no second claim, no speculative strip).
+- **Response encode.** The first instance that commits a gateway `Content-Encoding` owns the single coding layer and is the only instance whose response-body transform may compress. Later instances see the committed encoding as a protocol hard skip and return `None` from the transform. An earlier instance that only nominates identity/`Vary` does not block a later instance from compressing, so differing `algorithms` preferences compose as a configured-order union with at most one coding layer.
+- **Reload.** Plugin-cache rebuild/reload remains atomic: an in-flight request sees one plugin generation end-to-end on H1, H2, and native H3 (all share the same sequential transform loops).
+
 ```yaml
 config:
   algorithms: ["gzip", "br"]
