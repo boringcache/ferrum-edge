@@ -577,6 +577,25 @@ pub mod _test_support {
             .map_err(|error| error.to_string())
     }
 
+    // ── plugins/request_mirror ───────────────────────────────────────────────
+    pub fn request_mirror_should_mirror_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> bool {
+        plugin.should_mirror_for_test()
+    }
+
+    pub fn request_mirror_sample_threshold_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.sample_threshold_for_test()
+    }
+
+    pub fn request_mirror_sample_phase_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.sample_phase_for_test()
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
@@ -588,6 +607,12 @@ pub mod _test_support {
             http_client,
             instance_id,
         )
+    }
+
+    pub fn request_deduplication_logical_keys_from_context_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Vec<String> {
+        crate::plugins::request_deduplication::logical_keys_from_request_context_for_test(ctx)
     }
 
     pub async fn finalize_plugin_rejection_for_test(
@@ -608,7 +633,7 @@ pub mod _test_support {
             &mut headers,
             &mut body,
             false,
-            false,
+            true,
         )
         .await;
         crate::plugins::PluginResult::RejectBinary {
@@ -1088,6 +1113,14 @@ pub mod _test_support {
         plugin: &crate::plugins::response_caching::ResponseCaching,
     ) -> usize {
         plugin.current_total_size_for_tests()
+    }
+
+    /// Effective DashMap shard count the plugin's hot-path maps
+    /// (`cache`, `vary_index`, uncacheable predictor) were constructed with.
+    pub fn response_caching_shard_amount_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> usize {
+        plugin.shard_amount_for_tests()
     }
 
     pub fn response_caching_size_accounting_snapshot_for_test(

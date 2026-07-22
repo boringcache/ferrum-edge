@@ -35,6 +35,7 @@ use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnecti
 use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
+    create_plugin_with_http_client_and_config_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -1068,12 +1069,15 @@ fn try_create_plugin(
         )
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if pc.plugin_name == "request_deduplication" {
-        crate::plugins::request_deduplication::RequestDeduplication::new_with_instance_id(
+        // Pass the stable plugin-config resource id through the production
+        // factory so Redis logical keys partition sibling instances. Do not use
+        // the process-local runtime instance id here.
+        create_plugin_with_http_client_and_config_id(
+            &pc.plugin_name,
             &pc.config,
             http_client.clone(),
-            &pc.id,
+            Some(&pc.id),
         )
-        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if pc.plugin_name == "tcp_connection_throttle" {
         create_tcp_connection_throttle_plugin(
             pc,

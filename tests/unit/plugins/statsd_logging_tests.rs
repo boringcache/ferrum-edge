@@ -7,9 +7,10 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     StreamTransactionSummary, WsDisconnectContext, plugin_failure_policy,
     statsd_logging::{
-        MAX_UDP_PAYLOAD, STATSD_LOGGING_CONFIG_KEYS, StatsdLogging, format_http_metrics,
-        format_ws_metrics, http_body_outcome, is_valid_timer_sample, pack_udp_datagrams,
-        sanitize_namespace_tag_value, sanitize_tag_value, validate_tag_key,
+        MAX_UDP_PAYLOAD, STATSD_LOGGING_CONFIG_KEYS, StatsdLogging, bounded_grpc_status_tag,
+        format_http_metrics, format_ws_metrics, http_body_outcome, http_grpc_status_tag,
+        is_valid_timer_sample, pack_udp_datagrams, sanitize_namespace_tag_value,
+        sanitize_tag_value, validate_tag_key,
     },
     validate_plugin_config,
 };
@@ -138,6 +139,56 @@ async fn test_statsd_logging_invalid_scalar_types() {
             StatsdLogging::new(&config, default_client()).is_err(),
             "expected invalid config to be rejected: {config}"
         );
+    }
+}
+
+#[tokio::test]
+async fn test_statsd_logging_rejects_malformed_and_out_of_range_batching() {
+    let host = "127.0.0.1";
+    for config in [
+        json!({"host": host, "flush_interval_ms": null}),
+        json!({"host": host, "flush_interval_ms": "60000"}),
+        json!({"host": host, "flush_interval_ms": false}),
+        json!({"host": host, "flush_interval_ms": []}),
+        json!({"host": host, "flush_interval_ms": {}}),
+        json!({"host": host, "flush_interval_ms": 49}),
+        json!({"host": host, "flush_interval_ms": 600_001}),
+        json!({"host": host, "buffer_capacity": null}),
+        json!({"host": host, "buffer_capacity": false}),
+        json!({"host": host, "buffer_capacity": 0}),
+        json!({"host": host, "buffer_capacity": 1_000_001}),
+        json!({"host": host, "max_batch_lines": null}),
+        json!({"host": host, "max_batch_lines": []}),
+        json!({"host": host, "max_batch_lines": 0}),
+        json!({"host": host, "max_batch_lines": 10_001}),
+        json!({"host": host, "max_retries": "1"}),
+        json!({"host": host, "max_retries": -1}),
+        json!({"host": host, "max_retries": 11}),
+        json!({"host": host, "retry_delay_ms": true}),
+        json!({"host": host, "retry_delay_ms": 60_001}),
+    ] {
+        let err = StatsdLogging::new(&config, default_client())
+            .err()
+            .unwrap_or_else(|| panic!("expected batching rejection for {config}"));
+        assert!(
+            err.contains("statsd_logging:"),
+            "expected field-specific statsd error for {config}, got {err}"
+        );
+    }
+
+    let valid_bounds = StatsdLogging::new(
+        &json!({
+            "host": host,
+            "max_batch_lines": 1,
+            "buffer_capacity": 1,
+            "flush_interval_ms": 600_000,
+            "max_retries": 10,
+            "retry_delay_ms": 60_000
+        }),
+        default_client(),
+    );
+    if let Err(err) = valid_bounds {
+        panic!("valid batching boundaries must be admitted: {err}");
     }
 }
 
@@ -565,7 +616,9 @@ fn test_statsd_metric_docs_inventory_and_byte_directions() {
     for needle in [
         "request.client_disconnect",
         "request.body_incomplete",
+        "request.grpc_status.{code}",
         "body_outcome",
+        "`grpc_status` composition",
         "websocket.session.count",
         "websocket.session.duration_ms",
         "Mirror accounting",
@@ -670,6 +723,114 @@ fn test_statsd_terminal_body_failure_keeps_header_status() {
     assert!(buf.contains("request.body_incomplete:1|c"), "{buf}");
 }
 
+#[test]
+fn test_statsd_bounded_grpc_status_tag_contract() {
+    for (status, expected) in [
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(bounded_grpc_status_tag(status as u32), expected);
+    }
+    assert_eq!(bounded_grpc_status_tag(17), "OTHER");
+    assert_eq!(bounded_grpc_status_tag(u32::MAX), "OTHER");
+
+    let mut plain = create_test_transaction_summary();
+    plain.response_status_code = 200;
+    assert_eq!(http_grpc_status_tag(&plain), None);
+
+    let mut grpc = plain.clone();
+    grpc.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    // Missing terminal status on a known gRPC transaction → UNKNOWN (2).
+    assert_eq!(http_grpc_status_tag(&grpc), Some("2"));
+    grpc.metadata
+        .insert("grpc_status".to_string(), "bad".to_string());
+    assert_eq!(http_grpc_status_tag(&grpc), Some("OTHER"));
+}
+
+#[test]
+fn test_statsd_terminal_grpc_status_across_buffered_streamed_h2_h3_and_rejection() {
+    // Summary shapes mirror the upstream terminal grpc_status propagation
+    // contract (buffered H2, trailers-only/streamed H2, native H3, gateway
+    // rejection). StatsD consumes the authoritative summary value only.
+    for (case, streamed, body_completed, status, rejection, expected) in [
+        ("buffered_h2_ok", false, true, Some("0"), false, "0"),
+        (
+            "buffered_h2_unavailable",
+            false,
+            true,
+            Some("14"),
+            false,
+            "14",
+        ),
+        ("trailers_only_h2_ok", true, true, Some("0"), false, "0"),
+        ("streamed_h2_error", true, true, Some("14"), false, "14"),
+        ("native_h3_ok", true, true, Some("0"), false, "0"),
+        ("native_h3_internal", true, true, Some("13"), false, "13"),
+        ("gateway_rejection", false, true, Some("16"), true, "16"),
+        ("missing_terminal_unknown", true, true, None, false, "2"),
+        (
+            "malformed_terminal_other",
+            true,
+            true,
+            Some("bad"),
+            false,
+            "OTHER",
+        ),
+    ] {
+        let mut summary = create_test_transaction_summary();
+        summary.http_method = "POST".to_string();
+        summary.response_status_code = 200;
+        summary.response_streamed = streamed;
+        summary.body_completed = body_completed;
+        summary.latency_backend_ttfb_ms = 5.0;
+        summary
+            .metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+        if let Some(status) = status {
+            summary
+                .metadata
+                .insert("grpc_status".to_string(), status.to_string());
+        }
+        if rejection {
+            summary
+                .metadata
+                .insert("rejection_phase".to_string(), "authorize".to_string());
+        }
+
+        let mut buf = String::new();
+        format_http_metrics(&summary, "ferrum", "", None, &mut buf);
+        assert!(
+            buf.contains("status:200") && buf.contains("status_class:2xx"),
+            "{case}: HTTP status must stay distinct: {buf}"
+        );
+        assert!(
+            buf.contains(&format!("grpc_status:{expected}")),
+            "{case}: missing bounded grpc_status tag: {buf}"
+        );
+        assert!(
+            buf.contains(&format!("ferrum.request.grpc_status.{expected}:1|c")),
+            "{case}: missing grpc_status counter: {buf}"
+        );
+        assert!(
+            buf.contains("ferrum.request.status.2xx:1|c"),
+            "{case}: HTTP status-class counter must remain: {buf}"
+        );
+    }
+
+    let mut plain = create_test_transaction_summary();
+    plain.response_status_code = 200;
+    plain.body_completed = true;
+    let mut buf = String::new();
+    format_http_metrics(&plain, "ferrum", "", None, &mut buf);
+    assert!(
+        !buf.contains("grpc_status"),
+        "plain HTTP must omit grpc_status tag/counter: {buf}"
+    );
+}
+
 #[tokio::test]
 async fn test_statsd_websocket_session_metrics_and_opt_in() {
     let plugin = StatsdLogging::new(&json!({"host": "127.0.0.1"}), default_client()).unwrap();
@@ -739,9 +900,17 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
             json!({"host": "127.0.0.1", "global_tags": {"status": "spoof"}}),
             "reserved",
         ),
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"grpc_status": "spoof"}}),
+            "reserved",
+        ),
         // Case-insensitive reserved-key collision.
         (
             json!({"host": "127.0.0.1", "global_tags": {"Status": "spoof"}}),
+            "reserved",
+        ),
+        (
+            json!({"host": "127.0.0.1", "global_tags": {"Grpc_Status": "spoof"}}),
             "reserved",
         ),
         (
@@ -834,6 +1003,76 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
         assert!(
             err.to_lowercase().contains(needle) || err.contains("characters"),
             "expected '{needle}' in: {err}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_statsd_grpc_status_collector_visible_for_h2_h3_shapes() {
+    // Collector-visible evidence that OK vs non-OK gRPC outcomes remain
+    // distinguishable under HTTP 200 for the summary shapes produced by
+    // buffered H2, trailers-only/streamed H2, and native H3 paths.
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind collector");
+    let port = socket.local_addr().expect("local addr").port();
+
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": port,
+            "prefix": "ferrum",
+            "flush_interval_ms": 50,
+            "max_batch_lines": 1
+        }),
+        default_client(),
+    )
+    .expect("construct statsd");
+    plugin.start_background_tasks().expect("start statsd");
+    plugin.commit_background_tasks();
+
+    let cases = [
+        ("buffered_h2", false, true, "0"),
+        ("buffered_h2", false, true, "14"),
+        ("trailers_only_h2", true, true, "0"),
+        ("streamed_h2", true, true, "14"),
+        ("native_h3", true, true, "0"),
+        ("native_h3", true, true, "13"),
+    ];
+
+    for (case, streamed, body_completed, status) in cases {
+        let mut summary = create_test_transaction_summary();
+        summary.http_method = "POST".to_string();
+        summary.response_status_code = 200;
+        summary.response_streamed = streamed;
+        summary.body_completed = body_completed;
+        summary.latency_backend_ttfb_ms = 7.0;
+        summary
+            .metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+        summary
+            .metadata
+            .insert("grpc_status".to_string(), status.to_string());
+        plugin.log(&summary).await;
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = timeout(Duration::from_secs(10), socket.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {case} grpc_status={status}"))
+            .expect("receive statsd datagram");
+        assert!(n <= MAX_UDP_PAYLOAD, "datagram exceeded ceiling: {n}");
+        let payload = std::str::from_utf8(&buf[..n]).expect("utf8");
+        assert!(
+            payload.contains("status:200") && payload.contains("status_class:2xx"),
+            "{case}/{status}: HTTP tags must remain: {payload}"
+        );
+        assert!(
+            payload.contains(&format!("grpc_status:{status}")),
+            "{case}/{status}: collector must see grpc_status tag: {payload}"
+        );
+        assert!(
+            payload.contains(&format!("ferrum.request.grpc_status.{status}:1|c")),
+            "{case}/{status}: collector must see grpc_status counter: {payload}"
         );
     }
 }
