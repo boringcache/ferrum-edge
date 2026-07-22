@@ -1218,7 +1218,7 @@ assert_node_agent_ready_metric() {
 # Authenticated scrape of NodeWaypoint ambient proxy `/metrics` asserting the
 # honest `__mesh_bpf_metrics` contract: drop-reason series present, RST is
 # non-directional, accept-to-first-byte is absent, and after live traffic at
-# least one TCP lifecycle or bypass counter has advanced.
+# least one real capture-bypass counter has advanced.
 assert_mesh_bpf_metrics_contract() {
   log "checking NodeWaypoint __mesh_bpf_metrics contract"
   local token pod pf_pid metrics_file port
@@ -1261,11 +1261,14 @@ assert_mesh_bpf_metrics_contract() {
     exit 1
   fi
 
-  # After live traffic, at least one producer-backed series should be nonzero.
+  # Issue #2218 requires a real bypass decision, not merely a lifecycle event.
+  # The preceding service traffic makes the waypoint's own backend connection
+  # hit the proxy-UID bypass; accept any configured bypass reason here so the
+  # assertion remains valid when live-test capture policy changes.
   if ! grep -Eq \
-    'ferrum_mesh_bpf_(tcp_events_total\{event="(connect|accept_established|rst|fin_sent|fin_received)"\}|drops_total\{reason="[^"]+"\}) [1-9][0-9]*' \
+    'ferrum_mesh_bpf_drops_total\{reason="(bypass_uid_hit|exclude_cidr_hit|not_in_include_cidr|exclude_port_hit)"\} [1-9][0-9]*' \
     "$metrics_file"; then
-    echo "expected at least one nonzero ferrum_mesh_bpf_* producer series after traffic" >&2
+    echo "expected at least one real nonzero BPF capture-bypass counter after traffic" >&2
     head -n 80 "$metrics_file" >&2 || true
     rm -f "$metrics_file"
     exit 1
