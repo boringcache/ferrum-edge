@@ -152,6 +152,352 @@ async fn test_case_insensitive_content_type_is_validated_without_lowercase_copy(
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
+// body_validator must match Content-Type by normalized type/subtype only
+// (parameters stripped, OWS trimmed, ASCII case-insensitive). Substring
+// collisions against neighboring types or parameter values must not activate
+// JSON/XML validation. Malformed / empty media-type tokens fail closed.
+
+/// Table of (Content-Type, should apply default whitelist validation).
+#[test]
+fn test_content_type_exact_media_type_matching() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+
+    let cases: &[(&str, bool)] = &[
+        // Exact configured defaults.
+        ("application/json", true),
+        ("application/xml", true),
+        ("text/xml", true),
+        // Case variants.
+        ("Application/JSON", true),
+        ("APPLICATION/JSON", true),
+        ("APPLICATION/XML", true),
+        ("Text/XML", true),
+        // OWS and parameters are stripped before comparison.
+        ("application/json; charset=utf-8", true),
+        ("application/json; charset=UTF-8", true),
+        ("application/json;charset=utf-8", true),
+        ("application/json ; charset=utf-8", true),
+        ("application/json\t; charset=utf-8", true),
+        (" application/json ", true),
+        ("application/xml; charset=utf-8", true),
+        ("text/xml; charset=utf-8", true),
+        // Neighboring / distinct types must NOT match.
+        ("application/json-seq", false),
+        ("application/jsonp", false),
+        ("application/json-patch+json", false), // not in default list
+        ("application/json2", false),
+        ("text/xmlish", false),
+        ("application/soap+xml", false), // not in default list
+        // Parameter values that merely contain a configured string.
+        (
+            "application/octet-stream; profile=\"application/json\"",
+            false,
+        ),
+        ("application/octet-stream; charset=application/json", false),
+        (
+            "text/plain; type=\"application/xml\"",
+            false,
+        ),
+        // Malformed / empty media-type tokens fail closed.
+        ("", false),
+        ("; charset=utf-8", false),
+        (" ; charset=utf-8", false),
+        (";", false),
+        ("\t\n", false),
+        // Unrelated types.
+        ("text/plain", false),
+        ("application/octet-stream", false),
+        ("text/event-stream", false),
+    ];
+
+    for (content_type, should_match) in cases {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), (*content_type).to_string());
+        let buffered = plugin.should_buffer_request_body(&ctx);
+        assert_eq!(
+            buffered, *should_match,
+            "content_type={content_type:?}: should_buffer_request_body expected {should_match}, got {buffered}",
+        );
+    }
+}
+
+/// Custom content_types lists use the same exact type/subtype semantics.
+#[test]
+fn test_custom_content_types_exact_media_type_matching() {
+    let plugin = BodyValidator::new(&json!({
+        "required_fields": ["name"],
+        "content_types": ["application/vnd.api+json", "text/csv"]
+    }))
+    .unwrap();
+
+    let cases: &[(&str, bool)] = &[
+        ("application/vnd.api+json", true),
+        ("application/vnd.api+json; charset=utf-8", true),
+        ("APPLICATION/VND.API+JSON", true),
+        ("text/csv", true),
+        ("text/csv; charset=us-ascii", true),
+        ("application/vnd.api+jsonp", false),
+        ("application/vnd.api+json-patch", false),
+        ("text/csvp", false),
+        (
+            "application/octet-stream; profile=\"application/vnd.api+json\"",
+            false,
+        ),
+        // Default JSON is not on the custom list.
+        ("application/json", false),
+        ("application/json; charset=utf-8", false),
+    ];
+
+    for (content_type, should_match) in cases {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), (*content_type).to_string());
+        assert_eq!(
+            plugin.should_buffer_request_body(&ctx),
+            *should_match,
+            "content_type={content_type:?}"
+        );
+    }
+}
+
+/// Configured content_types with parameters are normalized to type/subtype;
+/// parameter-only entries are rejected.
+#[test]
+fn test_configured_content_types_normalize_and_reject_parameter_only() {
+    let plugin = BodyValidator::new(&json!({
+        "required_fields": ["name"],
+        "content_types": ["application/json; charset=utf-8"]
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+
+    for config in [
+        json!({"required_fields": ["name"], "content_types": ["; charset=utf-8"]}),
+        json!({"required_fields": ["name"], "content_types": [" ; charset=utf-8"]}),
+        json!({"response_required_fields": ["id"], "response_content_types": [";"]}),
+    ] {
+        assert!(
+            BodyValidator::new(&config).is_err(),
+            "parameter-only media type must be rejected: {config:?}"
+        );
+    }
+}
+
+/// `application/json-seq` must not activate the single-document JSON validator
+/// under the default content_types list (request → Continue, not 400).
+#[tokio::test]
+async fn test_request_json_seq_neighbor_type_is_not_validated() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    // RFC 7464 JSON text sequence framing — valid for json-seq, not for
+    // application/json single-document parsing.
+    let json_seq_body = "\u{001e}{\"name\":\"Alice\"}\n";
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/json-seq".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), json_seq_body.to_string());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+/// Parameter collision must not force request validation (Continue, not 400).
+#[tokio::test]
+async fn test_request_parameter_collision_is_not_validated() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream; profile=\"application/json\"".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), "not-json".to_string());
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+/// Malformed Content-Type fails closed without panic (Continue, not 400).
+#[tokio::test]
+async fn test_request_malformed_content_type_fails_closed() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    for content_type in ["", "; charset=utf-8", " ; charset=utf-8", ";", "\t"] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        ctx.metadata
+            .insert("request_body".to_string(), "not-json".to_string());
+        let mut headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+/// Parameterized application/json still rejects invalid bodies with 400.
+#[tokio::test]
+async fn test_request_parameterized_json_still_validated_400() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/json; charset=utf-8".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), r#"{"other": true}"#.to_string());
+    let mut headers = ctx.headers.clone();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+/// Response path shares exact media-type matching: json-seq is skipped.
+#[tokio::test]
+async fn test_response_json_seq_neighbor_type_is_not_validated() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let mut ctx = make_response_ctx();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/json-seq".to_string(),
+    );
+    // Record-separator framed body that single-document JSON would reject.
+    let body = b"\x1e{\"id\":1}\n";
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
+    );
+}
+
+/// Response parameter collision must not activate validation.
+#[tokio::test]
+async fn test_response_parameter_collision_is_not_validated() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let mut ctx = make_response_ctx();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream; profile=\"application/json\"".to_string(),
+    );
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, b"not-json")
+            .await,
+    );
+}
+
+/// Response malformed Content-Type fails closed (Continue, not 502).
+#[tokio::test]
+async fn test_response_malformed_content_type_fails_closed() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    for content_type in ["", "; charset=utf-8", " ; charset=utf-8", ";"] {
+        let mut ctx = make_response_ctx();
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), content_type.to_string());
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, b"not-json")
+                .await,
+        );
+    }
+}
+
+/// Parameterized application/json on the response path still rejects with 502.
+#[tokio::test]
+async fn test_response_parameterized_json_still_validated_502() {
+    let plugin = response_schema_plugin(serde_json::json!({
+        "type": "object",
+        "required": ["id"]
+    }));
+    let mut ctx = make_response_ctx();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/json; charset=utf-8".to_string(),
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"name":"x"}"#)
+            .await,
+        Some(502),
+    );
+}
+
+/// Structured-suffix JSON types on a custom whitelist dispatch to JSON
+/// validation; neighboring non-suffix types do not.
+#[tokio::test]
+async fn test_json_dispatch_uses_essence_not_substring() {
+    let plugin = BodyValidator::new(&json!({
+        "required_fields": ["name"],
+        "content_types": ["application/vnd.api+json", "application/json-seq"]
+    }))
+    .unwrap();
+
+    // +json structured suffix → JSON validator → 400 for missing field.
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/vnd.api+json".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), r#"{"other": true}"#.to_string());
+    let mut headers = ctx.headers.clone();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    // json-seq is on the whitelist so applicability matches, but dispatch must
+    // not treat it as single-document JSON (substring "json" is insufficient).
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/json-seq".to_string(),
+    );
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        "\u{001e}{\"name\":\"Alice\"}\n".to_string(),
+    );
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
 #[test]
 fn test_trait_object_dispatches_request_body_buffering_hooks() {
     let plugin: std::sync::Arc<dyn Plugin> =
