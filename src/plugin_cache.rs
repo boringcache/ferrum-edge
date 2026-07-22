@@ -396,6 +396,11 @@ impl Plugin for PriorityOverridePlugin {
     ) -> Option<(&str, Arc<crate::config::types::CountryMmdbSnapshot>)> {
         self.inner.country_mmdb_retained_load()
     }
+    fn mesh_bpf_metrics_exporter(
+        &self,
+    ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
+        self.inner.mesh_bpf_metrics_exporter()
+    }
     fn correlation_id_header_name(&self) -> Option<&str> {
         self.inner.correlation_id_header_name()
     }

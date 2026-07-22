@@ -169,6 +169,19 @@ fn assert_single_tcp_events_family(body: &str, prefix: &str) {
     );
 }
 
+#[test]
+fn priority_override_preserves_mesh_bpf_exporter_capability() {
+    let mut cfg = gateway_with_bpf_metrics(Some("priority_bpf"));
+    cfg.plugin_configs[0].priority_override = Some(1234);
+    let cache = PluginCache::with_http_client(&cfg, PluginHttpClient::default())
+        .expect("cache with priority-overridden bpf metrics");
+    let exporter = cache
+        .mesh_bpf_metrics_exporter()
+        .expect("priority wrapper must forward the exporter capability");
+    assert_eq!(exporter.prefix(), "priority_bpf");
+    assert_single_tcp_events_family(&exporter.render_prometheus(), "priority_bpf");
+}
+
 #[tokio::test]
 async fn authenticated_metrics_includes_seeded_mesh_bpf_families() {
     let state = BpfMetricsState::new();
