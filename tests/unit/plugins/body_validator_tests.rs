@@ -204,6 +204,13 @@ fn test_content_type_exact_media_type_matching() {
         (" ; charset=utf-8", false),
         (";", false),
         ("\t\n", false),
+        ("application", false),
+        ("/json", false),
+        ("application/", false),
+        ("application//json", false),
+        ("application json", false),
+        ("application/js(on)", false),
+        ("application/json\n", false),
         // Unrelated types.
         ("text/plain", false),
         ("application/octet-stream", false),
@@ -270,9 +277,9 @@ fn test_custom_content_types_exact_media_type_matching() {
 }
 
 /// Configured content_types with parameters are normalized to type/subtype;
-/// parameter-only entries are rejected.
+/// parameter-only and malformed entries are rejected.
 #[test]
-fn test_configured_content_types_normalize_and_reject_parameter_only() {
+fn test_configured_content_types_normalize_and_reject_malformed() {
     let plugin = BodyValidator::new(&json!({
         "required_fields": ["name"],
         "content_types": ["application/json; charset=utf-8"]
@@ -291,10 +298,17 @@ fn test_configured_content_types_normalize_and_reject_parameter_only() {
         json!({"required_fields": ["name"], "content_types": ["; charset=utf-8"]}),
         json!({"required_fields": ["name"], "content_types": [" ; charset=utf-8"]}),
         json!({"response_required_fields": ["id"], "response_content_types": [";"]}),
+        json!({"required_fields": ["name"], "content_types": ["application"]}),
+        json!({"required_fields": ["name"], "content_types": ["/json"]}),
+        json!({"required_fields": ["name"], "content_types": ["application/"]}),
+        json!({"required_fields": ["name"], "content_types": ["application//json"]}),
+        json!({"required_fields": ["name"], "content_types": ["application json"]}),
+        json!({"required_fields": ["name"], "content_types": ["application/js(on)"]}),
+        json!({"required_fields": ["name"], "content_types": ["application/json\n"]}),
     ] {
         assert!(
             BodyValidator::new(&config).is_err(),
-            "parameter-only media type must be rejected: {config:?}"
+            "malformed media type must be rejected: {config:?}"
         );
     }
 }
@@ -347,7 +361,20 @@ async fn test_request_parameter_collision_is_not_validated() {
 #[tokio::test]
 async fn test_request_malformed_content_type_fails_closed() {
     let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
-    for content_type in ["", "; charset=utf-8", " ; charset=utf-8", ";", "\t"] {
+    for content_type in [
+        "",
+        "; charset=utf-8",
+        " ; charset=utf-8",
+        ";",
+        "\t",
+        "application",
+        "/json",
+        "application/",
+        "application//json",
+        "application json",
+        "application/js(on)",
+        "application/json\n",
+    ] {
         let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             "POST".to_string(),
@@ -421,7 +448,17 @@ async fn test_response_parameter_collision_is_not_validated() {
 #[tokio::test]
 async fn test_response_malformed_content_type_fails_closed() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
-    for content_type in ["", "; charset=utf-8", " ; charset=utf-8", ";"] {
+    for content_type in [
+        "",
+        "; charset=utf-8",
+        " ; charset=utf-8",
+        ";",
+        "application",
+        "application/",
+        "application//json",
+        "application json",
+        "application/json\n",
+    ] {
         let mut ctx = make_response_ctx();
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), content_type.to_string());

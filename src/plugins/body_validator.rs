@@ -891,14 +891,15 @@ fn optional_content_types(
     for (index, value) in values.into_iter().enumerate() {
         // Normalize configured media types the same way actual headers are
         // compared: type/subtype only, parameters stripped, ASCII-lowercased.
-        let normalized = media_type_essence(&value).to_ascii_lowercase();
-        if normalized.is_empty() {
-            return Err(format!(
-                "body_validator: '{field}' entries must be media types \
-                 (type/subtype), not empty or parameter-only \
-                 (invalid entry at index {index})"
-            ));
-        }
+        let normalized = media_type_essence(&value)
+            .ok_or_else(|| {
+                format!(
+                    "body_validator: '{field}' entries must be valid media types \
+                     (type/subtype), not empty, parameter-only, or malformed \
+                     (invalid entry at index {index})"
+                )
+            })?
+            .to_ascii_lowercase();
         parsed.push(normalized);
     }
     Ok(Some(parsed))
@@ -913,10 +914,48 @@ fn default_content_types() -> Vec<String> {
 }
 
 /// Media-type essence (`type`/`subtype`) from a `Content-Type` value: the token
-/// before the first `;`, with surrounding OWS trimmed. Empty means a malformed
-/// or parameter-only header; callers must fail closed rather than match.
-fn media_type_essence(content_type: &str) -> &str {
-    content_type.split(';').next().unwrap_or("").trim()
+/// before the first `;`, with surrounding OWS trimmed. Both components must be
+/// non-empty RFC token values and exactly one slash must separate them.
+fn media_type_essence(content_type: &str) -> Option<&str> {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim_matches(|ch| ch == ' ' || ch == '\t');
+    let (type_name, subtype) = essence.split_once('/')?;
+    if type_name.is_empty()
+        || subtype.is_empty()
+        || subtype.contains('/')
+        || !type_name.bytes().all(is_media_type_token_byte)
+        || !subtype.bytes().all(is_media_type_token_byte)
+    {
+        return None;
+    }
+    Some(essence)
+}
+
+fn is_media_type_token_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
 }
 
 /// Exact type/subtype match against configured media types.
@@ -925,14 +964,14 @@ fn media_type_essence(content_type: &str) -> &str {
 /// OWS trimmed, ASCII case-insensitive) to each configured entry. Distinct
 /// neighbors such as `application/json-seq` and parameter values that merely
 /// contain a configured string do not match. An empty configured list means
-/// "match all" (legacy). An empty/malformed actual essence matches nothing.
+/// "match all valid media types" (legacy). A malformed actual value never
+/// matches, including when the configured list is empty.
 fn content_type_matches(configured: &[String], content_type: &str) -> bool {
+    let Some(actual) = media_type_essence(content_type) else {
+        return false;
+    };
     if configured.is_empty() {
         return true;
-    }
-    let actual = media_type_essence(content_type);
-    if actual.is_empty() {
-        return false;
     }
     configured
         .iter()
@@ -940,10 +979,13 @@ fn content_type_matches(configured: &[String], content_type: &str) -> bool {
 }
 
 fn is_grpc_content_type(content_type: &str) -> bool {
-    // gRPC media types are identified by their essence prefix; parameters must
-    // not participate (same strip-before-compare posture as JSON/XML matching).
-    let media_type = media_type_essence(content_type);
-    ascii_starts_with_ignore_case(media_type, "application/grpc")
+    // gRPC media types use application/grpc or a registered representation
+    // suffix such as application/grpc+proto. Parameters never participate.
+    let Some(media_type) = media_type_essence(content_type) else {
+        return false;
+    };
+    media_type.eq_ignore_ascii_case("application/grpc")
+        || ascii_starts_with_ignore_case(media_type, "application/grpc+")
 }
 
 /// Reject XML whose DOCTYPE declares an entity-expansion bomb ("billion
@@ -1278,10 +1320,9 @@ fn numeric_char_ref_at(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
 /// parameter values and neighboring types such as `application/json-seq` are
 /// not treated as single-document JSON.
 fn is_json_like_content_type(content_type: &str) -> bool {
-    let media_type = media_type_essence(content_type);
-    if media_type.is_empty() {
+    let Some(media_type) = media_type_essence(content_type) else {
         return false;
-    }
+    };
     media_type.eq_ignore_ascii_case("application/json")
         || ascii_ends_with_ignore_case(media_type, "+json")
 }
@@ -1289,10 +1330,9 @@ fn is_json_like_content_type(content_type: &str) -> bool {
 /// XML dispatch over a media-type essence: exact `application/xml` /
 /// `text/xml`, or an RFC 6838 structured suffix `+xml`.
 fn is_xml_like_content_type(content_type: &str) -> bool {
-    let media_type = media_type_essence(content_type);
-    if media_type.is_empty() {
+    let Some(media_type) = media_type_essence(content_type) else {
         return false;
-    }
+    };
     media_type.eq_ignore_ascii_case("application/xml")
         || media_type.eq_ignore_ascii_case("text/xml")
         || ascii_ends_with_ignore_case(media_type, "+xml")
