@@ -2081,7 +2081,7 @@ impl Plugin for RequestDeduplication {
         // RELEASE the in-flight locks so the marker transitions to a clean state
         // instead of dangling until `inflight_ttl`, which keeps duplicate
         // detection accurate once the synthetic short-circuit returns. Empty 200
-        // and 204/205/304 short-circuits skip this body-hook path entirely; the
+        // and 204/205 short-circuits skip this body-hook path entirely; the
         // shared reject finalizer's `FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY`
         // plus `on_response_committed` perform the equivalent token-matched
         // release. The exception is a synthetic short-circuit whose own

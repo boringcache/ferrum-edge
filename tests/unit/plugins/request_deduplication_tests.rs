@@ -830,7 +830,7 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
 }
 
 // Marker set by the shared H1/H2/H3 reject finalizer for every finalized
-// successful synthetic short-circuit (including empty 200 and 204), independent
+// successful HTTP 2xx synthetic short-circuit (including empty 200 and 204), independent
 // of whether synthetic response-body hooks ran. Mirrors
 // `crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY`.
 const FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY: &str = "ferrum:finalized_synthetic_response";

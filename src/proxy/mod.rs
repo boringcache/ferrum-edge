@@ -202,7 +202,7 @@ pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_
 
 /// Body-independent lifecycle signal set once a plugin short-circuit has been
 /// finalized as a successful synthetic response (final HTTP 2xx), including
-/// empty 200 and 204/205/304 shapes that intentionally skip the synthetic
+/// empty 200 and 204/205 shapes that intentionally skip the synthetic
 /// response-body hook pipeline. Unlike
 /// [`SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`] (scoped to the body-hook phase only),
 /// this marker remains visible through `on_response_committed` so ownership
@@ -14765,7 +14765,7 @@ pub(crate) async fn apply_plugin_rejection_response(
 ///   contract and keeps preflight/mock-heavy proxies from paying three extra
 ///   async plugin sweeps per request.
 ///
-/// Empty 200 and 204/205/304 successes still finalize through
+/// Empty 200 and 204/205 successes still finalize through
 /// [`apply_reject_after_proxy_and_synthetic_body_hooks`], which records
 /// [`FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY`] so ownership plugins can
 /// release in-flight markers from `on_response_committed` without depending on
@@ -15107,7 +15107,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         strip_websocket_transport_managed_response_header_map(headers);
     }
 
-    // Body-independent finalized-synthetic signal. Empty 200 and 204/205/304
+    // Body-independent finalized-synthetic signal. Empty 200 and 204/205
     // short-circuits skip the synthetic body-hook pipeline (and therefore never
     // see `SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`), but ownership plugins still
     // need a durable success signal through `on_response_committed`. Gate on the
