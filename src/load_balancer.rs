@@ -530,10 +530,7 @@ fn wrr_gcd(mut a: u32, mut b: u32) -> u32 {
 /// largest-remainder method in original target order for deterministic ties.
 /// Config validation limits upstreams to fewer targets than the normal cap;
 /// `max` also keeps direct internal construction safe if that invariant changes.
-fn bound_wrr_weights(
-    normalized: &[(usize, u64)],
-    total_weight: u64,
-) -> Vec<(usize, i64)> {
+fn bound_wrr_weights(normalized: &[(usize, u64)], total_weight: u64) -> Vec<(usize, i64)> {
     let schedule_len = WRR_MAX_SCHEDULE_LEN.max(normalized.len());
     if total_weight <= schedule_len as u64 {
         return normalized
