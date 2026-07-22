@@ -590,6 +590,12 @@ pub mod _test_support {
         )
     }
 
+    pub fn request_deduplication_logical_keys_from_context_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Vec<String> {
+        crate::plugins::request_deduplication::logical_keys_from_request_context_for_test(ctx)
+    }
+
     pub async fn finalize_plugin_rejection_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,

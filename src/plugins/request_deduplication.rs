@@ -288,6 +288,20 @@ pub(crate) fn set_request_state_for_test(
     );
 }
 
+/// Sorted logical keys acquired during `before_proxy` for external tests that
+/// construct plugins through `PluginCache` / the production factory (trait
+/// objects) rather than the concrete test helper.
+#[allow(dead_code)]
+pub(crate) fn logical_keys_from_request_context_for_test(ctx: &RequestContext) -> Vec<String> {
+    let mut keys: Vec<String> = ctx
+        .request_deduplication_states
+        .values()
+        .map(|state| state.key.clone())
+        .collect();
+    keys.sort();
+    keys
+}
+
 static NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct RequestDeduplication {
