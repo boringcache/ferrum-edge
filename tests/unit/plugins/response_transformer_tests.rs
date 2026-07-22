@@ -678,10 +678,9 @@ async fn test_response_transformer_accepts_valid_header_value_edge_cases() {
                 {"operation": "add", "target": "header", "key": "X-Edge", "value": value}
             ]
         }));
-        assert!(
-            plugin.is_ok(),
-            "valid HeaderValue edge case rejected: {value:?} -> {plugin:?}"
-        );
+        if let Err(error) = plugin {
+            panic!("valid HeaderValue edge case rejected: {value:?} -> {error}");
+        }
     }
 }
 
