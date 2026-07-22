@@ -156,19 +156,39 @@ async fn mirror_results_before_at_and_after_five_seconds_remain_observable() {
             .collect::<Vec<_>>()
     };
 
-    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    // Let every publisher and detached result collector register its paused-
+    // clock wait before advancing virtual time. Otherwise the first task may
+    // not be polled until after the clock has already moved four seconds.
     tokio::task::yield_now().await;
+
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    for _ in 0..100 {
+        if mirrored_statuses().len() >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert_eq!(mirrored_statuses(), vec![204]);
 
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    tokio::task::yield_now().await;
+    for _ in 0..100 {
+        if mirrored_statuses().len() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert_eq!(mirrored_statuses(), vec![204, 205]);
 
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     for publisher in publishers {
         publisher.await.expect("mirror result publisher");
     }
-    tokio::task::yield_now().await;
+    for _ in 0..100 {
+        if mirrored_statuses().len() >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert_eq!(mirrored_statuses(), vec![204, 205, 206]);
 }
 
