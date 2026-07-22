@@ -248,19 +248,26 @@ async fn config_validation_rejects_batch_and_retry_clamp_candidates() {
         ("retry.max_attempts", json!(0)),
         ("retry.max_attempts", json!(33)),
         ("retry.max_attempts", json!(4_294_967_295u64)),
+        ("retry.initial_delay_ms", json!(60_001)),
+        ("retry.max_delay_ms", json!(60_001)),
     ] {
         let mut config = valid_config(temp.path());
         match path {
             "batch.size" => config["batch"]["size"] = value.clone(),
             "batch.buffer_capacity" => config["batch"]["buffer_capacity"] = value.clone(),
             "retry.max_attempts" => config["retry"]["max_attempts"] = value.clone(),
+            "retry.initial_delay_ms" => config["retry"]["initial_delay_ms"] = value.clone(),
+            "retry.max_delay_ms" => {
+                config["retry"]["initial_delay_ms"] = json!(0);
+                config["retry"]["max_delay_ms"] = value.clone();
+            }
             _ => unreachable!(),
         }
         let err = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
             .err()
             .unwrap_or_else(|| panic!("expected rejection for {path}={value}"));
         assert!(
-            err.contains(path) || err.contains(path.replace('.', "_").as_str()),
+            err.contains(path),
             "expected field-specific error for {path}={value}, got {err}"
         );
     }
@@ -276,9 +283,52 @@ async fn config_validation_rejects_batch_and_retry_clamp_candidates() {
 
     let mut ok_max = valid_config(temp.path());
     ok_max["retry"]["max_attempts"] = json!(32);
+    ok_max["retry"]["initial_delay_ms"] = json!(0);
+    ok_max["retry"]["max_delay_ms"] = json!(0);
     assert!(
         ApiChargebackSink::new(&ok_max, PluginHttpClient::default(), "ferrum").is_ok(),
-        "max_attempts=32 must be admitted"
+        "max_attempts=32 with zero delays must be admitted"
+    );
+
+    // Exact worst-case cumulative budget boundary: 10 sleeps × 60000 ms = 600000.
+    let mut exact_budget = valid_config(temp.path());
+    exact_budget["retry"] = json!({
+        "max_attempts": 11,
+        "initial_delay_ms": 60_000,
+        "max_delay_ms": 60_000,
+        "jitter": false
+    });
+    assert!(
+        ApiChargebackSink::new(&exact_budget, PluginHttpClient::default(), "ferrum").is_ok(),
+        "exact 600000 ms cumulative delay budget must be admitted"
+    );
+
+    // One inter-attempt sleep over the budget: 11 × 60000 = 660000.
+    let mut over_budget = valid_config(temp.path());
+    over_budget["retry"] = json!({
+        "max_attempts": 12,
+        "initial_delay_ms": 60_000,
+        "max_delay_ms": 60_000,
+        "jitter": false
+    });
+    let over_err = ApiChargebackSink::new(&over_budget, PluginHttpClient::default(), "ferrum")
+        .err()
+        .expect("one-over cumulative delay budget must be rejected");
+    assert!(
+        over_err.contains("600000")
+            && (over_err.contains("retry.max_attempts")
+                || over_err.contains("retry.initial_delay_ms")
+                || over_err.contains("retry.max_delay_ms")),
+        "over-budget error must name the budget and retry fields; got {over_err}"
+    );
+
+    let mut delay_ceiling = valid_config(temp.path());
+    delay_ceiling["retry"]["max_attempts"] = json!(2);
+    delay_ceiling["retry"]["initial_delay_ms"] = json!(60_000);
+    delay_ceiling["retry"]["max_delay_ms"] = json!(60_000);
+    assert!(
+        ApiChargebackSink::new(&delay_ceiling, PluginHttpClient::default(), "ferrum").is_ok(),
+        "individual delay ceiling of 60000 ms must be admitted"
     );
 }
 
@@ -529,8 +579,40 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
         );
     }
 
-    // OpenAPI cannot express max_delay_ms >= initial_delay_ms; document and
-    // cover both layers so inverted retry bounds stay constructor-gated.
+    // OpenAPI cannot express max_delay_ms >= initial_delay_ms or the cumulative
+    // inter-attempt delay budget; document and cover both layers so inverted /
+    // over-budget retry bounds stay constructor-gated. Individual delay maxima
+    // are schema-enforced at 60000 ms.
+    for (label, config) in [
+        (
+            "initial_delay_ms over individual ceiling",
+            json!({
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+                "retry": { "initial_delay_ms": 60_001, "max_delay_ms": 60_001 }
+            }),
+        ),
+        (
+            "max_delay_ms over individual ceiling",
+            json!({
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+                "retry": { "initial_delay_ms": 0, "max_delay_ms": 60_001 }
+            }),
+        ),
+    ] {
+        assert!(
+            sink_validator.validate(&config).is_err(),
+            "{label} must be schema-invalid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", &config).is_err(),
+            "{label} must be runtime-rejected: {config}"
+        );
+    }
+
     let inverted_retry = json!({
         "clickhouse": { "url": "https://clickhouse.example:8443" },
         "spool": { "enabled": false },
@@ -549,6 +631,28 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
     assert!(
         retry_err.contains("retry.max_delay_ms must be >= retry.initial_delay_ms"),
         "unexpected retry admission error: {retry_err}"
+    );
+
+    let over_budget = json!({
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "retry": {
+            "max_attempts": 12,
+            "initial_delay_ms": 60_000,
+            "max_delay_ms": 60_000,
+            "jitter": false
+        }
+    });
+    assert!(
+        sink_validator.validate(&over_budget).is_ok(),
+        "cumulative delay budget remains schema-admitted when OpenAPI cannot compute the schedule"
+    );
+    let budget_err = validate_plugin_config("api_chargeback_sink", &over_budget)
+        .expect_err("over-budget retry must fail runtime admission");
+    assert!(
+        budget_err.contains("600000"),
+        "unexpected cumulative budget error: {budget_err}"
     );
 }
 

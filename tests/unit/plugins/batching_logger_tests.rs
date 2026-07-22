@@ -153,27 +153,89 @@ fn build_batch_config_applies_defaults_and_valid_boundaries() {
 
 #[test]
 fn validate_batch_config_rejects_malformed_and_out_of_range_values() {
-    for config in [
-        json!({"batch_size": "many"}),
-        json!({"batch_size": null}),
-        json!({"batch_size": true}),
-        json!({"batch_size": []}),
-        json!({"batch_size": {}}),
-        json!({"flush_interval_ms": false}),
-        json!({"buffer_capacity": -1}),
-        json!({"max_retries": {}}),
-        json!({"retry_delay_ms": []}),
-        json!({"batch_size": 0}),
-        json!({"buffer_capacity": MAX_BUFFER_CAPACITY as u64 + 1}),
-        json!({"flush_interval_ms": 99}),
-        json!({"max_retries": 11}),
-        json!({"retry_delay_ms": 60_001}),
+    let defaults = batch_defaults();
+    let fields = [
+        "batch_size",
+        "flush_interval_ms",
+        "buffer_capacity",
+        "max_retries",
+        "retry_delay_ms",
+    ];
+    let malformed = [
+        json!(null),
+        json!("bad"),
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(-1),
+    ];
+
+    for field in fields {
+        for bad in &malformed {
+            let mut config = json!({});
+            config[field] = bad.clone();
+            let err = validate_batch_config(&config, "batching_logger_bounds", defaults)
+                .expect_err(&format!("expected rejection for {field}={bad}"));
+            assert!(
+                err.contains(field),
+                "error for {field}={bad} must name the field; got {err}"
+            );
+        }
+    }
+
+    for (config, field) in [
+        (json!({"batch_size": 0}), "batch_size"),
+        (json!({"batch_size": MAX_BATCH_SIZE as u64 + 1}), "batch_size"),
+        (json!({"buffer_capacity": 0}), "buffer_capacity"),
+        (
+            json!({"buffer_capacity": MAX_BUFFER_CAPACITY as u64 + 1}),
+            "buffer_capacity",
+        ),
+        (json!({"flush_interval_ms": 99}), "flush_interval_ms"),
+        (json!({"max_retries": MAX_BATCH_RETRIES + 1}), "max_retries"),
+        (
+            json!({"retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS + 1}),
+            "retry_delay_ms",
+        ),
     ] {
+        let err = validate_batch_config(&config, "batching_logger_bounds", defaults)
+            .expect_err(&format!("expected out-of-range rejection for {config}"));
         assert!(
-            validate_batch_config(&config, "batching_logger_bounds", batch_defaults()).is_err(),
-            "expected invalid config to be rejected: {config}"
+            err.contains(field),
+            "out-of-range error for {config} must name {field}; got {err}"
         );
     }
+
+    assert!(
+        validate_batch_config(
+            &json!({
+                "batch_size": 1,
+                "buffer_capacity": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 0,
+                "retry_delay_ms": 0
+            }),
+            "batching_logger_bounds",
+            defaults
+        )
+        .is_ok(),
+        "valid lower boundaries must be admitted"
+    );
+    assert!(
+        validate_batch_config(
+            &json!({
+                "batch_size": MAX_BATCH_SIZE,
+                "buffer_capacity": MAX_BUFFER_CAPACITY,
+                "flush_interval_ms": 100,
+                "max_retries": MAX_BATCH_RETRIES,
+                "retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS
+            }),
+            "batching_logger_bounds",
+            defaults
+        )
+        .is_ok(),
+        "valid upper boundaries must be admitted"
+    );
 }
 
 #[test]

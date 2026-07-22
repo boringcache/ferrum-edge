@@ -56,6 +56,12 @@ const GRPC_STATUS_OTHER_SENTINEL: u32 = u32::MAX;
 /// including the initial try). Rejects the historical silent `.max(1)` rewrite
 /// of `0` and unbounded `u32::MAX` budgets that can pin the sole flush worker.
 const MAX_RETRY_MAX_ATTEMPTS: u32 = 32;
+/// Deployment-safe ceiling for each configured inter-attempt delay field
+/// (`retry.initial_delay_ms` and `retry.max_delay_ms`).
+const MAX_RETRY_DELAY_MS: u64 = 60_000;
+/// Worst-case cumulative inter-attempt delay budget across retries after the
+/// initial try (exponential/capped schedule, ignoring jitter reduction).
+const MAX_RETRY_TOTAL_DELAY_MS: u64 = 600_000;
 
 static ACTIVE_SINK: OnceLock<ArcSwap<Option<Arc<SinkRuntime>>>> = OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
@@ -421,6 +427,33 @@ struct SinkSummary {
     table: String,
     batch_size: usize,
     flush_interval_ms: u64,
+    retry_max_attempts: u32,
+    retry_initial_delay_ms: u64,
+    retry_max_delay_ms: u64,
+    retry_jitter: bool,
+}
+
+/// Worst-case cumulative inter-attempt delay for `max_attempts` total tries
+/// (including the initial). Matches [`RetryPolicy::backoff_delay`]'s
+/// exponential/capped schedule, excludes the initial attempt, ignores jitter
+/// reduction, and uses overflow-safe saturating arithmetic.
+fn worst_case_inter_attempt_delay_ms(
+    max_attempts: u32,
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+) -> u64 {
+    if max_attempts <= 1 {
+        return 0;
+    }
+    let cap_ms = max_delay_ms.max(initial_delay_ms);
+    let mut total: u64 = 0;
+    for attempt in 1..max_attempts {
+        let shift = (attempt - 1).min(63);
+        let grown = initial_delay_ms.saturating_mul(1u64 << shift);
+        let capped = grown.min(cap_ms);
+        total = total.saturating_add(capped);
+    }
+    total
 }
 
 pub struct ApiChargebackSink {
@@ -796,6 +829,10 @@ impl ApiChargebackSink {
                 table: self.config.clickhouse.table.clone(),
                 batch_size: self.config.batch.size,
                 flush_interval_ms: self.config.batch.flush_interval_ms,
+                retry_max_attempts: self.config.retry.max_attempts,
+                retry_initial_delay_ms: self.config.retry.initial_delay_ms,
+                retry_max_delay_ms: self.config.retry.max_delay_ms,
+                retry_jitter: self.config.retry.jitter,
             },
             logger,
             metrics,
@@ -1104,6 +1141,12 @@ pub fn render_status_json() -> String {
             "pricing_version": null,
             "clickhouse": null,
             "batch": {"size": 0, "flush_interval_ms": 0},
+            "retry": {
+                "max_attempts": 0,
+                "initial_delay_ms": 0,
+                "max_delay_ms": 0,
+                "jitter": false
+            },
             "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
             "spool": {"enabled": false, "available": false, "prepare_failures_total": 0, "files": 0, "bytes": 0, "drops_total": 0, "last_replay_at": null},
             "export": {
@@ -1157,6 +1200,12 @@ impl SinkRuntime {
             "batch": {
                 "size": self.summary.batch_size,
                 "flush_interval_ms": self.summary.flush_interval_ms,
+            },
+            "retry": {
+                "max_attempts": self.summary.retry_max_attempts,
+                "initial_delay_ms": self.summary.retry_initial_delay_ms,
+                "max_delay_ms": self.summary.retry_max_delay_ms,
+                "jitter": self.summary.retry_jitter,
             },
             "queue": {
                 "depth": self.logger.queue_depth(),
@@ -1430,9 +1479,29 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: retry.max_attempts must be between 1 and {MAX_RETRY_MAX_ATTEMPTS}"
         ));
     }
+    if config.retry.initial_delay_ms > MAX_RETRY_DELAY_MS {
+        return Err(format!(
+            "{PLUGIN_NAME}: retry.initial_delay_ms must be between 0 and {MAX_RETRY_DELAY_MS}"
+        ));
+    }
+    if config.retry.max_delay_ms > MAX_RETRY_DELAY_MS {
+        return Err(format!(
+            "{PLUGIN_NAME}: retry.max_delay_ms must be between 0 and {MAX_RETRY_DELAY_MS}"
+        ));
+    }
     if config.retry.max_delay_ms < config.retry.initial_delay_ms {
         return Err(format!(
             "{PLUGIN_NAME}: retry.max_delay_ms must be >= retry.initial_delay_ms"
+        ));
+    }
+    let worst_case_delay_ms = worst_case_inter_attempt_delay_ms(
+        config.retry.max_attempts,
+        config.retry.initial_delay_ms,
+        config.retry.max_delay_ms,
+    );
+    if worst_case_delay_ms > MAX_RETRY_TOTAL_DELAY_MS {
+        return Err(format!(
+            "{PLUGIN_NAME}: retry worst-case cumulative inter-attempt delay ({worst_case_delay_ms} ms) exceeds the {MAX_RETRY_TOTAL_DELAY_MS} ms budget; reduce retry.max_attempts, retry.initial_delay_ms, and/or retry.max_delay_ms"
         ));
     }
     if config.spool.enabled {

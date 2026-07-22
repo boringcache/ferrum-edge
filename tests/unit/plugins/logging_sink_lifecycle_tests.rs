@@ -514,6 +514,10 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
     );
     assert_eq!(status["batch"]["size"], 2);
     assert_eq!(status["batch"]["flush_interval_ms"], 60_000);
+    assert_eq!(status["retry"]["max_attempts"], 1);
+    assert_eq!(status["retry"]["initial_delay_ms"], 1);
+    assert_eq!(status["retry"]["max_delay_ms"], 1);
+    assert_eq!(status["retry"]["jitter"], false);
 
     // A later staged generation may stage its owned workers before the cache
     // swap, but it must not displace diagnostics for the committed live sink.
@@ -554,6 +558,10 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         "drop must clear ACTIVE_SINK owned by this instance"
     );
     assert_eq!(status_after["batch"]["size"], 0);
+    assert_eq!(status_after["retry"]["max_attempts"], 0);
+    assert_eq!(status_after["retry"]["initial_delay_ms"], 0);
+    assert_eq!(status_after["retry"]["max_delay_ms"], 0);
+    assert_eq!(status_after["retry"]["jitter"], false);
 }
 
 #[tokio::test]

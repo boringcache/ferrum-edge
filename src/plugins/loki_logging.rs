@@ -67,9 +67,9 @@ pub const LOKI_DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const LOKI_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
 // Retain sink-local exports for OpenAPI/runtime parity tests. Production uses
 // the authoritative shared constants directly.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub const LOKI_MAX_RETRIES: u64 = MAX_BATCH_RETRIES;
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub const LOKI_MAX_RETRY_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
 pub const LOKI_MAX_CUSTOM_HEADER_NAME_BYTES: usize = u16::MAX as usize;
 
