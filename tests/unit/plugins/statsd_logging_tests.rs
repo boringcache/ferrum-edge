@@ -675,9 +675,15 @@ fn test_statsd_terminal_body_failure_keeps_header_status() {
 
 #[test]
 fn test_statsd_bounded_grpc_status_tag_contract() {
-    assert_eq!(bounded_grpc_status_tag(0), "0");
-    assert_eq!(bounded_grpc_status_tag(14), "14");
-    assert_eq!(bounded_grpc_status_tag(16), "16");
+    for (status, expected) in [
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14",
+        "15", "16",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(bounded_grpc_status_tag(status as u32), expected);
+    }
     assert_eq!(bounded_grpc_status_tag(17), "OTHER");
     assert_eq!(bounded_grpc_status_tag(u32::MAX), "OTHER");
 
