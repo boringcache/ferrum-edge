@@ -1211,12 +1211,7 @@ impl LocalSchemaResolver {
             self.index_components(components, "/components", base, depth)?;
         }
         if let Some(paths) = root.get("paths").and_then(Value::as_object) {
-            self.index_path_item_map(
-                paths,
-                "/paths",
-                base,
-                depth.min(MAX_PATH_ITEM_INDEX_DEPTH),
-            )?;
+            self.index_path_item_map(paths, "/paths", base, depth.min(MAX_PATH_ITEM_INDEX_DEPTH))?;
         }
         if let Some(webhooks) = root.get("webhooks").and_then(Value::as_object) {
             self.index_path_item_map(
