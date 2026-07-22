@@ -155,7 +155,7 @@ async fn test_case_insensitive_content_type_is_validated_without_lowercase_copy(
 // body_validator must match Content-Type by normalized type/subtype only
 // (parameters stripped, OWS trimmed, ASCII case-insensitive). Substring
 // collisions against neighboring types or parameter values must not activate
-// JSON/XML validation. Malformed / empty media-type tokens fail closed.
+// JSON/XML validation. Malformed / empty media-type tokens do not match.
 
 /// Table of (Content-Type, should apply default whitelist validation).
 #[test]
@@ -195,7 +195,7 @@ fn test_content_type_exact_media_type_matching() {
         ),
         ("application/octet-stream; charset=application/json", false),
         ("text/plain; type=\"application/xml\"", false),
-        // Malformed / empty media-type tokens fail closed.
+        // Malformed / empty media-type tokens do not match.
         ("", false),
         ("; charset=utf-8", false),
         (" ; charset=utf-8", false),
@@ -354,7 +354,7 @@ async fn test_request_parameter_collision_is_not_validated() {
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
-/// Malformed Content-Type fails closed without panic (Continue, not 400).
+/// Malformed Content-Type is skipped without panic (Continue, not 400).
 #[tokio::test]
 async fn test_request_malformed_content_type_fails_closed() {
     let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
@@ -441,7 +441,7 @@ async fn test_response_parameter_collision_is_not_validated() {
     );
 }
 
-/// Response malformed Content-Type fails closed (Continue, not 502).
+/// Response malformed Content-Type is skipped (Continue, not 502).
 #[tokio::test]
 async fn test_response_malformed_content_type_fails_closed() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));

@@ -16626,7 +16626,7 @@ components:
             case-insensitive). Distinct neighbors such as application/json-seq
             and parameter values that merely contain a configured string do not
             match. Empty or parameter-only entries are rejected; malformed
-            actual headers fail closed.
+            actual headers do not match and are skipped.
         response_json_schema:
           type: object
           description: JSON Schema for response body validation
@@ -16652,7 +16652,7 @@ components:
           description: >-
             Response media types to validate. Same exact type/subtype matching
             semantics as content_types (parameters stripped; neighbors and
-            parameter collisions do not match; malformed headers fail closed).
+            parameter collisions and malformed headers do not match).
         protobuf_descriptor_path:
           type: string
           description: Path to compiled FileDescriptorSet binary (protoc --descriptor_set_out --include_imports)
