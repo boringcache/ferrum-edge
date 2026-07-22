@@ -6185,6 +6185,18 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
         }),
         false,
     );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "name": "grpc_lowercase_other",
+            "type": "grpc_status_count",
+            "grpc_statuses": ["other"],
+            "threshold_count": 1,
+            "channels": ["ops"]
+        }),
+        false,
+    );
 }
 
 #[test]

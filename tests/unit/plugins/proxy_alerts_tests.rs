@@ -2179,6 +2179,24 @@ fn rejects_unknown_grpc_status_selector_string() {
 }
 
 #[test]
+fn rejects_lowercase_other_grpc_status_selector_to_match_openapi() {
+    let cfg = json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [{
+            "name": "bad",
+            "type": "grpc_status_count",
+            "grpc_statuses": ["other"],
+            "threshold_count": 1,
+            "channels": ["c"]
+        }]
+    });
+    let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
+    assert!(err.contains("unknown 'grpc_statuses' entry"), "got: {err}");
+}
+
+#[test]
 fn grpc_status_count_keeps_http_status_distinct_across_shapes() {
     let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
         "channels": {

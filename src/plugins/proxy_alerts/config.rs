@@ -744,7 +744,7 @@ fn read_grpc_statuses(raw: &Value, rule_name: &str) -> Result<Vec<GrpcStatusMatc
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let selector = match item {
-            Value::String(s) if s.eq_ignore_ascii_case("OTHER") => GrpcStatusMatch::Other,
+            Value::String(s) if s == "OTHER" => GrpcStatusMatch::Other,
             Value::String(s) => {
                 return Err(format!(
                     "proxy_alerts: rule '{rule_name}': unknown 'grpc_statuses' entry '{s}' (expected 0..=16 or \"OTHER\")"

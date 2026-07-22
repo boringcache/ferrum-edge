@@ -681,20 +681,22 @@ fn observe_grpc_status_count(
     let SampleInput::Http(s) = sample else {
         return None;
     };
-    // Plain HTTP never matches; still record so the sliding window ages.
+    // Plain HTTP never enters this rule's window. Snapshotting at `now_ms`
+    // still expires old buckets and lets recovery advance without an
+    // avoidable write for every non-gRPC transaction.
     // Evaluation runs from `log()` after terminal completion (buffered,
     // trailers-only, streamed H2/H3, and gateway-generated rejections), so
     // trailer-borne statuses are visible before this sample is counted.
-    let matched = s
-        .grpc_status()
-        .is_some_and(|status| grpc_status_matches(&rule.grpc_statuses, status));
-    store.record_count(
-        rule.common.id,
-        proxy_id,
-        ownership_generation,
-        matched,
-        now_ms,
-    );
+    if let Some(status) = s.grpc_status() {
+        let matched = grpc_status_matches(&rule.grpc_statuses, status);
+        store.record_count(
+            rule.common.id,
+            proxy_id,
+            ownership_generation,
+            matched,
+            now_ms,
+        );
+    }
     let (matched_total, _) =
         store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
     let breach = matched_total >= rule.threshold_count;
