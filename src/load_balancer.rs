@@ -273,9 +273,16 @@ impl WrrSchedule {
             // start together; ratios are unchanged because each shard is itself
             // a full smooth-WRR walk of `order`.
             counters: std::array::from_fn(|i| {
-                CachePadded::new(AtomicU64::new(
-                    seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15)),
-                ))
+                let initial = if zero_weight {
+                    // All-zero weights retain the historical round-robin
+                    // fallback contract: each independent lane starts at
+                    // its own seed, regardless of the process-global
+                    // thread-to-shard assignment.
+                    seed
+                } else {
+                    seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15))
+                };
+                CachePadded::new(AtomicU64::new(initial))
             }),
             order,
             zero_weight,
