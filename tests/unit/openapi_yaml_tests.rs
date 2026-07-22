@@ -7772,3 +7772,81 @@ fn ai_rate_limiter_token_limit_required_without_default_contract() {
         "docs must not claim a 100000 default for token_limit"
     );
 }
+
+#[test]
+fn ai_rate_limiter_provider_enum_matches_runtime() {
+    use ferrum_edge::plugins::{PluginHttpClient, ai_rate_limiter::AiRateLimiter};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/AiRateLimiterConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("AiRateLimiterConfig schema compiles");
+
+    let provider_schema =
+        spec["components"]["schemas"]["AiRateLimiterConfig"]["properties"]["provider"].clone();
+    let enum_values: Vec<String> = provider_schema["enum"]
+        .as_array()
+        .expect("provider enum must be present")
+        .iter()
+        .map(|v| v.as_str().expect("enum entry is string").to_string())
+        .collect();
+    assert_eq!(
+        enum_values,
+        vec![
+            "auto",
+            "openai",
+            "anthropic",
+            "google",
+            "cohere",
+            "mistral",
+            "bedrock"
+        ],
+        "provider enum must match the runtime accepted set"
+    );
+
+    for supported in &enum_values {
+        let config = json!({ "token_limit": 100000, "provider": supported });
+        assert!(
+            validator.validate(&config).is_ok(),
+            "provider '{supported}' should be accepted by the schema"
+        );
+        AiRateLimiter::new(&config, PluginHttpClient::default())
+            .unwrap_or_else(|err| panic!("runtime must accept provider '{supported}': {err}"));
+    }
+
+    for rejected in &["gemini", "vertex", "openai_compatible", "gpt", ""] {
+        let config = json!({ "token_limit": 100000, "provider": rejected });
+        assert!(
+            validator.validate(&config).is_err(),
+            "provider '{rejected}' should be rejected by the schema"
+        );
+        let err = AiRateLimiter::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("runtime must reject provider '{rejected}'"));
+        assert!(
+            err.contains("provider"),
+            "runtime error for '{rejected}' should mention provider: {err}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_rate_limiter`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_rate_limiter docs section");
+    assert!(
+        section.contains("`google`"),
+        "docs must clarify Gemini/Vertex payloads use google"
+    );
+    assert!(
+        section.contains("`bedrock`"),
+        "docs must enumerate bedrock as an accepted provider"
+    );
+}

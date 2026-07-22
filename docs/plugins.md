@@ -4574,7 +4574,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |
 | `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers |
-| `provider` | String | `"auto"` | LLM provider format for token extraction |
+| `provider` | String | `"auto"` | LLM provider format for token extraction: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, or `bedrock`. Unknown values are rejected at construction time. |
 | `on_unmetered_response` | String | `"charge_estimate"` | Action for successful responses without usage metadata: `charge_estimate` keeps the pre-request reservation, `reject` returns a 502 and keeps the reservation, `warn` logs and releases the reservation |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
@@ -4588,7 +4588,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
-`provider` is parsed case-insensitively and ignores surrounding whitespace.
+`provider` is parsed case-insensitively and ignores surrounding whitespace. Accepted values: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, `bedrock`. Gemini/Vertex payloads use `google`.
 
 When `limit_by: "ip"`, the request client identity has already canonicalized IPv4-mapped IPv6 to native IPv4 before plugin execution, so local and Redis keys share one token budget without per-limiter reparsing.
 
