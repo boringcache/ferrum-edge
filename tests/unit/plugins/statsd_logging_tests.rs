@@ -973,6 +973,8 @@ async fn test_statsd_grpc_status_collector_visible_for_h2_h3_shapes() {
         default_client(),
     )
     .expect("construct statsd");
+    plugin.start_background_tasks().expect("start statsd");
+    plugin.commit_background_tasks();
 
     let cases = [
         ("buffered_h2", false, true, "0"),
