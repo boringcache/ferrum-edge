@@ -150,8 +150,6 @@ pub struct RequestMirror {
     mirror_port: u16,
     mirror_protocol: String,
     mirror_path: Option<String>,
-    /// Configured percentage (0.0–100.0) before tenth-percent quantization.
-    percentage: f64,
     /// `round(percentage × 10)` clamped to `0..=1000` (0.1% granularity).
     sample_threshold: u64,
     mirror_request_body: bool,
@@ -258,7 +256,6 @@ impl RequestMirror {
             mirror_port,
             mirror_protocol,
             mirror_path,
-            percentage,
             sample_threshold,
             mirror_request_body,
             max_response_body_bytes,
@@ -270,17 +267,18 @@ impl RequestMirror {
         })
     }
 
-    /// Configured mirror percentage before quantization (`0.0..=100.0`).
-    pub fn percentage(&self) -> f64 {
-        self.percentage
-    }
-
     /// Effective sampling threshold in tenths of a percent (`0..=1000`).
+    // This accessor exists for the external sampling contract tests. The
+    // production request path reads the field directly in `should_mirror`.
+    #[allow(dead_code)]
     pub fn sample_threshold(&self) -> u64 {
         self.sample_threshold
     }
 
     /// Current Bresenham phase in `0..SAMPLE_PERIOD`.
+    // This accessor exists for the external sampling contract tests. The
+    // production request path updates the atomic directly in `should_mirror`.
+    #[allow(dead_code)]
     pub fn sample_phase(&self) -> u64 {
         self.sample_phase.load(Ordering::Relaxed)
     }

@@ -755,7 +755,7 @@ fn assert_gap_bounds(percentage: f64, expected_threshold: u64) {
         "percentage {percentage}: need at least two selections to measure gaps"
     );
     let min_gap = (SAMPLE_PERIOD / expected_threshold) as usize;
-    let max_gap = ((SAMPLE_PERIOD + expected_threshold - 1) / expected_threshold) as usize;
+    let max_gap = SAMPLE_PERIOD.div_ceil(expected_threshold) as usize;
     for gap in &gaps {
         assert!(
             *gap >= min_gap && *gap <= max_gap,
