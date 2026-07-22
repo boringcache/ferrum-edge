@@ -19954,16 +19954,25 @@ async fn handle_proxy_request_inner(
                         };
                         let status = StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                        let normalized =
+                            finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                                &plugins,
+                                &mut ctx,
+                                status,
+                                &reject.body,
+                                reject.headers,
+                                is_grpc_request,
+                                grpc_web_response_content_type.is_none(),
+                            )
+                            .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        let grpc_web_response = build_grpc_web_reject_response(
                             &plugins,
                             &mut ctx,
-                            status,
-                            &reject.body,
-                            reject.headers,
-                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            &normalized,
                         )
                         .await;
-                        apply_grpc_reject_metadata(&mut ctx, &normalized);
                         log_rejected_request_with_path(
                             &plugins,
                             &ctx,
@@ -19975,6 +19984,9 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                         record_request(&state, normalized.http_status.as_u16());
+                        if let Some(response) = grpc_web_response {
+                            return Ok(response);
+                        }
                         return Ok(build_response_from_normalized_reject(normalized));
                     }
                 }
@@ -20254,16 +20266,25 @@ async fn handle_proxy_request_inner(
                         };
                         let status = StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                        let normalized =
+                            finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                                &plugins,
+                                &mut ctx,
+                                status,
+                                &reject.body,
+                                reject.headers,
+                                is_grpc_request,
+                                grpc_web_response_content_type.is_none(),
+                            )
+                            .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        let grpc_web_response = build_grpc_web_reject_response(
                             &plugins,
                             &mut ctx,
-                            status,
-                            &reject.body,
-                            reject.headers,
-                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            &normalized,
                         )
                         .await;
-                        apply_grpc_reject_metadata(&mut ctx, &normalized);
                         log_rejected_request_with_path(
                             &plugins,
                             &ctx,
@@ -20275,6 +20296,9 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                         record_request(&state, normalized.http_status.as_u16());
+                        if let Some(response) = grpc_web_response {
+                            return Ok(response);
+                        }
                         return Ok(build_response_from_normalized_reject(normalized));
                     }
                 }
@@ -20843,11 +20867,31 @@ async fn handle_proxy_request_inner(
                             "Internal Server Error",
                         ));
                     };
-                    let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                        &plugins, &mut ctx, reject, true,
+                    let status = StatusCode::from_u16(reject.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let normalized =
+                        finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            &reject.body,
+                            reject.headers,
+                            true,
+                            grpc_web_response_content_type.is_none(),
+                        )
+                        .await;
+                    apply_grpc_reject_metadata(&mut ctx, &normalized);
+                    let grpc_web_response = build_grpc_web_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        grpc_web_response_content_type,
+                        &normalized,
                     )
                     .await;
                     record_request(&state, normalized.http_status.as_u16());
+                    if let Some(response) = grpc_web_response {
+                        return Ok(response);
+                    }
                     return Ok(build_response_from_normalized_reject(normalized));
                 }
             }

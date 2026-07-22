@@ -1193,8 +1193,6 @@ async fn h3_grpc_web_validates_complete_binary_and_text_request_envelopes() {
     let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
     let mut compressed = vec![0x01, 0, 0, 0, 4];
     compressed.extend_from_slice(b"data");
-    let expected_binary = compressed.clone();
-    let expected_text = compressed.clone();
     let backend = ScriptedGrpcBackend::builder_tls(backend_listener, &backend_cert, &backend_key)
         .expect("backend TLS")
         .step(GrpcStep::AcceptRpc(MatchRpc::custom(move |request| {
@@ -1202,7 +1200,6 @@ async fn h3_grpc_web_validates_complete_binary_and_text_request_envelopes() {
                 && request.path == "/echo.Echo/Unary"
                 && request.header("content-type") == Some("application/grpc")
                 && request.header("grpc-encoding") == Some("gzip")
-                && request.body == expected_binary
         })))
         .step(GrpcStep::SendInitialHeaders)
         .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
@@ -1215,7 +1212,6 @@ async fn h3_grpc_web_validates_complete_binary_and_text_request_envelopes() {
                 && request.path == "/echo.Echo/Unary"
                 && request.header("content-type") == Some("application/grpc")
                 && request.header("grpc-encoding") == Some("gzip")
-                && request.body == expected_text
         })))
         .step(GrpcStep::SendInitialHeaders)
         .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
@@ -1332,5 +1328,8 @@ async fn h3_grpc_web_validates_complete_binary_and_text_request_envelopes() {
 
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
-    assert_eq!(backend.received_streams().await.len(), 2);
+    let received = backend.received_streams().await;
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0].body, compressed);
+    assert_eq!(received[1].body, compressed);
 }
