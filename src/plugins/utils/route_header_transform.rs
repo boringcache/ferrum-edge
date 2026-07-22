@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -122,6 +122,11 @@ pub fn parse_route_header_transforms(
                 if value.bytes().any(|b| b == b'\r' || b == b'\n') {
                     return Err(format!("{context}[{idx}].value must not contain CR or LF"));
                 }
+                // Same complete HeaderValue gate used by outbound Hyper / H3 /
+                // reqwest adapters so invalid controls fail at config load.
+                HeaderValue::from_str(value).map_err(|_| {
+                    format!("{context}[{idx}].value must be a valid HTTP HeaderValue")
+                })?;
                 out.push(RouteHeaderTransformRule {
                     operation: op,
                     key,
@@ -336,6 +341,46 @@ mod tests {
         .unwrap();
         let err = parse_route_header_transforms(&raw, "ctx").unwrap_err();
         assert!(err.contains("CR or LF"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_nul_and_other_forbidden_controls() {
+        for (label, value) in [
+            ("NUL", "ok\u{0000}bad"),
+            ("SOH", "ok\u{0001}bad"),
+            ("DEL", "ok\u{007f}bad"),
+        ] {
+            let raw: Vec<RawRouteHeaderTransformRule> =
+                serde_json::from_value(serde_json::json!([{
+                    "operation": "update",
+                    "target": "header",
+                    "key": "X",
+                    "value": value,
+                }]))
+                .unwrap();
+            let err = parse_route_header_transforms(&raw, "ctx").unwrap_err();
+            assert!(
+                err.contains("valid HTTP HeaderValue"),
+                "{label}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_accepts_header_value_edge_cases() {
+        for value in ["", " ", "\t", "plain", "tab\there", "café"] {
+            let raw: Vec<RawRouteHeaderTransformRule> =
+                serde_json::from_value(serde_json::json!([{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Edge",
+                    "value": value,
+                }]))
+                .unwrap();
+            parse_route_header_transforms(&raw, "ctx").unwrap_or_else(|e| {
+                panic!("valid HeaderValue rejected for {value:?}: {e}");
+            });
+        }
     }
 
     #[test]
