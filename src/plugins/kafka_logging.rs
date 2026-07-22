@@ -735,7 +735,7 @@ impl KafkaAdmission {
             KeyField::ProxyId => summary.proxy_id.as_deref(),
         };
         let record = match &self.schema {
-            Some(schema) => self.build_record(
+            Some(schema) if schema.applies_to_http() => self.build_record(
                 &SchemaView {
                     summary,
                     schema: schema.as_ref(),
@@ -743,7 +743,7 @@ impl KafkaAdmission {
                 key,
                 lease,
             ),
-            None => self.build_record(summary, key, lease),
+            _ => self.build_record(summary, key, lease),
         };
         let Some(record) = record else {
             return;
@@ -770,7 +770,7 @@ impl KafkaAdmission {
             KeyField::ProxyId => Some(summary.proxy_id.as_str()),
         };
         let record = match &self.schema {
-            Some(schema) => self.build_record(
+            Some(schema) if schema.applies_to_stream() => self.build_record(
                 &SchemaView {
                     summary,
                     schema: schema.as_ref(),
@@ -778,7 +778,7 @@ impl KafkaAdmission {
                 key,
                 lease,
             ),
-            None => self.build_record(summary, key, lease),
+            _ => self.build_record(summary, key, lease),
         };
         let Some(record) = record else {
             return;
@@ -1752,6 +1752,38 @@ pub(crate) async fn probe_byte_budget_before_serialize_for_test(
     drop(held_lease);
     let _ = logger.close_and_await().await;
     (exhausted, oversize)
+}
+
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn serialize_http_with_config_for_test(
+    config: &Value,
+    summary: &TransactionSummary,
+) -> Result<Value, String> {
+    let schema = resolve_schema(config, "kafka_logging", SchemaCapabilities::BASE)?;
+    match schema {
+        Some(schema) if schema.applies_to_http() => serde_json::to_value(&SchemaView {
+            summary,
+            schema: schema.as_ref(),
+        }),
+        _ => serde_json::to_value(summary),
+    }
+    .map_err(|error| error.to_string())
+}
+
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn serialize_stream_with_config_for_test(
+    config: &Value,
+    summary: &StreamTransactionSummary,
+) -> Result<Value, String> {
+    let schema = resolve_schema(config, "kafka_logging", SchemaCapabilities::BASE)?;
+    match schema {
+        Some(schema) if schema.applies_to_stream() => serde_json::to_value(&SchemaView {
+            summary,
+            schema: schema.as_ref(),
+        }),
+        _ => serde_json::to_value(summary),
+    }
+    .map_err(|error| error.to_string())
 }
 
 /// Pure producer-configuration admission used by construction and exposed to
