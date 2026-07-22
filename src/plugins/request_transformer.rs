@@ -276,6 +276,7 @@ impl RequestTransformer {
                         ));
                     }
                 };
+                let value_present = r.contains_key("value");
                 let value = match r.get("value") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
@@ -285,6 +286,7 @@ impl RequestTransformer {
                         ));
                     }
                 };
+                let new_key_present = r.contains_key("new_key");
                 let raw_new_key = match r.get("new_key") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
@@ -306,14 +308,14 @@ impl RequestTransformer {
                                 "request_transformer: rule[{idx}]: '{op_str}' operation requires a 'value'"
                             ));
                         }
-                        if raw_new_key.is_some() {
+                        if new_key_present {
                             return Err(format!(
                                 "request_transformer: rule[{idx}]: 'new_key' must not be set for {target} '{op_str}' operation"
                             ));
                         }
                     }
                     "rename" => {
-                        if value.is_some() {
+                        if value_present {
                             return Err(format!(
                                 "request_transformer: rule[{idx}]: 'value' must not be set for {target} 'rename' operation"
                             ));
@@ -325,12 +327,12 @@ impl RequestTransformer {
                         }
                     }
                     "remove" => {
-                        if value.is_some() {
+                        if value_present {
                             return Err(format!(
                                 "request_transformer: rule[{idx}]: 'value' must not be set for {target} 'remove' operation"
                             ));
                         }
-                        if raw_new_key.is_some() {
+                        if new_key_present {
                             return Err(format!(
                                 "request_transformer: rule[{idx}]: 'new_key' must not be set for {target} 'remove' operation"
                             ));

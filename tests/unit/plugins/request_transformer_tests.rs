@@ -1638,6 +1638,82 @@ async fn test_request_transformer_rejects_incompatible_header_and_query_fields()
             }),
             "'new_key' must not be set for query 'remove'",
         ),
+        (
+            json!({
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }),
+            "'new_key' must not be set for header 'add'",
+        ),
+        (
+            json!({
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "X-New",
+                "value": null
+            }),
+            "'value' must not be set for header 'rename'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "value": null
+            }),
+            "'value' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "new_key": null
+            }),
+            "'new_key' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "add",
+                "target": "query",
+                "key": "color",
+                "value": "blue",
+                "new_key": null
+            }),
+            "'new_key' must not be set for query 'add'",
+        ),
+        (
+            json!({
+                "operation": "rename",
+                "target": "query",
+                "key": "old",
+                "new_key": "new",
+                "value": null
+            }),
+            "'value' must not be set for query 'rename'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "query",
+                "key": "color",
+                "value": null
+            }),
+            "'value' must not be set for query 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "query",
+                "key": "color",
+                "new_key": null
+            }),
+            "'new_key' must not be set for query 'remove'",
+        ),
     ] {
         let err = RequestTransformer::new(&json!({ "rules": [rule] }))
             .err()
