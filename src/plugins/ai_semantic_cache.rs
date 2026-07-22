@@ -1078,9 +1078,8 @@ impl AiSemanticCache {
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
-        self.store_post_admit_hook.store(hook.map(|callback| {
-            Arc::new(StorePostAdmitHook { callback })
-        }));
+        self.store_post_admit_hook
+            .store(hook.map(|callback| Arc::new(StorePostAdmitHook { callback })));
     }
 
     fn run_store_post_admit_hook(&self) {

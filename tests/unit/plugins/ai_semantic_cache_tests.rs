@@ -2602,7 +2602,8 @@ fn shared_admission_rejects_unknown_keys_with_keep_last_known_good_policy() {
 fn assert_size_accounting_exact(plugin: &AiSemanticCache) -> usize {
     let (tracked, actual) = ai_semantic_cache_size_accounting_snapshot_for_test(plugin);
     assert_eq!(
-        tracked, actual,
+        tracked,
+        actual,
         "tracked total_size must equal the sum of retained entry approx_size values \
          (tracked={tracked}, actual={actual}, keys={:?})",
         plugin.tracked_keys_count()
