@@ -2384,6 +2384,202 @@ plugin_configs:
         "test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict PASSED"
     );
 }
+
+/// Two same-proxy Redis instances with distinct headers and unique prefixes must
+/// each complete/release independently (#2378).
+///
+/// Before instance-scoped completion ownership, both plugins wrote one shared
+/// metadata slot; the earlier instance then attempted token-delete with the
+/// later instance's key/token under the wrong prefix and left its lock until
+/// TTL. Distinct prefixes keep this case independent of shared-prefix
+/// self-conflict (#2379).
+#[tokio::test]
+#[ignore]
+async fn test_request_deduplication_redis_distinct_header_instances_complete_independently() {
+    if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!(
+                "Redis is required for the request deduplication distinct-header lifecycle CI gate"
+            );
+        }
+        return;
+    }
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let _backend = start_counting_backend_on(backend_listener, Arc::clone(&backend_hits))
+        .await
+        .unwrap();
+
+    let run_id = Uuid::new_v4().simple().to_string();
+    let prefix_a = format!("orders:dedup:a:{run_id}");
+    let prefix_b = format!("orders:dedup:b:{run_id}");
+    delete_redis_keys_by_prefix(&prefix_a).await;
+    delete_redis_keys_by_prefix(&prefix_b).await;
+
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "orders"
+    listen_path: "/orders"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "dedup-a"
+      - plugin_config_id: "dedup-b"
+
+consumers: []
+
+plugin_configs:
+  - id: "dedup-a"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "orders"
+    enabled: true
+    config:
+      header_name: "Idempotency-Key"
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix_a}"
+      ttl_seconds: 60
+      inflight_ttl_seconds: 30
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+  - id: "dedup-b"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "orders"
+    enabled: true
+    config:
+      header_name: "X-Operation-Key"
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix_b}"
+      ttl_seconds: 60
+      inflight_ttl_seconds: 30
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+"#
+    );
+
+    let port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let mut gw = spawn_file_gateway(
+        config,
+        port,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
+
+    sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let body = r#"{"order":1}"#;
+    let authority = "orders.example";
+    let url = format!("http://127.0.0.1:{port}/orders");
+
+    let response = client
+        .post(&url)
+        .header("Idempotency-Key", "key-a")
+        .header("X-Operation-Key", "key-b")
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("dual-header request failed");
+    let status = response.status().as_u16();
+    let response_body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "distinct-header Redis instances must both acquire ownership without self-409; body={response_body}"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "fresh dual-header request must reach the backend exactly once"
+    );
+
+    // Both instances must have published completed values and released locks.
+    assert_eq!(
+        redis_key_count_by_prefix(&format!("{prefix_a}:inflight:")).await,
+        0,
+        "instance A must token-release its Redis in-flight lock after buffered completion"
+    );
+    assert_eq!(
+        redis_key_count_by_prefix(&format!("{prefix_b}:inflight:")).await,
+        0,
+        "instance B must token-release its Redis in-flight lock after buffered completion"
+    );
+    assert!(
+        redis_key_count_by_prefix(&format!("{prefix_a}:v3:")).await >= 1,
+        "instance A must publish a completed Redis value under its unique prefix"
+    );
+    assert!(
+        redis_key_count_by_prefix(&format!("{prefix_b}:v3:")).await >= 1,
+        "instance B must publish a completed Redis value under its unique prefix"
+    );
+
+    let replay_a = client
+        .post(&url)
+        .header("Idempotency-Key", "key-a")
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("key-a replay failed");
+    assert_eq!(replay_a.status().as_u16(), 200);
+    assert_eq!(
+        replay_a
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "repeated key A must observe completed replay rather than a stale in-flight 409"
+    );
+
+    let replay_b = client
+        .post(&url)
+        .header("X-Operation-Key", "key-b")
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("key-b replay failed");
+    assert_eq!(replay_b.status().as_u16(), 200);
+    assert_eq!(
+        replay_b
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "repeated key B must observe completed replay rather than a stale in-flight 409"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "completed independent instances must not re-execute the backend on replay"
+    );
+
+    delete_redis_keys_by_prefix(&prefix_a).await;
+    delete_redis_keys_by_prefix(&prefix_b).await;
+    gw.shutdown();
+    println!(
+        "test_request_deduplication_redis_distinct_header_instances_complete_independently PASSED"
+    );
+}
+
 /// Namespace-based Redis key prefix isolation.
 ///
 /// Two gateways share the same Redis server with identical `rate_limiting`

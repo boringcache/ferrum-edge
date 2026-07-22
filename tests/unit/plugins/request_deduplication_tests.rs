@@ -163,6 +163,77 @@ fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, Stri
     headers
 }
 
+/// Two distinct-header instances on one request (issue #2378 reproduction shape).
+fn dual_keyed_headers(
+    idempotency_key: &str,
+    operation_key: &str,
+    host: &str,
+    body_len: usize,
+) -> HashMap<String, String> {
+    let mut headers = keyed_headers(idempotency_key, host, body_len);
+    headers.insert("x-operation-key".to_string(), operation_key.to_string());
+    headers
+}
+
+fn make_local_sibling(header_name: &str, config_id: &str) -> RequestDeduplication {
+    request_deduplication_with_instance_id_for_test(
+        &json!({
+            "header_name": header_name,
+            "scope_by_consumer": false,
+        }),
+        PluginHttpClient::default(),
+        config_id,
+    )
+    .unwrap()
+}
+
+fn make_redis_sibling(header_name: &str, config_id: &str, prefix: &str) -> RequestDeduplication {
+    // Unreachable Redis forces local fallback while still constructing Redis-mode
+    // instances with distinct explicit prefixes — the #2378 lifecycle shape that
+    // is independent of shared-prefix self-conflict (#2379).
+    request_deduplication_with_instance_id_for_test(
+        &json!({
+            "header_name": header_name,
+            "scope_by_consumer": false,
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:1/0",
+            "redis_connect_timeout_seconds": 1,
+            "redis_key_prefix": prefix,
+        }),
+        PluginHttpClient::default(),
+        config_id,
+    )
+    .unwrap()
+}
+
+async fn mark_both_fresh(
+    first: &RequestDeduplication,
+    second: &RequestDeduplication,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    assert!(matches!(
+        first.before_proxy(ctx, headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.before_proxy(ctx, headers).await,
+        PluginResult::Continue
+    ));
+    let keys = request_deduplication_logical_keys_from_context_for_test(ctx);
+    assert_eq!(
+        keys.len(),
+        2,
+        "each instance must own an independent request-private completion slot"
+    );
+    let first_id = request_identity(first, ctx).expect("first instance ownership");
+    let second_id = request_identity(second, ctx).expect("second instance ownership");
+    assert_ne!(
+        first_id.0, second_id.0,
+        "distinct headers must produce distinct logical keys per instance"
+    );
+}
+
 fn body_ctx(method: &str, path: &str, body: &'static [u8]) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -2136,6 +2207,273 @@ async fn multiple_instances_release_only_their_own_inflight_ownership() {
     second
         .on_response_committed(&mut ctx, 503, &HashMap::new(), b"rejected")
         .await;
+}
+
+/// Two proxy-scoped instances with distinct headers must each complete and
+/// release their own ownership. Before #2378, shared request-metadata slots
+/// meant the earlier instance retained a stale in-flight marker after a
+/// successful response.
+async fn two_instances_buffered_completion_releases_independently(
+    first: RequestDeduplication,
+    second: RequestDeduplication,
+) {
+    let body = br#"{"order":1}"#;
+    let mut ctx = body_ctx("POST", "/orders", body);
+    let mut headers = dual_keyed_headers("key-a", "key-b", "orders.example", body.len());
+    mark_both_fresh(&first, &second, &mut ctx, &mut headers).await;
+    assert_eq!(first.tracked_keys_count(), Some(1));
+    assert_eq!(second.tracked_keys_count(), Some(1));
+
+    complete_response(&first, &mut ctx).await;
+    assert!(
+        request_identity(&first, &ctx).is_none(),
+        "first instance must consume only its own completion state"
+    );
+    assert!(
+        request_identity(&second, &ctx).is_some(),
+        "second instance must retain its ownership after the first completes"
+    );
+    complete_response(&second, &mut ctx).await;
+    assert!(request_identity(&second, &ctx).is_none());
+    assert_eq!(first.tracked_keys_count(), Some(1));
+    assert_eq!(second.tracked_keys_count(), Some(1));
+
+    let mut retry_a = body_ctx("POST", "/orders", body);
+    let mut retry_a_headers = dual_keyed_headers("key-a", "unused-b", "orders.example", body.len());
+    match first
+        .before_proxy(&mut retry_a, &mut retry_a_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers: response_headers,
+            ..
+        } => {
+            assert_eq!(status_code, 201);
+            assert_eq!(
+                response_headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true"),
+                "repeated key A must observe completed replay, not a stale 409"
+            );
+        }
+        other => panic!("expected completed replay for key A, got {other:?}"),
+    }
+
+    let mut retry_b = body_ctx("POST", "/orders", body);
+    let mut retry_b_headers = dual_keyed_headers("unused-a", "key-b", "orders.example", body.len());
+    match second
+        .before_proxy(&mut retry_b, &mut retry_b_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers: response_headers,
+            ..
+        } => {
+            assert_eq!(status_code, 201);
+            assert_eq!(
+                response_headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true"),
+                "repeated key B must observe completed replay, not a stale 409"
+            );
+        }
+        other => panic!("expected completed replay for key B, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn two_instances_distinct_headers_local_buffered_completion_releases_independently() {
+    two_instances_buffered_completion_releases_independently(
+        make_local_sibling("Idempotency-Key", "dedup-a"),
+        make_local_sibling("X-Operation-Key", "dedup-b"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn two_instances_distinct_headers_redis_prefixed_buffered_completion_releases_independently()
+{
+    two_instances_buffered_completion_releases_independently(
+        make_redis_sibling("Idempotency-Key", "dedup-a", "orders:dedup:a"),
+        make_redis_sibling("X-Operation-Key", "dedup-b", "orders:dedup:b"),
+    )
+    .await;
+}
+
+async fn two_instances_streamed_completion_releases_independently(
+    first: RequestDeduplication,
+    second: RequestDeduplication,
+) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut headers = dual_keyed_headers("stream-a", "stream-b", "orders.example", 0);
+    mark_both_fresh(&first, &second, &mut ctx, &mut headers).await;
+    assert!(first.should_buffer_response_body(&ctx));
+    assert!(second.should_buffer_response_body(&ctx));
+    assert!(!first.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!second.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+
+    first
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(16))
+        .await;
+    assert!(
+        request_identity(&first, &ctx).is_none(),
+        "clean stream end must release only the first instance's ownership"
+    );
+    assert!(request_identity(&second, &ctx).is_some());
+    assert_eq!(first.tracked_keys_count(), Some(0));
+    assert_eq!(second.tracked_keys_count(), Some(1));
+
+    second
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(16))
+        .await;
+    assert!(request_identity(&second, &ctx).is_none());
+    assert_eq!(second.tracked_keys_count(), Some(0));
+
+    let mut retry_a = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut retry_a_headers = dual_keyed_headers("stream-a", "unused-b", "orders.example", 0);
+    assert!(
+        matches!(
+            first.before_proxy(&mut retry_a, &mut retry_a_headers).await,
+            PluginResult::Continue
+        ),
+        "clean streamed completion must not leave a stale in-flight conflict for key A"
+    );
+
+    let mut retry_b = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut retry_b_headers = dual_keyed_headers("unused-a", "stream-b", "orders.example", 0);
+    assert!(
+        matches!(
+            second.before_proxy(&mut retry_b, &mut retry_b_headers).await,
+            PluginResult::Continue
+        ),
+        "clean streamed completion must not leave a stale in-flight conflict for key B"
+    );
+}
+
+#[tokio::test]
+async fn two_instances_distinct_headers_local_streamed_completion_releases_independently() {
+    two_instances_streamed_completion_releases_independently(
+        make_local_sibling("Idempotency-Key", "dedup-a"),
+        make_local_sibling("X-Operation-Key", "dedup-b"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn two_instances_distinct_headers_redis_prefixed_streamed_completion_releases_independently()
+{
+    two_instances_streamed_completion_releases_independently(
+        make_redis_sibling("Idempotency-Key", "dedup-a", "orders:dedup:a"),
+        make_redis_sibling("X-Operation-Key", "dedup-b", "orders:dedup:b"),
+    )
+    .await;
+}
+
+async fn two_instances_interrupted_stream_retains_independently(
+    first: RequestDeduplication,
+    second: RequestDeduplication,
+) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut headers = dual_keyed_headers("hold-a", "hold-b", "orders.example", 0);
+    mark_both_fresh(&first, &second, &mut ctx, &mut headers).await;
+
+    first
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(8))
+        .await;
+    assert!(
+        request_identity(&first, &ctx).is_some(),
+        "interrupted stream must retain first-instance ownership until TTL"
+    );
+    assert!(
+        request_identity(&second, &ctx).is_some(),
+        "first instance's interrupted stream must not consume the second instance's state"
+    );
+    assert_eq!(first.tracked_keys_count(), Some(1));
+    assert_eq!(second.tracked_keys_count(), Some(1));
+
+    second
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(8))
+        .await;
+    assert!(request_identity(&second, &ctx).is_some());
+    assert_eq!(second.tracked_keys_count(), Some(1));
+
+    let mut retry_a = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut retry_a_headers = dual_keyed_headers("hold-a", "unused-b", "orders.example", 0);
+    assert!(
+        matches!(
+            first.before_proxy(&mut retry_a, &mut retry_a_headers).await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "interrupted stream for key A must keep blocking retries until TTL"
+    );
+
+    let mut retry_b = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut retry_b_headers = dual_keyed_headers("unused-a", "hold-b", "orders.example", 0);
+    assert!(
+        matches!(
+            second.before_proxy(&mut retry_b, &mut retry_b_headers).await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "interrupted stream for key B must keep blocking retries until TTL"
+    );
+}
+
+#[tokio::test]
+async fn two_instances_distinct_headers_local_interrupted_stream_retains_independently() {
+    two_instances_interrupted_stream_retains_independently(
+        make_local_sibling("Idempotency-Key", "dedup-a"),
+        make_local_sibling("X-Operation-Key", "dedup-b"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn two_instances_distinct_headers_redis_prefixed_interrupted_stream_retains_independently() {
+    two_instances_interrupted_stream_retains_independently(
+        make_redis_sibling("Idempotency-Key", "dedup-a", "orders:dedup:a"),
+        make_redis_sibling("X-Operation-Key", "dedup-b", "orders:dedup:b"),
+    )
+    .await;
 }
 
 #[tokio::test]
