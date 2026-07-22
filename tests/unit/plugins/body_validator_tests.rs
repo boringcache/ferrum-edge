@@ -2859,6 +2859,177 @@ fn test_non_sse_request_still_validates_response() {
 }
 
 #[test]
+fn test_response_content_type_refinement_releases_irrelevant_media_types() {
+    let plugin = BodyValidator::new(&json!({
+        "response_required_fields": ["id"]
+    }))
+    .unwrap();
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/download".to_string(),
+    );
+
+    let png_headers = HashMap::from([("content-type".to_string(), "image/png".to_string())]);
+    let octet_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    )]);
+    let json_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let xml_headers =
+        HashMap::from([("content-type".to_string(), "application/xml".to_string())]);
+
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &png_headers,
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/octet-stream"),
+        200,
+        &octet_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; charset=utf-8"),
+        200,
+        &json_headers,
+    ));
+    // Default response_content_types include XML, but this config has no XML
+    // response rules — only JSON required fields — so XML is not inspected.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/xml"),
+        200,
+        &xml_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        None,
+        200,
+        &HashMap::new(),
+    ));
+
+    // Retry-aware release must stream irrelevant types once headers are known.
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &png_headers));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &octet_headers));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_headers));
+    // Content-Type rewrite safety: only SSE uses the pre-rewrite release hook.
+    assert!(!plugin.should_release_response_body_before_content_type_rewrite(
+        &ctx,
+        200,
+        &png_headers,
+    ));
+}
+
+#[test]
+fn test_response_content_type_refinement_keeps_xml_when_xml_validation_configured() {
+    let plugin = BodyValidator::new(&json!({
+        "response_validate_xml": true
+    }))
+    .unwrap();
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/xml".to_string(),
+    );
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/xml"),
+        200,
+        &HashMap::new(),
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &HashMap::new(),
+    ));
+}
+
+#[test]
+fn test_protobuf_response_refinement_retains_applicable_grpc_and_releases_others() {
+    let plugin = BodyValidator::new(&json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_response_type": "test.HelloResponse"
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    let grpc_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let png_headers = HashMap::from([("content-type".to_string(), "image/png".to_string())]);
+    let json_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &grpc_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc+proto"),
+        200,
+        &grpc_headers,
+    ));
+    // Protobuf-only config does not claim ordinary JSON/XML responses.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &png_headers,
+    ));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &grpc_headers));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &png_headers));
+
+    // Method-scoped descriptors: non-applicable gRPC methods are released.
+    let method_plugin = protobuf_plugin_with_method_messages();
+    ctx.path = "/test.Greeter/OtherMethod".to_string();
+    assert!(!method_plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &grpc_headers,
+    ));
+    ctx.path = "/test.Greeter/SayHello".to_string();
+    assert!(method_plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &grpc_headers,
+    ));
+    ctx.metadata
+        .insert("grpc_full_method".to_string(), "test.Greeter/SayHello".to_string());
+    assert!(method_plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &grpc_headers,
+    ));
+}
+
+#[test]
 fn test_no_response_validation_never_buffers_even_for_non_sse() {
     // When response validation is disabled, the buffer flag is false
     // regardless of Accept — guarding the existing config-driven default.

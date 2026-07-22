@@ -701,6 +701,76 @@ impl BodyValidator {
             .and_then(|e| e.response.as_ref())
             .or(self.protobuf_response_descriptor.as_ref())
     }
+
+    /// Whether JSON response validation rules are configured.
+    fn has_json_response_validation(&self) -> bool {
+        self.response_json_schema.is_some() || !self.response_required_fields.is_empty()
+    }
+
+    /// Resolve the gRPC method path used for response descriptor lookup.
+    ///
+    /// Prefer `grpc_full_method` set by `grpc_method_router` when available;
+    /// otherwise fall back to `ctx.path`.
+    fn grpc_method_path_for_response(ctx: &RequestContext) -> String {
+        ctx.metadata
+            .get("grpc_full_method")
+            .map(|method| {
+                if method.starts_with('/') {
+                    method.clone()
+                } else {
+                    let mut path = String::with_capacity(method.len() + 1);
+                    path.push('/');
+                    path.push_str(method);
+                    path
+                }
+            })
+            .unwrap_or_else(|| ctx.path.clone())
+    }
+
+    /// Whether protobuf response validation applies to this request/response.
+    fn applicable_protobuf_response_validation(&self, ctx: &RequestContext) -> bool {
+        self.has_protobuf_response_validation
+            && self
+                .get_response_descriptor(&Self::grpc_method_path_for_response(ctx))
+                .is_some()
+    }
+
+    /// Whether the final response-body hook would inspect this media type.
+    ///
+    /// Used by the post-header buffering refinement so irrelevant downloads
+    /// (and other non-matching types) can stream instead of being collected
+    /// only to be skipped. Missing/ambiguous types stay buffered
+    /// conservatively; genuine `text/event-stream` is released so
+    /// `after_proxy` can fail closed before header commit.
+    fn response_body_requires_buffering_for_media_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        if !self.has_response_validation {
+            return false;
+        }
+        let Some(content_type) = content_type else {
+            return true;
+        };
+        if is_text_event_stream_media_type(content_type) {
+            return false;
+        }
+        if is_grpc_content_type(content_type) {
+            return self.applicable_protobuf_response_validation(ctx);
+        }
+        if !content_type_matches(&self.response_content_types, content_type) {
+            return false;
+        }
+        // Claim only representations the configured JSON/XML rules can
+        // actually inspect. A JSON-only config must not pin XML (or other
+        // allowlisted neighbors) onto the buffered path when the final hook
+        // would no-op.
+        if is_json_like_content_type(content_type) && self.has_json_response_validation() {
+            return true;
+        }
+        is_xml_like_content_type(content_type) && self.has_xml_response_validation
+    }
 }
 
 /// Parse the first gRPC length-prefixed frame and return the protobuf payload bytes.
@@ -1982,8 +2052,14 @@ impl Plugin for BodyValidator {
         _response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
+        // Once headers prove the representation is outside JSON/XML/gRPC
+        // validation scope (or is an unbounded event stream), retries must not
+        // keep pinning it on the buffered path. Matching types stay buffered.
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && !self.response_body_requires_buffering_for_media_type(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+            )
     }
 
     fn should_release_response_body_before_content_type_rewrite(
@@ -1992,6 +2068,10 @@ impl Plugin for BodyValidator {
         _response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
+        // Only genuine SSE is safe to release before the Content-Type relabel
+        // guard: `after_proxy` fails closed on it. Non-matching downloads still
+        // go through the ordinary content-type refinement, which refuses
+        // release when a later hook may rewrite Content-Type.
         self.should_buffer_response_body(ctx)
             && original_response_is_event_stream(ctx, response_headers)
     }
@@ -2003,8 +2083,12 @@ impl Plugin for BodyValidator {
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
+        // Narrow the pre-flight vote after backend headers arrive: release
+        // media types the final hook would skip (binary downloads, etc.) while
+        // keeping matching JSON/XML and applicable gRPC protobuf responses
+        // buffered for validation.
         self.should_buffer_response_body(ctx)
-            && !content_type.is_some_and(is_text_event_stream_media_type)
+            && self.response_body_requires_buffering_for_media_type(ctx, content_type)
     }
 
     async fn after_proxy(
@@ -2054,24 +2138,7 @@ impl Plugin for BodyValidator {
             // Resolve the gRPC method path from the request, NOT response headers.
             // Backends never echo `:path` in responses, so reading response_headers
             // would always miss per-method `protobuf_method_messages` overrides.
-            // Prefer `grpc_full_method` set by `grpc_method_router` when available
-            // (already validated as a well-formed `Service/Method`); otherwise fall
-            // back to `ctx.path` which is the inbound request path including the
-            // leading `/`. Both forms are accepted as keys in the descriptor map.
-            let grpc_path: String = ctx
-                .metadata
-                .get("grpc_full_method")
-                .map(|m| {
-                    if m.starts_with('/') {
-                        m.clone()
-                    } else {
-                        let mut path = String::with_capacity(m.len() + 1);
-                        path.push('/');
-                        path.push_str(m);
-                        path
-                    }
-                })
-                .unwrap_or_else(|| ctx.path.clone());
+            let grpc_path = Self::grpc_method_path_for_response(ctx);
             let descriptor = match self.get_response_descriptor(&grpc_path) {
                 Some(d) => d,
                 None => return PluginResult::Continue,
