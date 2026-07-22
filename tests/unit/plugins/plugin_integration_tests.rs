@@ -1025,14 +1025,16 @@ async fn test_finalized_response_replay_is_not_spoofable_via_metadata() {
 }
 
 #[test]
-fn test_h1_h2_h3_reject_paths_share_finalized_replay_chokepoint() {
+fn test_h1_h2_and_h3_early_reject_paths_share_finalized_replay_chokepoint() {
     // Behavioral coverage above exercises
     // `apply_reject_after_proxy_and_synthetic_body_hooks`. Pin that every
-    // frontend reject surface reaches that shared helper so HIT/REVALIDATED
-    // finalized-replay skipping stays protocol-parity.
+    // frontend's early plugin-reject surface reaches that shared helper so
+    // cache HIT/REVALIDATED and dedup replay skipping stays protocol-parity.
+    // H3 performs these hooks in `server.rs` before selecting its native or
+    // cross-protocol backend dispatch; `cross_protocol.rs` therefore does not
+    // own this early synthetic-replay chokepoint.
     let h1_h2 = include_str!("../../../src/proxy/mod.rs");
     let h3 = include_str!("../../../src/http3/server.rs");
-    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
 
     assert!(
         h1_h2.contains("apply_reject_after_proxy_and_synthetic_body_hooks(")
@@ -1041,13 +1043,7 @@ fn test_h1_h2_h3_reject_paths_share_finalized_replay_chokepoint() {
     );
     assert!(
         h3.contains("apply_reject_after_proxy_and_synthetic_body_hooks("),
-        "native H3 reject path must use the shared synthetic finalizer"
-    );
-    assert!(
-        h3_cross.contains("apply_reject_after_proxy_and_synthetic_body_hooks(")
-            || h3_cross
-                .contains("crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks("),
-        "H3 cross-protocol reject path must use the shared synthetic finalizer"
+        "H3 early reject path must use the shared synthetic finalizer before backend dispatch"
     );
 }
 
