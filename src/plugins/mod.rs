@@ -6728,10 +6728,9 @@ pub fn create_plugin_with_http_client_and_config_id(
                         config_id,
                     )?
                 }
-                None => request_deduplication::RequestDeduplication::new(
-                    config,
-                    http_client.clone(),
-                )?,
+                None => {
+                    request_deduplication::RequestDeduplication::new(config, http_client.clone())?
+                }
             };
             Ok(Some(Arc::new(plugin)))
         }

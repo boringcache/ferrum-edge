@@ -34,8 +34,8 @@ use crate::config::types::PluginConfig;
 use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
 use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::{
-    Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol,
-    create_plugin_with_http_client, create_plugin_with_http_client_and_config_id,
+    Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
+    create_plugin_with_http_client_and_config_id,
 };
 
 // ---------------------------------------------------------------------------
