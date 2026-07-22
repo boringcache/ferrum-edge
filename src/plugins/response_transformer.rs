@@ -40,6 +40,18 @@
 //! application (static rules AND route-overlay overrides). A missing
 //! entry falls back to `default_enabled` (defaults to `true` —
 //! fail-open).
+//!
+//! ## Representation metadata after a body rewrite
+//!
+//! When a body rule actually changes the client-visible JSON bytes, the shared
+//! body-transform lifecycle and this plugin's `on_response_body_transformed`
+//! hook remove origin validators and integrity fields that no longer describe
+//! those bytes (`ETag`, `Last-Modified`, `Content-Digest`, `Repr-Digest`,
+//! legacy `Digest`, `Content-MD5`, and related content-bound checksum /
+//! signature headers). `Last-Modified` is dropped rather than rewritten: it
+//! names when the origin representation changed, not the gateway-authored
+//! rewrite. Parse failures and semantic no-ops return `None` from
+//! `transform_response_body` and leave origin metadata untouched.
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
@@ -1109,5 +1121,23 @@ impl Plugin for ResponseTransformer {
             return None;
         }
         body_transform::apply_body_rules(body, &self.body_rules)
+    }
+
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        // Lifecycle `finalize_response_body_transformation` already invalidates
+        // content-bound validators before this hook. Re-run for defense in depth
+        // and for direct unit-test callers that exercise the plugin hook alone:
+        // an actual body rewrite must never leave ETag / Last-Modified /
+        // Content-Digest / Repr-Digest / Digest / Content-MD5 describing the
+        // pre-rewrite bytes. Last-Modified is dropped (not rewritten) because it
+        // names when the origin representation changed, not the gateway-authored
+        // JSON rewrite. The proxy calls this only after `transform_response_body`
+        // returns `Some`, so parse failures and semantic no-ops keep origin
+        // validators.
+        super::invalidate_content_bound_response_headers(response_headers);
     }
 }
