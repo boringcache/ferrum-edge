@@ -1778,6 +1778,18 @@ fn old_generation_direct_write_after_replacement_cannot_affect_new_generation() 
     plugin.write_lifecycle_state_for_test("p1", 2);
     assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 2));
 
+    // The periodic ownership sweep must bound the isolated orphan created by
+    // the stale writer without expiring the replacement's live incident.
+    plugin.sweep_lifecycle_ownership_for_test();
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "background ownership retention must prune a late old-generation write"
+    );
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
+        "background ownership retention must preserve current-generation state"
+    );
+
     // Cooldown armed under gen1 must not suppress gen2.
     let cooldown = CooldownGate::new();
     assert!(cooldown.try_acquire(1, "p1", 10, 60_000, 100, 1));

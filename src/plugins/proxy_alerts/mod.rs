@@ -85,7 +85,7 @@ pub struct ProxyAlerts {
     /// `None` until the first cold-path retain (unit tests that never retain
     /// keep the historical ungated write path). After retain, writes require a
     /// matching admitted generation.
-    active_proxy_generations: ArcSwap<Option<HashMap<String, u64>>>,
+    active_proxy_generations: Arc<ArcSwap<Option<HashMap<String, u64>>>>,
     dispatch_sem: Arc<Semaphore>,
     http_client: PluginHttpClient,
     enabled: AtomicBool,
@@ -120,10 +120,12 @@ impl ProxyAlerts {
         let cooldowns = Arc::new(CooldownGate::new());
         let recovery = Arc::new(RecoveryGate::new());
         let lifecycle_keep_ms = lifecycle_keep_ms(parsed.rules.as_ref());
+        let active_proxy_generations = Arc::new(ArcSwap::from_pointee(None));
         let eviction_handle = start_lifecycle_eviction_task(
             Arc::clone(&windows),
             Arc::clone(&cooldowns),
             Arc::clone(&recovery),
+            Arc::clone(&active_proxy_generations),
             lifecycle_keep_ms,
         );
 
@@ -135,7 +137,7 @@ impl ProxyAlerts {
             windows,
             cooldowns,
             recovery,
-            active_proxy_generations: ArcSwap::from_pointee(None),
+            active_proxy_generations,
             dispatch_sem,
             http_client,
             enabled: AtomicBool::new(parsed.enabled),
@@ -248,6 +250,18 @@ impl ProxyAlerts {
         let _ = self
             .recovery
             .observe(0, proxy_id, true, 5_000, 1, generation);
+    }
+
+    /// Run the ownership portion of the background lifecycle sweep without
+    /// waiting for its one-minute cadence.
+    #[doc(hidden)]
+    pub fn sweep_lifecycle_ownership_for_test(&self) {
+        retain_published_proxy_generations(
+            &self.windows,
+            &self.cooldowns,
+            &self.recovery,
+            &self.active_proxy_generations,
+        );
     }
 
     /// Whether an admitted sample may mutate lifecycle state for `proxy_id`.
@@ -468,6 +482,7 @@ fn start_lifecycle_eviction_task(
     windows: Arc<WindowStore>,
     cooldowns: Arc<CooldownGate>,
     recovery: Arc<RecoveryGate>,
+    active_proxy_generations: Arc<ArcSwap<Option<HashMap<String, u64>>>>,
     keep_ms: u64,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -478,11 +493,42 @@ fn start_lifecycle_eviction_task(
         loop {
             ticker.tick().await;
             let now_ms = windows::current_epoch_ms();
+            // A sample can pass the admission-generation check immediately
+            // before a cache commit and finish its write immediately after the
+            // commit-time retain. Generation-keying isolates that row from the
+            // replacement; periodically reapplying the published ownership map
+            // also bounds the orphan rather than leaving an old-generation
+            // Active/Recovering recovery row resident indefinitely.
+            retain_published_proxy_generations(
+                &windows,
+                &cooldowns,
+                &recovery,
+                &active_proxy_generations,
+            );
             windows.evict_stale(now_ms, keep_ms);
             cooldowns.evict_stale(now_ms, keep_ms);
             recovery.evict_stale(now_ms, keep_ms);
         }
     }))
+}
+
+fn retain_published_proxy_generations(
+    windows: &WindowStore,
+    cooldowns: &CooldownGate,
+    recovery: &RecoveryGate,
+    active_proxy_generations: &ArcSwap<Option<HashMap<String, u64>>>,
+) {
+    let active = active_proxy_generations.load();
+    let Some(active) = active.as_ref() else {
+        return;
+    };
+    let borrowed: HashMap<&str, u64> = active
+        .iter()
+        .map(|(proxy_id, generation)| (proxy_id.as_str(), *generation))
+        .collect();
+    windows.retain_proxies(&borrowed);
+    cooldowns.retain_proxies(&borrowed);
+    recovery.retain_proxies(&borrowed);
 }
 
 fn lifecycle_event_action(outcome: LifecycleOutcome) -> Option<EventAction> {
