@@ -3066,7 +3066,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
 | `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
-| `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, 1=fastest, 9=best) |
+| `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
 
 **Request decompression** (opt-in):

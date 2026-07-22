@@ -4442,6 +4442,23 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
     assert_component_validity(&spec, "CompressionConfig", &zero_gzip_level, true);
     assert!(CompressionPlugin::new(&zero_gzip_level).is_ok());
 
+    // Boundary values: 0, 1, and 9 are accepted by both schema and runtime;
+    // 10 is the first rejected value (just above the maximum of 9).
+    for level in [1u64, 9] {
+        let config = json!({"gzip_level": level});
+        assert_component_validity(&spec, "CompressionConfig", &config, true);
+        assert!(
+            CompressionPlugin::new(&config).is_ok(),
+            "runtime must accept gzip_level {level}"
+        );
+    }
+    let rejected = json!({"gzip_level": 10});
+    assert_component_validity(&spec, "CompressionConfig", &rejected, false);
+    assert!(
+        CompressionPlugin::new(&rejected).is_err(),
+        "runtime must reject gzip_level 10"
+    );
+
     for config in [
         json!({"min_content_lenght": 4096}),
         json!({"gzip_leveel": 1}),
