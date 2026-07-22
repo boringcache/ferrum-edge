@@ -628,6 +628,7 @@ pub struct ResponseCaching {
 }
 
 impl ResponseCaching {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(config: &Value) -> Result<Self, String> {
         // Convenience constructor for tests/support tooling: `0` auto-derives
         // the shard amount from host topology. Production construction goes
