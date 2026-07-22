@@ -103,7 +103,6 @@ async fn anthropic_provider(
             continue;
         };
         let capture = Arc::clone(&capture);
-        let body = body;
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             let n = stream.read(&mut buf).await.unwrap_or(0);
