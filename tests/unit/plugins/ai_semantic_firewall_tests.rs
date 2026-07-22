@@ -4615,7 +4615,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
                     &mut encoded_html_ctx,
                     200,
                     &mut encoded_html_headers,
-                    &mut encoded_html,
+                    &encoded_html,
                 )
                 .await,
         );

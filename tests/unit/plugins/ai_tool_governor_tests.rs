@@ -5442,7 +5442,7 @@ async fn buffered_sse_gzip_encoded_denied_call_is_caught() {
                 &mut ctx,
                 200,
                 &mut headers,
-                &mut gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
+                &gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
             )
             .await,
         Some(403),
@@ -5456,7 +5456,7 @@ async fn buffered_sse_gzip_encoded_denied_call_is_caught() {
                 &mut ctx,
                 200,
                 &mut headers,
-                &mut gzip(SSE_ALLOWED_TOOL_BODY.as_bytes()),
+                &gzip(SSE_ALLOWED_TOOL_BODY.as_bytes()),
             )
             .await,
     );
@@ -5821,7 +5821,7 @@ async fn encoded_sse_with_streaming_enabled_stays_buffered_and_is_governed() {
                 &mut ctx,
                 200,
                 &mut encoded_headers,
-                &mut gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
+                &gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
             )
             .await,
         Some(403),
@@ -5835,7 +5835,7 @@ async fn encoded_sse_with_streaming_enabled_stays_buffered_and_is_governed() {
                 &mut ctx,
                 200,
                 &mut encoded_headers,
-                &mut gzip(SSE_ALLOWED_TOOL_BODY.as_bytes()),
+                &gzip(SSE_ALLOWED_TOOL_BODY.as_bytes()),
             )
             .await,
     );
@@ -6044,7 +6044,7 @@ async fn buffered_json_gzip_encoded_body_is_decoded_and_governed() {
                 &mut ctx,
                 200,
                 &mut headers,
-                &mut gzip(&response_with_tool_call("report.read", "{}")),
+                &gzip(&response_with_tool_call("report.read", "{}")),
             )
             .await,
     );
@@ -6057,7 +6057,7 @@ async fn buffered_json_gzip_encoded_body_is_decoded_and_governed() {
                 &mut ctx,
                 200,
                 &mut headers,
-                &mut gzip(&response_with_tool_call("kubectl.apply", "{}")),
+                &gzip(&response_with_tool_call("kubectl.apply", "{}")),
             )
             .await,
         Some(403),
@@ -6076,7 +6076,7 @@ async fn buffered_json_gzip_encoded_body_is_decoded_and_governed() {
                 &mut ctx,
                 200,
                 &mut headers,
-                &mut gzip(&response_with_tool_call("kubectl.apply", "{}")),
+                &gzip(&response_with_tool_call("kubectl.apply", "{}")),
             )
             .await,
     );
@@ -7720,7 +7720,7 @@ async fn pre_transform_gateway_compression_keeps_plaintext_json_inspectable() {
                 &mut ctx,
                 200,
                 &mut headers,
-                &mut response_with_tool_call("report.read", "{}"),
+                &response_with_tool_call("report.read", "{}"),
             )
             .await,
     );
@@ -7738,7 +7738,7 @@ async fn pre_transform_gateway_compression_keeps_plaintext_json_inspectable() {
                 &mut ctx,
                 200,
                 &mut headers,
-                &mut response_with_tool_call("kubectl.apply", "{}"),
+                &response_with_tool_call("kubectl.apply", "{}"),
             )
             .await,
         Some(403),
