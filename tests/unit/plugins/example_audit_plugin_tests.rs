@@ -610,7 +610,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
     let stream = StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: None,
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
@@ -815,7 +815,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     ] {
         plugin
             .on_stream_disconnect(&StreamTransactionSummary {
-            proxy_lifecycle_generation: None,
+                proxy_lifecycle_generation: None,
 
                 namespace: "ferrum".to_string(),
                 proxy_id: if protocol == "tcp" {

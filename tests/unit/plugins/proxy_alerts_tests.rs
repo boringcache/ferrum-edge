@@ -1033,7 +1033,7 @@ fn websocket_disconnect_context_feeds_stream_rules() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1082,7 +1082,7 @@ fn websocket_disconnect_cause_distinguishes_client_write_failures() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1170,7 +1170,7 @@ fn latency_sentinel_sample_keeps_existing_breach() {
     let mut ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1224,7 +1224,7 @@ fn latency_boundary_threshold_does_not_fire_previous_bucket() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1275,7 +1275,7 @@ fn latency_non_boundary_threshold_fires_within_estimated_bucket() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1326,7 +1326,7 @@ fn latency_overflow_bucket_reports_configured_max_bound() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1776,7 +1776,7 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
     let summary = StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "udp-1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: Some("udp".to_string()),
         client_ip: "10.0.0.9".to_string(),
         consumer_username: None,
@@ -1811,7 +1811,7 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
     let ws = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-1".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: Some("ws".to_string()),
         client_ip: "10.0.0.8".to_string(),
         backend_target: "ws://backend".to_string(),

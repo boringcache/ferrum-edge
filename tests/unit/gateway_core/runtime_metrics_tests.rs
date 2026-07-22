@@ -44,7 +44,7 @@ fn runtime_metrics_stream_errors_increment() {
     let summary = StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-a".to_string(),
-            proxy_lifecycle_generation: None,
+        proxy_lifecycle_generation: None,
         proxy_name: None,
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
