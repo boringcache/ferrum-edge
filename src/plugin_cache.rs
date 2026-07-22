@@ -883,6 +883,9 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_ws_frame_hooks(&self) -> bool {
         self.inner.requires_ws_frame_hooks()
     }
+    fn observes_ws_frame_decisions(&self) -> bool {
+        self.inner.observes_ws_frame_decisions()
+    }
     fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
         self.inner.websocket_size_limits()
     }

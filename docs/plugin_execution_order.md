@@ -406,10 +406,18 @@ The identifier is **process-local**, not globally unique across gateway instance
 ### Frame Rejection
 
 Plugins can return `Some(Message::Close(...))` to close the connection in both
-directions. The relay records the first detailed policy Close, signals shared
-cancellation before any potentially backpressured write, then attempts the
-same protocol-valid Close to both peers under a short bound. Parser-level size
-rejections use the same path with code 1009.
+directions. The first terminal Close from a priority-ordered admission/mutating
+`on_ws_frame` hook is preserved for the rest of the chain: later mutating
+plugins (including additional `ws_rate_limiting` instances) are not invoked for
+that frame, so they neither charge local/Redis budget nor replace the Close
+code/reason. Observational hooks that opt in via
+`observes_ws_frame_decisions()` (today: `ws_frame_logging`) still receive the
+already-final Close so they can record the decision. The relay then records the
+first detailed policy Close, signals shared cancellation before any potentially
+backpressured write, then attempts the same protocol-valid Close to both peers
+under a short bound. Parser-level size rejections
+(`ws_message_size_limiting` via `websocket_size_limits`) never enter the
+post-reassembly hook chain and use the same dual-peer Close path with code 1009.
 
 ### Execution Order
 

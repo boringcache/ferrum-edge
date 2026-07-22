@@ -11646,6 +11646,49 @@ fn guard_ws_control_transform(
     }
 }
 
+/// Apply priority-ordered `on_ws_frame` hooks for one reassembled message.
+///
+/// The first terminal `Message::Close` from an admission/mutating plugin wins:
+/// later mutating plugins are skipped so they cannot charge budget or replace
+/// the Close, while observational hooks
+/// ([`Plugin::observes_ws_frame_decisions`]) still receive the final decision.
+/// Both relay directions and all H1/H2/H3 frontends share this helper.
+pub(crate) async fn apply_ws_frame_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
+    raw: Message,
+) -> Message {
+    if plugins.is_empty() {
+        return raw;
+    }
+    let original = raw.clone();
+    let mut current = raw;
+    let mut terminal_close = false;
+    for plugin in plugins {
+        let observes_decisions = plugin.observes_ws_frame_decisions();
+        if terminal_close && !observes_decisions {
+            continue;
+        }
+        let transformed = plugin
+            .on_ws_frame(proxy_id, connection_id, direction, &current)
+            .await;
+        if observes_decisions {
+            // Enforce the observe-only capability instead of trusting a custom
+            // implementation not to return an accidental replacement.
+            continue;
+        }
+        if let Some(transformed) = transformed {
+            if matches!(&transformed, Message::Close(_)) {
+                terminal_close = true;
+            }
+            current = transformed;
+        }
+    }
+    guard_ws_control_transform(&original, current, direction)
+}
+
 enum WsNextMessage {
     Item(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
     IdleTimeout,
@@ -12164,30 +12207,14 @@ where
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
-                            let outgoing = if ctb_plugins.is_empty() {
-                                raw
-                            } else {
-                                let original = raw.clone();
-                                let mut current = raw;
-                                for plugin in &ctb_plugins {
-                                    if let Some(transformed) = plugin
-                                        .on_ws_frame(
-                                            &proxy_id_ctb,
-                                            connection_id,
-                                            WebSocketFrameDirection::ClientToBackend,
-                                            &current,
-                                        )
-                                        .await
-                                    {
-                                        current = transformed;
-                                    }
-                                }
-                                guard_ws_control_transform(
-                                    &original,
-                                    current,
-                                    WebSocketFrameDirection::ClientToBackend,
-                                )
-                            };
+                            let outgoing = apply_ws_frame_plugins(
+                                &ctb_plugins,
+                                &proxy_id_ctb,
+                                connection_id,
+                                WebSocketFrameDirection::ClientToBackend,
+                                raw,
+                            )
+                            .await;
                             // If a plugin transformed the message into a Close, publish its
                             // details and cancel both halves before any bounded polite write.
                             if let Message::Close(close_frame) = &outgoing {
@@ -12376,30 +12403,14 @@ where
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
-                            let outgoing = if btc_plugins.is_empty() {
-                                raw
-                            } else {
-                                let original = raw.clone();
-                                let mut current = raw;
-                                for plugin in &btc_plugins {
-                                    if let Some(transformed) = plugin
-                                        .on_ws_frame(
-                                            &proxy_id_btc,
-                                            connection_id,
-                                            WebSocketFrameDirection::BackendToClient,
-                                            &current,
-                                        )
-                                        .await
-                                    {
-                                        current = transformed;
-                                    }
-                                }
-                                guard_ws_control_transform(
-                                    &original,
-                                    current,
-                                    WebSocketFrameDirection::BackendToClient,
-                                )
-                            };
+                            let outgoing = apply_ws_frame_plugins(
+                                &btc_plugins,
+                                &proxy_id_btc,
+                                connection_id,
+                                WebSocketFrameDirection::BackendToClient,
+                                raw,
+                            )
+                            .await;
                             // If a plugin transformed the message into a Close, publish its
                             // details and cancel both halves before any bounded polite write.
                             if let Message::Close(close_frame) = &outgoing {

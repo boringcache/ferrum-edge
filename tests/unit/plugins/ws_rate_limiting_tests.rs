@@ -39,6 +39,7 @@ fn test_supported_protocols_websocket_only() {
 fn test_requires_ws_frame_hooks() {
     let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default()).unwrap();
     assert!(plugin.requires_ws_frame_hooks());
+    assert!(!plugin.observes_ws_frame_decisions());
 }
 
 #[test]
@@ -746,6 +747,89 @@ fn test_warmup_hostnames_for_redis() {
 }
 
 // === Close-reason length cap (RFC 6455 §5.5 control-frame limit) ===
+
+#[tokio::test]
+async fn test_transformed_close_does_not_consume_budget_or_create_state() {
+    // A Close synthesized by an earlier admission plugin must neither charge a
+    // token nor create local rate-limit state. Both directions share this path.
+    let plugin = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "burst_size": 1}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let close = Message::Close(Some(
+        tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Size,
+            reason: "message too large".into(),
+        },
+    ));
+
+    for direction in [
+        WebSocketFrameDirection::ClientToBackend,
+        WebSocketFrameDirection::BackendToClient,
+    ] {
+        let result = plugin.on_ws_frame("test-proxy", 7, direction, &close).await;
+        assert!(
+            result.is_none(),
+            "Close must pass through without replacement ({direction:?})"
+        );
+        assert_eq!(
+            plugin.tracked_keys_count(),
+            Some(0),
+            "Close must not create local rate-limit state ({direction:?})"
+        );
+    }
+
+    // The sole burst token must still be available for a subsequent data frame.
+    let text = Message::Text("hello".into());
+    let allowed = plugin
+        .on_ws_frame(
+            "test-proxy",
+            7,
+            WebSocketFrameDirection::ClientToBackend,
+            &text,
+        )
+        .await;
+    assert!(
+        allowed.is_none(),
+        "first data frame after ignored Close must still be admitted"
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+#[tokio::test]
+async fn test_transformed_close_skips_redis_accounting_path() {
+    // Even with Redis sync enabled, an inbound Close must return before any
+    // Redis/local check. An unreachable Redis URL would otherwise fall back and
+    // charge local state; that must not happen for an already-final Close.
+    let plugin = WsRateLimiting::new(
+        &json!({
+            "frames_per_second": 1,
+            "burst_size": 1,
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:1"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let close = Message::Close(Some(
+        tokio_tungstenite::tungstenite::protocol::frame::CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Size,
+            reason: "message too large".into(),
+        },
+    ));
+
+    let result = plugin
+        .on_ws_frame(
+            "test-proxy",
+            9,
+            WebSocketFrameDirection::ClientToBackend,
+            &close,
+        )
+        .await;
+    assert!(result.is_none());
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
 
 #[tokio::test]
 async fn test_close_reason_is_truncated_to_websocket_limit() {

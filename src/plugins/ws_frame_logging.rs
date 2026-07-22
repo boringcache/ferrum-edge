@@ -442,6 +442,13 @@ impl Plugin for WsFrameLogging {
         true
     }
 
+    fn observes_ws_frame_decisions(&self) -> bool {
+        // Purely observational: after an earlier admission plugin synthesizes a
+        // terminal Close, the shared relay still invokes this hook so the final
+        // rejection is logged without allowing later mutating plugins to run.
+        true
+    }
+
     async fn on_ws_frame(
         &self,
         proxy_id: &str,
