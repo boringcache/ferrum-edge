@@ -833,11 +833,9 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         return Ok(Vec::new());
     };
     let mut operations = Vec::new();
-    let schema_draft = if version == "2.0" || version.starts_with("3.0.") {
-        "draft7"
-    } else {
-        "draft2020-12"
-    };
+    // Draft selection is emitted once on the top-level openapi_validator config
+    // (`schema_draft`). Runtime compiles every operation with that selector;
+    // per-operation copies are not part of the published Admin schema.
     for (path_template, path_item) in paths {
         let Some(path_object) = path_item.as_object() else {
             continue;
@@ -868,10 +866,6 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
             entry.insert(
                 "path_regex".to_string(),
                 Value::String(path_template_to_regex(path_template)?),
-            );
-            entry.insert(
-                "schema_draft".to_string(),
-                Value::String(schema_draft.to_string()),
             );
             if let Some((required, content)) = request_body {
                 entry.insert("request_required".to_string(), Value::Bool(required));
