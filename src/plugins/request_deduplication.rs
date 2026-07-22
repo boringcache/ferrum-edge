@@ -2109,14 +2109,18 @@ impl Plugin for RequestDeduplication {
         // (mirroring `response_caching`'s served-from-cache guard) but still
         // RELEASE the in-flight locks so the marker transitions to a clean state
         // instead of dangling until `inflight_ttl`, which keeps duplicate
-        // detection accurate once the synthetic short-circuit returns. The
-        // exception is a synthetic short-circuit whose own execution already
-        // performed an external side effect (for example an `ai_federation`
-        // provider call, which marks `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`):
-        // that operation has no replayable response, so a same-key retry must
-        // not immediately re-execute it. Retain both in-flight locks until
-        // `inflight_ttl` in that case, mirroring the terminate-mode serverless
-        // side-effect owner handling above.
+        // detection accurate once the synthetic short-circuit returns. Empty 200
+        // and 204/205 short-circuits skip this body-hook path entirely; the
+        // shared reject finalizer's `FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY`
+        // plus `on_response_committed` perform the equivalent token-matched
+        // release. The exception is a synthetic short-circuit whose own
+        // execution already performed an external side effect (for example an
+        // `ai_federation` provider call, which marks
+        // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`): that operation has no
+        // replayable response, so a same-key retry must not immediately
+        // re-execute it. Retain both in-flight locks until `inflight_ttl` in
+        // that case, mirroring the terminate-mode serverless side-effect owner
+        // handling above.
         if ctx
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
@@ -2398,16 +2402,27 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
-        // Generic committed-hook release signal used by non-serverless ownership
-        // producers (for example `ai_federation`, and the proxy/H3 commit paths):
+        // Generic committed-hook release signals used by non-serverless ownership
+        // producers (for example `ai_federation`, and the proxy/H3 commit paths)
+        // and by finalized successful synthetic short-circuits (including empty
+        // 200 and 204 shapes that skip the synthetic body-hook pipeline):
         // release this instance's exact in-flight token so a duplicate retry can
         // proceed. An external operation that completed is handled above and
         // never reaches here, so this path only releases requests that were
         // provably safe to retry (the `!EXTERNAL_OPERATION_COMPLETED` guard is
-        // retained defensively against any future reordering).
-        if ctx
+        // retained defensively against any future reordering). Token/fingerprint
+        // matching in `remove_matching_local_inflight` / Redis lock release
+        // ensures a late finalizer cannot clear a successor's marker.
+        //
+        // Non-2xx plugin rejects and downstream rejection replacements do not
+        // set `FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY`; those intentionally
+        // retain local and Redis in-flight ownership until `inflight_ttl`.
+        if (ctx
             .metadata
             .contains_key(super::RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY))
             && !ctx
                 .metadata
                 .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)

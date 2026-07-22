@@ -633,7 +633,7 @@ pub mod _test_support {
             &mut headers,
             &mut body,
             false,
-            false,
+            true,
         )
         .await;
         crate::plugins::PluginResult::RejectBinary {
