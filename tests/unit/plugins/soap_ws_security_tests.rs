@@ -3706,7 +3706,12 @@ async fn run_compressed_soap_lifecycle(
     compressed: Vec<u8>,
     plaintext: &str,
     max_decompressed_request_size: Option<usize>,
-) -> (PluginResult, Vec<u8>, HashMap<String, String>, RequestContext) {
+) -> (
+    PluginResult,
+    Vec<u8>,
+    HashMap<String, String>,
+    RequestContext,
+) {
     use ferrum_edge::_test_support::apply_buffered_request_body_normalization_before_before_proxy_for_test;
     use ferrum_edge::plugins::compression::CompressionPlugin;
     use std::sync::Arc;
@@ -3736,11 +3741,13 @@ async fn run_compressed_soap_lifecycle(
 
     let mut body = compressed;
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&compression) as Arc<dyn Plugin>];
-    let normalize =
-        apply_buffered_request_body_normalization_before_before_proxy_for_test(
-            &plugins, &mut ctx, &mut headers, &mut body,
-        )
-        .await;
+    let normalize = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await;
     if !matches!(normalize, PluginResult::Continue) {
         return (normalize, body, headers, ctx);
     }
@@ -3805,9 +3812,8 @@ async fn malformed_gzip_soap_is_rejected_before_ws_security() {
     use ferrum_edge::plugins::compression::CompressionPlugin;
     use std::sync::Arc;
 
-    let compression = Arc::new(
-        CompressionPlugin::new(&json!({ "decompress_request": true })).unwrap(),
-    );
+    let compression =
+        Arc::new(CompressionPlugin::new(&json!({ "decompress_request": true })).unwrap());
     let soap = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let corrupt = vec![0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00];
 
@@ -3829,11 +3835,13 @@ async fn malformed_gzip_soap_is_rejected_before_ws_security() {
 
     let mut body = corrupt.clone();
     let plugins: Vec<Arc<dyn Plugin>> = vec![compression as Arc<dyn Plugin>];
-    let normalize =
-        apply_buffered_request_body_normalization_before_before_proxy_for_test(
-            &plugins, &mut ctx, &mut headers, &mut body,
-        )
-        .await;
+    let normalize = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await;
     match normalize {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
         other => panic!("expected Reject for malformed gzip, got {other:?}"),
@@ -3888,11 +3896,13 @@ async fn over_limit_gzip_soap_is_rejected_before_ws_security() {
 
     let mut body = compressed;
     let plugins: Vec<Arc<dyn Plugin>> = vec![compression as Arc<dyn Plugin>];
-    let normalize =
-        apply_buffered_request_body_normalization_before_before_proxy_for_test(
-            &plugins, &mut ctx, &mut headers, &mut body,
-        )
-        .await;
+    let normalize = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await;
     match normalize {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
         other => panic!("expected Reject for over-limit gzip, got {other:?}"),

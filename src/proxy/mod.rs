@@ -2717,9 +2717,9 @@ pub(crate) fn refresh_request_body_views_after_normalization(
         body.len().to_string(),
     );
     if ctx.request_body_bytes.is_some()
-        || ctx.metadata.contains_key(
-            crate::plugins::compression::REQUEST_DECODED_METADATA_KEY,
-        )
+        || ctx
+            .metadata
+            .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY)
     {
         ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
     }
