@@ -2102,6 +2102,40 @@ async fn multipart_encoding_headers_respect_header_object_required_default() {
     }
 }
 
+#[test]
+fn multipart_encoding_header_bare_object_schema_is_not_a_header_object_wrapper() {
+    OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/bare-header-schema",
+            "path_regex": "^/bare-header-schema$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Metadata": {
+                                        "type": "object",
+                                        "description": "internal bare-schema form",
+                                        "required": ["kind"],
+                                        "properties": {"kind": {"type": "string"}}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .expect("bare JSON Schema keywords must not be mistaken for a Header Object wrapper");
+}
+
 #[tokio::test]
 async fn multipart_composed_anyof_scalar_is_branch_order_invariant() {
     for branches in [

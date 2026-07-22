@@ -1248,16 +1248,12 @@ fn parse_property_encoding(
             // `required` defaults to false (OAS 3.1 §4.8.21), so an optional
             // part header must not reject an otherwise valid multipart body.
             let header_object = header_schema.as_object();
+            // `required`, `description`, and `examples` are also valid JSON
+            // Schema keywords, so they cannot distinguish the supported bare
+            // schema form from a Header Object. The OAS wrapper is unambiguous
+            // only when it carries `schema` or `content`.
             let is_header_object = header_object.is_some_and(|object| {
-                object.contains_key("schema")
-                    || object.contains_key("required")
-                    || object.contains_key("description")
-                    || object.contains_key("deprecated")
-                    || object.contains_key("style")
-                    || object.contains_key("explode")
-                    || object.contains_key("content")
-                    || object.contains_key("example")
-                    || object.contains_key("examples")
+                object.contains_key("schema") || object.contains_key("content")
             });
             let required = if is_header_object {
                 match header_object.and_then(|object| object.get("required")) {
