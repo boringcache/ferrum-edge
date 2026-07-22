@@ -1043,7 +1043,7 @@ async fn test_ws_size_rejection_preserved_over_exhausted_rate_limiter_e2e() {
     enabled: true
     config:
       frames_per_second: 1
-      burst_size: 1
+      burst_size: 2
       close_reason: "frame rate exceeded""#,
         r#"      - plugin_config_id: "ws-size"
       - plugin_config_id: "ws-rate""#,
@@ -1055,7 +1055,8 @@ async fn test_ws_size_rejection_preserved_over_exhausted_rate_limiter_e2e() {
         .await
         .expect("connect WebSocket");
 
-    // Consume the sole rate token with a small frame that is forwarded.
+    // Consume both connection-wide rate tokens with the small request and its
+    // backend-to-client echo, leaving the bucket exhausted in both directions.
     ws.send(Message::Text("ok".into()))
         .await
         .expect("send small frame");
@@ -1139,7 +1140,7 @@ async fn test_ws_size_rejection_preserved_over_rate_limiter_backend_direction_e2
     enabled: true
     config:
       frames_per_second: 1
-      burst_size: 1
+      burst_size: 3
       close_reason: "frame rate exceeded""#,
         r#"      - plugin_config_id: "ws-size"
       - plugin_config_id: "ws-rate""#,
@@ -1151,6 +1152,10 @@ async fn test_ws_size_rejection_preserved_over_rate_limiter_backend_direction_e2
         .await
         .expect("connect WebSocket");
 
+    // The shared bucket counts both directions. The small request and echo use
+    // two tokens; the trigger request below uses the third, so the backend's
+    // oversized response reaches parser-level size rejection with no rate
+    // budget left to overwrite its terminal 1009 decision.
     ws.send(Message::Text("ok".into()))
         .await
         .expect("send small frame");
