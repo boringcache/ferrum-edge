@@ -755,6 +755,21 @@ impl ResponseCaching {
         )
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn vary_index_snapshot_for_tests(&self) -> Vec<(String, Vec<String>)> {
+        let _guard = self.accounting_guard();
+        self.vary_index
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn cache_keys_for_tests(&self) -> Vec<String> {
+        let _guard = self.accounting_guard();
+        self.cache.iter().map(|entry| entry.key().clone()).collect()
+    }
+
     fn actual_total_size_locked(&self) -> usize {
         self.cache
             .iter()
@@ -1909,13 +1924,6 @@ impl Plugin for ResponseCaching {
             }
         };
 
-        // Never narrow the indexed Vary dimensions for a base key. Once a
-        // credential/session or backend Vary dimension has been introduced,
-        // later responses that lack that header still need to store under an
-        // explicit empty-valued variant rather than replacing the index with a
-        // smaller set and making credential-bearing lookups probe the base key.
-        self.merge_existing_vary_headers(&base_key, &mut vary_headers);
-
         // Per RFC 7234 §3.2 / §8, a shared cache MUST NOT serve a stored
         // response to a request other than the one that produced it when the
         // original request carried credentials — unless the response
@@ -1949,13 +1957,6 @@ impl Plugin for ResponseCaching {
         // `ctx.headers`, the same source any future lookup would use for them,
         // so the lookup/storage symmetry holds for those too.
         self.merge_present_sensitive_vary_headers(&mut vary_headers, &lookup_headers.headers);
-
-        let cache_key = self.build_cache_key_with_ready_values(
-            ctx,
-            &vary_headers,
-            &lookup_headers.headers,
-            Some(&lookup_headers.cache_key_ready_headers),
-        );
         debug_assert_eq!(
             base_key,
             self.build_base_cache_key(ctx, &lookup_headers.headers),
@@ -1964,7 +1965,7 @@ impl Plugin for ResponseCaching {
 
         if body.len() > self.config.max_entry_size_bytes {
             debug!(
-                cache_key = %cache_key,
+                base_key = %base_key,
                 body_size = body.len(),
                 max_size = self.config.max_entry_size_bytes,
                 "response_caching: response body exceeds max_entry_size_bytes, skipping cache"
@@ -1972,37 +1973,75 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        // Mirror the keyed Vary list onto the cached response's `Vary` header
-        // so downstream caches and clients observe the same dimension we keyed
-        // by. In particular this surfaces the auto-merged `authorization`
-        // entry so any intermediate shared cache will also key by it (or
-        // refuse to cache, if it doesn't honor Vary).
+        // Copy the potentially large body before entering the publication
+        // critical section. The final key and response Vary header cannot be
+        // built yet: another concurrent store may widen `vary_index` before
+        // this store acquires `accounting_lock`.
         let mut cached_response_headers = response_headers.clone();
-        if !vary_headers.is_empty() {
-            let merged_vary = vary_headers.join(", ");
-            cached_response_headers.insert("vary".to_string(), merged_vary);
-        }
+        let cached_body = Bytes::copy_from_slice(body);
 
-        let entry = CacheEntry {
-            status_code: response_status,
-            headers: cached_response_headers,
-            body: Bytes::copy_from_slice(body),
-            stored_at: response_time_monotonic,
-            freshness_lifetime,
-            corrected_initial_age,
-            // `cache_key` is `base_key` plus an optional `:<vary>` suffix, so
-            // `base_key.len()` is the prefix that `prune_vary_index_locked`
-            // slices back out to recover this entry's base key.
-            base_key_len: base_key.len(),
-        };
-        let entry_size = entry.approx_size();
-
-        {
+        let (cache_key, entry_size) = {
             // Lock ordering: acquire `accounting_lock` before mutating
             // `cache`, `vary_index`, or `total_size`, and never acquire it
             // while holding a DashMap entry guard. Cache-hit reads do not take
             // this lock.
             let _guard = self.accounting_guard();
+
+            // Merge against the latest published dimensions while holding the
+            // same lock that protects cache-key publication. A pre-lock
+            // snapshot permits concurrent stores to overwrite one another's
+            // newly discovered dimensions.
+            let previous_vary_headers = self
+                .vary_index
+                .get(&base_key)
+                .map(|headers| headers.clone());
+            if let Some(existing_headers) = &previous_vary_headers {
+                let mut added = false;
+                for header in existing_headers {
+                    added |= merge_vary_header(&mut vary_headers, header);
+                }
+                if added {
+                    vary_headers.sort();
+                }
+            }
+
+            // A dimension increase changes the shape of every lookup key for
+            // this base key. Existing narrow variants cannot be migrated: the
+            // request values for newly introduced headers were never stored.
+            // Remove them deliberately so no retained entry becomes stranded
+            // behind the wider index.
+            if previous_vary_headers
+                .as_ref()
+                .is_some_and(|previous| previous != &vary_headers)
+            {
+                self.invalidate_base_key_locked(&base_key);
+            }
+
+            let cache_key = self.build_cache_key_with_ready_values(
+                ctx,
+                &vary_headers,
+                &lookup_headers.headers,
+                Some(&lookup_headers.cache_key_ready_headers),
+            );
+
+            // Mirror the final keyed Vary list onto the cached response so
+            // downstream caches and clients observe the same dimensions.
+            if !vary_headers.is_empty() {
+                cached_response_headers.insert("vary".to_string(), vary_headers.join(", "));
+            }
+
+            let entry = CacheEntry {
+                status_code: response_status,
+                headers: cached_response_headers,
+                body: cached_body,
+                stored_at: response_time_monotonic,
+                freshness_lifetime,
+                corrected_initial_age,
+                // `cache_key` is `base_key` plus an optional `:<vary>` suffix,
+                // so `base_key.len()` recovers this entry's base key.
+                base_key_len: base_key.len(),
+            };
+            let entry_size = entry.approx_size();
             let mut old_size = self
                 .cache
                 .get(&cache_key)
@@ -2064,7 +2103,8 @@ impl Plugin for ResponseCaching {
             // here so a high-cardinality principal stream can't leak it
             // unboundedly.
             self.prune_vary_index_locked();
-        }
+            (cache_key, entry_size)
+        };
         // Response was cacheable; remove the exact cache key from the predictor
         // even for client no-cache bypass refreshes, which return before
         // this instance's predict-key metadata is available.
