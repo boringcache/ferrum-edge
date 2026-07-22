@@ -1935,6 +1935,37 @@ pub mod _test_support {
         )
     }
 
+    /// Return true when an immediately-ready post-deadline terminal rejection
+    /// write completes under the shared gateway grace.
+    pub async fn ready_h3_post_deadline_terminal_write_completes_for_test() -> bool {
+        matches!(
+            crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                std::future::ready(Ok::<(), ()>(())),
+            )
+            .await,
+            Ok(())
+        )
+    }
+
+    /// Spawn a stalled post-deadline terminal rejection write under the shared
+    /// gateway grace. Callers in paused-time tests must advance simulated time
+    /// by [`h3_post_deadline_terminal_write_grace_for_test`] before awaiting the
+    /// handle — this helper intentionally never calls Tokio `test-util` APIs.
+    pub fn spawn_stalled_h3_post_deadline_terminal_write_for_test() -> tokio::task::JoinHandle<bool>
+    {
+        let write = std::future::pending::<Result<(), ()>>();
+        tokio::spawn(async move {
+            matches!(
+                crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await,
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
+            )
+        })
+    }
+
+    pub fn h3_post_deadline_terminal_write_grace_for_test() -> std::time::Duration {
+        crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE
+    }
+
     pub fn grpc_deadline_can_send_terminal_status_for_test(bytes_streamed: u64) -> bool {
         crate::http3::stream_util::grpc_deadline_can_send_terminal_status(bytes_streamed)
     }
@@ -2395,5 +2426,96 @@ pub mod _test_support {
 
     pub fn udp_logging_dtls_send_timeout_secs_for_test() -> u64 {
         crate::plugins::udp_logging::UDP_LOGGING_DTLS_SEND_TIMEOUT.as_secs()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum EarlyUploadWaitError {
+        TimedOut,
+        DeadlineExceeded,
+        Read,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EarlyUploadBoundKind {
+        OperatorTimeout,
+        RpcDeadline,
+    }
+
+    pub fn compose_early_upload_bound_for_test(
+        absolute_deadline: Option<tokio::time::Instant>,
+        operator_timeout_ms: u64,
+    ) -> Option<(tokio::time::Instant, EarlyUploadBoundKind)> {
+        crate::proxy::compose_early_upload_bound(absolute_deadline, operator_timeout_ms).map(
+            |(deadline, kind)| {
+                let kind = match kind {
+                    crate::proxy::EarlyUploadBoundKind::OperatorTimeout => {
+                        EarlyUploadBoundKind::OperatorTimeout
+                    }
+                    crate::proxy::EarlyUploadBoundKind::RpcDeadline => {
+                        EarlyUploadBoundKind::RpcDeadline
+                    }
+                };
+                (deadline, kind)
+            },
+        )
+    }
+
+    pub fn early_upload_phase_needs_fresh_drain_for_test(
+        prebuffered_body: &Option<Vec<u8>>,
+    ) -> bool {
+        crate::proxy::early_upload_phase_needs_fresh_drain(prebuffered_body)
+    }
+
+    pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(
+        collect: F,
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+    ) -> Result<Result<T, E>, EarlyUploadWaitError>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        match crate::proxy::collect_request_body_with_deadline(
+            collect,
+            deadline,
+            request_body_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(crate::proxy::RequestBodyWaitError::TimedOut) => {
+                Err(EarlyUploadWaitError::TimedOut)
+            }
+            Err(crate::proxy::RequestBodyWaitError::DeadlineExceeded) => {
+                Err(EarlyUploadWaitError::DeadlineExceeded)
+            }
+        }
+    }
+
+    pub async fn collect_h3_request_body_with_deadline_for_test<F, T, E>(
+        collect: F,
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+    ) -> Result<T, EarlyUploadWaitError>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        match crate::http3::server::collect_h3_request_body_with_deadline(
+            collect,
+            deadline,
+            request_body_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(value) => Ok(value),
+            Err(crate::http3::server::H3RequestBodyReadError::TimedOut) => {
+                Err(EarlyUploadWaitError::TimedOut)
+            }
+            Err(crate::http3::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                Err(EarlyUploadWaitError::DeadlineExceeded)
+            }
+            Err(crate::http3::server::H3RequestBodyReadError::Read(_)) => {
+                Err(EarlyUploadWaitError::Read)
+            }
+        }
     }
 }
