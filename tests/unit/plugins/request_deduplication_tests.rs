@@ -892,9 +892,7 @@ async fn finalize_empty_synthetic_and_assert_second_request_continues(
     );
     let mut retry_headers = HashMap::new();
     retry_headers.insert("idempotency-key".to_string(), idempotency_key.to_string());
-    let retry = dedup
-        .before_proxy(&mut retry_ctx, &mut retry_headers)
-        .await;
+    let retry = dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await;
     assert!(
         matches!(retry, PluginResult::Continue),
         "identical request after finalized empty/204 synthetic success must not see a stale 409; got {retry:?}"
@@ -969,9 +967,7 @@ async fn non_2xx_plugin_reject_retains_dedup_inflight_until_ttl() {
     );
     assert!(
         matches!(
-            dedup
-                .before_proxy(&mut retry_ctx, &mut retry_headers)
-                .await,
+            dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
             PluginResult::Reject {
                 status_code: 409,
                 ..
