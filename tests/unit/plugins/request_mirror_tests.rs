@@ -721,7 +721,11 @@ fn selection_gaps(selections: &[bool]) -> Vec<usize> {
 fn assert_exact_cycle_count(percentage: f64, expected_threshold: u64) {
     let plugin = mirror_plugin(percentage);
     assert_eq!(plugin.sample_threshold(), expected_threshold);
-    assert_eq!(plugin.sample_phase(), 0, "construction must start at phase 0");
+    assert_eq!(
+        plugin.sample_phase(),
+        0,
+        "construction must start at phase 0"
+    );
     let selections = collect_selections(&plugin, SAMPLE_PERIOD as usize);
     assert_eq!(
         selection_count(&selections) as u64,
@@ -832,7 +836,10 @@ fn test_sampling_is_evenly_spaced_not_contiguous_prefix() {
     );
     // Even spacing: every selection gap is exactly 100 for threshold 10.
     let gaps = selection_gaps(&selections);
-    assert!(gaps.iter().all(|g| *g == 100), "1% gaps must be exactly 100, got {gaps:?}");
+    assert!(
+        gaps.iter().all(|g| *g == 100),
+        "1% gaps must be exactly 100, got {gaps:?}"
+    );
 }
 
 #[test]
@@ -840,7 +847,10 @@ fn test_sampling_construction_and_reload_reset_phase_without_prefix_burst() {
     let first = mirror_plugin(50.0);
     assert_eq!(first.sample_phase(), 0);
     let first_cycle = collect_selections(&first, SAMPLE_PERIOD as usize);
-    assert!(!first_cycle[0], "fresh instance must not open with a mirror");
+    assert!(
+        !first_cycle[0],
+        "fresh instance must not open with a mirror"
+    );
     assert_eq!(selection_count(&first_cycle), 500);
 
     // Simulate config reload: a new instance resets phase independently.
@@ -963,7 +973,10 @@ async fn test_sampling_dispatch_observes_selection_not_just_continue() {
             dispatched += 1;
         }
     }
-    assert_eq!(dispatched, 10, "dispatch path must preserve the exact 1% cycle count");
+    assert_eq!(
+        dispatched, 10,
+        "dispatch path must preserve the exact 1% cycle count"
+    );
 }
 
 // ---------------------------------------------------------------------------
