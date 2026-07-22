@@ -154,21 +154,33 @@ where
     }
 
     pub fn check_at(&self, key: K, op: &A::Op, now: Instant) -> RateLimitOutcome {
+        self.check_at_with_capacity(key, op, now, usize::MAX)
+            .unwrap_or_else(RateLimitOutcome::deny)
+    }
+
+    /// Check one key while admitting at most max_entries distinct resident
+    /// keys. Existing keys continue at capacity; a vacant key must atomically
+    /// reserve a slot before its state is published.
+    pub fn check_at_with_capacity(
+        &self,
+        key: K,
+        op: &A::Op,
+        now: Instant,
+        max_entries: usize,
+    ) -> Option<RateLimitOutcome> {
         use dashmap::mapref::entry::Entry;
         match self.state.entry(key) {
             Entry::Occupied(mut occupied) => {
-                self.algorithm.check_local(occupied.get_mut(), op, now)
+                Some(self.algorithm.check_local(occupied.get_mut(), op, now))
             }
             Entry::Vacant(vacant) => {
-                // Count the insert before publishing so concurrent capacity
-                // observers never under-count a key that is about to become
-                // visible. The shard write guard held by `entry()` serializes
-                // vacant inserts for the same key.
-                self.entry_count.fetch_add(1, Ordering::AcqRel);
+                if !self.try_reserve_entry_slot(max_entries) {
+                    return None;
+                }
                 let mut state = self.algorithm.new_state();
                 let outcome = self.algorithm.check_local(&mut state, op, now);
                 vacant.insert(state);
-                outcome
+                Some(outcome)
             }
         }
     }
@@ -234,6 +246,14 @@ where
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             });
+    }
+
+    fn try_reserve_entry_slot(&self, max_entries: usize) -> bool {
+        self.entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < max_entries).then_some(count + 1)
+            })
+            .is_ok()
     }
 
     /// All-shard `DashMap::len()` for test reconciliation only. Never call from
@@ -379,6 +399,39 @@ where
         self.fallback.check(local_key, op)
     }
 
+    /// Prefer Redis when healthy; otherwise atomically cap distinct local
+    /// fallback keys. None means a new local key was denied at capacity.
+    pub async fn check_with_local_capacity(
+        &self,
+        local_key: K,
+        redis_key: &str,
+        op: &A::Op,
+        max_entries: usize,
+    ) -> Option<RateLimitOutcome> {
+        if self.redis_healthy.load(Ordering::Relaxed) && self.primary.is_available() {
+            match self.primary.check(redis_key, op).await {
+                Ok(result) => {
+                    self.redis_healthy.store(true, Ordering::Relaxed);
+                    self.fallback_warned.store(false, Ordering::Relaxed);
+                    return Some(result);
+                }
+                Err(()) => {
+                    self.redis_healthy.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if !self.fallback_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                plugin = self.plugin_name,
+                "Redis rate limiting unavailable — falling back to local in-memory state"
+            );
+        }
+
+        self.fallback
+            .check_at_with_capacity(local_key, op, Instant::now(), max_entries)
+    }
+
     pub fn tracked_keys_count(&self) -> usize {
         self.fallback.tracked_keys_count()
     }
@@ -511,6 +564,31 @@ where
         }
     }
 
+    /// Check through Redis when available, or reserve a bounded local/fallback
+    /// entry slot atomically. None denies only a previously unseen local key.
+    pub async fn check_with_redis_key_and_local_capacity<F>(
+        &self,
+        local_key: K,
+        redis_key: F,
+        op: &A::Op,
+        max_entries: usize,
+    ) -> Option<RateLimitOutcome>
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Local(local) => {
+                local.check_at_with_capacity(local_key, op, Instant::now(), max_entries)
+            }
+            Self::Failover(failover) => {
+                let redis_key = redis_key();
+                failover
+                    .check_with_local_capacity(local_key, &redis_key, op, max_entries)
+                    .await
+            }
+        }
+    }
+
     pub fn tracked_keys_count(&self) -> usize {
         match self {
             Self::Local(local) => local.tracked_keys_count(),
@@ -540,6 +618,23 @@ where
         match self {
             Self::Local(local) => local.check_at(key, op, now),
             Self::Failover(failover) => failover.fallback.check_at(key, op, now),
+        }
+    }
+
+    /// Test-support variant of local admission with an explicit hard cap.
+    #[allow(dead_code)]
+    pub fn check_local_at_with_capacity(
+        &self,
+        key: K,
+        op: &A::Op,
+        now: Instant,
+        max_entries: usize,
+    ) -> Option<RateLimitOutcome> {
+        match self {
+            Self::Local(local) => local.check_at_with_capacity(key, op, now, max_entries),
+            Self::Failover(failover) => failover
+                .fallback
+                .check_at_with_capacity(key, op, now, max_entries),
         }
     }
 

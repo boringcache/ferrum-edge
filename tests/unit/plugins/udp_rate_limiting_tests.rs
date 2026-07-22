@@ -589,59 +589,72 @@ async fn redis_mode_datagram_path_skips_local_all_shard_scans() {
 
 #[test]
 fn concurrent_insert_prune_and_cap_keep_exact_entry_count() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
 
     use ferrum_edge::_test_support::RateLimitCleanupHarness;
 
     let h = std::sync::Arc::new(RateLimitCleanupHarness::new());
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
     let epoch = h.udp_epoch_base();
     let mut handles = Vec::new();
 
-    for worker in 0..6 {
+    for worker in 0..8 {
         let h = std::sync::Arc::clone(&h);
-        let stop = std::sync::Arc::clone(&stop);
+        let max_seen = std::sync::Arc::clone(&max_seen);
         handles.push(thread::spawn(move || {
-            let mut i = 0u32;
-            while !stop.load(Ordering::Relaxed) {
-                let ip = format!("10.{}.{}.{}", worker, (i / 256) % 256, i % 256);
-                h.seed_udp(&ip, epoch);
-                i = i.wrapping_add(1);
-                if i % 11 == 0 {
-                    let _ = h.maybe_evict_udp_at_with_cap(epoch + Duration::from_secs(1), 32);
-                }
-                if i % 29 == 0 {
-                    h.arm_udp_periodic();
-                    let _ = h.maybe_evict_udp_at(epoch + Duration::from_secs(20));
-                }
+            for i in 0..512u32 {
+                let ip = format!("10.{worker}.{}.{}", (i / 256) % 256, i % 256);
+                let _ = h.seed_udp_with_cap(&ip, epoch, 32);
+                let count = h.udp_tracked().unwrap_or(usize::MAX);
+                max_seen.fetch_max(count, Ordering::Relaxed);
+            }
+        }));
+    }
+    {
+        let h = std::sync::Arc::clone(&h);
+        let max_seen = std::sync::Arc::clone(&max_seen);
+        handles.push(thread::spawn(move || {
+            for second in 20..84 {
+                h.arm_udp_periodic();
+                let _ = h.maybe_evict_udp_at(epoch + Duration::from_secs(second));
+                let count = h.udp_tracked().unwrap_or(usize::MAX);
+                max_seen.fetch_max(count, Ordering::Relaxed);
             }
         }));
     }
 
-    thread::sleep(Duration::from_millis(120));
-    stop.store(true, Ordering::Relaxed);
     for handle in handles {
         handle.join().expect("worker joins");
     }
 
-    let now = epoch + Duration::from_secs(60);
-    let _ = h.maybe_evict_udp_at_with_cap(now, 32);
-    if h.udp_tracked().unwrap_or(0) > 32 {
-        // A racing worker may have consumed the cooldown at `now`; one second
-        // later admits exactly one enforcing scan.
-        let _ = h.maybe_evict_udp_at_with_cap(now + Duration::from_secs(1), 32);
-    }
+    assert!(max_seen.load(Ordering::Relaxed) <= 32);
+    assert!(h.udp_tracked().unwrap_or(usize::MAX) <= 32);
     assert_eq!(
         h.udp_tracked(),
         Some(h.udp_map_len()),
-        "atomic count must match map after concurrent insert/prune/evict"
+        "atomic count must match after concurrent capped insertion and expiry removal"
     );
-    assert!(
-        h.udp_tracked().unwrap_or(usize::MAX) <= 32,
-        "hard cap must hold under concurrent pressure"
-    );
+
+    // Expiry removes every stale key and releases the exact same slots.
+    h.arm_udp_periodic();
+    let _ = h.maybe_evict_udp_at(epoch + Duration::from_secs(100));
+    assert_eq!(h.udp_tracked(), Some(0));
+    assert_eq!(h.udp_map_len(), 0);
+
+    // Refill through the cap gate, then deliberately use the uncapped test seed
+    // to model legacy/repair pressure and verify forced eviction reconciles the
+    // count without crossing the configured steady-admission cap afterward.
+    let active = epoch + Duration::from_secs(200);
+    for i in 0..96 {
+        h.seed_udp(&format!("192.0.2.{i}"), active);
+    }
+    assert_eq!(h.udp_tracked(), Some(96));
+    let _ = h.maybe_evict_udp_at_with_cap(active, 32);
+    assert_eq!(h.udp_tracked(), Some(32));
+    assert_eq!(h.udp_map_len(), 32);
+    assert!(!h.seed_udp_with_cap("198.51.100.1", active, 32));
 }
 
 // ── Default Trait Methods ─────────────────────────────────────────────

@@ -99,6 +99,26 @@ impl UdpRateLimiting {
             .check_local_at(client_ip, &UdpRateLimitOp { datagram_size }, now);
     }
 
+    /// Attempt to seed one local/fallback key through the production atomic
+    /// capacity gate. Returns false only for a previously unseen key at cap.
+    #[allow(dead_code)]
+    pub(crate) fn seed_client_at_with_cap_for_test(
+        &self,
+        client_ip: Arc<str>,
+        datagram_size: u64,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        self.limiter
+            .check_local_at_with_capacity(
+                client_ip,
+                &UdpRateLimitOp { datagram_size },
+                now,
+                max_entries,
+            )
+            .is_some()
+    }
+
     /// Arm the sampled periodic gate without spinning 100k hooks. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn arm_periodic_eviction_for_test(&self) {
@@ -229,24 +249,24 @@ impl Plugin for UdpRateLimiting {
     }
 
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
-        let over_capacity = self.maybe_evict();
+        self.maybe_evict();
         let key = Arc::clone(&ctx.client_ip);
 
-        if over_capacity && !self.limiter.contains_local_key(&key) {
-            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            return UdpDatagramVerdict::Drop;
-        }
-
-        let outcome = self
+        let Some(outcome) = self
             .limiter
-            .check_with_redis_key(
+            .check_with_redis_key_and_local_capacity(
                 Arc::clone(&key),
                 || Self::redis_ip_key(key.as_ref()),
                 &UdpRateLimitOp {
                     datagram_size: ctx.datagram_size as u64,
                 },
+                MAX_STATE_ENTRIES,
             )
-            .await;
+            .await
+        else {
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+            return UdpDatagramVerdict::Drop;
+        };
 
         if outcome.allowed {
             return UdpDatagramVerdict::Forward;

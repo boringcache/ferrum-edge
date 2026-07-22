@@ -1235,6 +1235,20 @@ pub mod _test_support {
                 .seed_client_at_for_test(std::sync::Arc::<str>::from(ip), 1, now);
         }
 
+        pub fn seed_udp_with_cap(
+            &self,
+            ip: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.udp.seed_client_at_with_cap_for_test(
+                std::sync::Arc::<str>::from(ip),
+                1,
+                now,
+                max_entries,
+            )
+        }
+
         pub fn arm_udp_periodic(&self) {
             self.udp.arm_periodic_eviction_for_test();
         }
