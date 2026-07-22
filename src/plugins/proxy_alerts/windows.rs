@@ -11,6 +11,13 @@
 //! whose tag points at an older epoch, the slot is reset (counters cleared)
 //! before being incremented.
 //!
+//! Bucket tags and eviction cutoffs are process-monotonic milliseconds (see
+//! [`monotonic_now_ms`]), not Unix wall time. Elapsed-window aging therefore
+//! follows process elapsed time; NTP/administrator wall-clock steps do not
+//! freeze or prematurely expire samples. Snapshots and eviction also reject
+//! future-dated tags so an injected or discontinuous backward step cannot
+//! treat pre-step samples as age-zero forever.
+//!
 //! All operations use atomics only. `record()` does at most:
 //! - 1 atomic load on the slot tag in the common case
 //! - 1 CAS + counter resets when the slot rolls over (rare)
@@ -94,6 +101,10 @@ impl BucketedCounter {
 
     /// Returns `(matched, total)` summed across buckets currently within the
     /// window relative to `now_ms`.
+    ///
+    /// Future-dated tags (`tag > cur_tag`) are excluded so a backward clock
+    /// discontinuity cannot keep pre-step samples age-zero via saturating
+    /// subtraction.
     pub fn snapshot(&self, now_ms: u64) -> (u64, u64) {
         let cur_tag = now_ms / self.bucket_ms;
         let max_age = self.buckets.len() as u64;
@@ -101,7 +112,7 @@ impl BucketedCounter {
         let mut total = 0u64;
         for bucket in self.buckets.iter() {
             let tag = bucket.epoch_index.load(Ordering::Acquire);
-            if tag != RESETTING_EPOCH && cur_tag.saturating_sub(tag) < max_age {
+            if tag_within_window(tag, cur_tag, max_age) {
                 matched = matched.saturating_add(bucket.matched.load(Ordering::Relaxed));
                 total = total.saturating_add(bucket.total.load(Ordering::Relaxed));
             }
@@ -160,6 +171,8 @@ impl BucketedLatencyHistogram {
 
     /// Returns `(estimated_percentile_upper_bound_ms, total_samples)`.
     /// `percentile` is clamped to `[1, 99]`.
+    ///
+    /// Future-dated tags are excluded; see [`BucketedCounter::snapshot`].
     pub fn percentile(&self, percentile: u8, now_ms: u64) -> (Option<f64>, u64) {
         let cur_tag = now_ms / self.bucket_ms;
         let max_age = self.buckets.len() as u64;
@@ -167,7 +180,7 @@ impl BucketedLatencyHistogram {
         let mut total = 0u64;
         for bucket in self.buckets.iter() {
             let tag = bucket.epoch_index.load(Ordering::Acquire);
-            if tag != RESETTING_EPOCH && cur_tag.saturating_sub(tag) < max_age {
+            if tag_within_window(tag, cur_tag, max_age) {
                 for (idx, slot) in bucket.counts.iter().enumerate() {
                     let v = slot.load(Ordering::Relaxed);
                     totals[idx] = totals[idx].saturating_add(v);
@@ -263,6 +276,11 @@ fn epoch_to_record_ms(tag: u64, bucket_ms: u64) -> u64 {
     } else {
         tag.saturating_mul(bucket_ms)
     }
+}
+
+#[inline]
+fn tag_within_window(tag: u64, current_tag: u64, max_age: u64) -> bool {
+    tag != RESETTING_EPOCH && tag <= current_tag && current_tag - tag < max_age
 }
 
 fn bucket_index_for(latency_ms: f64) -> usize {
@@ -467,7 +485,10 @@ impl WindowStore {
         let cutoff = now_ms.saturating_sub(keep_ms);
         for outer in self.by_rule.iter() {
             outer.value().retain(|_, generations| {
-                generations.retain(|_, state| state.last_record_ms() >= cutoff);
+                generations.retain(|_, state| {
+                    let last_record_ms = state.last_record_ms();
+                    last_record_ms <= now_ms && last_record_ms >= cutoff
+                });
                 !generations.is_empty()
             });
         }
@@ -516,10 +537,9 @@ impl WindowStore {
     }
 }
 
-pub fn current_epoch_ms() -> u64 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+/// Process-monotonic milliseconds used by every elapsed-time surface in this
+/// plugin. Zero remains reserved as the cooldown "never sent" sentinel.
+#[inline]
+pub fn monotonic_now_ms() -> u64 {
+    crate::socket_opts::monotonic_now_ms().saturating_add(1)
 }

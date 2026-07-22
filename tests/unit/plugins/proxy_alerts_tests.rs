@@ -20,7 +20,7 @@ use ferrum_edge::plugins::proxy_alerts::cooldown::{
 };
 use ferrum_edge::plugins::proxy_alerts::rules::SampleInput;
 use ferrum_edge::plugins::proxy_alerts::windows::{
-    BucketedCounter, BucketedLatencyHistogram, WindowStore,
+    BucketedCounter, BucketedLatencyHistogram, RuleWindowSpec, WindowKind, WindowStore,
 };
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{
@@ -1450,6 +1450,15 @@ fn bucketed_counter_drops_buckets_older_than_window() {
     assert_eq!(total_after, 1);
 }
 
+#[test]
+fn bucketed_counter_excludes_future_bucket_after_backward_jump() {
+    let counter = BucketedCounter::new(10);
+    counter.record(true, 20_000);
+
+    assert_eq!(counter.snapshot(5_000), (0, 0));
+    assert_eq!(counter.snapshot(20_000), (1, 1));
+}
+
 // ----------------------------------------------- BucketedLatencyHistogram
 
 #[test]
@@ -1481,6 +1490,15 @@ fn latency_histogram_returns_none_when_empty() {
     assert_eq!(total, 0);
 }
 
+#[test]
+fn latency_histogram_excludes_future_bucket_after_backward_jump() {
+    let histogram = BucketedLatencyHistogram::new(10);
+    histogram.record(50.0, 20_000);
+
+    assert_eq!(histogram.percentile(95, 5_000), (None, 0));
+    assert_eq!(histogram.percentile(95, 20_000), (Some(100.0), 1));
+}
+
 // ------------------------------------------------------------- CooldownGate
 
 #[test]
@@ -1501,6 +1519,15 @@ fn cooldown_gate_releases_after_window() {
     let gate = CooldownGate::new();
     assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
     assert!(gate.try_acquire(1, "p1", 10, 60_000, 100 + 60_001, 0));
+}
+
+#[test]
+fn cooldown_gate_rebases_backward_jump_and_tracks_new_epoch() {
+    let gate = CooldownGate::new();
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100_000, 0));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 10_000, 0));
+    assert!(!gate.try_acquire(1, "p1", 10, 60_000, 10_001, 0));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 70_000, 0));
 }
 
 #[test]
@@ -1554,6 +1581,28 @@ fn recovery_active_to_recovering_then_resolve() {
     let resolve = gate.observe(1, "p", false, 60_000, 62_000, 0);
     assert_eq!(resolve, LifecycleOutcome::Resolve);
     assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
+}
+
+#[test]
+fn recovery_rebases_backward_jump_before_resolving() {
+    let gate = RecoveryGate::new();
+    gate.observe(1, "p", true, 60_000, 100_000, 0);
+    gate.observe(1, "p", false, 60_000, 110_000, 0);
+
+    assert_eq!(
+        gate.observe(1, "p", false, 60_000, 10_000, 0),
+        LifecycleOutcome::Quiet
+    );
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::Recovering {
+            left_threshold_at_ms: 10_000
+        })
+    );
+    assert_eq!(
+        gate.observe(1, "p", false, 60_000, 70_000, 0),
+        LifecycleOutcome::Resolve
+    );
 }
 
 #[test]
@@ -1618,6 +1667,29 @@ fn cooldown_evict_stale_drops_expired_timestamps() {
     assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
     gate.evict_stale(100 + 60_000, 60_000);
     assert!(!gate.contains_proxy("p1"));
+}
+
+#[test]
+fn cooldown_evict_stale_drops_future_timestamp_after_backward_jump() {
+    let gate = CooldownGate::new();
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100_000, 0));
+    gate.evict_stale(10_000, 60_000);
+    assert!(!gate.contains_proxy("p1"));
+}
+
+#[test]
+fn window_evict_stale_drops_future_record_after_backward_jump() {
+    let store = WindowStore::new(std::collections::HashMap::from([(
+        1,
+        RuleWindowSpec {
+            window_seconds: 10,
+            kind: WindowKind::Counter,
+        },
+    )]));
+    store.record_count(1, "p1", 0, true, 100_000);
+
+    store.evict_stale(10_000, 60_000);
+    assert!(!store.contains_proxy("p1"));
 }
 
 #[test]
