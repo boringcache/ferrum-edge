@@ -18516,7 +18516,16 @@ components:
           type: integer
           format: uint64
           default: 104857600
-          description: Maximum total response-entry cache size in bytes (100 MiB, local mode). Includes response bodies, cached headers, semantic scope keys, and retained embedding vectors; excludes the separate HNSW snapshot copy and transient rebuild buffers.
+          description: >-
+            Maximum total response-entry cache size in bytes (100 MiB, local
+            mode). Includes response bodies, cached headers, semantic scope
+            keys, and retained embedding vectors; excludes the separate HNSW
+            snapshot copy and transient rebuild buffers. Concurrent stores of
+            distinct keys may briefly overshoot this soft ceiling (bounded by
+            concurrency × max_entry_size_bytes) until TTL/max-entries cleanup
+            reclaims space. Same-key replacement accounts for the displaced
+            DashMap entry so the retained-size counter never accumulates
+            phantom bytes for overwritten values.
         include_model_in_key:
           type: boolean
           default: true
