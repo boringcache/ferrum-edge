@@ -40,7 +40,7 @@ fn udp_sampled_cooldown_path_prunes_stale_preserves_active_below_cap() {
 }
 
 #[test]
-fn udp_cleanup_branch_force_evicts_over_cap_and_prunes_below() {
+fn udp_over_cap_path_bypasses_periodic_cooldown() {
     let h = RateLimitCleanupHarness::new();
     let epoch = h.udp_epoch_base();
     h.seed_udp("10.0.0.1", epoch);
@@ -48,12 +48,11 @@ fn udp_cleanup_branch_force_evicts_over_cap_and_prunes_below() {
     h.seed_udp("10.0.0.3", epoch);
     assert_eq!(h.udp_tracked(), Some(3));
 
-    // Below-cap branch must prune only idle keys (all three are still active).
-    h.udp_apply_branch(epoch, false, 1);
-    assert_eq!(h.udp_tracked(), Some(3));
-
-    // Over-cap branch force-evicts even while keys remain active.
-    h.udp_apply_branch(epoch, true, 1);
+    // A just-recorded periodic sweep must not block hard-cap enforcement. All
+    // keys remain active here, so the production wrapper must force-evict.
+    let now = epoch + Duration::from_secs(1);
+    h.block_udp_cooldown_at(now);
+    assert!(!h.maybe_evict_udp_at_with_cap(now, 1));
     assert!(h.udp_tracked().unwrap_or(0) <= 1);
 }
 

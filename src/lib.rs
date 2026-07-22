@@ -1204,14 +1204,13 @@ pub mod _test_support {
             self.udp.tracked_keys_count()
         }
 
-        pub fn udp_apply_branch(
+        pub fn maybe_evict_udp_at_with_cap(
             &self,
             now: std::time::Instant,
-            over_capacity: bool,
             max_entries: usize,
-        ) {
+        ) -> bool {
             self.udp
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+                .maybe_evict_at_with_cap_for_test(now, max_entries)
         }
 
         pub fn seed_rate_limiting(&self, key: &str, now: std::time::Instant) {

@@ -110,15 +110,14 @@ impl UdpRateLimiting {
         self.maybe_evict_at(now)
     }
 
-    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    /// Exercise the production sampled/cooldown path with a testable cap.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn apply_cleanup_branch_for_test(
+    pub(crate) fn maybe_evict_at_with_cap_for_test(
         &self,
         now: Instant,
-        over_capacity: bool,
         max_entries: usize,
-    ) {
-        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    ) -> bool {
+        self.maybe_evict_at_with_cap(now, max_entries)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -143,12 +142,24 @@ impl UdpRateLimiting {
     }
 
     fn maybe_evict_at(&self, now: Instant) -> bool {
+        self.maybe_evict_at_with_cap(now, MAX_STATE_ENTRIES)
+    }
+
+    fn maybe_evict_at_with_cap(&self, now: Instant, max_entries: usize) -> bool {
         let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
         let len = self.limiter.tracked_keys_count();
-        let over_capacity = len > MAX_STATE_ENTRIES;
+        let over_capacity = len > max_entries;
         let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
 
-        if over_capacity || periodic {
+        // Capacity enforcement must not wait for the periodic cooldown. If it
+        // did, the caller's new-client guard would reject every unseen IP until
+        // the cooldown elapsed after crossing the cap.
+        if over_capacity {
+            apply_rate_limit_cleanup(&self.limiter, max_entries, now, true);
+            return self.limiter.tracked_keys_count() > max_entries;
+        }
+
+        if periodic {
             let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
             let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
             if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
@@ -165,14 +176,14 @@ impl UdpRateLimiting {
                 // every new client IP indefinitely.
                 apply_rate_limit_cleanup(
                     &self.limiter,
-                    MAX_STATE_ENTRIES,
+                    max_entries,
                     now,
-                    over_capacity,
+                    false,
                 );
             }
         }
 
-        self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES
+        self.limiter.tracked_keys_count() > max_entries
     }
 }
 
