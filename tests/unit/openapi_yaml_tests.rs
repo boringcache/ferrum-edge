@@ -3673,8 +3673,10 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
         "ResponseTransformerBodyRule",
     ] {
         assert_eq!(
-            spec.pointer(&format!("/components/schemas/{component}/additionalProperties"))
-                .unwrap_or_else(|| panic!("{component}.additionalProperties")),
+            spec.pointer(&format!(
+                "/components/schemas/{component}/additionalProperties"
+            ))
+            .unwrap_or_else(|| panic!("{component}.additionalProperties")),
             &json!(false),
             "{component} must reject unknown properties"
         );

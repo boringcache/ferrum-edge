@@ -541,10 +541,7 @@ async fn test_response_transformer_rejects_crlf_in_header_value() {
     }))
     .err()
     .expect("expected error for CRLF in header value");
-    assert!(
-        err.contains("valid HTTP HeaderValue"),
-        "got: {err}"
-    );
+    assert!(err.contains("valid HTTP HeaderValue"), "got: {err}");
 }
 
 #[tokio::test]
@@ -666,7 +663,15 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
 
 #[tokio::test]
 async fn test_response_transformer_accepts_valid_header_value_edge_cases() {
-    for value in ["", " ", "\t", "plain", "a b", "tab\there", "!#$%&'*+-.^_`|~"] {
+    for value in [
+        "",
+        " ",
+        "\t",
+        "plain",
+        "a b",
+        "tab\there",
+        "!#$%&'*+-.^_`|~",
+    ] {
         let plugin = ResponseTransformer::new(&json!({
             "rules": [
                 {"operation": "add", "target": "header", "key": "X-Edge", "value": value}
@@ -696,10 +701,7 @@ async fn test_response_transformer_rejects_forbidden_header_control_bytes() {
         }))
         .err()
         .unwrap_or_else(|| panic!("expected HeaderValue rejection for {label}"));
-        assert!(
-            err.contains("valid HTTP HeaderValue"),
-            "{label}: got {err}"
-        );
+        assert!(err.contains("valid HTTP HeaderValue"), "{label}: got {err}");
     }
 }
 
