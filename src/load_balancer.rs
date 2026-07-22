@@ -447,6 +447,7 @@ impl WrrLaneState {
         self.rebuilds.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     #[inline]
     fn cache_stats(&self) -> (u64, u64) {
         (
@@ -4332,10 +4333,10 @@ impl LoadBalancer {
         }
 
         let fingerprint = healthy.bits;
-        if let Some(schedule) = wrr_state.hit_bitset_schedule(fingerprint) {
-            if let Some(target) = self.pick_wrr_bitset_schedule(healthy, &schedule) {
-                return Some(target);
-            }
+        if let Some(schedule) = wrr_state.hit_bitset_schedule(fingerprint)
+            && let Some(target) = self.pick_wrr_bitset_schedule(healthy, &schedule)
+        {
+            return Some(target);
         }
 
         self.rebuild_wrr_schedule_bitset(healthy, wrr_state, fingerprint)
@@ -4427,10 +4428,10 @@ impl LoadBalancer {
             return None;
         }
 
-        if let Some(schedule) = wrr_state.hit_vec_schedule(candidates) {
-            if let Some(target) = Self::pick_wrr_vec_schedule(candidates, &schedule) {
-                return Some(target);
-            }
+        if let Some(schedule) = wrr_state.hit_vec_schedule(candidates)
+            && let Some(target) = Self::pick_wrr_vec_schedule(candidates, &schedule)
+        {
+            return Some(target);
         }
 
         self.rebuild_wrr_schedule_vec(candidates, wrr_state)
