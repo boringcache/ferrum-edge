@@ -2239,7 +2239,7 @@ async fn two_instances_buffered_completion_releases_independently(
     assert_eq!(second.tracked_keys_count(), Some(1));
 
     let mut retry_a = body_ctx("POST", "/orders", body);
-    let mut retry_a_headers = dual_keyed_headers("key-a", "unused-b", "orders.example", body.len());
+    let mut retry_a_headers = dual_keyed_headers("key-a", "key-b", "orders.example", body.len());
     match first.before_proxy(&mut retry_a, &mut retry_a_headers).await {
         PluginResult::RejectBinary {
             status_code,
@@ -2259,7 +2259,7 @@ async fn two_instances_buffered_completion_releases_independently(
     }
 
     let mut retry_b = body_ctx("POST", "/orders", body);
-    let mut retry_b_headers = dual_keyed_headers("unused-a", "key-b", "orders.example", body.len());
+    let mut retry_b_headers = dual_keyed_headers("key-a", "key-b", "orders.example", body.len());
     match second
         .before_proxy(&mut retry_b, &mut retry_b_headers)
         .await
@@ -2349,7 +2349,7 @@ async fn two_instances_streamed_completion_releases_independently(
         "POST".to_string(),
         "/orders".to_string(),
     );
-    let mut retry_a_headers = dual_keyed_headers("stream-a", "unused-b", "orders.example", 0);
+    let mut retry_a_headers = dual_keyed_headers("stream-a", "stream-b", "orders.example", 0);
     assert!(
         matches!(
             first.before_proxy(&mut retry_a, &mut retry_a_headers).await,
@@ -2363,7 +2363,7 @@ async fn two_instances_streamed_completion_releases_independently(
         "POST".to_string(),
         "/orders".to_string(),
     );
-    let mut retry_b_headers = dual_keyed_headers("unused-a", "stream-b", "orders.example", 0);
+    let mut retry_b_headers = dual_keyed_headers("stream-a", "stream-b", "orders.example", 0);
     assert!(
         matches!(
             second
@@ -2431,7 +2431,7 @@ async fn two_instances_interrupted_stream_retains_independently(
         "POST".to_string(),
         "/orders".to_string(),
     );
-    let mut retry_a_headers = dual_keyed_headers("hold-a", "unused-b", "orders.example", 0);
+    let mut retry_a_headers = dual_keyed_headers("hold-a", "hold-b", "orders.example", 0);
     assert!(
         matches!(
             first.before_proxy(&mut retry_a, &mut retry_a_headers).await,
@@ -2448,7 +2448,7 @@ async fn two_instances_interrupted_stream_retains_independently(
         "POST".to_string(),
         "/orders".to_string(),
     );
-    let mut retry_b_headers = dual_keyed_headers("unused-a", "hold-b", "orders.example", 0);
+    let mut retry_b_headers = dual_keyed_headers("hold-a", "hold-b", "orders.example", 0);
     assert!(
         matches!(
             second
