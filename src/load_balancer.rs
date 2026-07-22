@@ -234,8 +234,8 @@ const WRR_MISS_PUBLISH_SAMPLE: u64 = 64;
 /// concurrent workers bounce one cache line on every pick and can fall *below*
 /// single-thread throughput. Sharded, cache-line-padded counters keep each
 /// worker on its own line while every shard still walks the same precomputed
-/// smooth-WRR order (exact long-run ratios; workers no longer share one global
-/// interleaving).
+/// smooth-WRR order (the schedule-defined long-run ratios are preserved;
+/// workers no longer share one global interleaving).
 const WRR_COUNTER_SHARDS: usize = 16;
 
 /// Exact cache key for one healthy target set.
@@ -329,9 +329,9 @@ fn wrr_counter_shard() -> usize {
 /// Concurrent Tokio workers therefore scale across cores without taking a
 /// blocking mutex on the hot path — including when several recurring
 /// fingerprints alternate. Each worker shard walks the same precomputed
-/// smooth-WRR order, so long-run weighted ratios stay exact for cached
-/// fingerprints; workers do **not** share a single global interleaving (the
-/// intentional contention tradeoff).
+/// smooth-WRR order, so uncapped cached periods retain exact configured ratios;
+/// workers do **not** share a single global interleaving (the intentional
+/// contention tradeoff).
 ///
 /// On a cache miss, publishers use `Mutex::try_lock` so rebuilds stay
 /// contention-bounded and never block the hot path. Empty cache slots fill
@@ -383,11 +383,9 @@ struct WrrLaneState {
     rebuilds: AtomicU64,
     /// Allocation-free miss-fallback selections (miss path only; not the
     /// steady-state hit path).
-    miss_fallbacks: AtomicU64,
+    miss_fallbacks: CachePadded<AtomicU64>,
     /// Rate-sample counter for full-cache replacement publishes.
     miss_publish_tickets: AtomicU64,
-    /// Counter for allocation-free miss-fallback lottery / RR tickets.
-    miss_select: AtomicU64,
     /// Seed source for newly published schedules. Distinct seeds avoid a herd
     /// of concurrent first-fill publishes all choosing entry zero.
     schedule_seed: AtomicU64,
@@ -441,9 +439,8 @@ impl WrrLaneState {
             #[cfg(test)]
             cache_hits: AtomicU64::new(0),
             rebuilds: AtomicU64::new(0),
-            miss_fallbacks: AtomicU64::new(0),
+            miss_fallbacks: CachePadded::new(AtomicU64::new(0)),
             miss_publish_tickets: AtomicU64::new(0),
-            miss_select: AtomicU64::new(0),
             schedule_seed: AtomicU64::new(0),
         }
     }
@@ -460,9 +457,8 @@ impl WrrLaneState {
             #[cfg(test)]
             cache_hits: AtomicU64::new(0),
             rebuilds: AtomicU64::new(0),
-            miss_fallbacks: AtomicU64::new(0),
+            miss_fallbacks: CachePadded::new(AtomicU64::new(0)),
             miss_publish_tickets: AtomicU64::new(0),
-            miss_select: AtomicU64::new(0),
             schedule_seed: AtomicU64::new(0),
         }
     }
@@ -537,13 +533,8 @@ impl WrrLaneState {
     }
 
     #[inline]
-    fn next_miss_select(&self) -> u64 {
-        self.miss_select.fetch_add(1, Ordering::Relaxed)
-    }
-
-    #[inline]
-    fn record_miss_fallback(&self) {
-        self.miss_fallbacks.fetch_add(1, Ordering::Relaxed);
+    fn next_miss_fallback(&self) -> u64 {
+        self.miss_fallbacks.fetch_add(1, Ordering::Relaxed)
     }
 
     /// True when at least one cache slot has never been published.
@@ -551,7 +542,7 @@ impl WrrLaneState {
     fn has_free_slot(&self) -> bool {
         self.slots
             .iter()
-            .any(|slot| matches!(slot.load().key, WrrScheduleKey::Invalid))
+            .any(|slot| matches!(&slot.load().key, WrrScheduleKey::Invalid))
     }
 
     /// Whether a locked miss may build+publish a schedule.
@@ -4556,8 +4547,7 @@ impl LoadBalancer {
         healthy: &HealthBitset,
         wrr_state: &WrrLaneState,
     ) -> Option<Arc<UpstreamTarget>> {
-        wrr_state.record_miss_fallback();
-        let ticket = wrr_state.next_miss_select();
+        let ticket = wrr_state.next_miss_fallback();
         let healthy_count = healthy.count();
         if healthy_count == 0 {
             return None;
@@ -4573,7 +4563,7 @@ impl LoadBalancer {
             return Some(Arc::clone(&self.targets[target_idx]));
         }
 
-        let mut cursor = ticket % total_weight;
+        let mut cursor = golden_ratio_hash(ticket) % total_weight;
         let mut chosen = None;
         healthy.for_each_set_bit(|idx| {
             if chosen.is_some() {
@@ -4692,8 +4682,7 @@ impl LoadBalancer {
         candidates: &[(usize, &Arc<UpstreamTarget>)],
         wrr_state: &WrrLaneState,
     ) -> Option<Arc<UpstreamTarget>> {
-        wrr_state.record_miss_fallback();
-        let ticket = wrr_state.next_miss_select();
+        let ticket = wrr_state.next_miss_fallback();
         if candidates.is_empty() {
             return None;
         }
@@ -4709,7 +4698,7 @@ impl LoadBalancer {
             ));
         }
 
-        let mut cursor = ticket % total_weight;
+        let mut cursor = golden_ratio_hash(ticket) % total_weight;
         for (_, target) in candidates {
             let weight = u64::from(target.weight);
             if weight == 0 {
