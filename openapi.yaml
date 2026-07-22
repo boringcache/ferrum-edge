@@ -17525,7 +17525,7 @@ components:
           format: uint64
           minimum: 1
           default: 104857600
-          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached. Must be greater than zero.
+          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; expired entries are reclaimed before a store is rejected for byte pressure; oversized entries are not cached. Must be greater than zero.
         cacheable_methods:
           type: array
           minItems: 1
@@ -17574,7 +17574,7 @@ components:
         invalidate_on_unsafe_methods:
           type: [boolean, "null"]
           default: true
-          description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on non-cacheable methods (POST, PUT, PATCH, DELETE)"
+          description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on unsafe methods (POST, PUT, PATCH, DELETE, and extension methods, which are conservatively treated as unsafe). Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating"
 
     GraphqlConfig:
       type: object
