@@ -4661,6 +4661,7 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
+            proxy_lifecycle_generation: None,
             client_addr,
             consumer_username: Some("alice".to_string()),
             auth_method: Some("mtls_auth"),
