@@ -233,14 +233,9 @@ fn port_wrr_vec_zero_weight_fallback_uses_port_counter() {
     let selected =
         LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "port", 8080, None)
             .expect("port selection");
-    let control = LoadBalancerCache::select_target_for_port_from(
-        &control_snapshot,
-        "u1",
-        "port",
-        8080,
-        None,
-    )
-    .expect("control port selection");
+    let control =
+        LoadBalancerCache::select_target_for_port_from(&control_snapshot, "u1", "port", 8080, None)
+            .expect("control port selection");
 
     assert_eq!(
         selected.target.host, control.target.host,
