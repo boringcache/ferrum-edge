@@ -598,6 +598,7 @@ jobs:
               integration::example_audit_plugin_opt_in_tests
               integration::kafka_logging_broker_tests
               integration::example_plugin_contract_tests
+              integration::ai_stream_router_normalization_tests
               integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
               integration::k8s_controller_gateway_status_tests
