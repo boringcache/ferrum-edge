@@ -131,35 +131,13 @@ pub struct Waf {
     supported_protocols: &'static [ProxyProtocol],
     /// Process-unique runtime id used as the private request-score map key.
     instance_id: u64,
-    /// Stable plugin-config identity (sanitized) for transaction-log ownership.
+    /// Stable validated plugin-config identity for transaction-log ownership.
     identity: Arc<str>,
     /// Precomputed `waf.instances.<identity>.score` metadata key (cold path).
     score_metadata_key: Arc<str>,
 }
 
 static NEXT_WAF_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Sanitize a plugin-config id for use as a metadata key segment.
-///
-/// Keeps the operator-visible identity stable and bounded while rejecting
-/// characters that would make `waf.instances.<id>.score` ambiguous.
-fn sanitize_waf_instance_identity(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len().min(64));
-    for (index, ch) in raw.chars().enumerate() {
-        if index >= 64 {
-            break;
-        }
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        out.push_str("instance");
-    }
-    out
-}
 
 impl Waf {
     fn body_encoding_specials_active(&self) -> bool {
@@ -360,8 +338,12 @@ impl Waf {
             HTTP_FAMILY_PROTOCOLS
         };
         let instance_id = NEXT_WAF_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
-        let identity: Arc<str> = match config_id.map(str::trim).filter(|id| !id.is_empty()) {
-            Some(id) => Arc::from(sanitize_waf_instance_identity(id)),
+        let identity: Arc<str> = match config_id {
+            Some(id) => {
+                crate::config::types::validate_resource_id(id)
+                    .map_err(|error| format!("waf: invalid plugin config id: {error}"))?;
+                Arc::from(id)
+            }
             None => Arc::from(format!("standalone-{instance_id}")),
         };
         let score_metadata_key: Arc<str> = Arc::from(format!("waf.instances.{identity}.score"));
@@ -661,11 +643,10 @@ impl Waf {
         // body, and response add up to a single instance score that can cross
         // that instance's block threshold. Sibling WAF instances never share
         // this accumulator.
-        let total_score = self.config.scoring.as_ref().map(|scoring| {
+        let total_score = self.config.scoring.as_ref().and_then(|scoring| {
             ctx.ensure_waf_metadata_initialized();
-            let total =
-                ctx.accumulate_waf_instance_score(self.instance_id, &self.identity, phase_score);
-            (total, scoring.block_threshold)
+            ctx.accumulate_waf_instance_score(self.instance_id, &self.identity, phase_score)
+                .map(|total| (total, scoring.block_threshold))
         });
         let score_block = enforce_actions
             && self.config.mode == GlobalMode::Enforce

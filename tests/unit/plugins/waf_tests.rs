@@ -2678,6 +2678,76 @@ async fn scoring_isolates_two_instances_when_combined_sum_crosses_threshold() {
 }
 
 #[tokio::test]
+async fn scoring_noncontributing_sibling_preserves_single_instance_metadata() {
+    let contributor = scoring_instance("waf-hit", "needle", 5, 10);
+    let noncontributor = scoring_instance("waf-miss", "absent", 7, 10);
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+
+    assert!(matches!(
+        contributor.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        noncontributor.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf-hit.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert!(!ctx.metadata.contains_key("waf.instances.waf-miss.score"));
+    assert!(!ctx.metadata.contains_key("waf.instance_scores"));
+}
+
+#[tokio::test]
+async fn scoring_preserves_distinct_valid_config_ids_in_metadata() {
+    let dotted = scoring_instance("waf.alpha", "needle", 2, 10);
+    let underscored = scoring_instance("waf_alpha", "needle", 3, 10);
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+
+    assert!(matches!(
+        dotted.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        underscored.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf.alpha.score")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf_alpha.score")
+            .map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.instance_scores").map(String::as_str),
+        Some("waf.alpha=2,waf_alpha=3")
+    );
+}
+
+#[test]
+fn scoring_rejects_invalid_or_blank_config_ids() {
+    let config = json!({"scoring": {"enabled": true, "block_threshold": 10}});
+    for id in ["", "   ", "bad/id"] {
+        let error = Waf::new_with_config_id(&config, Some(id))
+            .err()
+            .expect("invalid id must fail closed");
+        assert!(error.contains("invalid plugin config id"), "{error}");
+    }
+}
+
+#[tokio::test]
 async fn scoring_instances_use_own_weights_and_thresholds() {
     // Different weights/thresholds: first stays sub-threshold; second crosses
     // only its own threshold from its own contribution.

@@ -1558,7 +1558,7 @@ impl AiUsageExport {
 
 /// Per-instance WAF anomaly accumulator for one request.
 ///
-/// `identity` is the stable plugin-config id (sanitized) used in transaction
+/// `identity` is the stable validated plugin-config id used in transaction
 /// metadata. `score` accumulates only that instance's rule contributions across
 /// request/response phases.
 #[derive(Debug, Clone)]
@@ -3040,12 +3040,17 @@ impl RequestContext {
     }
 
     /// Accumulate anomaly score for one WAF instance and return its new total.
+    /// A never-seen zero contribution remains absent so a noncontributing
+    /// sibling cannot turn single-instance metadata into a multi-instance view.
     pub(crate) fn accumulate_waf_instance_score(
         &mut self,
         instance_id: u64,
         identity: &std::sync::Arc<str>,
         contribution: u32,
-    ) -> u32 {
+    ) -> Option<u32> {
+        if contribution == 0 && !self.waf_instance_scores.contains_key(&instance_id) {
+            return None;
+        }
         let entry = self
             .waf_instance_scores
             .entry(instance_id)
@@ -3054,7 +3059,7 @@ impl RequestContext {
                 score: 0,
             });
         entry.score = entry.score.saturating_add(contribution);
-        entry.score
+        Some(entry.score)
     }
 
     pub(crate) fn merge_waf_metadata(&mut self, key: &str, value: &str) {
