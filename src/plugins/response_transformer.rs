@@ -12,10 +12,13 @@
 //!
 //! Rules are validated at construction time:
 //!
+//! - Unknown top-level and per-rule properties are rejected (no silent typos).
 //! - Unknown `operation` / `target` values are rejected (no silent no-ops).
-//! - `add` / `update` require a `value`; `rename` requires a `new_key`.
-//! - Header values with CR/LF characters are rejected (defence against
-//!   header injection via config).
+//! - Header operation fields are exact: only `add`/`update` accept `value`;
+//!   only `rename` accepts `new_key`; `remove` accepts neither.
+//! - Every configured header `value` must parse as an HTTP `HeaderValue`
+//!   (same complete syntax accepted at H1/H2/H3 emission), including
+//!   rejection of non-CR/LF forbidden control bytes.
 //! - Header keys are pre-lowercased.
 //!
 //! ## Per-rule overrides from `mesh_route_dispatch`
@@ -39,8 +42,8 @@
 //! fail-open).
 
 use async_trait::async_trait;
-use http::header::HeaderName;
-use serde_json::Value;
+use http::header::{HeaderName, HeaderValue};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
@@ -57,6 +60,17 @@ use super::{Plugin, PluginResult, RequestContext};
 use crate::util::http_headers::{cache_control_has_directive, etag_value_is_strong};
 
 pub mod runtime_overlay;
+
+/// Top-level config keys accepted by [`ResponseTransformer::new`].
+const CONFIG_KEYS: &[&str] = &[
+    "rules",
+    "apply_route_overrides",
+    "runtime_overlay_scope",
+    "default_enabled",
+];
+
+/// Per-rule keys accepted for both header and body rules.
+const RULE_KEYS: &[&str] = &["operation", "target", "key", "value", "new_key"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HeaderOp {
@@ -264,15 +278,36 @@ fn parse_op(op: &str) -> Option<HeaderOp> {
     }
 }
 
-fn contains_crlf(s: &str) -> bool {
-    s.bytes().any(|b| b == b'\r' || b == b'\n')
+fn reject_unknown_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "response_transformer: unknown config key(s) under '{path}': {}; allowed keys: {}",
+        unknown.join(", "),
+        allowed.join(", ")
+    ))
 }
 
 impl ResponseTransformer {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("response_transformer: config must be an object".to_string());
-        }
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "response_transformer: config must be an object; allowed keys: {}",
+                CONFIG_KEYS.join(", ")
+            )
+        })?;
+        reject_unknown_keys(config_obj, "config", CONFIG_KEYS)?;
 
         let mut header_rules: Vec<HeaderRule> = Vec::new();
 
@@ -281,11 +316,12 @@ impl ResponseTransformer {
                 .as_array()
                 .ok_or("response_transformer: 'rules' must be an array")?;
             for (idx, r) in arr.iter().enumerate() {
-                if !r.is_object() {
-                    return Err(format!(
-                        "response_transformer: rule[{idx}]: rule must be an object"
-                    ));
-                }
+                let rule_obj = r.as_object().ok_or_else(|| {
+                    format!("response_transformer: rule[{idx}]: rule must be an object")
+                })?;
+                let rule_path = format!("config.rules[{idx}]");
+                reject_unknown_keys(rule_obj, &rule_path, RULE_KEYS)?;
+
                 let target = match r.get("target") {
                     Some(Value::String(s)) => s.as_str(),
                     None => {
@@ -301,7 +337,8 @@ impl ResponseTransformer {
                 };
 
                 if target == "body" {
-                    // Body rules are validated by `parse_body_rules`.
+                    // Body rules are validated by `parse_body_rules` (required /
+                    // incompatible fields). Unknown keys are already rejected above.
                     continue;
                 }
 
@@ -381,7 +418,9 @@ impl ResponseTransformer {
                     })
                     .transpose()?;
 
-                // Per-operation required-field validation.
+                // Per-operation required- and forbidden-field validation.
+                // Incompatible extras are rejected rather than silently ignored
+                // so typos cannot produce a different transform than intended.
                 match operation {
                     HeaderOp::Add | HeaderOp::Update => {
                         if value.is_none() {
@@ -389,23 +428,44 @@ impl ResponseTransformer {
                                 "response_transformer: rule[{idx}]: '{op_str}' operation requires a 'value'"
                             ));
                         }
+                        if raw_new_key.is_some() {
+                            return Err(format!(
+                                "response_transformer: rule[{idx}]: 'new_key' must not be set for header '{op_str}' operation"
+                            ));
+                        }
                     }
                     HeaderOp::Rename => {
+                        if value.is_some() {
+                            return Err(format!(
+                                "response_transformer: rule[{idx}]: 'value' must not be set for header 'rename' operation"
+                            ));
+                        }
                         if raw_new_key.is_none() {
                             return Err(format!(
                                 "response_transformer: rule[{idx}]: 'rename' operation requires a 'new_key'"
                             ));
                         }
                     }
-                    HeaderOp::Remove => {}
+                    HeaderOp::Remove => {
+                        if value.is_some() {
+                            return Err(format!(
+                                "response_transformer: rule[{idx}]: 'value' must not be set for header 'remove' operation"
+                            ));
+                        }
+                        if raw_new_key.is_some() {
+                            return Err(format!(
+                                "response_transformer: rule[{idx}]: 'new_key' must not be set for header 'remove' operation"
+                            ));
+                        }
+                    }
                 }
 
-                if let Some(ref v) = value
-                    && contains_crlf(v)
-                {
-                    return Err(format!(
-                        "response_transformer: rule[{idx}]: header 'value' must not contain CR or LF"
-                    ));
+                if let Some(ref v) = value {
+                    HeaderValue::from_str(v).map_err(|_| {
+                        format!(
+                            "response_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue"
+                        )
+                    })?;
                 }
 
                 header_rules.push(HeaderRule {

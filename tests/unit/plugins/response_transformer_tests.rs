@@ -541,7 +541,166 @@ async fn test_response_transformer_rejects_crlf_in_header_value() {
     }))
     .err()
     .expect("expected error for CRLF in header value");
-    assert!(err.contains("CR or LF"), "got: {err}");
+    assert!(
+        err.contains("valid HTTP HeaderValue"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_unknown_top_level_key() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Color", "value": "blue"}
+        ],
+        "runtime_overlay_scpoe": "internal"
+    }))
+    .err()
+    .expect("expected error for unknown top-level key");
+    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("runtime_overlay_scpoe"), "got: {err}");
+    assert!(err.contains("under 'config'"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_unknown_header_rule_key() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "vaule": "green"
+            }
+        ]
+    }))
+    .err()
+    .expect("expected error for unknown header rule key");
+    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("vaule"), "got: {err}");
+    assert!(err.contains("config.rules[0]"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_unknown_body_rule_key() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "add",
+                "target": "body",
+                "key": "enabled",
+                "value": true,
+                "extra_field": 1
+            }
+        ]
+    }))
+    .err()
+    .expect("expected error for unknown body rule key");
+    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("extra_field"), "got: {err}");
+    assert!(err.contains("config.rules[0]"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_incompatible_header_fields() {
+    for (rule, needle) in [
+        (
+            json!({
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": "X-Ignored"
+            }),
+            "'new_key' must not be set for header 'add'",
+        ),
+        (
+            json!({
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": "X-Ignored"
+            }),
+            "'new_key' must not be set for header 'update'",
+        ),
+        (
+            json!({
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "X-New",
+                "value": "ignored"
+            }),
+            "'value' must not be set for header 'rename'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "value": "ignored"
+            }),
+            "'value' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "new_key": "X-Ignored"
+            }),
+            "'new_key' must not be set for header 'remove'",
+        ),
+    ] {
+        let err = ResponseTransformer::new(&json!({ "rules": [rule] }))
+            .err()
+            .expect("expected incompatible header field rejection");
+        assert!(
+            err.contains(needle),
+            "expected needle {needle:?}, got: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_response_transformer_accepts_valid_header_value_edge_cases() {
+    for value in ["", " ", "\t", "plain", "a b", "tab\there", "!#$%&'*+-.^_`|~"] {
+        let plugin = ResponseTransformer::new(&json!({
+            "rules": [
+                {"operation": "add", "target": "header", "key": "X-Edge", "value": value}
+            ]
+        }));
+        assert!(
+            plugin.is_ok(),
+            "valid HeaderValue edge case rejected: {value:?} -> {plugin:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_forbidden_header_control_bytes() {
+    for (label, value) in [
+        ("NUL", "ok\u{0000}bad"),
+        ("SOH", "ok\u{0001}bad"),
+        ("BEL", "ok\u{0007}bad"),
+        ("DEL", "ok\u{007f}bad"),
+        ("CR", "ok\rbad"),
+        ("LF", "ok\nbad"),
+    ] {
+        let err = ResponseTransformer::new(&json!({
+            "rules": [
+                {"operation": "update", "target": "header", "key": "X-Color", "value": value}
+            ]
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("expected HeaderValue rejection for {label}"));
+        assert!(
+            err.contains("valid HTTP HeaderValue"),
+            "{label}: got {err}"
+        );
+    }
 }
 
 #[tokio::test]
