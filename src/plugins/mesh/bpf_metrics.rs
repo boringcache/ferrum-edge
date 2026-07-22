@@ -153,14 +153,6 @@ impl MeshBpfMetrics {
         Self::with_state(config, BpfMetricsState::new())
     }
 
-    pub fn metrics_state(&self) -> Arc<BpfMetricsState> {
-        self.state.clone()
-    }
-
-    pub fn snapshot(&self) -> BpfMetricsSnapshot {
-        self.state.snapshot()
-    }
-
     /// Cheap scrape handle sharing this instance's prefix and state Arc.
     pub fn exporter(&self) -> MeshBpfMetricsExporter {
         MeshBpfMetricsExporter {
@@ -174,7 +166,8 @@ impl MeshBpfMetrics {
     /// Cold path — used by unit tests and by
     /// [`MeshBpfMetricsExporter::render_prometheus`] on each authenticated
     /// `/metrics` scrape.
-    pub fn render_prometheus(&self) -> String {
+    #[cfg(test)]
+    fn render_prometheus(&self) -> String {
         self.exporter().render_prometheus()
     }
 }
@@ -374,15 +367,6 @@ impl Plugin for MeshBpfMetrics {
     // same `Arc<BpfMetricsState>`. The Plugin trait's default no-op
     // implementations for the request/response/stream/ws hooks are
     // exactly the right shape — we don't override any of them.
-}
-
-/// Wire `MeshBpfMetrics` into the per-proxy plugin slot.
-///
-/// Used by `inject_mesh_global_plugins` in `src/modes/mesh/mod.rs` to
-/// attach the plugin when topology is `NodeWaypoint`. The config payload
-/// is the serialized JSON we hand into the plugin cache constructor.
-pub fn config_payload() -> Value {
-    serde_json::json!({})
 }
 
 #[cfg(test)]
