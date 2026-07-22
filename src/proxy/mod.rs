@@ -11629,10 +11629,9 @@ impl WsFrameDeliveryBatch {
         let previous = std::mem::replace(self, Self::None);
         *self = match previous {
             Self::None => Self::One(index, observation),
-            Self::One(first_index, first_observation) => Self::Many(vec![
-                (first_index, first_observation),
-                (index, observation),
-            ]),
+            Self::One(first_index, first_observation) => {
+                Self::Many(vec![(first_index, first_observation), (index, observation)])
+            }
             Self::Many(mut entries) => {
                 entries.push((index, observation));
                 Self::Many(entries)

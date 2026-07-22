@@ -156,6 +156,98 @@ impl LogLevel {
     }
 }
 
+/// Emit a structured frame log at the given tracing level.
+///
+/// Close code / reason length and preview are optional: the macro branches so
+/// absent fields are omitted entirely rather than logged as empty sentinels.
+macro_rules! emit_ws_frame_log {
+    ($level:ident, $proxy_id:expr, $conn_id:expr, $dir:expr, $obs:expr, $outcome:expr) => {{
+        let obs = $obs;
+        match (&obs.preview, obs.close_code, obs.close_reason_len) {
+            (Some(preview), Some(code), Some(reason_len)) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    preview = %preview,
+                    close_code = code,
+                    close_reason_len = reason_len,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            (Some(preview), None, None) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    preview = %preview,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            (None, Some(code), Some(reason_len)) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    close_code = code,
+                    close_reason_len = reason_len,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            (None, None, None) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            // Close(None) or inconsistent close metadata: omit close fields.
+            (Some(preview), _, _) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    preview = %preview,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            (None, _, _) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+        }
+    }};
+}
+
 pub struct WsFrameLogging {
     log_level: LogLevel,
     include_payload_preview: bool,
@@ -480,102 +572,6 @@ fn payload_fingerprint(key: &[u8; 32], hashed: &[u8], full_len: usize, truncated
     let prefix = hex::encode(&digest.as_ref()[..6]);
     let marker = if truncated { "+" } else { "" };
     format!("hmac-sha256:{prefix}{marker} len={full_len}")
-}
-
-/// Emit a structured frame log at the given tracing level.
-///
-/// Close code / reason length and preview are optional: the macro branches so
-/// absent fields are omitted entirely rather than logged as empty sentinels.
-macro_rules! emit_ws_frame_log {
-    ($level:ident, $proxy_id:expr, $conn_id:expr, $dir:expr, $obs:expr, $outcome:expr) => {{
-        let obs = $obs;
-        match (
-            &obs.preview,
-            obs.close_code,
-            obs.close_reason_len,
-        ) {
-            (Some(preview), Some(code), Some(reason_len)) => {
-                tracing::$level!(
-                    target: "ws_frame_log",
-                    proxy_id = %$proxy_id,
-                    connection_id = $conn_id,
-                    direction = $dir,
-                    frame_type = obs.frame_type,
-                    size_bytes = obs.size_bytes,
-                    preview = %preview,
-                    close_code = code,
-                    close_reason_len = reason_len,
-                    outcome = $outcome,
-                    "WebSocket frame"
-                );
-            }
-            (Some(preview), None, None) => {
-                tracing::$level!(
-                    target: "ws_frame_log",
-                    proxy_id = %$proxy_id,
-                    connection_id = $conn_id,
-                    direction = $dir,
-                    frame_type = obs.frame_type,
-                    size_bytes = obs.size_bytes,
-                    preview = %preview,
-                    outcome = $outcome,
-                    "WebSocket frame"
-                );
-            }
-            (None, Some(code), Some(reason_len)) => {
-                tracing::$level!(
-                    target: "ws_frame_log",
-                    proxy_id = %$proxy_id,
-                    connection_id = $conn_id,
-                    direction = $dir,
-                    frame_type = obs.frame_type,
-                    size_bytes = obs.size_bytes,
-                    close_code = code,
-                    close_reason_len = reason_len,
-                    outcome = $outcome,
-                    "WebSocket frame"
-                );
-            }
-            (None, None, None) => {
-                tracing::$level!(
-                    target: "ws_frame_log",
-                    proxy_id = %$proxy_id,
-                    connection_id = $conn_id,
-                    direction = $dir,
-                    frame_type = obs.frame_type,
-                    size_bytes = obs.size_bytes,
-                    outcome = $outcome,
-                    "WebSocket frame"
-                );
-            }
-            // Close(None) or inconsistent close metadata: omit close fields.
-            (Some(preview), _, _) => {
-                tracing::$level!(
-                    target: "ws_frame_log",
-                    proxy_id = %$proxy_id,
-                    connection_id = $conn_id,
-                    direction = $dir,
-                    frame_type = obs.frame_type,
-                    size_bytes = obs.size_bytes,
-                    preview = %preview,
-                    outcome = $outcome,
-                    "WebSocket frame"
-                );
-            }
-            (None, _, _) => {
-                tracing::$level!(
-                    target: "ws_frame_log",
-                    proxy_id = %$proxy_id,
-                    connection_id = $conn_id,
-                    direction = $dir,
-                    frame_type = obs.frame_type,
-                    size_bytes = obs.size_bytes,
-                    outcome = $outcome,
-                    "WebSocket frame"
-                );
-            }
-        }
-    }};
 }
 
 macro_rules! emit_ws_disconnect_log {
