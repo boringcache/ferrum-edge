@@ -194,10 +194,7 @@ fn test_content_type_exact_media_type_matching() {
             false,
         ),
         ("application/octet-stream; charset=application/json", false),
-        (
-            "text/plain; type=\"application/xml\"",
-            false,
-        ),
+        ("text/plain; type=\"application/xml\"", false),
         // Malformed / empty media-type tokens fail closed.
         ("", false),
         ("; charset=utf-8", false),
