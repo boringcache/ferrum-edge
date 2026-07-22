@@ -56,11 +56,8 @@ const SENSITIVE_EXACT_HEADERS: &[&str] = &[
 ///   (`-limit`, `-remaining`, `-window`, `-usage`) and future additions.
 /// - `anthropic-ratelimit-` covers Anthropic's rate-limit family
 ///   (`anthropic-ratelimit-requests-limit`, `-tokens-remaining`, etc.).
-const SENSITIVE_HEADER_PREFIXES: &[&str] = &[
-    "x-ratelimit-",
-    "x-ai-ratelimit-",
-    "anthropic-ratelimit-",
-];
+const SENSITIVE_HEADER_PREFIXES: &[&str] =
+    &["x-ratelimit-", "x-ai-ratelimit-", "anthropic-ratelimit-"];
 
 /// Return whether `name` is a per-request tracing or request-correlation
 /// header whose value must not affect request identity or be replayed from a
@@ -185,7 +182,10 @@ mod tests {
             "X-B3-TraceId",
             "x-b3-spanid",
         ] {
-            assert!(is_per_request_trace_header(name), "expected {name} to match");
+            assert!(
+                is_per_request_trace_header(name),
+                "expected {name} to match"
+            );
         }
 
         for name in [
