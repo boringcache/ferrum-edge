@@ -2529,42 +2529,27 @@ plugin_configs:
         "instance B must publish a completed Redis value under its unique prefix"
     );
 
-    let replay_a = client
+    // A retry must preserve the complete original request fingerprint. Each
+    // deduplication instance excludes only its own idempotency header, so the
+    // sibling header remains a semantic request header for that instance.
+    let replay = client
         .post(&url)
         .header("Idempotency-Key", "key-a")
-        .header("Host", authority)
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .expect("key-a replay failed");
-    assert_eq!(replay_a.status().as_u16(), 200);
-    assert_eq!(
-        replay_a
-            .headers()
-            .get("x-idempotent-replayed")
-            .and_then(|value| value.to_str().ok()),
-        Some("true"),
-        "repeated key A must observe completed replay rather than a stale in-flight 409"
-    );
-
-    let replay_b = client
-        .post(&url)
         .header("X-Operation-Key", "key-b")
         .header("Host", authority)
         .header("Content-Type", "application/json")
         .body(body)
         .send()
         .await
-        .expect("key-b replay failed");
-    assert_eq!(replay_b.status().as_u16(), 200);
+        .expect("dual-header replay failed");
+    assert_eq!(replay.status().as_u16(), 200);
     assert_eq!(
-        replay_b
+        replay
             .headers()
             .get("x-idempotent-replayed")
             .and_then(|value| value.to_str().ok()),
         Some("true"),
-        "repeated key B must observe completed replay rather than a stale in-flight 409"
+        "an identical dual-header request must replay rather than encounter either stale in-flight lock"
     );
     assert_eq!(
         backend_hits.load(Ordering::SeqCst),
