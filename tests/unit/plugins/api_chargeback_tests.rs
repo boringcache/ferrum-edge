@@ -1756,7 +1756,10 @@ fn test_checked_add_charge_rejects_aggregate_overflow() {
     let near_max = f64::MAX / 2.0;
     assert!(checked_add_charge(near_max, near_max).is_ok());
     let err = checked_add_charge(f64::MAX, f64::MAX).unwrap_err();
-    assert!(err.contains("overflowed") || err.contains("non-finite"), "{err}");
+    assert!(
+        err.contains("overflowed") || err.contains("non-finite"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -1788,7 +1791,9 @@ fn test_max_price_times_max_counter_stays_finite_for_exports() {
         .unwrap();
     entry.call_count.store(u64::MAX, Ordering::Relaxed);
 
-    let charge = entry.call_charge().expect("max price × u64::MAX must be finite");
+    let charge = entry
+        .call_charge()
+        .expect("max price × u64::MAX must be finite");
     assert!(charge.is_finite());
 
     let prom = registry
@@ -1801,9 +1806,12 @@ fn test_max_price_times_max_counter_stays_finite_for_exports() {
         .render_json_uncached()
         .expect("json export must succeed for bounded prices");
     let parsed: serde_json::Value = serde_json::from_str(&json_text).unwrap();
-    let charges = &parsed["consumers"]["alice"]["proxies"]["proxy-max"]["by_status"]["200"]
-        ["charges"];
-    assert!(charges.is_number(), "charges must remain a JSON number, got {charges}");
+    let charges =
+        &parsed["consumers"]["alice"]["proxies"]["proxy-max"]["by_status"]["200"]["charges"];
+    assert!(
+        charges.is_number(),
+        "charges must remain a JSON number, got {charges}"
+    );
     assert!(!charges.is_null());
 }
 
@@ -1853,7 +1861,18 @@ fn test_render_fails_closed_on_quantity_price_overflow() {
     let registry = ChargebackRegistry::new();
     let s = scope();
     let poison = 1e308;
-    registry.record_http(&s, "alice", "proxy-poison", "API", 200, poison, 0, 0, 0.0, 0.0);
+    registry.record_http(
+        &s,
+        "alice",
+        "proxy-poison",
+        "API",
+        200,
+        poison,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
     let entry = registry
         .entries
         .get(&make_key_with_prices(
@@ -1893,7 +1912,9 @@ fn test_render_fails_closed_on_aggregate_addition_overflow() {
         registry.record_http(&s, "alice", proxy, "API", status, price, 0, 0, 0.0, 0.0);
         let entry = registry
             .entries
-            .get(&make_key_with_prices("alice", proxy, status, price, 0.0, 0.0))
+            .get(&make_key_with_prices(
+                "alice", proxy, status, price, 0.0, 0.0,
+            ))
             .unwrap();
         entry.call_count.store(1, Ordering::Relaxed);
         assert!(entry.call_charge().unwrap().is_finite());

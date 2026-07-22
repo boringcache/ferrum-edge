@@ -386,10 +386,9 @@ fn maximum_prices_remain_finite_in_per_event_and_snapshot_exports() {
     per_event.charge_bytes_sent = http_charge.charge_bytes_sent;
     per_event.charge_bytes_received = http_charge.charge_bytes_received;
     per_event.charge_total = http_charge.charge_total;
-    let per_event_json: Value = serde_json::from_str(
-        &serialize_json_each_row(std::slice::from_ref(&per_event)).unwrap(),
-    )
-    .unwrap();
+    let per_event_json: Value =
+        serde_json::from_str(&serialize_json_each_row(std::slice::from_ref(&per_event)).unwrap())
+            .unwrap();
     for field in [
         "charge_call",
         "charge_bytes_sent",
@@ -420,13 +419,14 @@ fn maximum_prices_remain_finite_in_per_event_and_snapshot_exports() {
         "http",
         http_charge,
     );
-    let events = accumulator.compute_deltas(
-        &snapshot_config,
-        "node-a",
-        1_774_000_000_000_000_000,
-        "maximum-price-snapshot",
-    )
-    .unwrap();
+    let events = accumulator
+        .compute_deltas(
+            &snapshot_config,
+            "node-a",
+            1_774_000_000_000_000_000,
+            "maximum-price-snapshot",
+        )
+        .unwrap();
     assert_eq!(events.len(), 1);
     let snapshot_json: Value =
         serde_json::from_str(&serialize_json_each_row(&events).unwrap()).unwrap();

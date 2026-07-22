@@ -1125,9 +1125,10 @@ impl ChargebackRegistry {
 
                 // Stream connections also count toward total_calls for headline numbers.
                 let proxy_total_calls = proxy_calls + agg.stream_connections;
-                let proxy_total_charges = checked_add_charge(proxy_per_call_charges, stream_charges)
-                    .and_then(|partial| checked_add_charge(partial, bw_sent))
-                    .and_then(|partial| checked_add_charge(partial, bw_received))?;
+                let proxy_total_charges =
+                    checked_add_charge(proxy_per_call_charges, stream_charges)
+                        .and_then(|partial| checked_add_charge(partial, bw_sent))
+                        .and_then(|partial| checked_add_charge(partial, bw_received))?;
                 require_finite_charge(proxy_total_charges, "proxy.total_charges")?;
 
                 total_calls += proxy_total_calls;
@@ -1136,18 +1137,12 @@ impl ChargebackRegistry {
                     .entry(agg.currency.as_ref().to_string())
                     .or_default();
                 currency_totals.total_calls += proxy_total_calls;
-                currency_totals.per_call_charges = checked_add_charge(
-                    currency_totals.per_call_charges,
-                    proxy_per_call_charges,
-                )?;
-                currency_totals.stream_connection_charges = checked_add_charge(
-                    currency_totals.stream_connection_charges,
-                    stream_charges,
-                )?;
-                currency_totals.bandwidth_charges = checked_add_charge(
-                    currency_totals.bandwidth_charges,
-                    proxy_bandwidth_charges,
-                )?;
+                currency_totals.per_call_charges =
+                    checked_add_charge(currency_totals.per_call_charges, proxy_per_call_charges)?;
+                currency_totals.stream_connection_charges =
+                    checked_add_charge(currency_totals.stream_connection_charges, stream_charges)?;
+                currency_totals.bandwidth_charges =
+                    checked_add_charge(currency_totals.bandwidth_charges, proxy_bandwidth_charges)?;
 
                 // Deterministic protocol_family label: "mixed" when a proxy
                 // carries both HTTP and stream activity, otherwise the single
