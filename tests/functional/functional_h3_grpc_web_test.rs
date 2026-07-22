@@ -1181,3 +1181,155 @@ async fn h3_grpc_web_preserves_ascii_custom_trailers_binary_and_text() {
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_web_validates_complete_binary_and_text_request_envelopes() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gRPC backend");
+    let backend_port = backend_listener.local_addr().expect("backend addr").port();
+    let backend_ca = TestCa::new("h3-grpc-web-request-envelope").expect("backend CA");
+    let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
+    let mut compressed = vec![0x01, 0, 0, 0, 4];
+    compressed.extend_from_slice(b"data");
+    let backend = ScriptedGrpcBackend::builder_tls(backend_listener, &backend_cert, &backend_key)
+        .expect("backend TLS")
+        .step(GrpcStep::AcceptRpc(MatchRpc::custom(move |request| {
+            request.method == "POST"
+                && request.path == "/echo.Echo/Unary"
+                && request.header("content-type") == Some("application/grpc")
+                && request.header("grpc-encoding") == Some("gzip")
+        })))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .step(GrpcStep::AcceptRpc(MatchRpc::custom(move |request| {
+            request.method == "POST"
+                && request.path == "/echo.Echo/Unary"
+                && request.header("content-type") == Some("application/grpc")
+                && request.header("grpc-encoding") == Some("gzip")
+        })))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn gRPC backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-grpc-web-request-envelope",
+            "listen_path": "/envelope",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "auth_mode": "single",
+            "plugins": [{"plugin_config_id": "grpc-web-request-envelope"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "grpc-web-request-envelope",
+            "plugin_name": "grpc_web",
+            "scope": "proxy",
+            "proxy_id": "h3-grpc-web-request-envelope",
+            "enabled": true,
+            "config": {},
+        }],
+    });
+    let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://127.0.0.1:{https_port}/envelope/echo.Echo/Unary");
+
+    let mut complete_then_invalid = grpc_frame(b"ok");
+    complete_then_invalid.extend_from_slice(&[0x42, 0, 0, 0, 0]);
+    for (content_type, body) in [
+        (
+            "application/grpc-web+proto",
+            Bytes::from_static(&[0x00, 0, 0, 0, 5, b'x']),
+        ),
+        (
+            "application/grpc-web-text+proto",
+            Bytes::from(BASE64.encode(&complete_then_invalid)),
+        ),
+        (
+            "application/grpc-web-text+proto",
+            Bytes::from_static(b"not!base64"),
+        ),
+    ] {
+        let rejected = request_with_retry(
+            &client,
+            &url,
+            GetOptions::default()
+                .method(Method::POST)
+                .header("content-type", content_type)
+                .body(body),
+        )
+        .await;
+        assert_grpc_web_error(&rejected, "3", content_type);
+    }
+
+    for (content_type, body) in [
+        (
+            "application/grpc-web+proto",
+            Bytes::from(compressed.clone()),
+        ),
+        (
+            "application/grpc-web-text+proto",
+            Bytes::from(BASE64.encode(&compressed)),
+        ),
+    ] {
+        let accepted = request_with_retry(
+            &client,
+            &url,
+            GetOptions::default()
+                .method(Method::POST)
+                .header("content-type", content_type)
+                .header("grpc-encoding", "gzip")
+                .body(body),
+        )
+        .await;
+        assert_eq!(accepted.status, StatusCode::OK);
+        assert_eq!(
+            accepted
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some(content_type)
+        );
+        let decoded;
+        let framed = if content_type.contains("-text") {
+            decoded = BASE64
+                .decode(&accepted.body_bytes)
+                .expect("text response base64");
+            decoded.as_slice()
+        } else {
+            accepted.body_bytes.as_ref()
+        };
+        assert!(
+            framed
+                .windows(b"grpc-status: 0".len())
+                .any(|window| window == b"grpc-status: 0"),
+            "valid compressed H3 {content_type} request was not forwarded"
+        );
+    }
+
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+    let received = backend.received_streams().await;
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0].body, compressed);
+    assert_eq!(received[1].body, compressed);
+}

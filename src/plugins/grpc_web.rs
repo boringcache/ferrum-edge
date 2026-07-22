@@ -342,6 +342,102 @@ fn binary_frames_are_complete(data: &[u8], trailer_frame_allowed: bool) -> bool 
     frames > 0
 }
 
+/// Validate the complete backend-bound gRPC-Web request envelope.
+///
+/// Request bodies may contain one or more native gRPC DATA frames. Ferrum does
+/// not translate body-encoded gRPC-Web request trailers into native HTTP/2
+/// trailers, so `0x80`/`0x81` are rejected instead of being forwarded as data.
+/// A compressed DATA frame is valid only when the request declares one
+/// non-identity `grpc-encoding`; uncompressed frames remain legal when an
+/// encoding is declared because compression is selected per message.
+fn validate_grpc_web_request_frames(
+    data: &[u8],
+    headers: &HashMap<String, String>,
+) -> Result<(), &'static str> {
+    if data.is_empty() {
+        return Err("body does not contain a gRPC message frame");
+    }
+
+    let compressed_encoding_declared = grpc_encoding_allows_compressed_frames(headers);
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let remaining = data.len() - pos;
+        if remaining < 5 {
+            return Err("truncated gRPC frame header or trailing bytes");
+        }
+
+        match data[pos] {
+            GRPC_FRAME_DATA => {}
+            GRPC_FRAME_DATA_COMPRESSED if compressed_encoding_declared => {}
+            GRPC_FRAME_DATA_COMPRESSED => {
+                return Err("compressed gRPC frame requires a non-identity grpc-encoding");
+            }
+            GRPC_FRAME_TRAILER | GRPC_FRAME_TRAILER_COMPRESSED => {
+                return Err("request-side gRPC-Web trailer frames are unsupported");
+            }
+            _ => return Err("unsupported gRPC frame flag"),
+        }
+
+        let declared =
+            u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+        let header_end = pos
+            .checked_add(5)
+            .ok_or("gRPC frame header offset overflow")?;
+        let payload_len =
+            usize::try_from(declared).map_err(|_| "gRPC frame length exceeds this platform")?;
+        if payload_len > data.len() - header_end {
+            return Err("truncated gRPC frame payload");
+        }
+        pos = header_end
+            .checked_add(payload_len)
+            .ok_or("gRPC frame payload offset overflow")?;
+    }
+
+    Ok(())
+}
+
+fn grpc_encoding_allows_compressed_frames(headers: &HashMap<String, String>) -> bool {
+    let mut values = headers.iter().filter_map(|(name, value)| {
+        name.eq_ignore_ascii_case("grpc-encoding")
+            .then_some(value.trim())
+    });
+    let Some(value) = values.next() else {
+        return false;
+    };
+    values.next().is_none()
+        && !value.is_empty()
+        && !value.eq_ignore_ascii_case("identity")
+        && !value.contains(',')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn invalid_grpc_web_request(error: &'static str) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: format!("{{\"error\":\"Invalid gRPC-Web request: {error}\"}}"),
+        headers: grpc_content_type_header(),
+    }
+}
+
 /// Whether `data` is a gRPC-Web **text**-mode body: standard base64 whose decoded
 /// octets are exactly a complete gRPC-Web binary frame sequence.
 ///
@@ -2172,12 +2268,13 @@ impl Plugin for GrpcWebPlugin {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        // Only buffer for text mode (needs base64 decoding).
-        // Binary mode body is already native gRPC framing. Any effective
-        // instance may observe the shared owner-written mode marker.
+        // gRPC-Web does not support client/request streaming. Buffer both
+        // owned modes so binary passthrough and decoded text traverse the same
+        // complete-envelope validation boundary before backend dispatch.
+        // Native gRPC requests have no owner marker and remain streaming.
         ctx.metadata
             .get(META_GRPC_WEB_MODE)
-            .is_some_and(|m| m == "text")
+            .is_some_and(|mode| mode == "text" || mode == "binary")
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -2463,39 +2560,18 @@ impl Plugin for GrpcWebPlugin {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Legacy path: validate when the owner-injected text-mode marker is
-        // present. Production uses `on_final_request_body_with_context`.
-        let is_text = headers
-            .get(HEADER_GRPC_WEB_MODE)
-            .is_some_and(|m| m == "text");
-
-        if !is_text {
+        // Legacy path: validate when the owner-injected mode marker names a
+        // recognized gRPC-Web transport. Production uses the owner-scoped
+        // context path below.
+        let Some(mode) = headers.get(HEADER_GRPC_WEB_MODE).map(String::as_str) else {
+            return PluginResult::Continue;
+        };
+        if mode != "text" && mode != "binary" {
             return PluginResult::Continue;
         }
 
-        // Validate that the body (post-transform) has valid gRPC length-prefixed
-        // framing. If base64 decode failed or produced garbage, reject early with
-        // a clear error rather than sending corrupt data to the backend.
-        if body.len() < 5 {
-            return PluginResult::Reject {
-                status_code: 400,
-                body:
-                    r#"{"error":"Invalid gRPC-Web text request: body too short for gRPC framing"}"#
-                        .to_string(),
-                headers: grpc_content_type_header(),
-            };
-        }
-
-        let flag = body[0];
-        if flag != GRPC_FRAME_DATA && flag != GRPC_FRAME_TRAILER {
-            return PluginResult::Reject {
-                status_code: 400,
-                body: r#"{"error":"Invalid gRPC-Web text request: invalid base64 encoding or corrupted gRPC framing"}"#.to_string(),
-                headers: grpc_content_type_header(),
-            };
-        }
-
-        PluginResult::Continue
+        validate_grpc_web_request_frames(body, headers)
+            .map_or_else(invalid_grpc_web_request, |()| PluginResult::Continue)
     }
 
     async fn on_final_request_body_with_context(
@@ -2504,7 +2580,7 @@ impl Plugin for GrpcWebPlugin {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only the translation owner validates text-mode framing. Followers
+        // Only the translation owner validates gRPC-Web framing. Followers
         // must not re-validate (or reject) after the owner's decode.
         if !self.is_translation_owner(ctx) {
             return PluginResult::Continue;
@@ -2517,10 +2593,11 @@ impl Plugin for GrpcWebPlugin {
             );
             return PluginResult::Continue;
         };
-        if mode != "text" {
+        if mode != "text" && mode != "binary" {
             return PluginResult::Continue;
         }
-        self.on_final_request_body(headers, body).await
+        validate_grpc_web_request_frames(body, headers)
+            .map_or_else(invalid_grpc_web_request, |()| PluginResult::Continue)
     }
 
     fn may_modify_response_content_type(

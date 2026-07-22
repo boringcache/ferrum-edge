@@ -3636,6 +3636,17 @@ Message-format suffixes (`+proto`, `+json`, `+thrift`, or another valid custom `
 
 On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. Request-body decoding mode follows request `Content-Type` only.
 
+After text-mode base64 decoding, binary and text requests share one complete
+envelope validator. It accepts one or more `0x00` uncompressed DATA frames and
+`0x01` compressed DATA frames when a single non-identity `grpc-encoding` is
+declared. Every five-byte header and declared payload must be present, later
+frame flags are checked, and the buffer must be consumed exactly. Empty bodies,
+truncated frames, trailing bytes, unsupported flags, and compressed frames
+without a usable encoding fail closed with a gRPC-Web-shaped client error.
+Request-side body trailer frames (`0x80`/`0x81`) are unsupported and rejected:
+Ferrum does not translate them into native HTTP/2 request trailers, so they are
+never forwarded to the backend as message bytes.
+
 On the response path, `grpc_web` embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, binary `*-bin` metadata, and valid ASCII custom trailing metadata such as `request-id` — as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` to the **negotiated** gRPC-Web variant. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and initial response headers are not copied into the trailer block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name.
 
 **Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
