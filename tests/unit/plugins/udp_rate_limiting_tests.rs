@@ -475,6 +475,184 @@ async fn both_directions_share_same_per_client_window() {
     assert_eq!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop);
 }
 
+// ── Capacity bookkeeping (#2314) ──────────────────────────────────────
+
+#[tokio::test]
+async fn steady_datagram_path_does_not_call_all_shard_len() {
+    use ferrum_edge::_test_support::RateLimitCleanupHarness;
+
+    let h = RateLimitCleanupHarness::new();
+    let epoch = h.udp_epoch_base();
+    for idx in 0..8 {
+        h.seed_udp(&format!("10.0.0.{idx}"), epoch);
+    }
+    let before = h.udp_all_shard_len_calls();
+
+    // Steady under-cap observations: maybe_evict loads the atomic count twice
+    // in the historical shape, but must never take every shard read lock.
+    for _ in 0..1_000 {
+        let _ = h.maybe_evict_udp_at(epoch);
+    }
+    assert_eq!(
+        h.udp_all_shard_len_calls(),
+        before,
+        "steady maybe_evict must not call DashMap::len()"
+    );
+    assert_eq!(h.udp_tracked(), Some(h.udp_map_len()));
+}
+
+#[tokio::test]
+async fn on_udp_datagram_steady_admission_skips_all_shard_len() {
+    use ferrum_edge::_test_support::{
+        udp_rate_limiting_all_shard_len_calls_for_test, udp_rate_limiting_map_len_for_test,
+        udp_rate_limiting_with_shards_for_test,
+    };
+
+    let plugin_4 =
+        udp_rate_limiting_with_shards_for_test(&json!({"datagrams_per_second": 1_000_000}), 4);
+    let plugin_256 =
+        udp_rate_limiting_with_shards_for_test(&json!({"datagrams_per_second": 1_000_000}), 256);
+
+    for plugin in [&plugin_4, &plugin_256] {
+        for idx in 0..8u8 {
+            let ctx = make_ctx(&format!("10.0.0.{idx}"), 64);
+            assert_eq!(
+                plugin.on_udp_datagram(&ctx).await,
+                UdpDatagramVerdict::Forward
+            );
+        }
+    }
+
+    let before_4 = udp_rate_limiting_all_shard_len_calls_for_test(&plugin_4);
+    let before_256 = udp_rate_limiting_all_shard_len_calls_for_test(&plugin_256);
+    for _ in 0..500 {
+        let ctx = make_ctx("10.0.0.1", 64);
+        assert_eq!(
+            plugin_4.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+        assert_eq!(
+            plugin_256.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+    let calls_4 = udp_rate_limiting_all_shard_len_calls_for_test(&plugin_4) - before_4;
+    let calls_256 = udp_rate_limiting_all_shard_len_calls_for_test(&plugin_256) - before_256;
+    assert_eq!(
+        calls_4, 0,
+        "steady admission must not call DashMap::len() (4 shards)"
+    );
+    assert_eq!(
+        calls_256, 0,
+        "steady admission must not call DashMap::len() (256 shards)"
+    );
+    assert_eq!(
+        calls_4, calls_256,
+        "steady all-shard work must not scale with DashMap shard count"
+    );
+    assert_eq!(
+        plugin_4.tracked_keys_count(),
+        Some(udp_rate_limiting_map_len_for_test(&plugin_4))
+    );
+}
+
+#[tokio::test]
+async fn redis_mode_datagram_path_skips_local_all_shard_scans() {
+    use ferrum_edge::_test_support::{
+        udp_rate_limiting_all_shard_len_calls_for_test, udp_rate_limiting_epoch_base_for_test,
+        udp_rate_limiting_maybe_evict_at_for_test, udp_rate_limiting_seed_client_at_for_test,
+    };
+
+    let plugin = make_plugin(json!({
+        "datagrams_per_second": 1_000_000,
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:9/0",
+        "redis_health_check_interval_seconds": 1
+    }));
+    let epoch = udp_rate_limiting_epoch_base_for_test(&plugin);
+    udp_rate_limiting_seed_client_at_for_test(&plugin, "10.0.0.1", 1, epoch);
+    udp_rate_limiting_seed_client_at_for_test(&plugin, "10.0.0.2", 1, epoch);
+    let before = udp_rate_limiting_all_shard_len_calls_for_test(&plugin);
+    for _ in 0..2_000 {
+        let _ = udp_rate_limiting_maybe_evict_at_for_test(&plugin, epoch);
+    }
+    assert_eq!(
+        udp_rate_limiting_all_shard_len_calls_for_test(&plugin),
+        before,
+        "Redis-mode local fallback must not all-shard scan per datagram"
+    );
+}
+
+#[test]
+fn concurrent_insert_prune_and_cap_keep_exact_entry_count() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use ferrum_edge::_test_support::RateLimitCleanupHarness;
+
+    let h = std::sync::Arc::new(RateLimitCleanupHarness::new());
+    let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
+    let epoch = h.udp_epoch_base();
+    let mut handles = Vec::new();
+
+    for worker in 0..8 {
+        let h = std::sync::Arc::clone(&h);
+        let max_seen = std::sync::Arc::clone(&max_seen);
+        handles.push(thread::spawn(move || {
+            for i in 0..512u32 {
+                let ip = format!("10.{worker}.{}.{}", (i / 256) % 256, i % 256);
+                let _ = h.seed_udp_with_cap(&ip, epoch, 32);
+                let count = h.udp_tracked().unwrap_or(usize::MAX);
+                max_seen.fetch_max(count, Ordering::Relaxed);
+            }
+        }));
+    }
+    {
+        let h = std::sync::Arc::clone(&h);
+        let max_seen = std::sync::Arc::clone(&max_seen);
+        handles.push(thread::spawn(move || {
+            for second in 20..84 {
+                h.arm_udp_periodic();
+                let _ = h.maybe_evict_udp_at(epoch + Duration::from_secs(second));
+                let count = h.udp_tracked().unwrap_or(usize::MAX);
+                max_seen.fetch_max(count, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("worker joins");
+    }
+
+    assert!(max_seen.load(Ordering::Relaxed) <= 32);
+    assert!(h.udp_tracked().unwrap_or(usize::MAX) <= 32);
+    assert_eq!(
+        h.udp_tracked(),
+        Some(h.udp_map_len()),
+        "atomic count must match after concurrent capped insertion and expiry removal"
+    );
+
+    // Expiry removes every stale key and releases the exact same slots.
+    h.arm_udp_periodic();
+    let _ = h.maybe_evict_udp_at(epoch + Duration::from_secs(100));
+    assert_eq!(h.udp_tracked(), Some(0));
+    assert_eq!(h.udp_map_len(), 0);
+
+    // Refill through the cap gate, then deliberately use the uncapped test seed
+    // to model legacy/repair pressure and verify forced eviction reconciles the
+    // count without crossing the configured steady-admission cap afterward.
+    let active = epoch + Duration::from_secs(200);
+    for i in 0..96 {
+        h.seed_udp(&format!("192.0.2.{i}"), active);
+    }
+    assert_eq!(h.udp_tracked(), Some(96));
+    let _ = h.maybe_evict_udp_at_with_cap(active, 32);
+    assert_eq!(h.udp_tracked(), Some(32));
+    assert_eq!(h.udp_map_len(), 32);
+    assert!(!h.seed_udp_with_cap("198.51.100.1", active, 32));
+}
+
 // ── Default Trait Methods ─────────────────────────────────────────────
 
 #[tokio::test]

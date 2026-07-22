@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -116,6 +116,14 @@ where
 {
     algorithm: A,
     state: DashMap<K, A::State>,
+    /// Exact resident-entry count coordinated with insert/remove. Steady-path
+    /// capacity checks load this atomic instead of `DashMap::len()`, which
+    /// takes a read guard on every shard.
+    entry_count: AtomicUsize,
+    /// Counts all-shard `DashMap::len()` observations. Production steady paths
+    /// never increment this; tests assert it stays flat under admission.
+    #[cfg(debug_assertions)]
+    all_shard_len_calls: AtomicUsize,
     #[cfg(test)]
     shard_amount: usize,
 }
@@ -135,6 +143,9 @@ where
         Self {
             algorithm,
             state: DashMap::with_shard_amount(shard_amount),
+            entry_count: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            all_shard_len_calls: AtomicUsize::new(0),
             #[cfg(test)]
             shard_amount,
         }
@@ -145,15 +156,39 @@ where
     }
 
     pub fn check_at(&self, key: K, op: &A::Op, now: Instant) -> RateLimitOutcome {
-        let mut entry = self
-            .state
-            .entry(key)
-            .or_insert_with(|| self.algorithm.new_state());
-        self.algorithm.check_local(entry.value_mut(), op, now)
+        self.check_at_with_capacity(key, op, now, usize::MAX)
+            .unwrap_or_else(RateLimitOutcome::deny)
+    }
+
+    /// Check one key while admitting at most max_entries distinct resident
+    /// keys. Existing keys continue at capacity; a vacant key must atomically
+    /// reserve a slot before its state is published.
+    pub fn check_at_with_capacity(
+        &self,
+        key: K,
+        op: &A::Op,
+        now: Instant,
+        max_entries: usize,
+    ) -> Option<RateLimitOutcome> {
+        use dashmap::mapref::entry::Entry;
+        match self.state.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                Some(self.algorithm.check_local(occupied.get_mut(), op, now))
+            }
+            Entry::Vacant(vacant) => {
+                if !self.try_reserve_entry_slot(max_entries) {
+                    return None;
+                }
+                let mut state = self.algorithm.new_state();
+                let outcome = self.algorithm.check_local(&mut state, op, now);
+                vacant.insert(state);
+                Some(outcome)
+            }
+        }
     }
 
     pub fn tracked_keys_count(&self) -> usize {
-        self.state.len()
+        self.entry_count.load(Ordering::Acquire)
     }
 
     /// Drop idle entries according to the algorithm's activity predicate.
@@ -162,8 +197,14 @@ where
     /// still-active keys and is safe to invoke on a sampled schedule even when
     /// the map sits under the hard capacity ceiling.
     pub fn prune_stale_at(&self, now: Instant) {
-        self.state
-            .retain(|_, state| self.algorithm.is_state_active(state, now));
+        self.state.retain(|_, state| {
+            if self.algorithm.is_state_active(state, now) {
+                true
+            } else {
+                self.release_entry_slot();
+                false
+            }
+        });
     }
 
     /// Enforce the hard entry cap after first pruning idle state.
@@ -175,7 +216,7 @@ where
     pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
         self.prune_stale_at(now);
 
-        let len = self.state.len();
+        let len = self.tracked_keys_count();
         if len <= max_entries {
             return;
         }
@@ -191,12 +232,52 @@ where
             .map(|entry| entry.key().clone())
             .collect();
         for key in keys {
-            self.state.remove(&key);
+            if self.state.remove(&key).is_some() {
+                self.release_entry_slot();
+            }
         }
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
         self.state.contains_key(key)
+    }
+
+    fn release_entry_slot(&self) {
+        let _ = self
+            .entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
+    }
+
+    fn try_reserve_entry_slot(&self, max_entries: usize) -> bool {
+        self.entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < max_entries).then_some(count + 1)
+            })
+            .is_ok()
+    }
+
+    /// All-shard `DashMap::len()` for test reconciliation only. Never call from
+    /// steady admission — each invocation takes every shard read lock.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn map_len_for_test(&self) -> usize {
+        #[cfg(debug_assertions)]
+        self.all_shard_len_calls.fetch_add(1, Ordering::Relaxed);
+        self.state.len()
+    }
+
+    /// Number of all-shard length observations since construction.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn all_shard_len_calls_for_test(&self) -> usize {
+        #[cfg(debug_assertions)]
+        {
+            self.all_shard_len_calls.load(Ordering::Relaxed)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
     }
 
     /// DashMap shard count for the local token-state map. Test-only so
@@ -328,6 +409,39 @@ where
         self.fallback.check(local_key, op)
     }
 
+    /// Prefer Redis when healthy; otherwise atomically cap distinct local
+    /// fallback keys. None means a new local key was denied at capacity.
+    pub async fn check_with_local_capacity(
+        &self,
+        local_key: K,
+        redis_key: &str,
+        op: &A::Op,
+        max_entries: usize,
+    ) -> Option<RateLimitOutcome> {
+        if self.redis_healthy.load(Ordering::Relaxed) && self.primary.is_available() {
+            match self.primary.check(redis_key, op).await {
+                Ok(result) => {
+                    self.redis_healthy.store(true, Ordering::Relaxed);
+                    self.fallback_warned.store(false, Ordering::Relaxed);
+                    return Some(result);
+                }
+                Err(()) => {
+                    self.redis_healthy.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if !self.fallback_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                plugin = self.plugin_name,
+                "Redis rate limiting unavailable — falling back to local in-memory state"
+            );
+        }
+
+        self.fallback
+            .check_at_with_capacity(local_key, op, Instant::now(), max_entries)
+    }
+
     pub fn tracked_keys_count(&self) -> usize {
         self.fallback.tracked_keys_count()
     }
@@ -342,6 +456,16 @@ where
 
     pub fn contains_local_key(&self, key: &K) -> bool {
         self.fallback.contains_key(key)
+    }
+
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn map_len_for_test(&self) -> usize {
+        self.fallback.map_len_for_test()
+    }
+
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn all_shard_len_calls_for_test(&self) -> usize {
+        self.fallback.all_shard_len_calls_for_test()
     }
 
     pub fn warmup_hostname(&self) -> Option<String> {
@@ -450,6 +574,31 @@ where
         }
     }
 
+    /// Check through Redis when available, or reserve a bounded local/fallback
+    /// entry slot atomically. None denies only a previously unseen local key.
+    pub async fn check_with_redis_key_and_local_capacity<F>(
+        &self,
+        local_key: K,
+        redis_key: F,
+        op: &A::Op,
+        max_entries: usize,
+    ) -> Option<RateLimitOutcome>
+    where
+        F: FnOnce() -> String,
+    {
+        match self {
+            Self::Local(local) => {
+                local.check_at_with_capacity(local_key, op, Instant::now(), max_entries)
+            }
+            Self::Failover(failover) => {
+                let redis_key = redis_key();
+                failover
+                    .check_with_local_capacity(local_key, &redis_key, op, max_entries)
+                    .await
+            }
+        }
+    }
+
     pub fn tracked_keys_count(&self) -> usize {
         match self {
             Self::Local(local) => local.tracked_keys_count(),
@@ -482,10 +631,47 @@ where
         }
     }
 
+    /// Test-support variant of local admission with an explicit hard cap.
+    #[allow(dead_code)]
+    pub fn check_local_at_with_capacity(
+        &self,
+        key: K,
+        op: &A::Op,
+        now: Instant,
+        max_entries: usize,
+    ) -> Option<RateLimitOutcome> {
+        match self {
+            Self::Local(local) => local.check_at_with_capacity(key, op, now, max_entries),
+            Self::Failover(failover) => {
+                failover
+                    .fallback
+                    .check_at_with_capacity(key, op, now, max_entries)
+            }
+        }
+    }
+
     pub fn contains_local_key(&self, key: &K) -> bool {
         match self {
             Self::Local(local) => local.contains_key(key),
             Self::Failover(failover) => failover.contains_local_key(key),
+        }
+    }
+
+    /// All-shard map length for test reconciliation only.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn map_len_for_test(&self) -> usize {
+        match self {
+            Self::Local(local) => local.map_len_for_test(),
+            Self::Failover(failover) => failover.map_len_for_test(),
+        }
+    }
+
+    /// All-shard `DashMap::len()` call counter for hot-path regression tests.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn all_shard_len_calls_for_test(&self) -> usize {
+        match self {
+            Self::Local(local) => local.all_shard_len_calls_for_test(),
+            Self::Failover(failover) => failover.all_shard_len_calls_for_test(),
         }
     }
 
@@ -3005,5 +3191,138 @@ mod tests {
         )
         .expect("udp_rate_limiting redis constructs");
         assert_eq!(udp.local_map_shard_amount(), expected);
+    }
+
+    #[test]
+    fn local_limiter_entry_count_matches_map_under_concurrent_insert_prune_evict() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let limiter = Arc::new(LocalLimiter::new(
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+            64,
+        ));
+        let op = TestOp;
+        let max_entries = 64usize;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+        for worker in 0..8 {
+            let limiter = Arc::clone(&limiter);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let key = format!("w{worker}:{i}");
+                    let _ = limiter.check(key, &op);
+                    i = i.wrapping_add(1);
+                    if i.is_multiple_of(17) {
+                        limiter.prune_stale_at(Instant::now() + Duration::from_secs(30));
+                    }
+                    if i.is_multiple_of(23) {
+                        limiter.enforce_capacity(max_entries, Instant::now());
+                    }
+                }
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(150));
+        stop.store(true, Ordering::Relaxed);
+        for handle in handles {
+            handle.join().expect("worker joins");
+        }
+
+        // Final cold-path enforcement must leave both the atomic count and the
+        // map at or below the hard cap with matching bookkeeping.
+        limiter.enforce_capacity(max_entries, Instant::now());
+        let tracked = limiter.tracked_keys_count();
+        let map_len = limiter.map_len_for_test();
+        assert_eq!(
+            tracked, map_len,
+            "atomic entry count must stay exact with insert/remove coordination"
+        );
+        assert!(
+            tracked <= max_entries,
+            "hard cap must hold after concurrent insert/prune/evict (tracked={tracked})"
+        );
+    }
+
+    #[test]
+    fn steady_admission_tracked_keys_count_does_not_scale_with_shard_count() {
+        fn steady_all_shard_calls(shard_amount: usize) -> usize {
+            let limiter = LocalLimiter::new(
+                TestAlgorithm {
+                    redis_ok: Arc::new(AtomicBool::new(true)),
+                },
+                shard_amount,
+            );
+            let op = TestOp;
+            // Warm a handful of keys so later checks are occupied-entry hits.
+            for idx in 0..16 {
+                assert!(limiter.check(format!("steady:{idx}"), &op).allowed);
+            }
+            let before = limiter.all_shard_len_calls_for_test();
+            for _ in 0..2_000 {
+                // Occupied-key admission + capacity observation (the UDP
+                // maybe_evict pattern) must stay O(1) in shard count.
+                let _ = limiter.check("steady:0".to_string(), &op);
+                let _ = limiter.tracked_keys_count();
+            }
+            limiter.all_shard_len_calls_for_test() - before
+        }
+
+        let calls_4 = steady_all_shard_calls(4);
+        let calls_256 = steady_all_shard_calls(256);
+        assert_eq!(
+            calls_4, 0,
+            "steady admission must not call DashMap::len() (4 shards)"
+        );
+        assert_eq!(
+            calls_256, 0,
+            "steady admission must not call DashMap::len() (256 shards)"
+        );
+        assert_eq!(
+            calls_4, calls_256,
+            "steady all-shard work must not scale with DashMap shard count"
+        );
+    }
+
+    #[test]
+    fn redis_failover_tracked_keys_count_skips_all_shard_scans() {
+        let http_client = http_client_with_shards("ferrum", 128);
+        let algorithm = TestAlgorithm {
+            redis_ok: Arc::new(AtomicBool::new(true)),
+        };
+        let backend: RateLimitBackend<String, TestAlgorithm> =
+            RateLimitBackend::from_plugin_config(
+                "udp_rate_limiting",
+                &json!({
+                    "sync_mode": "redis",
+                    "redis_url": "redis://127.0.0.1:9/0",
+                    "redis_health_check_interval_seconds": 1
+                }),
+                &http_client,
+                algorithm,
+            )
+            .expect("failover backend");
+        assert!(matches!(backend, RateLimitBackend::Failover(_)));
+
+        // Seed local fallback state the way Redis-outage / test seeding does.
+        let op = TestOp;
+        for idx in 0..32 {
+            let _ = backend.check_local_at(format!("ip:{idx}"), &op, Instant::now());
+        }
+        let before = backend.all_shard_len_calls_for_test();
+        for _ in 0..5_000 {
+            let _ = backend.tracked_keys_count();
+        }
+        assert_eq!(
+            backend.all_shard_len_calls_for_test(),
+            before,
+            "Redis-mode local fallback capacity reads must not scan all shards"
+        );
+        assert_eq!(backend.tracked_keys_count(), backend.map_len_for_test());
     }
 }

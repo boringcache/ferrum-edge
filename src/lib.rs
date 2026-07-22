@@ -1254,6 +1254,20 @@ pub mod _test_support {
                 .seed_client_at_for_test(std::sync::Arc::<str>::from(ip), 1, now);
         }
 
+        pub fn seed_udp_with_cap(
+            &self,
+            ip: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.udp.seed_client_at_with_cap_for_test(
+                std::sync::Arc::<str>::from(ip),
+                1,
+                now,
+                max_entries,
+            )
+        }
+
         pub fn arm_udp_periodic(&self) {
             self.udp.arm_periodic_eviction_for_test();
         }
@@ -1282,6 +1296,14 @@ pub mod _test_support {
             max_entries: usize,
         ) -> bool {
             self.udp.maybe_evict_at_with_cap_for_test(now, max_entries)
+        }
+
+        pub fn udp_all_shard_len_calls(&self) -> usize {
+            self.udp.all_shard_len_calls_for_test()
+        }
+
+        pub fn udp_map_len(&self) -> usize {
+            self.udp.map_len_for_test()
         }
 
         pub fn seed_rate_limiting(&self, key: &str, now: std::time::Instant) {
@@ -1448,6 +1470,68 @@ pub mod _test_support {
             self.ws
                 .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
         }
+    }
+
+    /// Build `udp_rate_limiting` with an explicit pool-shard override for
+    /// hot-path shard-scaling regressions (#2314).
+    pub fn udp_rate_limiting_with_shards_for_test(
+        config: &serde_json::Value,
+        pool_shard_amount: usize,
+    ) -> crate::plugins::udp_rate_limiting::UdpRateLimiting {
+        use crate::config::PoolConfig;
+        use crate::dns::{DnsCache, DnsConfig};
+        use crate::plugins::PluginHttpClient;
+
+        let http = PluginHttpClient::new(
+            &PoolConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            None,
+            std::sync::Arc::new(Vec::new()),
+            "ferrum",
+            crate::config::BackendEgressPolicy::unrestricted(),
+            std::sync::Arc::new(Vec::new()),
+            pool_shard_amount,
+        );
+        crate::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(config, http)
+            .expect("udp_rate_limiting constructs")
+    }
+
+    pub fn udp_rate_limiting_all_shard_len_calls_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) -> usize {
+        plugin.all_shard_len_calls_for_test()
+    }
+
+    pub fn udp_rate_limiting_map_len_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) -> usize {
+        plugin.map_len_for_test()
+    }
+
+    pub fn udp_rate_limiting_seed_client_at_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        client_ip: &str,
+        datagram_size: u64,
+        now: std::time::Instant,
+    ) {
+        plugin.seed_client_at_for_test(std::sync::Arc::<str>::from(client_ip), datagram_size, now);
+    }
+
+    pub fn udp_rate_limiting_maybe_evict_at_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.maybe_evict_at_for_test(now)
+    }
+
+    pub fn udp_rate_limiting_epoch_base_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) -> std::time::Instant {
+        plugin.epoch_base_for_test()
     }
 
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
