@@ -153,7 +153,7 @@ impl ProxyAlerts {
     pub fn retain_proxies(&self, active_proxy_generations: &HashMap<&str, u64>) {
         let owned: HashMap<String, u64> = active_proxy_generations
             .iter()
-            .map(|(id, gen)| ((*id).to_string(), *gen))
+            .map(|(id, generation)| ((*id).to_string(), *generation))
             .collect();
         self.windows.retain_proxies(active_proxy_generations);
         self.cooldowns.retain_proxies(active_proxy_generations);
@@ -169,14 +169,14 @@ impl ProxyAlerts {
             .iter()
             .copied()
             .map(|id| {
-                let gen = self
+                let generation = self
                     .active_proxy_generations
                     .load()
                     .as_ref()
                     .as_ref()
                     .and_then(|map| map.get(id).copied())
                     .unwrap_or(1);
-                (id, gen)
+                (id, generation)
             })
             .collect();
         self.retain_proxies(&generations);

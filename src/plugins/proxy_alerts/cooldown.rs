@@ -128,7 +128,7 @@ impl CooldownGate {
             per_proxy.retain(|proxy_id, generations| {
                 match active_proxy_generations.get(proxy_id.as_str()).copied() {
                     Some(active_gen) => {
-                        generations.retain(|&gen, _| gen == active_gen);
+                        generations.retain(|&generation, _| generation == active_gen);
                         !generations.is_empty()
                     }
                     None => false,
@@ -418,7 +418,7 @@ impl RecoveryGate {
             per_rule.retain(|proxy_id, generations| {
                 match active_proxy_generations.get(proxy_id.as_str()).copied() {
                     Some(active_gen) => {
-                        generations.retain(|&gen, _| gen == active_gen);
+                        generations.retain(|&generation, _| generation == active_gen);
                         !generations.is_empty()
                     }
                     None => false,

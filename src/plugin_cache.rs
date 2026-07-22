@@ -3057,8 +3057,8 @@ pub(crate) fn build_proxy_lifecycle_generations(
     let previous_max = previous.values().copied().max().unwrap_or(0);
     let mut high = previous_high_water.max(previous_max);
     for proxy in &config.proxies {
-        if let Some(&gen) = previous.get(&proxy.id) {
-            next.insert(proxy.id.clone(), gen);
+        if let Some(&generation) = previous.get(&proxy.id) {
+            next.insert(proxy.id.clone(), generation);
         } else {
             high = high.checked_add(1).ok_or_else(|| {
                 "proxy lifecycle generation counter exhausted".to_string()
@@ -3695,7 +3695,7 @@ impl PluginCache {
         let active_proxy_generations: HashMap<&str, u64> = inner
             .proxy_lifecycle_generations
             .iter()
-            .map(|(id, gen)| (id.as_str(), *gen))
+            .map(|(id, generation)| (id.as_str(), *generation))
             .collect();
         // `config` is the published generation that produced `inner`; keep the
         // parameter so call sites stay explicitly paired with that commit.
