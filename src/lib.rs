@@ -967,7 +967,7 @@ pub mod _test_support {
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         message: &Message,
     ) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
-        crate::proxy::prepare_ws_frame_deliveries(plugins, message)
+        crate::proxy::prepare_ws_frame_deliveries(plugins, message).into_vec()
     }
 
     /// Emit previously prepared delivery observations after a successful sink accept.
@@ -983,7 +983,7 @@ pub mod _test_support {
             proxy_id,
             connection_id,
             direction,
-            prepared,
+            crate::proxy::WsFrameDeliveryBatch::from_vec(prepared),
         )
     }
 

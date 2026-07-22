@@ -954,7 +954,8 @@ async fn test_ws_frame_logging_peer_close_and_disconnect_fields() {
         "close log must carry outcome=delivered and close_code=1000; close_lines={close_lines:?}"
     );
     assert!(
-        logs.iter().all(|line| !line.contains("should-never-appear")),
+        logs.iter()
+            .all(|line| !line.contains("should-never-appear")),
         "raw Close reason must never appear in logs; logs={logs:?}"
     );
 

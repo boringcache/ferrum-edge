@@ -675,7 +675,13 @@ impl Plugin for WsFrameLogging {
         direction: WebSocketFrameDirection,
         observation: WsFrameDeliveryObservation,
     ) {
-        self.emit_observation(proxy_id, connection_id, direction, &observation, "delivered");
+        self.emit_observation(
+            proxy_id,
+            connection_id,
+            direction,
+            &observation,
+            "delivered",
+        );
     }
 
     fn requires_ws_disconnect_hooks(&self) -> bool {

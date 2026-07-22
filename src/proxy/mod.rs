@@ -11618,17 +11618,66 @@ fn ws_message_payload_bytes(msg: &Message) -> u64 {
 
 /// Prepare deferred delivery observations from the final post-plugin message
 /// before `send()` moves it. Empty when no plugin wants a delivery record.
+pub(crate) enum WsFrameDeliveryBatch {
+    None,
+    One(usize, crate::plugins::WsFrameDeliveryObservation),
+    Many(Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>),
+}
+
+impl WsFrameDeliveryBatch {
+    fn push(&mut self, index: usize, observation: crate::plugins::WsFrameDeliveryObservation) {
+        let previous = std::mem::replace(self, Self::None);
+        *self = match previous {
+            Self::None => Self::One(index, observation),
+            Self::One(first_index, first_observation) => Self::Many(vec![
+                (first_index, first_observation),
+                (index, observation),
+            ]),
+            Self::Many(mut entries) => {
+                entries.push((index, observation));
+                Self::Many(entries)
+            }
+        };
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
+        match self {
+            Self::None => Vec::new(),
+            Self::One(index, observation) => vec![(index, observation)],
+            Self::Many(entries) => entries,
+        }
+    }
+
+    pub(crate) fn from_vec(
+        mut entries: Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>,
+    ) -> Self {
+        match entries.len() {
+            0 => Self::None,
+            1 => {
+                if let Some((index, observation)) = entries.pop() {
+                    Self::One(index, observation)
+                } else {
+                    Self::None
+                }
+            }
+            _ => Self::Many(entries),
+        }
+    }
+}
+
 pub(crate) fn prepare_ws_frame_deliveries(
     plugins: &[Arc<dyn Plugin>],
     message: &Message,
-) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
+) -> WsFrameDeliveryBatch {
     if plugins.is_empty() {
-        return Vec::new();
+        return WsFrameDeliveryBatch::None;
     }
-    let mut out = Vec::new();
+    // The normal deployment has one ws_frame_logging instance. Keep that path
+    // stack-only; allocate only when multiple delivery observers are configured.
+    let mut out = WsFrameDeliveryBatch::None;
     for (index, plugin) in plugins.iter().enumerate() {
         if let Some(observation) = plugin.prepare_ws_frame_delivery(message) {
-            out.push((index, observation));
+            out.push(index, observation);
         }
     }
     out
@@ -11643,11 +11692,20 @@ pub(crate) fn emit_ws_frame_deliveries(
     proxy_id: &str,
     connection_id: u64,
     direction: WebSocketFrameDirection,
-    prepared: Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>,
+    prepared: WsFrameDeliveryBatch,
 ) {
-    for (index, observation) in prepared {
+    let emit = |index, observation| {
         if let Some(plugin) = plugins.get(index) {
             plugin.emit_ws_frame_delivery(proxy_id, connection_id, direction, observation);
+        }
+    };
+    match prepared {
+        WsFrameDeliveryBatch::None => {}
+        WsFrameDeliveryBatch::One(index, observation) => emit(index, observation),
+        WsFrameDeliveryBatch::Many(entries) => {
+            for (index, observation) in entries {
+                emit(index, observation);
+            }
         }
     }
 }
@@ -12361,6 +12419,11 @@ where
                                     match res {
                                         Err(e) => {
                                             error!("Failed to send close to backend: {}", e);
+                                            let _ = first_failure_ctb.set((
+                                                crate::plugins::Direction::ClientToBackend,
+                                                retry::classify_boxed_error(&e),
+                                                Some(tcp_proxy::StreamIoSide::Write),
+                                            ));
                                         }
                                         Ok(()) => {
                                             frames_c2b_task.fetch_add(1, Ordering::Relaxed);
@@ -12575,6 +12638,11 @@ where
                                     match res {
                                         Err(e) => {
                                             error!("Failed to send close to client: {}", e);
+                                            let _ = first_failure_btc.set((
+                                                crate::plugins::Direction::BackendToClient,
+                                                retry::classify_boxed_error(&e),
+                                                Some(tcp_proxy::StreamIoSide::Write),
+                                            ));
                                         }
                                         Ok(()) => {
                                             frames_b2c_task.fetch_add(1, Ordering::Relaxed);

@@ -1186,10 +1186,7 @@ async fn peer_close_delivery_logs_code_and_reason_len_without_raw_reason() {
     assert_eq!(events[0].outcome.as_deref(), Some("delivered"));
     assert_eq!(events[0].frame_type.as_deref(), Some("close"));
     assert_eq!(events[0].close_code, Some(1000));
-    assert_eq!(
-        events[0].close_reason_len,
-        Some(secret_reason.len() as u64)
-    );
+    assert_eq!(events[0].close_reason_len, Some(secret_reason.len() as u64));
     assert_eq!(
         events[0].size_bytes,
         Some(2 + secret_reason.len() as u64),
@@ -1230,7 +1227,10 @@ async fn policy_close_emits_from_on_ws_frame_with_distinct_outcome() {
     assert_eq!(events[0].outcome.as_deref(), Some("policy_close"));
     assert_eq!(events[0].frame_type.as_deref(), Some("close"));
     assert_eq!(events[0].close_code, Some(1008));
-    assert_eq!(events[0].close_reason_len, Some("rate exceeded".len() as u64));
+    assert_eq!(
+        events[0].close_reason_len,
+        Some("rate exceeded".len() as u64)
+    );
     assert_eq!(events[0].direction.as_deref(), Some("backend->client"));
 }
 

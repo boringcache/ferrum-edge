@@ -200,7 +200,8 @@ impl Plugin for SizeReject {
 #[tokio::test(flavor = "current_thread")]
 async fn delivery_log_sees_restored_ping_after_control_guard() {
     let capture = Capture::default();
-    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
 
     let flip = Arc::new(PingToPongFlip {
         invocations: AtomicU64::new(0),
@@ -233,7 +234,8 @@ async fn delivery_log_sees_restored_ping_after_control_guard() {
 #[tokio::test(flavor = "current_thread")]
 async fn policy_close_emits_once_without_delivered_duplicate() {
     let capture = Capture::default();
-    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
 
     let size = Arc::new(SizeReject {
         invocations: AtomicU64::new(0),
@@ -259,7 +261,11 @@ async fn policy_close_emits_once_without_delivered_duplicate() {
     }
 
     let events = capture.events();
-    assert_eq!(events.len(), 1, "policy Close must not be double-counted: {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "policy Close must not be double-counted: {events:?}"
+    );
     assert_eq!(events[0].outcome.as_deref(), Some("policy_close"));
     assert_eq!(events[0].frame_type.as_deref(), Some("close"));
     assert_eq!(events[0].close_code, Some(1009));
@@ -270,7 +276,8 @@ async fn policy_close_emits_once_without_delivered_duplicate() {
 #[tokio::test(flavor = "current_thread")]
 async fn peer_close_delivery_helper_logs_both_directions() {
     let capture = Capture::default();
-    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
 
     let logger = Arc::new(WsFrameLogging::new(&json!({})).unwrap());
     let plugins: Vec<Arc<dyn Plugin>> = vec![logger];
@@ -308,8 +315,16 @@ async fn peer_close_delivery_helper_logs_both_directions() {
 
     let events = capture.events();
     assert_eq!(events.len(), 2, "{events:?}");
-    assert!(events.iter().all(|e| e.outcome.as_deref() == Some("delivered")));
-    assert!(events.iter().all(|e| e.frame_type.as_deref() == Some("close")));
+    assert!(
+        events
+            .iter()
+            .all(|e| e.outcome.as_deref() == Some("delivered"))
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e.frame_type.as_deref() == Some("close"))
+    );
     assert_eq!(events[0].close_code, Some(1000));
     assert_eq!(events[1].close_code, Some(1001));
 }
@@ -317,7 +332,8 @@ async fn peer_close_delivery_helper_logs_both_directions() {
 #[tokio::test(flavor = "current_thread")]
 async fn cancelled_delivery_drops_prepared_observation() {
     let capture = Capture::default();
-    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
 
     let logger = Arc::new(WsFrameLogging::new(&json!({})).unwrap());
     let plugins: Vec<Arc<dyn Plugin>> = vec![logger];
