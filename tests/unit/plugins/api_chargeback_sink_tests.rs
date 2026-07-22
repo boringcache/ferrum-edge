@@ -256,9 +256,7 @@ async fn config_validation_rejects_batch_and_retry_clamp_candidates() {
         match path {
             "batch.size" => config["batch"]["size"] = value.clone(),
             "batch.buffer_capacity" => config["batch"]["buffer_capacity"] = value.clone(),
-            "batch.flush_interval_ms" => {
-                config["batch"]["flush_interval_ms"] = value.clone()
-            }
+            "batch.flush_interval_ms" => config["batch"]["flush_interval_ms"] = value.clone(),
             "retry.max_attempts" => config["retry"]["max_attempts"] = value.clone(),
             "retry.initial_delay_ms" => config["retry"]["initial_delay_ms"] = value.clone(),
             "retry.max_delay_ms" => {
