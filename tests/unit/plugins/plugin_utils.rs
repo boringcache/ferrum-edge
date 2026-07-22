@@ -231,6 +231,7 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 

@@ -57,6 +57,7 @@ fn fully_populated_http() -> TransactionSummary {
             ("grpc_status".to_string(), "14".to_string()),
         ]),
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 

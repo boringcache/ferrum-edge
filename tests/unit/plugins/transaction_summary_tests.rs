@@ -38,6 +38,7 @@ fn make_full_summary() -> TransactionSummary {
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 

@@ -66,6 +66,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         mirror: false,
         metadata,
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 
@@ -199,6 +200,7 @@ fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         mirror: false,
         metadata,
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 

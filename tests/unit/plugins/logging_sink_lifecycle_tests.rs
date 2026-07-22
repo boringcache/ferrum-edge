@@ -853,6 +853,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "proxy-ws".to_string(),
         proxy_name: Some("websocket-proxy".to_string()),
+        connection_id: 1,
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend.local/chat".to_string(),
         listen_port: 8080,
@@ -869,6 +870,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         consumer_username: Some("alice".to_string()),
         auth_method: None,
         metadata: HashMap::new(),
+        proxy_lifecycle_generation: None,
     }
 }
 

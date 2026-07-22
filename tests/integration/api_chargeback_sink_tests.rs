@@ -93,6 +93,7 @@ async fn clickhouse_insert_round_trip_when_configured() {
         mirror: false,
         metadata,
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     };
     plugin.log(&summary).await;
 
