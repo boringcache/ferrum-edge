@@ -2951,7 +2951,13 @@ config:
 
 **Valid `target` values:** `header`, `query`, `body`. `target` is required on every rule — there is no default. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings. Header and query `value` must be strings; body `value` accepts any JSON type including explicit `null` (see below).
 
-**Header value constraints:** header `value` must not contain CR (`\r`) or LF (`\n`) — rejected at plugin load time as defence against header injection.
+**Configuration is fail-closed at plugin load time:**
+
+- Unknown top-level keys and unknown header/query/body rule keys are rejected with path-qualified diagnostics (for example `config.rules[0]`).
+- Unknown operations and unknown targets are rejected.
+- Header and query operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints.
+- Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
+- Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF keep a dedicated diagnostic and other forbidden control bytes (NUL, DEL, …) fail construction instead of being dropped later at a protocol boundary. Route-level request header transforms (`mesh_route_dispatch` → `apply_route_overrides`) apply the same value gate.
 
 **Body rules:** use dot-notation paths for nested JSON. Features:
 - **Nested objects** — `user.address.city`.

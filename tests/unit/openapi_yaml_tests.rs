@@ -3479,6 +3479,22 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
         "body value must remain unconstrained JSON (including null)"
     );
 
+    for component in [
+        "RequestTransformerConfig",
+        "RequestTransformerHeaderRule",
+        "RequestTransformerQueryRule",
+        "RequestTransformerBodyRule",
+    ] {
+        assert_eq!(
+            spec.pointer(&format!(
+                "/components/schemas/{component}/additionalProperties"
+            ))
+            .unwrap_or_else(|| panic!("{component}.additionalProperties")),
+            &json!(false),
+            "{component} must reject unknown properties"
+        );
+    }
+
     let runtime_overlay = spec
         .pointer("/components/schemas/RequestTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
@@ -3565,6 +3581,14 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime_overlay_scope": "internal",
             "default_enabled": false
         }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Edge",
+                "value": "tab\there"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, true);
         assert!(
@@ -3605,6 +3629,24 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             }],
             "runtime_overlay_scope": " \t "
         }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue"
+            }],
+            "runtime_overlay_scpoe": "internal"
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "vaule": "green"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, false);
         assert!(
@@ -3612,6 +3654,23 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid request_transformer config: {config}"
         );
     }
+
+    // Operation-incompatible extras are known OpenAPI properties but still fail
+    // runtime construction (schema cannot encode per-operation field sets).
+    let incompatible = json!({
+        "rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": "X-Color",
+            "value": "blue",
+            "new_key": "X-Ignored"
+        }]
+    });
+    assert_component_validity(&spec, "RequestTransformerConfig", &incompatible, true);
+    assert!(
+        RequestTransformer::new(&incompatible).is_err(),
+        "runtime must reject operation-incompatible header fields: {incompatible}"
+    );
 }
 
 #[test]

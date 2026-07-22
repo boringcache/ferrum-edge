@@ -15461,13 +15461,19 @@ components:
 
     RequestTransformerConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: request_transformer — Modifies request headers, query params,
-        and JSON body. Rules are validated at plugin load time; unknown
-        operations or targets, missing `value` on add/update, missing
-        `new_key` on rename, and CR/LF in header values are rejected.
-        Every rule must set an explicit `target` (`header`, `query`, or
-        `body`); there is no default.
+        and JSON body. Configuration is fail-closed: unknown top-level keys
+        and unknown per-rule keys are rejected at plugin load time. Header
+        and query rules enforce operation-exact fields (only add/update
+        accept `value`; only rename accepts `new_key`; remove accepts
+        neither). Every configured header `value` must be a valid HTTP
+        `HeaderValue` (same complete syntax accepted at H1/H2/H3 emission),
+        including rejection of CR/LF and other forbidden control bytes.
+        Unknown operations / targets and missing required fields are also
+        rejected. Every rule must set an explicit `target` (`header`,
+        `query`, or `body`); there is no default.
 
         When `apply_route_overrides: true`, the plugin also consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -15522,6 +15528,7 @@ components:
 
     RequestTransformerHeaderRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15534,6 +15541,9 @@ components:
             update: write the header value.
             remove: delete the header.
             rename: move old → new header name.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: header
@@ -15543,14 +15553,18 @@ components:
         value:
           type: string
           description: |
-            Required for add/update. Must be a string and must not contain
-            CR or LF.
+            Required for add/update; must not be set for remove/rename.
+            Must be a valid HTTP HeaderValue (HTAB, visible ASCII, and
+            obs-text are accepted; CR, LF, DEL, and other C0 controls are
+            rejected).
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     RequestTransformerQueryRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15561,6 +15575,9 @@ components:
             update: write the query parameter value.
             remove: delete the query parameter.
             rename: move old → new query parameter name.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: query
@@ -15569,13 +15586,16 @@ components:
           description: Query parameter name.
         value:
           type: string
-          description: Required for add/update. Must be a string.
+          description: |
+            Required for add/update; must not be set for remove/rename.
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     RequestTransformerBodyRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15586,6 +15606,9 @@ components:
             update: write, creating intermediate objects as needed.
             remove: delete the field.
             rename: move old → new, with rollback if the destination is unreachable.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: body
@@ -15605,7 +15628,8 @@ components:
             as a JSON string.
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     ResponseTransformerConfig:
       type: object
