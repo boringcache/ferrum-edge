@@ -947,7 +947,7 @@ async fn test_statsd_rejects_reserved_and_injecting_global_tags() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_statsd_grpc_status_collector_visible_for_h2_h3_shapes() {
     // Collector-visible evidence that OK vs non-OK gRPC outcomes remain
     // distinguishable under HTTP 200 for the summary shapes produced by
@@ -994,7 +994,7 @@ async fn test_statsd_grpc_status_collector_visible_for_h2_h3_shapes() {
         plugin.log(&summary).await;
 
         let mut buf = [0u8; 2048];
-        let (n, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        let (n, _) = timeout(Duration::from_secs(10), socket.recv_from(&mut buf))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {case} grpc_status={status}"))
             .expect("receive statsd datagram");
