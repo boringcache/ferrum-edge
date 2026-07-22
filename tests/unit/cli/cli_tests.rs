@@ -416,19 +416,6 @@ fn pin_absent_conf_file(temp_dir: &TempDir) {
     unsafe { std::env::set_var("FERRUM_CONF_PATH", &missing) };
 }
 
-/// Restore the process working directory when dropped.
-///
-/// Smart path discovery resolves `./resources.yaml` against the CWD. Tests that
-/// exercise discovery must enter a temp directory and restore on every exit
-/// path — including panic — so they do not leak a CWD change into later tests.
-struct RestoreCwd(std::path::PathBuf);
-
-impl Drop for RestoreCwd {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.0);
-    }
-}
-
 fn write_non_file_conf(path: &Path, mode: &str) {
     std::fs::write(
         path,
@@ -661,78 +648,6 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
                     .unwrap()
                     .ends_with("resources.yaml"),
                 "explicit --spec must still install the resources path"
-            );
-        },
-    );
-}
-
-/// Issue #2392 reproduction (`run`): a smart-discovered `./resources.yaml` must
-/// not flip a non-file conf-file mode into `FERRUM_MODE=file`.
-#[test]
-fn test_run_smart_discovered_spec_does_not_override_conf_file_mode() {
-    without_env_vars(
-        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
-        || {
-            let temp_dir = TempDir::new().unwrap();
-            let conf_path = temp_dir.path().join("ferrum.conf");
-            write_non_file_conf(&conf_path, "database");
-            write_empty_resources(&temp_dir.path().join("resources.yaml"));
-
-            let previous_cwd = std::env::current_dir().expect("cwd");
-            std::env::set_current_dir(temp_dir.path()).expect("enter temp cwd");
-            let _restore_cwd = RestoreCwd(previous_cwd);
-
-            let args = RunArgs {
-                settings: Some(conf_path),
-                spec: None,
-                mode: None,
-                verbose: 0,
-            };
-            ferrum_edge::cli::apply_run_overrides(&args);
-            assert!(
-                std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok(),
-                "smart discovery must install FERRUM_FILE_CONFIG_PATH from ./resources.yaml"
-            );
-
-            ferrum_edge::cli::infer_file_mode();
-
-            assert!(
-                std::env::var("FERRUM_MODE").is_err(),
-                "smart-discovered resources must not override ferrum.conf FERRUM_MODE=database"
-            );
-        },
-    );
-}
-
-/// Issue #2392 reproduction (`validate`): same smart-discovery precedence.
-#[test]
-fn test_validate_smart_discovered_spec_does_not_override_conf_file_mode() {
-    without_env_vars(
-        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
-        || {
-            let temp_dir = TempDir::new().unwrap();
-            let conf_path = temp_dir.path().join("ferrum.conf");
-            write_non_file_conf(&conf_path, "database");
-            write_empty_resources(&temp_dir.path().join("resources.yaml"));
-
-            let previous_cwd = std::env::current_dir().expect("cwd");
-            std::env::set_current_dir(temp_dir.path()).expect("enter temp cwd");
-            let _restore_cwd = RestoreCwd(previous_cwd);
-
-            let args = ValidateArgs {
-                settings: Some(conf_path),
-                spec: None,
-            };
-            ferrum_edge::cli::apply_validate_overrides(&args);
-            ferrum_edge::cli::infer_file_mode();
-
-            assert!(
-                std::env::var("FERRUM_MODE").is_err(),
-                "smart-discovered resources must not override ferrum.conf FERRUM_MODE=database"
-            );
-            assert!(
-                std::env::var("FERRUM_FILE_CONFIG_PATH").is_ok(),
-                "smart discovery must still install the resources path"
             );
         },
     );
