@@ -4218,16 +4218,16 @@ impl LoadBalancer {
 
         let fingerprint = healthy.bits;
         let schedule = wrr_state.schedule.load();
-        if !wrr_state.invalidate.load(Ordering::Acquire)
-            && schedule.fingerprint == fingerprint
-        {
+        if !wrr_state.invalidate.load(Ordering::Acquire) && schedule.fingerprint == fingerprint {
             if schedule.zero_weight {
                 let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 let target_idx = healthy.nth_set_bit(idx);
                 return Some(Arc::clone(&self.targets[target_idx]));
             }
             if let Some(target) = Self::pick_from_wrr_schedule(&schedule, wrr_state, |idx| {
-                healthy.contains(idx).then(|| Arc::clone(&self.targets[idx]))
+                healthy
+                    .contains(idx)
+                    .then(|| Arc::clone(&self.targets[idx]))
             }) {
                 return Some(target);
             }
@@ -4243,10 +4243,7 @@ impl LoadBalancer {
         wrr_state: &WrrLaneState,
         fingerprint: u128,
     ) -> Option<Arc<UpstreamTarget>> {
-        let _guard = wrr_state
-            .rebuild
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = wrr_state.rebuild.lock().unwrap_or_else(|e| e.into_inner());
 
         let schedule = wrr_state.schedule.load();
         if !wrr_state.invalidate.load(Ordering::Acquire) && schedule.fingerprint == fingerprint {
@@ -4256,7 +4253,9 @@ impl LoadBalancer {
                 return Some(Arc::clone(&self.targets[target_idx]));
             }
             if let Some(target) = Self::pick_from_wrr_schedule(&schedule, wrr_state, |idx| {
-                healthy.contains(idx).then(|| Arc::clone(&self.targets[idx]))
+                healthy
+                    .contains(idx)
+                    .then(|| Arc::clone(&self.targets[idx]))
             }) {
                 return Some(target);
             }
@@ -4281,7 +4280,9 @@ impl LoadBalancer {
             return Some(Arc::clone(&self.targets[target_idx]));
         }
         Self::pick_from_wrr_schedule(&new_schedule, wrr_state, |idx| {
-            healthy.contains(idx).then(|| Arc::clone(&self.targets[idx]))
+            healthy
+                .contains(idx)
+                .then(|| Arc::clone(&self.targets[idx]))
         })
     }
 
@@ -4314,21 +4315,17 @@ impl LoadBalancer {
 
         let fingerprint = wrr_vec_fingerprint(candidates);
         let schedule = wrr_state.schedule.load();
-        if !wrr_state.invalidate.load(Ordering::Acquire)
-            && schedule.fingerprint == fingerprint
-        {
+        if !wrr_state.invalidate.load(Ordering::Acquire) && schedule.fingerprint == fingerprint {
             if schedule.zero_weight {
                 let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 return Some(Arc::clone(candidates[idx % candidates.len()].1));
             }
-            if let Some(target) =
-                Self::pick_from_wrr_schedule(&schedule, wrr_state, |orig_idx| {
-                    candidates
-                        .iter()
-                        .find(|(idx, _)| *idx == orig_idx)
-                        .map(|(_, target)| Arc::clone(target))
-                })
-            {
+            if let Some(target) = Self::pick_from_wrr_schedule(&schedule, wrr_state, |orig_idx| {
+                candidates
+                    .iter()
+                    .find(|(idx, _)| *idx == orig_idx)
+                    .map(|(_, target)| Arc::clone(target))
+            }) {
                 return Some(target);
             }
         }
@@ -4343,10 +4340,7 @@ impl LoadBalancer {
         wrr_state: &WrrLaneState,
         fingerprint: u128,
     ) -> Option<Arc<UpstreamTarget>> {
-        let _guard = wrr_state
-            .rebuild
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = wrr_state.rebuild.lock().unwrap_or_else(|e| e.into_inner());
 
         let schedule = wrr_state.schedule.load();
         if !wrr_state.invalidate.load(Ordering::Acquire) && schedule.fingerprint == fingerprint {
@@ -4354,14 +4348,12 @@ impl LoadBalancer {
                 let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 return Some(Arc::clone(candidates[idx % candidates.len()].1));
             }
-            if let Some(target) =
-                Self::pick_from_wrr_schedule(&schedule, wrr_state, |orig_idx| {
-                    candidates
-                        .iter()
-                        .find(|(idx, _)| *idx == orig_idx)
-                        .map(|(_, target)| Arc::clone(target))
-                })
-            {
+            if let Some(target) = Self::pick_from_wrr_schedule(&schedule, wrr_state, |orig_idx| {
+                candidates
+                    .iter()
+                    .find(|(idx, _)| *idx == orig_idx)
+                    .map(|(_, target)| Arc::clone(target))
+            }) {
                 return Some(target);
             }
         }
