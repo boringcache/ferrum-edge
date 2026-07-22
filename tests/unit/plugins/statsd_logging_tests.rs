@@ -262,7 +262,9 @@ async fn test_statsd_logging_buffer_full_drops_gracefully() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     // Send more entries than buffer_capacity — excess should be dropped
     for _ in 0..20 {
@@ -292,6 +294,8 @@ async fn test_statsd_logging_accepts_all_config_options() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     assert_eq!(plugin.name(), "statsd_logging");
 }
 
@@ -690,6 +694,7 @@ async fn test_statsd_websocket_session_metrics_and_opt_in() {
         error_class: Some(ErrorClass::ReadWriteTimeout),
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: HashMap::new(),
     };
     let mut buf = String::new();
@@ -853,7 +858,9 @@ async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
         default_client(),
     )
     .expect("construct statsd");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let mut summary = create_test_transaction_summary();
     summary.body_completed = true;
     summary.latency_backend_ttfb_ms = 11.0;
@@ -917,6 +924,8 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
         default_client(),
     )
     .expect("construct statsd");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     assert!(
         plugin.requires_ws_disconnect_hooks(),
         "statsd_logging must opt into terminal WS disconnect dispatch"
@@ -941,6 +950,7 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: HashMap::new(),
     };
     plugin.on_ws_disconnect(&ctx).await;

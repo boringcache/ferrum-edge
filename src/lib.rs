@@ -685,6 +685,20 @@ pub mod _test_support {
         crate::plugins::kafka_logging::validate_producer_admission(config, http_client)
     }
 
+    pub fn kafka_logging_serialize_http_with_config_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::TransactionSummary,
+    ) -> Result<serde_json::Value, String> {
+        crate::plugins::kafka_logging::serialize_http_with_config_for_test(config, summary)
+    }
+
+    pub fn kafka_logging_serialize_stream_with_config_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::StreamTransactionSummary,
+    ) -> Result<serde_json::Value, String> {
+        crate::plugins::kafka_logging::serialize_stream_with_config_for_test(config, summary)
+    }
+
     /// Deterministic probe: channel reservation must precede serialization so
     /// an oversized summary rejected by a full Ferrum channel never increments
     /// the oversize counter.
@@ -1429,8 +1443,15 @@ pub mod _test_support {
         crate::plugins::grpc_web::parse_grpc_frames(data)
     }
 
-    pub fn response_content_type(original_ct: &str) -> &'static str {
+    pub fn response_content_type(original_ct: &str) -> String {
         crate::plugins::grpc_web::response_content_type(original_ct)
+    }
+
+    pub fn negotiate_grpc_web_response_media_type(
+        request_content_type: &str,
+        accept: Option<&str>,
+    ) -> Result<String, crate::plugins::grpc_web::GrpcWebAcceptError> {
+        crate::plugins::grpc_web::negotiate_response_media_type(request_content_type, accept)
     }
 
     pub fn finalize_grpc_web_error_response_headers(
@@ -2224,6 +2245,7 @@ pub mod _test_support {
             client_ip,
             backend_target,
             listen_port,
+            connection_id: 0,
             consumer_username,
             auth_method: None,
             metadata,
@@ -2252,6 +2274,7 @@ pub mod _test_support {
             client_ip,
             backend_target,
             listen_port,
+            connection_id: 0,
             consumer_username,
             auth_method: None,
             metadata,

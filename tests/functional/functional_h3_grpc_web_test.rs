@@ -867,7 +867,11 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         &format!("https://127.0.0.1:{https_port}/success/echo.Echo/Unary"),
         GetOptions::default()
             .method(Method::POST)
-            .header("content-type", "application/grpc-web+proto")
+            .header("content-type", "application/grpc-web+json")
+            .header(
+                "accept",
+                "text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8",
+            )
             .header("x-api-key", "h3-grpc-web-chargeback-key-99887766")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
@@ -879,7 +883,14 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
             .headers
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
-        Some("application/grpc-web+proto")
+        Some("application/grpc-web-text+json")
+    );
+    assert!(
+        response
+            .headers
+            .get("vary")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|vary| vary.split(',').any(|token| token.trim() == "Accept"))
     );
     let expose_headers = response
         .headers
@@ -892,7 +903,10 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         response.trailers.is_none(),
         "gRPC-Web must not leak native H3 trailers"
     );
-    let frames = grpc_web_frames(&response.body_bytes);
+    let decoded_response = BASE64
+        .decode(&response.body_bytes)
+        .expect("Accept-negotiated H3 response must be base64 text");
+    let frames = grpc_web_frames(&decoded_response);
     assert_eq!(
         frames.iter().filter(|(flag, _)| *flag & 0x80 != 0).count(),
         1,
@@ -916,12 +930,46 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         &format!("https://127.0.0.1:{https_port}/success/echo.Echo/Unary"),
         GetOptions::default()
             .method(Method::POST)
+            .header("content-type", "application/grpc-web-text+custom")
+            .header("accept", "application/grpc-web; q=1")
+            .header("x-api-key", "h3-grpc-web-chargeback-key-99887766")
+            .body(Bytes::from(BASE64.encode(grpc_frame(b"ping")))),
+    )
+    .await;
+    assert_grpc_web_error(&failure, "7", "application/grpc-web+custom");
+
+    let unacceptable = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/success/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
             .header("content-type", "application/grpc-web+proto")
+            .header("accept", "application/grpc-web;q=broken")
             .header("x-api-key", "h3-grpc-web-chargeback-key-99887766")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
     .await;
-    assert_grpc_web_error(&failure, "7", "application/grpc-web+proto");
+    assert_eq!(unacceptable.status, StatusCode::NOT_ACCEPTABLE);
+    assert_eq!(
+        unacceptable
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        unacceptable
+            .headers
+            .get("vary")
+            .and_then(|value| value.to_str().ok()),
+        Some("Accept")
+    );
+    assert!(
+        !unacceptable
+            .headers
+            .contains_key("x-ferrum-grpc-web-accept-rejected")
+    );
+    assert!(String::from_utf8_lossy(&unacceptable.body_bytes).contains("Not Acceptable"));
 
     let logs = gateway
         .wait_for_log_contains(
@@ -942,11 +990,19 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         .collect();
     assert_eq!(
         access_logs.len(),
-        1,
-        "errors_only must exclude translated status 0 and emit translated status 7; logs:\n{logs}"
+        2,
+        "errors_only must exclude translated status 0 and emit translated status 7 plus the HTTP 406 rejection; logs:\n{logs}"
     );
-    assert_eq!(access_logs[0]["response_status_code"], 200);
-    assert_eq!(access_logs[0]["grpc_status"], 7);
+    let translated_failure = access_logs
+        .iter()
+        .find(|entry| entry["grpc_status"] == 7)
+        .expect("translated status-7 failure log");
+    assert_eq!(translated_failure["response_status_code"], 200);
+    let accept_rejection = access_logs
+        .iter()
+        .find(|entry| entry["response_status_code"] == 406)
+        .expect("HTTP 406 Accept-rejection log");
+    assert_eq!(accept_rejection["request_path"], "/success/echo.Echo/Unary");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let charges = loop {

@@ -3,6 +3,13 @@
 //! This plugin is intentionally independent from `api_chargeback`: it uses the
 //! same pricing parser/math but owns its queue, spool, replay, metrics, and
 //! optional snapshot accumulator.
+//!
+//! Construction (`new`) is runtime-free shape validation: it does not create
+//! spool directories, materialize secrets, build a dedicated TLS client, spawn
+//! the batching worker / background tasks, or publish `ACTIVE_SINK`. Live
+//! staging happens from [`Plugin::start_background_tasks`]; workers stay
+//! dormant until [`Plugin::commit_background_tasks`] after PluginCache
+//! publication.
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -16,9 +23,10 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 use tracing::warn;
 use url::Url;
 
@@ -27,7 +35,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
-use super::utils::{BatchConfig, BatchingLogger, LoggerHooks, PluginHttpClient, RetryPolicy};
+use super::utils::{
+    BatchConfig, BatchingLogger, LoggerHooks, PluginHttpClient, RetryPolicy, wait_until_committed,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
 
@@ -407,16 +417,21 @@ struct SinkSummary {
 }
 
 pub struct ApiChargebackSink {
-    runtime: Arc<SinkRuntime>,
     pricing: PricingConfig,
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
-    snapshot_accumulator: Option<Arc<SnapshotAccumulator>>,
+    namespace: String,
+    /// Shared gateway client retained for dedicated ClickHouse client build at start.
+    http_client: PluginHttpClient,
+    /// Live sink runtime after [`Plugin::start_background_tasks`].
+    runtime: OnceLock<Arc<SinkRuntime>>,
+    snapshot_accumulator: OnceLock<Arc<SnapshotAccumulator>>,
     /// Handles for the per-instance background loops (spool replayer and, in
     /// snapshot mode, the snapshot emitter). Aborted on `Drop` so a config
     /// reload or admin-validation throwaway does not leak immortal tasks that
     /// would otherwise keep racing on the shared spool directory.
-    background_tasks: Vec<tokio::task::JoinHandle<()>>,
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    start_lock: Mutex<()>,
 }
 
 struct SinkRuntime {
@@ -433,6 +448,8 @@ struct SinkMetrics {
     failure_reasons: FailureReasonCounters,
     queue_high_water_hits_total: AtomicU64,
     spool_drops_total: AtomicU64,
+    spool_available: AtomicBool,
+    spool_prepare_failures_total: AtomicU64,
     snapshot_emits_total: AtomicU64,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
@@ -450,6 +467,8 @@ impl Default for SinkMetrics {
             failure_reasons: FailureReasonCounters::default(),
             queue_high_water_hits_total: AtomicU64::new(0),
             spool_drops_total: AtomicU64::new(0),
+            spool_available: AtomicBool::new(false),
+            spool_prepare_failures_total: AtomicU64::new(0),
             snapshot_emits_total: AtomicU64::new(0),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
@@ -630,28 +649,56 @@ impl ApiChargebackSink {
             &parsed_url,
             http_client.backend_allow_ips(),
         )?;
+
+        Ok(Self {
+            pricing,
+            config: Arc::new(config),
+            node_id: Arc::<str>::from(resolve_node_id()),
+            namespace: namespace.to_string(),
+            http_client,
+            runtime: OnceLock::new(),
+            snapshot_accumulator: OnceLock::new(),
+            background_tasks: Mutex::new(Vec::new()),
+            start_lock: Mutex::new(()),
+        })
+    }
+
+    fn activate(&self) -> Result<(), String> {
+        // Fallible setup first. Staged workers share one commit gate and stay
+        // dormant until commit_background_tasks; ACTIVE_SINK stays unpublished.
+        let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
-        let insert_url = build_insert_url(&parsed_url, &config.clickhouse);
-        let password = resolve_password_ref(config.clickhouse.password_ref.as_deref())?;
-        let http = build_clickhouse_http_client(&config.clickhouse, &http_client)?;
-        let flush_config = ClickHouseFlushConfig {
-            http,
-            insert_url: insert_url.clone(),
-            username: config.clickhouse.username.clone(),
-            password,
-            timeout: Duration::from_millis(config.clickhouse.timeout_ms),
-            metrics: Arc::new(SinkMetrics::default()),
+        let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
+        let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
+        let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
+        // Build the spool-replay client before staging so a TLS/file failure
+        // cannot orphan an already-staged BatchingLogger or replayer task.
+        let replay_http = if self.config.spool.enabled {
+            Some(build_clickhouse_http_client(
+                &self.config.clickhouse,
+                &self.http_client,
+            )?)
+        } else {
+            None
         };
-        let metrics = Arc::clone(&flush_config.metrics);
-        let node_id = Arc::<str>::from(resolve_node_id());
-        let spool = if config.spool.enabled {
+        let metrics = Arc::new(SinkMetrics::default());
+        let spool = if self.config.spool.enabled {
             Some(Arc::new(SpoolManager::new(
-                config.spool.clone(),
-                Arc::clone(&node_id),
+                self.config.spool.clone(),
+                Arc::clone(&self.node_id),
                 Arc::clone(&metrics),
             )?))
         } else {
             None
+        };
+
+        let flush_config = ClickHouseFlushConfig {
+            http,
+            insert_url: insert_url.clone(),
+            username: self.config.clickhouse.username.clone(),
+            password,
+            timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
+            metrics: Arc::clone(&metrics),
         };
 
         let failed_spool = spool.clone();
@@ -704,36 +751,42 @@ impl ApiChargebackSink {
             high_watermark_percent: 80,
         };
 
-        let logger = BatchingLogger::spawn_with_hooks(
+        let (commit_tx, commit_rx) = watch::channel(false);
+        let logger = BatchingLogger::spawn_with_hooks_on_commit_gate(
             BatchConfig {
-                batch_size: config.batch.size,
-                flush_interval: Duration::from_millis(config.batch.flush_interval_ms),
-                buffer_capacity: config.batch.buffer_capacity,
+                batch_size: self.config.batch.size,
+                flush_interval: Duration::from_millis(self.config.batch.flush_interval_ms),
+                buffer_capacity: self.config.batch.buffer_capacity,
                 // Honor the advertised retry schema: bounded exponential
                 // backoff from initial_delay_ms up to max_delay_ms, with
                 // optional full jitter (finding #77).
                 retry: RetryPolicy {
-                    max_attempts: config.retry.max_attempts.max(1),
-                    delay: Duration::from_millis(config.retry.initial_delay_ms),
-                    max_delay: Duration::from_millis(config.retry.max_delay_ms),
-                    jitter: config.retry.jitter,
+                    max_attempts: self.config.retry.max_attempts.max(1),
+                    delay: Duration::from_millis(self.config.retry.initial_delay_ms),
+                    max_delay: Duration::from_millis(self.config.retry.max_delay_ms),
+                    jitter: self.config.retry.jitter,
                 },
                 plugin_name: PLUGIN_NAME,
             },
             hooks,
-            move |batch| {
+            commit_tx,
+            commit_rx,
+            {
                 let flush_config = flush_config.clone();
-                async move { send_batch(&flush_config, batch).await }
+                move |batch| {
+                    let flush_config = flush_config.clone();
+                    async move { send_batch(&flush_config, batch).await }
+                }
             },
         );
 
         let runtime = Arc::new(SinkRuntime {
             summary: SinkSummary {
-                mode: config.mode,
-                pricing_version: config.pricing_version.clone(),
+                mode: self.config.mode,
+                pricing_version: self.config.pricing_version.clone(),
                 endpoint,
-                database: config.clickhouse.database.clone(),
-                table: config.clickhouse.table.clone(),
+                database: self.config.clickhouse.database.clone(),
+                table: self.config.clickhouse.table.clone(),
             },
             logger,
             metrics,
@@ -741,58 +794,106 @@ impl ApiChargebackSink {
         });
 
         let mut background_tasks = Vec::new();
-        if let Some(spool) = runtime.spool.clone() {
+        if let (Some(spool), Some(replay_http)) = (runtime.spool.clone(), replay_http) {
             background_tasks.push(start_spool_replayer(
                 Arc::clone(&spool),
                 runtime.summary.clone(),
                 ClickHouseFlushConfig {
-                    http: build_clickhouse_http_client(&config.clickhouse, &http_client)?,
+                    http: replay_http,
                     insert_url,
-                    username: config.clickhouse.username.clone(),
-                    password: resolve_password_ref(config.clickhouse.password_ref.as_deref())?,
-                    timeout: Duration::from_millis(config.clickhouse.timeout_ms),
+                    username: self.config.clickhouse.username.clone(),
+                    password: flush_config.password.clone(),
+                    timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
                     metrics: Arc::clone(&runtime.metrics),
                 },
-                config.batch.size,
-                config.spool.replay_interval_secs,
+                self.config.batch.size,
+                self.config.spool.replay_interval_secs,
+                runtime.logger.commit_sender().subscribe(),
             ));
         }
 
-        let config = Arc::new(config);
-        let snapshot_accumulator = if config.mode == SinkMode::Snapshot {
+        let snapshot_accumulator = if self.config.mode == SinkMode::Snapshot {
             let accumulator = Arc::new(SnapshotAccumulator::new());
             background_tasks.push(start_snapshot_task(
                 Arc::clone(&accumulator),
                 Arc::clone(&runtime),
-                Arc::clone(&config),
-                Arc::clone(&node_id),
-                namespace.to_string(),
+                Arc::clone(&self.config),
+                Arc::clone(&self.node_id),
+                self.namespace.clone(),
+                runtime.logger.commit_sender().subscribe(),
             ));
             Some(accumulator)
         } else {
             None
         };
 
-        active_sink().store(Arc::new(Some(Arc::clone(&runtime))));
-        invalidate_status_cache();
+        // Stage ownership. Abort every staged task on any failure so infinite
+        // replayer/snapshot loops cannot outlive a rejected activation. The
+        // BatchingLogger is owned by `runtime` and is not published to
+        // ACTIVE_SINK until commit succeeds; dropping `runtime` cancels its
+        // commit gate. ACTIVE_SINK is published only after `self.runtime` is set.
+        let abort_tasks = |tasks: &mut Vec<tokio::task::JoinHandle<()>>| {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        };
 
-        Ok(Self {
-            runtime,
-            pricing,
-            config,
-            node_id,
-            snapshot_accumulator,
-            background_tasks,
-        })
+        let mut owned_tasks = match self.background_tasks.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                abort_tasks(&mut background_tasks);
+                return Err(format!(
+                    "{PLUGIN_NAME}: background task lock poisoned; refusing to start"
+                ));
+            }
+        };
+
+        *owned_tasks = std::mem::take(&mut background_tasks);
+
+        if let Some(accumulator) = snapshot_accumulator
+            && self.snapshot_accumulator.set(accumulator).is_err()
+        {
+            abort_tasks(&mut owned_tasks);
+            return Err(format!(
+                "{PLUGIN_NAME}: snapshot accumulator already activated; refusing duplicate start"
+            ));
+        }
+
+        if self.runtime.set(Arc::clone(&runtime)).is_err() {
+            abort_tasks(&mut owned_tasks);
+            return Err(format!(
+                "{PLUGIN_NAME}: runtime already activated; refusing duplicate start"
+            ));
+        }
+
+        Ok(())
     }
 
     fn enqueue(&self, event: ChargeEvent) {
-        self.runtime
+        let Some(runtime) = self.runtime.get() else {
+            return;
+        };
+        runtime
             .metrics
             .events_enqueued_total
             .fetch_add(1, Ordering::Relaxed);
-        self.runtime.logger.try_send(event);
+        runtime.logger.try_send(event);
         invalidate_status_cache();
+    }
+
+    /// Whether this instance currently owns the process-global `ACTIVE_SINK`
+    /// diagnostics slot. Staging (`start_background_tasks`) must leave this
+    /// false; only [`Plugin::commit_background_tasks`] publishes ownership.
+    #[allow(dead_code)] // lifecycle tests observe pre/post-commit publication
+    pub fn owns_active_sink(&self) -> bool {
+        let Some(runtime) = self.runtime.get() else {
+            return false;
+        };
+        active_sink()
+            .load_full()
+            .as_ref()
+            .as_ref()
+            .is_some_and(|published| Arc::ptr_eq(published, runtime))
     }
 }
 
@@ -804,9 +905,15 @@ impl Drop for ApiChargebackSink {
         // BatchingLogger flush loop is intentionally left running: it owns the
         // mpsc receiver and terminates on its own once the sender is dropped,
         // after draining any buffered events.
-        for task in &self.background_tasks {
-            task.abort();
+        if let Ok(mut tasks) = self.background_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
         }
+        let Some(runtime) = self.runtime.get() else {
+            // Never started: ACTIVE_SINK was never published for this instance.
+            return;
+        };
         // If this instance is still the one published for status/metrics
         // rendering, clear the slot. Without this, a dropped validation
         // throwaway would leave stale (zeroed) metrics — and its idle flush
@@ -815,7 +922,7 @@ impl Drop for ApiChargebackSink {
         if current
             .as_ref()
             .as_ref()
-            .is_some_and(|runtime| Arc::ptr_eq(runtime, &self.runtime))
+            .is_some_and(|published| Arc::ptr_eq(published, runtime))
         {
             active_sink().store(Arc::new(None));
             invalidate_status_cache();
@@ -837,6 +944,41 @@ impl Plugin for ApiChargebackSink {
         super::ALL_PROTOCOLS
     }
 
+    fn start_background_tasks(&self) -> Result<(), String> {
+        if self.runtime.get().is_some() {
+            return Ok(());
+        }
+        let _guard = self.start_lock.lock().map_err(|_| {
+            format!("{PLUGIN_NAME}: start lock poisoned; refusing to start chargeback sink")
+        })?;
+        if self.runtime.get().is_some() {
+            return Ok(());
+        }
+        let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            format!("{PLUGIN_NAME}: start_background_tasks requires a Tokio runtime")
+        })?;
+        self.activate()
+    }
+
+    fn commit_background_tasks(&self) {
+        let Some(runtime) = self.runtime.get() else {
+            return;
+        };
+        // Release flush/replay/snapshot dormancy before publishing diagnostics
+        // so the live instance cannot appear active while workers are gated.
+        runtime.logger.commit();
+        let current = active_sink().load_full();
+        if current
+            .as_ref()
+            .as_ref()
+            .is_some_and(|published| Arc::ptr_eq(published, runtime))
+        {
+            return;
+        }
+        active_sink().store(Arc::new(Some(Arc::clone(runtime))));
+        invalidate_status_cache();
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         let consumer = match summary.consumer_username.as_deref() {
             Some(c) if !c.is_empty() => c,
@@ -851,7 +993,7 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.as_ref() {
+            if let Some(accumulator) = self.snapshot_accumulator.get() {
                 accumulator.record_http(summary, consumer, outcome, charge);
             }
             return;
@@ -879,7 +1021,7 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.as_ref() {
+            if let Some(accumulator) = self.snapshot_accumulator.get() {
                 accumulator.record_stream(summary, consumer, charge);
             }
             return;
@@ -910,7 +1052,7 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.as_ref() {
+            if let Some(accumulator) = self.snapshot_accumulator.get() {
                 accumulator.record_websocket(summary, consumer, charge);
             }
             return;
@@ -953,7 +1095,7 @@ pub fn render_status_json() -> String {
             "pricing_version": null,
             "clickhouse": null,
             "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
-            "spool": {"enabled": false, "files": 0, "bytes": 0, "drops_total": 0, "last_replay_at": null},
+            "spool": {"enabled": false, "available": false, "prepare_failures_total": 0, "files": 0, "bytes": 0, "drops_total": 0, "last_replay_at": null},
             "export": {
                 "events_enqueued_total": 0,
                 "events_exported_total": 0,
@@ -1009,6 +1151,8 @@ impl SinkRuntime {
             },
             "spool": {
                 "enabled": spool_enabled,
+                "available": spool_enabled && self.metrics.spool_available.load(Ordering::Acquire),
+                "prepare_failures_total": self.metrics.spool_prepare_failures_total.load(Ordering::Relaxed),
                 "files": spool_files,
                 "bytes": spool_bytes,
                 "drops_total": self.metrics.spool_drops_total.load(Ordering::Relaxed),
@@ -1104,6 +1248,22 @@ impl SinkRuntime {
         output.push_str(&format!(
             "chargeback_sink_spool_drops_total {}\n",
             metrics.spool_drops_total.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP chargeback_sink_spool_available Whether committed spool storage is currently writable (1) or unavailable (0).\n");
+        output.push_str("# TYPE chargeback_sink_spool_available gauge\n");
+        output.push_str(&format!(
+            "chargeback_sink_spool_available {}\n",
+            if metrics.spool_available.load(Ordering::Acquire) {
+                1
+            } else {
+                0
+            }
+        ));
+        output.push_str("# HELP chargeback_sink_spool_prepare_failures_total Chargeback sink committed spool storage preparation failures.\n");
+        output.push_str("# TYPE chargeback_sink_spool_prepare_failures_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_spool_prepare_failures_total {}\n",
+            metrics.spool_prepare_failures_total.load(Ordering::Relaxed)
         ));
         output.push_str("# HELP chargeback_sink_export_latency_seconds Chargeback sink ClickHouse export latency in seconds.\n");
         output.push_str("# TYPE chargeback_sink_export_latency_seconds histogram\n");
@@ -1265,7 +1425,9 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
                 "{PLUGIN_NAME}: spool.replay_interval_secs must be at least 1"
             ));
         }
-        ensure_private_dir(&config.spool.dir)?;
+        // Shape-only: do not mkdir/chmod/probe here. Live storage preparation
+        // starts only after the candidate generation is committed.
+        validate_spool_dir_shape(&config.spool.dir)?;
     } else if config.mode == SinkMode::Snapshot {
         return Err(format!(
             "{PLUGIN_NAME}: snapshot mode requires spool.enabled=true so emitted deltas remain durable during ClickHouse outages"
@@ -1310,11 +1472,38 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: clickhouse.password_ref cannot be used when ClickHouse TLS certificate or hostname verification is disabled"
         ));
     }
+    // Shape-only secret-ref check (do not materialize the env value here).
+    if let Some(reference) = config
+        .clickhouse
+        .password_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && !reference.starts_with("FERRUM_")
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.password_ref must reference a FERRUM_* environment variable"
+        ));
+    }
     if config.pricing_version.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: pricing_version must not be empty"));
     }
     if config.currency.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: currency must not be empty"));
+    }
+    Ok(())
+}
+
+fn validate_spool_dir_shape(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{PLUGIN_NAME}: spool.dir must not be empty"));
+    }
+    // Reject NUL-containing paths without touching the filesystem.
+    let display = path.to_string_lossy();
+    if display.contains('\0') {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool.dir must not contain NUL bytes"
+        ));
     }
     Ok(())
 }
@@ -1520,6 +1709,7 @@ pub struct SpoolManager {
     node_id: Arc<str>,
     metrics: Arc<SinkMetrics>,
     last_drop_warn_at: AtomicI64,
+    live_storage_prepared: AtomicBool,
     write_lock: Mutex<()>,
 }
 
@@ -1529,29 +1719,27 @@ impl SpoolManager {
         node_id: Arc<str>,
         metrics: Arc<SinkMetrics>,
     ) -> Result<Self, String> {
-        ensure_private_dir(&cfg.dir)?;
-        ensure_private_dir(&cfg.dir.join(node_id.as_ref()))?;
-        warn_on_sibling_spool_dirs(&cfg.dir, node_id.as_ref());
-        let manager = Self {
+        Ok(Self {
             cfg,
             node_id,
             metrics,
             last_drop_warn_at: AtomicI64::new(0),
+            live_storage_prepared: AtomicBool::new(false),
             write_lock: Mutex::new(()),
-        };
-        // Crash-left *.tmp files consume disk but are incomplete; delete them
-        // before any quota decision so ownership accounting matches durable state.
-        manager.reconcile_stale_temp_files()?;
-        Ok(manager)
+        })
     }
 
     #[allow(dead_code)]
     pub fn for_tests(cfg: SpoolSettings, node_id: &str) -> Result<Self, String> {
-        Self::new(
+        let manager = Self::new(
             cfg,
             Arc::<str>::from(node_id.to_string()),
             Arc::new(SinkMetrics::default()),
-        )
+        )?;
+        // Test callers model a committed/live sink and retain the historical
+        // eager startup validation contract.
+        manager.prepare_live_storage()?;
+        Ok(manager)
     }
 
     pub fn write_events(&self, events: &[ChargeEvent]) -> Result<PathBuf, String> {
@@ -1562,6 +1750,7 @@ impl SpoolManager {
             .write_lock
             .lock()
             .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.prepare_live_storage_locked()?;
         // Size the pending encoded file before admission so max_bytes is a hard
         // ceiling over existing owned bytes plus this write.
         let body = serialize_json_each_row(events)?;
@@ -1589,6 +1778,57 @@ impl SpoolManager {
         write_private_file_atomically(&tmp_path, &final_path, &bytes)?;
         invalidate_status_cache();
         Ok(final_path)
+    }
+
+    /// Prepare mutable spool state only for a committed generation. Candidate
+    /// staging must not create directories, write probes, or reconcile files.
+    fn prepare_live_storage(&self) -> Result<(), String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.prepare_live_storage_locked()
+    }
+
+    fn prepare_live_storage_locked(&self) -> Result<(), String> {
+        let result = self.prepare_live_storage_locked_inner();
+        let available = result.is_ok();
+        let changed = self
+            .metrics
+            .spool_available
+            .swap(available, Ordering::AcqRel)
+            != available;
+        if !available {
+            self.metrics
+                .spool_prepare_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if changed || !available {
+            invalidate_status_cache();
+        }
+        result
+    }
+
+    fn prepare_live_storage_locked_inner(&self) -> Result<(), String> {
+        let node_dir = self.cfg.dir.join(self.node_id.as_ref());
+        // Avoid repeated chmod/write probes on every batch and replay tick.
+        // If an operator removes either live directory, fall through and
+        // securely recreate/re-probe it instead of creating permissive parents
+        // implicitly from the later day-directory write.
+        if self.live_storage_prepared.load(Ordering::Acquire)
+            && self.cfg.dir.is_dir()
+            && node_dir.is_dir()
+        {
+            return Ok(());
+        }
+        ensure_private_dir(&self.cfg.dir)?;
+        ensure_private_dir(&node_dir)?;
+        warn_on_sibling_spool_dirs(&self.cfg.dir, self.node_id.as_ref());
+        // Crash-left *.tmp files consume disk but are incomplete; delete them
+        // only after publication and before any live quota decision.
+        self.reconcile_stale_temp_files()?;
+        self.live_storage_prepared.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub fn scan_stats(&self) -> Result<SpoolStats, String> {
@@ -2043,11 +2283,23 @@ fn start_spool_replayer(
     flush_config: ClickHouseFlushConfig,
     _batch_size: usize,
     replay_interval_secs: u64,
+    commit_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if !wait_until_committed(commit_rx).await {
+            return;
+        }
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
         loop {
             timer.tick().await;
+            if let Err(error) = spool.prepare_live_storage() {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %error,
+                    "Chargeback sink live spool preparation failed"
+                );
+                continue;
+            }
             if let Err(error) = replay_spool_once(&spool, &flush_config).await {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
             }
@@ -2451,8 +2703,12 @@ fn start_snapshot_task(
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
     _namespace: String,
+    commit_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if !wait_until_committed(commit_rx).await {
+            return;
+        }
         let mut snapshot_timer =
             tokio::time::interval(Duration::from_secs(config.snapshot.interval_secs));
         let mut cleanup_timer =

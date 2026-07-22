@@ -3,6 +3,8 @@
 use ferrum_edge::_test_support::{
     kafka_logging_probe_byte_budget_before_serialize_for_test,
     kafka_logging_probe_reserve_before_serialize_for_test,
+    kafka_logging_serialize_http_with_config_for_test,
+    kafka_logging_serialize_stream_with_config_for_test,
     kafka_logging_validate_producer_admission_for_test,
 };
 use ferrum_edge::plugins::kafka_logging::{
@@ -20,6 +22,13 @@ use super::plugin_utils::{
 
 fn default_http_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+fn start_kafka_logging(plugin: &KafkaLogging) {
+    plugin
+        .start_background_tasks()
+        .expect("kafka_logging live tests require start_background_tasks");
+    plugin.commit_background_tasks();
 }
 
 #[tokio::test]
@@ -669,6 +678,7 @@ async fn test_kafka_logging_finalize_is_exact_once() {
         &default_http_client(),
     )
     .unwrap();
+    start_kafka_logging(&plugin);
     let before = plugin.snapshot();
     assert!(before.accepting);
     assert!(!before.finalized);
@@ -690,7 +700,6 @@ fn test_kafka_logging_finalize_budget_includes_blocking_pool_queue() {
         .enable_all()
         .build()
         .expect("build constrained Kafka finalize test runtime");
-
     runtime.block_on(async {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -713,6 +722,7 @@ fn test_kafka_logging_finalize_budget_includes_blocking_pool_queue() {
             &default_http_client(),
         )
         .expect("construct Kafka logger for blocking-pool budget test");
+        start_kafka_logging(&plugin);
         plugin.log(&create_test_transaction_summary()).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while plugin.snapshot().admitted_total == 0 {
@@ -756,6 +766,7 @@ async fn test_kafka_logging_snapshot_counters_start_at_zero() {
         &default_http_client(),
     )
     .unwrap();
+    start_kafka_logging(&plugin);
     let snap = plugin.snapshot();
     assert_eq!(snap.admitted_total, 0);
     assert_eq!(snap.delivered_total, 0);
@@ -799,6 +810,7 @@ async fn test_kafka_logging_byte_budget_defaults_and_validation() {
         &default_http_client(),
     )
     .unwrap();
+    start_kafka_logging(&plugin);
     let snap = plugin.snapshot();
     assert_eq!(snap.max_entry_bytes, DEFAULT_MAX_ENTRY_BYTES as u64);
     assert_eq!(snap.buffer_max_bytes, DEFAULT_BUFFER_MAX_BYTES as u64);
@@ -888,6 +900,7 @@ async fn test_kafka_logging_rejects_oversize_entry_when_channel_has_capacity() {
         &default_http_client(),
     )
     .unwrap();
+    start_kafka_logging(&plugin);
 
     let mut huge = create_test_transaction_summary();
     huge.request_path = format!("/{}", "b".repeat(4096));
@@ -916,6 +929,7 @@ async fn test_kafka_logging_byte_budget_saturation_and_release() {
         &default_http_client(),
     )
     .unwrap();
+    start_kafka_logging(&plugin);
 
     let summary = create_test_transaction_summary();
     for _ in 0..8 {
@@ -937,6 +951,54 @@ async fn test_kafka_logging_byte_budget_saturation_and_release() {
     );
 }
 
+#[test]
+fn test_kafka_logging_schema_only_applies_to_matching_summary_type() {
+    let http = create_test_transaction_summary();
+    let stream = create_test_stream_transaction_summary();
+
+    let stream_only_schema = json!({
+        "schema": {
+            "summary_type": "stream",
+            "omit": ["protocol"]
+        }
+    });
+    let http_value = kafka_logging_serialize_http_with_config_for_test(&stream_only_schema, &http)
+        .expect("HTTP serialization should succeed with a stream-only schema");
+    assert!(
+        http_value.get("http_method").is_some(),
+        "stream-only schemas must not remove native HTTP audit fields: {http_value}"
+    );
+    assert!(
+        http_value.get("request_path").is_some(),
+        "stream-only schemas must not remove native HTTP path fields: {http_value}"
+    );
+
+    let http_only_schema = json!({
+        "schema": {
+            "summary_type": "http",
+            "omit": ["request_path"]
+        }
+    });
+    let stream_value =
+        kafka_logging_serialize_stream_with_config_for_test(&http_only_schema, &stream)
+            .expect("stream serialization should succeed with an HTTP-only schema");
+    assert!(
+        stream_value.get("protocol").is_some(),
+        "HTTP-only schemas must not remove native stream connection fields: {stream_value}"
+    );
+    assert!(
+        stream_value.get("listen_port").is_some(),
+        "HTTP-only schemas must not remove native stream listener fields: {stream_value}"
+    );
+
+    let matching_http = kafka_logging_serialize_http_with_config_for_test(&http_only_schema, &http)
+        .expect("matching HTTP schema should serialize");
+    assert!(
+        matching_http.get("request_path").is_none(),
+        "matching HTTP schema should still be applied: {matching_http}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_kafka_logging_http_and_stream_schema_key_behavior() {
     let plugin = KafkaLogging::new(
@@ -954,6 +1016,7 @@ async fn test_kafka_logging_http_and_stream_schema_key_behavior() {
         &default_http_client(),
     )
     .unwrap();
+    start_kafka_logging(&plugin);
 
     let mut http = create_test_transaction_summary();
     http.proxy_id = Some("http-proxy".to_string());
@@ -986,6 +1049,7 @@ async fn test_kafka_logging_diagnostics_omit_secrets() {
         &default_http_client(),
     )
     .unwrap();
+    start_kafka_logging(&plugin);
     plugin.log(&create_test_transaction_summary()).await;
     let snap = serde_json::to_string(&plugin.snapshot()).unwrap();
     let prom = ferrum_edge::plugins::kafka_logging::render_prometheus();

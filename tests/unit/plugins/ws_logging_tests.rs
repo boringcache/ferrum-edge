@@ -85,6 +85,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         error_class: None,
         consumer_username: Some("alice".to_string()),
         auth_method: None,
+        connection_id: 0,
         metadata,
     }
 }
@@ -262,6 +263,8 @@ async fn test_ws_logging_log_does_not_panic() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
 
     // Should not panic — entry goes into channel and is drained
@@ -281,6 +284,8 @@ async fn test_ws_logging_ws_disconnect_does_not_panic() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let ctx = test_ws_disconnect_context();
 
     plugin.on_ws_disconnect(&ctx).await;
@@ -300,6 +305,8 @@ async fn test_ws_logging_ws_disconnect_with_auth_method() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let mut ctx = test_ws_disconnect_context();
     ctx.auth_method = Some("jwt_auth");
 
@@ -356,7 +363,9 @@ async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let mut ctx = test_ws_disconnect_context();
     ctx.auth_method = Some("jwt_auth");
     ctx.error_class = Some(ErrorClass::ConnectionReset);
@@ -406,6 +415,8 @@ async fn test_ws_logging_stream_disconnect_does_not_panic() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let summary = create_test_stream_transaction_summary();
 
     plugin.on_stream_disconnect(&summary).await;
@@ -425,6 +436,8 @@ async fn test_ws_logging_unreachable_endpoint_does_not_panic() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
 
     plugin.log(&summary).await;
@@ -490,6 +503,8 @@ async fn test_ws_logging_custom_batch_config() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     assert_eq!(plugin.name(), "ws_logging");
 }
 
@@ -506,7 +521,9 @@ async fn test_ws_logging_buffer_accepts_multiple_entries() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     for _ in 0..100 {
         plugin.log(&summary).await;
@@ -527,7 +544,9 @@ async fn test_ws_logging_buffer_full_drops_gracefully() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     // Send more entries than buffer_capacity — excess should be dropped
     for _ in 0..20 {
@@ -608,7 +627,9 @@ async fn test_ws_logging_drain_task_replies_to_server_ping() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     // Trigger the first flush so the connection is established.
     plugin.log(&create_test_transaction_summary()).await;
 
@@ -667,7 +688,9 @@ async fn test_ws_logging_drop_releases_underlying_stream() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
 
     // Give the flush loop a moment to actually deliver the batch so we know
@@ -743,7 +766,9 @@ async fn test_ws_logging_reconnects_after_server_close() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     // First entry establishes connection #1.
     plugin.log(&create_test_transaction_summary()).await;
     // Wait long enough for the server to read the first frame and drop the
@@ -798,7 +823,9 @@ async fn test_ws_logging_native_disconnect_preserves_bytes_and_timestamps() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let mut ctx = test_ws_disconnect_context();
     ctx.frames_client_to_backend = 0;
     ctx.frames_backend_to_client = 0;
@@ -869,7 +896,9 @@ async fn test_ws_logging_connect_timeout_against_silent_tcp_peer() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
     await_within("silent TCP first accept", first_rx)
         .await
@@ -942,7 +971,9 @@ async fn test_ws_logging_write_timeout_against_slow_reader_then_recovers() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     // Build one roughly 14 MiB batch against the capped, non-reading peer. The
     // frame exceeds the hosted Linux sender's kernel buffering, so the send
     // must block long enough for the production write timeout to invalidate
@@ -1026,7 +1057,9 @@ async fn test_ws_logging_application_frame_invalidates_and_reconnects() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     // Establish gen1 (Text ack), then pump until gen2 appears while gen1 stays
     // physically open. Reconnect must be driven by drain-completion notification.
     plugin.log(&create_test_transaction_summary()).await;
@@ -1095,7 +1128,9 @@ async fn test_ws_logging_connect_timeout_against_silent_tls_peer() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
     await_within("silent TLS first accept", first_rx)
         .await
@@ -1213,7 +1248,9 @@ async fn test_ws_logging_binary_and_repeated_ack_generations() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     // Establish gen1 (Binary ack), then pump until gen2 appears.
     plugin.log(&create_test_transaction_summary()).await;
     for _ in 0..6 {
@@ -1272,7 +1309,9 @@ async fn test_ws_logging_diagnostics_redact_endpoint_path_and_query() {
         default_client(),
     )
     .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
     // Poll long enough for admitted flush_interval_ms plus connect_timeout_ms.
     for _ in 0..150 {
