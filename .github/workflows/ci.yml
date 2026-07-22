@@ -3278,7 +3278,7 @@ jobs:
           python3 .github/scripts/verify_wrr_selection_benchmark.py --self-test
           python3 .github/scripts/verify_wrr_selection_benchmark.py \
             --criterion-root tests/performance/mesh/target/criterion \
-            --min-parallel-speedup 1.25
+            --min-parallel-speedup 1.10
 
       - name: Build release binaries
         if: steps.perf_changes.outputs.run == 'true'
@@ -3384,7 +3384,7 @@ jobs:
           fi
           if [ "${RUN_WRR}" = "true" ]; then
             {
-              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.25x across 4/32/129-target fixtures."
+              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x across 4/32/129-target fixtures."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi

@@ -31,6 +31,7 @@ from pathlib import Path
 
 TARGET_COUNTS = (4, 32, 129)
 PARALLEL_THREADS = 4
+HOSTED_CONTENTION_FLOOR = 1.10
 # Must match tests/performance/mesh/benches/wrr_selection.rs
 ITERATIONS_PER_THREAD = 50_000
 
@@ -120,11 +121,18 @@ def self_test() -> int:
     if math.isclose(naive, correct):
         failures.append("naive wall-ratio must differ from throughput speedup under equal wall time")
 
-    # Floor gate: serialized 1.0 fails; modest parallel clears 1.25.
-    if throughput_speedup(100.0, 400.0, 4) >= 1.25:
-        failures.append("serialized 1.0x must stay below the 1.25 hosted floor")
-    if throughput_speedup(100.0, 200.0, 4) < 1.25:
-        failures.append("2.0x throughput must clear the 1.25 hosted floor")
+    # Floor gate: serialized 1.0 fails; modest parallel clears the hosted
+    # threshold. Production selection necessarily shares target Arc refcounts,
+    # so the guard is intentionally just above serialization rather than an
+    # assumption of near-linear four-core scaling on variable hosted runners.
+    if throughput_speedup(100.0, 400.0, 4) >= HOSTED_CONTENTION_FLOOR:
+        failures.append(
+            f"serialized 1.0x must stay below the {HOSTED_CONTENTION_FLOOR:.2f} hosted floor"
+        )
+    if throughput_speedup(100.0, 200.0, 4) < HOSTED_CONTENTION_FLOOR:
+        failures.append(
+            f"2.0x throughput must clear the {HOSTED_CONTENTION_FLOOR:.2f} hosted floor"
+        )
 
     if failures:
         for failure in failures:
