@@ -3604,6 +3604,18 @@ async fn test_request_no_transform_metadata_does_not_skip_context_aware_decode()
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     headers.insert("content-length".to_string(), compressed.len().to_string());
 
+    // Production claims decode ownership in before_proxy before the transform
+    // loop; the context-aware path is owner-gated.
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        ferrum_edge::_test_support::compression_ownership_for_test(&ctx)
+            .0
+            .is_some()
+    );
+
     let transformed = plugin
         .transform_request_body_with_context(
             &mut ctx,
@@ -4313,4 +4325,519 @@ async fn test_trailer_integrity_digests_retired_after_compression_rewrite() {
         "application trailer digests must be retired; terminal status preserved"
     );
     assert_integrity_digests_absent(&headers);
+}
+// ────────────────────── Multi-instance ownership (#2353) ──────────────────────
+
+fn gzip_bytes(plaintext: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(plaintext).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn gunzip_bytes(compressed: &[u8]) -> Vec<u8> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(compressed);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).unwrap();
+    out
+}
+
+async fn run_before_proxy_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    for plugin in plugins {
+        match plugin.before_proxy(ctx, headers).await {
+            PluginResult::Continue => {}
+            reject => return reject,
+        }
+    }
+    PluginResult::Continue
+}
+
+async fn run_after_proxy_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    for plugin in plugins {
+        match plugin
+            .after_proxy(ctx, response_status, response_headers)
+            .await
+        {
+            PluginResult::Continue => {}
+            reject => return reject,
+        }
+    }
+    PluginResult::Continue
+}
+
+/// Mirror the production H1/H2 / native H3 request-body transform loop.
+async fn run_request_body_transform_loop(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+    body: Vec<u8>,
+) -> Vec<u8> {
+    let content_type = headers.get("content-type").map(String::as_str);
+    let mut current = body;
+    for plugin in plugins {
+        if !plugin.modifies_request_body() {
+            continue;
+        }
+        if let Some(transformed) = plugin
+            .transform_request_body_with_context(ctx, &current, content_type, headers)
+            .await
+        {
+            current = transformed;
+        }
+    }
+    current
+}
+
+#[tokio::test]
+async fn test_multi_instance_response_single_coding_layer() {
+    // Two gzip instances must advertise one Content-Encoding and emit one layer.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(json!({
+            "algorithms": ["gzip"],
+            "min_content_length": 10
+        }))),
+        Arc::new(make_plugin(json!({
+            "algorithms": ["gzip"],
+            "min_content_length": 10
+        }))),
+        Arc::new(make_plugin(json!({
+            "algorithms": ["br"],
+            "min_content_length": 10
+        }))),
+    ];
+
+    let original = compressible_json_body();
+    let mut ctx = make_ctx(Some("gzip, br"));
+    let mut req_headers = HashMap::new();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut req_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut status = 200u16;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), original.len().to_string());
+    insert_stale_integrity_digests(&mut resp_headers);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &resp_headers);
+
+    assert!(matches!(
+        run_after_proxy_chain(&plugins, &mut ctx, status, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "first committing instance wins; later configs must not stack encodings"
+    );
+    assert!(
+        ferrum_edge::_test_support::compression_ownership_for_test(&ctx)
+            .1
+            .is_some()
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("compression:algorithm")
+            .map(String::as_str),
+        Some("gzip")
+    );
+
+    let mut body = original.clone();
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut resp_headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    assert!(rewritten);
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(gunzip_bytes(&body), original);
+    assert_integrity_digests_absent(&resp_headers);
+}
+
+#[tokio::test]
+async fn test_multi_instance_response_order_selects_brotli_first() {
+    // Configured order: brotli-only then gzip-only. Accept-Encoding prefers br.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(json!({
+            "algorithms": ["br"],
+            "min_content_length": 10
+        }))),
+        Arc::new(make_plugin(json!({
+            "algorithms": ["gzip"],
+            "min_content_length": 10
+        }))),
+    ];
+
+    let original = compressible_json_body();
+    let mut ctx = make_ctx(Some("br, gzip"));
+    let mut req_headers = HashMap::new();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut req_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut status = 200u16;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), original.len().to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, status, &resp_headers);
+    assert!(matches!(
+        run_after_proxy_chain(&plugins, &mut ctx, status, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("br")
+    );
+
+    let mut body = original.clone();
+    transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut resp_headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    let mut decoded = Vec::new();
+    brotli::BrotliDecompress(&mut &body[..], &mut decoded).unwrap();
+    assert_eq!(decoded, original);
+}
+
+#[tokio::test]
+async fn test_multi_instance_identity_then_later_instance_may_compress() {
+    // First instance cannot produce gzip (algorithms=[br] only) so nominates
+    // identity; second instance with gzip may still commit a single layer.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(json!({
+            "algorithms": ["br"],
+            "min_content_length": 10
+        }))),
+        Arc::new(make_plugin(json!({
+            "algorithms": ["gzip"],
+            "min_content_length": 10
+        }))),
+    ];
+
+    let original = compressible_json_body();
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut req_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut status = 200u16;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), original.len().to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, status, &resp_headers);
+    assert!(matches!(
+        run_after_proxy_chain(&plugins, &mut ctx, status, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "identity-only earlier instance must not block a later compress"
+    );
+
+    let mut body = original.clone();
+    transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut resp_headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(gunzip_bytes(&body), original);
+}
+
+#[tokio::test]
+async fn test_multi_instance_request_decode_exactly_once() {
+    let original = b"{\"hello\":\"multi-instance upload\"}";
+    let compressed = gzip_bytes(original);
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(json!({"decompress_request": true}))),
+        Arc::new(make_plugin(json!({"decompress_request": true}))),
+        Arc::new(make_plugin(json!({"decompress_request": false}))),
+    ];
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "owner strips public encoding exactly once"
+    );
+    assert_eq!(
+        headers
+            .get("x-ferrum-original-content-encoding")
+            .map(String::as_str),
+        Some("gzip"),
+        "siblings must not delete the owner's internal marker"
+    );
+    assert!(
+        ferrum_edge::_test_support::compression_ownership_for_test(&ctx)
+            .0
+            .is_some()
+    );
+
+    let decoded = run_request_body_transform_loop(&plugins, &mut ctx, &headers, compressed).await;
+    assert_eq!(decoded, original);
+}
+
+#[tokio::test]
+async fn test_multi_instance_request_second_instance_claims_when_first_disabled() {
+    let original = b"claimed by second compression instance";
+    let compressed = gzip_bytes(original);
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(json!({"decompress_request": false}))),
+        Arc::new(make_plugin(json!({"decompress_request": true}))),
+    ];
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(!headers.contains_key("content-encoding"));
+    let decoded = run_request_body_transform_loop(&plugins, &mut ctx, &headers, compressed).await;
+    assert_eq!(decoded, original);
+}
+
+#[tokio::test]
+async fn test_multi_instance_malformed_upload_rejects_without_stripping() {
+    let corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00];
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(json!({"decompress_request": true}))),
+        Arc::new(make_plugin(json!({"decompress_request": true}))),
+    ];
+
+    let mut ctx = make_request_ctx_with_body("gzip", &corrupt);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), corrupt.len().to_string());
+
+    match run_before_proxy_chain(&plugins, &mut ctx, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for corrupt upload, got {other:?}"),
+    }
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "failed claim must not strip encoding metadata"
+    );
+    assert!(
+        ferrum_edge::_test_support::compression_ownership_for_test(&ctx)
+            .0
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
+    use ferrum_edge::config::types::{PluginAssociation, PluginConfig, PluginScope};
+    use ferrum_edge::config_delta::ConfigDelta;
+
+    fn gateway_with(
+        ids_and_configs: &[(&str, serde_json::Value, u16)],
+    ) -> ferrum_edge::config::types::GatewayConfig {
+        let mut proxy = create_test_proxy();
+        proxy.id = "p1".to_string();
+        proxy.plugins = ids_and_configs
+            .iter()
+            .map(|(id, _, _)| PluginAssociation {
+                plugin_config_id: (*id).to_string(),
+            })
+            .collect();
+        ferrum_edge::config::types::GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy],
+            consumers: vec![],
+            plugin_configs: ids_and_configs
+                .iter()
+                .map(|(id, config, priority)| PluginConfig {
+                    id: (*id).to_string(),
+                    namespace: ferrum_edge::config::types::default_namespace(),
+                    plugin_name: "compression".to_string(),
+                    config: config.clone(),
+                    scope: PluginScope::Proxy,
+                    proxy_id: Some("p1".to_string()),
+                    enabled: true,
+                    priority_override: Some(*priority),
+                    api_spec_id: None,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .collect(),
+            upstreams: vec![],
+            loaded_at: chrono::Utc::now(),
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    let seed = gateway_with(&[
+        (
+            "comp-a",
+            json!({"algorithms": ["gzip"], "min_content_length": 10, "decompress_request": true}),
+            4050,
+        ),
+        (
+            "comp-b",
+            json!({"algorithms": ["br"], "min_content_length": 10, "decompress_request": true}),
+            4060,
+        ),
+    ]);
+    let cache = ferrum_edge::PluginCache::new(&seed).expect("seed compression cache");
+    let compression: Vec<_> = cache
+        .get_plugins("p1")
+        .iter()
+        .filter(|p| p.name() == "compression")
+        .cloned()
+        .collect();
+    assert_eq!(compression.len(), 2);
+
+    let original = compressible_json_body();
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    assert!(matches!(
+        run_before_proxy_chain(&compression, &mut ctx, &mut req_headers).await,
+        PluginResult::Continue
+    ));
+    let mut status = 200u16;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), original.len().to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, status, &resp_headers);
+    assert!(matches!(
+        run_after_proxy_chain(&compression, &mut ctx, status, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+    let mut body = original.clone();
+    transform_buffered_response_body_with_deadline_full_for_test(
+        &compression,
+        &mut ctx,
+        &mut status,
+        &mut resp_headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(gunzip_bytes(&body), original);
+
+    let rebuilt = gateway_with(&[
+        (
+            "comp-a",
+            json!({"algorithms": ["gzip"], "min_content_length": 10, "decompress_request": true}),
+            4050,
+        ),
+        (
+            "comp-b",
+            json!({"algorithms": ["br"], "min_content_length": 10, "decompress_request": true}),
+            4060,
+        ),
+        (
+            "comp-c",
+            json!({"algorithms": ["gzip", "br"], "min_content_length": 10, "decompress_request": true}),
+            4070,
+        ),
+    ]);
+    let delta = ConfigDelta::compute(&seed, &rebuilt);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&seed, &rebuilt);
+    cache
+        .apply_delta(
+            &rebuilt,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("compression multi-instance reload");
+
+    let after_compression: Vec<_> = cache
+        .get_plugins("p1")
+        .iter()
+        .filter(|p| p.name() == "compression")
+        .cloned()
+        .collect();
+    assert_eq!(after_compression.len(), 3);
+
+    let upload = b"post-reload decode";
+    let compressed = gzip_bytes(upload);
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+    assert!(matches!(
+        run_before_proxy_chain(&after_compression, &mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let decoded =
+        run_request_body_transform_loop(&after_compression, &mut ctx, &headers, compressed).await;
+    assert_eq!(decoded, upload);
+}
+
+#[test]
+fn test_h1_h2_h3_paths_share_multi_instance_body_transform_loops() {
+    // Behavioral coverage above drives the shared helpers. Pin that each
+    // production protocol surface reaches those same sequential loops so
+    // multi-instance ownership cannot diverge per protocol.
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert!(
+        h1_h2.contains("apply_request_body_plugins_with_context(")
+            && h1_h2.contains("transform_request_body_with_context(")
+            && h1_h2.contains("transform_buffered_response_body_with_deadline(")
+            && h1_h2.contains("transform_response_body_with_context("),
+        "H1/H2 must use the shared request/response body transform loops"
+    );
+    assert!(
+        h3.contains("apply_request_body_plugins_with_context(")
+            && h3.contains("transform_buffered_response_body_with_deadline("),
+        "native H3 must use the shared body transform helpers"
+    );
+    assert!(
+        h3_cross.contains("apply_request_body_plugins_with_context("),
+        "H3 cross-protocol must use the shared request-body transform helper"
+    );
 }

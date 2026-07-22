@@ -1876,6 +1876,15 @@ pub struct RequestContext {
     /// origin response; public plugin metadata is not trusted for that security
     /// decision.
     gateway_response_compression_algorithm: Option<&'static str>,
+    /// Process-local compression instance that owns the one-shot request-body
+    /// decode. Kept out of public metadata so sibling/custom plugins cannot
+    /// spoof ownership, and stored as a scalar to avoid a per-request String
+    /// allocation on the body-transform hot path.
+    compression_request_decode_owner: Option<u64>,
+    /// Process-local compression instance that owns the one-shot response-body
+    /// encode. This remains private for the same ownership and allocation
+    /// reasons as `compression_request_decode_owner`.
+    compression_response_encode_owner: Option<u64>,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -2250,6 +2259,8 @@ impl RequestContext {
             ai_prompt_compressor_wire_stats_started: false,
             ai_prompt_compressor_marker_reject_status: None,
             gateway_response_compression_algorithm: None,
+            compression_request_decode_owner: None,
+            compression_response_encode_owner: None,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -2479,6 +2490,46 @@ impl RequestContext {
 
     pub(crate) fn gateway_response_compression_algorithm(&self) -> Option<&'static str> {
         self.gateway_response_compression_algorithm
+    }
+
+    pub(crate) fn has_compression_request_decode_owner(&self) -> bool {
+        self.compression_request_decode_owner.is_some()
+    }
+
+    pub(crate) fn claim_compression_request_decode(&mut self, owner: u64) -> bool {
+        if self.compression_request_decode_owner.is_some() {
+            return false;
+        }
+        self.compression_request_decode_owner = Some(owner);
+        true
+    }
+
+    pub(crate) fn owns_compression_request_decode(&self, owner: u64) -> bool {
+        self.compression_request_decode_owner == Some(owner)
+    }
+
+    pub(crate) fn has_compression_response_encode_owner(&self) -> bool {
+        self.compression_response_encode_owner.is_some()
+    }
+
+    pub(crate) fn claim_compression_response_encode(&mut self, owner: u64) -> bool {
+        if self.compression_response_encode_owner.is_some() {
+            return false;
+        }
+        self.compression_response_encode_owner = Some(owner);
+        true
+    }
+
+    pub(crate) fn owns_compression_response_encode(&self, owner: u64) -> bool {
+        self.compression_response_encode_owner == Some(owner)
+    }
+
+    #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
+    pub(crate) fn compression_ownership_for_test(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.compression_request_decode_owner,
+            self.compression_response_encode_owner,
+        )
     }
 
     pub(crate) fn mark_response_cache_hit(&mut self) {
@@ -2905,6 +2956,8 @@ impl RequestContext {
                 &mut self.ai_prompt_compressor_marker_reject_status,
             ),
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
+            compression_request_decode_owner: self.compression_request_decode_owner,
+            compression_response_encode_owner: self.compression_response_encode_owner,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
