@@ -7804,6 +7804,10 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(description.contains("WebSocket"));
     assert!(description.contains("frame stream"));
     assert!(
+        description.contains("Native gRPC") && description.contains("unsupported"),
+        "ResponseMockConfig must document native gRPC exclusion: {description}"
+    );
+    assert!(
         description.contains("204")
             && description.contains("205")
             && description.contains("304")
@@ -7935,13 +7939,15 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
     assert!(guide.contains("Status / body wire semantics"));
     assert!(guide.contains("informational statuses"));
+    assert!(guide.contains("Native gRPC exclusion"));
+    assert!(guide.contains("native gRPC unsupported"));
 
     let matrix = include_str!("../../docs/plugin_execution_order.md");
     assert!(
         matrix.contains(
-            "| `response_mock` | ✓ | ✓ | ✓ | | | Short-circuits HTTP/gRPC and WebSocket upgrade handshakes"
+            "| `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes"
         ),
-        "protocol matrix must mark WebSocket support for response_mock"
+        "protocol matrix must mark HTTP+WebSocket support and exclude native gRPC for response_mock"
     );
 }
 

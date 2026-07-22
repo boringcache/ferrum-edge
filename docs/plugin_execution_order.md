@@ -913,7 +913,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
-| `response_mock` | ✓ | ✓ | ✓ | | | Short-circuits HTTP/gRPC and WebSocket upgrade handshakes with a synthetic response; does not mock upgraded frame streams |
+| `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported (Reject cannot carry framed unary payloads) |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
 | `load_testing` | ✓ | | | | | On-demand load testing via header trigger with multi-node fan-out |
 | `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |

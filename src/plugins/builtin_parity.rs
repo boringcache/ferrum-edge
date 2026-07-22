@@ -463,8 +463,8 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         classification: BuiltinPluginClassification::Public,
         priority: 3030,
         active_phases: "before_proxy",
-        matrix_protocols: HTTP_FAMILY_PROTOCOLS,
-        protocol_rationale: "Short-circuits HTTP/gRPC and WebSocket upgrade handshakes with a synthetic response; does not mock upgraded frame streams",
+        matrix_protocols: &[ProxyProtocol::Http, ProxyProtocol::WebSocket],
+        protocol_rationale: "Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported (Reject cannot carry framed unary payloads)",
     },
     BuiltinPluginParityMeta {
         name: "grpc_deadline",

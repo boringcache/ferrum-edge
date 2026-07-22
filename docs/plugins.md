@@ -2797,7 +2797,7 @@ config:
 
 Returns configurable mock responses without proxying to the backend. Supports matching by HTTP method and path pattern (exact or regex), with configurable status codes, headers, body, and optional latency simulation. Useful for early API testing before backends are ready, contract testing, and local development.
 
-**Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family (HTTP, gRPC, WebSocket handshake)
+**Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP and WebSocket handshake (native gRPC unsupported)
 
 Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599` or `101` (synthetic WebSocket handshake only). Other informational statuses (`100`, `102`–`199`) are rejected — a mock cannot emit a 1xx as a body-bearing final response. A configured `101` that matches an ordinary HTTP request fails closed with `500`; only a request already classified as a WebSocket handshake may receive it. Runtime construction and request-flavor enforcement are the authoritative final boundaries.
 
@@ -2809,7 +2809,7 @@ Configuration must be a top-level object. Unknown top-level and per-rule keys ar
 | `204` / `205` / `304` (any method) | Omitted | Stripped, even when `body` is configured non-empty |
 | Other final statuses on GET/POST/… | Configured `body` | Unchanged unless a later hook sets it |
 
-gRPC and WebSocket frame streams are unchanged: gRPC rejects still normalize to trailers-only errors, and a matching WebSocket rule still short-circuits only the HTTP handshake.
+**Native gRPC exclusion:** `response_mock` is not selected for native gRPC (`application/grpc`) requests on H2 or H3. Gateway reject normalization turns `PluginResult::Reject` into trailers-only gRPC errors and discards the configured body, so advertising gRPC would turn a default `status_code: 200` mock into `grpc-status: 13` (`INTERNAL`) without a payload. A matching rule still short-circuits only the HTTP WebSocket handshake; it does not mock upgraded frame streams. Use dedicated gRPC plugins (or a real backend) for native gRPC contract testing.
 
 **Path matching by listen-path scope:**
 

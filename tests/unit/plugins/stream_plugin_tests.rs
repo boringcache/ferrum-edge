@@ -1091,3 +1091,32 @@ fn test_graphql_http_and_websocket_protocol_coverage() {
         "graphql must not claim on_ws_frame inspection"
     );
 }
+
+#[test]
+fn test_response_mock_http_and_websocket_excludes_native_grpc() {
+    // Issue #2442: response_mock must not advertise native gRPC. Reject
+    // normalization turns configured bodies into trailers-only INTERNAL errors.
+    let plugin = make_plugin(
+        "response_mock",
+        json!({"rules": [{"path": "/test", "body": "mock"}]}),
+    );
+    assert!(plugin.is_some(), "Failed to create plugin: response_mock");
+    let plugin = plugin.unwrap();
+    assert_eq!(
+        plugin.supported_protocols(),
+        &[ProxyProtocol::Http, ProxyProtocol::WebSocket],
+        "response_mock should support HTTP and WebSocket handshakes"
+    );
+    assert!(
+        !plugin.supported_protocols().contains(&ProxyProtocol::Grpc),
+        "response_mock must NOT support native gRPC"
+    );
+    assert!(
+        !plugin.requires_websocket_framing(),
+        "response_mock must not require WebSocket framing/frame inspection"
+    );
+    assert!(
+        !plugin.requires_ws_frame_hooks(),
+        "response_mock must not claim on_ws_frame inspection"
+    );
+}
