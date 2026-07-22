@@ -2646,8 +2646,14 @@ async fn scoring_isolates_two_instances_when_combined_sum_crosses_threshold() {
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=alpha-beta".into());
 
-    assert!(matches!(alpha.authorize(&mut ctx).await, PluginResult::Continue));
-    assert!(matches!(beta.authorize(&mut ctx).await, PluginResult::Continue));
+    assert!(matches!(
+        alpha.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        beta.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
     assert_eq!(
         ctx.metadata
             .get("waf.instances.waf-alpha.score")
@@ -2722,7 +2728,10 @@ async fn scoring_instances_use_own_weights_and_thresholds() {
     let mut ctx = ctx("GET", "/search");
     ctx.set_raw_query_string("q=needle".into());
 
-    assert!(matches!(soft.authorize(&mut ctx).await, PluginResult::Continue));
+    assert!(matches!(
+        soft.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
     assert_eq!(
         ctx.metadata
             .get("waf.instances.waf-soft.score")
@@ -2743,9 +2752,7 @@ async fn scoring_instances_use_own_weights_and_thresholds() {
         Some("score")
     );
     assert_eq!(
-        ctx.metadata
-            .get("waf.scoring_instance")
-            .map(String::as_str),
+        ctx.metadata.get("waf.scoring_instance").map(String::as_str),
         Some("waf-hard")
     );
     assert_eq!(
@@ -2818,11 +2825,11 @@ async fn scoring_preserves_same_instance_accumulation_across_lifecycle_phases() 
         .insert("content-type".into(), "application/json".into());
     ctx.set_raw_query_string("q=qhit".into());
 
-    assert!(matches!(plugin.authorize(&mut ctx).await, PluginResult::Continue));
-    assert_eq!(
-        ctx.metadata.get("waf.score").map(String::as_str),
-        Some("2")
-    );
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("2"));
 
     let req_headers = ctx.headers.clone();
     assert!(matches!(
@@ -2831,17 +2838,16 @@ async fn scoring_preserves_same_instance_accumulation_across_lifecycle_phases() 
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(
-        ctx.metadata.get("waf.score").map(String::as_str),
-        Some("5")
-    );
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
 
     let mut response_headers = HashMap::from([
         ("content-type".into(), "application/json".into()),
         ("x-trace".into(), "rhhit".into()),
     ]);
     assert!(matches!(
-        plugin.after_proxy(&mut ctx, 200, &mut response_headers).await,
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
         PluginResult::Continue
     ));
     assert_eq!(

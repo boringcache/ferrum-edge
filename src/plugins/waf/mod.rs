@@ -364,8 +364,7 @@ impl Waf {
             Some(id) => Arc::from(sanitize_waf_instance_identity(id)),
             None => Arc::from(format!("standalone-{instance_id}")),
         };
-        let score_metadata_key: Arc<str> =
-            Arc::from(format!("waf.instances.{identity}.score"));
+        let score_metadata_key: Arc<str> = Arc::from(format!("waf.instances.{identity}.score"));
         Ok(Self {
             config,
             compiled,
@@ -664,11 +663,8 @@ impl Waf {
         // this accumulator.
         let total_score = self.config.scoring.as_ref().map(|scoring| {
             ctx.ensure_waf_metadata_initialized();
-            let total = ctx.accumulate_waf_instance_score(
-                self.instance_id,
-                &self.identity,
-                phase_score,
-            );
+            let total =
+                ctx.accumulate_waf_instance_score(self.instance_id, &self.identity, phase_score);
             (total, scoring.block_threshold)
         });
         let score_block = enforce_actions
