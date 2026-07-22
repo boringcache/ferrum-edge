@@ -30,8 +30,15 @@
 //!   injection. Provider SSE is already OpenAI-shaped, so it streams through
 //!   unchanged (zero-overhead — no inspector).
 //! - `anthropic`: OpenAI Chat Completions request is translated to the Anthropic
-//!   Messages API streaming request; Anthropic SSE events are normalized back to
-//!   OpenAI `chat.completion.chunk` SSE.
+//!   Messages API streaming request (including assistant `tool_calls` and
+//!   matching `role: "tool"` results); Anthropic SSE events are normalized back
+//!   to OpenAI `chat.completion.chunk` SSE. Normalization requires Anthropic
+//!   `message_stop` (or an explicit provider `error`) before emitting a
+//!   success-shaped terminal sequence; premature EOF / malformed events fail
+//!   closed with an upstream-error SSE frame. Requests that will be normalized
+//!   strip `Accept-Encoding`, and residual `Content-Encoding` is decoded (gzip /
+//!   br) or rejected before SSE parsing so response headers describe identity
+//!   bytes.
 //! - `google_gemini`: config is accepted and validated but construction fails
 //!   with a clear "not yet implemented" error until the second phase lands.
 //!
@@ -46,10 +53,12 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use tracing::debug;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -108,9 +117,20 @@ const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
 const META_FALLBACK_ATTEMPTS: &str = "ai_stream_router.fallback_attempts";
+/// Provider `Content-Encoding` that must be decoded before Anthropic SSE
+/// normalization. Stamped in `after_proxy` before representation headers are
+/// repaired so both streaming and buffered normalizers see the same coding.
+const META_PROVIDER_ENCODING: &str = "ai_stream_router.provider_content_encoding";
 /// Shared marker (same contract as `ai_prompt_shield` / `ai_semantic_firewall`)
 /// telling response plugins the request asked for a streaming response.
 const META_STREAMING_SHARED: &str = "ai_request_streaming";
+
+/// Bound decoding of residual provider content codings before SSE normalization.
+const NORMALIZE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
+    max_decoded_bytes: 8 * 1024 * 1024,
+    max_cumulative_bytes: 16 * 1024 * 1024,
+    max_codings: 4,
+};
 
 // ---------------------------------------------------------------------------
 // Provider types
@@ -767,11 +787,203 @@ fn flatten_content_text(content: &Value) -> String {
     out
 }
 
+#[derive(Clone)]
+struct ParsedToolCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn parse_openai_tool_calls(
+    message: &Value,
+    message_index: usize,
+) -> Result<Vec<ParsedToolCall>, String> {
+    let Some(tool_calls_value) = message.get("tool_calls") else {
+        return Ok(Vec::new());
+    };
+    let tool_calls = tool_calls_value.as_array().ok_or_else(|| {
+        format!("messages[{message_index}].tool_calls must be an array")
+    })?;
+    if tool_calls.is_empty() {
+        return Err(format!(
+            "messages[{message_index}].tool_calls must not be empty"
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(tool_calls.len());
+    for (tool_index, call) in tool_calls.iter().enumerate() {
+        let call_object = call.as_object().ok_or_else(|| {
+            format!("messages[{message_index}].tool_calls[{tool_index}] must be an object")
+        })?;
+        if call_object.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(format!(
+                "messages[{message_index}].tool_calls[{tool_index}] must have type 'function'"
+            ));
+        }
+        let id = call_object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!("messages[{message_index}].tool_calls[{tool_index}] missing id")
+            })?;
+        let function = call_object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                format!("messages[{message_index}].tool_calls[{tool_index}] missing function")
+            })?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_name(value))
+            .ok_or_else(|| {
+                format!(
+                    "messages[{message_index}].tool_calls[{tool_index}] has invalid function name"
+                )
+            })?;
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "messages[{message_index}].tool_calls[{tool_index}] arguments must be a JSON string"
+                )
+            })?;
+        let arguments: Value = serde_json::from_str(arguments).map_err(|error| {
+            format!(
+                "messages[{message_index}].tool_calls[{tool_index}] arguments are not valid JSON: {error}"
+            )
+        })?;
+        if !arguments.is_object() {
+            return Err(format!(
+                "messages[{message_index}].tool_calls[{tool_index}] arguments must encode a JSON object"
+            ));
+        }
+        parsed.push(ParsedToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments,
+        });
+    }
+    Ok(parsed)
+}
+
+fn tool_result_text(content: &Value) -> Result<String, String> {
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_string());
+    }
+    if content.is_null() {
+        return Ok(String::new());
+    }
+    let parts = content
+        .as_array()
+        .ok_or("tool message content must be a string or text-parts array")?;
+    let mut text = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            return Err(format!(
+                "tool message content[{index}] must be a text part"
+            ));
+        }
+        text.push_str(part.get("text").and_then(Value::as_str).ok_or_else(|| {
+            format!("tool message content[{index}] missing text")
+        })?);
+    }
+    Ok(text)
+}
+
+fn anthropic_text_content_blocks(text: &str) -> Vec<Value> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({ "type": "text", "text": text })]
+    }
+}
+
+/// Validate OpenAI message history that will be translated to Anthropic.
+/// Fail closed on malformed tool calls/results rather than silently dropping them.
+fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
+    let mut tool_call_ids = HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        let message_object = message
+            .as_object()
+            .ok_or_else(|| format!("messages[{index}] must be an object"))?;
+        let role = message_object
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("messages[{index}] missing string role"))?;
+        if !matches!(
+            role,
+            "system" | "developer" | "user" | "assistant" | "tool"
+        ) {
+            return Err(format!(
+                "messages[{index}] has unsupported role '{role}'"
+            ));
+        }
+
+        let has_tool_calls = message_object.get("tool_calls").is_some();
+        match message_object.get("content") {
+            Some(Value::String(_)) | Some(Value::Array(_)) => {}
+            Some(Value::Null) | None if role == "assistant" && has_tool_calls => {}
+            Some(Value::Null) | None if role == "tool" => {}
+            _ if matches!(role, "system" | "developer" | "user" | "assistant") => {
+                return Err(format!(
+                    "messages[{index}] content must be a string or content-parts array"
+                ));
+            }
+            _ => {}
+        }
+
+        if role == "assistant" {
+            for call in parse_openai_tool_calls(message, index)? {
+                if !tool_call_ids.insert(call.id) {
+                    return Err(format!("messages[{index}] repeats a tool-call id"));
+                }
+            }
+        } else if has_tool_calls {
+            return Err(format!(
+                "messages[{index}] tool_calls are only valid on assistant messages"
+            ));
+        }
+
+        if role == "tool" {
+            let tool_call_id = message_object
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("messages[{index}] tool message missing tool_call_id"))?;
+            if !tool_call_ids.contains(tool_call_id) {
+                return Err(format!(
+                    "messages[{index}] tool_call_id has no preceding assistant tool call"
+                ));
+            }
+            tool_result_text(message_object.get("content").unwrap_or(&Value::Null)).map_err(
+                |error| format!("messages[{index}] {error}"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Translate an OpenAI Chat Completions streaming request into an Anthropic
-/// Messages API streaming request body.
-fn translate_to_anthropic(openai_body: &Value, model: &str) -> Vec<u8> {
-    let empty: Vec<Value> = Vec::new();
-    let messages = openai_body["messages"].as_array().unwrap_or(&empty);
+/// Messages API streaming request body. Preserves assistant `tool_calls` and
+/// matching `role: "tool"` results; rejects malformed history instead of
+/// dropping it.
+fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, String> {
+    let messages = openai_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "request missing 'messages' array".to_string())?;
+    validate_openai_tool_history(messages)?;
 
     let system_parts: Vec<String> = messages
         .iter()
@@ -780,20 +992,79 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Vec<u8> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let translated_messages: Vec<Value> = messages
-        .iter()
-        .filter(|m| {
-            let role = m["role"].as_str().unwrap_or("");
-            role == "user" || role == "assistant"
-        })
-        .map(|m| {
-            let role = m["role"].as_str().unwrap_or("user");
-            json!({
-                "role": role,
-                "content": flatten_content_text(&m["content"]),
-            })
-        })
-        .collect();
+    let mut translated_messages = Vec::with_capacity(messages.len());
+    let mut message_index = 0;
+    while message_index < messages.len() {
+        let message = &messages[message_index];
+        let role = message["role"].as_str().unwrap_or("");
+        if is_system_role(role) {
+            message_index += 1;
+            continue;
+        }
+        if role == "tool" {
+            let mut tool_results = Vec::new();
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("tool")
+            {
+                let tool_message = &messages[message_index];
+                let tool_use_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!("messages[{message_index}] tool message missing tool_call_id")
+                })?;
+                let mut block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": tool_result_text(&tool_message["content"])
+                        .map_err(|error| format!("messages[{message_index}] {error}"))?,
+                });
+                if tool_message.get("is_error").and_then(Value::as_bool) == Some(true) {
+                    block["is_error"] = Value::Bool(true);
+                }
+                tool_results.push(block);
+                message_index += 1;
+            }
+            translated_messages.push(json!({
+                "role": "user",
+                "content": tool_results
+            }));
+            continue;
+        }
+        if role != "user" && role != "assistant" {
+            return Err(format!(
+                "messages[{message_index}] has unsupported role '{role}'"
+            ));
+        }
+
+        let text = flatten_content_text(&message["content"]);
+        let tool_calls = if role == "assistant" {
+            parse_openai_tool_calls(message, message_index)?
+        } else {
+            Vec::new()
+        };
+        let content = if tool_calls.is_empty() {
+            if text.is_empty() && role == "assistant" {
+                return Err(format!(
+                    "messages[{message_index}] has no Anthropic-representable content"
+                ));
+            }
+            Value::String(text)
+        } else {
+            let mut content = anthropic_text_content_blocks(&text);
+            for call in tool_calls {
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }));
+            }
+            Value::Array(content)
+        };
+        translated_messages.push(json!({
+            "role": role,
+            "content": content,
+        }));
+        message_index += 1;
+    }
 
     let max_tokens = openai_body["max_tokens"]
         .as_u64()
@@ -826,7 +1097,8 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Vec<u8> {
         body["tool_choice"] = choice;
     }
 
-    serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())
+    serde_json::to_vec(&body)
+        .map_err(|error| format!("failed to serialize Anthropic body: {error}"))
 }
 
 /// Anthropic `stop_sequences` is always an array of strings.
@@ -1048,6 +1320,20 @@ impl Plugin for AiStreamRouter {
             );
         }
 
+        // Fail closed on Anthropic tool-history shapes that cannot be
+        // represented safely before the route override commits.
+        if provider.provider_type == ProviderType::Anthropic
+            && let Err(message) = translate_to_anthropic(&openai_body, &model)
+        {
+            return openai_error_response(
+                400,
+                &format!("Invalid request for Anthropic translation: {message}"),
+                "invalid_request_error",
+                Some("messages"),
+                Some("invalid_messages"),
+            );
+        }
+
         let mut backend_path = if provider.path_has_model_placeholder {
             provider.path.replace("{model}", &model)
         } else {
@@ -1132,6 +1418,14 @@ impl Plugin for AiStreamRouter {
 
         // --- Metadata (observability + downstream-hook coordination). ---
         let normalizes = provider.normalizes_response(self.normalize_response_stream);
+        // Normalization parses line-delimited SSE. Strip client content-coding
+        // negotiation so the provider does not return gzip/br octets that the
+        // normalizer would misread as plaintext events. Residual encodings are
+        // still handled fail-safe in `after_proxy` / the normalizer.
+        if normalizes {
+            remove_header_ci(headers, "accept-encoding");
+        }
+
         ctx.metadata
             .insert(META_ENABLED.to_string(), "true".to_string());
         ctx.metadata
@@ -1191,7 +1485,10 @@ impl Plugin for AiStreamRouter {
         match provider.provider_type {
             ProviderType::Anthropic => {
                 let openai_body: Value = serde_json::from_slice(body).ok()?;
-                Some(translate_to_anthropic(&openai_body, &model))
+                // Validation already ran in `before_proxy`; a late parse failure
+                // leaves the body untouched so the request cannot silently reach
+                // Anthropic with an OpenAI-shaped payload.
+                translate_to_anthropic(&openai_body, &model).ok()
             }
             ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
                 if self.inject_usage_options {
@@ -1238,7 +1535,11 @@ impl Plugin for AiStreamRouter {
             .get(META_MODEL)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        Some(Box::new(AnthropicSseNormalizer::new(model)))
+        let encoding = ctx
+            .metadata
+            .get(META_PROVIDER_ENCODING)
+            .cloned();
+        Some(wrap_anthropic_normalizer(model, encoding.as_deref()))
     }
 
     async fn normalize_response_body_with_context(
@@ -1247,7 +1548,7 @@ impl Plugin for AiStreamRouter {
         response_status: u16,
         body: &[u8],
         content_type: Option<&str>,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         if !self.response_stream_hooks {
             return None;
@@ -1268,7 +1569,57 @@ impl Plugin for AiStreamRouter {
             .get(META_MODEL)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        normalize_anthropic_sse_buffered(model, body).await
+        let encoding = ctx
+            .metadata
+            .get(META_PROVIDER_ENCODING)
+            .map(String::as_str)
+            .or_else(|| content_encoding_value(response_headers));
+        let plaintext = match prepare_sse_bytes_for_normalization(body, encoding) {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                return Some(upstream_sse_error_body(&message));
+            }
+        };
+        normalize_anthropic_sse_buffered(model, &plaintext).await
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.enabled
+            || ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true")
+        {
+            return PluginResult::Continue;
+        }
+        if !(200..300).contains(&response_status) {
+            return PluginResult::Continue;
+        }
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        if !content_type.is_some_and(is_event_stream_content_type) {
+            return PluginResult::Continue;
+        }
+
+        match classify_provider_content_encoding(response_headers) {
+            ProviderContentEncoding::Identity => PluginResult::Continue,
+            ProviderContentEncoding::Supported(coding) => {
+                ctx.metadata
+                    .insert(META_PROVIDER_ENCODING.to_string(), coding.to_string());
+                repair_normalized_representation_headers(response_headers);
+                PluginResult::Continue
+            }
+            ProviderContentEncoding::Unsupported(message) => openai_error_response(
+                502,
+                &format!(
+                    "Upstream Anthropic SSE used an unsupported Content-Encoding: {message}"
+                ),
+                "upstream_error",
+                None,
+                Some("unsupported_content_encoding"),
+            ),
+        }
     }
 }
 
@@ -1299,6 +1650,140 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
         let lk = k.to_ascii_lowercase();
         !CREDENTIAL_HEADERS.contains(&lk.as_str())
     });
+}
+
+fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case(name));
+}
+
+fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+enum ProviderContentEncoding {
+    Identity,
+    Supported(&'static str),
+    Unsupported(String),
+}
+
+fn classify_provider_content_encoding(
+    headers: &HashMap<String, String>,
+) -> ProviderContentEncoding {
+    let Some(raw) = content_encoding_value(headers) else {
+        return ProviderContentEncoding::Identity;
+    };
+    let mut codings = Vec::new();
+    for part in raw.split(',') {
+        let coding = part.trim();
+        if coding.is_empty() {
+            return ProviderContentEncoding::Unsupported(
+                "content-encoding contains an empty coding".to_string(),
+            );
+        }
+        if coding.contains(';') {
+            return ProviderContentEncoding::Unsupported(format!(
+                "content-encoding coding '{coding}' contains unsupported parameters"
+            ));
+        }
+        let lower = coding.to_ascii_lowercase();
+        match lower.as_str() {
+            "identity" => {}
+            "gzip" | "br" => codings.push(lower),
+            other => {
+                return ProviderContentEncoding::Unsupported(format!(
+                    "unsupported content-encoding '{other}'"
+                ));
+            }
+        }
+    }
+    if codings.is_empty() {
+        ProviderContentEncoding::Identity
+    } else if codings.len() == 1 {
+        match codings[0].as_str() {
+            "gzip" => ProviderContentEncoding::Supported("gzip"),
+            "br" => ProviderContentEncoding::Supported("br"),
+            other => ProviderContentEncoding::Unsupported(format!(
+                "unsupported content-encoding '{other}'"
+            )),
+        }
+    } else {
+        // Multi-layer residual encodings are unusual for SSE and are rejected
+        // rather than partially decoded into a mislabeled stream.
+        ProviderContentEncoding::Unsupported(
+            "multi-layer content-encoding is not supported for Anthropic SSE normalization"
+                .to_string(),
+        )
+    }
+}
+
+fn repair_normalized_representation_headers(headers: &mut HashMap<String, String>) {
+    remove_header_ci(headers, "content-encoding");
+    remove_header_ci(headers, "content-length");
+    super::invalidate_content_bound_response_headers(headers);
+    scrub_accept_encoding_from_vary(headers);
+}
+
+fn scrub_accept_encoding_from_vary(headers: &mut HashMap<String, String>) {
+    let Some((name, value)) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+    else {
+        return;
+    };
+    if value.trim() == "*" {
+        return;
+    }
+    let mut kept = Vec::new();
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() || token.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        kept.push(token.to_string());
+    }
+    if kept.is_empty() {
+        headers.remove(&name);
+    } else {
+        headers.insert(name, kept.join(", "));
+    }
+}
+
+fn prepare_sse_bytes_for_normalization<'a>(
+    body: &'a [u8],
+    encoding: Option<&str>,
+) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+    decode_content_encoding(encoding, body, NORMALIZE_DECODE_LIMITS)
+}
+
+fn upstream_sse_error_body(message: &str) -> Vec<u8> {
+    let err = json!({
+        "error": {
+            "message": message,
+            "type": "upstream_error",
+        }
+    });
+    format!("data: {err}\n\ndata: [DONE]\n\n").into_bytes()
+}
+
+fn wrap_anthropic_normalizer(
+    model: String,
+    encoding: Option<&str>,
+) -> Box<dyn ResponseStreamInspector> {
+    let inner = AnthropicSseNormalizer::new(model);
+    match encoding {
+        Some("gzip") => Box::new(ContentDecodingNormalizer::gzip(inner)),
+        Some("br") => Box::new(ContentDecodingNormalizer::brotli(inner)),
+        Some(other) => Box::new(ImmediateUpstreamErrorNormalizer::new(format!(
+            "unsupported content-encoding '{other}' for Anthropic SSE normalization"
+        ))),
+        None => Box::new(inner),
+    }
 }
 
 fn decoded_query_names(query: &str) -> HashSet<String> {
@@ -1390,9 +1875,25 @@ fn is_valid_url_model_component(model: &str) -> bool {
 /// terminate the stream.
 const MAX_SSE_EVENT_CARRY_BYTES: usize = 1024 * 1024;
 
+/// How a stream reached its terminal OpenAI sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamTerminal {
+    /// Anthropic `message_stop` — successful protocol completion.
+    MessageStop,
+    /// Explicit Anthropic `error` event (or oversized-event fail-safe).
+    ProviderError,
+    /// Clean EOF / malformed framing before a successful terminal state.
+    UpstreamFailure,
+}
+
 /// Stateful, per-response inspector that transcodes Anthropic Messages API SSE
 /// events into OpenAI `chat.completion.chunk` SSE. Robust to chunk splits: raw
 /// bytes accumulate in `carry` and only complete SSE events are transcoded.
+///
+/// Successful termination requires Anthropic `message_stop` (or an explicit
+/// provider `error`). Clean EOF before that state, and malformed complete event
+/// data that prevents protocol tracking, surface an upstream error rather than
+/// synthesizing a success-only `[DONE]`.
 struct AnthropicSseNormalizer {
     carry: Vec<u8>,
     model: String,
@@ -1400,6 +1901,7 @@ struct AnthropicSseNormalizer {
     created: i64,
     role_emitted: bool,
     done_emitted: bool,
+    terminal: Option<StreamTerminal>,
     /// Anthropic content-block index → OpenAI `tool_calls` index.
     tool_indices: HashMap<u64, u32>,
     next_tool_index: u32,
@@ -1416,6 +1918,7 @@ impl AnthropicSseNormalizer {
             created: Utc::now().timestamp(),
             role_emitted: false,
             done_emitted: false,
+            terminal: None,
             tool_indices: HashMap::new(),
             next_tool_index: 0,
             prompt_tokens: None,
@@ -1469,8 +1972,19 @@ impl AnthropicSseNormalizer {
         Some(format!("data: {payload}\n\n"))
     }
 
+    fn emit_upstream_error(&mut self, message: &str, out: &mut String) {
+        let err = json!({
+            "error": {
+                "message": message,
+                "type": "upstream_error",
+            }
+        });
+        out.push_str(&format!("data: {err}\n\n"));
+    }
+
     /// Transcode one Anthropic event JSON into zero or more OpenAI SSE lines.
-    fn transcode_event(&mut self, event: &Value, out: &mut String) {
+    /// Returns whether the upstream inspector driver should terminate now.
+    fn transcode_event(&mut self, event: &Value, out: &mut String) -> bool {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 let message = &event["message"];
@@ -1487,6 +2001,7 @@ impl AnthropicSseNormalizer {
                     self.role_emitted = true;
                     out.push_str(&self.chunk_line(json!({ "role": "assistant" }), None));
                 }
+                false
             }
             Some("content_block_start") => {
                 let index = event["index"].as_u64().unwrap_or(0);
@@ -1509,6 +2024,7 @@ impl AnthropicSseNormalizer {
                         None,
                     ));
                 }
+                false
             }
             Some("content_block_delta") => {
                 let index = event["index"].as_u64().unwrap_or(0);
@@ -1538,6 +2054,7 @@ impl AnthropicSseNormalizer {
                     // no OpenAI-visible content in this MVP.
                     _ => {}
                 }
+                false
             }
             Some("message_delta") => {
                 if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
@@ -1545,25 +2062,25 @@ impl AnthropicSseNormalizer {
                 }
                 let finish = map_stop_reason(event["delta"]["stop_reason"].as_str());
                 out.push_str(&self.chunk_line(json!({}), Some(finish)));
+                false
             }
             Some("message_stop") => {
-                self.finish(out);
+                self.finish(StreamTerminal::MessageStop, out);
+                true
             }
             Some("error") => {
                 let message = event["error"]["message"]
                     .as_str()
                     .unwrap_or("upstream provider stream error");
-                let err = json!({
-                    "error": {
-                        "message": message,
-                        "type": "upstream_error",
-                    }
-                });
-                out.push_str(&format!("data: {err}\n\n"));
-                self.finish(out);
+                self.emit_upstream_error(message, out);
+                self.finish(StreamTerminal::ProviderError, out);
+                true
             }
-            // ping, content_block_stop, and unknown events produce no output.
-            _ => {}
+            // ping, content_block_stop, and unknown events produce no output
+            // (forward-compatible). Events with a present `type` that is not a
+            // known Anthropic frame are ignored; malformed JSON is handled by
+            // the caller as an upstream failure.
+            _ => false,
         }
     }
 
@@ -1574,29 +2091,58 @@ impl AnthropicSseNormalizer {
         }
     }
 
-    /// Emit the final usage chunk (when available) and the OpenAI `[DONE]`
+    /// Emit the final usage chunk (when successful) and the OpenAI `[DONE]`
     /// sentinel exactly once.
-    fn finish(&mut self, out: &mut String) {
+    fn finish(&mut self, terminal: StreamTerminal, out: &mut String) {
         if self.done_emitted {
             return;
         }
         self.done_emitted = true;
-        if let Some(usage) = self.usage_line() {
+        self.terminal = Some(terminal);
+        if terminal == StreamTerminal::MessageStop
+            && let Some(usage) = self.usage_line()
+        {
             out.push_str(&usage);
         }
         out.push_str("data: [DONE]\n\n");
     }
 
-    /// Drain every complete SSE event currently buffered, transcoding each.
-    fn drain(&mut self, out: &mut String) {
-        while let Some(end) = next_event_boundary(&self.carry) {
-            let raw: Vec<u8> = self.carry.drain(..end).collect();
-            if let Some(data) = extract_sse_data(&raw)
-                && let Ok(event) = serde_json::from_str::<Value>(&data)
-            {
-                self.transcode_event(&event, out);
+    fn ingest_complete_event(&mut self, raw: &[u8], out: &mut String) -> bool {
+        match extract_sse_data_result(raw) {
+            Ok(None) => false,
+            Ok(Some(data)) => match serde_json::from_str::<Value>(&data) {
+                Ok(event) => self.transcode_event(&event, out),
+                Err(_) => {
+                    self.emit_upstream_error(
+                        "upstream provider sent a malformed SSE JSON event; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    true
+                }
+            },
+            Err(_) => {
+                self.emit_upstream_error(
+                    "upstream provider sent a malformed SSE event; stream terminated",
+                    out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                true
             }
         }
+    }
+
+    /// Drain every complete SSE event currently buffered, transcoding each.
+    /// Returns whether the stream should terminate immediately.
+    fn drain(&mut self, out: &mut String) -> bool {
+        while let Some(end) = next_event_boundary(&self.carry) {
+            let raw: Vec<u8> = self.carry.drain(..end).collect();
+            if self.ingest_complete_event(&raw, out) {
+                self.carry.clear();
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1608,11 +2154,13 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
 
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         if self.done_emitted {
-            return ResponseStreamAction::Forward(Bytes::new());
+            return ResponseStreamAction::Terminate(None);
         }
         self.carry.extend_from_slice(chunk);
         let mut out = String::new();
-        self.drain(&mut out);
+        if self.drain(&mut out) {
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
+        }
         // Per-event bound: after draining every complete event, whatever is
         // left is one partial event. If it exceeds the cap the provider is
         // streaming a pathological/never-terminated event — fail safe by
@@ -1621,14 +2169,11 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
         if self.carry.len() > MAX_SSE_EVENT_CARRY_BYTES {
             self.carry.clear();
             self.carry.shrink_to_fit();
-            let err = json!({
-                "error": {
-                    "message": "upstream provider sent an oversized SSE event; stream terminated",
-                    "type": "upstream_error",
-                }
-            });
-            out.push_str(&format!("data: {err}\n\n"));
-            self.finish(&mut out);
+            self.emit_upstream_error(
+                "upstream provider sent an oversized SSE event; stream terminated",
+                &mut out,
+            );
+            self.finish(StreamTerminal::ProviderError, &mut out);
             return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
         }
         ResponseStreamAction::Forward(Bytes::from(out.into_bytes()))
@@ -1636,23 +2181,215 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         if self.done_emitted {
-            return ResponseStreamAction::Forward(Bytes::new());
+            return ResponseStreamAction::Terminate(None);
         }
         let mut out = String::new();
-        self.drain(&mut out);
+        if self.drain(&mut out) {
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
+        }
         // Transcode any trailing event that lacked a final blank-line boundary.
         if !self.carry.is_empty() {
             let raw = std::mem::take(&mut self.carry);
-            if let Some(data) = extract_sse_data(&raw)
-                && let Ok(event) = serde_json::from_str::<Value>(&data)
-            {
-                self.transcode_event(&event, &mut out);
+            if self.ingest_complete_event(&raw, &mut out) {
+                return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
+            }
+            // Trailing bytes that are not a complete SSE event (no data: line /
+            // incomplete framing) are a protocol failure, not success.
+            if !raw.iter().all(u8::is_ascii_whitespace) {
+                self.emit_upstream_error(
+                    "upstream provider ended the Anthropic SSE stream with malformed trailing data",
+                    &mut out,
+                );
+                self.finish(StreamTerminal::UpstreamFailure, &mut out);
+                return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
             }
         }
-        // Guarantee the client sees a clean OpenAI stream termination even if the
-        // provider ended without a `message_stop`.
-        self.finish(&mut out);
-        ResponseStreamAction::Forward(Bytes::from(out.into_bytes()))
+        // Clean EOF without `message_stop` is premature truncation — never
+        // synthesize a success-only `[DONE]`.
+        self.emit_upstream_error(
+            "upstream provider closed the Anthropic SSE stream before message_stop",
+            &mut out,
+        );
+        self.finish(StreamTerminal::UpstreamFailure, &mut out);
+        ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
+    }
+}
+
+/// Decode residual provider content coding, then feed plaintext SSE into the
+/// Anthropic→OpenAI normalizer.
+struct ContentDecodingNormalizer {
+    decoder: StreamContentDecoder,
+    inner: AnthropicSseNormalizer,
+}
+
+enum StreamContentDecoder {
+    Gzip(flate2::write::GzDecoder<Vec<u8>>),
+    Brotli(brotli::DecompressorWriter<Vec<u8>>),
+}
+
+impl ContentDecodingNormalizer {
+    fn gzip(inner: AnthropicSseNormalizer) -> Self {
+        Self {
+            decoder: StreamContentDecoder::Gzip(flate2::write::GzDecoder::new(Vec::new())),
+            inner,
+        }
+    }
+
+    fn brotli(inner: AnthropicSseNormalizer) -> Self {
+        Self {
+            decoder: StreamContentDecoder::Brotli(brotli::DecompressorWriter::new(Vec::new(), 4096)),
+            inner,
+        }
+    }
+
+    fn take_decoded(&mut self) -> Result<Vec<u8>, String> {
+        match &mut self.decoder {
+            StreamContentDecoder::Gzip(decoder) => {
+                let buf = decoder.get_mut();
+                let out = std::mem::take(buf);
+                Ok(out)
+            }
+            StreamContentDecoder::Brotli(decoder) => {
+                let buf = decoder.get_mut();
+                let out = std::mem::take(buf);
+                Ok(out)
+            }
+        }
+    }
+
+    fn write_compressed(&mut self, chunk: &[u8]) -> Result<(), String> {
+        match &mut self.decoder {
+            StreamContentDecoder::Gzip(decoder) => decoder
+                .write_all(chunk)
+                .map_err(|error| format!("gzip decompression failed: {error}")),
+            StreamContentDecoder::Brotli(decoder) => decoder
+                .write_all(chunk)
+                .map_err(|error| format!("brotli decompression failed: {error}")),
+        }
+    }
+
+    fn finish_decoder(&mut self) -> Result<Vec<u8>, String> {
+        match std::mem::replace(
+            &mut self.decoder,
+            // Consumed below; placeholder keeps the enum inhabited.
+            StreamContentDecoder::Gzip(flate2::write::GzDecoder::new(Vec::new())),
+        ) {
+            StreamContentDecoder::Gzip(decoder) => decoder
+                .finish()
+                .map_err(|error| format!("gzip decompression failed: {error}")),
+            StreamContentDecoder::Brotli(decoder) => decoder
+                .into_inner()
+                .map_err(|_| "brotli decompression failed".to_string()),
+        }
+    }
+
+    async fn fail_decode(&mut self, message: String) -> ResponseStreamAction {
+        let mut out = String::new();
+        self.inner.emit_upstream_error(&message, &mut out);
+        self.inner
+            .finish(StreamTerminal::UpstreamFailure, &mut out);
+        ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for ContentDecodingNormalizer {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Normalize
+    }
+
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if self.inner.done_emitted {
+            return ResponseStreamAction::Terminate(None);
+        }
+        if let Err(message) = self.write_compressed(chunk) {
+            return self.fail_decode(message).await;
+        }
+        let decoded = match self.take_decoded() {
+            Ok(bytes) => bytes,
+            Err(message) => return self.fail_decode(message).await,
+        };
+        if decoded.is_empty() {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        self.inner.on_chunk(&decoded).await
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        if self.inner.done_emitted {
+            return ResponseStreamAction::Terminate(None);
+        }
+        let decoded = match self.finish_decoder() {
+            Ok(bytes) => bytes,
+            Err(message) => return self.fail_decode(message).await,
+        };
+        let mut out = Vec::new();
+        if !decoded.is_empty() {
+            match self.inner.on_chunk(&decoded).await {
+                ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
+                ResponseStreamAction::Terminate(bytes) => {
+                    if let Some(bytes) = bytes {
+                        out.extend_from_slice(&bytes);
+                    }
+                    return ResponseStreamAction::Terminate(Some(Bytes::from(out)));
+                }
+            }
+        }
+        match self.inner.on_end().await {
+            ResponseStreamAction::Forward(bytes) => {
+                out.extend_from_slice(&bytes);
+                ResponseStreamAction::Terminate(Some(Bytes::from(out)))
+            }
+            ResponseStreamAction::Terminate(Some(bytes)) => {
+                out.extend_from_slice(&bytes);
+                ResponseStreamAction::Terminate(Some(Bytes::from(out)))
+            }
+            ResponseStreamAction::Terminate(None) => {
+                if out.is_empty() {
+                    ResponseStreamAction::Terminate(None)
+                } else {
+                    ResponseStreamAction::Terminate(Some(Bytes::from(out)))
+                }
+            }
+        }
+    }
+}
+
+/// Fail closed immediately when residual encoding cannot be decoded.
+struct ImmediateUpstreamErrorNormalizer {
+    message: String,
+    emitted: bool,
+}
+
+impl ImmediateUpstreamErrorNormalizer {
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            emitted: false,
+        }
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Normalize
+    }
+
+    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        if self.emitted {
+            return ResponseStreamAction::Terminate(None);
+        }
+        self.emitted = true;
+        ResponseStreamAction::Terminate(Some(Bytes::from(upstream_sse_error_body(&self.message))))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        if self.emitted {
+            return ResponseStreamAction::Terminate(None);
+        }
+        self.emitted = true;
+        ResponseStreamAction::Terminate(Some(Bytes::from(upstream_sse_error_body(&self.message))))
     }
 }
 
@@ -1710,10 +2447,11 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Extract and concatenate the `data:` payload lines of one raw SSE event.
-/// Returns `None` when the event carries no `data:` line (e.g. a comment or a
-/// lone `event:` line).
-fn extract_sse_data(raw: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(raw).ok()?;
+///
+/// Returns `Ok(None)` when the event carries no `data:` line (e.g. a comment or
+/// a lone `event:` line). Returns `Err` for invalid UTF-8 framing.
+fn extract_sse_data_result(raw: &[u8]) -> Result<Option<String>, ()> {
+    let text = std::str::from_utf8(raw).map_err(|_| ())?;
     let mut data = String::new();
     let mut found = false;
     for line in text.lines() {
@@ -1726,5 +2464,5 @@ fn extract_sse_data(raw: &[u8]) -> Option<String> {
             data.push_str(rest);
         }
     }
-    if found { Some(data) } else { None }
+    Ok(if found { Some(data) } else { None })
 }
