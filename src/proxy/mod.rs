@@ -36349,7 +36349,7 @@ mod tests {
         );
     }
 
-    /// body_validator must release oversized non-matching responses on the
+    /// body_validator must release large non-matching responses on the
     /// reqwest (HTTP/1.1 / H2) path while keeping matching JSON buffered for
     /// validation. Mirrors the WAF wiring guard for #2323.
     #[tokio::test]
@@ -36401,13 +36401,14 @@ mod tests {
         }
 
         let server = wiremock::MockServer::start().await;
-        // Larger than a 1 MiB response limit so a buffered path would 502.
-        let oversized = vec![0u8; 1_500_000];
+        // Larger than the eager-buffer cutoff but below the global response
+        // ceiling, so the body type proves whether refinement selected stream.
+        let large_body = vec![0u8; 1_500_000];
         wiremock::Mock::given(wiremock::matchers::path("/binary"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
                     .insert_header("content-type", "image/png")
-                    .set_body_bytes(oversized.clone()),
+                    .set_body_bytes(large_body.clone()),
             )
             .mount(&server)
             .await;
@@ -36429,7 +36430,7 @@ mod tests {
             .await;
 
         let mut state = make_test_proxy_state(GatewayConfig::default());
-        state.max_response_body_size_bytes = 1_048_576;
+        state.max_response_body_size_bytes = 2_000_000;
         let mut proxy = test_proxy(ResponseBodyMode::Stream);
         proxy.backend_scheme = Some(BackendScheme::Http);
         proxy.backend_host = server.address().ip().to_string();
@@ -36451,7 +36452,7 @@ mod tests {
         .await;
         assert!(
             matches!(binary, ResponseBody::Streaming { .. }),
-            "non-matching image/png larger than the response limit must stream, not 502"
+            "non-matching image/png above the eager cutoff must stream"
         );
 
         let json_body = dispatch_body(

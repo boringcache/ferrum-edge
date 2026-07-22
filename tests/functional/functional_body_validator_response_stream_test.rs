@@ -1,7 +1,7 @@
 //! Protocol coverage for body_validator post-header response release (#2323).
 //!
-//! A response-only validator must not keep oversized non-matching media types
-//! on the buffered path (which would 502 against `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`).
+//! A response-only validator must not keep large non-matching media types on
+//! the buffered path solely because matching JSON/XML requires validation.
 //! Matching JSON stays buffered and validated. Coverage spans HTTP/1.1, H2, and H3.
 
 use crate::common::{TestGateway, TestGatewayBuilder};
@@ -22,12 +22,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-const LIMIT_BYTES: &str = "1048576";
-const OVERSIZED_LEN: usize = 1_500_000;
+const GLOBAL_LIMIT_BYTES: &str = "2000000";
+const LARGE_BODY_LEN: usize = 1_500_000;
 
 #[ignore]
 #[tokio::test]
-async fn body_validator_streams_oversized_png_http1_and_buffers_matching_json() {
+async fn body_validator_streams_large_png_http1_and_buffers_matching_json() {
     let (backend_port, backend_hits, backend_task) = spawn_typed_backend().await;
     let mut gateway = body_validator_gateway_builder(backend_port)
         .spawn()
@@ -52,9 +52,9 @@ async fn body_validator_streams_oversized_png_http1_and_buffers_matching_json() 
     assert_eq!(
         png.status(),
         StatusCode::OK,
-        "irrelevant oversized PNG must stream"
+        "irrelevant large PNG must stream"
     );
-    assert_eq!(png.bytes().await.expect("png body").len(), OVERSIZED_LEN);
+    assert_eq!(png.bytes().await.expect("png body").len(), LARGE_BODY_LEN);
 
     let json = client
         .get(gateway.proxy_url("/item.json"))
@@ -90,7 +90,7 @@ async fn body_validator_streams_oversized_png_http1_and_buffers_matching_json() 
 
 #[ignore]
 #[tokio::test]
-async fn body_validator_streams_oversized_png_http2() {
+async fn body_validator_streams_large_png_http2() {
     let (backend_port, _backend_hits, backend_task) = spawn_typed_backend().await;
     let mut gateway = body_validator_gateway_builder(backend_port)
         .spawn()
@@ -129,7 +129,7 @@ async fn body_validator_streams_oversized_png_http2() {
         .await
         .expect("h2 body")
         .to_bytes();
-    assert_eq!(body.len(), OVERSIZED_LEN, "H2 must stream oversized PNG");
+    assert_eq!(body.len(), LARGE_BODY_LEN, "H2 must stream large PNG");
 
     drop(sender);
     conn_task.abort();
@@ -137,9 +137,8 @@ async fn body_validator_streams_oversized_png_http2() {
     backend_task.abort();
 }
 
-#[ignore]
 #[tokio::test]
-async fn body_validator_streams_oversized_png_http3() {
+async fn body_validator_streams_large_png_http3() {
     let (backend_port, _backend_hits, backend_task) = spawn_typed_backend().await;
     let https_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -167,8 +166,8 @@ async fn body_validator_streams_oversized_png_http3() {
         .get_with_options(&url, GetOptions::default())
         .await
         .expect("h3 get");
-    assert_eq!(resp.status.as_u16(), 200, "H3 must stream oversized PNG");
-    assert_eq!(resp.body_bytes.len(), OVERSIZED_LEN);
+    assert_eq!(resp.status.as_u16(), 200, "H3 must stream large PNG");
+    assert_eq!(resp.body_bytes.len(), LARGE_BODY_LEN);
 
     gateway.shutdown();
     backend_task.abort();
@@ -178,7 +177,10 @@ fn body_validator_gateway_builder(backend_port: u16) -> TestGatewayBuilder {
     TestGateway::builder()
         .mode_file(body_validator_config(backend_port))
         .log_level("warn")
-        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", LIMIT_BYTES)
+        .env(
+            "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
+            GLOBAL_LIMIT_BYTES,
+        )
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
 }
 
@@ -228,7 +230,7 @@ async fn spawn_typed_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
             let req = String::from_utf8_lossy(&buf);
             let (status_line, content_type, body): (&str, &str, Vec<u8>) =
                 if req.contains("GET /download.png") {
-                    ("200 OK", "image/png", vec![0x89u8; OVERSIZED_LEN])
+                    ("200 OK", "image/png", vec![0x89u8; LARGE_BODY_LEN])
                 } else if req.contains("GET /missing.json") {
                     (
                         "200 OK",
