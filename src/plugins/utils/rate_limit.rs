@@ -3157,10 +3157,10 @@ mod tests {
                     let key = format!("w{worker}:{i}");
                     let _ = limiter.check(key, &op);
                     i = i.wrapping_add(1);
-                    if i % 17 == 0 {
+                    if i.is_multiple_of(17) {
                         limiter.prune_stale_at(Instant::now() + Duration::from_secs(30));
                     }
-                    if i % 23 == 0 {
+                    if i.is_multiple_of(23) {
                         limiter.enforce_capacity(max_entries, Instant::now());
                     }
                 }
