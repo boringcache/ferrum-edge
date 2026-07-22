@@ -3740,6 +3740,250 @@ fn test_apply_delta_preserves_proxy_group_instance_for_unchanged_group_config() 
 }
 
 #[test]
+fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
+    let alerts = make_plugin_config("g-alerts", "proxy_alerts", PluginScope::Global, None, true);
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![alerts.clone()],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let global_before = cache.get_plugins("p1");
+    let alerts_plugin = global_before
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("global proxy_alerts");
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("p1");
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("p2");
+    assert!(alerts_plugin.has_proxy_lifecycle_state_for_test("p1"));
+    assert!(alerts_plugin.has_proxy_lifecycle_state_for_test("p2"));
+
+    let config2 = make_config(
+        vec![make_proxy("p2", "/web", vec![])],
+        vec![alerts],
+    );
+    let mut proxy_ids = HashSet::new();
+    // p1 removed; p2 unchanged so the global instance is preserved.
+    cache
+        .apply_delta(&config2, &proxy_ids, &["p1".to_string()], false)
+        .unwrap();
+
+    let global_after = cache.get_plugins("p2");
+    assert_eq!(
+        plugin_ptr_by_name(&global_before, "proxy_alerts"),
+        plugin_ptr_by_name(&global_after, "proxy_alerts"),
+        "unchanged global proxy_alerts instance must be preserved"
+    );
+    let alerts_after = global_after
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("preserved global proxy_alerts");
+    assert!(
+        !alerts_after.has_proxy_lifecycle_state_for_test("p1"),
+        "removed proxy must retire cooldown/recovery ownership"
+    );
+    assert!(alerts_after.has_proxy_lifecycle_state_for_test("p2"));
+
+    // ID reuse after removal must not inherit prior lifecycle state.
+    let config3 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![make_plugin_config(
+            "g-alerts",
+            "proxy_alerts",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    proxy_ids.insert("p1".to_string());
+    cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
+    let recreated = cache
+        .get_plugins("p1")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("global proxy_alerts after recreate")
+        .clone();
+    assert_eq!(
+        plugin_ptr_by_name(&global_after, "proxy_alerts"),
+        Arc::as_ptr(&recreated) as *const () as usize,
+        "re-adding a proxy must keep the preserved global instance"
+    );
+    assert!(
+        !recreated.has_proxy_lifecycle_state_for_test("p1"),
+        "recreated proxy ID must start without inherited lifecycle state"
+    );
+}
+
+#[test]
+fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
+    let group_alerts = make_plugin_config(
+        "group-alerts",
+        "proxy_alerts",
+        PluginScope::ProxyGroup,
+        None,
+        true,
+    );
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group-alerts"]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts.clone()],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let p1_before = cache.get_plugins("p1");
+    let group_ptr_before = plugin_ptr_by_name(&p1_before, "proxy_alerts");
+    let alerts_plugin = p1_before
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("group proxy_alerts");
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("p1");
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("p2");
+
+    // Rename p1 → p1b while keeping the group config unchanged so the shared
+    // instance is preserved; only membership identities change.
+    let config2 = make_config(
+        vec![
+            make_proxy("p1b", "/api", vec!["group-alerts"]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts],
+    );
+    let mut proxy_ids = HashSet::new();
+    proxy_ids.insert("p1b".to_string());
+    cache
+        .apply_delta(&config2, &proxy_ids, &["p1".to_string()], false)
+        .unwrap();
+
+    let p2_after = cache.get_plugins("p2");
+    assert_eq!(
+        plugin_ptr_by_name(&p2_after, "proxy_alerts"),
+        group_ptr_before,
+        "unchanged proxy-group proxy_alerts instance must be preserved"
+    );
+    let alerts_after = p2_after
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("preserved group proxy_alerts");
+    assert!(
+        !alerts_after.has_proxy_lifecycle_state_for_test("p1"),
+        "renamed-away proxy ID must leave the preserved group instance"
+    );
+    assert!(alerts_after.has_proxy_lifecycle_state_for_test("p2"));
+    assert!(
+        !alerts_after.has_proxy_lifecycle_state_for_test("p1b"),
+        "renamed-in proxy ID starts without inherited lifecycle state"
+    );
+}
+
+#[test]
+fn test_apply_delta_prunes_proxy_group_proxy_alerts_when_member_leaves_group() {
+    let group_alerts = make_plugin_config(
+        "group-alerts",
+        "proxy_alerts",
+        PluginScope::ProxyGroup,
+        None,
+        true,
+    );
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group-alerts"]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts.clone()],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let shared = cache
+        .get_plugins("p1")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("group proxy_alerts")
+        .clone();
+    shared.seed_proxy_lifecycle_state_for_test("p1");
+    shared.seed_proxy_lifecycle_state_for_test("p2");
+    let shared_ptr = Arc::as_ptr(&shared) as *const () as usize;
+
+    // p1 remains in the gateway but leaves the group; p2 keeps the shared
+    // instance and must lose only p1's lifecycle rows.
+    let config2 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts],
+    );
+    let mut proxy_ids = HashSet::new();
+    proxy_ids.insert("p1".to_string());
+    cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
+
+    let p2_after = cache.get_plugins("p2");
+    assert_eq!(plugin_ptr_by_name(&p2_after, "proxy_alerts"), shared_ptr);
+    let alerts_after = p2_after
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("preserved group proxy_alerts");
+    assert!(!alerts_after.has_proxy_lifecycle_state_for_test("p1"));
+    assert!(alerts_after.has_proxy_lifecycle_state_for_test("p2"));
+}
+
+#[test]
+fn test_apply_delta_rebuild_globals_resets_proxy_alerts_lifecycle() {
+    let alerts = make_plugin_config("g-alerts", "proxy_alerts", PluginScope::Global, None, true);
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![alerts],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let before = cache.get_plugins("p1");
+    let alerts_before = before
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("global proxy_alerts");
+    alerts_before.seed_proxy_lifecycle_state_for_test("p1");
+    assert!(alerts_before.has_proxy_lifecycle_state_for_test("p1"));
+    let ptr_before = plugin_ptr_by_name(&before, "proxy_alerts");
+
+    let mut rebuilt = make_plugin_config("g-alerts", "proxy_alerts", PluginScope::Global, None, true);
+    // Touch the JSON so the global plugin config is considered changed.
+    rebuilt.config = json!({
+        "channels": {
+            "ops": { "type": "slack", "webhook_url": "https://hooks.slack.com/y" }
+        },
+        "rules": [{
+            "name": "r", "type": "error_rate",
+            "status_codes": [500], "threshold_percent": 5.0,
+            "channels": ["ops"]
+        }]
+    });
+    let config2 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![rebuilt]);
+    let mut proxy_ids = HashSet::new();
+    proxy_ids.insert("p1".to_string());
+    cache
+        .apply_delta(&config2, &proxy_ids, &[], true)
+        .unwrap();
+
+    let after = cache.get_plugins("p1");
+    assert_ne!(
+        plugin_ptr_by_name(&after, "proxy_alerts"),
+        ptr_before,
+        "global plugin rebuild must construct a fresh proxy_alerts instance"
+    );
+    let alerts_after = after
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("rebuilt global proxy_alerts");
+    assert!(
+        !alerts_after.has_proxy_lifecycle_state_for_test("p1"),
+        "rebuilt instance must not carry prior lifecycle state"
+    );
+}
+
+#[test]
 fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed() {
     let config1 = make_config(
         vec![make_proxy("p1", "/api", vec!["group1"])],

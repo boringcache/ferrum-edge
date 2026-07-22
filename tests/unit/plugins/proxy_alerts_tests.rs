@@ -8,6 +8,8 @@
 //! - Cooldown gate per `(rule_id, proxy_id, channel_id)`.
 //! - Recovery state machine transitions (Healthy → Active → Recovering →
 //!   Healthy / Recovering → Active flap).
+//! - Lifecycle retention: prune removed proxies, expire cooldown rows, drop
+//!   terminal Healthy recovery state, and clear inherited ID-reuse state.
 //! - Plugin construction wires everything end-to-end.
 
 use chrono::{TimeZone, Utc};
@@ -1505,6 +1507,78 @@ fn recovery_disabled_when_recovery_ms_is_zero() {
     assert_eq!(gate.current_state(1, "p"), Some(RuleState::Healthy));
     let next_breach = gate.observe(1, "p", true, 0, 1_000_000);
     assert_eq!(next_breach, LifecycleOutcome::Trigger);
+}
+
+// ----------------------------------------- Lifecycle retain / bounded history
+
+#[test]
+fn cooldown_retain_proxies_drops_removed_proxy_rows() {
+    let gate = CooldownGate::new();
+    assert!(gate.try_acquire(1, "gone", 10, 60_000, 100));
+    assert!(gate.try_acquire(1, "keep", 10, 60_000, 100));
+    gate.retain_proxies(&std::collections::HashSet::from(["keep"]));
+    assert!(!gate.contains_proxy("gone"));
+    assert!(gate.contains_proxy("keep"));
+    // Removed proxy must not inherit the old cooldown after ID reuse.
+    assert!(gate.try_acquire(1, "gone", 10, 60_000, 100 + 1));
+}
+
+#[test]
+fn recovery_retain_proxies_drops_removed_proxy_rows() {
+    let gate = RecoveryGate::new();
+    gate.observe(1, "gone", true, 60_000, 1_000);
+    gate.observe(1, "keep", true, 60_000, 1_000);
+    gate.retain_proxies(&std::collections::HashSet::from(["keep"]));
+    assert_eq!(gate.current_state(1, "gone"), None);
+    assert!(matches!(
+        gate.current_state(1, "keep"),
+        Some(RuleState::Active { .. })
+    ));
+    assert_eq!(
+        gate.observe(1, "gone", true, 60_000, 2_000),
+        LifecycleOutcome::Trigger,
+        "recreated proxy ID must start Healthy rather than inherit Active"
+    );
+}
+
+#[test]
+fn cooldown_evict_stale_drops_expired_timestamps() {
+    let gate = CooldownGate::new();
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
+    gate.evict_stale(100 + 60_000, 60_000);
+    assert!(!gate.contains_proxy("p1"));
+}
+
+#[test]
+fn recovery_evict_stale_drops_only_healthy_rows() {
+    let gate = RecoveryGate::new();
+    gate.observe(1, "active", true, 60_000, 1_000);
+    gate.observe(1, "resolved", true, 60_000, 1_000);
+    gate.observe(1, "resolved", false, 0, 2_000); // Active → Healthy when recovery_ms=0
+    assert_eq!(
+        gate.current_state(1, "resolved"),
+        Some(RuleState::Healthy)
+    );
+    gate.evict_stale(3_000, 60_000);
+    assert_eq!(gate.current_state(1, "resolved"), None);
+    assert!(matches!(
+        gate.current_state(1, "active"),
+        Some(RuleState::Active { .. })
+    ));
+}
+
+#[test]
+fn proxy_alerts_retain_proxies_clears_all_lifecycle_stores() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.seed_lifecycle_state_for_test("gone");
+    plugin.seed_lifecycle_state_for_test("keep");
+    assert!(plugin.has_lifecycle_state_for_test("gone"));
+    assert!(plugin.has_lifecycle_state_for_test("keep"));
+
+    plugin.retain_proxies(&std::collections::HashSet::from(["keep"]));
+
+    assert!(!plugin.has_lifecycle_state_for_test("gone"));
+    assert!(plugin.has_lifecycle_state_for_test("keep"));
 }
 
 #[test]

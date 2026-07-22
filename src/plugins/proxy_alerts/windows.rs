@@ -25,10 +25,9 @@
 //! Both are acceptable for alerting where threshold breaches sustain across
 //! many buckets and individual samples are not load-bearing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use dashmap::DashMap;
 
@@ -438,34 +437,25 @@ impl WindowStore {
                 .retain(|_, state| state.last_record_ms() >= cutoff);
         }
     }
-}
 
-impl WindowStore {
-    /// Spawn a background task that periodically evicts stale entries when
-    /// called from inside a Tokio runtime.
+    /// Drop window rows for proxies absent from `active_proxy_ids`.
     ///
-    /// Validation paths can instantiate plugins outside a runtime, so this is
-    /// deliberately best-effort. Runtime plugin instances keep the returned
-    /// handle and abort it on drop.
-    pub fn start_eviction_task(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return None;
-        };
-        let store = Arc::clone(self);
-        Some(handle.spawn(async move {
-            // Eviction cadence chosen to be coarse — staleness is determined
-            // by per-rule window length, and inactive proxies just take a
-            // bit longer to free up.
-            let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                ticker.tick().await;
-                let now_ms = current_epoch_ms();
-                // Keep entries that recorded within the last hour OR the
-                // largest window (whichever is greater). 1h is a generous
-                // floor that covers all reasonable rule windows.
-                store.evict_stale(now_ms, 3_600_000);
-            }
-        }))
+    /// Cold-path only: paired with cooldown/recovery retention so a delete
+    /// and recreate of the same proxy ID cannot inherit prior samples.
+    pub fn retain_proxies(&self, active_proxy_ids: &HashSet<&str>) {
+        for outer in self.by_rule.iter() {
+            outer
+                .value()
+                .retain(|proxy_id, _| active_proxy_ids.contains(proxy_id.as_str()));
+        }
+    }
+
+    /// Whether any rule window currently holds a row for `proxy_id`.
+    #[allow(dead_code)] // Used by external test crate and admin/debug helpers.
+    pub fn contains_proxy(&self, proxy_id: &str) -> bool {
+        self.by_rule
+            .iter()
+            .any(|entry| entry.value().contains_key(proxy_id))
     }
 }
 

@@ -23,8 +23,13 @@
 //! - **Quiet hours**: optional UTC time-of-day windows where `Trigger`
 //!   alerts are suppressed (without consuming the cooldown gate). `Resolve`
 //!   events still fire so operators don't miss recovery during off hours.
+//! - **Lifecycle retention**: preserved global/proxy-group instances retire
+//!   per-proxy cooldown, recovery, and window rows when proxies leave the
+//!   instance's active set (incremental cache commit, off the request path).
+//!   Expired cooldown timestamps and terminal Healthy recovery rows are also
+//!   swept by the background eviction task.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -54,6 +59,10 @@ use rules::{Rule, RuleObservation, SampleInput};
 use windows::WindowStore;
 #[cfg(test)]
 use windows::current_epoch_ms;
+
+/// Floor for background lifecycle retention, matching the historical window
+/// sweep cadence documented for inactive proxies.
+const LIFECYCLE_KEEP_FLOOR_MS: u64 = 3_600_000;
 
 pub struct ProxyAlerts {
     rules: Arc<Vec<Rule>>,
@@ -92,7 +101,15 @@ impl ProxyAlerts {
             .map(|r| (r.id(), r.window_spec()))
             .collect();
         let windows = Arc::new(WindowStore::new(rule_specs));
-        let eviction_handle = windows.start_eviction_task();
+        let cooldowns = Arc::new(CooldownGate::new());
+        let recovery = Arc::new(RecoveryGate::new());
+        let lifecycle_keep_ms = lifecycle_keep_ms(parsed.rules.as_ref());
+        let eviction_handle = start_lifecycle_eviction_task(
+            Arc::clone(&windows),
+            Arc::clone(&cooldowns),
+            Arc::clone(&recovery),
+            lifecycle_keep_ms,
+        );
 
         let dispatch_sem = Arc::new(Semaphore::new(parsed.max_concurrent_dispatches));
 
@@ -100,14 +117,40 @@ impl ProxyAlerts {
             rules: parsed.rules,
             channel_by_id: parsed.channel_by_id,
             windows,
-            cooldowns: Arc::new(CooldownGate::new()),
-            recovery: Arc::new(RecoveryGate::new()),
+            cooldowns,
+            recovery,
             dispatch_sem,
             http_client,
             enabled: AtomicBool::new(parsed.enabled),
             quiet_hours: Arc::new(parsed.quiet_hours),
             eviction_handle,
         })
+    }
+
+    /// Retire per-proxy window/cooldown/recovery ownership for proxies that
+    /// are no longer in this instance's active set.
+    ///
+    /// Invoked from the plugin-cache commit path for preserved global and
+    /// proxy-group instances. Must not run on the request hot path.
+    pub fn retain_proxies(&self, active_proxy_ids: &HashSet<&str>) {
+        self.windows.retain_proxies(active_proxy_ids);
+        self.cooldowns.retain_proxies(active_proxy_ids);
+        self.recovery.retain_proxies(active_proxy_ids);
+    }
+
+    /// Seed cooldown + Active recovery state for deterministic external tests.
+    #[doc(hidden)]
+    pub fn seed_lifecycle_state_for_test(&self, proxy_id: &str) {
+        let _ = self.cooldowns.try_acquire(0, proxy_id, 0, 60_000, 1);
+        let _ = self.recovery.observe(0, proxy_id, true, 5_000, 1);
+    }
+
+    /// Whether this instance currently holds lifecycle state for `proxy_id`.
+    #[doc(hidden)]
+    pub fn has_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
+        self.cooldowns.contains_proxy(proxy_id)
+            || self.recovery.contains_proxy(proxy_id)
+            || self.windows.contains_proxy(proxy_id)
     }
 
     fn handle(&self, sample: SampleInput<'_>) {
@@ -262,6 +305,40 @@ impl Drop for ProxyAlerts {
     }
 }
 
+fn lifecycle_keep_ms(rules: &[Rule]) -> u64 {
+    let mut keep = LIFECYCLE_KEEP_FLOOR_MS;
+    for rule in rules {
+        let common = rule.common();
+        keep = keep.max(common.cooldown_ms);
+        keep = keep.max(u64::from(common.window_seconds) * 1000);
+        if let Some(recovery) = common.recovery.as_ref() {
+            keep = keep.max(recovery.resolved_window_ms);
+        }
+    }
+    keep
+}
+
+fn start_lifecycle_eviction_task(
+    windows: Arc<WindowStore>,
+    cooldowns: Arc<CooldownGate>,
+    recovery: Arc<RecoveryGate>,
+    keep_ms: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return None;
+    };
+    Some(handle.spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            let now_ms = windows::current_epoch_ms();
+            windows.evict_stale(now_ms, keep_ms);
+            cooldowns.evict_stale(now_ms, keep_ms);
+            recovery.evict_stale(now_ms, keep_ms);
+        }
+    }))
+}
+
 fn lifecycle_event_action(outcome: LifecycleOutcome) -> Option<EventAction> {
     match outcome {
         LifecycleOutcome::Trigger | LifecycleOutcome::StillActive => Some(EventAction::Trigger),
@@ -293,6 +370,20 @@ impl Plugin for ProxyAlerts {
 
     fn priority(&self) -> u16 {
         super::priority::PROXY_ALERTS
+    }
+
+    fn retain_active_proxy_state(&self, active_proxy_ids: &HashSet<&str>) {
+        self.retain_proxies(active_proxy_ids);
+    }
+
+    #[doc(hidden)]
+    fn seed_proxy_lifecycle_state_for_test(&self, proxy_id: &str) {
+        self.seed_lifecycle_state_for_test(proxy_id);
+    }
+
+    #[doc(hidden)]
+    fn has_proxy_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
+        self.has_lifecycle_state_for_test(proxy_id)
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {

@@ -7749,6 +7749,10 @@ impl ProxyState {
                 }
             };
             PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
+            PluginCache::retain_active_proxy_lifecycle_for_inner(
+                &published.plugin_cache,
+                &published.config,
+            );
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -7937,6 +7941,10 @@ impl ProxyState {
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
+        PluginCache::retain_active_proxy_lifecycle_for_inner(
+            &published.plugin_cache,
+            &published.config,
+        );
 
         // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
         // there is no resource delta to drive pruning, DNS warmup, listener
@@ -8395,6 +8403,10 @@ impl ProxyState {
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
+        PluginCache::retain_active_proxy_lifecycle_for_inner(
+            &published.plugin_cache,
+            &published.config,
+        );
 
         let Some(delta) = applied_delta else {
             debug!("Incremental config: accepted MMDB-only generation republished");

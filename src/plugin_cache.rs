@@ -396,6 +396,15 @@ impl Plugin for PriorityOverridePlugin {
     ) -> Option<(&str, Arc<crate::config::types::CountryMmdbSnapshot>)> {
         self.inner.country_mmdb_retained_load()
     }
+    fn retain_active_proxy_state(&self, active_proxy_ids: &HashSet<&str>) {
+        self.inner.retain_active_proxy_state(active_proxy_ids);
+    }
+    fn seed_proxy_lifecycle_state_for_test(&self, proxy_id: &str) {
+        self.inner.seed_proxy_lifecycle_state_for_test(proxy_id);
+    }
+    fn has_proxy_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
+        self.inner.has_proxy_lifecycle_state_for_test(proxy_id)
+    }
     fn correlation_id_header_name(&self) -> Option<&str> {
         self.inner.correlation_id_header_name()
     }
@@ -3596,6 +3605,45 @@ impl PluginCache {
         retain_active_requirements(&requirements);
     }
 
+    /// Retire per-proxy lifecycle state on preserved global and proxy-group
+    /// plugin instances after an incremental cache generation is published.
+    ///
+    /// Must run only after commit: staging builds share Arcs with the live
+    /// generation, so pruning before publication would mutate the still-served
+    /// instance if the staged build later fails validation.
+    pub(crate) fn retain_active_proxy_lifecycle_for_inner(
+        inner: &PluginCacheInner,
+        config: &GatewayConfig,
+    ) {
+        let active_proxy_ids: HashSet<&str> =
+            config.proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+        for plugin in inner.global_plugins.iter() {
+            plugin.retain_active_proxy_state(&active_proxy_ids);
+        }
+
+        let mut group_members: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for proxy in &config.proxies {
+            for assoc in &proxy.plugins {
+                if inner
+                    .proxy_group_plugins
+                    .contains_key(assoc.plugin_config_id.as_str())
+                {
+                    group_members
+                        .entry(assoc.plugin_config_id.as_str())
+                        .or_default()
+                        .insert(proxy.id.as_str());
+                }
+            }
+        }
+        for (group_id, instance) in &inner.proxy_group_plugins {
+            let members = group_members
+                .get(group_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            instance.plugin.retain_active_proxy_state(&members);
+        }
+    }
+
     /// Build a request-scoped view of plugin-cache values for one proxy/protocol.
     ///
     /// Use this when a request needs more than one plugin-cache-derived value.
@@ -3622,6 +3670,7 @@ impl PluginCache {
         // after commit so a staged rebuild that fails validation cannot prune
         // the still-live cache.
         Self::retain_active_uris_for_inner(&inner);
+        Self::retain_active_proxy_lifecycle_for_inner(&inner, config);
         Ok(())
     }
 
@@ -4440,6 +4489,9 @@ impl PluginCache {
         // Clean up JWKS cache entries (and their background refresh tasks)
         // after commit so a rejected staged cache never prunes the live set.
         Self::retain_active_uris_for_inner(&inner);
+        // Retire per-proxy alert lifecycle rows on preserved global/group
+        // instances so delete/rename/ID-reuse cannot inherit prior state.
+        Self::retain_active_proxy_lifecycle_for_inner(&inner, config);
 
         Ok(())
     }

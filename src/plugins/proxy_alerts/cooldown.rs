@@ -7,7 +7,13 @@
 //!
 //! Both surfaces are infallible by design — they only return whether to
 //! proceed; the caller's `tokio::spawn` does the actual dispatch.
+//!
+//! Per-proxy entries are retired when a proxy leaves a preserved global or
+//! proxy-group instance ([`CooldownGate::retain_proxies`] /
+//! [`RecoveryGate::retain_proxies`]), and expired cooldown / resolved
+//! recovery rows are swept by the plugin's background eviction task.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -85,6 +91,40 @@ impl CooldownGate {
                 Err(p) => prev = p,
             }
         }
+    }
+
+    /// Drop cooldown rows for proxies absent from `active_proxy_ids`.
+    ///
+    /// Cold-path only: called after incremental plugin-cache commit when a
+    /// preserved global/proxy-group instance outlives individual proxies.
+    pub fn retain_proxies(&self, active_proxy_ids: &HashSet<&str>) {
+        self.last_sent.retain(|_, per_proxy| {
+            per_proxy.retain(|proxy_id, _| active_proxy_ids.contains(proxy_id.as_str()));
+            !per_proxy.is_empty()
+        });
+    }
+
+    /// Drop cooldown timestamps older than `keep_ms`.
+    ///
+    /// Entries whose last dispatch is still inside the keep window are
+    /// retained so an in-flight cooldown continues to suppress duplicates.
+    pub fn evict_stale(&self, now_ms: u64, keep_ms: u64) {
+        let cutoff = now_ms.saturating_sub(keep_ms);
+        self.last_sent.retain(|_, per_proxy| {
+            per_proxy.retain(|_, atomic| {
+                let ts = atomic.load(Ordering::Acquire);
+                ts == 0 || ts >= cutoff
+            });
+            !per_proxy.is_empty()
+        });
+    }
+
+    /// Whether any `(rule, channel)` map currently holds a row for `proxy_id`.
+    #[allow(dead_code)] // Used by external test crate and admin/debug helpers.
+    pub fn contains_proxy(&self, proxy_id: &str) -> bool {
+        self.last_sent
+            .iter()
+            .any(|entry| entry.value().contains_key(proxy_id))
     }
 }
 
@@ -281,5 +321,35 @@ impl RecoveryGate {
         self.state
             .get(&rule_id)
             .and_then(|per_rule| per_rule.get(proxy_id).map(|e| *e.value()))
+    }
+
+    /// Drop recovery rows for proxies absent from `active_proxy_ids`.
+    ///
+    /// Cold-path only: called after incremental plugin-cache commit when a
+    /// preserved global/proxy-group instance outlives individual proxies.
+    pub fn retain_proxies(&self, active_proxy_ids: &HashSet<&str>) {
+        self.state.retain(|_, per_rule| {
+            per_rule.retain(|proxy_id, _| active_proxy_ids.contains(proxy_id.as_str()));
+            !per_rule.is_empty()
+        });
+    }
+
+    /// Drop terminal `Healthy` rows left after a Resolve (or recovery-less
+    /// reset). Active/Recovering incidents are owned by
+    /// [`Self::retain_proxies`] so a long-lived breach is never TTL-reset
+    /// while its proxy remains in the active set.
+    pub fn evict_stale(&self, _now_ms: u64, _keep_ms: u64) {
+        self.state.retain(|_, per_rule| {
+            per_rule.retain(|_, state| !matches!(*state, RuleState::Healthy));
+            !per_rule.is_empty()
+        });
+    }
+
+    /// Whether any rule map currently holds a row for `proxy_id`.
+    #[allow(dead_code)] // Used by external test crate and admin/debug helpers.
+    pub fn contains_proxy(&self, proxy_id: &str) -> bool {
+        self.state
+            .iter()
+            .any(|entry| entry.value().contains_key(proxy_id))
     }
 }

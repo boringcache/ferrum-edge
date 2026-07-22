@@ -5223,6 +5223,27 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Cold-path: drop per-proxy mutable lifecycle state for proxies absent
+    /// from `active_proxy_ids`.
+    ///
+    /// Incremental plugin-cache commits call this on preserved global and
+    /// proxy-group instances after the new generation is published so delete,
+    /// rename, group-membership churn, and ID reuse cannot inherit prior
+    /// cooldown/recovery ownership. Must not run on the request hot path.
+    /// Ordinary plugins retain the no-op default.
+    fn retain_active_proxy_state(&self, _active_proxy_ids: &HashSet<&str>) {}
+
+    /// Test helper: seed per-proxy lifecycle state owned by this plugin.
+    #[doc(hidden)]
+    fn seed_proxy_lifecycle_state_for_test(&self, _proxy_id: &str) {}
+
+    /// Test helper: whether this plugin currently holds lifecycle state for
+    /// `proxy_id`.
+    #[doc(hidden)]
+    fn has_proxy_lifecycle_state_for_test(&self, _proxy_id: &str) -> bool {
+        false
+    }
+
     /// Return the node-local `.mmdb` path this instance was built from together
     /// with the validated snapshot it currently holds, or `None` when it holds
     /// no snapshot.
