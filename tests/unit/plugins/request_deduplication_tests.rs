@@ -280,12 +280,15 @@ fn test_new_rejects_non_object_config() {
 #[test]
 fn new_with_instance_id_rejects_blank_stable_identity() {
     for blank in ["", "   ", "\t\n"] {
-        let err = request_deduplication_with_instance_id_for_test(
+        let result = request_deduplication_with_instance_id_for_test(
             &json!({}),
             PluginHttpClient::default(),
             blank,
-        )
-        .expect_err("blank plugin config id must fail closed");
+        );
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("blank plugin config id must fail closed"),
+        };
         assert!(
             err.contains("plugin config id must be a non-empty stable identity"),
             "unexpected error for {blank:?}: {err}"
@@ -296,13 +299,18 @@ fn new_with_instance_id_rejects_blank_stable_identity() {
 #[test]
 fn production_factory_rejects_blank_plugin_config_id() {
     for blank in ["", "   ", "\t\n"] {
-        let err = create_plugin_with_http_client_and_config_id(
+        let result = create_plugin_with_http_client_and_config_id(
             "request_deduplication",
             &json!({}),
             PluginHttpClient::default(),
             Some(blank),
-        )
-        .expect_err("blank plugin config id must fail closed through the production factory");
+        );
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "blank plugin config id must fail closed through the production factory"
+            ),
+        };
         assert!(
             err.contains("plugin config id must be a non-empty stable identity"),
             "unexpected error for {blank:?}: {err}"
