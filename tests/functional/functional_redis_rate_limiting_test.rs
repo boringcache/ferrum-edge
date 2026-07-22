@@ -1807,9 +1807,7 @@ plugin_configs:
 async fn test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict() {
     if !redis_is_available().await {
         if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
-            panic!(
-                "Redis is required for the request deduplication same-proxy sibling CI gate"
-            );
+            panic!("Redis is required for the request deduplication same-proxy sibling CI gate");
         }
         return;
     }
