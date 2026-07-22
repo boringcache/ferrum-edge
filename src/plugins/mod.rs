@@ -6702,9 +6702,12 @@ pub fn create_plugin_with_http_client(
         "request_termination" => Ok(Some(Arc::new(
             request_termination::RequestTermination::new(config)?,
         ))),
-        "response_caching" => Ok(Some(Arc::new(response_caching::ResponseCaching::new(
-            config,
-        )?))),
+        "response_caching" => Ok(Some(Arc::new(
+            response_caching::ResponseCaching::new_with_pool_shard_amount(
+                config,
+                http_client.pool_shard_amount(),
+            )?,
+        ))),
         "fault_injection" => Ok(Some(Arc::new(fault_injection::FaultInjectionPlugin::new(
             config,
         )?))),

@@ -559,9 +559,9 @@ struct UncacheablePredictor {
 }
 
 impl UncacheablePredictor {
-    fn new(max_entries: usize) -> Self {
+    fn new(max_entries: usize, shard_amount: usize) -> Self {
         Self {
-            keys: DashMap::with_capacity(max_entries / 4),
+            keys: DashMap::with_capacity_and_shard_amount(max_entries / 4, shard_amount),
             max_entries,
         }
     }
@@ -621,10 +621,34 @@ pub struct ResponseCaching {
     accounting_lock: Arc<Mutex<()>>,
     clock_offset_nanos: Arc<AtomicU64>,
     uncacheable_predictor: UncacheablePredictor,
+    /// Effective shard count used for `cache`, `vary_index`, and the
+    /// uncacheable predictor. Retained so tests can prove construction
+    /// honored the gateway's configured `FERRUM_POOL_SHARD_AMOUNT`.
+    shard_amount: usize,
 }
 
 impl ResponseCaching {
     pub fn new(config: &Value) -> Result<Self, String> {
+        // Convenience constructor for tests/support tooling: `0` auto-derives
+        // the shard amount from host topology. Production construction goes
+        // through the plugin factory, which passes the gateway's normalized
+        // `FERRUM_POOL_SHARD_AMOUNT` to `new_with_pool_shard_amount`.
+        Self::new_with_pool_shard_amount(config, 0)
+    }
+
+    /// Construct the plugin with an explicit pool shard amount.
+    ///
+    /// `pool_shard_amount` follows the `FERRUM_POOL_SHARD_AMOUNT` contract:
+    /// `0` auto-derives from host topology and any positive value is rounded
+    /// up to a power of two (idempotent for already-normalized values such as
+    /// [`PluginHttpClient::pool_shard_amount`]). All three hot-path maps
+    /// (`cache`, `vary_index`, uncacheable predictor) use the resolved count.
+    ///
+    /// [`PluginHttpClient::pool_shard_amount`]: super::utils::http_client::PluginHttpClient::pool_shard_amount
+    pub fn new_with_pool_shard_amount(
+        config: &Value,
+        pool_shard_amount: usize,
+    ) -> Result<Self, String> {
         let config = ResponseCachingConfig::from_json(config)?;
 
         if config.cacheable_methods.is_empty() {
@@ -634,6 +658,7 @@ impl ResponseCaching {
             );
         }
 
+        let shard_amount = crate::util::sharding::pool_shard_amount(pool_shard_amount);
         let instance_id = NEXT_RESPONSE_CACHING_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let predictor_size = config.max_entries / 10; // 10% of cache size
         Ok(Self {
@@ -650,13 +675,23 @@ impl ResponseCaching {
                 CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX,
             ),
             config,
-            cache: Arc::new(DashMap::new()),
-            vary_index: Arc::new(DashMap::new()),
+            cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
             total_size: Arc::new(AtomicUsize::new(0)),
             accounting_lock: Arc::new(Mutex::new(())),
             clock_offset_nanos: Arc::new(AtomicU64::new(0)),
-            uncacheable_predictor: UncacheablePredictor::new(predictor_size.max(100)),
+            uncacheable_predictor: UncacheablePredictor::new(predictor_size.max(100), shard_amount),
+            shard_amount,
         })
+    }
+
+    /// Effective shard count this instance's hot-path maps were built with.
+    ///
+    /// Routed through `_test_support` so external tests can assert the
+    /// configured `FERRUM_POOL_SHARD_AMOUNT` reached every map.
+    #[allow(dead_code)]
+    pub(crate) fn shard_amount_for_tests(&self) -> usize {
+        self.shard_amount
     }
 
     /// Process-unique staging namespace for this instance (tests / diagnostics).
@@ -895,6 +930,18 @@ impl ResponseCaching {
         self.config.cacheable_methods.iter().any(|m| m == method)
     }
 
+    /// Check if the request method has unsafe (state-changing) semantics.
+    ///
+    /// RFC 9110 §9.2.1 safe methods (GET/HEAD/OPTIONS/TRACE) never invalidate
+    /// cached entries, even when absent from `cacheable_methods` — being
+    /// ineligible for storage is not the same as changing server state. Every
+    /// other method (POST/PUT/PATCH/DELETE, and any extension method, which is
+    /// conservatively treated as unsafe because its semantics are unknown to
+    /// the gateway) triggers `invalidate_on_unsafe_methods`.
+    fn is_unsafe_method(method: &str) -> bool {
+        !matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
+    }
+
     fn cache_lookup_vary_headers(&self, base_key: &str) -> Vec<String> {
         self.vary_index
             .get(base_key)
@@ -1097,23 +1144,39 @@ impl ResponseCaching {
         }
     }
 
-    /// Evict expired entries when cache exceeds max_entries.
-    fn evict_if_needed_locked(&self) {
-        if self.cache.len() <= self.config.max_entries {
-            return;
-        }
-
+    /// Remove every expired entry, refund its tracked bytes, and reclaim any
+    /// `vary_index` mappings left without a surviving variant. Caller must
+    /// hold `accounting_lock`. Returns the number of entries removed.
+    fn reclaim_expired_locked(&self) -> usize {
         let now = self.now_monotonic();
         let mut removed_size = 0usize;
+        let mut removed_count = 0usize;
         self.cache.retain(|_, entry| {
             if !entry.is_fresh_at(now) {
                 removed_size += entry.approx_size();
+                removed_count += 1;
                 false
             } else {
                 true
             }
         });
         self.sub_total_size_locked(removed_size);
+        if removed_count > 0 {
+            // Expired variants may have been the last live entry for their
+            // base key; reclaim the stranded `vary_index` mappings now rather
+            // than waiting for the next store-side prune.
+            self.prune_vary_index_locked();
+        }
+        removed_count
+    }
+
+    /// Evict expired entries when cache exceeds max_entries.
+    fn evict_if_needed_locked(&self) {
+        if self.cache.len() <= self.config.max_entries {
+            return;
+        }
+
+        self.reclaim_expired_locked();
 
         if self.cache.len() > self.config.max_entries {
             let mut entries: Vec<(String, Duration)> = self
@@ -1187,7 +1250,9 @@ impl ResponseCaching {
     }
 
     /// Invalidate cache entries matching a path pattern.
-    /// Called when an unsafe method (POST/PUT/PATCH/DELETE) hits a path.
+    /// Called when an unsafe method (POST/PUT/PATCH/DELETE, or an extension
+    /// method conservatively treated as unsafe — see
+    /// [`Self::is_unsafe_method`]) hits a path.
     fn invalidate_path(&self, ctx: &RequestContext) {
         let _guard = self.accounting_guard();
         let proxy_id = ctx
@@ -1580,7 +1645,11 @@ impl Plugin for ResponseCaching {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.is_cacheable_method(&ctx.method) {
-            if self.config.invalidate_on_unsafe_methods {
+            // Only genuinely unsafe methods evict: a safe method that is
+            // merely ineligible for storage (OPTIONS with the default
+            // cacheable set, HEAD with a GET-only set) must bypass without
+            // flushing hot entries.
+            if self.config.invalidate_on_unsafe_methods && Self::is_unsafe_method(&ctx.method) {
                 self.invalidate_path(ctx);
             }
             // Clear only this instance's staging so a sibling cache keeps
@@ -1933,15 +2002,37 @@ impl Plugin for ResponseCaching {
             // while holding a DashMap entry guard. Cache-hit reads do not take
             // this lock.
             let _guard = self.accounting_guard();
-            let old_size = self
+            let mut old_size = self
                 .cache
                 .get(&cache_key)
                 .map(|old_entry| old_entry.approx_size())
                 .unwrap_or(0);
-            let current_total = self.total_size.load(Ordering::Relaxed);
-            let next_total = current_total
+            let mut current_total = self.total_size.load(Ordering::Relaxed);
+            let mut next_total = current_total
                 .saturating_sub(old_size)
                 .saturating_add(entry_size);
+
+            if next_total > self.config.max_total_size_bytes
+                && entry_size <= self.config.max_total_size_bytes
+            {
+                // The byte cap is the limiting dimension: reclaim expired
+                // entries before rejecting an otherwise eligible store.
+                // Stale entries must not trap the byte budget when the entry
+                // count never exceeded `max_entries` — the count-gated sweep
+                // in `evict_if_needed_locked` never runs for them. The reclaim
+                // may also collect the entry being replaced, so recompute both
+                // accounting inputs under the same lock.
+                self.reclaim_expired_locked();
+                old_size = self
+                    .cache
+                    .get(&cache_key)
+                    .map(|old_entry| old_entry.approx_size())
+                    .unwrap_or(0);
+                current_total = self.total_size.load(Ordering::Relaxed);
+                next_total = current_total
+                    .saturating_sub(old_size)
+                    .saturating_add(entry_size);
+            }
 
             if entry_size > self.config.max_total_size_bytes
                 || next_total > self.config.max_total_size_bytes

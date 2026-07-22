@@ -5,7 +5,7 @@ use chrono::Utc;
 use ferrum_edge::_test_support::{
     advance_response_caching_clock_for_test, clone_log_metadata,
     response_caching_current_total_size_for_test, response_caching_instance_id_for_test,
-    response_caching_size_accounting_snapshot_for_test,
+    response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test,
 };
 use ferrum_edge::config::types::Consumer;
@@ -3792,4 +3792,269 @@ async fn reload_generations_do_not_share_staging_namespaces() {
         "replacement generation must not inherit the retired generation's entries"
     );
     assert_status(&generation_two, &replay, "MISS");
+}
+
+// === Unsafe-method invalidation scope (#2418) ===
+
+/// A safe method that is merely absent from `cacheable_methods` must bypass
+/// without evicting: with the default cacheable set, OPTIONS is not cacheable
+/// but is still an RFC 9110 safe method.
+#[tokio::test]
+async fn test_options_does_not_invalidate_cached_get() {
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    // Sanity: the entry is served from cache.
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(is_reject(plugin.before_proxy(&mut ctx, &mut headers).await));
+
+    let mut ctx = make_ctx("OPTIONS", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&plugin, &ctx, "BYPASS");
+
+    // The cached GET response must survive the safe-method bypass.
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(
+        is_reject(plugin.before_proxy(&mut ctx, &mut headers).await),
+        "OPTIONS must not invalidate cached GET entries"
+    );
+}
+
+/// HEAD is safe even when an operator deliberately configures a GET-only
+/// cacheable set — it must bypass without invalidating the cached GET entry.
+#[tokio::test]
+async fn test_non_cacheable_head_does_not_invalidate_cached_get() {
+    let plugin = plugin_with_config(json!({
+        "cacheable_methods": ["GET"]
+    }));
+
+    cache_response(&plugin, "GET", "/api/items", 200, &HashMap::new(), b"body").await;
+
+    let mut ctx = make_ctx("HEAD", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&plugin, &ctx, "BYPASS");
+
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(
+        is_reject(plugin.before_proxy(&mut ctx, &mut headers).await),
+        "non-cacheable HEAD must not invalidate cached GET entries"
+    );
+}
+
+/// Every standardized unsafe method must still invalidate the cached entry
+/// for the same path, preserving the documented POST/PUT/PATCH/DELETE
+/// behavior of `invalidate_on_unsafe_methods`.
+#[tokio::test]
+async fn test_every_unsafe_method_invalidates_cached_get() {
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        let plugin = default_plugin();
+        cache_response(&plugin, "GET", "/api/items", 200, &HashMap::new(), b"body").await;
+
+        let mut ctx = make_ctx(method, "/api/items");
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut ctx = make_ctx("GET", "/api/items");
+        let mut headers = HashMap::new();
+        assert!(
+            matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "{method} must invalidate the cached GET entry"
+        );
+    }
+}
+
+/// Extension methods have unknown semantics, so they are conservatively
+/// treated as unsafe and invalidate matching cached entries.
+#[tokio::test]
+async fn test_extension_method_conservatively_invalidates_cached_get() {
+    let plugin = default_plugin();
+    cache_response(&plugin, "GET", "/api/items", 200, &HashMap::new(), b"body").await;
+
+    let mut ctx = make_ctx("PURGE", "/api/items");
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ),
+        "unknown extension methods must conservatively invalidate cached entries"
+    );
+}
+
+// === Byte-cap admission reclaims expired entries (#2400) ===
+
+/// Expired entries must not trap the byte budget: a store rejected only for
+/// aggregate byte pressure reclaims stale entries first and admits the new
+/// key when it fits after reclamation — even when the entry count never
+/// exceeded `max_entries`.
+#[tokio::test]
+async fn test_byte_cap_admission_reclaims_expired_entries() {
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 10,
+        "max_entries": 1000,
+        "max_total_size_bytes": 3000
+    }));
+
+    let body = vec![b'x'; 1000];
+    // Two distinct ~1KB entries fit inside the 3KB byte budget; a third
+    // cannot fit while both are retained.
+    cache_response(&plugin, "GET", "/a", 200, &HashMap::new(), &body).await;
+    cache_response(&plugin, "GET", "/b", 200, &HashMap::new(), &body).await;
+    let filled_total = response_caching_current_total_size_for_test(&plugin);
+    assert!(
+        filled_total > 1500 && filled_total <= 3000,
+        "setup entries must fill most of the byte budget, got {filled_total}"
+    );
+
+    // While every retained entry is fresh, the byte cap still rejects a new
+    // distinct key — the cap is enforced, not bypassed by the reclaim path.
+    cache_response(&plugin, "GET", "/c", 200, &HashMap::new(), &body).await;
+    assert_eq!(
+        response_caching_current_total_size_for_test(&plugin),
+        filled_total,
+        "fresh entries must keep the byte cap closed to a third distinct entry"
+    );
+    let mut ctx = make_ctx("GET", "/c");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    // Expire every retained entry without re-requesting its key. The entry
+    // count stays below `max_entries`, so the count-gated eviction sweep
+    // never runs for them.
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(20));
+
+    // The next store must reclaim the expired bytes and be admitted.
+    cache_response(&plugin, "GET", "/d", 200, &HashMap::new(), &body).await;
+    let mut ctx = make_ctx("GET", "/d");
+    let mut headers = HashMap::new();
+    assert!(
+        is_reject(plugin.before_proxy(&mut ctx, &mut headers).await),
+        "new entry must be admitted after expired entries are reclaimed"
+    );
+
+    // Expired keys are gone and tracked size matches the retained entries.
+    let mut ctx = make_ctx("GET", "/a");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        response_caching_current_total_size_for_test(&plugin) <= 3000,
+        "tracked size must stay within the byte cap after reclaim"
+    );
+    assert_size_accounting_exact(&plugin);
+}
+
+/// Concurrent stores racing an expiring working set must keep the size
+/// accountant exact: byte-cap admission reclaim runs under the same
+/// accounting lock as insertion and replacement accounting.
+#[tokio::test]
+async fn test_concurrent_stores_with_expiry_keep_size_accounting_exact() {
+    let plugin = Arc::new(
+        ResponseCaching::new(&json!({
+            "ttl_seconds": 5,
+            "max_total_size_bytes": 8192,
+            "max_entries": 1000
+        }))
+        .expect("config should be valid"),
+    );
+
+    // Seed a working set that expires before the concurrent stores run, so
+    // byte-cap admission must reclaim it while other stores race.
+    let seed_body = vec![b's'; 512];
+    for n in 0..8u32 {
+        cache_response(
+            &plugin,
+            "GET",
+            &format!("/seed-{n}"),
+            200,
+            &HashMap::new(),
+            &seed_body,
+        )
+        .await;
+    }
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(10));
+
+    let mut tasks = Vec::new();
+    for n in 0..32u32 {
+        let plugin = Arc::clone(&plugin);
+        tasks.push(tokio::spawn(async move {
+            let path = format!("/api/item-{}", n % 16);
+            let body = vec![b'x'; 512];
+            cache_response(&plugin, "GET", &path, 200, &HashMap::new(), &body).await;
+        }));
+    }
+    for task in tasks {
+        task.await.expect("store task panicked");
+    }
+
+    assert_size_accounting_exact(&plugin);
+    assert!(
+        response_caching_current_total_size_for_test(&plugin) <= 8192,
+        "total_size exceeded configured max_total_size_bytes"
+    );
+}
+
+// === Hot-path map shard sizing (#2429) ===
+
+/// The explicit constructor must route the selected shard count to the
+/// plugin's hot-path maps, normalizing non-power-of-two values the same way
+/// `FERRUM_POOL_SHARD_AMOUNT` does.
+#[test]
+fn test_constructor_honors_explicit_pool_shard_amount() {
+    let plugin = ResponseCaching::new_with_pool_shard_amount(&json!({}), 96)
+        .expect("config should be valid");
+    assert_eq!(
+        response_caching_shard_amount_for_test(&plugin),
+        128,
+        "non-power-of-two overrides must round up to the next power of two"
+    );
+
+    let plugin = ResponseCaching::new_with_pool_shard_amount(&json!({}), 256)
+        .expect("config should be valid");
+    assert_eq!(response_caching_shard_amount_for_test(&plugin), 256);
+}
+
+/// The convenience constructor used by tests/support tooling must auto-derive
+/// the same host-topology shard amount the gateway computes for a zero
+/// `FERRUM_POOL_SHARD_AMOUNT`.
+#[test]
+fn test_default_constructor_auto_derives_shard_amount() {
+    let plugin = default_plugin();
+    assert_eq!(
+        response_caching_shard_amount_for_test(&plugin),
+        ferrum_edge::util::sharding::pool_shard_amount(0),
+        "the default constructor must auto-derive the host shard amount"
+    );
 }

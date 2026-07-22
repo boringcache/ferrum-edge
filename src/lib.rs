@@ -1076,6 +1076,14 @@ pub mod _test_support {
         plugin.current_total_size_for_tests()
     }
 
+    /// Effective DashMap shard count the plugin's hot-path maps
+    /// (`cache`, `vary_index`, uncacheable predictor) were constructed with.
+    pub fn response_caching_shard_amount_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> usize {
+        plugin.shard_amount_for_tests()
+    }
+
     pub fn response_caching_size_accounting_snapshot_for_test(
         plugin: &crate::plugins::response_caching::ResponseCaching,
     ) -> (usize, usize) {
