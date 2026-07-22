@@ -892,6 +892,7 @@ jobs:
               functional_secrets_test
               functional_ai_plugins_test
               functional_ai_semantic_firewall_streaming_test
+              functional_body_validator_response_stream_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
               functional_logging_plugins_test
