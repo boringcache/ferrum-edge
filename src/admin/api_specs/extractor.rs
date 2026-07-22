@@ -1559,7 +1559,7 @@ fn normalize_request_body_encoding(
                     error: format!("encoding['{property}'].headers must not exceed 32 entries"),
                 });
             }
-            for header_name in headers.keys() {
+            for (header_name, header_value) in headers {
                 let name = header_name.trim().to_ascii_lowercase();
                 if http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
                     || matches!(
@@ -1571,6 +1571,16 @@ fn normalize_request_body_encoding(
                         which: "requestBody.content.encoding",
                         error: format!(
                             "encoding['{property}'].headers contains invalid or reserved header '{header_name}'"
+                        ),
+                    });
+                }
+                if let Some(required) = header_value.get("required")
+                    && !required.is_boolean()
+                {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'].required must be a boolean"
                         ),
                     });
                 }

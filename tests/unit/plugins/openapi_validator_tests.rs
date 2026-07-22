@@ -2044,6 +2044,65 @@ async fn multipart_encoding_headers_use_full_json_schema_validation() {
 }
 
 #[tokio::test]
+async fn multipart_encoding_headers_respect_header_object_required_default() {
+    for (required, include_header, expected_status) in [
+        (None, false, None),
+        (Some(false), false, None),
+        (Some(true), false, Some(400)),
+        (Some(true), true, None),
+    ] {
+        let mut header_object = json!({
+            "schema": {"type": "string", "minLength": 5}
+        });
+        if let Some(required) = required {
+            header_object["required"] = json!(required);
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/optional-header",
+                "path_regex": "^/optional-header$",
+                "request_body": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["title"],
+                                "properties": {"title": {"type": "string"}}
+                            },
+                            "encoding": {
+                                "title": {
+                                    "headers": {"X-Part-Token": header_object}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let optional_header = if include_header {
+            "X-Part-Token: abcde\r\n"
+        } else {
+            ""
+        };
+        let body = format!(
+            "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\n{optional_header}\r\nhello\r\n--abc--\r\n"
+        );
+        let headers = content_type_headers("multipart/form-data; boundary=abc");
+        let mut ctx = post_ctx("/optional-header");
+        ctx.headers = headers.clone();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await;
+        match expected_status {
+            Some(status) => assert_reject(result, Some(status)),
+            None => assert_continue(result),
+        }
+    }
+}
+
+#[tokio::test]
 async fn multipart_composed_anyof_scalar_is_branch_order_invariant() {
     for branches in [
         json!([{"type": "integer"}, {"type": "string", "pattern": "^[a-z]+$"}]),

@@ -104,6 +104,7 @@ struct PropertyEncoding {
 }
 
 struct EncodingHeaderValidator {
+    required: bool,
     schema: Value,
     validator: jsonschema::Validator,
 }
@@ -1242,11 +1243,68 @@ fn parse_property_encoding(
                     "encoding['{property}'].headers must not redefine '{name}'"
                 ));
             }
-            // Header Object may wrap `schema`; accept either form.
-            let schema_value = header_schema
-                .as_object()
-                .and_then(|object| object.get("schema"))
-                .unwrap_or(header_schema);
+            // Header Object may wrap `schema`; accept either that public OAS
+            // shape or the internal bare-schema representation. Header Object
+            // `required` defaults to false (OAS 3.1 §4.8.21), so an optional
+            // part header must not reject an otherwise valid multipart body.
+            let header_object = header_schema.as_object();
+            let is_header_object = header_object.is_some_and(|object| {
+                object.contains_key("schema")
+                    || object.contains_key("required")
+                    || object.contains_key("description")
+                    || object.contains_key("deprecated")
+                    || object.contains_key("style")
+                    || object.contains_key("explode")
+                    || object.contains_key("content")
+                    || object.contains_key("example")
+                    || object.contains_key("examples")
+            });
+            let required = if is_header_object {
+                match header_object.and_then(|object| object.get("required")) {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    Some(_) => {
+                        return Err(format!(
+                            "encoding['{property}'].headers['{header_name}'].required must be a boolean"
+                        ));
+                    }
+                }
+            } else {
+                false
+            };
+            if is_header_object && header_object.is_some_and(|object| object.contains_key("content"))
+            {
+                return Err(format!(
+                    "encoding['{property}'].headers['{header_name}'].content is not supported; use a schema Header Object"
+                ));
+            }
+            if is_header_object
+                && let Some(style) = header_object.and_then(|object| object.get("style"))
+                && style.as_str() != Some("simple")
+            {
+                return Err(format!(
+                    "encoding['{property}'].headers['{header_name}'].style must be 'simple'"
+                ));
+            }
+            if is_header_object
+                && let Some(explode) = header_object.and_then(|object| object.get("explode"))
+                && !explode.is_boolean()
+            {
+                return Err(format!(
+                    "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
+                ));
+            }
+            let schema_value = if is_header_object {
+                header_object
+                    .and_then(|object| object.get("schema"))
+                    .ok_or_else(|| {
+                        format!(
+                            "encoding['{property}'].headers['{header_name}'] must contain schema"
+                        )
+                    })?
+            } else {
+                header_schema
+            };
             let validator = compile_schema(schema_value, schema_draft).map_err(|error| {
                 format!(
                     "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
@@ -1255,6 +1313,7 @@ fn parse_property_encoding(
             headers.insert(
                 name,
                 EncodingHeaderValidator {
+                    required,
                     schema: schema_value.clone(),
                     validator,
                 },
@@ -2069,10 +2128,13 @@ fn multipart_part_to_schema_value(
         }
         for (header_name, header_validator) in &encoding.headers {
             let Some(header_value) = part.headers.get(header_name) else {
-                return Err(format!(
-                    "Multipart field '{}' is missing required encoding header '{header_name}'",
-                    part.name
-                ));
+                if header_validator.required {
+                    return Err(format!(
+                        "Multipart field '{}' is missing required encoding header '{header_name}'",
+                        part.name
+                    ));
+                }
+                continue;
             };
             let converted = scalar_to_schema_value(header_value, &header_validator.schema)?;
             header_validator
