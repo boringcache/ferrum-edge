@@ -169,6 +169,7 @@ impl ProxyAlerts {
 
     /// Compatibility helper for tests that only have an active-ID set.
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn retain_proxy_ids_for_test(&self, active_proxy_ids: &HashSet<&str>) {
         let generations: HashMap<&str, u64> = active_proxy_ids
             .iter()
