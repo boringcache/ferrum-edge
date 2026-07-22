@@ -122,6 +122,7 @@ where
     entry_count: AtomicUsize,
     /// Counts all-shard `DashMap::len()` observations. Production steady paths
     /// never increment this; tests assert it stays flat under admission.
+    #[cfg(debug_assertions)]
     all_shard_len_calls: AtomicUsize,
     #[cfg(test)]
     shard_amount: usize,
@@ -143,6 +144,7 @@ where
             algorithm,
             state: DashMap::with_shard_amount(shard_amount),
             entry_count: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
             all_shard_len_calls: AtomicUsize::new(0),
             #[cfg(test)]
             shard_amount,
@@ -260,6 +262,7 @@ where
     /// steady admission — each invocation takes every shard read lock.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn map_len_for_test(&self) -> usize {
+        #[cfg(debug_assertions)]
         self.all_shard_len_calls.fetch_add(1, Ordering::Relaxed);
         self.state.len()
     }
@@ -267,7 +270,14 @@ where
     /// Number of all-shard length observations since construction.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn all_shard_len_calls_for_test(&self) -> usize {
-        self.all_shard_len_calls.load(Ordering::Relaxed)
+        #[cfg(debug_assertions)]
+        {
+            self.all_shard_len_calls.load(Ordering::Relaxed)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
     }
 
     /// DashMap shard count for the local token-state map. Test-only so
