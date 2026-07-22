@@ -1195,7 +1195,8 @@ jobs:
             --run-ignored=all \
             --no-fail-fast \
             -j 1 \
-            'test_request_deduplication_redis_blocks_concurrent_cross_instance|test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict'
+            test_request_deduplication_redis_blocks_concurrent_cross_instance \
+            test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict
         env:
           FERRUM_SKIP_GATEWAY_BUILD: "1"
           FERRUM_REDIS_REQUIRED: "1"
