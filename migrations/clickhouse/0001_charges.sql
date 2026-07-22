@@ -31,35 +31,41 @@ ORDER BY (namespace, consumer_id, received_at, event_id)
 PARTITION BY toYYYYMM(received_at)
 TTL toDateTime(received_at) + INTERVAL 13 MONTH;
 
-CREATE VIEW IF NOT EXISTS ferrum.charges_hourly AS
+-- Monetary rollups must stay partitioned by currency and pricing_version so
+-- mixed-currency or multi-generation sinks never produce unitless charge sums
+-- (issue #2569). CREATE OR REPLACE keeps re-applying the baseline DDL safe.
+CREATE OR REPLACE VIEW ferrum.charges_hourly AS
 SELECT
     namespace, consumer_id, proxy_id, status_code,
+    currency, pricing_version,
     toStartOfHour(received_at) AS hour,
     sum(call_count)            AS calls,
     sum(charge_total)          AS charge,
     sum(bytes_sent)            AS bytes_sent,
     sum(bytes_received)        AS bytes_received
 FROM ferrum.charges_raw FINAL
-GROUP BY namespace, consumer_id, proxy_id, status_code, hour;
+GROUP BY namespace, consumer_id, proxy_id, status_code, currency, pricing_version, hour;
 
-CREATE VIEW IF NOT EXISTS ferrum.charges_daily AS
+CREATE OR REPLACE VIEW ferrum.charges_daily AS
 SELECT
     namespace, consumer_id, proxy_id,
+    currency, pricing_version,
     toDate(received_at)        AS day,
     sum(call_count)            AS calls,
     sum(charge_total)          AS charge,
     sum(bytes_sent)            AS bytes_sent,
     sum(bytes_received)        AS bytes_received
 FROM ferrum.charges_raw FINAL
-GROUP BY namespace, consumer_id, proxy_id, day;
+GROUP BY namespace, consumer_id, proxy_id, currency, pricing_version, day;
 
-CREATE VIEW IF NOT EXISTS ferrum.charges_monthly AS
+CREATE OR REPLACE VIEW ferrum.charges_monthly AS
 SELECT
     namespace, consumer_id, proxy_id,
+    currency, pricing_version,
     toStartOfMonth(received_at) AS month,
     sum(call_count)             AS calls,
     sum(charge_total)           AS charge,
     sum(bytes_sent)             AS bytes_sent,
     sum(bytes_received)         AS bytes_received
 FROM ferrum.charges_raw FINAL
-GROUP BY namespace, consumer_id, proxy_id, month;
+GROUP BY namespace, consumer_id, proxy_id, currency, pricing_version, month;

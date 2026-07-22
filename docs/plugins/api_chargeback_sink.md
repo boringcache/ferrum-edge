@@ -60,7 +60,10 @@ clickhouse-client < migrations/clickhouse/0001_charges.sql
 The DDL creates `ferrum.charges_raw` with `ReplacingMergeTree` idempotency on
 `event_id`, plus hourly, daily, and monthly views that read from
 `charges_raw FINAL`. The views trade query cost for correctness: duplicate raw
-events are deduplicated before rollup aggregation.
+events are deduplicated before rollup aggregation. Monetary `charge` columns in
+those views are grouped by `currency` and `pricing_version` (in addition to
+namespace/consumer/proxy/time) so mixed-currency or multi-generation sinks never
+produce unitless rollups.
 
 For HTTP-family events, `status_code` is the billable status used for pricing
 and rollups. `http_status_code` preserves the transport status, and
@@ -208,15 +211,23 @@ WHERE node_id = 'edge-a'
   AND received_at >= now() - INTERVAL 1 HOUR;
 ```
 
-Consumer daily invoice rollup:
+Consumer daily invoice rollup (partitioned by currency and pricing generation —
+never sum `charge` across currencies or pricing versions):
 
 ```sql
-SELECT namespace, consumer_id, day, sum(calls), sum(charge)
+SELECT namespace, consumer_id, currency, pricing_version, day, sum(calls), sum(charge)
 FROM ferrum.charges_daily
 WHERE day >= today() - 30
-GROUP BY namespace, consumer_id, day
-ORDER BY day, namespace, consumer_id;
+GROUP BY namespace, consumer_id, currency, pricing_version, day
+ORDER BY day, namespace, consumer_id, currency, pricing_version;
 ```
+
+The reference hourly/daily/monthly views group by `currency` and
+`pricing_version` in addition to namespace/consumer/proxy/time so two sink
+instances that share a table (or one sink that changes currency/pricing
+generation on reload) cannot produce unitless USD+EUR-style rollups. Re-apply
+`migrations/clickhouse/0001_charges.sql` to refresh those views (`CREATE OR
+REPLACE VIEW`).
 
 For snapshot mode, compare `/charges` totals to `sum(call_count)`,
 `sum(bytes_sent)`, `sum(bytes_received)`, and `sum(charge_total)` over the same

@@ -20564,6 +20564,10 @@ components:
             plugin instance carries its own currency (per global/proxy/proxy_group
             scope), so this is `"mixed"` when instances disagree — read the
             per-proxy `currency` field for the authoritative value in that case.
+            When `"mixed"`, any consumer whose proxies span more than one currency
+            nulls its flat monetary totals and exposes `charges_by_currency`
+            instead; never treat a mixed consumer's omitted/null totals as a
+            settlement amount.
           example: "USD"
         generated_at:
           type: string
@@ -20574,20 +20578,60 @@ components:
             type: object
             properties:
               total_charges:
-                type: number
-                description: Sum of per-call, stream-connection, and bandwidth charges across all proxies for this consumer.
+                type: [number, "null"]
+                description: |
+                  Sum of per-call, stream-connection, and bandwidth charges across
+                  all proxies for this consumer when every contributing proxy shares
+                  one currency. `null` when this consumer spans multiple currencies
+                  — use `charges_by_currency` (and per-proxy `currency`) instead.
+                  Migration: treat `null` as "not a unitless total"; do not coerce
+                  to `0`.
               total_calls:
                 type: integer
-                description: Sum of HTTP calls + stream sessions across all proxies for this consumer.
+                description: |
+                  Sum of HTTP calls + stream sessions across all proxies for this
+                  consumer. Unitless and always present, including mixed-currency
+                  consumers.
               per_call_charges:
-                type: number
-                description: HTTP per-call charges only.
+                type: [number, "null"]
+                description: |
+                  HTTP per-call charges only when every proxy for this consumer
+                  shares one currency; `null` when currencies are mixed.
               stream_connection_charges:
-                type: number
-                description: Stream per-connection charges only.
+                type: [number, "null"]
+                description: |
+                  Stream per-connection charges only when every proxy for this
+                  consumer shares one currency; `null` when currencies are mixed.
               bandwidth_charges:
-                type: number
-                description: Bandwidth charges only (sent + received).
+                type: [number, "null"]
+                description: |
+                  Bandwidth charges only (sent + received) when every proxy for
+                  this consumer shares one currency; `null` when currencies are
+                  mixed.
+              charges_by_currency:
+                type: object
+                description: |
+                  Present only when this consumer's proxies span more than one
+                  currency. Keys are ISO-style currency labels; each value is the
+                  monetary rollup for that currency alone. The sum of a currency
+                  partition's `total_charges` must equal the sum of
+                  `proxies[*].total_charges` for proxies with that same
+                  `currency`. Namespace/ledger boundaries remain on the per-proxy
+                  rows (composite proxy keys when the same `proxy_id` appears under
+                  more than one currency/namespace).
+                additionalProperties:
+                  type: object
+                  properties:
+                    total_calls:
+                      type: integer
+                    total_charges:
+                      type: number
+                    per_call_charges:
+                      type: number
+                    stream_connection_charges:
+                      type: number
+                    bandwidth_charges:
+                      type: number
               proxies:
                 type: object
                 additionalProperties:
