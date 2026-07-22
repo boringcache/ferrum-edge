@@ -856,7 +856,7 @@ async fn configured_decompression_preserves_semantic_cache_miss_store_hit_lifecy
                     headers.get("x-ai-cache-status").map(String::as_str),
                     Some("HIT")
                 );
-                assert_eq!(cached_body.as_slice(), response_body);
+                assert_eq!(cached_body.as_ref(), response_body);
             }
             other => panic!("expected {encoding} cache HIT after normalization, got {other:?}"),
         }
