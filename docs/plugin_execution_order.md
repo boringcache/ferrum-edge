@@ -399,7 +399,9 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 
 ### Connection Tracking
 
-Each WebSocket connection is assigned a `connection_id` — a monotonic `u64` counter unique per WebSocket connection. Plugins use this identifier for per-connection state tracking (e.g., per-connection rate limit buckets, per-connection frame counters).
+Each WebSocket connection is assigned a `connection_id` — a monotonic `u64` counter unique within a single gateway process. Plugins use this identifier for per-connection state tracking (e.g., per-connection rate limit buckets, per-connection frame counters). The same admission ID is passed to every `on_ws_frame` call and copied into `WsDisconnectContext` at teardown so frame and disconnect observers share one session key without a lookup map.
+
+The identifier is **process-local**, not globally unique across gateway instances. Operators aggregating multi-instance logs must join on `(gateway_instance_id, proxy_id, connection_id)` (or an equivalent host/process identity + `proxy_id` + `connection_id` tuple).
 
 ### Frame Rejection
 
@@ -748,11 +750,12 @@ transaction hook sequentially:
 
 Potentially slow sinks should use an explicitly bounded, plugin-owned handoff.
 Own the queue, worker, cancellation state, and retry budget in the plugin;
-start the worker from `start_background_tasks()` after cache acceptance; define
-queue-full behavior; and signal intake closure when the plugin is dropped. Do
-not spawn an unbounded task per transaction. Because `Drop` cannot await and
-runtime shutdown can still cancel a worker, durable delivery needs persistence
-or an external collector with an explicit drain protocol.
+stage the worker from `start_background_tasks()` (dormant until publication) and
+release it from `commit_background_tasks()` after atomic cache installation;
+define queue-full behavior; and signal intake closure when the plugin is
+dropped. Do not spawn an unbounded task per transaction. Because `Drop` cannot
+await and runtime shutdown can still cancel a worker, durable delivery needs
+persistence or an external collector with an explicit drain protocol.
 
 Relative ordering within the logging band (9000–9300) determines invocation
 order but otherwise does not change lifecycle phase semantics.

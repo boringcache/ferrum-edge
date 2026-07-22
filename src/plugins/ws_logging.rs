@@ -26,8 +26,8 @@ use futures_util::SinkExt;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Duration;
 use tracing::warn;
@@ -42,7 +42,7 @@ use super::utils::log_schema::{
 };
 use super::utils::{
     BatchConfigDefaults, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    validate_batch_config,
+    validate_batch_config, wait_until_committed,
 };
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
@@ -424,7 +424,12 @@ impl Write for BoundedJsonWriter {
 }
 
 pub struct WsLogging {
-    sender: mpsc::Sender<QueuedEntry>,
+    buffer_capacity: usize,
+    pending_config: Mutex<Option<WsConfig>>,
+    sender: OnceLock<mpsc::Sender<QueuedEntry>>,
+    /// Releases the staged flush/connect loop after PluginCache publication.
+    commit_tx: OnceLock<watch::Sender<bool>>,
+    start_lock: Mutex<()>,
     schema: Option<Arc<SummarySchema>>,
     byte_budget: Arc<WsByteBudget>,
     max_entry_bytes: usize,
@@ -473,6 +478,8 @@ impl WsLogging {
         let endpoint_url_for_logs = redacted_endpoint_url(&parsed_url);
 
         // Build TLS connector for wss:// using gateway CA/verify settings.
+        // This is sync admission work (no Tokio spawn) and remains in `new`
+        // so a bad CA/SNI config still fails before a generation is published.
         let connector = if parsed_url.scheme() == "wss" {
             Some(build_tls_connector(&http_client)?)
         } else {
@@ -598,11 +605,12 @@ impl WsLogging {
             write_timeout: Duration::from_millis(write_timeout_ms),
         };
 
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, ws_config));
-
         Ok(Self {
-            sender,
+            buffer_capacity,
+            pending_config: Mutex::new(Some(ws_config)),
+            sender: OnceLock::new(),
+            commit_tx: OnceLock::new(),
+            start_lock: Mutex::new(()),
             schema,
             byte_budget: Arc::new(WsByteBudget::new(buffer_max_bytes)),
             max_entry_bytes,
@@ -614,7 +622,12 @@ impl WsLogging {
     where
         T: serde::Serialize,
     {
-        let Ok(permit) = self.sender.try_reserve() else {
+        let Some(sender) = self.sender.get() else {
+            self.byte_budget
+                .record_drop("worker unavailable before start_background_tasks");
+            return;
+        };
+        let Ok(permit) = sender.try_reserve() else {
             self.byte_budget.record_drop("queue slot exhausted");
             return;
         };
@@ -650,7 +663,12 @@ impl WsLogging {
     fn queue_websocket(&self, ctx: &WsDisconnectContext) {
         // Slot first, then provisional aggregate bytes, then a borrowed
         // disconnect view (no deep clone of attacker-shaped strings/metadata).
-        let Ok(permit) = self.sender.try_reserve() else {
+        let Some(sender) = self.sender.get() else {
+            self.byte_budget
+                .record_drop("worker unavailable before start_background_tasks");
+            return;
+        };
+        let Ok(permit) = sender.try_reserve() else {
             self.byte_budget.record_drop("queue slot exhausted");
             return;
         };
@@ -857,6 +875,67 @@ impl Plugin for WsLogging {
         ALL_PROTOCOLS
     }
 
+    fn start_background_tasks(&self) -> Result<(), String> {
+        if self.sender.get().is_some() {
+            return Ok(());
+        }
+        let _guard = self.start_lock.lock().map_err(|_| {
+            "ws_logging: start lock poisoned; refusing to start flush worker".to_string()
+        })?;
+        if self.sender.get().is_some() {
+            return Ok(());
+        }
+        let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            "ws_logging: start_background_tasks requires a Tokio runtime".to_string()
+        })?;
+
+        // Take pending config under the start lock. On any failure before the
+        // sender is staged, restore it so activation remains retryable.
+        let ws_config = {
+            let mut pending = self
+                .pending_config
+                .lock()
+                .map_err(|_| "ws_logging: pending config lock poisoned".to_string())?;
+            pending.take().ok_or_else(|| {
+                "ws_logging: flush worker config already consumed without an active sender"
+                    .to_string()
+            })?
+        };
+
+        let (sender, receiver) = mpsc::channel(self.buffer_capacity);
+        let (commit_tx, commit_rx) = watch::channel(false);
+        // Under start_lock both OnceLocks are empty; set the commit gate first
+        // so a theoretical sender collision can still restore pending config.
+        if self.commit_tx.set(commit_tx).is_err() {
+            if let Ok(mut pending) = self.pending_config.lock() {
+                *pending = Some(ws_config);
+            }
+            return Err(
+                "ws_logging: commit gate already staged; refusing duplicate activation".to_string(),
+            );
+        }
+        if self.sender.set(sender).is_err() {
+            if let Ok(mut pending) = self.pending_config.lock() {
+                *pending = Some(ws_config);
+            }
+            return Err(
+                "ws_logging: flush worker already started; refusing duplicate activation"
+                    .to_string(),
+            );
+        }
+        // Sender is staged: Drop of WsLogging closes the channel / commit gate
+        // and the flush loop exits without connect/flush side effects when
+        // commit never ran. Config is intentionally consumed on success.
+        tokio::spawn(flush_loop(receiver, ws_config, commit_rx));
+        Ok(())
+    }
+
+    fn commit_background_tasks(&self) {
+        if let Some(commit_tx) = self.commit_tx.get() {
+            let _ = commit_tx.send(true);
+        }
+    }
+
     fn requires_ws_disconnect_hooks(&self) -> bool {
         true
     }
@@ -883,7 +962,19 @@ impl Plugin for WsLogging {
 
 /// Background task that maintains a persistent WebSocket connection and
 /// flushes batched log entries as JSON text messages.
-async fn flush_loop(mut receiver: mpsc::Receiver<QueuedEntry>, cfg: WsConfig) {
+///
+/// Remains dormant until the owning PluginCache generation commits; dropping
+/// the commit sender without publication exits with no connect/flush work.
+async fn flush_loop(
+    mut receiver: mpsc::Receiver<QueuedEntry>,
+    cfg: WsConfig,
+    commit_rx: watch::Receiver<bool>,
+) {
+    if !wait_until_committed(commit_rx).await {
+        drop(receiver);
+        return;
+    }
+
     if cfg.endpoint_url.is_empty() {
         while receiver.recv().await.is_some() {}
         return;
@@ -1444,6 +1535,7 @@ mod tests {
             error_class: Some(crate::retry::ErrorClass::ConnectionReset),
             consumer_username: Some("alice".to_string()),
             auth_method: Some("jwt_auth"),
+            connection_id: 0,
             metadata,
         };
         let entry = WsDisconnectLogEntry::from(&ctx);
