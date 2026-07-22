@@ -163,7 +163,7 @@ async fn mirror_results_before_at_and_after_five_seconds_remain_observable() {
 
     tokio::time::advance(std::time::Duration::from_secs(4)).await;
     for _ in 0..100 {
-        if mirrored_statuses().len() >= 1 {
+        if !mirrored_statuses().is_empty() {
             break;
         }
         tokio::task::yield_now().await;
