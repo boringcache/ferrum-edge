@@ -98,7 +98,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::AnyPool;
 use sqlx::any::AnyPoolOptions;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tracing::warn;
 use uuid::Uuid;
@@ -252,6 +255,8 @@ pub struct ExampleAuditPlugin {
     batch_config: BatchConfig,
     /// Set once during `start_background_tasks`; hot-path enqueue is lock-free.
     logger: OnceLock<BatchingLogger<AuditRecord>>,
+    /// Prevents an unstarted optional sink from emitting one warning per transaction.
+    drop_warning_emitted: AtomicBool,
     retention_task: OnceLock<tokio::task::AbortHandle>,
     /// Serializes idempotent startup only; never acquired on steady-state hooks.
     start_lock: Mutex<()>,
@@ -367,6 +372,7 @@ impl ExampleAuditPlugin {
             retention_days,
             batch_config,
             logger: OnceLock::new(),
+            drop_warning_emitted: AtomicBool::new(false),
             retention_task: OnceLock::new(),
             start_lock: Mutex::new(()),
         })
@@ -383,11 +389,13 @@ impl ExampleAuditPlugin {
                 }
             }
             None => {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    "example_audit_plugin: dropping audit record because the \
-                     background worker has not started (start_background_tasks)"
-                );
+                if !self.drop_warning_emitted.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        plugin = PLUGIN_NAME,
+                        "example_audit_plugin: dropping audit records because the \
+                         background worker has not started (start_background_tasks)"
+                    );
+                }
             }
         }
     }
