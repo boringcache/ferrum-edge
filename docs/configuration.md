@@ -892,7 +892,7 @@ FERRUM_FRONTEND_TLS_CERT_PATH = "/path/with spaces/cert.pem"
 
 A reference `ferrum.conf` with all available fields and descriptions is included in the repository root.
 
-**Precedence order:** environment variables > `ferrum.conf` > built-in defaults
+**Precedence order:** CLI flags (when using `ferrum-edge run` / `validate`) > environment variables > `ferrum.conf` > smart path/mode defaults > built-in defaults. See [cli.md](cli.md#configuration-precedence) for CLI override details. File-mode inference from a discovered or `--spec` path is a smart default and never overrides a `FERRUM_MODE` set by CLI, environment, or the selected settings file.
 
 ## File Mode Configuration Format
 

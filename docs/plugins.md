@@ -850,7 +850,7 @@ Only set when the gateway itself could not communicate with the backend (or when
 | `disconnect_cause` | String or null | Session termination cause: `"idle_timeout"`, `"recv_error"` (frontend recv failed), `"backend_error"` (backend recv failed), or `"graceful_shutdown"`. Disambiguates idle timeouts from recv errors (previously both presented as `error_class: null`). Omitted when null |
 | `timestamp_connected` | String (RFC 3339) | Connection start time |
 | `timestamp_disconnected` | String (RFC 3339) | Connection end time |
-| `sni_hostname` | String or null | SNI from TLS/DTLS ClientHello when passthrough mode is enabled; omitted from JSON when null |
+| `sni_hostname` | String or null | SNI from the frontend TLS/DTLS ClientHello for TCP TLS termination, DTLS termination, and TLS/DTLS passthrough; omitted from JSON when null |
 | `metadata` | Object | Plugin-injected key-value pairs; omitted from JSON when empty |
 
 #### Example: HTTP/1.1 or HTTP/2 (Buffered Response)
@@ -2422,7 +2422,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 
 The resolved request client identity canonicalizes IPv4-mapped IPv6 to native IPv4 once before plugin execution. Every local or Redis fallback key therefore uses the same canonical text without reparsing it in each limiter.
 
-**Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
+**Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. Every admitted (counted) request's client-visible response carries them — including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections raised by plugins that run after `rate_limiting`; requests that never reached the rate-limit check carry no metadata and get no synthesized headers. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
@@ -2953,7 +2953,13 @@ config:
 
 **Valid `target` values:** `header`, `query`, `body`. `target` is required on every rule — there is no default. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings. Header and query `value` must be strings; body `value` accepts any JSON type including explicit `null` (see below).
 
-**Header value constraints:** header `value` must not contain CR (`\r`) or LF (`\n`) — rejected at plugin load time as defence against header injection.
+**Configuration is fail-closed at plugin load time:**
+
+- Unknown top-level keys and unknown header/query/body rule keys are rejected with path-qualified diagnostics (for example `config.rules[0]`).
+- Unknown operations and unknown targets are rejected.
+- Header and query operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints.
+- Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
+- Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF keep a dedicated diagnostic and other forbidden control bytes (NUL, DEL, …) fail construction instead of being dropped later at a protocol boundary. Route-level request header transforms (`mesh_route_dispatch` → `apply_route_overrides`) apply the same value gate.
 
 **Body rules:** use dot-notation paths for nested JSON. Features:
 - **Nested objects** — `user.address.city`.
@@ -2997,7 +3003,14 @@ config:
 
 **Valid targets for `response_transformer` are `header` and `body` ONLY** — unlike `request_transformer`, there is no `query` target (query parameters are part of the request, not the response). Configs specifying `target: query` are rejected at plugin load time.
 
-**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
+**Operations and required fields** match `request_transformer` (see the table above). Configuration is fail-closed at plugin load time:
+
+- Unknown top-level keys and unknown header/body rule keys are rejected with path-qualified diagnostics (for example `config.rules[0]`).
+- Unknown operations and unknown targets (valid here: `header` or `body`) are rejected.
+- Header operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints.
+- Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
+- Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF, DEL, and other forbidden control bytes fail construction instead of being dropped later at a protocol boundary.
+- Non-string values for `target`, `operation`, `key`, or `new_key` are rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
 
 Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
@@ -3338,6 +3351,8 @@ Validates JSON, XML, and gRPC protobuf request and response bodies against schem
 
 Request-side validation only buffers matching request bodies: methods that can carry a body and whose `content-type` matches `content_types`. Response-only configs do not force request buffering.
 
+**Media-type matching:** `content_types` / `response_content_types` compare the `Content-Type` media-type essence (`type`/`subtype` before the first `;`, OWS-trimmed) to each configured entry with ASCII case-insensitive equality. Parameters such as `; charset=utf-8` are ignored for applicability, so `application/json; charset=utf-8` matches configured `application/json`. Distinct neighbors such as `application/json-seq`, and parameter values that merely contain a configured string (for example `application/octet-stream; profile="application/json"`), do not match unless that distinct type itself is configured. Configured entries are normalized the same way (parameters stripped); empty or parameter-only entries are rejected. Malformed or empty actual media-type tokens do not match and are skipped without panic. Once a type matches, JSON vs XML dispatch uses the same essence: exact `application/json` or an RFC 6838 `+json` suffix for JSON, and exact `application/xml` / `text/xml` or a `+xml` suffix for XML.
+
 **Priority:** 2950
 
 **Request validation:**
@@ -3350,7 +3365,7 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `required_xml_elements` | String[] | `[]` | Required XML element names |
 | `xml_max_entities` | usize | `100` | Maximum `<!ENTITY` declarations allowed in XML DOCTYPEs before rejecting as possible entity-expansion abuse. Applies to request and response XML validation. |
 | `xml_reject_nested_entities` | bool | `true` | Reject XML entity definitions, including parameter-entity expansions, that reference or generate other entity definitions. |
-| `content_types` | String[] | `["application/json","application/xml","text/xml"]` | MIME types to validate |
+| `content_types` | String[] | `["application/json","application/xml","text/xml"]` | Request media types to validate (exact type/subtype; see matching rules above) |
 
 **Response validation:**
 
@@ -3362,7 +3377,7 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `response_required_xml_elements` | String[] | `[]` | Required XML elements in responses |
 | `xml_max_entities` | usize | `100` | Shared request/response cap for XML entity declarations. |
 | `xml_reject_nested_entities` | bool | `true` | Shared request/response protection against nested or declaration-generating XML entities. |
-| `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response MIME types to validate |
+| `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response media types to validate (exact type/subtype; see matching rules above) |
 
 **Protobuf validation (gRPC):**
 

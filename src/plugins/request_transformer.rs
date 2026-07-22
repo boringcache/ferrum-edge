@@ -7,10 +7,13 @@
 //!
 //! Rules are validated and partitioned at construction time:
 //!
+//! - Unknown top-level and per-rule properties are rejected (no silent typos).
 //! - Unknown `operation` / `target` values are rejected (no silent no-ops).
-//! - `add` / `update` require a `value`; `rename` requires a `new_key`.
-//! - Header values with CR/LF characters are rejected (defence against
-//!   header injection via config).
+//! - Header/query operation fields are exact: only `add`/`update` accept
+//!   `value`; only `rename` accepts `new_key`; `remove` accepts neither.
+//! - Every configured header `value` must parse as an HTTP `HeaderValue`
+//!   (same complete syntax accepted at H1/H2/H3 emission). CR/LF keep a
+//!   dedicated diagnostic; other forbidden control bytes fail the same gate.
 //! - Rules are split into `header_rules` and `query_rules` so the hot path
 //!   does not dispatch on target strings per request, and so
 //!   [`modifies_request_headers`] returns an accurate answer (which lets the
@@ -47,8 +50,8 @@
 //! is fail-open).
 
 use async_trait::async_trait;
-use http::header::HeaderName;
-use serde_json::Value;
+use http::header::{HeaderName, HeaderValue};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -60,6 +63,17 @@ use super::utils::route_header_transform::{
 use super::{Plugin, PluginResult, RequestContext};
 
 pub mod runtime_overlay;
+
+/// Top-level config keys accepted by [`RequestTransformer::new`].
+const CONFIG_KEYS: &[&str] = &[
+    "rules",
+    "apply_route_overrides",
+    "runtime_overlay_scope",
+    "default_enabled",
+];
+
+/// Per-rule keys accepted for header, query, and body rules.
+const RULE_KEYS: &[&str] = &["operation", "target", "key", "value", "new_key"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HeaderOp {
@@ -143,11 +157,52 @@ fn contains_crlf(s: &str) -> bool {
     s.bytes().any(|b| b == b'\r' || b == b'\n')
 }
 
+fn reject_unknown_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "request_transformer: unknown config key(s) under '{path}': {}; allowed keys: {}",
+        unknown.join(", "),
+        allowed.join(", ")
+    ))
+}
+
+/// Validate a configured header value the same way outbound Hyper / H3 /
+/// reqwest adapters do (`HeaderValue::from_str`), while keeping the
+/// historical CR/LF-specific diagnostic for injection typos.
+fn validate_configured_header_value(value: &str, idx: usize) -> Result<(), String> {
+    if contains_crlf(value) {
+        return Err(format!(
+            "request_transformer: rule[{idx}]: header 'value' must not contain CR or LF"
+        ));
+    }
+    HeaderValue::from_str(value).map_err(|_| {
+        format!("request_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue")
+    })?;
+    Ok(())
+}
+
 impl RequestTransformer {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("request_transformer: config must be an object".to_string());
-        }
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "request_transformer: config must be an object; allowed keys: {}",
+                CONFIG_KEYS.join(", ")
+            )
+        })?;
+        reject_unknown_keys(config_obj, "config", CONFIG_KEYS)?;
+
         let mut header_rules: Vec<HeaderRule> = Vec::new();
         let mut query_rules: Vec<QueryRule> = Vec::new();
 
@@ -156,11 +211,12 @@ impl RequestTransformer {
                 .as_array()
                 .ok_or("request_transformer: 'rules' must be an array")?;
             for (idx, r) in arr.iter().enumerate() {
-                if !r.is_object() {
-                    return Err(format!(
-                        "request_transformer: rule[{idx}]: rule must be an object"
-                    ));
-                }
+                let rule_obj = r.as_object().ok_or_else(|| {
+                    format!("request_transformer: rule[{idx}]: rule must be an object")
+                })?;
+                let rule_path = format!("config.rules[{idx}]");
+                reject_unknown_keys(rule_obj, &rule_path, RULE_KEYS)?;
+
                 let target = match r.get("target") {
                     Some(Value::String(s)) => s.as_str(),
                     None => {
@@ -175,7 +231,9 @@ impl RequestTransformer {
                     }
                 };
 
-                // Body rules are validated and collected by `parse_body_rules`.
+                // Body rules are validated and collected by `parse_body_rules`
+                // (required / incompatible fields). Unknown keys are already
+                // rejected above.
                 if target == "body" {
                     continue;
                 }
@@ -218,6 +276,7 @@ impl RequestTransformer {
                         ));
                     }
                 };
+                let value_present = rule_obj.contains_key("value");
                 let value = match r.get("value") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
@@ -227,6 +286,7 @@ impl RequestTransformer {
                         ));
                     }
                 };
+                let new_key_present = rule_obj.contains_key("new_key");
                 let raw_new_key = match r.get("new_key") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
@@ -237,17 +297,46 @@ impl RequestTransformer {
                     }
                 };
 
-                // Per-operation required-field validation.
+                // Per-operation required- and forbidden-field validation.
+                // Incompatible extras are rejected rather than silently ignored
+                // so typos cannot produce a different transform than intended.
+                // Matches body-rule constraints in `body_transform`.
                 match op_str {
-                    "add" | "update" if value.is_none() => {
-                        return Err(format!(
-                            "request_transformer: rule[{idx}]: '{op_str}' operation requires a 'value'"
-                        ));
+                    "add" | "update" => {
+                        if value.is_none() {
+                            return Err(format!(
+                                "request_transformer: rule[{idx}]: '{op_str}' operation requires a 'value'"
+                            ));
+                        }
+                        if new_key_present {
+                            return Err(format!(
+                                "request_transformer: rule[{idx}]: 'new_key' must not be set for {target} '{op_str}' operation"
+                            ));
+                        }
                     }
-                    "rename" if raw_new_key.is_none() => {
-                        return Err(format!(
-                            "request_transformer: rule[{idx}]: 'rename' operation requires a 'new_key'"
-                        ));
+                    "rename" => {
+                        if value_present {
+                            return Err(format!(
+                                "request_transformer: rule[{idx}]: 'value' must not be set for {target} 'rename' operation"
+                            ));
+                        }
+                        if raw_new_key.is_none() {
+                            return Err(format!(
+                                "request_transformer: rule[{idx}]: 'rename' operation requires a 'new_key'"
+                            ));
+                        }
+                    }
+                    "remove" => {
+                        if value_present {
+                            return Err(format!(
+                                "request_transformer: rule[{idx}]: 'value' must not be set for {target} 'remove' operation"
+                            ));
+                        }
+                        if new_key_present {
+                            return Err(format!(
+                                "request_transformer: rule[{idx}]: 'new_key' must not be set for {target} 'remove' operation"
+                            ));
+                        }
                     }
                     _ => {}
                 }
@@ -273,15 +362,8 @@ impl RequestTransformer {
                         })
                         .transpose()?;
 
-                    // Defence-in-depth: reject CR/LF in header values at
-                    // config time (hyper would reject later, but failing at
-                    // load time gives clearer operator feedback).
-                    if let Some(ref v) = value
-                        && contains_crlf(v)
-                    {
-                        return Err(format!(
-                            "request_transformer: rule[{idx}]: header 'value' must not contain CR or LF"
-                        ));
+                    if let Some(ref v) = value {
+                        validate_configured_header_value(v, idx)?;
                     }
                     header_rules.push(HeaderRule {
                         operation: hop,
