@@ -5650,6 +5650,7 @@ async fn plugin_cache_wires_stable_plugin_config_id_into_dedup_logical_keys() {
             "POST".to_string(),
             "/orders".to_string(),
         );
+        ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"{}"));
         let mut headers = HashMap::new();
         headers.insert("idempotency-key".to_string(), "order-1".to_string());
         headers.insert("host".to_string(), "api.example".to_string());
