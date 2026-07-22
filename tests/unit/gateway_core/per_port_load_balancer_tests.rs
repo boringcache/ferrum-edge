@@ -224,15 +224,23 @@ fn port_wrr_vec_zero_weight_fallback_uses_port_counter() {
         ..GatewayConfig::default()
     };
     let cache = LoadBalancerCache::new(&config);
+    let control_cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
+    let control_snapshot = control_cache.load();
 
     LoadBalancerCache::select_target_from(&snapshot, "u1", "parent", None)
         .expect("parent selection");
     let selected =
         LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "port", 8080, None)
             .expect("port selection");
+    let control =
+        LoadBalancerCache::select_target_for_port_from(&control_snapshot, "u1", "port", 8080, None)
+            .expect("control port selection");
 
-    assert_eq!(selected.target.host, "h0");
+    assert_eq!(
+        selected.target.host, control.target.host,
+        "parent-lane selection must not advance the independent port WRR lane"
+    );
 }
 
 #[test]

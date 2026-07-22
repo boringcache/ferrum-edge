@@ -45,6 +45,10 @@ harness = false
 name = "ip_restriction"
 harness = false
 
+[[bench]]
+name = "wrr_selection"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true
