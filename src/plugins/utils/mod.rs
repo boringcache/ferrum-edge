@@ -44,8 +44,9 @@ pub mod transformer_gate;
 pub mod udp_endpoint;
 
 pub use batching_logger::{
-    BatchConfig, BatchingLogger, BatchingLoggerHandle, BatchingLoggerPermit, LoggerHooks,
-    MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
+    BatchConfig, BatchingLogger, BatchingLoggerHandle, BatchingLoggerPermit,
+    DeferredBatchingLogger, LoggerHooks, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
+    wait_until_committed,
 };
 pub use http_client::PluginHttpClient;
 pub use log_helpers::{

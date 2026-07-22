@@ -6,8 +6,8 @@ use std::time::Duration;
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
     SpoolManager, SpoolSettings, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    new_ulid, render_prometheus, replay_spool_once_for_tests, serialize_json_each_row,
-    write_private_file_atomically_for_tests,
+    new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
+    serialize_json_each_row, write_private_file_atomically_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::ChargeComputation;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
@@ -118,7 +118,9 @@ async fn grpc_per_event_exports_billable_and_raw_terminal_statuses() {
         {"status_codes": [503], "price_per_call": 0.09}
     ]);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
 
+    plugin.commit_background_tasks();
     plugin.log(&grpc_summary("grpc-ok", "0")).await;
     plugin.log(&grpc_summary("grpc-unavailable", "14")).await;
 
@@ -971,16 +973,29 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
     for _ in 0..20 {
         let plugin =
             ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
-        let node_dirs: Vec<_> = fs::read_dir(temp.path())
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .collect();
+        plugin.start_background_tasks().expect("chargeback start");
+        plugin.commit_background_tasks();
+        // Committed spool preparation is intentionally asynchronous: the
+        // replayer wakes on the publication gate and creates/probes live
+        // storage on its first tick. Validation and pre-commit staging must
+        // not create this directory.
+        let mut node_dirs = Vec::new();
+        for _ in 0..200 {
+            node_dirs = fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            if node_dirs.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             node_dirs.len(),
             1,
-            "enabled spool should create exactly one node directory"
+            "committed spool should create exactly one node directory"
         );
         let day = node_dirs[0].join("20260524");
         fs::create_dir_all(&day).unwrap();
@@ -1016,12 +1031,70 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
         prom.contains("chargeback_sink_spool_files 1\n"),
         "prometheus must count quarantined files toward spool.files; got:\n{prom}"
     );
+    assert!(
+        prom.contains("chargeback_sink_spool_available 1\n"),
+        "prepared committed spool must report available; got:\n{prom}"
+    );
+    assert!(
+        prom.contains("chargeback_sink_spool_prepare_failures_total 0\n"),
+        "healthy committed spool must have no preparation failures; got:\n{prom}"
+    );
     assert_eq!(
         disk_owned_bytes(temp.path()),
         corrupt_bytes,
         "on-disk owned usage must include the planted .corrupt file"
     );
     drop(held_plugin);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn committed_unusable_spool_latches_status_and_metric_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocked = temp.path().join("not-a-directory");
+    fs::write(&blocked, b"file blocks spool directory creation").unwrap();
+    let config = valid_config(&blocked);
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+
+    plugin
+        .start_background_tasks()
+        .expect("stage chargeback sink");
+    plugin.commit_background_tasks();
+
+    let mut status = Value::Null;
+    for _ in 0..200 {
+        status = serde_json::from_str(&render_status_json()).expect("status json");
+        if status["spool"]["prepare_failures_total"]
+            .as_u64()
+            .is_some_and(|failures| failures > 0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(status["spool"]["enabled"], true);
+    assert_eq!(status["spool"]["available"], false);
+    assert!(
+        status["spool"]["prepare_failures_total"]
+            .as_u64()
+            .is_some_and(|failures| failures > 0),
+        "committed unusable spool must retain operational failure evidence: {status}"
+    );
+
+    let prometheus = render_prometheus();
+    assert!(prometheus.contains("chargeback_sink_spool_available 0\n"));
+    let failures = prometheus
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("chargeback_sink_spool_prepare_failures_total ")
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    assert!(
+        failures > 0,
+        "missing persistent failure counter:\n{prometheus}"
+    );
 }
 
 #[cfg(unix)]
@@ -1148,6 +1221,8 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
     config["clickhouse"]["url"] = json!(server.uri());
     config["batch"]["size"] = json!(1);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
     assert!(plugin.requires_ws_disconnect_hooks());
 
     plugin
@@ -1194,7 +1269,9 @@ async fn connect_method_is_not_classified_as_websocket() {
     config["clickhouse"]["url"] = json!(server.uri());
     config["batch"]["size"] = json!(1);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
 
+    plugin.commit_background_tasks();
     plugin
         .log(&TransactionSummary {
             namespace: "ferrum".to_string(),
