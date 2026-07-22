@@ -1,3 +1,7 @@
+use ferrum_edge::_test_support::{
+    request_mirror_sample_phase_for_test, request_mirror_sample_threshold_for_test,
+    request_mirror_should_mirror_for_test,
+};
 use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
     HTTP_GRPC_PROTOCOLS, MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult,
@@ -699,7 +703,9 @@ fn mirror_plugin(percentage: f64) -> RequestMirror {
 }
 
 fn collect_selections(plugin: &RequestMirror, n: usize) -> Vec<bool> {
-    (0..n).map(|_| plugin.should_mirror()).collect()
+    (0..n)
+        .map(|_| request_mirror_should_mirror_for_test(plugin))
+        .collect()
 }
 
 fn selection_count(selections: &[bool]) -> usize {
@@ -720,9 +726,12 @@ fn selection_gaps(selections: &[bool]) -> Vec<usize> {
 
 fn assert_exact_cycle_count(percentage: f64, expected_threshold: u64) {
     let plugin = mirror_plugin(percentage);
-    assert_eq!(plugin.sample_threshold(), expected_threshold);
     assert_eq!(
-        plugin.sample_phase(),
+        request_mirror_sample_threshold_for_test(&plugin),
+        expected_threshold
+    );
+    assert_eq!(
+        request_mirror_sample_phase_for_test(&plugin),
         0,
         "construction must start at phase 0"
     );
@@ -797,12 +806,12 @@ fn test_sampling_gap_bounds_for_required_percentages() {
 #[test]
 fn test_sampling_zero_percent_never_selects() {
     let plugin = mirror_plugin(0.0);
-    assert_eq!(plugin.sample_threshold(), 0);
+    assert_eq!(request_mirror_sample_threshold_for_test(&plugin), 0);
     for _ in 0..(SAMPLE_PERIOD * 3) {
-        assert!(!plugin.should_mirror());
+        assert!(!request_mirror_should_mirror_for_test(&plugin));
     }
     assert_eq!(
-        plugin.sample_phase(),
+        request_mirror_sample_phase_for_test(&plugin),
         0,
         "0% must not advance the phase accumulator"
     );
@@ -811,12 +820,15 @@ fn test_sampling_zero_percent_never_selects() {
 #[test]
 fn test_sampling_hundred_percent_always_selects() {
     let plugin = mirror_plugin(100.0);
-    assert_eq!(plugin.sample_threshold(), SAMPLE_PERIOD);
+    assert_eq!(
+        request_mirror_sample_threshold_for_test(&plugin),
+        SAMPLE_PERIOD
+    );
     for _ in 0..(SAMPLE_PERIOD * 3) {
-        assert!(plugin.should_mirror());
+        assert!(request_mirror_should_mirror_for_test(&plugin));
     }
     assert_eq!(
-        plugin.sample_phase(),
+        request_mirror_sample_phase_for_test(&plugin),
         0,
         "100% must not advance the phase accumulator"
     );
@@ -845,7 +857,7 @@ fn test_sampling_is_evenly_spaced_not_contiguous_prefix() {
 #[test]
 fn test_sampling_construction_and_reload_reset_phase_without_prefix_burst() {
     let first = mirror_plugin(50.0);
-    assert_eq!(first.sample_phase(), 0);
+    assert_eq!(request_mirror_sample_phase_for_test(&first), 0);
     let first_cycle = collect_selections(&first, SAMPLE_PERIOD as usize);
     assert!(
         !first_cycle[0],
@@ -855,7 +867,7 @@ fn test_sampling_construction_and_reload_reset_phase_without_prefix_burst() {
 
     // Simulate config reload: a new instance resets phase independently.
     let reloaded = mirror_plugin(50.0);
-    assert_eq!(reloaded.sample_phase(), 0);
+    assert_eq!(request_mirror_sample_phase_for_test(&reloaded), 0);
     let reload_cycle = collect_selections(&reloaded, SAMPLE_PERIOD as usize);
     assert_eq!(
         first_cycle, reload_cycle,
@@ -877,8 +889,8 @@ fn test_sampling_construction_and_reload_reset_phase_without_prefix_burst() {
 fn test_sampling_phase_stays_bounded_across_many_cycles() {
     let plugin = mirror_plugin(33.3);
     for _ in 0..(SAMPLE_PERIOD * 5) {
-        let _ = plugin.should_mirror();
-        let phase = plugin.sample_phase();
+        let _ = request_mirror_should_mirror_for_test(&plugin);
+        let phase = request_mirror_sample_phase_for_test(&plugin);
         assert!(
             phase < SAMPLE_PERIOD,
             "phase must remain in 0..{SAMPLE_PERIOD}, got {phase}"
@@ -904,7 +916,7 @@ fn test_sampling_concurrent_calls_preserve_exact_cycle_count() {
         let selected = selected.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..per_thread {
-                if plugin.should_mirror() {
+                if request_mirror_should_mirror_for_test(&plugin) {
                     selected.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -916,10 +928,11 @@ fn test_sampling_concurrent_calls_preserve_exact_cycle_count() {
 
     assert_eq!(
         selected.load(Ordering::Relaxed) as u64,
-        (total as u64 / SAMPLE_PERIOD) * plugin.sample_threshold(),
+        (total as u64 / SAMPLE_PERIOD)
+            * request_mirror_sample_threshold_for_test(&plugin),
         "concurrent selection must preserve exact long-run counts"
     );
-    assert!(plugin.sample_phase() < SAMPLE_PERIOD);
+    assert!(request_mirror_sample_phase_for_test(&plugin) < SAMPLE_PERIOD);
 }
 
 #[tokio::test]

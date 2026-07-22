@@ -86,7 +86,8 @@
 //!
 //! **Concurrency:** selection uses a single `AtomicU64` phase with a lock-free
 //! compare-exchange update (relaxed ordering). No per-request allocation, RNG,
-//! formatting, or mutex. Contended CAS retries remain O(1) amortized.
+//! formatting, or mutex. The sampler guarantees system-wide progress under
+//! contention; an individual caller may retry after a competing update.
 //!
 //! **Wrap / exhaustion:** the phase is bounded to `0..1000` at every successful
 //! update, so integer wraparound of an unbounded counter cannot occur, cannot
@@ -271,7 +272,7 @@ impl RequestMirror {
     // This accessor exists for the external sampling contract tests. The
     // production request path reads the field directly in `should_mirror`.
     #[allow(dead_code)]
-    pub fn sample_threshold(&self) -> u64 {
+    pub(crate) fn sample_threshold_for_test(&self) -> u64 {
         self.sample_threshold
     }
 
@@ -279,7 +280,7 @@ impl RequestMirror {
     // This accessor exists for the external sampling contract tests. The
     // production request path updates the atomic directly in `should_mirror`.
     #[allow(dead_code)]
-    pub fn sample_phase(&self) -> u64 {
+    pub(crate) fn sample_phase_for_test(&self) -> u64 {
         self.sample_phase.load(Ordering::Relaxed)
     }
 
@@ -330,9 +331,8 @@ impl RequestMirror {
     /// Should this request be mirrored (deterministic evenly spaced sampling)?
     ///
     /// See the module-level "Percentage sampling" section for phase/reset,
-    /// concurrency, and wrap semantics. Exposed as `pub` so unit tests can
-    /// observe selection decisions without spawning detached mirror tasks.
-    pub fn should_mirror(&self) -> bool {
+    /// concurrency, and wrap semantics.
+    fn should_mirror(&self) -> bool {
         let threshold = self.sample_threshold;
         if threshold == 0 {
             return false;
@@ -363,6 +363,13 @@ impl RequestMirror {
                 Err(observed) => current = observed,
             }
         }
+    }
+
+    /// External-test probe for the real state-advancing sampler without
+    /// widening the production API surface.
+    #[allow(dead_code)]
+    pub(crate) fn should_mirror_for_test(&self) -> bool {
+        self.should_mirror()
     }
 }
 

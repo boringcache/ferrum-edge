@@ -577,6 +577,25 @@ pub mod _test_support {
             .map_err(|error| error.to_string())
     }
 
+    // ── plugins/request_mirror ───────────────────────────────────────────────
+    pub fn request_mirror_should_mirror_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> bool {
+        plugin.should_mirror_for_test()
+    }
+
+    pub fn request_mirror_sample_threshold_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.sample_threshold_for_test()
+    }
+
+    pub fn request_mirror_sample_phase_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.sample_phase_for_test()
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
