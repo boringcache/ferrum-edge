@@ -49,7 +49,7 @@ jobs:
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -184,7 +184,7 @@ jobs:
               integration::db_incremental_poll_tests
               integration::db_offline_bootstrap_tests
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -288,7 +288,7 @@ jobs:
         if: needs.coverage-plan.outputs.mode == 'full' && needs.coverage-shard.result != 'success'
         run: exit 1
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.coverage-plan.outputs.mode != 'skip'
         with:
           fetch-depth: 0

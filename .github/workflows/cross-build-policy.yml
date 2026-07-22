@@ -21,7 +21,7 @@ jobs:
       # pull_request_target loads this workflow from the base branch. Keep the
       # checkout on the trusted base commit and treat the PR's configuration
       # and workflow files only as data; no code from the PR is executed here.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0

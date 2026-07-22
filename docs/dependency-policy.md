@@ -252,8 +252,11 @@ jobs are a separate supply-chain surface from Rust crates. Policy:
    accurate version comment (for example
    `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`).
    Mutable tags (`@v7`, `@v7.0.1`), branches (`@main`), and short SHAs are
-   forbidden. Local composite actions under `./.github/actions/...` are allowed
-   without a SHA pin.
+   forbidden. `docker://` action references require an explicit
+   `@sha256:<64-hex>` image digest. Local composite actions under
+   `./.github/actions/...` and reusable workflows directly under
+   `./.github/workflows/` are allowed without a SHA pin; local Docker actions
+   must also digest-pin every non-`scratch` `FROM` image.
 2. **Install kind, kubectl, and Helm only through**
    [`.github/actions/setup-kubernetes-tools`](../.github/actions/setup-kubernetes-tools/action.yml).
    That composite action downloads from official versioned release URLs, verifies
@@ -271,7 +274,17 @@ jobs are a separate supply-chain surface from Rust crates. Policy:
    kind/kubectl/Helm downloads outside the composite action. Repository-local
    actions are allowed, but dynamic or matrix-generated `uses` references are
    rejected because the checker cannot prove that every generated value is a
-   full immutable SHA.
+   full immutable SHA. A separate read-only job executes a pull request's
+   proposed planner self-tests without using its output for scheduling, so new
+   policy code is exercised before merge while the base branch remains the
+   authority for job gates.
+
+   This is deliberately static enforcement, not a shell interpreter. It catches
+   known direct URLs and folded/continued installer commands, but cannot prove
+   the destination of a URL assembled indirectly from shell variables or other
+   obfuscation. Reviewers must treat such construction as unverified and require
+   a literal, versioned URL plus repository-pinned checksum (or the centralized
+   installer) before approving it.
 
 ### Refreshing GitHub Actions (Dependabot)
 

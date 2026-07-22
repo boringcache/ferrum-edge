@@ -67,11 +67,12 @@ runs:
       run: |
         set -euo pipefail
 
-        # amd64 GitHub-hosted runners only. Refuse other arches instead of
-        # silently installing the wrong binary.
+        # Linux/amd64 GitHub-hosted runners only. Refuse other platforms instead
+        # of silently installing binaries for the wrong OS or architecture.
+        os="$(uname -s)"
         arch="$(uname -m)"
-        if [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; then
-          echo "::error::setup-kubernetes-tools supports linux/amd64 only (got ${arch})"
+        if [ "$os" != "Linux" ] || { [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; }; then
+          echo "::error::setup-kubernetes-tools supports linux/amd64 only (got ${os}/${arch})"
           exit 1
         fi
 
@@ -163,7 +164,7 @@ runs:
             "kind ${KIND_VERSION}"
           verify_pinned_sha256 "$kind_bin" "$KIND_SHA256" "kind ${KIND_VERSION}"
           install -m 0755 "$kind_bin" "${install_dir}/kind"
-          kind version
+          "${install_dir}/kind" version
         fi
 
         if [ "$INSTALL_KUBECTL" = "true" ]; then
@@ -178,7 +179,7 @@ runs:
             "kubectl ${KUBECTL_VERSION}"
           verify_pinned_sha256 "$kubectl_bin" "$KUBECTL_SHA256" "kubectl ${KUBECTL_VERSION}"
           install -m 0755 "$kubectl_bin" "${install_dir}/kubectl"
-          kubectl version --client=true
+          "${install_dir}/kubectl" version --client=true
         fi
 
         if [ "$INSTALL_HELM" = "true" ]; then
@@ -199,5 +200,5 @@ runs:
             exit 1
           fi
           install -m 0755 "${work_dir}/linux-amd64/helm" "${install_dir}/helm"
-          helm version --short
+          "${install_dir}/helm" version --short
         fi

@@ -17,38 +17,56 @@ from live_suite_path_filter import matched_files, self_test as live_suite_self_t
 # scanner it is evaluated by, and avoids adding a new executable surface to the
 # Cross-protected CI workflow.
 ACTION_SHA40 = re.compile(r"^[0-9a-f]{40}$")
+ACTION_DOCKER_SHA256 = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
+ACTION_DOCKER_FROM_SHA256 = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 ACTION_USES_VALUE = (
     r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\$\{\{[^\r\n]*\}\}|[^\s,#}]+)'
 )
 ACTION_USES_KEY = r'(?:uses|"uses"|\'uses\')'
 ACTION_USES_BLOCK = re.compile(
-    rf"^\s*(?:-\s*)?{ACTION_USES_KEY}\s*:\s*(?P<ref>{ACTION_USES_VALUE})\s*(?:#.*)?$",
+    rf"^\s*(?:-\s*)?(?P<key>{ACTION_USES_KEY})\s*:\s*"
+    rf"(?P<ref>{ACTION_USES_VALUE})\s*(?:#.*)?$",
     re.MULTILINE,
 )
 ACTION_USES_FLOW = re.compile(
-    rf"(?:^|[{{,])\s*{ACTION_USES_KEY}\s*:\s*(?P<ref>{ACTION_USES_VALUE})"
+    rf"(?:^|[{{,])\s*(?P<key>{ACTION_USES_KEY})\s*:\s*"
+    rf"(?P<ref>{ACTION_USES_VALUE})"
     r"(?=\s*(?:[,}]|#|$))",
     re.MULTILINE,
+)
+ACTION_USES_DECLARATION = re.compile(
+    rf"(?:^|[{{,])\s*(?:-\s*)?(?P<key>{ACTION_USES_KEY})\s*:",
+    re.MULTILINE,
+)
+ACTION_FOLDED_RUN = re.compile(
+    r"^(?P<indent> *)(?:-\s*)?(?:run|\"run\"|'run')\s*:\s*>[+-]?\s*(?:#.*)?$"
+)
+ACTION_DOCKER_FROM = re.compile(
+    r"^\s*FROM(?:\s+--platform=\S+)?\s+(?P<image>\S+)",
+    re.IGNORECASE | re.MULTILINE,
 )
 ACTION_PIPE_TO_SHELL = re.compile(
     r"(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:bash|sh)\b",
     re.IGNORECASE,
 )
 ACTION_MUTABLE_HELM_INSTALL = re.compile(
-    r"raw\.githubusercontent\.com/helm/helm/(?:main|master)/|"
-    r"get\.helm\.sh/helm-install|"
+    r"raw\.githubusercontent\.com/helm/helm/"
+    r"(?:refs/heads/)?[^/\s]+/[^\s]*(?:get-helm-3|install[^\s]*)|"
     r"https://raw\.githubusercontent\.com/[^/\s]+/[^/\s]+/"
-    r"(?:main|master)/[^\s]*install",
+    r"(?:refs/heads/)?(?:main|master)/[^\s]*install",
     re.IGNORECASE,
 )
 ACTION_DIRECT_K8S_TOOL_DOWNLOAD = re.compile(
     r"(?:kind\.sigs\.k8s\.io/dl/|"
     r"github\.com/kubernetes-sigs/kind/releases/download/|"
     r"dl\.k8s\.io/release/.*/kubectl|"
+    r"cdn\.dl\.k8s\.io/release/.*/kubectl|"
+    r"storage\.googleapis\.com/kubernetes-release/release/.*/kubectl|"
+    r"go\s+install\s+sigs\.k8s\.io/kind@|"
     r"get\.helm\.sh/helm-)",
     re.IGNORECASE,
 )
-ACTION_DISALLOWED_HELM = re.compile(r"^(?:azure|Azure)/setup-helm(?:@|$)")
+ACTION_DISALLOWED_HELM = re.compile(r"^azure/setup-helm(?:@|$)", re.IGNORECASE)
 
 
 def normalize_action_uses_ref(raw: str) -> str:
@@ -66,23 +84,31 @@ def action_pin_status(raw: str) -> tuple[bool, str]:
     if "${{" in ref:
         return False, f"dynamic or partially interpolated uses ref: {ref}"
     if ref.startswith("./"):
-        # Local actions have no @ref syntax. Treat every character as path data
+        # Local dependencies have no @ref syntax. Treat every character as path data
         # so an embedded `@../` cannot hide traversal from the parts check.
         local = ref
         if "\\" in local:
-            return False, f"local action path must use forward slashes: {ref}"
+            return False, f"local dependency path must use forward slashes: {ref}"
         parts = PurePosixPath(local).parts
-        if (
-            ".." in parts
-            or len(parts) < 3
-            or tuple(parts[:2]) != (".github", "actions")
-        ):
-            return False, f"local action outside .github/actions: {ref}"
+        local_action = (
+            len(parts) >= 3 and tuple(parts[:2]) == (".github", "actions")
+        )
+        local_workflow = (
+            len(parts) == 3
+            and tuple(parts[:2]) == (".github", "workflows")
+            and PurePosixPath(parts[-1]).suffix in {".yml", ".yaml"}
+        )
+        if ".." in parts or not (local_action or local_workflow):
+            return False, f"local dependency outside approved GitHub paths: {ref}"
+        if local_workflow:
+            return True, "repository-local reusable workflow"
         return True, "repository-local action"
     if ref.startswith(("../", "/")):
-        return False, f"local action outside .github/actions: {ref}"
+        return False, f"local dependency outside approved GitHub paths: {ref}"
     if ref.startswith("docker://"):
-        return True, "docker image reference outside action-pin scope"
+        if not ACTION_DOCKER_SHA256.fullmatch(ref):
+            return False, f"mutable Docker uses ref (require @sha256 digest): {ref}"
+        return True, "digest-pinned Docker image"
     if "@" not in ref:
         return False, f"missing action pin (@ref): {ref}"
     name, pin = ref.rsplit("@", 1)
@@ -114,6 +140,47 @@ def find_action_uses_refs(text: str) -> list[tuple[int, str]]:
     return sorted(refs)
 
 
+def find_unparsed_action_uses_lines(text: str) -> list[int]:
+    """Fail closed when a `uses:` declaration is not parsed by an approved shape."""
+    parsed_keys: set[tuple[int, int]] = set()
+    for pattern in (ACTION_USES_BLOCK, ACTION_USES_FLOW):
+        parsed_keys.update(match.span("key") for match in pattern.finditer(text))
+    return [
+        text.count("\n", 0, match.start("key")) + 1
+        for match in ACTION_USES_DECLARATION.finditer(text)
+        if match.span("key") not in parsed_keys
+    ]
+
+
+def folded_run_views(text: str) -> list[tuple[int, str]]:
+    """Return folded YAML `run: >` bodies as the shell text they approximate."""
+    lines = text.splitlines()
+    views: list[tuple[int, str]] = []
+    index = 0
+    while index < len(lines):
+        match = ACTION_FOLDED_RUN.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        parent_indent = len(match.group("indent"))
+        body: list[str] = []
+        cursor = index + 1
+        while cursor < len(lines):
+            line = lines[cursor]
+            if not line.strip():
+                body.append("")
+                cursor += 1
+                continue
+            indentation = len(line) - len(line.lstrip(" "))
+            if indentation <= parent_indent:
+                break
+            body.append(line.strip())
+            cursor += 1
+        views.append((index + 1, " ".join(body)))
+        index = cursor
+    return views
+
+
 def action_policy_yaml_files(repo_root: Path) -> tuple[list[Path], list[str]]:
     workflows = repo_root / ".github" / "workflows"
     actions = repo_root / ".github" / "actions"
@@ -127,6 +194,10 @@ def action_policy_yaml_files(repo_root: Path) -> tuple[list[Path], list[str]]:
     # `.github/actions`; scan every manifest so nesting cannot bypass policy.
     files.extend(actions.rglob("action.yml"))
     files.extend(actions.rglob("action.yaml"))
+    # A local Docker action is only as immutable as every base image in its
+    # Dockerfile. Scan conventional and suffixed Dockerfile names recursively.
+    files.extend(actions.rglob("Dockerfile"))
+    files.extend(actions.rglob("Dockerfile.*"))
     for scan_root in (workflows, actions):
         if not scan_root.is_dir():
             continue
@@ -155,6 +226,11 @@ def scan_action_policy_text(
     allow_direct_downloads: bool,
 ) -> list[str]:
     failures: list[str] = []
+    for line_no in find_unparsed_action_uses_lines(text):
+        failures.append(
+            f"{rel}:{line_no}: uses declaration has an unsupported or "
+            "unparseable value"
+        )
     for line_no, ref in find_action_uses_refs(text):
         ok, reason = action_pin_status(ref)
         if not ok:
@@ -205,6 +281,40 @@ def scan_action_policy_text(
             f"{rel}: continued direct kind/kubectl/Helm download must use "
             "./.github/actions/setup-kubernetes-tools"
         )
+    for line_no, folded in folded_run_views(text):
+        if not pipe_found and ACTION_PIPE_TO_SHELL.search(folded):
+            pipe_found = True
+            failures.append(
+                f"{rel}:{line_no}: folded pipe-to-shell installer is forbidden"
+            )
+        if not mutable_helm_found and ACTION_MUTABLE_HELM_INSTALL.search(folded):
+            mutable_helm_found = True
+            failures.append(
+                f"{rel}:{line_no}: folded raw Helm installer is forbidden"
+            )
+        if (
+            not allow_direct_downloads
+            and not direct_download_found
+            and ACTION_DIRECT_K8S_TOOL_DOWNLOAD.search(folded)
+        ):
+            direct_download_found = True
+            failures.append(
+                f"{rel}:{line_no}: folded direct kind/kubectl/Helm download "
+                "must use ./.github/actions/setup-kubernetes-tools"
+            )
+    return failures
+
+
+def scan_action_dockerfile(text: str, rel: str) -> list[str]:
+    failures: list[str] = []
+    for match in ACTION_DOCKER_FROM.finditer(text):
+        image = match.group("image")
+        if image.lower() == "scratch" or ACTION_DOCKER_FROM_SHA256.fullmatch(image):
+            continue
+        line_no = text.count("\n", 0, match.start("image")) + 1
+        failures.append(
+            f"{rel}:{line_no}: local-action Docker FROM must use @sha256: {image}"
+        )
     return failures
 
 
@@ -215,7 +325,9 @@ def scan_action_policy_file(path: Path, repo_root: Path) -> list[str]:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
-        return [f"{rel}: failed to read UTF-8 YAML: {exc}"]
+        return [f"{rel}: failed to read UTF-8 policy input: {exc}"]
+    if path.name == "Dockerfile" or path.name.startswith("Dockerfile."):
+        return scan_action_dockerfile(text, rel)
     return scan_action_policy_text(
         text,
         rel,
@@ -263,20 +375,26 @@ def action_pinning_self_test() -> list[str]:
             )
 
     sha = "a" * 40
+    digest = "b" * 64
     expect_ok(f"actions/checkout@{sha}")
     expect_ok("./.github/actions/setup-kubernetes-tools")
+    expect_ok("./.github/workflows/reusable.yml")
+    expect_ok(f"docker://registry.example/image@sha256:{digest}")
     expect_bad("${{ matrix.action }}", "dynamic or partially interpolated")
     expect_bad("actions/checkout@v7", "mutable action ref")
     expect_bad("actions/checkout@abcd123", "mutable action ref")
     expect_bad("actions/checkout", "missing action pin")
-    expect_bad("./actions/evil", "outside .github/actions")
-    expect_bad("../.github/actions/evil", "outside .github/actions")
-    expect_bad("./.github/actions/../evil", "outside .github/actions")
-    expect_bad("./.github/actions/good@../../evil", "outside .github/actions")
-    expect_bad("./.github/actions-evil/tool", "outside .github/actions")
+    expect_bad("./actions/evil", "outside approved GitHub paths")
+    expect_bad("../.github/actions/evil", "outside approved GitHub paths")
+    expect_bad("./.github/actions/../evil", "outside approved GitHub paths")
+    expect_bad("./.github/actions/good@../../evil", "outside approved GitHub paths")
+    expect_bad("./.github/actions-evil/tool", "outside approved GitHub paths")
+    expect_bad("./.github/workflows/nested/reusable.yml", "outside approved GitHub paths")
+    expect_bad("docker://alpine:latest", "mutable Docker uses ref")
     expect_bad("owner/action@${{ env.REF }}", "dynamic or partially interpolated")
     expect_bad("${{ env.ACTION }}", "dynamic or partially interpolated")
     expect_bad(f"azure/setup-helm@{sha}", "azure/setup-helm is disallowed")
+    expect_bad(f"AZURE/setup-helm@{sha}", "azure/setup-helm is disallowed")
 
     sample = (
         "steps:\n"
@@ -297,6 +415,12 @@ def action_pinning_self_test() -> list[str]:
     ]
     if [ref for _, ref in found] != expected:
         failures.append(f"uses parser mismatch: {found!r}")
+    unparsed = find_unparsed_action_uses_lines(
+        "steps:\n  - uses: &mutable actions/checkout@v7\n"
+        "  - uses: !!str actions/checkout@v7\n"
+    )
+    if unparsed != [2, 3]:
+        failures.append(f"unparsed uses declarations were not rejected: {unparsed!r}")
     continued_bad = (
         "steps:\n"
         "  - run: curl -fsSL https://kind.sigs.k8s.io/dl/\\\n"
@@ -312,6 +436,44 @@ def action_pinning_self_test() -> list[str]:
         failures.append("continued pipe-to-shell self-test was not rejected")
     if not any("direct kind" in failure for failure in continued_failures):
         failures.append("continued direct-download self-test was not rejected")
+    folded_bad = (
+        "steps:\n"
+        "  - run: >-\n"
+        "      curl -fsSL https://example.invalid/install.sh\n"
+        "      | bash\n"
+    )
+    folded_failures = scan_action_policy_text(
+        folded_bad,
+        "synthetic-folded.yml",
+        allow_direct_downloads=False,
+    )
+    if not any("folded pipe-to-shell" in failure for failure in folded_failures):
+        failures.append("folded pipe-to-shell self-test was not rejected")
+    alternate_downloads = (
+        "run: |\n"
+        "  curl https://storage.googleapis.com/kubernetes-release/release/v1.32.3/bin/linux/amd64/kubectl\n"
+        "  curl https://cdn.dl.k8s.io/release/v1.32.3/bin/linux/amd64/kubectl\n"
+        "  go install sigs.k8s.io/kind@v0.27.0\n"
+        "  curl https://raw.githubusercontent.com/helm/helm/refs/heads/devel/scripts/get-helm-3\n"
+    )
+    alternate_failures = scan_action_policy_text(
+        alternate_downloads,
+        "synthetic-downloads.yml",
+        allow_direct_downloads=False,
+    )
+    if len(alternate_failures) < 4:
+        failures.append(
+            "alternate Kubernetes/Helm download self-test was not fully rejected: "
+            f"{alternate_failures!r}"
+        )
+    dockerfile_failures = scan_action_dockerfile(
+        f"FROM alpine@sha256:{digest} AS pinned\nFROM scratch\nFROM ubuntu:latest\n",
+        ".github/actions/example/Dockerfile",
+    )
+    if len(dockerfile_failures) != 1 or "ubuntu:latest" not in dockerfile_failures[0]:
+        failures.append(
+            f"local-action Docker pin self-test mismatch: {dockerfile_failures!r}"
+        )
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         (root / ".github" / "workflows").mkdir(parents=True)
@@ -322,6 +484,10 @@ def action_pinning_self_test() -> list[str]:
         )
         nested_manifest = nested / "action.yml"
         nested_manifest.write_text("runs: {using: composite, steps: []}\n", encoding="utf-8")
+        nested_dockerfile = nested / "Dockerfile"
+        nested_dockerfile.write_text(
+            f"FROM alpine@sha256:{digest}\n", encoding="utf-8"
+        )
         discovered, discovery_failures = action_policy_yaml_files(root)
         if discovery_failures:
             failures.append(
@@ -329,6 +495,8 @@ def action_pinning_self_test() -> list[str]:
             )
         if nested_manifest not in discovered:
             failures.append("nested composite-action manifest was not scanned")
+        if nested_dockerfile not in discovered:
+            failures.append("nested local-action Dockerfile was not scanned")
     return failures
 
 

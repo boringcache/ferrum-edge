@@ -53,6 +53,9 @@ env:
   FERRUM_IMAGE_TAG: node-waypoint-ebpf-live
   KIND_CLUSTER: ferrum-ebpf-live
   ISTIO_VERSION: 1.24.3
+  # Commit behind the signed Istio 1.24.3 release tag.
+  ISTIO_COMMIT_SHA: 44d0e58e49d0dc89e27fc4f8679c68132d46b887
+  ISTIO_CRD_SHA256: 952afcf4b1bf47d2bdf1f230d636f9e613c3ee9cc68ef53ab751f6d59e2ee205
 
 jobs:
   node-waypoint-ebpf-live:
@@ -62,7 +65,7 @@ jobs:
 
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -137,7 +140,14 @@ jobs:
       - name: Install Istio policy CRDs
         run: |
           set -euo pipefail
-          kubectl apply --server-side=true -f "https://raw.githubusercontent.com/istio/istio/${ISTIO_VERSION}/manifests/charts/base/files/crd-all.gen.yaml"
+          crd_path="${RUNNER_TEMP}/istio-${ISTIO_VERSION}-crd-all.gen.yaml"
+          crd_url="https://raw.githubusercontent.com/istio/istio/${ISTIO_COMMIT_SHA}/manifests/charts/base/files/crd-all.gen.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 30 --max-time 300 \
+            -o "$crd_path" "$crd_url"
+          test -s "$crd_path"
+          printf '%s  %s\n' "$ISTIO_CRD_SHA256" "$crd_path" | sha256sum --check --strict
+          kubectl apply --server-side=true -f "$crd_path"
           for crd in \
             authorizationpolicies.security.istio.io \
             peerauthentications.security.istio.io \

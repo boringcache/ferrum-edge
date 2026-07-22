@@ -22,10 +22,13 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 - External GitHub Actions must be pinned to a full commit SHA (see
   `docs/dependency-policy.md` → "CI Actions and Kubernetes tooling").
+- `docker://` action refs and local-action Dockerfile bases must use full
+  SHA-256 image digests; `scratch` is the only unpinned Dockerfile base.
 - kind / kubectl / Helm install only via
   `.github/actions/setup-kubernetes-tools` with repository-pinned checksums.
 - The trusted-base `pr_ci_plan.py --self-test` rejects mutable or dynamic
-  action refs, pipe-to-shell installers, and unverified tool downloads.
+  action refs, pipe-to-shell installers, and unverified tool downloads. The
+  pull request's proposed policy is tested separately but never controls gates.
 
 ## Drift Guard
 
