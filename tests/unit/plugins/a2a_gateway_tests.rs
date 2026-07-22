@@ -344,7 +344,7 @@ async fn rest_agent_card_response_rewrites_gateway_urls() {
     let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "protocolVersion": "0.3.0",
@@ -362,7 +362,7 @@ async fn rest_agent_card_response_rewrites_gateway_urls() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     let PluginResult::Reject {
         status_code, body, ..
@@ -437,7 +437,7 @@ async fn jsonrpc_agent_card_response_rewrites_gateway_urls() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(plugin.should_buffer_response_body(&ctx));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "jsonrpc": "2.0",
@@ -463,7 +463,7 @@ async fn jsonrpc_agent_card_response_rewrites_gateway_urls() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     let PluginResult::Reject { body, .. } = result else {
         panic!("JSON-RPC agent card rewrite should replace response body");
@@ -500,7 +500,7 @@ async fn agent_card_rewrite_still_runs_when_metadata_is_disabled() {
     assert!(ctx.metadata.is_empty());
     assert!(plugin.should_buffer_response_body(&ctx));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "protocolVersion": "0.3.0",
@@ -510,7 +510,7 @@ async fn agent_card_rewrite_still_runs_when_metadata_is_disabled() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     let PluginResult::Reject { body, .. } = result else {
         panic!("agent card rewrite should replace response body");
@@ -532,7 +532,7 @@ async fn non_agent_card_response_shape_is_not_rewritten() {
     let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "protocolVersion": "0.3.0",
@@ -543,7 +543,7 @@ async fn non_agent_card_response_shape_is_not_rewritten() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -565,7 +565,7 @@ async fn invalid_forwarded_origin_does_not_rewrite_agent_card() {
     let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "protocolVersion": "0.3.0",
@@ -575,7 +575,7 @@ async fn invalid_forwarded_origin_does_not_rewrite_agent_card() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -593,7 +593,7 @@ async fn response_host_is_not_used_for_agent_card_public_rewrite() {
     let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let response_headers = HashMap::from([
+    let mut response_headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
         ("host".to_string(), "backend.example.com".to_string()),
     ]);
@@ -605,7 +605,7 @@ async fn response_host_is_not_used_for_agent_card_public_rewrite() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -630,7 +630,7 @@ async fn trusted_forwarded_origin_rewrites_agent_card_url() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(plugin.should_buffer_response_body(&ctx));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "protocolVersion": "0.3.0",
@@ -640,7 +640,7 @@ async fn trusted_forwarded_origin_rewrites_agent_card_url() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     let PluginResult::Reject { body, .. } = result else {
         panic!("trusted forwarded origin should rewrite the agent card");
@@ -666,7 +666,7 @@ async fn trusted_host_header_rewrites_agent_card_url_without_forwarded_host() {
     let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "protocolVersion": "0.3.0",
@@ -676,7 +676,7 @@ async fn trusted_host_header_rewrites_agent_card_url_without_forwarded_host() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     let PluginResult::Reject { body, .. } = result else {
         panic!("trusted host header should rewrite the agent card");
@@ -699,7 +699,7 @@ async fn agent_card_rewrite_strips_stale_body_coupled_headers() {
     assert!(matches!(result, PluginResult::Continue));
 
     // Mixed-case header names exercise the case-insensitive strip.
-    let response_headers = HashMap::from([
+    let mut response_headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
         ("Content-Length".to_string(), "128".to_string()),
         ("Content-Encoding".to_string(), "gzip".to_string()),
@@ -722,7 +722,7 @@ async fn agent_card_rewrite_strips_stale_body_coupled_headers() {
     .to_string();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     let PluginResult::Reject { headers, body, .. } = result else {
         panic!("agent card rewrite should replace response body");
@@ -1159,7 +1159,7 @@ async fn task_id_metadata_uses_known_a2a_locations_only() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(!ctx.metadata.contains_key("a2a.task_id"));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "jsonrpc": "2.0",
@@ -1170,7 +1170,7 @@ async fn task_id_metadata_uses_known_a2a_locations_only() {
     })
     .to_string();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!ctx.metadata.contains_key("a2a.task_id"));
@@ -1213,7 +1213,7 @@ async fn response_metadata_normalizes_task_state() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let response_headers =
+    let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = json!({
         "jsonrpc": "2.0",
@@ -1227,7 +1227,7 @@ async fn response_metadata_normalizes_task_state() {
     })
     .to_string();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &response_headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut response_headers, body.as_bytes())
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(

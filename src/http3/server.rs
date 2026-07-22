@@ -6419,7 +6419,7 @@ async fn handle_h3_request(
                     plugin.on_response_body(
                         &mut ctx,
                         response_status,
-                        &response_headers,
+                        &mut response_headers,
                         &response_body,
                     ),
                 )
@@ -6432,7 +6432,12 @@ async fn handle_h3_request(
                     }
                 };
                 match result {
-                    PluginResult::Continue => {}
+                    PluginResult::Continue => {
+                        ctx.record_deadline_response_header_plugin(
+                            plugin.as_ref(),
+                            &response_headers,
+                        );
+                    }
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {

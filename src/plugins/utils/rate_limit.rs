@@ -1323,10 +1323,18 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                         // reservation).
                         state.current_usage(now);
                     }
-                    return RateLimitOutcome::allow();
+                } else {
+                    state.adjust_usage(now, reservation_id, delta);
                 }
-                state.adjust_usage(now, reservation_id, delta);
+                // Surface post-reconcile bucket state so `expose_headers` can
+                // refresh `x-ai-ratelimit-usage` / `remaining` after admission.
+                let usage = state.current_usage(now);
+                let remaining = state.remaining(now);
                 RateLimitOutcome::allow()
+                    .with_limit(self.token_limit)
+                    .with_window(self.window_seconds)
+                    .with_usage(usage)
+                    .with_remaining(remaining)
             }
         }
     }
@@ -1418,6 +1426,20 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 actual_tokens,
                 delta,
             } => {
+                // Read both live sliding-window counters before mutating either
+                // one. If this read fails, failover is still safe because Redis
+                // has not been changed. A post-mutation telemetry read could
+                // fail after the correction landed and then replay the same
+                // operation against the local fallback.
+                let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
+                let prev_idx = curr_idx.saturating_sub(1);
+                let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(self.window_seconds);
+                let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
+                let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+                let (mut prev_count, mut curr_count) =
+                    redis.get_two_counters(&prev_key, &curr_key).await?;
+                let ttl = self.window_seconds * 2 + 1;
+
                 // `reservation_id` identifies the matching entry only in the
                 // local in-memory window; the Redis counter is aggregate, so it
                 // is intentionally ignored here.
@@ -1437,28 +1459,21 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // schedule. No `reserved_window_index` exists for a
                     // local-origin reservation, so the current window is correct.
                     if actual_tokens > 0 {
-                        let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
-                        let redis_key = redis.make_key(&[key, &curr_idx.to_string()]);
-                        let ttl = self.window_seconds * 2 + 1;
                         let increment = u64_to_i64_saturating(actual_tokens);
-                        let _ = redis.incrby_with_expire(&redis_key, increment, ttl).await?;
+                        curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
                     }
                     // `actual_tokens == 0` (full release of a local reservation)
                     // is a no-op against Redis — there is nothing on this backend
                     // to release, and the local reservation expires on its own.
-                    return Ok(RateLimitOutcome::allow());
-                }
-                if delta != 0 {
+                } else if delta != 0 {
                     // Debit the window the reservation actually credited (carried
                     // back from the `Reserve` outcome) so a request that
                     // straddles a window rollover corrects the right counter. If
                     // the reserved window is unknown (e.g. an `Unknown`-origin
                     // reservation with no markers), fall back to the current
                     // window — the floor below still prevents a budget-bypass.
-                    let target_idx = reserved_window_index
-                        .unwrap_or_else(|| RedisRateLimitClient::window_index(self.window_seconds));
+                    let target_idx = reserved_window_index.unwrap_or(curr_idx);
                     let redis_key = redis.make_key(&[key, &target_idx.to_string()]);
-                    let ttl = self.window_seconds * 2 + 1;
                     // Floor the per-window counter at zero. Reconciliation
                     // deltas are usually negative (reserved ≫ actual; non-2xx
                     // releases the full reservation); a raw INCRBY could drive
@@ -1466,11 +1481,25 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // lets the consumer reserve the full limit again — defeating
                     // centralized enforcement. Matches the floor-at-zero in the
                     // local `TokenUsageWindow::adjust_usage` path.
-                    let _ = redis
+                    let adjusted_count = redis
                         .incrby_with_expire_floor_zero(&redis_key, delta, ttl)
                         .await?;
+                    if target_idx == curr_idx {
+                        curr_count = adjusted_count;
+                    } else if target_idx == prev_idx {
+                        prev_count = adjusted_count;
+                    }
                 }
-                Ok(RateLimitOutcome::allow())
+                // Compute post-reconcile telemetry without another fallible
+                // Redis call after the mutation.
+                let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+                let usage = weighted.max(0.0) as u64;
+                let remaining = self.token_limit.saturating_sub(usage);
+                Ok(RateLimitOutcome::allow()
+                    .with_limit(self.token_limit)
+                    .with_window(self.window_seconds)
+                    .with_usage(usage)
+                    .with_remaining(remaining))
             }
         }
     }
@@ -2192,6 +2221,38 @@ mod tests {
         assert!(exact.allowed);
         assert_eq!(exact.usage, Some(100));
         assert_eq!(exact.remaining, Some(0));
+    }
+
+    #[test]
+    fn ai_token_window_adjust_usage_returns_post_reconcile_usage_remaining() {
+        // #2261: AdjustUsage must surface the post-reconcile bucket so expose_headers
+        // can refresh x-ai-ratelimit-usage / remaining after admission.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        let id = reserved.reservation_id.expect("reserve returns an id");
+        assert_eq!(reserved.usage, Some(100));
+        assert_eq!(reserved.remaining, Some(900));
+
+        let adjusted = algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(id),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 10,
+                delta: -90,
+            },
+            now,
+        );
+        assert!(adjusted.allowed);
+        assert_eq!(adjusted.usage, Some(10));
+        assert_eq!(adjusted.remaining, Some(990));
+        assert_eq!(adjusted.limit, Some(1000));
+        assert_eq!(adjusted.window_seconds, Some(60));
     }
 
     #[test]

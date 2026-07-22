@@ -14868,7 +14868,12 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         .await
         .into_plugin_result(ctx);
         match result {
-            PluginResult::Continue => {}
+            PluginResult::Continue => {
+                // Inspect-phase header mutations (e.g. ai_rate_limiter
+                // refreshing usage/remaining after reconcile) must enter
+                // deadline provenance the same way after_proxy mutations do.
+                ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
+            }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let reject = plugin_result_into_reject_parts(reject)
                     .expect("reject result should convert to rejection parts");
@@ -22453,14 +22458,19 @@ async fn handle_proxy_request_inner(
                             plugin.on_response_body(
                                 &mut ctx,
                                 response_status,
-                                &plugin_response_headers,
+                                &mut plugin_response_headers,
                                 &response_body,
                             ),
                         )
                         .await
                         .into_plugin_result(&mut ctx);
                         match result {
-                            PluginResult::Continue => {}
+                            PluginResult::Continue => {
+                                ctx.record_deadline_response_header_plugin(
+                                    plugin.as_ref(),
+                                    &plugin_response_headers,
+                                );
+                            }
                             reject @ PluginResult::Reject { .. }
                             | reject @ PluginResult::RejectBinary { .. } => {
                                 let reject = plugin_result_into_reject_parts(reject)
@@ -24304,12 +24314,14 @@ async fn handle_proxy_request_inner(
             let deadline = ctx.grpc_deadline_at();
             let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
-                plugin.on_response_body(&mut ctx, response_status, &response_headers, data),
+                plugin.on_response_body(&mut ctx, response_status, &mut response_headers, data),
             )
             .await
             .into_plugin_result(&mut ctx);
             match result {
-                PluginResult::Continue => {}
+                PluginResult::Continue => {
+                    ctx.record_deadline_response_header_plugin(plugin.as_ref(), &response_headers);
+                }
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
                     let reject = plugin_result_into_reject_parts(reject)
@@ -34125,7 +34137,7 @@ mod tests {
             &self,
             ctx: &mut RequestContext,
             _response_status: u16,
-            _response_headers: &HashMap<String, String>,
+            _response_headers: &mut HashMap<String, String>,
             _body: &[u8],
         ) -> PluginResult {
             ctx.metadata

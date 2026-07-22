@@ -111,7 +111,7 @@ async fn test_provider_is_case_insensitive() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -119,7 +119,7 @@ async fn test_provider_is_case_insensitive() {
 
     let body = openai_response(80, 30);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     let mut ctx2 = create_test_context();
@@ -148,10 +148,10 @@ async fn test_token_accumulation_and_limit() {
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 
     // Record 150 tokens
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
     let body = openai_response(100, 50);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // Second request passes (150 < 200)
@@ -162,7 +162,7 @@ async fn test_token_accumulation_and_limit() {
     // Record another 100 tokens (total now 250)
     let body2 = openai_response(60, 40);
     plugin
-        .on_response_body(&mut ctx2, 200, &resp_headers, &body2)
+        .on_response_body(&mut ctx2, 200, &mut resp_headers, &body2)
         .await;
 
     // Third request should be rejected (250 >= 200) and exported by the
@@ -195,10 +195,10 @@ async fn test_sliding_window_eviction() {
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
     let body = openai_response(80, 30); // 110 tokens
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // Should be rejected now
@@ -231,7 +231,7 @@ async fn test_different_consumers_independent() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     // Consumer A uses 150 tokens
     let mut ctx_a = create_test_context();
@@ -240,7 +240,7 @@ async fn test_different_consumers_independent() {
     plugin.before_proxy(&mut ctx_a, &mut headers_a).await;
     let body = openai_response(100, 50);
     plugin
-        .on_response_body(&mut ctx_a, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx_a, 200, &mut resp_headers, &body)
         .await;
 
     // Consumer A should be rejected
@@ -274,7 +274,7 @@ async fn test_count_mode_prompt_tokens() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -283,7 +283,7 @@ async fn test_count_mode_prompt_tokens() {
     // 50 prompt + 500 completion = only 50 counted
     let body = openai_response(50, 500);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // Should still pass (50 < 100)
@@ -304,7 +304,7 @@ async fn test_count_mode_completion_tokens() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -313,7 +313,7 @@ async fn test_count_mode_completion_tokens() {
     // 500 prompt + 50 completion = only 50 counted
     let body = openai_response(500, 50);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // Should still pass (50 < 100)
@@ -335,7 +335,7 @@ async fn test_anthropic_format() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -346,7 +346,7 @@ async fn test_anthropic_format() {
     }))
     .unwrap();
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // 120 total > 100 limit
@@ -369,7 +369,7 @@ async fn test_google_format() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -384,7 +384,7 @@ async fn test_google_format() {
     }))
     .unwrap();
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // 110 > 100
@@ -417,7 +417,7 @@ async fn test_non_json_response_not_counted() {
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-type".to_string(), "text/plain".to_string());
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, b"not json")
+        .on_response_body(&mut ctx, 200, &mut resp_headers, b"not json")
         .await;
 
     // No tokens counted — should still pass
@@ -437,7 +437,7 @@ async fn test_non_2xx_response_not_counted() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -446,7 +446,7 @@ async fn test_non_2xx_response_not_counted() {
     // 500 error with tokens — should NOT count
     let body = openai_response(500, 500);
     plugin
-        .on_response_body(&mut ctx, 500, &resp_headers, &body)
+        .on_response_body(&mut ctx, 500, &mut resp_headers, &body)
         .await;
 
     // Should still pass
@@ -466,13 +466,13 @@ async fn test_empty_body_not_counted() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, b"")
+        .on_response_body(&mut ctx, 200, &mut resp_headers, b"")
         .await;
 
     let mut ctx2 = create_test_context();
@@ -491,7 +491,7 @@ async fn test_zero_tokens_counted_but_no_usage() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -499,7 +499,7 @@ async fn test_zero_tokens_counted_but_no_usage() {
 
     let body = openai_response(0, 0);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // 0 tokens used — still within limit
@@ -555,7 +555,7 @@ async fn test_expose_headers_on_rejection() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     // Record 100 tokens
     let mut ctx = create_test_context();
@@ -563,7 +563,7 @@ async fn test_expose_headers_on_rejection() {
     plugin.before_proxy(&mut ctx, &mut headers).await;
     let body = openai_response(60, 40);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // Should be rejected with headers
@@ -595,7 +595,7 @@ async fn test_consumer_fallback_to_ip() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     // No consumer set — should use IP as key
     let mut ctx = create_test_context();
@@ -606,7 +606,7 @@ async fn test_consumer_fallback_to_ip() {
 
     let body = openai_response(80, 30);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
     // Same IP should be rejected
@@ -636,7 +636,7 @@ async fn test_reads_tokens_from_ai_token_metrics_metadata() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -652,7 +652,7 @@ async fn test_reads_tokens_from_ai_token_metrics_metadata() {
 
     // Pass an empty body — the plugin should read from metadata, not body
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, b"")
+        .on_response_body(&mut ctx, 200, &mut resp_headers, b"")
         .await;
 
     // Should have recorded 150 tokens from metadata → next request rejected
@@ -803,7 +803,7 @@ async fn test_anthropic_sse_only_message_delta_records_completion_tokens() {
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, sse)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, sse)
         .await;
 
     let mut ctx2 = create_test_context();
@@ -812,7 +812,7 @@ async fn test_anthropic_sse_only_message_delta_records_completion_tokens() {
 
     let sse2 = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":300}}\n\n";
     plugin
-        .on_response_body(&mut ctx2, 200, &resp_headers, sse2)
+        .on_response_body(&mut ctx2, 200, &mut resp_headers, sse2)
         .await;
 
     // 750 + 300 = 1050 → exceeds 1000 → next request must be rejected.
@@ -851,7 +851,7 @@ async fn test_cohere_v2_sse_message_end_records_tokens() {
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, sse)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, sse)
         .await;
 
     // 75 tokens recorded — second request fits (75 + 25 ≤ 100), a 26-token
@@ -862,7 +862,7 @@ async fn test_cohere_v2_sse_message_end_records_tokens() {
 
     let sse2 = b"data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":15,\"output_tokens\":15}}}}\n\n";
     plugin
-        .on_response_body(&mut ctx2, 200, &resp_headers, sse2)
+        .on_response_body(&mut ctx2, 200, &mut resp_headers, sse2)
         .await;
 
     let mut ctx3 = create_test_context();
@@ -896,12 +896,12 @@ async fn test_window_running_sum_matches_after_eviction() {
 
     let body100 = openai_response(50, 50);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body100)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body100)
         .await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let body50 = openai_response(20, 30);
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body50)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body50)
         .await;
 
     // Next call should see remaining = 200 - 50 = 150.
@@ -1046,7 +1046,7 @@ async fn test_sse_with_usage_block_still_recorded() {
                data: {\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":8,\"total_tokens\":50}}\n\n\
                data: [DONE]\n\n";
     plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), sse.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), sse.as_bytes())
         .await;
 
     assert_eq!(
@@ -1081,7 +1081,7 @@ async fn streaming_without_usage_charged_or_rejected() {
                data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n\
                data: [DONE]\n\n";
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), sse.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), sse.as_bytes())
         .await;
     assert_continue(result);
 
@@ -1114,7 +1114,7 @@ async fn unmetered_2xx_is_not_free_in_enforce_mode() {
     // Valid JSON, but no usage block the extractor understands.
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_continue(result);
 
@@ -1215,7 +1215,7 @@ async fn compressed_request_skips_pre_reservation_and_reconciles_actual_usage() 
     // No control traffic touched this instance's key, so cumulative usage == 55.
     let body = openai_response(40, 15);
     let reconcile = plugin
-        .on_response_body(&mut compressed, 200, &json_headers(), &body)
+        .on_response_body(&mut compressed, 200, &mut json_headers(), &body)
         .await;
     assert_continue(reconcile);
     assert_eq!(
@@ -1254,7 +1254,7 @@ async fn compressed_unmetered_2xx_reject_mode_returns_502() {
 
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_reject(result, Some(502));
 }
@@ -1279,7 +1279,7 @@ async fn compressed_unmetered_2xx_default_charge_estimate_rejects_without_estima
 
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_reject(result, Some(502));
 }
@@ -1347,7 +1347,7 @@ async fn compressed_decompressed_ai_request_classified_in_on_final() {
     // A usage-less 2xx is now subject to the default charge_estimate reject → 502.
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_reject(result, Some(502));
 }
@@ -1402,7 +1402,7 @@ async fn compressed_decompressed_non_ai_request_not_marked() {
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 }
@@ -1481,7 +1481,7 @@ async fn compressed_framed_grpc_json_not_marked() {
     let body = serde_json::to_vec(&json!({"id": "x"})).unwrap();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 }
@@ -1652,7 +1652,7 @@ async fn unmetered_2xx_warn_mode_releases_reservation() {
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 
@@ -1690,7 +1690,7 @@ async fn unmetered_2xx_reject_mode_returns_502() {
 
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_reject(result, Some(502));
 
@@ -1735,7 +1735,7 @@ async fn non_ai_2xx_is_not_rejected_in_reject_mode() {
     // radius would have rejected — must continue, not 502.
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), b"")
+            .on_response_body(&mut ctx, 200, &mut json_headers(), b"")
             .await,
     );
 
@@ -1744,7 +1744,7 @@ async fn non_ai_2xx_is_not_rejected_in_reject_mode() {
     html_headers.insert("content-type".to_string(), "text/html".to_string());
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &html_headers, b"<html>ok</html>")
+            .on_response_body(&mut ctx, 200, &mut html_headers, b"<html>ok</html>")
             .await,
     );
 }
@@ -1794,7 +1794,7 @@ async fn completion_tokens_mode_ai_request_still_subject_to_reject_policy() {
     // An unmetered 2xx for this AI request must still be rejected per policy.
     let body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_reject(result, Some(502));
 }
@@ -1826,7 +1826,7 @@ async fn non_2xx_releases_pre_request_reservation() {
     let body = openai_response(500, 500);
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 500, &json_headers(), &body)
+            .on_response_body(&mut ctx, 500, &mut json_headers(), &body)
             .await,
     );
 
@@ -1864,7 +1864,7 @@ async fn actual_usage_above_reservation_charges_extra() {
     let body = openai_response(400, 600); // 1000 total tokens
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 
@@ -2113,7 +2113,7 @@ async fn non_2xx_release_then_gateway_rejection_reconciles_exactly_once() {
     let body = openai_response(500, 500);
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 500, &json_headers(), &body)
+            .on_response_body(&mut ctx, 500, &mut json_headers(), &body)
             .await,
     );
     assert!(
@@ -2939,7 +2939,7 @@ async fn test_on_response_body_does_not_charge_federation_tokens() {
     // marker, not by an unparseable body.
     let body = openai_response(100, 200);
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_continue(result);
     assert_eq!(
@@ -3012,7 +3012,7 @@ async fn test_cache_hit_is_not_charged_against_token_budget() {
     }))
     .unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_continue(result);
 
@@ -3060,7 +3060,7 @@ async fn test_response_caching_hit_is_not_charged_against_token_budget() {
     }))
     .unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_continue(result);
 
@@ -3111,7 +3111,7 @@ async fn test_request_deduplication_replay_is_not_charged_against_token_budget()
     }))
     .unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
     assert_continue(result);
 
@@ -3151,7 +3151,7 @@ async fn test_replay_response_header_alone_does_not_skip_charging() {
 
     let body = openai_response(100, 200);
     let result = plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
     assert_continue(result);
 
@@ -3200,7 +3200,7 @@ async fn test_response_mock_synthetic_body_is_not_charged() {
     }))
     .unwrap();
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_continue(result);
 
@@ -3245,7 +3245,7 @@ async fn test_fresh_response_is_still_charged_despite_replay_exemption() {
 
     let body = openai_response(100, 200);
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_continue(result);
 
@@ -3451,7 +3451,7 @@ async fn non_llm_json_post_is_not_treated_as_ai_request() {
     let body = serde_json::to_vec(&json!({"ok": true})).unwrap();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 
@@ -3505,7 +3505,7 @@ async fn non_llm_json_post_is_not_treated_as_ai_request() {
     let ai_body = serde_json::to_vec(&json!({"id": "x", "object": "thing"})).unwrap();
     assert_reject(
         plugin
-            .on_response_body(&mut ai_ctx, 200, &json_headers(), &ai_body)
+            .on_response_body(&mut ai_ctx, 200, &mut json_headers(), &ai_body)
             .await,
         Some(502),
     );
@@ -3881,4 +3881,288 @@ async fn prompt_estimate_preserves_whole_body_fallback_prompt_with_role_informat
         "role_information must not drop the fallback-counted `inputs` prompt \
          (got {reserved_with_role}, inputs-only was {reserved_inputs_only})"
     );
+}
+
+// ─── #2261: exposed headers reflect post-reconcile bucket state ─────────
+
+/// Drive the real production ordering for a successful buffered metered response:
+/// `before_proxy` (reserve + admission metadata) → `after_proxy` (copy headers) →
+/// `on_response_body` (reconcile actual usage + refresh client-visible headers).
+async fn run_expose_header_lifecycle(
+    plugin: &AiRateLimiter,
+    max_tokens: u64,
+    prompt: &str,
+    actual_prompt: u64,
+    actual_completion: u64,
+) -> (RequestContext, HashMap<String, String>, u64) {
+    let mut ctx = ai_request_ctx(max_tokens, prompt);
+    let mut request_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut request_headers).await);
+
+    let reserved = reserved_tokens(&ctx);
+    assert!(
+        reserved > 0,
+        "lifecycle fixture must take a pre-request reservation"
+    );
+    let admission_usage = ctx
+        .metadata
+        .get("ai_ratelimit_usage")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert_eq!(
+        admission_usage, reserved,
+        "admission metadata usage must equal the reservation estimate"
+    );
+
+    // The production hook only parses buffered JSON responses when the upstream
+    // response declares a JSON-compatible media type. Keep this lifecycle fixture
+    // faithful to a real OpenAI-style response so reconciliation sees `usage`.
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    let reserved_str = reserved.to_string();
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
+        Some(reserved_str.as_str()),
+        "after_proxy must initially expose the admission estimate"
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-remaining")
+            .map(String::as_str),
+        Some(ctx.metadata.get("ai_ratelimit_remaining").unwrap().as_str())
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-limit")
+            .map(String::as_str),
+        Some("1000")
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-window")
+            .map(String::as_str),
+        Some("60")
+    );
+
+    let body = openai_response(actual_prompt, actual_completion);
+    let actual_total = actual_prompt.saturating_add(actual_completion);
+    assert_ne!(
+        actual_total, reserved,
+        "fixture must use actual usage different from the reservation estimate"
+    );
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+    );
+
+    (ctx, response_headers, actual_total)
+}
+
+#[tokio::test]
+async fn expose_headers_lifecycle_reflects_reconciled_usage_local() {
+    // #2261: after_proxy copies admission estimate headers before on_response_body
+    // reconciles. The final client-visible usage/remaining must describe the
+    // bucket after actual provider usage lands — not the reservation snapshot.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let (ctx, response_headers, actual) =
+        run_expose_header_lifecycle(&plugin, 200, "hello world", 4, 6).await;
+
+    let actual_str = actual.to_string();
+    let remaining_str = (1000 - actual).to_string();
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
+        Some(actual_str.as_str()),
+        "final headers must expose reconciled usage, not the admission estimate"
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-remaining")
+            .map(String::as_str),
+        Some(remaining_str.as_str()),
+        "final remaining must match the post-reconcile bucket"
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-limit")
+            .map(String::as_str),
+        Some("1000"),
+        "limit stays coherent across reconcile"
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-window")
+            .map(String::as_str),
+        Some("60"),
+        "window stays coherent across reconcile"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_ratelimit_usage").map(String::as_str),
+        Some(actual_str.as_str()),
+        "metadata must refresh with the reconciled outcome"
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        actual,
+        "internal window must charge actual usage after the lifecycle"
+    );
+}
+
+#[tokio::test]
+async fn expose_headers_lifecycle_reflects_reconciled_usage_redis_fallback() {
+    // Redis-compatible path: sync_mode=redis with an unreachable broker falls
+    // back to the local window. AdjustUsage still returns post-reconcile
+    // usage/remaining, and the same before_proxy → after_proxy → on_response_body
+    // ordering must refresh client-visible headers.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true,
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:1/0",
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 60,
+            "redis_key_prefix": "ferrum:ai_rate_limiter:issue2261"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let (_ctx, response_headers, actual) =
+        run_expose_header_lifecycle(&plugin, 180, "redis fallback prompt", 5, 5).await;
+
+    let actual_str = actual.to_string();
+    let remaining_str = (1000 - actual).to_string();
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
+        Some(actual_str.as_str()),
+        "Redis-fallback lifecycle must expose reconciled usage on the final headers"
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-remaining")
+            .map(String::as_str),
+        Some(remaining_str.as_str())
+    );
+    assert_eq!(observed_usage(&plugin).await, actual);
+}
+
+#[tokio::test]
+async fn expose_headers_lifecycle_positive_delta_charges_extra() {
+    // Actual usage ABOVE the reservation (positive delta) must raise both the
+    // internal window and the final exposed usage/remaining.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "count_mode": "completion_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // completion_tokens mode reserves only max_tokens (50). Actual completion=80.
+    let (ctx, response_headers, _actual) =
+        run_expose_header_lifecycle(&plugin, 50, "short", 10, 80).await;
+    assert_eq!(reserved_tokens(&ctx), 50);
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
+        Some("80")
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-remaining")
+            .map(String::as_str),
+        Some("920")
+    );
+    assert_eq!(observed_usage(&plugin).await, 80);
+}
+
+#[tokio::test]
+async fn expose_headers_non_2xx_release_refreshes_remaining() {
+    // Non-2xx releases the reservation in on_response_body after after_proxy
+    // already copied admission headers. Final usage/remaining must show the
+    // released bucket (zero charged for this request).
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(100, "will fail");
+    let mut request_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut request_headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0);
+    let reserved_str = reserved.to_string();
+
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 500, &mut response_headers)
+            .await,
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
+        Some(reserved_str.as_str())
+    );
+
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                500,
+                &mut response_headers,
+                br#"{"error":"upstream"}"#,
+            )
+            .await,
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
+        Some("0"),
+        "non-2xx release must refresh usage to the post-release bucket"
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-remaining")
+            .map(String::as_str),
+        Some("1000")
+    );
+    assert_eq!(observed_usage(&plugin).await, 0);
 }

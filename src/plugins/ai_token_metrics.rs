@@ -506,7 +506,7 @@ impl Plugin for AiTokenMetrics {
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
-        response_headers: &HashMap<String, String>,
+        response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         // Do not record token usage for ANY synthetic short-circuit body. A

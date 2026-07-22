@@ -397,6 +397,26 @@ impl AiRateLimiter {
         );
     }
 
+    /// Copy exposed rate-limit telemetry from request metadata into the
+    /// client-visible response map. Used by `after_proxy` (admission and
+    /// federation/gateway reconcile) and again by `on_response_body` after
+    /// buffered usage reconciliation so the final headers match the bucket.
+    fn apply_exposed_headers(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if !self.expose_headers {
+            return;
+        }
+
+        for (meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {
+            if let Some(value) = ctx.metadata.get(*meta_key) {
+                response_headers.insert(header_name.to_string(), value.clone());
+            }
+        }
+    }
+
     fn reject(&self, usage: u64) -> PluginResult {
         let mut headers = HashMap::new();
         if self.expose_headers {
@@ -444,7 +464,7 @@ impl AiRateLimiter {
         reservation_backend: ReservationBackend,
         actual_tokens: u64,
         reserved_tokens: u64,
-    ) {
+    ) -> Option<RateLimitOutcome> {
         let delta = Self::reservation_delta(actual_tokens, reserved_tokens);
         // Skip only when there is genuinely nothing to apply on ANY backend:
         // no actual usage to charge and no reservation to release. `delta == 0`
@@ -453,22 +473,23 @@ impl AiRateLimiter {
         // a request whose `actual == reserved` (`delta == 0`) but `actual > 0`
         // must still be dispatched so the now-active backend records that usage.
         if actual_tokens == 0 && delta == 0 {
-            return;
+            return None;
         }
-        let _ = self
-            .limiter
-            .check(
-                key.clone(),
-                &key,
-                &AiRateLimitOp::AdjustUsage {
-                    reservation_id,
-                    reserved_window_index,
-                    reservation_backend,
-                    actual_tokens,
-                    delta,
-                },
-            )
-            .await;
+        Some(
+            self.limiter
+                .check(
+                    key.clone(),
+                    &key,
+                    &AiRateLimitOp::AdjustUsage {
+                        reservation_id,
+                        reserved_window_index,
+                        reservation_backend,
+                        actual_tokens,
+                        delta,
+                    },
+                )
+                .await,
+        )
     }
 
     /// Which backend the original reservation for this request landed on,
@@ -645,15 +666,23 @@ impl AiRateLimiter {
                 ACTUAL_TOKENS_METADATA_KEY.to_string(),
                 actual_tokens.to_string(),
             );
-            self.adjust_usage(
-                self.rate_key(ctx),
-                reservation_id,
-                reserved_window_index,
-                reservation_backend,
-                actual_tokens,
-                reserved_tokens,
-            )
-            .await;
+            if let Some(outcome) = self
+                .adjust_usage(
+                    self.rate_key(ctx),
+                    reservation_id,
+                    reserved_window_index,
+                    reservation_backend,
+                    actual_tokens,
+                    reserved_tokens,
+                )
+                .await
+            {
+                // Refresh expose-header metadata to the post-reconcile bucket so
+                // later header copies (after_proxy federation/gateway, or
+                // on_response_body on the normal path) describe actual usage —
+                // not the pre-request admission estimate (#2261).
+                self.store_metadata(ctx, &outcome);
+            }
             return PluginResult::Continue;
         }
 
@@ -685,15 +714,19 @@ impl AiRateLimiter {
         );
 
         if !(200..300).contains(&response_status) {
-            self.adjust_usage(
-                self.rate_key(ctx),
-                reservation_id,
-                reserved_window_index,
-                reservation_backend,
-                0,
-                reserved_tokens,
-            )
-            .await;
+            if let Some(outcome) = self
+                .adjust_usage(
+                    self.rate_key(ctx),
+                    reservation_id,
+                    reserved_window_index,
+                    reservation_backend,
+                    0,
+                    reserved_tokens,
+                )
+                .await
+            {
+                self.store_metadata(ctx, &outcome);
+            }
             return PluginResult::Continue;
         }
 
@@ -741,15 +774,19 @@ impl AiRateLimiter {
                     UNMETERED_ACTION_METADATA_KEY.to_string(),
                     OnUnmeteredResponse::Warn.as_str().to_string(),
                 );
-                self.adjust_usage(
-                    self.rate_key(ctx),
-                    reservation_id,
-                    reserved_window_index,
-                    reservation_backend,
-                    0,
-                    reserved_tokens,
-                )
-                .await;
+                if let Some(outcome) = self
+                    .adjust_usage(
+                        self.rate_key(ctx),
+                        reservation_id,
+                        reserved_window_index,
+                        reservation_backend,
+                        0,
+                        reserved_tokens,
+                    )
+                    .await
+                {
+                    self.store_metadata(ctx, &outcome);
+                }
                 warn!(
                     provider = %self.provider,
                     count_mode = %self.count_mode,
@@ -1737,11 +1774,7 @@ impl Plugin for AiRateLimiter {
             return PluginResult::Continue;
         }
 
-        for (meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {
-            if let Some(value) = ctx.metadata.get(*meta_key) {
-                response_headers.insert(header_name.to_string(), value.clone());
-            }
-        }
+        self.apply_exposed_headers(ctx, response_headers);
 
         PluginResult::Continue
     }
@@ -1771,7 +1804,7 @@ impl Plugin for AiRateLimiter {
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
-        response_headers: &HashMap<String, String>,
+        response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         // Federation tokens are reconciled EXCLUSIVELY by `after_proxy`, never
@@ -1832,9 +1865,15 @@ impl Plugin for AiRateLimiter {
                 "ai_rate_limiter: skipping non-2xx response (status {})",
                 response_status
             );
-            return self
+            let result = self
                 .reconcile_usage(ctx, response_status, None, "non_2xx_response")
                 .await;
+            // `after_proxy` already copied admission-time usage/remaining; refresh
+            // the client-visible map now that the reservation was released.
+            if matches!(result, PluginResult::Continue) {
+                self.apply_exposed_headers(ctx, response_headers);
+            }
+            return result;
         }
 
         let content_type = response_headers
@@ -1864,7 +1903,18 @@ impl Plugin for AiRateLimiter {
             self.extract_token_count(body)
         });
 
-        self.reconcile_usage(ctx, response_status, tokens, unmetered_detail)
-            .await
+        let result = self
+            .reconcile_usage(ctx, response_status, tokens, unmetered_detail)
+            .await;
+        // Production ordering is `after_proxy` (admission headers) →
+        // `on_response_body` (reconcile). Re-apply so the final client-visible
+        // `x-ai-ratelimit-usage` / `remaining` match the reconciled bucket, not
+        // the reservation estimate. Limit/window stay coherent from metadata.
+        // Reject paths rebuild the response from `PluginResult::Reject` headers
+        // (e.g. unmetered `reject` → empty map), so skip the refresh there.
+        if matches!(result, PluginResult::Continue) {
+            self.apply_exposed_headers(ctx, response_headers);
+        }
+        result
     }
 }

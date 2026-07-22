@@ -6039,7 +6039,11 @@ pub trait Plugin: Send + Sync {
     /// The body bytes are the normalized backend response body (after
     /// `normalize_response_body_with_context`, before ordinary response
     /// transformation). The response_status and response_headers are the values
-    /// after the `after_proxy` phase.
+    /// after the `after_proxy` phase. `response_headers` is mutable so a plugin
+    /// may refresh client-visible headers after body inspection (for example
+    /// `ai_rate_limiter` rewriting `x-ai-ratelimit-usage` / `remaining` after
+    /// usage reconciliation). The proxy records deadline provenance for each
+    /// completed Continue so those mutations survive a later deadline rebuild.
     ///
     /// Returning `PluginResult::Reject` replaces the buffered response with the
     /// rejection body/status before it reaches the client (useful for enforcing
@@ -6048,7 +6052,7 @@ pub trait Plugin: Send + Sync {
         &self,
         _ctx: &mut RequestContext,
         _response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        _response_headers: &mut HashMap<String, String>,
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue

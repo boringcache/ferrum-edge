@@ -637,7 +637,7 @@ async fn multiple_instances_admit_independently_for_unknown_keys() {
         good.on_response_body(
             &mut ctx,
             200,
-            &json_headers(),
+            &mut json_headers(),
             &response_with_tool_call("report.read", "{}"),
         )
         .await,
@@ -682,7 +682,7 @@ async fn allows_tool_in_allowlist() {
     let mut ctx = create_test_context();
     let body = response_with_tool_call("github.create_pr", "{\"repo\":\"acme/app\"}");
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_continue(result);
     assert_eq!(
@@ -700,7 +700,7 @@ async fn denies_unknown_tool_via_default_deny() {
     let mut ctx = create_test_context();
     let body = response_with_tool_call("kubectl.apply", "{}");
     let result = plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_reject(result, Some(403));
     assert_eq!(
@@ -718,7 +718,7 @@ async fn denies_explicit_deny_tool() {
     let body = response_with_tool_call("kubectl.apply", "{}");
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(403),
     );
@@ -736,7 +736,7 @@ async fn denies_on_max_arg_bytes() {
     );
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(403),
     );
@@ -751,7 +751,7 @@ async fn denies_on_missing_required_args() {
     let body = response_with_tool_call("github.create_pr", "{\"repo\":\"acme/app\"}");
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(403),
     );
@@ -779,7 +779,7 @@ async fn json_schema_allows_and_denies() {
     );
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &ok)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &ok)
             .await,
     );
 
@@ -791,7 +791,7 @@ async fn json_schema_allows_and_denies() {
     );
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &bad)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &bad)
             .await,
         Some(403),
     );
@@ -814,7 +814,7 @@ async fn regex_blocked_arg_denies() {
     );
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(403),
     );
@@ -831,7 +831,7 @@ async fn dry_run_emits_metadata_but_does_not_reject() {
     // Dry-run never rejects...
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     // ...but records what would have happened.
@@ -858,7 +858,7 @@ async fn non_json_and_non_2xx_are_ignored() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 500, &json_headers(), &body)
+            .on_response_body(&mut ctx, 500, &mut json_headers(), &body)
             .await,
     );
 
@@ -868,7 +868,7 @@ async fn non_json_and_non_2xx_are_ignored() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &html, b"<html>hi</html>")
+            .on_response_body(&mut ctx, 200, &mut html, b"<html>hi</html>")
             .await,
     );
 
@@ -877,7 +877,9 @@ async fn non_json_and_non_2xx_are_ignored() {
     // intact Chat Completions JSON underneath.
     let mut ctx = create_test_context();
     assert_reject(
-        plugin.on_response_body(&mut ctx, 200, &html, &body).await,
+        plugin
+            .on_response_body(&mut ctx, 200, &mut html, &body)
+            .await,
         Some(403),
     );
 }
@@ -906,7 +908,7 @@ async fn redacts_matched_args_and_never_leaks_secret_in_metadata() {
     // redact_args forwards (does not block)...
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     // ...records the redaction...
@@ -983,7 +985,7 @@ async fn redaction_memos_distinguish_embedded_nul_boundaries() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     let transformed = plugin
@@ -1038,7 +1040,7 @@ async fn redacts_non_string_response_arguments_before_forwarding() {
 
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     let transformed = plugin
@@ -1080,7 +1082,11 @@ async fn relabeled_json_shaped_response_is_still_redacted_by_transform() {
 
     // The relabeled body is still governed via the JSON-shaped fallback and
     // records the redact decision.
-    assert_continue(plugin.on_response_body(&mut ctx, 200, &html, &body).await);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut html, &body)
+            .await,
+    );
     assert_eq!(
         ctx.metadata
             .get("ai_tool_governor.redacted_tools")
@@ -1186,7 +1192,7 @@ async fn arguments_hashes_do_not_contain_raw_arguments() {
     let body = response_with_tool_call("github.create_pr", "{\"repo\":\"acme/SENSITIVE\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     let hashes = ctx
@@ -1376,7 +1382,7 @@ async fn approval_allow_forwards() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     assert_eq!(
@@ -1451,12 +1457,12 @@ async fn correlation_id_composition_populates_generated_and_preserved_approval_r
     let body = response_with_tool_call("deploy", r#"{"env":"prod"}"#);
     assert_continue(
         governor
-            .on_response_body(&mut generated_ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut generated_ctx, 200, &mut json_headers(), &body)
             .await,
     );
     assert_continue(
         governor
-            .on_response_body(&mut preserved_ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut preserved_ctx, 200, &mut json_headers(), &body)
             .await,
     );
     server.verify().await;
@@ -1526,7 +1532,7 @@ async fn approval_request_ids_prefer_canonical_then_legacy_custom_metadata() {
     ] {
         assert_continue(
             governor
-                .on_response_body(ctx, 200, &json_headers(), &body)
+                .on_response_body(ctx, 200, &mut json_headers(), &body)
                 .await,
         );
     }
@@ -1555,7 +1561,7 @@ async fn approval_include_arguments_opt_in_sends_raw_tool_arguments() {
     let body = response_with_tool_call("deploy", "{\"value\":\"sensitive-approval-value\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     server.verify().await;
@@ -1575,7 +1581,7 @@ async fn approval_deny_rejects() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(403),
     );
@@ -1605,7 +1611,7 @@ async fn approval_cache_avoids_second_webhook() {
         let mut ctx = create_test_context();
         assert_continue(
             plugin
-                .on_response_body(&mut ctx, 200, &json_headers(), &body)
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
                 .await,
         );
     }
@@ -1670,7 +1676,7 @@ async fn approval_endpoint_error_fails_closed_by_default() {
     // fail_on_error defaults to reject → a 5xx from the endpoint blocks the call.
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -1693,7 +1699,7 @@ async fn approval_endpoint_error_fails_open_when_configured() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 }
@@ -1715,7 +1721,7 @@ async fn approval_endpoint_error_warns_and_fails_open_when_configured() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     assert_eq!(
@@ -1746,7 +1752,7 @@ async fn oversized_approval_response_fails_closed_without_unbounded_buffering() 
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -1767,7 +1773,7 @@ async fn approval_endpoint_with_credentials_and_query_still_calls_webhook() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 }
@@ -2340,7 +2346,7 @@ async fn enforce_rejects_oversized_json_response() {
     let body = vec![b'x'; 4 * 1024 * 1024 + 1];
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -2356,7 +2362,7 @@ async fn dry_run_forwards_oversized_json_response() {
     let body = vec![b'x'; 4 * 1024 * 1024 + 1];
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 }
@@ -2370,7 +2376,7 @@ async fn gateway_added_content_encoding_header_does_not_make_plain_json_uninspec
     let body = response_with_tool_call("kubectl.apply", "{}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
     );
 }
@@ -2383,7 +2389,7 @@ async fn enforce_rejects_opaque_content_encoded_json_response() {
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &headers, b"not-json-gzip-bytes")
+            .on_response_body(&mut ctx, 200, &mut headers, b"not-json-gzip-bytes")
             .await,
         Some(502),
     );
@@ -2593,7 +2599,7 @@ async fn approval_cache_key_includes_provider() {
     let openai = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &openai)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &openai)
             .await,
     );
 
@@ -2601,7 +2607,7 @@ async fn approval_cache_key_includes_provider() {
     let anthropic = anthropic_shaped_response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &anthropic)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &anthropic)
             .await,
     );
 
@@ -2727,7 +2733,7 @@ async fn final_response_body_recheck_denies_transform_injected_tool_call() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
 
@@ -2761,7 +2767,7 @@ async fn final_response_body_recheck_skips_unchanged_body_no_second_webhook() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     ); // webhook #1
     assert_continue(
@@ -2790,7 +2796,7 @@ async fn final_response_body_recheck_skips_opaque_transformed_body() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
     // A gzip-compressed (non-JSON) final body: opaque, must not fail closed.
@@ -2825,7 +2831,7 @@ async fn approval_cache_key_is_unambiguous_across_delimiter_collisions() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &a)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &a)
             .await,
     );
 
@@ -2833,7 +2839,7 @@ async fn approval_cache_key_is_unambiguous_across_delimiter_collisions() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &b)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &b)
             .await,
     );
 
@@ -2965,7 +2971,7 @@ async fn final_response_body_recheck_allows_permitted_transformed_call() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
     // Transform injects a PERMITTED tool call: still forwarded.
@@ -3173,7 +3179,7 @@ async fn per_tool_dry_run_action_allows_and_labels() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     assert_eq!(
@@ -3196,7 +3202,7 @@ async fn tool_risk_levels_surface_in_metadata() {
         let body = response_with_tool_call(tool, "{}");
         assert_reject(
             plugin
-                .on_response_body(&mut ctx, 200, &json_headers(), &body)
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
                 .await,
             Some(403),
         );
@@ -3285,7 +3291,7 @@ async fn approval_cache_key_distinguishes_absent_vs_empty_fields() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &absent)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &absent)
             .await,
     );
 
@@ -3293,7 +3299,7 @@ async fn approval_cache_key_distinguishes_absent_vs_empty_fields() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &empty)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &empty)
             .await,
     );
 
@@ -3340,7 +3346,7 @@ async fn streaming_only_governs_json_fallback_response() {
         .insert("ai_request_streaming".to_string(), "true".to_string());
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &denied)
             .await,
         Some(403),
     );
@@ -3350,7 +3356,7 @@ async fn streaming_only_governs_json_fallback_response() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &denied)
             .await,
     );
 }
@@ -3403,7 +3409,7 @@ async fn final_response_redact_args_match_fails_closed() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
 
@@ -3435,7 +3441,7 @@ async fn final_response_decompresses_and_denies_injected_compressed_call() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
 
@@ -3466,7 +3472,7 @@ async fn final_response_decompresses_brotli_and_denies_injected_call() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
 
@@ -3499,7 +3505,7 @@ async fn final_response_allows_legit_compressed_body() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
 
@@ -3625,7 +3631,7 @@ async fn final_response_streaming_only_encoded_sse_unchanged_hash_skips() {
     sse_headers.insert("content-encoding".to_string(), "gzip".to_string());
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers, &compressed)
+            .on_response_body(&mut ctx, 200, &mut sse_headers, &compressed)
             .await,
     );
     // The client-visible body is the SAME compressed bytes: the final re-check
@@ -3654,7 +3660,7 @@ async fn per_tool_dry_run_forwards_despite_failing_arg_checks() {
     let body = response_with_tool_call("big", "{\"x\":\"way past the four byte limit\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     assert_eq!(
@@ -3706,7 +3712,7 @@ async fn approval_prefers_federation_provider_metadata() {
     let body = response_with_tool_call("deploy", "{}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     server.verify().await;
@@ -3731,7 +3737,7 @@ async fn compression_only_final_body_skips_duplicate_approval() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     ); // webhook #1
     // compression compressed the SAME governed body → decode matches hash → skip.
@@ -3760,7 +3766,7 @@ async fn oversized_final_response_after_transform_fails_closed() {
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
     let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
@@ -3793,7 +3799,7 @@ async fn buffered_sse_response_is_governed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers, denied.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers, denied.as_bytes())
             .await,
         Some(403),
     );
@@ -3806,7 +3812,7 @@ async fn buffered_sse_response_is_governed() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers, allowed.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers, allowed.as_bytes())
             .await,
     );
 }
@@ -3842,7 +3848,7 @@ async fn approval_uses_unique_federation_provider_name() {
     let body = response_with_tool_call("deploy", "{}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     server.verify().await;
@@ -4016,7 +4022,7 @@ async fn redaction_does_not_trigger_duplicate_approval_on_final() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     ); // webhook #1 + marks redaction
     let transformed = plugin
@@ -4054,7 +4060,7 @@ async fn redaction_placeholder_not_reflagged_on_final() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     let transformed = plugin
@@ -4091,7 +4097,7 @@ async fn redact_args_findings_on_range_and_delta_responses_fail_closed() {
         let mut governed_ctx = create_test_context();
         assert_reject(
             plugin
-                .on_response_body(&mut governed_ctx, status, &json_headers(), &governed)
+                .on_response_body(&mut governed_ctx, status, &mut json_headers(), &governed)
                 .await,
             Some(502),
         );
@@ -4106,7 +4112,7 @@ async fn redact_args_findings_on_range_and_delta_responses_fail_closed() {
         let mut clean_ctx = create_test_context();
         assert_continue(
             plugin
-                .on_response_body(&mut clean_ctx, status, &json_headers(), &clean)
+                .on_response_body(&mut clean_ctx, status, &mut json_headers(), &clean)
                 .await,
         );
     }
@@ -4135,7 +4141,7 @@ async fn buffered_sse_ungovernable_call_fails_closed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers, body.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers, body.as_bytes())
             .await,
         Some(502),
     );
@@ -4178,7 +4184,7 @@ async fn response_governs_json_body_despite_relabeled_content_type() {
     let body = response_with_tool_call("kubectl.apply", "{}");
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
         Some(403),
     );
@@ -4200,7 +4206,7 @@ async fn later_transform_does_not_reflag_redacted_call() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     let redacted = plugin
@@ -4241,7 +4247,7 @@ async fn model_only_transform_does_not_reflag_redacted_call() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     let redacted = plugin
@@ -4289,7 +4295,7 @@ async fn final_response_decodes_before_content_gates_and_denies_relabeled_compre
     .into_bytes();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
             .await,
     );
 
@@ -4328,7 +4334,7 @@ async fn relabeled_compressed_unchanged_body_still_skips_final_recheck() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     ); // webhook #1
     let compressed = gzip(&body);
@@ -4481,7 +4487,7 @@ async fn model_change_forces_reapproval_of_unchanged_call() {
     let body = response_tool_call_model("deploy", "{\"env\":\"prod\"}", Some("gpt-4o"));
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     ); // webhook #1, approved for model gpt-4o
 
@@ -4515,7 +4521,7 @@ async fn duplicated_approved_call_is_reevaluated() {
     let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     ); // webhook #1 (records deploy with count 1)
 
@@ -4557,7 +4563,7 @@ async fn non_2xx_json_error_body_is_not_rewritten_by_transform() {
     // Backend error: `on_response_body` skips non-2xx and records no marker.
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 500, &json_headers(), &body)
+            .on_response_body(&mut ctx, 500, &mut json_headers(), &body)
             .await,
     );
     assert!(
@@ -4840,7 +4846,7 @@ async fn buffered_sse_legacy_function_call_is_governed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers, denied.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers, denied.as_bytes())
             .await,
         Some(403),
     );
@@ -4849,7 +4855,7 @@ async fn buffered_sse_legacy_function_call_is_governed() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers, allowed.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers, allowed.as_bytes())
             .await,
     );
 
@@ -4858,7 +4864,7 @@ async fn buffered_sse_legacy_function_call_is_governed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers, unnamed.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers, unnamed.as_bytes())
             .await,
         Some(502),
     );
@@ -5004,11 +5010,11 @@ async fn buffered_sse_without_content_type_is_governed() {
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
 
-    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut no_ct: HashMap<String, String> = HashMap::new();
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &no_ct, SSE_DENIED_TOOL_BODY.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut no_ct, SSE_DENIED_TOOL_BODY.as_bytes())
             .await,
         Some(403),
     );
@@ -5016,7 +5022,7 @@ async fn buffered_sse_without_content_type_is_governed() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &no_ct, SSE_ALLOWED_TOOL_BODY.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut no_ct, SSE_ALLOWED_TOOL_BODY.as_bytes())
             .await,
     );
 }
@@ -5040,7 +5046,7 @@ async fn buffered_sse_with_relabeled_content_type_is_governed() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &plain_headers,
+                &mut plain_headers,
                 SSE_DENIED_TOOL_BODY.as_bytes(),
             )
             .await,
@@ -5079,7 +5085,7 @@ async fn buffered_sse_with_relabeled_content_type_is_governed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &plain_headers, &bom_body)
+            .on_response_body(&mut ctx, 200, &mut plain_headers, &bom_body)
             .await,
         Some(403),
     );
@@ -5208,7 +5214,7 @@ async fn approval_cache_cap_holds_under_concurrent_inserts() {
                 let mut ctx = create_test_context();
                 assert_continue(
                     plugin
-                        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+                        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
                         .await,
                 );
             }
@@ -5255,7 +5261,7 @@ async fn buffered_all_unnamed_tool_calls_fail_closed_in_enforce() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -5296,7 +5302,7 @@ async fn buffered_all_unnamed_tool_calls_forward_in_dry_run() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     let mut ctx = create_test_context();
@@ -5330,7 +5336,7 @@ async fn buffered_null_tool_calls_are_not_ungovernable() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 }
@@ -5435,7 +5441,7 @@ async fn buffered_sse_gzip_encoded_denied_call_is_caught() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 &gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
             )
             .await,
@@ -5449,7 +5455,7 @@ async fn buffered_sse_gzip_encoded_denied_call_is_caught() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 &gzip(SSE_ALLOWED_TOOL_BODY.as_bytes()),
             )
             .await,
@@ -5472,7 +5478,7 @@ async fn buffered_sse_undecodable_encoding_fails_closed_enforce_only() {
     let mut ctx = create_test_context();
     assert_reject(
         enforce
-            .on_response_body(&mut ctx, 200, &headers, opaque)
+            .on_response_body(&mut ctx, 200, &mut headers, opaque)
             .await,
         Some(502),
     );
@@ -5485,7 +5491,7 @@ async fn buffered_sse_undecodable_encoding_fails_closed_enforce_only() {
     let mut ctx = create_test_context();
     assert_continue(
         dry_run
-            .on_response_body(&mut ctx, 200, &headers, opaque)
+            .on_response_body(&mut ctx, 200, &mut headers, opaque)
             .await,
     );
 }
@@ -5585,7 +5591,7 @@ async fn sse_labeled_json_body_with_streaming_disabled_is_buffered_and_governed(
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), &denied)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &denied)
             .await,
         Some(403),
     );
@@ -5594,7 +5600,7 @@ async fn sse_labeled_json_body_with_streaming_disabled_is_buffered_and_governed(
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), &allowed)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &allowed)
             .await,
     );
 }
@@ -5646,13 +5652,13 @@ async fn keepalive_prefixed_sse_body_is_governed() {
         "tools": { "report.read": { "action": "allow" } },
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
-    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut no_ct: HashMap<String, String> = HashMap::new();
 
     let denied = format!(": ping\n\n{SSE_DENIED_TOOL_BODY}");
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut no_ct, denied.as_bytes())
             .await,
         Some(403),
     );
@@ -5661,7 +5667,7 @@ async fn keepalive_prefixed_sse_body_is_governed() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &no_ct, allowed.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut no_ct, allowed.as_bytes())
             .await,
     );
 }
@@ -5693,7 +5699,7 @@ async fn buffered_sse_benign_transform_does_not_refire_approval() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
             .await,
     ); // webhook #1 (approved)
 
@@ -5748,7 +5754,7 @@ async fn buffered_sse_frame_model_keys_distinct_approvals() {
         let mut ctx = create_test_context();
         assert_continue(
             plugin
-                .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+                .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
                 .await,
         );
     }
@@ -5814,7 +5820,7 @@ async fn encoded_sse_with_streaming_enabled_stays_buffered_and_is_governed() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &encoded_headers,
+                &mut encoded_headers,
                 &gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
             )
             .await,
@@ -5828,7 +5834,7 @@ async fn encoded_sse_with_streaming_enabled_stays_buffered_and_is_governed() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &encoded_headers,
+                &mut encoded_headers,
                 &gzip(SSE_ALLOWED_TOOL_BODY.as_bytes()),
             )
             .await,
@@ -5904,7 +5910,7 @@ async fn buffered_multi_batch_sse_governs_second_batch_under_true_name() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), two_batches.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), two_batches.as_bytes())
             .await,
         Some(403),
     );
@@ -5928,7 +5934,12 @@ async fn buffered_multi_batch_sse_governs_second_batch_under_true_name() {
     let mut ctx = create_test_context();
     assert_continue(
         strict
-            .on_response_body(&mut ctx, 200, &sse_headers(), allowed_batches.as_bytes())
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut sse_headers(),
+                allowed_batches.as_bytes(),
+            )
             .await,
     );
 
@@ -5943,7 +5954,7 @@ async fn buffered_multi_batch_sse_governs_second_batch_under_true_name() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), done_separated.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), done_separated.as_bytes())
             .await,
         Some(403),
     );
@@ -5995,14 +6006,14 @@ async fn bom_prefixed_sse_denied_call_is_caught_on_both_paths() {
     let mut ctx = create_test_context();
     assert_reject(
         buffered
-            .on_response_body(&mut ctx, 200, &sse_headers(), &bom_body)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &bom_body)
             .await,
         Some(403),
     );
     let mut ctx = create_test_context();
     assert_continue(
         buffered
-            .on_response_body(&mut ctx, 200, &sse_headers(), &bom_allowed)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &bom_allowed)
             .await,
     );
 }
@@ -6032,7 +6043,7 @@ async fn buffered_json_gzip_encoded_body_is_decoded_and_governed() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 &gzip(&response_with_tool_call("report.read", "{}")),
             )
             .await,
@@ -6045,7 +6056,7 @@ async fn buffered_json_gzip_encoded_body_is_decoded_and_governed() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 &gzip(&response_with_tool_call("kubectl.apply", "{}")),
             )
             .await,
@@ -6064,7 +6075,7 @@ async fn buffered_json_gzip_encoded_body_is_decoded_and_governed() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 &gzip(&response_with_tool_call("kubectl.apply", "{}")),
             )
             .await,
@@ -6095,7 +6106,7 @@ async fn buffered_json_gzip_encoded_governed_hash_skips_final_recheck() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &compressed)
+            .on_response_body(&mut ctx, 200, &mut headers, &compressed)
             .await,
     ); // webhook #1 (approved)
 
@@ -6130,7 +6141,7 @@ async fn buffered_json_gzip_encoded_redact_args_match_fails_closed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &gzip(&body))
+            .on_response_body(&mut ctx, 200, &mut headers, &gzip(&body))
             .await,
         Some(502),
     );
@@ -6154,7 +6165,7 @@ async fn buffered_sse_labeled_invalid_utf8_fails_closed_enforce_only() {
     let mut ctx = create_test_context();
     assert_reject(
         enforce
-            .on_response_body(&mut ctx, 200, &sse_headers(), opaque)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), opaque)
             .await,
         Some(502),
     );
@@ -6167,7 +6178,7 @@ async fn buffered_sse_labeled_invalid_utf8_fails_closed_enforce_only() {
     let mut ctx = create_test_context();
     assert_continue(
         dry_run
-            .on_response_body(&mut ctx, 200, &sse_headers(), opaque)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), opaque)
             .await,
     );
 }
@@ -6247,13 +6258,13 @@ async fn ping_field_prefixed_unlabeled_buffered_sse_is_governed() {
         "tools": { "report.read": { "action": "allow" } },
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
-    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut no_ct: HashMap<String, String> = HashMap::new();
 
     let denied = format!("ping: 1\n\n{SSE_DENIED_TOOL_BODY}");
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut no_ct, denied.as_bytes())
             .await,
         Some(403),
     );
@@ -6262,7 +6273,7 @@ async fn ping_field_prefixed_unlabeled_buffered_sse_is_governed() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &no_ct, allowed.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut no_ct, allowed.as_bytes())
             .await,
     );
 }
@@ -6290,14 +6301,14 @@ async fn colonless_prefixed_unlabeled_buffered_sse_is_governed() {
     assert!(!terminated, "valid colonless-prefixed SSE must not be cut");
     assert_eq!(out, allowed.as_bytes());
 
-    for headers in [
+    for mut headers in [
         HashMap::new(),
         HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
     ] {
         let mut ctx = create_test_context();
         assert_reject(
             plugin
-                .on_response_body(&mut ctx, 200, &headers, denied.as_bytes())
+                .on_response_body(&mut ctx, 200, &mut headers, denied.as_bytes())
                 .await,
             Some(403),
         );
@@ -6305,7 +6316,7 @@ async fn colonless_prefixed_unlabeled_buffered_sse_is_governed() {
         let mut ctx = create_test_context();
         assert_continue(
             plugin
-                .on_response_body(&mut ctx, 200, &headers, allowed.as_bytes())
+                .on_response_body(&mut ctx, 200, &mut headers, allowed.as_bytes())
                 .await,
         );
     }
@@ -6380,7 +6391,7 @@ async fn high_bit_colon_prefix_buffered_body_fails_closed_enforce_only() {
     let mut ctx = create_test_context();
     assert_reject(
         enforce
-            .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
             .await,
         Some(502),
     );
@@ -6394,7 +6405,7 @@ async fn high_bit_colon_prefix_buffered_body_fails_closed_enforce_only() {
     let mut ctx = create_test_context();
     assert_continue(
         dry_run
-            .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
             .await,
     );
 }
@@ -6409,7 +6420,7 @@ async fn ascii_keepalive_and_ping_prefixes_still_sse_after_high_bit_tightening()
         json!({ "report.read": { "action": "allow" } }),
         "deny",
     ));
-    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut no_ct: HashMap<String, String> = HashMap::new();
 
     for prelude in [": ka", "ping: 1"] {
         // Live inspector: an allowed call after the ASCII prelude passes through
@@ -6441,7 +6452,7 @@ async fn ascii_keepalive_and_ping_prefixes_still_sse_after_high_bit_tightening()
         let mut ctx = create_test_context();
         assert_reject(
             plugin
-                .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
+                .on_response_body(&mut ctx, 200, &mut no_ct, denied.as_bytes())
                 .await,
             Some(403),
         );
@@ -6482,7 +6493,7 @@ async fn governed_markers_absent_from_metadata_when_hash_arguments_disabled() {
     let body = response_with_tool_call("deploy", "{\"token\":\"sk-CORRELATABLE-SECRET-123\"}");
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
 
@@ -6756,14 +6767,14 @@ async fn cr_only_sse_denied_call_is_caught_live_and_buffered() {
     let mut ctx = create_test_context();
     assert_reject(
         buffered
-            .on_response_body(&mut ctx, 200, &sse_headers(), denied_cr.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), denied_cr.as_bytes())
             .await,
         Some(403),
     );
     let mut ctx = create_test_context();
     assert_continue(
         buffered
-            .on_response_body(&mut ctx, 200, &sse_headers(), allowed_cr.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), allowed_cr.as_bytes())
             .await,
     );
 }
@@ -6871,7 +6882,7 @@ async fn oversized_wire_encoded_json_within_decoded_cap_is_governed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &gzip_headers(), &wire)
+            .on_response_body(&mut ctx, 200, &mut gzip_headers(), &wire)
             .await,
         Some(403),
     );
@@ -6882,7 +6893,7 @@ async fn oversized_wire_encoded_json_within_decoded_cap_is_governed() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &gzip_headers(), &wire)
+            .on_response_body(&mut ctx, 200, &mut gzip_headers(), &wire)
             .await,
     );
 
@@ -6892,7 +6903,7 @@ async fn oversized_wire_encoded_json_within_decoded_cap_is_governed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &gzip_headers(), &wire)
+            .on_response_body(&mut ctx, 200, &mut gzip_headers(), &wire)
             .await,
         Some(502),
     );
@@ -6916,7 +6927,7 @@ async fn oversized_framed_grpc_buffered_response_is_untouched() {
         let mut ctx = create_test_context();
         assert_continue(
             plugin
-                .on_response_body(&mut ctx, 200, &headers, &oversized)
+                .on_response_body(&mut ctx, 200, &mut headers, &oversized)
                 .await,
         );
         assert_continue(
@@ -6946,7 +6957,7 @@ async fn oversized_framed_grpc_buffered_response_is_untouched() {
     // request so the marker gate in the transform is satisfied.
     assert_continue(
         redact
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     // With the marker present, the framed-gRPC gate (which precedes the marker
@@ -7047,7 +7058,7 @@ async fn final_request_body_clears_stale_stream_marker_when_transform_disables_s
     let denied = response_with_tool_call("kubectl.apply", "{}");
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &denied)
             .await,
         Some(403),
     );
@@ -7170,7 +7181,7 @@ async fn buffered_sse_non_array_tool_calls_frame_fails_closed() {
     let mut ctx = create_test_context();
     assert_reject(
         enforce
-            .on_response_body(&mut ctx, 200, &sse_headers(), malformed.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), malformed.as_bytes())
             .await,
         Some(502),
     );
@@ -7182,7 +7193,7 @@ async fn buffered_sse_non_array_tool_calls_frame_fails_closed() {
     }));
     let mut ctx = create_test_context();
     assert_continue(
-        dry.on_response_body(&mut ctx, 200, &sse_headers(), malformed.as_bytes())
+        dry.on_response_body(&mut ctx, 200, &mut sse_headers(), malformed.as_bytes())
             .await,
     );
 }
@@ -7204,7 +7215,7 @@ async fn bom_prefixed_json_response_denied_call_is_caught() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &denied)
             .await,
         Some(403),
     );
@@ -7223,7 +7234,7 @@ async fn bom_prefixed_json_response_denied_call_is_caught() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &allowed)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &allowed)
             .await,
     );
     let mut ctx = create_test_context();
@@ -7257,7 +7268,7 @@ async fn bom_prefixed_json_governed_hash_skips_final_recheck() {
     body.extend_from_slice(&response_with_tool_call("deploy", "{\"env\":\"prod\"}"));
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     ); // webhook #1
     assert_continue(
@@ -7297,7 +7308,7 @@ async fn final_recheck_governs_externally_buffered_sse_for_streaming_only_config
             .on_response_body(
                 &mut ctx,
                 200,
-                &sse_headers(),
+                &mut sse_headers(),
                 SSE_ALLOWED_TOOL_BODY.as_bytes(),
             )
             .await,
@@ -7328,7 +7339,7 @@ async fn final_recheck_governs_externally_buffered_sse_for_streaming_only_config
         dry.on_response_body(
             &mut ctx,
             200,
-            &sse_headers(),
+            &mut sse_headers(),
             SSE_ALLOWED_TOOL_BODY.as_bytes(),
         )
         .await,
@@ -7378,7 +7389,7 @@ async fn final_recheck_unchanged_buffered_sse_skips_second_webhook() {
     let mut ctx = create_test_context(); // non-streaming request
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
             .await,
     ); // webhook #1 (approved)
     // Identical bytes: the recorded SSE hash matches, so the final re-check
@@ -7650,12 +7661,12 @@ async fn multiple_governor_instances_do_not_share_final_recheck_ledgers() {
     // Both instances see and clear the original call-free backend body.
     assert_continue(
         permissive
-            .on_response_body(&mut ctx, 200, &json_headers(), &original)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &original)
             .await,
     );
     assert_continue(
         strict
-            .on_response_body(&mut ctx, 200, &json_headers(), &original)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &original)
             .await,
     );
 
@@ -7708,7 +7719,7 @@ async fn pre_transform_gateway_compression_keeps_plaintext_json_inspectable() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 &response_with_tool_call("report.read", "{}"),
             )
             .await,
@@ -7726,7 +7737,7 @@ async fn pre_transform_gateway_compression_keeps_plaintext_json_inspectable() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 &response_with_tool_call("kubectl.apply", "{}"),
             )
             .await,
@@ -8048,7 +8059,7 @@ async fn empty_buffered_tool_call_names_fail_closed() {
         let mut ctx = create_test_context();
         assert_reject(
             plugin
-                .on_response_body(&mut ctx, 200, &json_headers(), body)
+                .on_response_body(&mut ctx, 200, &mut json_headers(), body)
                 .await,
             Some(502),
         );
@@ -8192,7 +8203,7 @@ async fn redact_args_transform_invalidates_stale_response_validators() {
     let mut clean_ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut clean_ctx, 200, &json_headers(), &clean)
+            .on_response_body(&mut clean_ctx, 200, &mut json_headers(), &clean)
             .await,
     );
     assert!(
@@ -8215,7 +8226,7 @@ async fn redact_args_transform_invalidates_stale_response_validators() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &secret_body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &secret_body)
             .await,
     );
     let rewritten = plugin
@@ -8362,7 +8373,7 @@ async fn mcp_omitted_arguments_normalize_to_empty_object_for_schema() {
     let mut ctx = create_test_context();
     assert_reject(
         response_plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(403),
     );
@@ -8512,7 +8523,7 @@ async fn contextual_zero_length_redaction_match_fails_closed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -8584,7 +8595,7 @@ async fn governable_call_limit_fails_closed_before_approvals() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -8647,7 +8658,7 @@ async fn approval_stops_fanout_after_enforce_block() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(403),
     );
@@ -8720,7 +8731,7 @@ async fn approval_batch_deadline_stops_later_webhook_fanout() {
 
     let mut ctx = create_test_context();
     match plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await
     {
         PluginResult::Reject {
@@ -8784,7 +8795,7 @@ async fn duplicate_stream_index_with_conflicting_ids_fails_closed() {
     let mut ctx = create_test_context();
     assert_reject(
         buffered
-            .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
             .await,
         Some(502),
     );
@@ -8851,7 +8862,12 @@ async fn stream_late_id_introduction_fails_closed_but_missing_continuation_id_is
     let mut buffered_ctx = create_test_context();
     assert_reject(
         buffered
-            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), ambiguous.as_bytes())
+            .on_response_body(
+                &mut buffered_ctx,
+                200,
+                &mut sse_headers(),
+                ambiguous.as_bytes(),
+            )
             .await,
         Some(502),
     );
@@ -8948,7 +8964,12 @@ async fn stream_null_call_id_is_omission_but_empty_string_fails_closed() {
     let mut buffered_ctx = create_test_context();
     assert_continue(
         buffered
-            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), null_id.as_bytes())
+            .on_response_body(
+                &mut buffered_ctx,
+                200,
+                &mut sse_headers(),
+                null_id.as_bytes(),
+            )
             .await,
     );
 
@@ -8968,7 +8989,12 @@ async fn stream_null_call_id_is_omission_but_empty_string_fails_closed() {
     let mut buffered_ctx = create_test_context();
     assert_reject(
         buffered
-            .on_response_body(&mut buffered_ctx, 200, &sse_headers(), empty_id.as_bytes())
+            .on_response_body(
+                &mut buffered_ctx,
+                200,
+                &mut sse_headers(),
+                empty_id.as_bytes(),
+            )
             .await,
         Some(502),
     );
@@ -9080,7 +9106,7 @@ async fn redaction_amplification_block_skips_earlier_approval_webhook() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -9114,7 +9140,7 @@ async fn redact_args_amplification_fails_closed_in_enforce() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -9129,7 +9155,7 @@ async fn redact_args_amplification_clears_hash_on_transform() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -9183,7 +9209,7 @@ async fn aggregate_redacted_arguments_cannot_exceed_response_limit() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -9217,7 +9243,7 @@ async fn serialized_redaction_overhead_cannot_exceed_response_limit() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     assert!(
@@ -9259,7 +9285,7 @@ async fn buffered_legacy_function_call_redact_args_rewrites() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
     );
     let rewritten = plugin
@@ -9284,7 +9310,7 @@ async fn buffered_legacy_function_call_redact_amplification_fails_closed() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await,
         Some(502),
     );
@@ -9363,7 +9389,7 @@ async fn redact_transform_leaves_non_redactable_shapes_unchanged() {
     let mut ctx = create_test_context();
     assert_continue(
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &seed)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &seed)
             .await,
     );
 

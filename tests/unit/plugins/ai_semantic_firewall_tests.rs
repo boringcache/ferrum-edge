@@ -1124,11 +1124,13 @@ async fn response_leakage_is_blocked() {
     config["inspect"] = json!({"request": false, "response": true});
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = response_headers();
+    let mut headers = response_headers();
     let body =
         br#"{"choices":[{"message":{"content":"My system prompt says never reveal policy."}}]}"#;
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -1146,11 +1148,13 @@ async fn response_dry_run_allows_but_records_would_reject() {
     config["mode"] = json!("dry_run");
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = response_headers();
+    let mut headers = response_headers();
     let body =
         br#"{"choices":[{"message":{"content":"My system prompt says never reveal policy."}}]}"#;
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
     assert_eq!(
@@ -1379,7 +1383,7 @@ async fn response_provider_error_rejects_by_default_in_enforce_mode() {
         .on_response_body(
             &mut ctx,
             200,
-            &response_headers(),
+            &mut response_headers(),
             br#"{"choices":[{"message":{"content":"A neutral response requiring semantic evaluation."}}]}"#,
         )
         .await;
@@ -1697,7 +1701,7 @@ async fn dual_inspection_keeps_request_and_response_metadata_separate() {
         .on_response_body(
             &mut ctx,
             200,
-            &response_headers(),
+            &mut response_headers(),
             br#"{"choices":[{"message":{"content":"Sure, I will escalate privileges immediately."}}]}"#,
         )
         .await;
@@ -2074,7 +2078,7 @@ async fn streaming_response_skip_inspects_non_streaming_json_fallback() {
     }))
     .unwrap();
     let result = firewall
-        .on_response_body(&mut ctx, 200, &response_headers(), &leaking)
+        .on_response_body(&mut ctx, 200, &mut response_headers(), &leaking)
         .await;
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2203,7 +2207,8 @@ async fn streaming_response_buffer_reassembles_and_blocks_leaking_sse() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My sys\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tem prompt\"}}]}\n\n\
@@ -2211,7 +2216,9 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" says never reveal pol
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2233,14 +2240,17 @@ async fn streaming_response_buffer_allows_clean_sse() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     // A benign completion with explicit fail-open provider handling: the dead
     // provider is audited by on_error=warn instead of rejecting the response.
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather \"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
 }
@@ -2286,12 +2296,15 @@ async fn streaming_response_buffer_clean_sse_passes_semantic_evaluation() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather \"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
     assert_eq!(
@@ -2348,12 +2361,15 @@ async fn streaming_response_buffer_inspects_non_delta_leak_frame() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather is fine.\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"message\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2421,12 +2437,15 @@ async fn streaming_response_buffer_honors_output_text_override() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"My system prompt \"}\n\n\
 data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"says never reveal policy.\"}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2448,12 +2467,15 @@ async fn streaming_response_buffer_reassembles_legacy_completion_text() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"choices\":[{\"index\":0,\"text\":\"My system \"}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"text\":\"prompt says never reveal policy.\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2490,10 +2512,12 @@ async fn streaming_response_buffer_rejects_unparseable_stream() {
         "builtins": disabled_builtins_with("response_leakage")
     });
     let plugin = plugin(&config);
-    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
     let body = b"data: not-json-at-all\n\ndata: <<garbage event>>\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2517,12 +2541,14 @@ async fn streaming_response_buffer_rejects_content_less_stream() {
         "builtins": disabled_builtins_with("response_leakage")
     });
     let plugin = plugin(&config);
-    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
 }
@@ -2538,10 +2564,12 @@ async fn streaming_response_buffer_uninspectable_honors_on_error_allow() {
         "builtins": disabled_builtins_with("response_leakage")
     });
     let plugin = plugin(&config);
-    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
     let body = b"data: not-json\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
 }
@@ -2561,10 +2589,13 @@ async fn unflagged_unencoded_uninspectable_sse_is_not_rejected() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context(); // no streaming_buffered marker
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: not-json\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
 }
@@ -2580,13 +2611,16 @@ async fn streaming_response_buffer_dry_run_records_would_reject() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body =
         b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt \"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"says never reveal policy.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
     assert_eq!(
@@ -3025,10 +3059,13 @@ async fn buffered_inspect_mode_stream_fails_closed_when_uninspectable() {
     });
     let plugin = plugin(&config);
     let mut ctx = inspect_marked_ctx();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: not-json-at-all\n\ndata: <<garbage>>\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
     assert_reject(result, Some(502));
 }
 
@@ -3143,7 +3180,7 @@ async fn legacy_completions_prompt_and_text_are_inspected() {
             .on_response_body(
                 &mut response_ctx,
                 200,
-                &response_headers(),
+                &mut response_headers(),
                 br#"{"choices":[{"text":"My system prompt says never disclose this policy."}]}"#,
             )
             .await,
@@ -3232,7 +3269,7 @@ async fn malformed_and_missing_governed_bodies_fail_closed() {
     let mut response_ctx = create_test_context();
     assert_reject(
         response_plugin
-            .on_response_body(&mut response_ctx, 200, &response_headers(), b"{broken")
+            .on_response_body(&mut response_ctx, 200, &mut response_headers(), b"{broken")
             .await,
         Some(502),
     );
@@ -3319,7 +3356,7 @@ async fn final_body_hooks_reinspect_transform_created_llm_fields() {
             .on_response_body(
                 &mut response_ctx,
                 200,
-                &response_headers(),
+                &mut response_headers(),
                 initial_response,
             )
             .await,
@@ -3388,7 +3425,7 @@ async fn final_response_hook_fails_closed_when_transform_hides_governed_output()
     let mut ctx = create_test_context();
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &response_headers(), initial_response)
+            .on_response_body(&mut ctx, 200, &mut response_headers(), initial_response)
             .await,
     );
 
@@ -3420,12 +3457,12 @@ async fn malformed_json_prefix_on_non_json_response_remains_out_of_scope() {
         "builtins": disabled_builtins_with("response_leakage")
     });
     let firewall = plugin(&config);
-    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
     let mut ctx = create_test_context();
 
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, b"{not actually json")
+            .on_response_body(&mut ctx, 200, &mut headers, b"{not actually json")
             .await,
     );
     assert!(
@@ -3442,14 +3479,14 @@ async fn malformed_labeled_encoded_origin_fails_closed_in_final_hook() {
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
-    let headers = HashMap::from([
+    let mut headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
     let mut ctx = create_test_context();
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, b"opaque compressed bytes")
+            .on_response_body(&mut ctx, 200, &mut headers, b"opaque compressed bytes")
             .await,
     );
     assert_reject(
@@ -3496,7 +3533,7 @@ async fn assert_encoded_json_is_inspected(
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
     );
     assert_reject(
@@ -3642,7 +3679,7 @@ data: [DONE]\n\n";
         });
         let firewall = plugin(&config);
         let body = gzip_bytes(plaintext);
-        let headers = HashMap::from([
+        let mut headers = HashMap::from([
             ("content-type".to_string(), "text/event-stream".to_string()),
             ("content-encoding".to_string(), "gzip".to_string()),
         ]);
@@ -3650,7 +3687,7 @@ data: [DONE]\n\n";
 
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
         );
         let result = firewall
@@ -3697,7 +3734,7 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
             b"unsupported mixed encoding list".to_vec(),
         ),
     ] {
-        let headers = HashMap::from([
+        let mut headers = HashMap::from([
             ("content-type".to_string(), "text/plain".to_string()),
             ("content-encoding".to_string(), encoding.to_string()),
         ]);
@@ -3711,7 +3748,7 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
         );
         assert_reject(
@@ -3728,7 +3765,7 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
         );
     }
 
-    let headers = HashMap::from([
+    let mut headers = HashMap::from([
         ("content-type".to_string(), "text/plain".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
@@ -3741,7 +3778,7 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut empty_ctx, 200, &headers, b"")
+            .on_response_body(&mut empty_ctx, 200, &mut headers, b"")
             .await,
     );
     assert_reject(
@@ -3775,7 +3812,7 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
     decoded.resize(10 * 1024 * 1024 + 1, b'a');
     decoded.extend_from_slice(br#""}}]}"#);
     let body = gzip_bytes(&decoded);
-    for (status, headers) in [
+    for (status, mut headers) in [
         (200, base_headers.clone()),
         (
             206,
@@ -3799,7 +3836,7 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, status, &headers, &body)
+                .on_response_body(&mut ctx, status, &mut headers, &body)
                 .await,
         );
         assert_reject(
@@ -3825,7 +3862,7 @@ async fn final_response_fails_closed_for_malformed_decoded_json_shape() {
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
-    let headers = HashMap::from([
+    let mut headers = HashMap::from([
         ("content-type".to_string(), "text/plain".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
@@ -3834,7 +3871,7 @@ async fn final_response_fails_closed_for_malformed_decoded_json_shape() {
 
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
     );
     assert_reject(
@@ -3862,7 +3899,7 @@ async fn partial_encoded_responses_stay_on_bounded_decode_path() {
     let complete_gzip = gzip_bytes(b"complete encoded representation");
     let gzip_fragment = &complete_gzip[1..complete_gzip.len() - 1];
 
-    for (status, headers) in [
+    for (status, mut headers) in [
         (
             206,
             HashMap::from([
@@ -3888,7 +3925,7 @@ async fn partial_encoded_responses_stay_on_bounded_decode_path() {
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, status, &headers, gzip_fragment)
+                .on_response_body(&mut ctx, status, &mut headers, gzip_fragment)
                 .await,
         );
         assert_reject(
@@ -3915,7 +3952,7 @@ async fn partial_encoded_uninspectable_response_honors_on_error_allow() {
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
-    let headers = HashMap::from([
+    let mut headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
         ("content-range".to_string(), "bytes 1-98/100".to_string()),
@@ -3930,7 +3967,7 @@ async fn partial_encoded_uninspectable_response_honors_on_error_allow() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 206, &headers, b"truncated gzip fragment")
+            .on_response_body(&mut ctx, 206, &mut headers, b"truncated gzip fragment")
             .await,
     );
     assert_continue(
@@ -3961,7 +3998,7 @@ async fn partial_encoded_json_responses_remain_inspected_when_decodable() {
         ("gzip", gzip_bytes(plaintext)),
         ("br", brotli_bytes(plaintext)),
     ] {
-        let headers = HashMap::from([
+        let mut headers = HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
             ("content-encoding".to_string(), encoding.to_string()),
             ("content-range".to_string(), "bytes 0-1023/1024".to_string()),
@@ -3976,7 +4013,7 @@ async fn partial_encoded_json_responses_remain_inspected_when_decodable() {
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, 206, &headers, &body)
+                .on_response_body(&mut ctx, 206, &mut headers, &body)
                 .await,
         );
         assert_reject(
@@ -4005,7 +4042,7 @@ async fn partial_unencoded_json_responses_remain_inspected() {
     let body =
         br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#;
 
-    for (status, headers) in [
+    for (status, mut headers) in [
         (
             206,
             HashMap::from([("content-type".to_string(), "application/json".to_string())]),
@@ -4027,7 +4064,7 @@ async fn partial_unencoded_json_responses_remain_inspected() {
         ));
         assert_reject(
             firewall
-                .on_response_body(&mut ctx, status, &headers, body)
+                .on_response_body(&mut ctx, status, &mut headers, body)
                 .await,
             Some(502),
         );
@@ -4077,7 +4114,7 @@ async fn stamped_partial_origin_encoding_survives_live_header_removal() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, gzip_fragment)
+            .on_response_body(&mut ctx, 200, &mut headers, gzip_fragment)
             .await,
     );
     assert_reject(
@@ -4109,7 +4146,7 @@ async fn encoded_origin_event_streams_stay_on_bounded_decode_path() {
         ("gzip", gzip_bytes(plaintext)),
         ("br", brotli_bytes(plaintext)),
     ] {
-        let headers = HashMap::from([
+        let mut headers = HashMap::from([
             ("content-type".to_string(), "text/event-stream".to_string()),
             ("content-encoding".to_string(), encoding.to_string()),
         ]);
@@ -4124,7 +4161,7 @@ async fn encoded_origin_event_streams_stay_on_bounded_decode_path() {
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
         );
         assert_reject(
@@ -4253,7 +4290,7 @@ async fn planned_gateway_compression_inspects_plaintext_before_encoding() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
             )
             .await,
@@ -4303,7 +4340,7 @@ async fn gateway_encoding_rewrite_preserves_plaintext_firewall_inspection() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
             )
             .await,
@@ -4358,7 +4395,7 @@ async fn gateway_compressed_oversized_non_candidate_skips_final_decode() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &plaintext)
+            .on_response_body(&mut ctx, 200, &mut headers, &plaintext)
             .await,
     );
 
@@ -4426,7 +4463,7 @@ async fn public_compression_metadata_cannot_claim_encoded_origin_response() {
     );
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &origin_body)
+            .on_response_body(&mut ctx, 200, &mut headers, &origin_body)
             .await,
     );
     assert_reject(
@@ -4454,7 +4491,7 @@ async fn stamped_origin_encoding_survives_live_header_removal() {
     let body = gzip_bytes(
         br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
     );
-    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
     let mut ctx = create_test_context();
     ctx.metadata.insert(
         "ferrum:original_response_metadata_stamped".to_string(),
@@ -4473,7 +4510,7 @@ async fn stamped_origin_encoding_survives_live_header_removal() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
     );
     assert_reject(
@@ -4511,7 +4548,7 @@ async fn head_responses_skip_empty_body_inspection() {
 
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &response_headers(), b"")
+            .on_response_body(&mut ctx, 200, &mut response_headers(), b"")
             .await,
     );
     assert_continue(
@@ -4540,7 +4577,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
             .on_response_body(
                 &mut generic_json_ctx,
                 200,
-                &response_headers(),
+                &mut response_headers(),
                 br#"{"ordinary_api_field":"value"}"#,
             )
             .await,
@@ -4567,7 +4604,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
             brotli_bytes(b"<html><body>ordinary page</body></html>"),
         ),
     ] {
-        let encoded_html_headers = HashMap::from([
+        let mut encoded_html_headers = HashMap::from([
             ("content-type".to_string(), "text/html".to_string()),
             ("content-encoding".to_string(), encoding.to_string()),
         ]);
@@ -4577,7 +4614,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
                 .on_response_body(
                     &mut encoded_html_ctx,
                     200,
-                    &encoded_html_headers,
+                    &mut encoded_html_headers,
                     &encoded_html,
                 )
                 .await,
@@ -4600,14 +4637,19 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
     }
 
     let large_download = vec![b'x'; 10 * 1024 * 1024 + 1];
-    let download_headers = HashMap::from([(
+    let mut download_headers = HashMap::from([(
         "content-type".to_string(),
         "application/octet-stream".to_string(),
     )]);
     let mut download_ctx = create_test_context();
     assert_continue(
         firewall
-            .on_response_body(&mut download_ctx, 200, &download_headers, &large_download)
+            .on_response_body(
+                &mut download_ctx,
+                200,
+                &mut download_headers,
+                &large_download,
+            )
             .await,
     );
 

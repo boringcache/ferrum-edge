@@ -2762,10 +2762,20 @@ where
                 let mut response_body_rejected = false;
                 for plugin in plugins {
                     let result = plugin
-                        .on_response_body(ctx, response_status, &response_headers, &response_body)
+                        .on_response_body(
+                            ctx,
+                            response_status,
+                            &mut response_headers,
+                            &response_body,
+                        )
                         .await;
                     match result {
-                        PluginResult::Continue => {}
+                        PluginResult::Continue => {
+                            ctx.record_deadline_response_header_plugin(
+                                plugin.as_ref(),
+                                &response_headers,
+                            );
+                        }
                         reject @ PluginResult::Reject { .. }
                         | reject @ PluginResult::RejectBinary { .. } => {
                             apply_buffered_plain_plugin_reject(
@@ -4650,7 +4660,7 @@ where
                     plugin.on_response_body(
                         ctx,
                         response_status,
-                        &plugin_response_headers,
+                        &mut plugin_response_headers,
                         &response_body,
                     ),
                 )
@@ -4663,7 +4673,12 @@ where
                     }
                 };
                 match result {
-                    PluginResult::Continue => {}
+                    PluginResult::Continue => {
+                        ctx.record_deadline_response_header_plugin(
+                            plugin.as_ref(),
+                            &plugin_response_headers,
+                        );
+                    }
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         debug!(

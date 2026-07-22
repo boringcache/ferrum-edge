@@ -18808,7 +18808,15 @@ components:
         expose_headers:
           type: boolean
           default: false
-          description: Inject x-ai-ratelimit-* headers
+          description: >-
+            Inject x-ai-ratelimit-* headers. For successful buffered metered
+            responses, usage and remaining reflect the bucket after provider-usage
+            reconciliation (not the admission estimate). Limit and window stay
+            coherent with the configured budget. Unmetered charge_estimate keeps
+            the reservation; warn releases and refreshes; reject returns 502
+            without these headers. Non-2xx and gateway-rejection releases refresh
+            to the post-release bucket. Federation reconciles before header copy
+            on the rejection-path after_proxy.
         provider:
           type: string
           enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]

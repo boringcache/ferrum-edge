@@ -2277,7 +2277,7 @@ impl Plugin for AiSemanticFirewall {
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
-        response_headers: &HashMap<String, String>,
+        response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         if !self.enabled || !self.inspect_response || !self.has_response_rules {

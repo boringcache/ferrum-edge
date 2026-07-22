@@ -129,6 +129,56 @@ async fn redis_key_count_by_prefix(prefix: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Sum integer Redis counters under `prefix` (DB 15).
+///
+/// Used to observe the post-reconcile `ai_rate_limiter` token bucket without
+/// hard-coding the limit-by identity segment of the Redis key.
+async fn redis_sum_counters_by_prefix(prefix: &str) -> i64 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(stream) = tokio::net::TcpStream::connect("127.0.0.1:6379").await else {
+        return 0;
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = reader;
+    let mut buf = vec![0u8; 8192];
+
+    if writer
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n")
+        .await
+        .is_err()
+    {
+        return 0;
+    }
+    let _ = reader.read(&mut buf).await;
+
+    let pattern = format!("{}*", prefix);
+    let lua_script = format!(
+        "local keys = redis.call('KEYS','{}') local sum = 0 \
+         for i=1,#keys do local v = redis.call('GET',keys[i]) \
+         if v then sum = sum + (tonumber(v) or 0) end end return sum",
+        pattern
+    );
+    let lua_len = lua_script.len();
+    let cmd = format!(
+        "*3\r\n$4\r\nEVAL\r\n${}\r\n{}\r\n$1\r\n0\r\n",
+        lua_len, lua_script
+    );
+    if writer.write_all(cmd.as_bytes()).await.is_err() {
+        return 0;
+    }
+    buf.fill(0);
+    let Ok(n) = reader.read(&mut buf).await else {
+        return 0;
+    };
+    let response = String::from_utf8_lossy(&buf[..n]);
+    response
+        .strip_prefix(':')
+        .and_then(|value| value.split("\r\n").next())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
 // ============================================================================
 // Test Harness (Database mode with Redis rate limiting)
 // ============================================================================
@@ -526,12 +576,31 @@ async fn start_ai_backend_on(
     listener: tokio::net::TcpListener,
     total_tokens: u64,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    start_ai_backend_with_usage_on(listener, total_tokens / 2, total_tokens / 2).await
+}
+
+/// Start a mock LLM backend that returns explicit OpenAI-style usage fields.
+async fn start_ai_backend_with_usage(
+    port: u16,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    start_ai_backend_with_usage_on(listener, prompt_tokens, completion_tokens).await
+}
+
+async fn start_ai_backend_with_usage_on(
+    listener: tokio::net::TcpListener,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
-            let tokens = total_tokens;
+            let prompt = prompt_tokens;
+            let completion = completion_tokens;
             tokio::spawn(async move {
                 let (reader, mut writer) = tokio::io::split(stream);
                 let mut buf_reader = tokio::io::BufReader::new(reader);
@@ -546,7 +615,7 @@ async fn start_ai_backend_on(
                     }
                 }
 
-                // Return OpenAI-format response with token usage
+                let total = prompt.saturating_add(completion);
                 let body = json!({
                     "id": "chatcmpl-test",
                     "object": "chat.completion",
@@ -556,9 +625,9 @@ async fn start_ai_backend_on(
                         "finish_reason": "stop"
                     }],
                     "usage": {
-                        "prompt_tokens": tokens / 2,
-                        "completion_tokens": tokens / 2,
-                        "total_tokens": tokens
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "total_tokens": total
                     }
                 });
                 let body_str = body.to_string();
@@ -1075,6 +1144,250 @@ plugin_configs:
     gw1.shutdown();
     gw2.shutdown();
     println!("test_ai_rate_limiter_redis_shared_across_instances PASSED");
+}
+
+/// #2261 Redis acceptance: client-visible expose headers must match the
+/// post-reconcile Redis token bucket after a real OpenAI-style response.
+///
+/// Covers both a positive delta (actual usage > admission reservation) and a
+/// negative delta (reservation > actual usage). Uses `count_mode:
+/// completion_tokens` so the reservation equals `max_tokens` exactly.
+///
+/// Distinct from the unit test
+/// `expose_headers_lifecycle_reflects_reconciled_usage_redis_fallback`, which
+/// points at an unreachable Redis URL and only proves local failover.
+#[tokio::test]
+#[ignore]
+async fn test_ai_rate_limiter_redis_expose_headers_match_reconciled_bucket() {
+    if !redis_is_available().await {
+        return;
+    }
+
+    let harness = RedisRateLimitHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let client = reqwest::Client::new();
+    let token_limit: u64 = 1000;
+    // Long window keeps the reservation and reconcile in the same Redis
+    // bucket index so header usage equals the raw counter (no sliding-window
+    // prev-term contribution / rollover race during the request).
+    let window_seconds: u64 = 3600;
+
+    // --- Positive delta: reserve 50 completion tokens, actual completion = 80 ---
+    {
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        drop(backend_listener);
+        let reserved: u64 = 50;
+        let actual_completion: u64 = 80;
+        let _backend = start_ai_backend_with_usage(backend_port, 10, actual_completion)
+            .await
+            .unwrap();
+        let unique_prefix = format!("ferrum:test:ai:expose:pos:{}", Uuid::new_v4().simple());
+
+        setup_proxy_with_plugins(
+            &harness,
+            &client,
+            "proxy-ai-expose-pos",
+            "/ai-expose-pos",
+            backend_port,
+            "http",
+            vec![json!({
+                "id": "plugin-ai-expose-pos",
+                "plugin_name": "ai_rate_limiter",
+                "scope": "proxy",
+                "proxy_id": "proxy-ai-expose-pos",
+                "enabled": true,
+                "config": {
+                    "token_limit": token_limit,
+                    "window_seconds": window_seconds,
+                    "count_mode": "completion_tokens",
+                    "limit_by": "ip",
+                    "expose_headers": true,
+                    "sync_mode": "redis",
+                    "redis_url": REDIS_URL,
+                    "redis_key_prefix": unique_prefix
+                }
+            })],
+        )
+        .await
+        .unwrap();
+
+        harness.wait_for_poll().await;
+        delete_redis_keys_by_prefix(&unique_prefix).await;
+
+        let resp = client
+            .post(format!(
+                "{}/ai-expose-pos/v1/chat/completions",
+                harness.proxy_base_url
+            ))
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"model":"test","messages":[{{"role":"user","content":"hi"}}],"max_tokens":{reserved}}}"#
+            ))
+            .send()
+            .await
+            .expect("positive-delta request failed");
+
+        // Read headers before consuming the body so assertions use the
+        // client-visible map as delivered on the wire.
+        assert_eq!(resp.status().as_u16(), 200, "positive-delta must succeed");
+        let usage_hdr = resp
+            .headers()
+            .get("x-ai-ratelimit-usage")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let remaining_hdr = resp
+            .headers()
+            .get("x-ai-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let _ = resp.text().await;
+
+        assert_ne!(
+            actual_completion, reserved,
+            "fixture must exercise a non-zero positive reservation delta"
+        );
+        let expected_usage = actual_completion.to_string();
+        let expected_remaining = (token_limit - actual_completion).to_string();
+        assert_eq!(
+            usage_hdr.as_deref(),
+            Some(expected_usage.as_str()),
+            "positive-delta headers must expose reconciled usage, not the admission estimate {reserved}"
+        );
+        assert_eq!(
+            remaining_hdr.as_deref(),
+            Some(expected_remaining.as_str()),
+            "positive-delta remaining must match the post-reconcile Redis budget"
+        );
+        let redis_usage = redis_sum_counters_by_prefix(&unique_prefix).await;
+        assert_eq!(
+            redis_usage, actual_completion as i64,
+            "Redis bucket after positive-delta reconcile must charge actual completion tokens"
+        );
+        let redis_usage_str = redis_usage.to_string();
+        let redis_remaining_str = (token_limit as i64 - redis_usage).to_string();
+        assert_eq!(
+            usage_hdr.as_deref(),
+            Some(redis_usage_str.as_str()),
+            "client-visible usage must match the post-reconcile Redis bucket"
+        );
+        assert_eq!(
+            remaining_hdr.as_deref(),
+            Some(redis_remaining_str.as_str()),
+            "client-visible remaining must match token_limit minus Redis usage"
+        );
+
+        delete_redis_keys_by_prefix(&unique_prefix).await;
+    }
+
+    // --- Negative delta: reserve 200 completion tokens, actual completion = 10 ---
+    {
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        drop(backend_listener);
+        let reserved: u64 = 200;
+        let actual_completion: u64 = 10;
+        let _backend = start_ai_backend_with_usage(backend_port, 10, actual_completion)
+            .await
+            .unwrap();
+        let unique_prefix = format!("ferrum:test:ai:expose:neg:{}", Uuid::new_v4().simple());
+
+        setup_proxy_with_plugins(
+            &harness,
+            &client,
+            "proxy-ai-expose-neg",
+            "/ai-expose-neg",
+            backend_port,
+            "http",
+            vec![json!({
+                "id": "plugin-ai-expose-neg",
+                "plugin_name": "ai_rate_limiter",
+                "scope": "proxy",
+                "proxy_id": "proxy-ai-expose-neg",
+                "enabled": true,
+                "config": {
+                    "token_limit": token_limit,
+                    "window_seconds": window_seconds,
+                    "count_mode": "completion_tokens",
+                    "limit_by": "ip",
+                    "expose_headers": true,
+                    "sync_mode": "redis",
+                    "redis_url": REDIS_URL,
+                    "redis_key_prefix": unique_prefix
+                }
+            })],
+        )
+        .await
+        .unwrap();
+
+        harness.wait_for_poll().await;
+        delete_redis_keys_by_prefix(&unique_prefix).await;
+
+        let resp = client
+            .post(format!(
+                "{}/ai-expose-neg/v1/chat/completions",
+                harness.proxy_base_url
+            ))
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"model":"test","messages":[{{"role":"user","content":"hi"}}],"max_tokens":{reserved}}}"#
+            ))
+            .send()
+            .await
+            .expect("negative-delta request failed");
+
+        assert_eq!(resp.status().as_u16(), 200, "negative-delta must succeed");
+        let usage_hdr = resp
+            .headers()
+            .get("x-ai-ratelimit-usage")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let remaining_hdr = resp
+            .headers()
+            .get("x-ai-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let _ = resp.text().await;
+
+        assert_ne!(
+            actual_completion, reserved,
+            "fixture must exercise a non-zero negative reservation delta"
+        );
+        let expected_usage = actual_completion.to_string();
+        let expected_remaining = (token_limit - actual_completion).to_string();
+        assert_eq!(
+            usage_hdr.as_deref(),
+            Some(expected_usage.as_str()),
+            "negative-delta headers must expose reconciled usage, not the admission estimate {reserved}"
+        );
+        assert_eq!(
+            remaining_hdr.as_deref(),
+            Some(expected_remaining.as_str()),
+            "negative-delta remaining must match the post-reconcile Redis budget"
+        );
+        let redis_usage = redis_sum_counters_by_prefix(&unique_prefix).await;
+        assert_eq!(
+            redis_usage, actual_completion as i64,
+            "Redis bucket after negative-delta reconcile must charge actual completion tokens"
+        );
+        let redis_usage_str = redis_usage.to_string();
+        let redis_remaining_str = (token_limit as i64 - redis_usage).to_string();
+        assert_eq!(
+            usage_hdr.as_deref(),
+            Some(redis_usage_str.as_str()),
+            "client-visible usage must match the post-reconcile Redis bucket"
+        );
+        assert_eq!(
+            remaining_hdr.as_deref(),
+            Some(redis_remaining_str.as_str()),
+            "client-visible remaining must match token_limit minus Redis usage"
+        );
+
+        delete_redis_keys_by_prefix(&unique_prefix).await;
+    }
+
+    println!("test_ai_rate_limiter_redis_expose_headers_match_reconciled_bucket PASSED");
 }
 
 // ============================================================================

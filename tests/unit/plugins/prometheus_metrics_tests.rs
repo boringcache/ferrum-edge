@@ -1446,7 +1446,7 @@ async fn ai_token_metadata_records_and_renders_bounded_prometheus_families() {
         "POST".to_string(),
         "/responses".to_string(),
     );
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = serde_json::to_vec(&json!({
         "object": "response",
         "model": "must-not-be-a-label",
@@ -1454,7 +1454,7 @@ async fn ai_token_metadata_records_and_renders_bounded_prometheus_families() {
     }))
     .unwrap();
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
 
     let registry = MetricsRegistry::new();
@@ -1527,7 +1527,7 @@ async fn multiple_ai_token_instances_preserve_one_trusted_cost_without_double_co
     }))
     .unwrap();
     let detailed = AiTokenMetrics::new(&json!({"metadata_prefix": "zeta"})).unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = br#"{"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
 
     let registry = MetricsRegistry::new();
@@ -1549,7 +1549,7 @@ async fn multiple_ai_token_instances_preserve_one_trusted_cost_without_double_co
         };
         for instance in instances {
             instance
-                .on_response_body(&mut ctx, 200, &headers, body)
+                .on_response_body(&mut ctx, 200, &mut headers, body)
                 .await;
         }
 
@@ -1714,7 +1714,7 @@ async fn submicro_request_costs_accumulate_before_aggregate_rounding() {
         .on_response_body(
             &mut ctx,
             200,
-            &HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            &mut HashMap::from([("content-type".to_string(), "application/json".to_string())]),
             br#"{"usage":{"prompt_tokens":1,"total_tokens":1}}"#,
         )
         .await;
