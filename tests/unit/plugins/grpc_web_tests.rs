@@ -923,12 +923,21 @@ async fn test_final_request_body_rejects_every_malformed_envelope_boundary() {
         ("empty", Vec::new()),
         ("invalid first flag", request_frame(0x42, b"bad")),
         ("invalid later flag", invalid_later_flag),
-        ("request trailer", request_frame(0x80, b"grpc-status: 0\r\n")),
-        ("compressed request trailer", request_frame(0x81, b"trailers")),
+        (
+            "request trailer",
+            request_frame(0x80, b"grpc-status: 0\r\n"),
+        ),
+        (
+            "compressed request trailer",
+            request_frame(0x81, b"trailers"),
+        ),
         ("data then trailer", data_then_trailer),
         ("trailer then data", trailer_then_data),
         ("trailing byte", trailing_byte),
-        ("u32 max declared length", vec![0x00, 0xff, 0xff, 0xff, 0xff]),
+        (
+            "u32 max declared length",
+            vec![0x00, 0xff, 0xff, 0xff, 0xff],
+        ),
     ];
     for header_len in 1..5 {
         cases.push(("truncated first header", vec![0; header_len]));

@@ -943,7 +943,10 @@ async fn grpc_web_request_envelopes_are_validated_on_h1_and_h2_binary_and_text()
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            assert!(accepted, "{version:?} valid compressed {content_type} rejected");
+            assert!(
+                accepted,
+                "{version:?} valid compressed {content_type} rejected"
+            );
 
             let malformed = if text_mode {
                 vec![
