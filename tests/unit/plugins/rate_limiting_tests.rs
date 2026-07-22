@@ -1329,16 +1329,18 @@ async fn test_expose_headers_reports_tightest_window() {
 
 // ─── Shared synthetic/rejection finalizer (issue #2306) ─────────────────
 
-fn assert_standard_ratelimit_headers(headers: &HashMap<String, String>, limit: &str, remaining: &str) {
+fn assert_standard_ratelimit_headers(
+    headers: &HashMap<String, String>,
+    limit: &str,
+    remaining: &str,
+) {
     assert_eq!(
         headers.get("x-ratelimit-limit").map(String::as_str),
         Some(limit),
         "expected x-ratelimit-limit={limit}, got {headers:?}"
     );
     assert_eq!(
-        headers
-            .get("x-ratelimit-remaining")
-            .map(String::as_str),
+        headers.get("x-ratelimit-remaining").map(String::as_str),
         Some(remaining),
         "expected x-ratelimit-remaining={remaining}, got {headers:?}"
     );
@@ -1628,10 +1630,7 @@ async fn test_expose_headers_survive_grpc_reject_normalization() {
     assert_eq!(normalized.grpc_status, Some(7)); // PERMISSION_DENIED from 403
     assert_standard_ratelimit_headers(&normalized.headers, "5", "4");
     assert_eq!(
-        normalized
-            .headers
-            .get("content-type")
-            .map(String::as_str),
+        normalized.headers.get("content-type").map(String::as_str),
         Some("application/grpc")
     );
 }
