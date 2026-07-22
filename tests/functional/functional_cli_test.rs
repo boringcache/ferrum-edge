@@ -1467,14 +1467,11 @@ async fn functional_cli_validate_conf_mode_beats_smart_discovered_spec() {
     // temp dir so ./resources.yaml is the discovery candidate. --settings wins
     // for the settings path; FERRUM_MODE and FERRUM_FILE_CONFIG_PATH stay unset
     // so only conf + discovery drive the decision.
-    let output = hermetic_validate_command(
-        &temp_dir,
-        &["--settings", conf_path.to_str().unwrap()],
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .output()
-    .expect("Failed to run ferrum-edge validate");
+    let output = hermetic_validate_command(&temp_dir, &["--settings", conf_path.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
