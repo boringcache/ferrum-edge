@@ -21455,6 +21455,7 @@ components:
             - ProxyUpstreamIdMismatch
             - InvalidTagName
             - UnsupportedExternalRef
+            - SchemaReference
             - SchemaTooDeep
           description: |
             Machine-readable error discriminant.
@@ -21476,6 +21477,7 @@ components:
             - `ProxyUpstreamIdMismatch` — `x-ferrum-proxy.upstream_id` conflicts with the `id` of the inline `x-ferrum-upstream`
             - `InvalidTagName` — a `tags[].name` contains a forbidden character (`"`, `%`, `_`, or `\`) that would break the SQL `has_tag` LIKE filter
             - `UnsupportedExternalRef` — `x-ferrum-validate` references an external `$ref`; only local refs are resolved into generated plugin config
+            - `SchemaReference` — a local schema `$id`, `$anchor`, URI fragment, or `$ref` is malformed, duplicated, or unresolved
             - `SchemaTooDeep` — `x-ferrum-validate` schema refs exceed the resolver depth limit
         details:
           type: string
@@ -21484,4 +21486,5 @@ components:
             offending extension name and the underlying serde error; for
             `Plugin*` codes includes the plugin id; for `InvalidTagName`
             includes the offending tag name and character. Includes field
-            paths and values where applicable.
+            paths and values where applicable. For `SchemaReference`, includes
+            the malformed or unresolved local schema-reference detail.

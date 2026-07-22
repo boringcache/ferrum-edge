@@ -344,13 +344,7 @@ fn malformed_percent_encoding_is_rejected() {
     );
     let err = extract_err(&spec);
     assert!(
-        matches!(
-            err,
-            ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                ..
-            }
-        ),
+        matches!(err, ExtractError::SchemaReference(_)),
         "got: {err}"
     );
     assert!(
@@ -386,13 +380,7 @@ fn missing_anchor_is_rejected() {
     );
     let err = extract_err(&spec);
     assert!(
-        matches!(
-            err,
-            ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                ..
-            }
-        ),
+        matches!(err, ExtractError::SchemaReference(_)),
         "got: {err}"
     );
     assert!(
@@ -435,13 +423,7 @@ fn duplicate_anchor_is_rejected() {
     );
     let err = extract_err(&spec);
     assert!(
-        matches!(
-            err,
-            ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                ..
-            }
-        ),
+        matches!(err, ExtractError::SchemaReference(_)),
         "got: {err}"
     );
     assert!(
@@ -736,6 +718,164 @@ fn openapi_30_ignores_dollar_anchor_keyword() {
             .contains("unresolved internal $ref '#Order'"),
         "got: {err}"
     );
+}
+
+#[test]
+fn draft7_anchor_accepts_colon_and_resource_pointer_uses_fragment_id_root() {
+    let spec = format!(
+        r##"{{
+  "openapi": "3.0.3",
+  "info": {{"title": "Draft 7 Anchor Grammar", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "components": {{
+    "schemas": {{
+      "Order": {{
+        "$id": "https://example.com/schemas/order.json#ns:Order",
+        "type": "object",
+        "properties": {{"id": {{"type": "string"}}}}
+      }}
+    }}
+  }},
+  "paths": {{
+    "/orders": {{
+      "post": {{
+        "requestBody": {{
+          "content": {{
+            "application/json": {{
+              "schema": {{"$ref": "https://example.com/schemas/order.json#/properties/id"}}
+            }}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+    let schema = first_request_schema(&spec);
+    assert_eq!(schema["type"], "string");
+}
+
+#[test]
+fn annotation_payload_identifiers_and_refs_remain_opaque_instance_data() {
+    let spec = format!(
+        r##"{{
+  "openapi": "3.0.3",
+  "info": {{"title": "Opaque Annotation Data", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "paths": {{
+    "/orders": {{
+      "post": {{
+        "requestBody": {{
+          "content": {{
+            "application/json": {{
+              "schema": {{
+                "type": "object",
+                "default": {{
+                  "id": "http://[invalid-authority",
+                  "$ref": "#not-a-schema-reference"
+                }}
+              }}
+            }}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+    let schema = first_request_schema(&spec);
+    assert_eq!(schema["default"]["id"], "http://[invalid-authority");
+    assert_eq!(
+        schema["default"]["$ref"],
+        "#not-a-schema-reference"
+    );
+}
+
+#[test]
+fn components_path_items_schema_anchors_are_indexed() {
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Path Item Anchor", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "components": {{
+    "pathItems": {{
+      "Reusable": {{
+        "post": {{
+          "requestBody": {{
+            "content": {{
+              "application/json": {{
+                "schema": {{"$anchor": "PathItemBody", "type": "integer"}}
+              }}
+            }}
+          }},
+          "responses": {{"204": {{"description": "ok"}}}}
+        }}
+      }}
+    }}
+  }},
+  "paths": {{
+    "/orders": {{
+      "post": {{
+        "requestBody": {{
+          "content": {{
+            "application/json": {{"schema": {{"$ref": "#PathItemBody"}}}}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+    let schema = first_request_schema(&spec);
+    assert_eq!(schema["$anchor"], "PathItemBody");
+    assert_eq!(schema["type"], "integer");
+}
+
+#[test]
+fn resource_uri_percent_escape_hex_case_is_canonicalized() {
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "URI Escape Case", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "components": {{
+    "schemas": {{
+      "Order": {{
+        "$id": "https://example.com/schemas/order%2fid.json",
+        "type": "string"
+      }}
+    }}
+  }},
+  "paths": {{
+    "/orders": {{
+      "post": {{
+        "requestBody": {{
+          "content": {{
+            "application/json": {{
+              "schema": {{"$ref": "https://example.com/schemas/order%2Fid.json#"}}
+            }}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+    let schema = first_request_schema(&spec);
+    assert_eq!(schema["type"], "string");
 }
 
 #[test]
@@ -1047,13 +1187,7 @@ fn duplicate_same_document_resource_id_is_rejected() {
     );
     let err = extract_err(&spec);
     assert!(
-        matches!(
-            err,
-            ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                ..
-            }
-        ),
+        matches!(err, ExtractError::SchemaReference(_)),
         "got: {err}"
     );
     assert!(

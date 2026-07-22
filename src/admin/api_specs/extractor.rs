@@ -24,7 +24,7 @@ use crate::config::types::{
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
 use chrono::Utc;
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use url::Url;
 
 /// HTTP method keys counted when computing `operation_count`.
@@ -122,6 +122,8 @@ pub enum ExtractError {
     InvalidTagName { name: String, char: char },
     #[error("external $ref '{reference}' is not supported in x-ferrum-validate schemas")]
     UnsupportedExternalRef { reference: String },
+    #[error("schema reference error: {0}")]
+    SchemaReference(String),
     #[error("schema reference depth exceeded while resolving '{location}'")]
     SchemaTooDeep { location: String },
 }
@@ -899,6 +901,7 @@ fn extract_openapi_request_body(
         MAX_SCHEMA_REF_DEPTH,
         resolver.document_base(),
         resolver,
+        ResolveContext::ReferenceObject,
     )?;
     let Some(object) = resolved.as_object() else {
         return Ok(None);
@@ -918,6 +921,7 @@ fn extract_openapi_request_body(
                     MAX_SCHEMA_REF_DEPTH,
                     resolver.document_base(),
                     resolver,
+                    ResolveContext::Schema,
                 )?;
                 content_schemas.insert(
                     media_type.clone(),
@@ -951,6 +955,7 @@ fn extract_openapi_responses(
             MAX_SCHEMA_REF_DEPTH,
             resolver.document_base(),
             resolver,
+            ResolveContext::ReferenceObject,
         )?;
         let Some(response_object) = resolved.as_object() else {
             continue;
@@ -966,6 +971,7 @@ fn extract_openapi_responses(
                         MAX_SCHEMA_REF_DEPTH,
                         resolver.document_base(),
                         resolver,
+                        ResolveContext::Schema,
                     )?;
                     content_schemas.insert(
                         media_type.clone(),
@@ -1008,6 +1014,7 @@ fn extract_swagger_request_body(
             MAX_SCHEMA_REF_DEPTH,
             resolver.document_base(),
             resolver,
+            ResolveContext::ReferenceObject,
         )?;
         let Some(parameter_object) = resolved.as_object() else {
             continue;
@@ -1025,6 +1032,7 @@ fn extract_swagger_request_body(
             MAX_SCHEMA_REF_DEPTH,
             resolver.document_base(),
             resolver,
+            ResolveContext::Schema,
         )?;
         let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Request);
         let required = parameter_object
@@ -1060,6 +1068,7 @@ fn extract_swagger_responses(
             MAX_SCHEMA_REF_DEPTH,
             resolver.document_base(),
             resolver,
+            ResolveContext::ReferenceObject,
         )?;
         let Some(response_object) = resolved.as_object() else {
             continue;
@@ -1074,6 +1083,7 @@ fn extract_swagger_responses(
             MAX_SCHEMA_REF_DEPTH,
             resolver.document_base(),
             resolver,
+            ResolveContext::Schema,
         )?;
         let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
         let mut content = Map::new();
@@ -1128,11 +1138,17 @@ struct LocalSchemaResolver {
     /// Absolute resource URI → (anchor name → JSON Pointer from document root).
     anchors: HashMap<String, HashMap<String, String>>,
     /// Absolute URIs of schema resources present in the document.
-    resources: HashMap<String, ()>,
-    /// `(json_pointer, resource_uri)` resource roots for longest-prefix base lookup.
-    resource_roots: Vec<(String, String)>,
+    resources: HashSet<String>,
+    /// Resource roots for longest-prefix base lookup without reparsing URLs.
+    resource_roots: Vec<SchemaResourceRoot>,
     /// OpenAPI 3.1+ uses `$anchor`; Swagger 2.0 / OAS 3.0 use Draft-7 `$id`/`id` fragments.
     use_dollar_anchor: bool,
+}
+
+struct SchemaResourceRoot {
+    pointer: String,
+    key: String,
+    base: Url,
 }
 
 impl LocalSchemaResolver {
@@ -1147,21 +1163,22 @@ impl LocalSchemaResolver {
         let mut resolver = Self {
             document_base: document_base.clone(),
             anchors: HashMap::new(),
-            resources: HashMap::new(),
+            resources: HashSet::new(),
             resource_roots: Vec::new(),
             use_dollar_anchor,
         };
-        resolver
-            .resources
-            .insert(document_base.as_str().to_string(), ());
-        resolver
-            .resource_roots
-            .push((String::new(), document_base.as_str().to_string()));
+        let document_key = resource_uri_key(&document_base);
+        resolver.resources.insert(document_key.clone());
+        resolver.resource_roots.push(SchemaResourceRoot {
+            pointer: String::new(),
+            key: document_key,
+            base: document_base.clone(),
+        });
         resolver.index_openapi_schemas(root, &document_base, MAX_SCHEMA_INDEX_DEPTH)?;
         // Longest JSON Pointer prefix wins when locating a node's resource.
         resolver
             .resource_roots
-            .sort_by_key(|b| std::cmp::Reverse(b.0.len()));
+            .sort_by_key(|root| std::cmp::Reverse(root.pointer.len()));
         Ok(resolver)
     }
 
@@ -1251,6 +1268,14 @@ impl LocalSchemaResolver {
                     self.index_path_item_map(path_items, &callback_pointer, base, depth)?;
                 }
             }
+        }
+        if let Some(path_items) = components.get("pathItems").and_then(Value::as_object) {
+            self.index_path_item_map(
+                path_items,
+                &append_json_pointer(pointer, "pathItems"),
+                base,
+                depth,
+            )?;
         }
         Ok(())
     }
@@ -1587,53 +1612,32 @@ impl LocalSchemaResolver {
         if let Some(id_value) = id_value {
             let resolved = base
                 .join(id_value)
-                .map_err(|_| ExtractError::MalformedExtension {
-                    which: "x-ferrum-validate",
-                    error: format!("invalid schema $id '{id_value}'"),
-                })?;
+                .map_err(|_| schema_reference_error(format!("invalid schema $id '{id_value}'")))?;
             let fragment = resolved.fragment().unwrap_or("");
             if !fragment.is_empty() {
                 if self.use_dollar_anchor {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!(
-                            "schema $id '{id_value}' must not contain a non-empty fragment under Draft 2020-12"
-                        ),
-                    });
+                    return Err(schema_reference_error(format!(
+                        "schema $id '{id_value}' must not contain a non-empty fragment under Draft 2020-12"
+                    )));
                 }
                 // Draft 7 / OAS 3.0 / Swagger: fragment-only `$id`/`id` defines a plain-name anchor.
-                if !is_valid_anchor_name(fragment) {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!("invalid schema anchor in $id '{id_value}'"),
-                    });
+                if !is_valid_draft7_anchor_name(fragment) {
+                    return Err(schema_reference_error(format!(
+                        "invalid schema anchor in $id '{id_value}'"
+                    )));
                 }
                 let mut resource = resolved.clone();
                 resource.set_fragment(None);
                 let resource_uri = resource_uri_key(&resource);
-                self.resources.insert(resource_uri.clone(), ());
+                if resource_uri != resource_uri_key(base) {
+                    self.register_resource_root(pointer, &resource, id_value)?;
+                } else {
+                    self.resources.insert(resource_uri.clone());
+                }
                 self.register_anchor(&resource_uri, fragment, pointer)?;
                 child_base = resource;
             } else {
-                let resource_uri = resource_uri_key(&resolved);
-                // Same-document resource `$id` URIs must be unique; otherwise
-                // `resource_root_pointer` would pick an arbitrary root.
-                if let Some((existing_pointer, _)) = self
-                    .resource_roots
-                    .iter()
-                    .find(|(_, uri)| uri == &resource_uri)
-                {
-                    if existing_pointer.as_str() != pointer {
-                        return Err(ExtractError::MalformedExtension {
-                            which: "x-ferrum-validate",
-                            error: format!("duplicate schema $id '{id_value}'"),
-                        });
-                    }
-                } else {
-                    self.resources.insert(resource_uri.clone(), ());
-                    self.resource_roots
-                        .push((pointer.to_string(), resource_uri));
-                }
+                self.register_resource_root(pointer, &resolved, id_value)?;
                 child_base = resolved;
             }
         }
@@ -1641,17 +1645,40 @@ impl LocalSchemaResolver {
         if self.use_dollar_anchor
             && let Some(anchor) = object.get("$anchor").and_then(Value::as_str)
         {
-            if !is_valid_anchor_name(anchor) {
-                return Err(ExtractError::MalformedExtension {
-                    which: "x-ferrum-validate",
-                    error: format!("invalid $anchor '{anchor}'"),
-                });
+            if !is_valid_2020_anchor_name(anchor) {
+                return Err(schema_reference_error(format!(
+                    "invalid $anchor '{anchor}'"
+                )));
             }
             let resource_uri = resource_uri_key(&child_base);
             self.register_anchor(&resource_uri, anchor, pointer)?;
         }
 
         Ok(child_base)
+    }
+
+    fn register_resource_root(
+        &mut self,
+        pointer: &str,
+        base: &Url,
+        id_value: &str,
+    ) -> Result<(), ExtractError> {
+        let key = resource_uri_key(base);
+        if let Some(existing) = self.resource_roots.iter().find(|root| root.key == key) {
+            if existing.pointer != pointer {
+                return Err(schema_reference_error(format!(
+                    "duplicate schema $id '{id_value}'"
+                )));
+            }
+            return Ok(());
+        }
+        self.resources.insert(key.clone());
+        self.resource_roots.push(SchemaResourceRoot {
+            pointer: pointer.to_string(),
+            key,
+            base: base.clone(),
+        });
+        Ok(())
     }
 
     fn register_anchor(
@@ -1663,10 +1690,9 @@ impl LocalSchemaResolver {
         let entry = self.anchors.entry(resource_uri.to_string()).or_default();
         if let Some(existing) = entry.get(anchor) {
             if existing != pointer {
-                return Err(ExtractError::MalformedExtension {
-                    which: "x-ferrum-validate",
-                    error: format!("duplicate schema anchor '{anchor}'"),
-                });
+                return Err(schema_reference_error(format!(
+                    "duplicate schema anchor '{anchor}'"
+                )));
             }
             return Ok(());
         }
@@ -1674,23 +1700,27 @@ impl LocalSchemaResolver {
         Ok(())
     }
 
-    fn resource_for_pointer(&self, pointer: &str) -> &str {
-        for (root_pointer, uri) in &self.resource_roots {
-            if root_pointer.is_empty() {
+    fn resource_for_pointer(&self, pointer: &str) -> &Url {
+        for root in &self.resource_roots {
+            if root.pointer.is_empty() {
                 continue;
             }
-            if pointer == root_pointer || pointer.starts_with(&format!("{root_pointer}/")) {
-                return uri;
+            if pointer == root.pointer.as_str()
+                || pointer
+                    .strip_prefix(&root.pointer)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                return &root.base;
             }
         }
-        self.document_base.as_str()
+        &self.document_base
     }
 
     fn resource_root_pointer(&self, resource_uri: &str) -> &str {
         self.resource_roots
             .iter()
-            .find(|(_, uri)| uri == resource_uri)
-            .map(|(pointer, _)| pointer.as_str())
+            .find(|root| root.key == resource_uri)
+            .map(|root| root.pointer.as_str())
             .unwrap_or("")
     }
 
@@ -1713,9 +1743,8 @@ impl LocalSchemaResolver {
                 let joined =
                     current_base
                         .join(uri)
-                        .map_err(|_| ExtractError::MalformedExtension {
-                            which: "x-ferrum-validate",
-                            error: format!("invalid internal $ref '{reference}'"),
+                        .map_err(|_| {
+                            schema_reference_error(format!("invalid internal $ref '{reference}'"))
                         })?;
                 let mut resource = joined;
                 resource.set_fragment(None);
@@ -1724,7 +1753,7 @@ impl LocalSchemaResolver {
         };
 
         let resource_key = resource_uri_key(&target_resource);
-        if !self.resources.contains_key(&resource_key) {
+        if !self.resources.contains(&resource_key) {
             return Err(ExtractError::UnsupportedExternalRef {
                 reference: reference.to_string(),
             });
@@ -1736,10 +1765,7 @@ impl LocalSchemaResolver {
                 root
             } else {
                 root.pointer(resource_root_pointer).ok_or_else(|| {
-                    ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!("unresolved internal $ref '{reference}'"),
-                    }
+                    schema_reference_error(format!("unresolved internal $ref '{reference}'"))
                 })?
             };
             // Empty fragment = schema resource root. The OpenAPI document root
@@ -1747,20 +1773,14 @@ impl LocalSchemaResolver {
             // it must not expand the whole document (which recurses into itself).
             let target = if decoded_fragment.is_empty() {
                 if resource_root_pointer.is_empty() {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!(
-                            "unresolved internal $ref '{reference}': OpenAPI document root is not a Schema Object"
-                        ),
-                    });
+                    return Err(schema_reference_error(format!(
+                        "unresolved internal $ref '{reference}': OpenAPI document root is not a Schema Object"
+                    )));
                 }
                 resource_root
             } else {
                 resource_root.pointer(&decoded_fragment).ok_or_else(|| {
-                    ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!("unresolved internal $ref '{reference}'"),
-                    }
+                    schema_reference_error(format!("unresolved internal $ref '{reference}'"))
                 })?
             };
             let absolute_pointer = if decoded_fragment.is_empty() {
@@ -1770,39 +1790,42 @@ impl LocalSchemaResolver {
             } else {
                 format!("{resource_root_pointer}{decoded_fragment}")
             };
-            let base_uri = self.resource_for_pointer(&absolute_pointer);
-            let base = Url::parse(base_uri).map_err(|_| ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                error: "internal schema resource base is invalid".to_string(),
-            })?;
-            return Ok((target, base));
+            return Ok((
+                target,
+                self.resource_for_pointer(&absolute_pointer).clone(),
+            ));
         }
 
-        if !is_valid_anchor_name(&decoded_fragment) {
-            return Err(ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                error: format!("invalid plain-name fragment in $ref '{reference}'"),
-            });
+        if !self.valid_anchor_name(&decoded_fragment) {
+            return Err(schema_reference_error(format!(
+                "invalid plain-name fragment in $ref '{reference}'"
+            )));
         }
 
         let pointer = self
             .anchors
             .get(&resource_key)
             .and_then(|anchors| anchors.get(&decoded_fragment))
-            .ok_or_else(|| ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                error: format!("unresolved internal $ref '{reference}'"),
+            .ok_or_else(|| {
+                schema_reference_error(format!("unresolved internal $ref '{reference}'"))
             })?;
         let target = if pointer.is_empty() {
             root
         } else {
             root.pointer(pointer)
-                .ok_or_else(|| ExtractError::MalformedExtension {
-                    which: "x-ferrum-validate",
-                    error: format!("unresolved internal $ref '{reference}'"),
+                .ok_or_else(|| {
+                    schema_reference_error(format!("unresolved internal $ref '{reference}'"))
                 })?
         };
         Ok((target, target_resource))
+    }
+
+    fn valid_anchor_name(&self, name: &str) -> bool {
+        if self.use_dollar_anchor {
+            is_valid_2020_anchor_name(name)
+        } else {
+            is_valid_draft7_anchor_name(name)
+        }
     }
 
     fn child_base_for_object(
@@ -1825,10 +1848,7 @@ impl LocalSchemaResolver {
         };
         let resolved = base
             .join(id_value)
-            .map_err(|_| ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                error: format!("invalid schema $id '{id_value}'"),
-            })?;
+            .map_err(|_| schema_reference_error(format!("invalid schema $id '{id_value}'")))?;
         let mut resource = resolved;
         resource.set_fragment(None);
         Ok(resource)
@@ -1838,7 +1858,30 @@ impl LocalSchemaResolver {
 fn resource_uri_key(url: &Url) -> String {
     let mut owned = url.clone();
     owned.set_fragment(None);
-    owned.to_string()
+    normalize_percent_escape_case(owned.as_str())
+}
+
+fn normalize_percent_escape_case(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(offset) = remaining.find('%') {
+        normalized.push_str(&remaining[..offset]);
+        let escape = &remaining[offset..];
+        if escape.len() >= 3
+            && escape.as_bytes()[1].is_ascii_hexdigit()
+            && escape.as_bytes()[2].is_ascii_hexdigit()
+        {
+            normalized.push('%');
+            normalized.push(char::from(escape.as_bytes()[1].to_ascii_uppercase()));
+            normalized.push(char::from(escape.as_bytes()[2].to_ascii_uppercase()));
+            remaining = &escape[3..];
+        } else {
+            normalized.push('%');
+            remaining = &escape[1..];
+        }
+    }
+    normalized.push_str(remaining);
+    normalized
 }
 
 fn append_json_pointer(base: &str, token: &str) -> String {
@@ -1862,22 +1905,19 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
         match bytes[index] {
             b'%' => {
                 if index + 2 >= bytes.len() {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!("malformed percent-encoding in $ref '{reference}'"),
-                    });
+                    return Err(schema_reference_error(format!(
+                        "malformed percent-encoding in $ref '{reference}'"
+                    )));
                 }
                 let hi = hex_nibble(bytes[index + 1]).ok_or_else(|| {
-                    ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!("malformed percent-encoding in $ref '{reference}'"),
-                    }
+                    schema_reference_error(format!(
+                        "malformed percent-encoding in $ref '{reference}'"
+                    ))
                 })?;
                 let lo = hex_nibble(bytes[index + 2]).ok_or_else(|| {
-                    ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!("malformed percent-encoding in $ref '{reference}'"),
-                    }
+                    schema_reference_error(format!(
+                        "malformed percent-encoding in $ref '{reference}'"
+                    ))
                 })?;
                 out.push((hi << 4) | lo);
                 index += 3;
@@ -1888,9 +1928,10 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
             }
         }
     }
-    String::from_utf8(out).map_err(|_| ExtractError::MalformedExtension {
-        which: "x-ferrum-validate",
-        error: format!("malformed percent-encoding in $ref '{reference}'"),
+    String::from_utf8(out).map_err(|_| {
+        schema_reference_error(format!(
+            "malformed percent-encoding in $ref '{reference}'"
+        ))
     })
 }
 
@@ -1907,13 +1948,54 @@ fn is_json_pointer_fragment(decoded: &str) -> bool {
     decoded.is_empty() || decoded.starts_with('/')
 }
 
-fn is_valid_anchor_name(name: &str) -> bool {
+fn is_valid_2020_anchor_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+fn is_valid_draft7_anchor_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':')
+    })
+}
+
+fn schema_reference_error(message: String) -> ExtractError {
+    ExtractError::SchemaReference(message)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResolveContext {
+    ReferenceObject,
+    Schema,
+    SchemaMap,
+    SchemaArray,
+    Opaque,
+}
+
+fn schema_child_context(key: &str, value: &Value) -> ResolveContext {
+    match key {
+        "$defs"
+        | "definitions"
+        | "properties"
+        | "patternProperties"
+        | "dependentSchemas"
+        | "dependencies" => ResolveContext::SchemaMap,
+        "allOf" | "anyOf" | "oneOf" | "prefixItems" => ResolveContext::SchemaArray,
+        "items" if value.is_array() => ResolveContext::SchemaArray,
+        "items" | "additionalProperties" | "unevaluatedProperties" | "additionalItems"
+        | "unevaluatedItems" | "contains" | "not" | "if" | "then" | "else"
+        | "propertyNames" | "contentSchema" => ResolveContext::Schema,
+        _ => ResolveContext::Opaque,
+    }
 }
 
 fn resolve_refs(
@@ -1923,7 +2005,11 @@ fn resolve_refs(
     depth: usize,
     current_base: &Url,
     resolver: &LocalSchemaResolver,
+    context: ResolveContext,
 ) -> Result<Value, ExtractError> {
+    if context == ResolveContext::Opaque {
+        return Ok(value.clone());
+    }
     if depth == 0 {
         return Err(ExtractError::SchemaTooDeep {
             location: location.to_string(),
@@ -1931,18 +2017,33 @@ fn resolve_refs(
     }
     match value {
         Value::Object(object) => {
-            // `$id` on this Schema Object establishes the base URI for every
-            // URI-reference keyword in the same object, including `$ref`.
-            // Compute it before resolving `$ref`; using the parent base here
-            // misclassifies valid same-document relative targets as external.
-            let child_base = resolver.child_base_for_object(object, current_base)?;
-            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+            let child_base = if context == ResolveContext::Schema {
+                // `$id` on this Schema Object establishes the base URI for every
+                // URI-reference keyword in the same object, including `$ref`.
+                resolver.child_base_for_object(object, current_base)?
+            } else {
+                current_base.clone()
+            };
+            let resolves_own_reference = matches!(
+                context,
+                ResolveContext::Schema | ResolveContext::ReferenceObject
+            );
+            if resolves_own_reference
+                && let Some(reference) = object.get("$ref").and_then(Value::as_str)
+            {
                 // Non-local absolute/relative refs without a matching in-document `$id`
                 // are rejected inside `resolve_reference` as UnsupportedExternalRef.
                 let (target, target_base) =
                     resolver.resolve_reference(root, reference, &child_base)?;
-                let mut resolved =
-                    resolve_refs(root, target, reference, depth - 1, &target_base, resolver)?;
+                let mut resolved = resolve_refs(
+                    root,
+                    target,
+                    reference,
+                    depth - 1,
+                    &target_base,
+                    resolver,
+                    context,
+                )?;
                 if object.len() > 1
                     && let Some(resolved_object) = resolved.as_object_mut()
                 {
@@ -1957,6 +2058,11 @@ fn resolve_refs(
                                     depth - 1,
                                     &child_base,
                                     resolver,
+                                    if context == ResolveContext::Schema {
+                                        schema_child_context(key, child)
+                                    } else {
+                                        ResolveContext::Opaque
+                                    },
                                 )?,
                             );
                         }
@@ -1964,18 +2070,44 @@ fn resolve_refs(
                 }
                 return Ok(resolved);
             }
+            if context == ResolveContext::ReferenceObject {
+                return Ok(value.clone());
+            }
             let mut resolved = Map::new();
             for (key, child) in object {
+                let child_context = match context {
+                    ResolveContext::Schema => schema_child_context(key, child),
+                    ResolveContext::SchemaMap => ResolveContext::Schema,
+                    _ => ResolveContext::Opaque,
+                };
                 resolved.insert(
                     key.clone(),
-                    resolve_refs(root, child, location, depth - 1, &child_base, resolver)?,
+                    resolve_refs(
+                        root,
+                        child,
+                        location,
+                        depth - 1,
+                        &child_base,
+                        resolver,
+                        child_context,
+                    )?,
                 );
             }
             Ok(Value::Object(resolved))
         }
-        Value::Array(values) => values
+        Value::Array(values) if context == ResolveContext::SchemaArray => values
             .iter()
-            .map(|child| resolve_refs(root, child, location, depth - 1, current_base, resolver))
+            .map(|child| {
+                resolve_refs(
+                    root,
+                    child,
+                    location,
+                    depth - 1,
+                    current_base,
+                    resolver,
+                    ResolveContext::Schema,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
         other => Ok(other.clone()),

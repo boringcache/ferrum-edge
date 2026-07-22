@@ -636,6 +636,7 @@ fn extract_error_code(e: &ExtractError) -> &'static str {
         ExtractError::ProxyUpstreamIdMismatch { .. } => "ProxyUpstreamIdMismatch",
         ExtractError::InvalidTagName { .. } => "InvalidTagName",
         ExtractError::UnsupportedExternalRef { .. } => "UnsupportedExternalRef",
+        ExtractError::SchemaReference(_) => "SchemaReference",
         ExtractError::SchemaTooDeep { .. } => "SchemaTooDeep",
     }
 }
@@ -664,6 +665,7 @@ fn extract_error_status(e: &ExtractError) -> StatusCode {
         | ExtractError::ProxyUpstreamIdMismatch { .. }
         | ExtractError::InvalidTagName { .. }
         | ExtractError::UnsupportedExternalRef { .. }
+        | ExtractError::SchemaReference(_)
         | ExtractError::SchemaTooDeep { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
