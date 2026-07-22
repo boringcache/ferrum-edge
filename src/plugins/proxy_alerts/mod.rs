@@ -255,6 +255,7 @@ impl ProxyAlerts {
     /// Run the ownership portion of the background lifecycle sweep without
     /// waiting for its one-minute cadence.
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn sweep_lifecycle_ownership_for_test(&self) {
         retain_published_proxy_generations(
             &self.windows,
