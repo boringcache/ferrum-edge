@@ -20569,8 +20569,7 @@ components:
             type: object
             properties:
               total_charges:
-                type: number
-                nullable: true
+                type: [number, "null"]
                 description: |
                   Sum of per-call, stream-connection, and bandwidth charges across
                   all proxies for this consumer when every contributing proxy shares
@@ -20585,20 +20584,17 @@ components:
                   consumer. Unitless and always present, including mixed-currency
                   consumers.
               per_call_charges:
-                type: number
-                nullable: true
+                type: [number, "null"]
                 description: |
                   HTTP per-call charges only when every proxy for this consumer
                   shares one currency; `null` when currencies are mixed.
               stream_connection_charges:
-                type: number
-                nullable: true
+                type: [number, "null"]
                 description: |
                   Stream per-connection charges only when every proxy for this
                   consumer shares one currency; `null` when currencies are mixed.
               bandwidth_charges:
-                type: number
-                nullable: true
+                type: [number, "null"]
                 description: |
                   Bandwidth charges only (sent + received) when every proxy for
                   this consumer shares one currency; `null` when currencies are
