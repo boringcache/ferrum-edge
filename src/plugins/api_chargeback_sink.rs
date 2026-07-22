@@ -419,6 +419,8 @@ struct SinkSummary {
     endpoint: String,
     database: String,
     table: String,
+    batch_size: usize,
+    flush_interval_ms: u64,
 }
 
 pub struct ApiChargebackSink {
@@ -792,6 +794,8 @@ impl ApiChargebackSink {
                 endpoint,
                 database: self.config.clickhouse.database.clone(),
                 table: self.config.clickhouse.table.clone(),
+                batch_size: self.config.batch.size,
+                flush_interval_ms: self.config.batch.flush_interval_ms,
             },
             logger,
             metrics,
@@ -1099,6 +1103,7 @@ pub fn render_status_json() -> String {
             "enabled": false,
             "pricing_version": null,
             "clickhouse": null,
+            "batch": {"size": 0, "flush_interval_ms": 0},
             "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
             "spool": {"enabled": false, "available": false, "prepare_failures_total": 0, "files": 0, "bytes": 0, "drops_total": 0, "last_replay_at": null},
             "export": {
@@ -1148,6 +1153,10 @@ impl SinkRuntime {
                 "endpoint": self.summary.endpoint,
                 "database": self.summary.database,
                 "table": self.summary.table,
+            },
+            "batch": {
+                "size": self.summary.batch_size,
+                "flush_interval_ms": self.summary.flush_interval_ms,
             },
             "queue": {
                 "depth": self.logger.queue_depth(),

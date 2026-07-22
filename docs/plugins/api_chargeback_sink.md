@@ -218,8 +218,9 @@ node and time window.
 
 ## Status And Metrics
 
-`GET /charges/sink/status` is JWT-authenticated and returns queue depth, spool
-size, replay timestamps, and export counters. `/metrics` includes:
+`GET /charges/sink/status` is JWT-authenticated and returns the effective batch
+size and flush interval, queue depth, spool size, replay timestamps, and export
+counters. `/metrics` includes:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`

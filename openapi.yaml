@@ -1483,10 +1483,11 @@ paths:
       operationId: getChargebackSinkStatus
       summary: API chargeback sink status
       description: |
-        Returns queue depth, spool size, replay timestamps, and export counters
-        for the `api_chargeback_sink` plugin. Requires a valid admin JWT because
-        sink status can expose billing topology and ClickHouse endpoint metadata.
-        Credentials and URL user-info are never returned.
+        Returns effective batch settings, queue depth, spool size, replay
+        timestamps, and export counters for the `api_chargeback_sink` plugin.
+        Requires a valid admin JWT because sink status can expose billing
+        topology and ClickHouse endpoint metadata. Credentials and URL user-info
+        are never returned.
       tags: [Metrics]
       responses:
         "200":
@@ -20567,6 +20568,17 @@ components:
               type: string
             table:
               type: string
+        batch:
+          type: object
+          description: Effective admitted batching settings used by the live sink. Values are zero while the sink is disabled.
+          properties:
+            size:
+              type: integer
+              minimum: 0
+              maximum: 10000
+            flush_interval_ms:
+              type: integer
+              minimum: 0
         queue:
           type: object
           properties:

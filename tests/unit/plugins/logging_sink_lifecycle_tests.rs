@@ -512,6 +512,8 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         Some(true),
         "successful activation must publish ACTIVE_SINK"
     );
+    assert_eq!(status["batch"]["size"], 2);
+    assert_eq!(status["batch"]["flush_interval_ms"], 60_000);
 
     // A later staged generation may stage its owned workers before the cache
     // swap, but it must not displace diagnostics for the committed live sink.
@@ -551,6 +553,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         Some(false),
         "drop must clear ACTIVE_SINK owned by this instance"
     );
+    assert_eq!(status_after["batch"]["size"], 0);
 }
 
 #[tokio::test]
