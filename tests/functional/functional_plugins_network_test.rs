@@ -850,15 +850,26 @@ async fn assert_misbehaving_mirror_does_not_delay_primary(behavior: &'static str
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                     .any(|entry| {
                         entry.get("mirror").and_then(Value::as_bool) == Some(true)
-                            && if behavior == "slow" {
-                                entry.get("response_status_code").and_then(Value::as_u64)
-                                    == Some(204)
-                            } else {
-                                entry
+                            && match behavior {
+                                "slow" => {
+                                    entry.get("response_status_code").and_then(Value::as_u64)
+                                        == Some(204)
+                                }
+                                "stall" => entry
                                     .get("metadata")
                                     .and_then(|metadata| metadata.get("mirror_error"))
                                     .and_then(Value::as_str)
-                                    .is_some()
+                                    .is_some(),
+                                "reset" => {
+                                    entry.get("response_status_code").and_then(Value::as_u64)
+                                        == Some(200)
+                                        || entry
+                                            .get("metadata")
+                                            .and_then(|metadata| metadata.get("mirror_error"))
+                                            .and_then(Value::as_str)
+                                            .is_some()
+                                }
+                                _ => false,
                             }
                     })
             },
@@ -870,14 +881,24 @@ async fn assert_misbehaving_mirror_does_not_delay_primary(behavior: &'static str
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|entry| {
             entry.get("mirror").and_then(Value::as_bool) == Some(true)
-                && if behavior == "slow" {
-                    entry.get("response_status_code").and_then(Value::as_u64) == Some(204)
-                } else {
-                    entry
+                && match behavior {
+                    "slow" => {
+                        entry.get("response_status_code").and_then(Value::as_u64) == Some(204)
+                    }
+                    "stall" => entry
                         .get("metadata")
                         .and_then(|metadata| metadata.get("mirror_error"))
                         .and_then(Value::as_str)
-                        .is_some()
+                        .is_some(),
+                    "reset" => {
+                        entry.get("response_status_code").and_then(Value::as_u64) == Some(200)
+                            || entry
+                                .get("metadata")
+                                .and_then(|metadata| metadata.get("mirror_error"))
+                                .and_then(Value::as_str)
+                                .is_some()
+                    }
+                    _ => false,
                 }
         });
     assert!(
