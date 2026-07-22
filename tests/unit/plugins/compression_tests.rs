@@ -1,6 +1,10 @@
 use super::plugin_utils::create_test_proxy;
 use ferrum_edge::_test_support::{
+    apply_synthetic_response_body_hooks_for_test,
+    discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_plugin_rejection_parts_for_test, run_after_proxy_hooks_reject_for_test,
+    stamp_original_response_metadata_for_test,
+    transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
 use ferrum_edge::plugins::response_caching::ResponseCaching;
@@ -8,6 +12,55 @@ use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, validate_plugin
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Origin integrity fields that become stale after gateway compression.
+const INTEGRITY_DIGEST_HEADERS: &[&str] = &[
+    "content-digest",
+    "repr-digest",
+    "digest",
+    "content-md5",
+];
+
+fn insert_stale_integrity_digests(headers: &mut HashMap<String, String>) {
+    // Mixed-case names prove case-insensitive cleanup rather than exact-key deletes.
+    headers.insert(
+        "Content-Digest".to_string(),
+        "sha-256=:stale-content:".to_string(),
+    );
+    headers.insert(
+        "Repr-Digest".to_string(),
+        "sha-256=:stale-repr:".to_string(),
+    );
+    headers.insert("Digest".to_string(), "sha-256=stale-legacy".to_string());
+    headers.insert("Content-MD5".to_string(), "stale-md5".to_string());
+}
+
+fn assert_integrity_digests_absent(headers: &HashMap<String, String>) {
+    for name in INTEGRITY_DIGEST_HEADERS {
+        assert!(
+            headers
+                .keys()
+                .all(|key| !key.eq_ignore_ascii_case(name)),
+            "stale integrity field {name} must be removed after compression"
+        );
+    }
+}
+
+fn assert_integrity_digests_present(headers: &HashMap<String, String>) {
+    for name in INTEGRITY_DIGEST_HEADERS {
+        assert!(
+            headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(name)),
+            "integrity field {name} must be preserved when compression does not rewrite bytes"
+        );
+    }
+}
+
+fn compressible_json_body() -> Vec<u8> {
+    br#"{"users":[{"name":"alice","email":"alice@example.com","role":"admin"},{"name":"bob","email":"bob@example.com","role":"user"},{"name":"charlie","email":"charlie@example.com","role":"user"},{"name":"dave","email":"dave@example.com","role":"moderator"},{"name":"eve","email":"eve@example.com","role":"user"}]}"#
+        .to_vec()
+}
 
 fn make_plugin(config: serde_json::Value) -> CompressionPlugin {
     CompressionPlugin::new(&config).unwrap()
@@ -3891,4 +3944,466 @@ fn test_absent_content_type_fails_closed() {
     let headers = HashMap::new();
 
     assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &headers));
+}
+
+// ────────────────────── Integrity digests after compression (#2354) ──────────────────────
+
+/// Production H1/H2/H3 buffered transforms call
+/// `finalize_response_body_transformation` after replacement bytes. Pin those
+/// call sites so an H1-only cleanup cannot silently regress the other protocols.
+#[test]
+fn test_h1_h2_h3_paths_finalize_transformed_response_metadata() {
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert!(
+        h1_h2.contains("crate::plugins::finalize_response_body_transformation("),
+        "H1/H2 buffered transform path must finalize content-bound metadata"
+    );
+    assert!(
+        h1_h2.contains("transform_buffered_response_body_with_deadline("),
+        "H1/H2 buffered path must use the shared transform helper that finalizes"
+    );
+    assert!(
+        h3.contains("crate::proxy::transform_buffered_response_body_with_deadline("),
+        "native H3 buffered path must use the shared transform helper that finalizes"
+    );
+    assert!(
+        h3.contains("response_trailers = None")
+            && h3.contains("body_transformed"),
+        "native H3 must drop backend trailers after a body rewrite so trailer digests cannot describe compressed bytes"
+    );
+    assert!(
+        h3_cross.contains("crate::plugins::finalize_response_body_transformation("),
+        "H3 cross-protocol path must finalize content-bound metadata"
+    );
+    assert!(
+        h3_cross.contains("discard_grpc_application_trailers_after_body_rewrite("),
+        "H3 gRPC bridge must retire application trailers (including digests) after a rewrite"
+    );
+    assert!(
+        h1_h2.contains("discard_grpc_application_trailers_after_body_rewrite("),
+        "H1/H2 buffered gRPC path must retire application trailers after a rewrite"
+    );
+}
+
+/// Actual gzip compression through the shared buffered transform lifecycle must
+/// remove all four integrity fields case-insensitively while keeping the
+/// gateway encoding and producing compressed wire bytes.
+#[tokio::test]
+async fn test_compression_transform_strips_stale_integrity_digests() {
+    let plugin = Arc::new(make_plugin(json!({"min_content_length": 10}))) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let original = compressible_json_body();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert(
+        "content-length".to_string(),
+        original.len().to_string(),
+    );
+    insert_stale_integrity_digests(&mut headers);
+    headers.insert("etag".to_string(), "W/\"weak-origin\"".to_string());
+
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, status, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_integrity_digests_present(&headers);
+
+    let mut body = original.clone();
+    let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(!replaced);
+    assert!(rewritten, "compression must rewrite the buffered body");
+    assert_ne!(body, original, "wire bytes must be the compressed representation");
+    assert!(body.len() < original.len());
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "gateway Content-Encoding must survive integrity cleanup"
+    );
+    assert!(
+        headers
+            .get("vary")
+            .is_some_and(|vary| vary.to_ascii_lowercase().contains("accept-encoding")),
+        "Vary: Accept-Encoding must survive integrity cleanup"
+    );
+    let expected_len = body.len().to_string();
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some(expected_len.as_str())
+    );
+    assert_integrity_digests_absent(&headers);
+    assert!(
+        headers.keys().all(|key| !key.eq_ignore_ascii_case("etag")),
+        "weak ETag must not describe compressed bytes"
+    );
+
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(body.as_slice());
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .expect("compressed body must round-trip");
+    assert_eq!(decompressed, original);
+}
+
+/// Brotli path must strip the same integrity set after an actual transform.
+#[tokio::test]
+async fn test_brotli_compression_transform_strips_stale_integrity_digests() {
+    let plugin = Arc::new(make_plugin(json!({"min_content_length": 10}))) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx(Some("br"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let original = compressible_json_body();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert(
+        "content-length".to_string(),
+        original.len().to_string(),
+    );
+    insert_stale_integrity_digests(&mut headers);
+
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, status, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("br")
+    );
+
+    let mut body = original.clone();
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(rewritten);
+    assert_ne!(body, original);
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("br")
+    );
+    assert_integrity_digests_absent(&headers);
+}
+
+/// When negotiation / eligibility declines compression, origin integrity fields
+/// must remain untouched.
+#[tokio::test]
+async fn test_skipped_compression_preserves_integrity_digests() {
+    let plugin = Arc::new(make_plugin(json!({"min_content_length": 10}))) as Arc<dyn Plugin>;
+
+    // Strong ETag: skip compression, keep digests.
+    {
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut req_headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+        let original = compressible_json_body();
+        let mut status = 200u16;
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert(
+            "content-length".to_string(),
+            original.len().to_string(),
+        );
+        headers.insert("etag".to_string(), "\"strong-origin\"".to_string());
+        insert_stale_integrity_digests(&mut headers);
+
+        stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, status, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(!headers.contains_key("content-encoding"));
+
+        let mut body = original.clone();
+        let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+            &[Arc::clone(&plugin)],
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            false,
+        )
+        .await;
+        assert!(!rewritten);
+        assert_eq!(body, original);
+        assert_integrity_digests_present(&headers);
+        assert_eq!(headers.get("etag").map(String::as_str), Some("\"strong-origin\""));
+    }
+
+    // Identity preferred: skip compression, keep digests.
+    {
+        let mut ctx = make_ctx(Some("identity;q=1, gzip;q=0.2"));
+        let mut req_headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+        let original = compressible_json_body();
+        let mut status = 200u16;
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert(
+            "content-length".to_string(),
+            original.len().to_string(),
+        );
+        insert_stale_integrity_digests(&mut headers);
+
+        stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, status, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(!headers.contains_key("content-encoding"));
+
+        let mut body = original.clone();
+        let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+            &[Arc::clone(&plugin)],
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            false,
+        )
+        .await;
+        assert!(!rewritten);
+        assert_eq!(body, original);
+        assert_integrity_digests_present(&headers);
+    }
+
+    // Below min_content_length: skip compression, keep digests.
+    {
+        let plugin = Arc::new(make_plugin(json!({"min_content_length": 10_000}))) as Arc<dyn Plugin>;
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut req_headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+        let original = b"tiny".to_vec();
+        let mut status = 200u16;
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert(
+            "content-length".to_string(),
+            original.len().to_string(),
+        );
+        insert_stale_integrity_digests(&mut headers);
+
+        stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, status, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(!headers.contains_key("content-encoding"));
+
+        let mut body = original.clone();
+        let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+            &[plugin],
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            false,
+        )
+        .await;
+        assert!(!rewritten);
+        assert_eq!(body, original);
+        assert_integrity_digests_present(&headers);
+    }
+}
+
+/// A transform that returns `None` (no gateway commit) must leave digests alone.
+#[tokio::test]
+async fn test_compression_noop_transform_preserves_integrity_digests() {
+    let plugin = Arc::new(make_plugin(json!({"min_content_length": 10}))) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx(Some("gzip"));
+    // Do not run after_proxy: no gateway compression commit → transform returns None.
+    let original = compressible_json_body();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert(
+        "content-length".to_string(),
+        original.len().to_string(),
+    );
+    // Origin encoding without gateway commit metadata must not compress.
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    insert_stale_integrity_digests(&mut headers);
+
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let mut body = original.clone();
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(!rewritten);
+    assert_eq!(body, original);
+    assert_integrity_digests_present(&headers);
+}
+
+/// Synthetic short-circuit publication uses the same finalize contract after an
+/// actual compression rewrite.
+#[tokio::test]
+async fn test_synthetic_compression_transform_strips_stale_integrity_digests() {
+    let plugin = Arc::new(make_plugin(json!({"min_content_length": 10}))) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let original = compressible_json_body();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert(
+        "content-length".to_string(),
+        original.len().to_string(),
+    );
+    insert_stale_integrity_digests(&mut headers);
+
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, status, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+
+    let mut body = original.clone();
+    apply_synthetic_response_body_hooks_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert_ne!(body, original);
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_integrity_digests_absent(&headers);
+}
+
+/// Digests that arrived only as trailers in the merged plugin view are removed
+/// by finalize; buffered gRPC then retires the trailer channel copies.
+#[tokio::test]
+async fn test_trailer_integrity_digests_retired_after_compression_rewrite() {
+    let plugin = Arc::new(make_plugin(json!({"min_content_length": 10}))) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let original = compressible_json_body();
+    let mut status = 200u16;
+    // Merged header+trailer compatibility view: digests present only via trailer names.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert(
+        "content-length".to_string(),
+        original.len().to_string(),
+    );
+    insert_stale_integrity_digests(&mut headers);
+
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, status, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut body = original.clone();
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    assert!(rewritten);
+    assert_integrity_digests_absent(&headers);
+
+    // Wire trailers still hold the pre-rewrite values until the shared discard
+    // boundary runs (H1/H2/H3 gRPC buffered paths). Digests must leave both maps.
+    let mut trailers = HashMap::new();
+    insert_stale_integrity_digests(&mut trailers);
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    discard_grpc_application_trailers_after_body_rewrite_for_test(
+        &mut headers,
+        &mut trailers,
+        &[],
+    );
+    assert_eq!(
+        trailers,
+        HashMap::from([("grpc-status".to_string(), "0".to_string())]),
+        "application trailer digests must be retired; terminal status preserved"
+    );
+    assert_integrity_digests_absent(&headers);
+}
+
+/// Direct hook coverage mirrors neighboring transforming plugins: after an
+/// actual rewrite the plugin-owned cleanup removes the integrity set.
+#[test]
+fn test_on_response_body_transformed_strips_integrity_digests() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    insert_stale_integrity_digests(&mut headers);
+
+    plugin.on_response_body_transformed(&mut ctx, &mut headers);
+
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(
+        headers.get("vary").map(String::as_str),
+        Some("Accept-Encoding")
+    );
+    assert_integrity_digests_absent(&headers);
 }

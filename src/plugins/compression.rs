@@ -1373,4 +1373,20 @@ impl Plugin for CompressionPlugin {
         // — far cheaper than serving a malformed response.
         self.compress_response_body(body, encoding)
     }
+
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        // Production buffered paths call `finalize_response_body_transformation`
+        // immediately after this plugin returns replacement bytes, which already
+        // runs the shared content-bound cleanup before invoking this hook.
+        // Re-run here for defense in depth and for direct unit-test callers:
+        // gzip/Brotli bytes must never keep origin `Content-Digest`,
+        // `Repr-Digest`, legacy `Digest`, or `Content-MD5` (or other content-
+        // bound validators) computed over the uncompressed representation.
+        // `Content-Encoding` / `Vary` are intentionally outside that cleanup set.
+        super::invalidate_content_bound_response_headers(response_headers);
+    }
 }
