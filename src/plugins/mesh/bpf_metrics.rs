@@ -76,7 +76,7 @@ impl Default for BpfMetricsConfig {
 /// `ArcSwap` load — no plugin-list scan and no new plugin allocation on the
 /// scrape path. When the plugin is absent from the published configuration
 /// the cache stores `None` and `/metrics` emits nothing from this renderer.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MeshBpfMetricsExporter {
     prefix: Arc<str>,
     state: Arc<BpfMetricsState>,
