@@ -1161,7 +1161,7 @@ impl LocalSchemaResolver {
         // Longest JSON Pointer prefix wins when locating a node's resource.
         resolver
             .resource_roots
-            .sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            .sort_by_key(|b| std::cmp::Reverse(b.0.len()));
         Ok(resolver)
     }
 
@@ -1742,7 +1742,18 @@ impl LocalSchemaResolver {
                     }
                 })?
             };
+            // Empty fragment = schema resource root. The OpenAPI document root
+            // (synthetic document base) is not a Schema Object; bare `#` against
+            // it must not expand the whole document (which recurses into itself).
             let target = if decoded_fragment.is_empty() {
+                if resource_root_pointer.is_empty() {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "x-ferrum-validate",
+                        error: format!(
+                            "unresolved internal $ref '{reference}': OpenAPI document root is not a Schema Object"
+                        ),
+                    });
+                }
                 resource_root
             } else {
                 resource_root.pointer(&decoded_fragment).ok_or_else(|| {

@@ -51,7 +51,7 @@ The importer generates a proxy-scoped `openapi_validator` plugin, resolves local
 
 Local reference forms resolved at import time:
 
-- JSON Pointer fragments (`#`, `#/…`), including percent-encoded pointer tokens.
+- JSON Pointer fragments (`#/…`), including percent-encoded pointer tokens. Empty fragments resolve to a Schema Object `$id` resource root; bare `#` against the OpenAPI document root is rejected (the OpenAPI root is not a Schema Object).
 - OpenAPI 3.1+ Draft 2020-12 `$anchor` plain-name fragments (`#Order`), indexed only on Schema Objects and nested subschemas (not annotation payloads or non-schema OpenAPI fields).
 - Swagger 2.0 / OpenAPI 3.0.x Draft 7 fragment `$id` / `id` plain-name anchors.
 - Same-document `$id` targets (URI matches an in-document Schema Object `$id`; no network fetch). Duplicate resource `$id` URIs fail closed.

@@ -21,9 +21,12 @@ fn proxy_block() -> &'static str {
 fn first_request_schema(spec: &str) -> Value {
     let (bundle, _meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
         .expect("spec extraction must succeed");
-    assert_eq!(bundle.plugins.len(), 1);
-    assert_eq!(bundle.plugins[0].plugin_name, "openapi_validator");
-    bundle.plugins[0].config["operations"][0]["request_body"]["content"]["application/json"].clone()
+    let plugin = bundle
+        .plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "openapi_validator")
+        .expect("generated openapi_validator plugin must be present");
+    plugin.config["operations"][0]["request_body"]["content"]["application/json"].clone()
 }
 
 fn extract_err(spec: &str) -> ExtractError {
@@ -70,11 +73,56 @@ fn json_pointer_ref_still_resolves() {
 }
 
 #[test]
-fn document_root_ref_resolves() {
+fn schema_resource_root_empty_fragment_resolves() {
+    // Empty fragment `#` is a JSON Pointer to the *schema resource* root (a
+    // Schema Object with `$id`), not the OpenAPI document root.
     let spec = format!(
         r##"{{
   "openapi": "3.1.0",
-  "info": {{"title": "Root API", "version": "1.0.0"}},
+  "info": {{"title": "Resource Root API", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "components": {{
+    "schemas": {{
+      "Order": {{
+        "$id": "https://example.com/schemas/order.json",
+        "type": "object",
+        "required": ["root"],
+        "properties": {{"root": {{"type": "boolean"}}}}
+      }}
+    }}
+  }},
+  "paths": {{
+    "/root": {{
+      "post": {{
+        "requestBody": {{
+          "content": {{
+            "application/json": {{
+              "schema": {{"$ref": "https://example.com/schemas/order.json#"}}
+            }}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+    let schema = first_request_schema(&spec);
+    assert_eq!(schema["$id"], "https://example.com/schemas/order.json");
+    assert_eq!(schema["required"], json!(["root"]));
+    assert_eq!(schema["properties"]["root"]["type"], "boolean");
+}
+
+#[test]
+fn openapi_document_root_empty_fragment_is_rejected() {
+    // An OpenAPI document is not a JSON Schema document; bare `#` must not
+    // treat the OpenAPI root as a Schema Object (that recurses into SchemaTooDeep).
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "OpenAPI Root Ref", "version": "1.0.0"}},
   "x-ferrum-validate": true,
   "x-ferrum-proxy": {proxy},
   "type": "object",
@@ -97,9 +145,16 @@ fn document_root_ref_resolves() {
 }}"##,
         proxy = proxy_block()
     );
-    let schema = first_request_schema(&spec);
-    assert_eq!(schema["required"], json!(["root"]));
-    assert_eq!(schema["properties"]["root"]["type"], "boolean");
+    let err = extract_err(&spec);
+    assert!(
+        err.to_string()
+            .contains("OpenAPI document root is not a Schema Object"),
+        "got: {err}"
+    );
+    assert!(
+        !matches!(err, ExtractError::SchemaTooDeep { .. }),
+        "bare `#` must fail closed on semantics, not recurse into SchemaTooDeep: {err}"
+    );
 }
 
 #[test]
