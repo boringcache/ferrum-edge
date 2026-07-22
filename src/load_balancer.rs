@@ -207,8 +207,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 /// Cap on a precomputed smooth-WRR schedule length.
 ///
 /// Normal weights produce `sum(weight)/gcd` entries (often tens). Pathological
-/// huge weights are truncated and the truncated order repeats; long-run ratios
-/// stay close to configured weights while rebuild stays bounded.
+/// huge periods are proportionally apportioned into this many entries while
+/// retaining at least one entry for every positive-weight target.
 const WRR_MAX_SCHEDULE_LEN: usize = 8192;
 
 /// Bound on concurrently cached healthy-set schedules per WRR lane.
@@ -249,8 +249,8 @@ struct WrrSchedule {
     /// Per-worker counter shards. Each cached healthy set keeps its own shard
     /// set so alternating fingerprints cannot alias onto one counter parity.
     counters: [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS],
-    /// Target indices in NGINX smooth-WRR order for one (possibly truncated)
-    /// weight period. Empty when the lane is inactive or all weights are 0.
+    /// Target indices in NGINX smooth-WRR order for one exact or proportionally
+    /// bounded weight period. Empty when the lane is inactive or all weights are 0.
     order: Box<[usize]>,
     /// When true, selection uses this schedule's counter over healthy targets.
     zero_weight: bool,
@@ -334,9 +334,10 @@ fn wrr_counter_shard() -> usize {
 ///
 /// At most [`WRR_SCHEDULE_CACHE_SLOTS`] schedules are retained (strict memory
 /// bound). Each shard counter is `u64` and indexes with `% order.len()`.
-/// Wrapping is well-defined and does not bias long-run ratios. Schedule length
-/// is capped at [`WRR_MAX_SCHEDULE_LEN`]; larger weight periods repeat the
-/// truncated prefix.
+/// Wrapping is well-defined and does not bias the schedule's long-run ratios.
+/// Config-valid schedules are capped at [`WRR_MAX_SCHEDULE_LEN`]; larger exact
+/// periods are deterministically apportioned while preserving every positive-
+/// weight target, then smoothed over the complete bounded period.
 struct WrrLaneState {
     /// Bounded fingerprint → schedule cache. Steady hits load matching slots
     /// with no lock and no per-selection allocation.
@@ -523,6 +524,49 @@ fn wrr_gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
+/// Bound a normalized WRR period without starving positive-weight targets.
+///
+/// Each target first receives one slot. Remaining slots are apportioned by the
+/// largest-remainder method in original target order for deterministic ties.
+/// Config validation limits upstreams to fewer targets than the normal cap;
+/// `max` also keeps direct internal construction safe if that invariant changes.
+fn bound_wrr_weights(
+    normalized: &[(usize, u64)],
+    total_weight: u64,
+) -> Vec<(usize, i64)> {
+    let schedule_len = WRR_MAX_SCHEDULE_LEN.max(normalized.len());
+    if total_weight <= schedule_len as u64 {
+        return normalized
+            .iter()
+            .map(|&(idx, weight)| (idx, weight as i64))
+            .collect();
+    }
+
+    let remaining = schedule_len - normalized.len();
+    let denominator = u128::from(total_weight);
+    let mut apportioned = Vec::with_capacity(normalized.len());
+    let mut remainders = Vec::with_capacity(normalized.len());
+    let mut assigned = normalized.len();
+
+    for (slot, &(idx, weight)) in normalized.iter().enumerate() {
+        let numerator = u128::from(weight) * remaining as u128;
+        let extra = (numerator / denominator) as usize;
+        apportioned.push((idx, (extra + 1) as i64));
+        remainders.push((slot, numerator % denominator));
+        assigned += extra;
+    }
+
+    remainders.sort_unstable_by(|(slot_a, remainder_a), (slot_b, remainder_b)| {
+        remainder_b
+            .cmp(remainder_a)
+            .then_with(|| slot_a.cmp(slot_b))
+    });
+    for &(slot, _) in remainders.iter().take(schedule_len - assigned) {
+        apportioned[slot].1 += 1;
+    }
+    apportioned
+}
+
 /// Build a smooth-WRR order for `(target_index, weight)` pairs with weight > 0.
 fn build_smooth_wrr_order(weighted: &[(usize, u32)]) -> (Box<[usize]>, bool) {
     let mut gcd = 0u32;
@@ -540,31 +584,30 @@ fn build_smooth_wrr_order(weighted: &[(usize, u32)]) -> (Box<[usize]>, bool) {
         return (Box::new([]), true);
     }
 
-    let normalized: Vec<(usize, i64)> = weighted
+    let normalized: Vec<(usize, u64)> = weighted
         .iter()
         .filter(|(_, weight)| *weight > 0)
-        .map(|&(idx, weight)| (idx, (weight / gcd) as i64))
+        .map(|&(idx, weight)| (idx, u64::from(weight / gcd)))
         .collect();
-    let total_weight: i64 = normalized.iter().map(|(_, weight)| *weight).sum();
-    if total_weight <= 0 {
-        return (Box::new([]), true);
-    }
+    let total_weight: u64 = normalized.iter().map(|(_, weight)| *weight).sum();
+    let bounded = bound_wrr_weights(&normalized, total_weight);
+    let bounded_total: i64 = bounded.iter().map(|(_, weight)| *weight).sum();
 
-    let steps = (total_weight as usize).min(WRR_MAX_SCHEDULE_LEN);
-    let mut current = vec![0i64; normalized.len()];
+    let steps = bounded_total as usize;
+    let mut current = vec![0i64; bounded.len()];
     let mut order = Vec::with_capacity(steps);
     for _ in 0..steps {
         let mut best_slot = 0usize;
         let mut best_current = i64::MIN;
-        for (slot, &(_, weight)) in normalized.iter().enumerate() {
+        for (slot, &(_, weight)) in bounded.iter().enumerate() {
             current[slot] += weight;
             if current[slot] > best_current {
                 best_current = current[slot];
                 best_slot = slot;
             }
         }
-        current[best_slot] -= total_weight;
-        order.push(normalized[best_slot].0);
+        current[best_slot] -= bounded_total;
+        order.push(bounded[best_slot].0);
     }
     (order.into_boxed_slice(), false)
 }
@@ -4906,6 +4949,33 @@ impl LoadBalancer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_wrr_period_does_not_starve_extreme_low_weight_target() {
+        let (order, zero_weight) = build_smooth_wrr_order(&[(7, 65_535), (9, 1)]);
+
+        assert!(!zero_weight);
+        assert_eq!(order.len(), WRR_MAX_SCHEDULE_LEN);
+        assert_eq!(order.iter().filter(|&&idx| idx == 7).count(), 8_191);
+        assert_eq!(order.iter().filter(|&&idx| idx == 9).count(), 1);
+    }
+
+    #[test]
+    fn bounded_wrr_period_retains_every_config_valid_positive_target() {
+        let weighted: Vec<(usize, u32)> = (0..1_000)
+            .map(|idx| (idx, if idx == 0 { 65_535 } else { 1 }))
+            .collect();
+        let (order, zero_weight) = build_smooth_wrr_order(&weighted);
+
+        assert!(!zero_weight);
+        assert_eq!(order.len(), WRR_MAX_SCHEDULE_LEN);
+        for idx in 0..weighted.len() {
+            assert!(
+                order.contains(&idx),
+                "positive-weight target {idx} must remain schedulable"
+            );
+        }
+    }
 
     // ── HealthBitset tests ──────────────────────────────────────────────
 
