@@ -250,14 +250,6 @@ impl GraphqlPlugin {
         self.last_periodic_sweep_secs.store(0, Ordering::Relaxed);
     }
 
-    /// Block the below-cap cooldown so an armed sample does not scan. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn block_periodic_cooldown_at_for_test(&self, now: Instant) {
-        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
-        self.last_periodic_sweep_secs
-            .store(now_secs, Ordering::Relaxed);
-    }
-
     /// Invoke the production cleanup wrapper at `now`. Test-only.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn evict_stale_entries_at_for_test(&self, now: Instant) {

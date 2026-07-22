@@ -1123,6 +1123,12 @@ pub mod _test_support {
         ws: crate::plugins::ws_rate_limiting::WsRateLimiting,
     }
 
+    impl Default for RateLimitCleanupHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl RateLimitCleanupHarness {
         pub fn new() -> Self {
             use crate::plugins::PluginHttpClient;
