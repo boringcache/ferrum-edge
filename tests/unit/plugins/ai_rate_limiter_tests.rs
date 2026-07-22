@@ -3917,10 +3917,8 @@ async fn run_expose_header_lifecycle(
     // The production hook only parses buffered JSON responses when the upstream
     // response declares a JSON-compatible media type. Keep this lifecycle fixture
     // faithful to a real OpenAI-style response so reconciliation sees `usage`.
-    let mut response_headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/json".to_string(),
-    )]);
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     assert_continue(
         plugin
             .after_proxy(&mut ctx, 200, &mut response_headers)
