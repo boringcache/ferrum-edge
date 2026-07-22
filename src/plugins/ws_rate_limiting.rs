@@ -109,19 +109,18 @@ impl WsRateLimiting {
             count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && tracked_keys > 0;
 
         if over_capacity || periodic {
-            // `enforce_capacity` first calls `retain_active_at` to drop
-            // inactive entries, then — if the map is still over the cap —
-            // force-evicts remaining keys until it holds. Plain
-            // `retain_active_at` isn't enough under sustained traffic:
-            // every tracked connection's TokenBucket keeps reporting
-            // active, so nothing gets evicted and the map stays pinned at
-            // `MAX_STATE_ENTRIES + 1`. The `over_capacity &&
-            // !contains_local_key` branch in `on_ws_frame` would then
-            // reject every new WebSocket connection indefinitely — a
-            // service-degradation bug. Mirrors `ai_rate_limiter.rs` and
-            // `rate_limiting.rs`.
-            self.limiter
-                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
+            // Periodic sweeps prune idle keys even below the hard cap.
+            // Over-cap pressure still force-evicts after that prune so
+            // sustained traffic cannot pin the map at
+            // `MAX_STATE_ENTRIES + 1` and leave the
+            // `over_capacity && !contains_local_key` branch in
+            // `on_ws_frame` rejecting every new connection indefinitely.
+            let now = Instant::now();
+            if over_capacity {
+                self.limiter.enforce_capacity(MAX_STATE_ENTRIES, now);
+            } else {
+                self.limiter.prune_stale_at(now);
+            }
         }
 
         self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES

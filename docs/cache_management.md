@@ -112,7 +112,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Stale entries (where all windows have expired) are evicted on a piggyback sweep triggered during normal request processing. When the entry count exceeds 100,000, eviction runs unconditionally. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback. `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
+**Cleanup mechanism:** Sampled piggyback sweeps during normal request processing prune idle keys even while the map is below the 100,000 hard cap. When the entry count exceeds 100,000, the same helper force-evicts still-active keys down to the cap after that stale prune. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback (subject to the same below-cap stale prune / over-cap force-eviction rules). `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
 
 ### AI Rate Limiter
 
@@ -122,7 +122,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Same as rate limiting -- stale entry eviction on piggyback sweep. When using `sync_mode: "redis"`, token counters are stored in Redis and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Same as rate limiting — sampled below-cap stale pruning plus unconditional over-cap force eviction after prune. When using `sync_mode: "redis"`, token counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### WebSocket Rate Limiting
 
@@ -132,7 +132,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Capacity-triggered eviction when exceeding 50,000 entries, plus stale entry cleanup. When using `sync_mode: "redis"`, frame counters are stored in Redis and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled periodic sweeps prune idle connection state below the 50,000 hard cap; exceeding the cap force-evicts after that prune. When using `sync_mode: "redis"`, frame counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### UDP Rate Limiting
 
@@ -142,7 +142,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Capacity-triggered eviction when exceeding 100,000 entries. When using `sync_mode: "redis"`, datagram and byte counters are stored in Redis and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled periodic sweeps (every 100,000 datagram hooks, cooldown-gated to once per second) prune idle client state below the 100,000 hard cap; exceeding the cap force-evicts after that prune. When using `sync_mode: "redis"`, datagram and byte counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### GraphQL Rate Limiting
 
@@ -152,7 +152,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Stale entry eviction on piggyback sweep. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled piggyback sweeps prune idle keys below the hard cap; exceeding 100,000 force-evicts after that prune. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
 
 ### gRPC Method Router Rate Limiting
 
@@ -162,7 +162,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Stale entry eviction on piggyback sweep. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled piggyback sweeps prune idle keys below the hard cap; exceeding 100,000 force-evicts after that prune. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
 
 ### Response Caching
 

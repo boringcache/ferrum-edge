@@ -98,18 +98,18 @@ impl UdpRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                // `enforce_capacity` runs `retain_active_at` first and
-                // then force-evicts down to the cap when active-only
-                // pruning isn't enough. Under sustained per-IP UDP
-                // traffic every window state keeps reporting active, so
-                // plain `retain_active_at` would leave the map pinned
-                // at `MAX_STATE_ENTRIES + 1` and the
-                // `over_capacity && !contains_local_key` guard in
-                // `on_udp_datagram` would drop every new client IP
-                // indefinitely. Mirrors `ai_rate_limiter.rs` and
-                // `rate_limiting.rs`.
-                self.limiter
-                    .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
+                // Periodic sweeps prune idle keys even while the map is
+                // below the hard cap. Over-cap pressure still force-evicts
+                // after that prune so sustained per-IP traffic cannot pin
+                // the map at `MAX_STATE_ENTRIES + 1` and leave the
+                // `over_capacity && !contains_local_key` guard dropping
+                // every new client IP indefinitely.
+                let now = Instant::now();
+                if over_capacity {
+                    self.limiter.enforce_capacity(MAX_STATE_ENTRIES, now);
+                } else {
+                    self.limiter.prune_stale_at(now);
+                }
             }
         }
 

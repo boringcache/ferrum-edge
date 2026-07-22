@@ -231,9 +231,17 @@ impl GraphqlPlugin {
         if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
         }
-        if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
-            self.limiter
-                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
+        let len = self.limiter.tracked_keys_count();
+        if len == 0 {
+            return;
+        }
+        // Sampled piggyback sweeps prune idle keys below the hard cap;
+        // only over-cap pressure force-evicts still-active entries.
+        let now = Instant::now();
+        if len > MAX_STATE_ENTRIES {
+            self.limiter.enforce_capacity(MAX_STATE_ENTRIES, now);
+        } else {
+            self.limiter.prune_stale_at(now);
         }
     }
 

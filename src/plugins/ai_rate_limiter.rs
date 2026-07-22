@@ -27,6 +27,7 @@ use crate::proxy::{
 };
 
 const MAX_STATE_ENTRIES: usize = 100_000;
+const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 /// Redis sliding-window index the reservation credited (centralized mode only).
 /// Carried back to the reconciliation op so a negative correction debits the
@@ -151,6 +152,7 @@ pub struct AiRateLimiter {
     /// reconciles the federation tokens against its own window exactly once.
     federation_flag_key: String,
     limiter: RateLimitBackend<String, AiTokenRateAlgorithm>,
+    request_counter: AtomicU64,
 }
 
 impl AiRateLimiter {
@@ -252,6 +254,7 @@ impl AiRateLimiter {
                 &http_client,
                 AiTokenRateAlgorithm::new(token_limit, window_seconds),
             )?,
+            request_counter: AtomicU64::new(0),
         })
     }
 
@@ -278,17 +281,24 @@ impl AiRateLimiter {
     }
 
     fn evict_stale_entries(&self) {
-        if self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES {
-            // `enforce_capacity` first calls `retain_active_at` to drop
-            // entries whose token-usage window has fully expired, then —
-            // if the map is still over capacity — forcibly removes
-            // additional keys until the hard cap holds. Plain
-            // `retain_active_at` is not enough on its own: when traffic
-            // is sustained, every tracked key keeps reporting "active"
-            // and nothing gets evicted, so the DashMap can grow without
-            // bound past `MAX_STATE_ENTRIES`.
-            self.limiter
-                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
+        let len = self.limiter.tracked_keys_count();
+        if len == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        // Over-cap pressure force-evicts immediately after pruning idle
+        // keys so sustained traffic cannot grow the map without bound.
+        if len > MAX_STATE_ENTRIES {
+            self.limiter.enforce_capacity(MAX_STATE_ENTRIES, now);
+            return;
+        }
+
+        // Below the hard cap, sample piggyback sweeps so idle identity
+        // state is reclaimed without scanning the map on every request.
+        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        if request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
+            self.limiter.prune_stale_at(now);
         }
     }
 
