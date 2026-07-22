@@ -1282,3 +1282,42 @@ fn preacquired_admission_has_exactly_once_outcome_and_release_ownership() {
     assert!(matches!(permitless.take_if_acquired(), Some(None)));
     assert!(permitless.take_if_acquired().is_none());
 }
+
+#[test]
+fn h3_header_limits_precede_grpc_web_response_negotiation() {
+    let src = include_str!("../../../src/http3/server.rs");
+    let detected = src
+        .find(
+            "let detected_http_flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);",
+        )
+        .expect("H3 handler must classify base request flavor");
+    let header_limits = src[detected..]
+        .find("// Enforce configured HTTP/3 header limits before deriving any gRPC-Web")
+        .map(|offset| detected + offset)
+        .expect("H3 handler must validate header limits before gRPC-Web negotiation");
+    let grpc_web_negotiation = src[detected..]
+        .find("let grpc_web_response_content_type_owned =")
+        .map(|offset| detected + offset)
+        .expect("H3 handler must retain gRPC-Web response content-type negotiation");
+    let context_build = src[detected..]
+        .find("let mut ctx = RequestContext::new")
+        .map(|offset| detected + offset)
+        .expect("H3 handler must retain request context construction");
+    let header_limit_block = &src[header_limits..grpc_web_negotiation];
+
+    assert!(
+        header_limits < grpc_web_negotiation,
+        "H3 must reject oversized headers before parsing attacker-controlled gRPC-Web suffixes"
+    );
+    assert!(
+        grpc_web_negotiation < context_build,
+        "valid gRPC-Web requests must still retain negotiated response content type on the request context"
+    );
+    assert!(header_limit_block.contains("state.max_single_header_size_bytes"));
+    assert!(header_limit_block.contains("state.max_header_size_bytes"));
+    assert!(header_limit_block.contains("state.max_header_count"));
+    assert!(
+        !header_limit_block.contains("grpc_web_response_content_type"),
+        "header-limit rejection must not depend on pre-validation gRPC-Web response negotiation"
+    );
+}
