@@ -1511,6 +1511,12 @@ paths:
         object states that its configured concurrent-connection limit is
         process-local and independently enforced per replica.
 
+        Served in every mode that constructs an AdminState:
+        `database`, `file`, `cp`, `dp`, `mesh`, and `node_agent`. Modes without
+        proxy state (`cp`, `node_agent`) return zeroed runtime counters. JWT
+        authentication is required; this endpoint never returns unauthenticated
+        detail.
+
         The response is cached for 5 seconds to avoid performance impact from
         frequent polling. The `X-Cache` response header indicates `hit` or `miss`.
 
@@ -8299,6 +8305,7 @@ components:
               plugin_name:
                 const: api_chargeback_sink
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/ApiChargebackSinkConfig"
@@ -8490,9 +8497,12 @@ components:
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
         (client→backend and backend→client) consume from the same per-connection
-        bucket. Supports centralized Redis-backed mode for cross-instance
-        coordination of frame counters. Counter storage supports only local
-        memory and Redis; database-backed counters are intentionally unsupported.
+        bucket. Redis mode (`sync_mode: "redis"`) externalizes those
+        per-connection counters under a per-plugin/gateway-instance key
+        namespace; it does not coordinate a portable frame budget across
+        gateway instances, reconnects, or plugin rebuilds. Counter storage
+        supports only local memory and Redis; database-backed counters are
+        intentionally unsupported.
       properties:
         frames_per_second:
           type: integer
@@ -8521,7 +8531,11 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
+          description: >-
+            Frame counter storage: 'local' (in-memory) or 'redis' (externalized
+            per-connection counters namespaced per plugin/gateway instance; not
+            a portable cross-instance budget). Database-backed counters are
+            unsupported. Any RESP-compatible server works.
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."
@@ -10538,8 +10552,9 @@ components:
           items:
             $ref: "#/components/schemas/AdminMetricsCircuitBreaker"
           description: |
-            Per-proxy circuit breaker states. Only proxies with circuit breaker
-            config that have been accessed appear here.
+            Circuit breaker states for direct-backend proxies (no `target`) and
+            per-upstream-target breakers (`target` = `host:port`). Only proxies
+            with circuit breaker config that have been accessed appear here.
         health_check:
           $ref: "#/components/schemas/AdminMetricsHealthCheck"
         load_balancers:
@@ -10574,8 +10589,11 @@ components:
       properties:
         mode:
           type: string
-          enum: [database, file, cp, dp]
-          description: Operating mode (set by FERRUM_MODE)
+          enum: [database, file, cp, dp, mesh, node_agent]
+          description: |
+            Operating mode that constructed this AdminState (set by FERRUM_MODE).
+            Every mode that serves authenticated `GET /admin/metrics` is listed:
+            `database`, `file`, `cp`, `dp`, `mesh`, and `node_agent`.
         ferrum_version:
           type: string
           description: Ferrum Edge binary version
@@ -10691,15 +10709,26 @@ components:
     AdminMetricsCircuitBreaker:
       type: object
       description: |
-        Circuit breaker state for a single proxy. Three states:
+        Circuit breaker state for a single proxy or upstream target. Three states:
         - **closed**: Normal operation, requests pass through
         - **open**: Failures exceeded threshold, requests rejected with 503
         - **half_open**: Timeout elapsed, limited probe requests allowed to test recovery
+
+        Direct-backend proxies (no upstream) emit one per-proxy entry without
+        `target`. Proxies with upstream targets emit one independent breaker per
+        target and include `target` as `host:port`.
       required: [proxy_id, state, failure_count, success_count]
       properties:
         proxy_id:
           type: string
           description: ID of the proxy this circuit breaker protects
+        target:
+          type: string
+          description: |
+            Upstream target `host:port` this breaker is scoped to. Present for
+            per-target (upstream) breakers; omitted for direct-backend
+            (per-proxy) breakers.
+          example: "10.0.2.1:8080"
         state:
           type: string
           enum: [closed, open, half_open]
@@ -10714,6 +10743,50 @@ components:
             Consecutive successes during half_open state. When this reaches the
             configured success_threshold, the circuit closes (recovers).
 
+    AdminMetricsUnhealthyTarget:
+      type: object
+      description: |
+        One unhealthy target excluded from load balancing. Active health checks
+        are upstream-scoped (`type=active`, no `proxy_id`). Passive health checks
+        are proxy-scoped (`type=passive` and always include `proxy_id`).
+      required: [target, type, since_epoch_ms]
+      properties:
+        proxy_id:
+          type: string
+          description: |
+            Proxy that owns this passive health entry. Required when
+            `type` is `passive`; omitted when `type` is `active`.
+        target:
+          type: string
+          description: "Target in host:port format"
+          example: "10.0.3.12:8080"
+        type:
+          type: string
+          enum: [active, passive]
+          description: |
+            `active` for periodic probe failures; `passive` for failures
+            observed on proxied requests.
+        since_epoch_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the target was marked unhealthy
+      allOf:
+        - if:
+            properties:
+              type:
+                const: passive
+            required: [type]
+          then:
+            required: [proxy_id]
+        - if:
+            properties:
+              type:
+                const: active
+            required: [type]
+          then:
+            not:
+              required: [proxy_id]
+
     AdminMetricsHealthCheck:
       type: object
       description: |
@@ -10727,17 +10800,7 @@ components:
         unhealthy_targets:
           type: array
           items:
-            type: object
-            required: [target, since_epoch_ms]
-            properties:
-              target:
-                type: string
-                description: "Target in host:port format"
-                example: "10.0.3.12:8080"
-              since_epoch_ms:
-                type: integer
-                format: int64
-                description: Unix epoch milliseconds when the target was marked unhealthy
+            $ref: "#/components/schemas/AdminMetricsUnhealthyTarget"
 
     AdminMetricsLoadBalancers:
       type: object
@@ -12487,7 +12550,7 @@ components:
             metric:
               type: string
               enum: [backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms]
-              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/WebSocket sessions; the others apply to HTTP-family summaries.
+              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/DTLS/WebSocket sessions and is measured on a process-monotonic clock (not UTC wall time); connect/disconnect timestamps remain civil-clock values for rendering. The other metrics apply to HTTP-family summaries.
             percentile:
               type: integer
               minimum: 1
@@ -14463,7 +14526,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled. Note: signature paths verify against the wire bytes of SignedInfo / referenced elements and do not yet apply Exclusive XML Canonicalization (xml-exc-c14n#); operators integrating with IdPs that strictly canonicalize should validate end-to-end."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported)."
       properties:
         reject_missing_security_header:
           type: boolean
@@ -14493,7 +14556,14 @@ components:
               description: Clock skew tolerance (seconds) for timestamp validation
         username_token:
           type: object
-          description: WS-Security UsernameToken authentication
+          description: |
+            WS-Security UsernameToken authentication. Unknown usernames, wrong
+            PasswordText values, and wrong PasswordDigest values share one
+            generic HTTP 401 body (`{"error":"WS-Security: invalid credentials"}`)
+            and must not disclose whether the principal exists. Lookup misses
+            still perform PasswordText/PasswordDigest verification against
+            process-local dummy material. Structural token or policy failures
+            remain distinct.
           properties:
             enabled:
               type: boolean
@@ -14562,24 +14632,26 @@ components:
                  More than one `<Assertion>` inside the WS-Security block is
                  rejected outright.
               2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
-              3. Verify each `<Reference>` digest against the assertion with its own
-                 `<Signature>` element removed (XMLDSIG enveloped-signature transform).
+              3. Verify each `<Reference>` digest after the supported transform chain
+                 (XMLDSIG enveloped-signature followed by Exclusive XML Canonicalization
+                 `xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`).
                  The digest algorithm must be in `allowed_digest_algorithms`. At
                  least one Reference must target the enclosing Assertion ID.
               4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate`
                  against `trusted_signing_certs` by SHA-256 fingerprint of the full DER
                  (leaf-cert trust — no CA chain validation; operators supply the IdP's
                  actual signing certificate(s) as published in IdP metadata).
-              5. Verify `<SignatureValue>` over the `<SignedInfo>` bytes using the matched
-                 cert's RSA public key.
+              5. Verify `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
+                 (`xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`) using the
+                 matched cert's RSA public key.
               6. Validate Issuer (must match `trusted_issuers`), NotBefore /
                  NotOnOrAfter (with `clock_skew_seconds` tolerance), and Audience
                  (if `audience` is configured).
               7. Extract the Subject NameID into `ctx.metadata["soap_ws_saml_subject"]`
                  for downstream plugins.
-            On any failure the request is rejected with HTTP 401. Signature paths use the
-            wire bytes of `SignedInfo` / referenced elements and do not currently apply
-            Exclusive XML Canonicalization (xml-exc-c14n#).
+            On any failure the request is rejected with HTTP 401. Unsupported
+            canonicalization or transform algorithms fail closed; inclusive c14n,
+            comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
           properties:
             enabled:
               type: boolean
@@ -15394,6 +15466,8 @@ components:
         and JSON body. Rules are validated at plugin load time; unknown
         operations or targets, missing `value` on add/update, missing
         `new_key` on rename, and CR/LF in header values are rejected.
+        Every rule must set an explicit `target` (`header`, `query`, or
+        `body`); there is no default.
 
         When `apply_route_overrides: true`, the plugin also consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -15412,40 +15486,16 @@ components:
         rules:
           type: array
           items:
-            type: object
-            required: [operation, key]
-            properties:
-              operation:
-                type: string
-                enum: [add, remove, update, rename]
-                description: |
-                  add: insert if absent (does not overwrite). Note: this is
-                  the historical Ferrum semantics, not Istio's "append to
-                  multi-value" semantics — use `update` to overwrite.
-                  update: write, creating intermediate objects as needed.
-                  remove: delete the field.
-                  rename: move old → new, with rollback if the destination is unreachable.
-              target:
-                type: string
-                enum: [header, query, body]
-                default: header
-              key:
-                type: string
-                description: |
-                  Header name, query param, or dot-notation body path. Body
-                  paths support nested objects ('user.address.city'), array
-                  indexing via numeric segments ('items.0.name'), and
-                  backslash-escaped literal dots ('meta.weird\\.key').
-              value:
-                type: string
-                description: |
-                  Required for add/update. For body rules, strings that parse
-                  as JSON (e.g., "42", "true", '{"a":1}') are inserted as the
-                  parsed type; otherwise kept as a JSON string. Header values
-                  must not contain CR or LF.
-              new_key:
-                type: string
-                description: Required for rename operations.
+            oneOf:
+              - $ref: "#/components/schemas/RequestTransformerHeaderRule"
+              - $ref: "#/components/schemas/RequestTransformerQueryRule"
+              - $ref: "#/components/schemas/RequestTransformerBodyRule"
+            discriminator:
+              propertyName: target
+              mapping:
+                header: "#/components/schemas/RequestTransformerHeaderRule"
+                query: "#/components/schemas/RequestTransformerQueryRule"
+                body: "#/components/schemas/RequestTransformerBodyRule"
         apply_route_overrides:
           type: boolean
           default: false
@@ -15470,13 +15520,103 @@ components:
             Fallback when `runtime_overlay_scope` is configured but the RTDS
             overlay has no boolean value for that key.
 
+    RequestTransformerHeaderRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite). Note: this is
+            the historical Ferrum semantics, not Istio's "append to
+            multi-value" semantics — use `update` to overwrite.
+            update: write the header value.
+            remove: delete the header.
+            rename: move old → new header name.
+        target:
+          type: string
+          const: header
+        key:
+          type: string
+          description: HTTP header name.
+        value:
+          type: string
+          description: |
+            Required for add/update. Must be a string and must not contain
+            CR or LF.
+        new_key:
+          type: string
+          description: Required for rename operations.
+
+    RequestTransformerQueryRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write the query parameter value.
+            remove: delete the query parameter.
+            rename: move old → new query parameter name.
+        target:
+          type: string
+          const: query
+        key:
+          type: string
+          description: Query parameter name.
+        value:
+          type: string
+          description: Required for add/update. Must be a string.
+        new_key:
+          type: string
+          description: Required for rename operations.
+
+    RequestTransformerBodyRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write, creating intermediate objects as needed.
+            remove: delete the field.
+            rename: move old → new, with rollback if the destination is unreachable.
+        target:
+          type: string
+          const: body
+        key:
+          type: string
+          description: |
+            Dot-notation body path. Supports nested objects
+            ('user.address.city'), array indexing via numeric segments
+            ('items.0.name'), and backslash-escaped literal dots
+            ('meta.weird\\.key').
+        value:
+          description: |
+            Required for add/update. Accepts any JSON value — strings,
+            numbers, booleans, objects, arrays, and explicit null.
+            Strings that parse as JSON (e.g., "42", "true", '{"a":1}')
+            are inserted as the parsed type at runtime; otherwise kept
+            as a JSON string.
+        new_key:
+          type: string
+          description: Required for rename operations.
+
     ResponseTransformerConfig:
       type: object
       description: |
         Plugin: response_transformer — Modifies response headers and JSON
         body. Same validation rules as request_transformer (unknown
         operations / targets, missing value / new_key, and CR/LF in header
-        values are rejected at plugin load time).
+        values are rejected at plugin load time). Every rule must set an
+        explicit `target` (`header` or `body`); there is no default. Valid
+        targets are `header` and `body` only — unlike request_transformer,
+        there is no `query` target.
 
         When `apply_route_overrides: true`, the plugin consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -15487,30 +15627,14 @@ components:
         rules:
           type: array
           items:
-            type: object
-            required: [operation, key]
-            properties:
-              operation:
-                type: string
-                enum: [add, remove, update, rename]
-              target:
-                type: string
-                enum: [header, body]
-                default: header
-              key:
-                type: string
-                description: |
-                  Header name or dot-notation body path. Body paths support
-                  nested objects, array indexing ('items.0'), and
-                  backslash-escaped literal dots.
-              value:
-                type: string
-                description: |
-                  Required for add/update. Header values must not contain CR
-                  or LF.
-              new_key:
-                type: string
-                description: Required for rename operations.
+            oneOf:
+              - $ref: "#/components/schemas/ResponseTransformerHeaderRule"
+              - $ref: "#/components/schemas/ResponseTransformerBodyRule"
+            discriminator:
+              propertyName: target
+              mapping:
+                header: "#/components/schemas/ResponseTransformerHeaderRule"
+                body: "#/components/schemas/ResponseTransformerBodyRule"
         apply_route_overrides:
           type: boolean
           default: false
@@ -15530,6 +15654,64 @@ components:
           description: >-
             Fallback when `runtime_overlay_scope` is configured but the RTDS
             overlay has no boolean value for that key.
+
+    ResponseTransformerHeaderRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write the header value.
+            remove: delete the header.
+            rename: move old → new header name.
+        target:
+          type: string
+          const: header
+        key:
+          type: string
+          description: HTTP header name.
+        value:
+          type: string
+          description: |
+            Required for add/update. Must be a string and must not contain
+            CR or LF.
+        new_key:
+          type: string
+          description: Required for rename operations.
+
+    ResponseTransformerBodyRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write, creating intermediate objects as needed.
+            remove: delete the field.
+            rename: move old → new, with rollback if the destination is unreachable.
+        target:
+          type: string
+          const: body
+        key:
+          type: string
+          description: |
+            Dot-notation body path. Supports nested objects, array indexing
+            ('items.0'), and backslash-escaped literal dots.
+        value:
+          description: |
+            Required for add/update. Accepts any JSON value — strings,
+            numbers, booleans, objects, arrays, and explicit null.
+            Strings that parse as JSON (e.g., "42", "true", '{"a":1}')
+            are inserted as the parsed type at runtime; otherwise kept
+            as a JSON string.
+        new_key:
+          type: string
+          description: Required for rename operations.
 
     SecurityHeadersConfig:
       type: object
@@ -15616,7 +15798,7 @@ components:
     CompressionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression. Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance."
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Content negotiation follows RFC 9110 §12.5.3 including the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance."
       properties:
         algorithms:
           type: array
@@ -15634,7 +15816,7 @@ components:
           type: array
           items:
             type: string
-          description: "Content-type whitelist. Defaults to 10 common text/application types"
+          description: "Content-type whitelist. Defaults to 10 common text/application types. Matched as an exact media-type token (before the first semicolon, ASCII case-insensitive); parameters like ; charset=utf-8 are ignored. Substring matching is not used, so application/jsonp does not match application/json."
         remove_accept_encoding:
           type: boolean
           default: true
@@ -15644,7 +15826,7 @@ components:
           minimum: 0
           maximum: 9
           default: 6
-          description: "Gzip compression level (0=no compression, 1=fastest, 9=best)"
+          description: "Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best)"
         brotli_quality:
           type: integer
           minimum: 0
@@ -15830,7 +16012,12 @@ components:
         redis_connect_timeout_seconds:
           type: integer
           default: 5
-          description: Redis connection timeout in seconds
+          description: >-
+            Effective Redis connection-attempt timeout in seconds. Applied to the
+            redis-rs inner connection config for cached, dedicated, and health-check
+            paths (TCP connect, TLS handshake when enabled, Redis protocol handshake).
+            Gateway DNS screening/resolution of the Redis hostname runs before this
+            timeout starts.
         redis_health_check_interval_seconds:
           type: integer
           default: 5
@@ -16132,6 +16319,14 @@ components:
           enum: [info, low, medium, high, critical]
           default: medium
         target:
+          description: >-
+            Scan target. A string selects a target that needs no extra fields
+            (`body_json_path` is object-only). Object form uses `type` plus
+            target-specific fields: optional non-empty `names` only for
+            `header_values`/`request_headers`, and required non-empty `path`
+            only for `body_json_path`. Aliases `request_headers`,
+            `request_query`, `request_path`, `request_url`, `request_method`,
+            and `request_body` match runtime parsing.
           oneOf:
             - type: string
               enum:
@@ -16150,18 +16345,48 @@ components:
                 - request_method
                 - body_text
                 - request_body
-                - body_json_path
                 - response_headers
                 - response_body
             - type: object
               required: [type]
+              not:
+                required: [path]
+              properties:
+                type:
+                  type: string
+                  enum: [header_values, request_headers]
+                names:
+                  type: array
+                  description: >-
+                    Optional header-name filter for header_values/request_headers;
+                    must be non-empty when provided.
+                  minItems: 1
+                  items:
+                    type: string
+                    minLength: 1
+            - type: object
+              required: [type, path]
+              not:
+                required: [names]
+              properties:
+                type:
+                  const: body_json_path
+                path:
+                  type: string
+                  minLength: 1
+                  description: >-
+                    Required dotted JSON path for body_json_path targets.
+            - type: object
+              required: [type]
+              not:
+                anyOf:
+                  - required: [names]
+                  - required: [path]
               properties:
                 type:
                   type: string
                   enum:
                     - header_names
-                    - header_values
-                    - request_headers
                     - query_keys
                     - query_values
                     - request_query
@@ -16174,17 +16399,8 @@ components:
                     - request_method
                     - body_text
                     - request_body
-                    - body_json_path
                     - response_headers
                     - response_body
-                names:
-                  type: array
-                  description: Only valid for header_values/request_headers targets; must be non-empty when provided.
-                  items:
-                    type: string
-                path:
-                  type: string
-                  description: Required and only valid for body_json_path targets.
         match_kind:
           type: string
           enum: [regex, literal, contains, equals, luhn, cidr]
@@ -16456,11 +16672,14 @@ components:
           type: integer
           format: uint64
           minimum: 0
-          default: 10485760
           description: >-
-            Maximum decompressed protobuf payload size accepted from a gRPC
-            frame. Defaults to `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, or 10 MiB
-            when that setting is absent.
+            Maximum decompressed gRPC protobuf payload size in bytes for both
+            request and response validation. Nonnegative integer matching runtime
+            `usize` parsing. `0` disables the decompressed cap. When omitted,
+            inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses
+            as an unsigned integer; otherwise falls back to 10 MiB (10485760).
+            No static OpenAPI default is advertised because the effective value
+            can be environment-derived.
 
     OpenapiValidatorConfig:
       type: object
@@ -16530,7 +16749,11 @@ components:
           type: string
           enum: [auto, draft7, draft2020-12]
           default: auto
-          description: JSON Schema draft used when compiling generated schemas.
+          description: >
+            Sole authoritative JSON Schema draft selector used when compiling every
+            operation's request and response schemas. Per-operation draft fields are
+            not part of the published contract; the importer emits this field only at
+            the top-level config.
         operations:
           type: array
           minItems: 1
@@ -16590,6 +16813,14 @@ components:
           default: 1024
           description: Maximum validation-error characters written to metadata and problem bodies.
 
+    OpenapiValidatorJsonSchema:
+      type: [object, boolean]
+      description: >
+        JSON Schema value embedded in an openapi_validator operation. Accepts ordinary
+        object schemas and OpenAPI 3.1 boolean schemas (`true` / `false`). Dialect
+        selection is controlled by the top-level OpenapiValidatorConfig.schema_draft
+        field, not per operation.
+
     OpenapiValidatorOperation:
       type: object
       additionalProperties: false
@@ -16621,22 +16852,25 @@ components:
             content:
               type: object
               additionalProperties:
-                type: object
-              description: Media type to JSON Schema map.
+                $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+              description: Media type to JSON Schema map (object or boolean schemas).
             content_type:
               type: string
               description: Alternate single-schema form.
             schema:
-              type: object
-              description: Alternate single-schema form.
+              $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+              description: Alternate single-schema form (object or boolean schema).
           description: Request body schemas by media type.
         responses:
           type: object
           additionalProperties:
             type: object
             additionalProperties:
-              type: object
-          description: Status code to media type to JSON Schema map. Exact status codes are checked first, OpenAPI wildcard ranges such as `4XX` are checked next, and `default` is used as the final fallback.
+              $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+          description: >
+            Status code to media type to JSON Schema map (object or boolean schemas).
+            Exact status codes are checked first, OpenAPI wildcard ranges such as `4XX`
+            are checked next, and `default` is used as the final fallback.
 
     RequestTerminationConfig:
       type: object
@@ -16743,8 +16977,14 @@ components:
         handshakes: a match short-circuits only the HTTP handshake response and
         does not establish or mock an upgraded WebSocket frame stream. Unknown
         top-level and per-rule keys are rejected; the free-form headers map
-        remains open for string-valued response headers. Runtime construction
-        is the authoritative final boundary.
+        remains open for string-valued response headers. Status codes must be
+        final (200–599) or 101 for a synthetic WebSocket handshake; other
+        informational statuses are rejected. A configured 101 fails closed
+        with 500 when the matching request is not an actual WebSocket
+        handshake. HEAD omits content bytes while keeping representation
+        Content-Length; 204/205/304 omit body and Content-Length on every
+        frontend (H1/H2/H3). Runtime construction and request-flavor
+        enforcement are the authoritative final boundaries.
       required:
         - rules
       properties:
@@ -16781,11 +17021,15 @@ components:
                 minimum: 100
                 maximum: 599
                 description: >-
-                  HTTP status code to return (default 200). Values outside
-                  100–599 are rejected. Status 101 on an HTTP/1.1 WebSocket
-                  upgrade, or a success-like 200 on HTTP/2 / HTTP/3 Extended
-                  CONNECT, is still only a synthetic HTTP handshake response;
-                  it does not create an upgraded frame stream.
+                  HTTP status code to return (default 200). Must be a final
+                  status 200–599, or 101 for a synthetic WebSocket handshake
+                  response. Other informational statuses (100, 102–199) and
+                  values outside 100–599 are rejected at construction rather
+                  than coerced. Status 101 on an HTTP/1.1 WebSocket upgrade, or
+                  a success-like 200 on HTTP/2 / HTTP/3 Extended CONNECT, is
+                  still only a synthetic HTTP handshake response; it does not
+                  create an upgraded frame stream. A 101 rule that matches an
+                  ordinary HTTP request fails closed with status 500.
               headers:
                 type: object
                 additionalProperties:
@@ -16793,7 +17037,12 @@ components:
                 description: Response headers (default content-type application/json)
               body:
                 type: string
-                description: Response body string
+                description: >-
+                  Response body string (default empty). On the wire, HEAD
+                  responses omit content bytes while keeping representation
+                  Content-Length. Statuses 204, 205, and 304 omit both the body
+                  and Content-Length even when this field is non-empty. Shared
+                  synthetic-response finalization keeps H1, H2, and H3 aligned.
               delay_ms:
                 type: integer
                 format: uint64
@@ -16847,7 +17096,10 @@ components:
         Omitted optional fields select defaults; runtime also treats explicit
         null on optional fields as omitted. Matching replay bodies have a hard
         10 MiB plugin-local ceiling and active local/fan-out replay work shares
-        a 64 MiB process-wide retained-body budget.
+        a 64 MiB process-wide retained-body budget. Synthetic and fan-out
+        headers reuse the canonical secondary-request sanitizer shared with
+        request_mirror (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        markers, proxy-owned X-Forwarded-*), preserving Host for routing.
       required:
         - key
         - concurrent_clients
@@ -16944,7 +17196,16 @@ components:
         for the mirror response and mirror failures never propagate to the
         client. Mirror response metadata (status, size, latency) is captured
         via a `tokio::sync::watch` channel and surfaced through transaction
-        logs.
+        logs. Outbound mirror headers use Ferrum's canonical secondary-request
+        sanitizer (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        request-only markers, and proxy-owned X-Forwarded-* identity); these
+        forwarding fields are stripped rather than regenerated, so mirrors do
+        not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
+        the mirror URL. Native gRPC mirrors require HTTP/2 and re-synthesise te:
+        trailers. The mirror request-target preserves the raw query (after the
+        same auth credential strips as primary) including repeated pairs,
+        order, flags, empty values, +, percent escapes, and non-ASCII encoded
+        bytes.
       required:
         - mirror_host
       properties:
@@ -16964,7 +17225,8 @@ components:
           description: "Transport protocol used for the mirror request."
         mirror_path:
           type: string
-          description: "Override path used for the mirror request. When omitted, the original request path is used."
+          pattern: '^$|^/[^?#]*$'
+          description: "Override path used for the mirror request. Must start with `/` and cannot contain a query or fragment. Empty is treated as omitted; when omitted, the original request path is used."
         percentage:
           type: number
           format: double
@@ -17177,7 +17439,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -17262,7 +17524,16 @@ components:
         required (`max_depth`, `max_complexity`, `max_aliases`,
         `introspection_allowed: false`, a non-empty `type_rate_limits`, or a
         non-empty `operation_rate_limits`). `introspection_allowed: true` alone is
-        not an effective rule. Unknown top-level keys are rejected. Rate-limit
+        not an effective rule. Unknown top-level keys are rejected. Unsupported
+        GraphQL HTTP representations fail closed with HTTP 400 GraphQL-style
+        JSON errors (non-POST methods including GraphQL GET/`?query=` and
+        GraphQL-over-SSE GET, non-JSON content types including
+        `application/graphql`, missing or unparseable bodies, JSON batch arrays,
+        APQ envelopes without an inline query document, and multipart
+        `operations`). The plugin attaches to HTTP and WebSocket proxies so
+        WebSocket upgrade handshakes are refused before uninspectable
+        GraphQL-over-WebSocket frames can be admitted; it does not inspect
+        post-upgrade frames. gRPC, TCP, and UDP are unsupported. Rate-limit
         counter storage supports only local memory and Redis; database-backed
         counters are intentionally unsupported. When `sync_mode` is `redis`,
         `redis_url` is required. Explicit Redis fields are validated even in
@@ -17376,7 +17647,12 @@ components:
           type: integer
           minimum: 1
           default: 5
-          description: Redis connection timeout in seconds
+          description: >-
+            Effective Redis connection-attempt timeout in seconds (must be ≥ 1).
+            Applied to the redis-rs inner connection config for cached, dedicated,
+            and health-check paths (TCP connect, TLS handshake when enabled, Redis
+            protocol handshake). Gateway DNS screening/resolution of the Redis
+            hostname runs before this timeout starts.
         redis_health_check_interval_seconds:
           type: integer
           minimum: 1
@@ -17486,7 +17762,12 @@ components:
           type: integer
           minimum: 1
           default: 5
-          description: Redis connection timeout in seconds
+          description: >-
+            Effective Redis connection-attempt timeout in seconds (must be ≥ 1).
+            Applied to the redis-rs inner connection config for cached, dedicated,
+            and health-check paths (TCP connect, TLS handshake when enabled, Redis
+            protocol handshake). Gateway DNS screening/resolution of the Redis
+            hostname runs before this timeout starts.
         redis_health_check_interval_seconds:
           type: integer
           minimum: 1
@@ -17499,9 +17780,30 @@ components:
       description: >-
         Plugin: grpc_web — Translates between gRPC-Web (browser-compatible)
         and native gRPC (HTTP/2) wire formats. Supports binary
-        (application/grpc-web) and text (application/grpc-web-text) encoding.
+        (application/grpc-web) and text (application/grpc-web-text) encoding,
+        including message-format suffixes such as +proto, +json, +thrift, and
+        other valid +subtype values. Request-body decoding follows request
+        Content-Type; response encoding and Content-Type follow Accept
+        negotiation (absent Accept defaults to the request Content-Type mode
+        and suffix; lists, q-values, and */* / application/* wildcards are
+        honored; Accept can select binary versus text but cannot transcode to a
+        different message-format suffix; malformed or fully refused Accept
+        fails closed with HTTP 406;
+        translated responses merge Vary: Accept so caches separate variants).
         Config must be a JSON object (not null); `{}` and objects that only set
-        `expose_headers` are accepted. Unknown keys are rejected.
+        `expose_headers` are accepted. Unknown keys are rejected. When a backend
+        or intermediary response omits a valid numeric grpc-status, the response
+        trailer frame synthesizes status from the official HTTP-to-gRPC client
+        mapping (400→13, 401→16, 403→7, 404→12, 429/502/503/504→14, others→2);
+        a valid supplied grpc-status remains authoritative. The client-visible
+        HTTP status is not rewritten to 200 on this path. The body trailer frame
+        preserves backend `grpc-status` / `grpc-message`, binary `*-bin`
+        metadata, and valid ASCII custom trailing metadata while excluding
+        hop-by-hop, forbidden, pseudo, connection-listed, and invalid
+        names/values; initial response headers are not copied into the frame.
+        Multiple effective instances are supported: the first in configured
+        order owns body translation exactly once; siblings union expose_headers
+        only.
       properties:
         expose_headers:
           type: array
@@ -17510,7 +17812,8 @@ components:
           description: >-
             Additional response headers to include in
             Access-Control-Expose-Headers for browser CORS compatibility.
-            grpc-status and grpc-message are always exposed.
+            grpc-status and grpc-message are always exposed. Multiple grpc_web
+            instances union their lists in configured order.
 
     GrpcDeadlineConfig:
       type: object
@@ -18182,8 +18485,11 @@ components:
           description: Enable TLS for Redis connection
         redis_key_prefix:
           type: string
-          default: "ferrum:ai_semantic_cache"
-          description: Redis key namespace prefix
+          description: >-
+            Redis key namespace prefix. When omitted, the runtime derives
+            `{FERRUM_NAMESPACE}:ai_cache` (for example `ferrum:ai_cache` when
+            the namespace is `ferrum`). No static OpenAPI default is advertised
+            because the value depends on the gateway namespace.
         redis_pool_size:
           type: integer
           format: uint64
@@ -18370,8 +18676,7 @@ components:
         token_limit:
           type: integer
           minimum: 1
-          default: 100000
-          description: Maximum tokens allowed per window
+          description: Required maximum tokens allowed per window. Omission is rejected at construction; there is no default.
         window_seconds:
           type: integer
           minimum: 1
@@ -18393,8 +18698,12 @@ components:
           description: Inject x-ai-ratelimit-* headers
         provider:
           type: string
+          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
           default: auto
-          description: LLM provider format for token extraction
+          description: >-
+            LLM provider format for token extraction. Accepted values: auto,
+            openai, anthropic, google, cohere, mistral, bedrock. Gemini/Vertex
+            payloads use `google`.
         on_unmetered_response:
           type: string
           enum: [reject, charge_estimate, warn]
@@ -18438,7 +18747,7 @@ components:
     AiPromptShieldConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_prompt_shield — PII detection and redaction in bare JSON AI prompts. Native protobuf/framed gRPC and gRPC-Web bodies are outside the JSON inspection scope."
+      description: "Plugin: ai_prompt_shield — HTTP-only PII detection and redaction in bare JSON AI prompts. Native gRPC is unsupported (not registered for the Grpc protocol view). Framed gRPC-Web bodies remain outside the JSON inspection scope and are skipped without decoding."
       anyOf:
         - not:
             required: [patterns]
@@ -19734,6 +20043,7 @@ components:
     ApiChargebackSinkConfig:
       type: object
       additionalProperties: false
+      required: [clickhouse]
       description: |
         Plugin: api_chargeback_sink — Durable ClickHouse charge export. Uses the
         same `pricing_tiers`, `bandwidth_pricing`, `stream_connection_pricing`,
@@ -19744,6 +20054,123 @@ components:
         normalized grpc-status mapped to the canonical effective HTTP status.
         Durable events preserve that billable status, the raw HTTP status, and
         the normalized gRPC status separately.
+
+        At least one nonempty pricing dimension must be configured with the same
+        semantics as runtime `PricingConfig::has_any_pricing`: a nonempty
+        `pricing_tiers` array, `bandwidth_pricing` with at least one strictly
+        positive per-byte rate, or `stream_connection_pricing` with a strictly
+        positive `price_per_connection`.
+
+        OpenAPI encodes material cross-field invariants that JSON Schema can
+        represent accurately: `clickhouse` (with runtime-mandatory `url`) is
+        required; snapshot mode requires `spool.enabled=true`; nonempty
+        `clickhouse.password_ref` requires `https://` and forbids disabled TLS
+        certificate/hostname verification; `clickhouse.url` must be http(s)
+        without user-info; batch/spool/snapshot numeric bounds match the
+        constructor.
+
+        Runtime admission layer (not safely expressible as OpenAPI 3.1
+        comparisons or input-independent checks):
+        `retry.max_delay_ms >= retry.initial_delay_ms`;
+        nonempty `password_ref` must name a set `FERRUM_*` process environment
+        variable; spool directory privacy/permissions
+        (`ensure_private_dir`); ClickHouse URL egress IP screening; and
+        whitespace-only trimming for `currency` / `pricing_version` /
+        `password_ref`. File, Admin, and CP-DP admission all invoke the same
+        plugin constructor validation path.
+      allOf:
+        - anyOf:
+            - required: [pricing_tiers]
+              properties:
+                pricing_tiers:
+                  type: array
+                  minItems: 1
+            - required: [bandwidth_pricing]
+              properties:
+                bandwidth_pricing:
+                  type: object
+                  anyOf:
+                    - required: [price_per_byte_sent]
+                      properties:
+                        price_per_byte_sent:
+                          type: number
+                          exclusiveMinimum: 0
+                    - required: [price_per_byte_received]
+                      properties:
+                        price_per_byte_received:
+                          type: number
+                          exclusiveMinimum: 0
+            - required: [stream_connection_pricing]
+              properties:
+                stream_connection_pricing:
+                  type: object
+                  required: [price_per_connection]
+                  properties:
+                    price_per_connection:
+                      type: number
+                      exclusiveMinimum: 0
+        - if:
+            required: [mode]
+            properties:
+              mode:
+                const: snapshot
+          then:
+            required: [spool]
+            properties:
+              spool:
+                type: object
+                required: [enabled]
+                properties:
+                  enabled:
+                    const: true
+        - not:
+            allOf:
+              - required: [clickhouse]
+                properties:
+                  clickhouse:
+                    type: object
+                    required: [password_ref]
+                    properties:
+                      password_ref:
+                        type: string
+                        minLength: 1
+                        pattern: '\S'
+              - anyOf:
+                  - required: [clickhouse]
+                    properties:
+                      clickhouse:
+                        type: object
+                        required: [url]
+                        properties:
+                          url:
+                            type: string
+                            pattern: '^https?://'
+                            not:
+                              pattern: '^https://'
+                  - required: [clickhouse]
+                    properties:
+                      clickhouse:
+                        type: object
+                        required: [tls]
+                        properties:
+                          tls:
+                            type: object
+                            required: [insecure_skip_verify]
+                            properties:
+                              insecure_skip_verify:
+                                const: true
+                  - required: [clickhouse]
+                    properties:
+                      clickhouse:
+                        type: object
+                        required: [tls]
+                        properties:
+                          tls:
+                            type: object
+                            required: [verify_hostname]
+                            properties:
+                              verify_hostname:
+                                const: false
       properties:
         mode:
           type: string
@@ -19752,12 +20179,16 @@ components:
           description: Export one event per transaction or periodic snapshot deltas. Snapshot mode requires spool.enabled=true for durable delta delivery.
         currency:
           type: string
+          minLength: 1
+          pattern: '\S'
           default: "USD"
-          description: Currency label written to each charge event.
+          description: Currency label written to each charge event. Runtime also rejects whitespace-only values after trim.
         pricing_version:
           type: string
+          minLength: 1
+          pattern: '\S'
           default: default
-          description: Operator-controlled pricing/version label written to each event.
+          description: Operator-controlled pricing/version label written to each event. Runtime also rejects whitespace-only values after trim.
         include_request_id:
           type: boolean
           default: true
@@ -19785,7 +20216,7 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
-          description: HTTP-family per-call pricing by billable status. A status code must appear in at most one tier.
+          description: HTTP-family per-call pricing by billable status. A status code must appear in at most one tier. A nonempty tiers list satisfies has_any_pricing even when prices are zero.
         bandwidth_pricing:
           type: object
           additionalProperties: false
@@ -19798,7 +20229,7 @@ components:
               type: number
               minimum: 0
               default: 0.0
-          description: Optional per-byte pricing for client->backend and backend->client bytes.
+          description: Optional per-byte pricing for client->backend and backend->client bytes. When this is the only pricing dimension, at least one rate must be strictly greater than zero (has_any_pricing).
         stream_connection_pricing:
           type: object
           additionalProperties: false
@@ -19807,7 +20238,7 @@ components:
             price_per_connection:
               type: number
               minimum: 0
-          description: Optional flat per-session charge for TCP/TCP+TLS/UDP/DTLS disconnects.
+          description: Optional flat per-session charge for TCP/TCP+TLS/UDP/DTLS disconnects. When this is the only pricing dimension, price_per_connection must be strictly greater than zero (has_any_pricing).
         clickhouse:
           type: object
           additionalProperties: false
@@ -19816,19 +20247,36 @@ components:
             url:
               type: string
               format: uri
-              description: ClickHouse HTTP endpoint. Must use http:// or https:// and must not contain user-info.
+              minLength: 1
+              pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
+              description: ClickHouse HTTP endpoint. Must use http:// or https://, include a host, and must not contain user-info (use username/password_ref instead).
             database:
               type: string
+              minLength: 1
+              pattern: '^[A-Za-z0-9_.]+$'
               default: ferrum
+              description: ClickHouse database identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only.
             table:
               type: string
+              minLength: 1
+              pattern: '^[A-Za-z0-9_.]+$'
               default: charges_raw
+              description: ClickHouse table identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only.
             username:
               type: string
               description: Optional ClickHouse HTTP Basic username.
             password_ref:
               type: string
-              description: FERRUM_* environment variable containing the ClickHouse password, often materialized at startup from an existing `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, or `_GCP` secret suffix. Because the password is sent via HTTP Basic auth, `clickhouse.url` must use `https://` and TLS certificate/hostname verification must stay enabled when this is set.
+              pattern: '^\s*(?:FERRUM_.*)?\s*$'
+              description: |
+                FERRUM_* environment variable containing the ClickHouse password,
+                often materialized at startup from an existing `_FILE`, `_VAULT`,
+                `_AWS`, `_AZURE`, or `_GCP` secret suffix. Empty values are treated
+                as unset. Because the password is sent via HTTP Basic auth,
+                `clickhouse.url` must use `https://` and TLS certificate/hostname
+                verification must stay enabled when this is nonempty after
+                trimming. Empty or whitespace-only values are treated as unset.
+                Runtime additionally requires the referenced env var to be set.
             tls:
               type: object
               additionalProperties: false
@@ -19881,6 +20329,10 @@ components:
         retry:
           type: object
           additionalProperties: false
+          description: |
+            Retry budget and bounded exponential backoff. OpenAPI cannot express
+            `max_delay_ms >= initial_delay_ms`; the plugin constructor rejects
+            inverted bounds during Admin/file/CP-DP admission.
           properties:
             max_attempts:
               type: integer
@@ -19894,6 +20346,7 @@ components:
               type: integer
               minimum: 0
               default: 10000
+              description: Cap on inter-attempt delay. Runtime requires max_delay_ms >= initial_delay_ms.
             jitter:
               type: boolean
               default: true
@@ -19906,11 +20359,21 @@ components:
               default: true
             dir:
               type: string
+              minLength: 1
               default: /var/lib/ferrum/chargeback-spool
             max_bytes:
               type: integer
               minimum: 1
               default: 10737418240
+              description: |
+                Hard ceiling on total encoded on-disk bytes owned by this sink under
+                spool.dir for the local node_id (after compression). Counts active
+                spool files (*.ndjson / *.ndjson.zst), in-progress atomic-write temps
+                (*.tmp), and quarantined (*.corrupt) files. A pending write is sized
+                before admission under the spool write lock; oldest owned files are
+                dropped until the incoming encoded file fits. If one encoded batch
+                still cannot fit, the write is rejected rather than exceeding the
+                ceiling.
             replay_interval_secs:
               type: integer
               minimum: 1
@@ -20088,8 +20551,10 @@ components:
               type: boolean
             files:
               type: integer
+              description: Count of owned spool files (active data, temps, and quarantined).
             bytes:
               type: integer
+              description: Total encoded on-disk bytes for owned spool files (active data, temps, and quarantined).
             drops_total:
               type: integer
             last_replay_at:

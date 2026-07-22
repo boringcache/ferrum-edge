@@ -49,6 +49,16 @@ paths:
 
 The importer generates a proxy-scoped `openapi_validator` plugin, resolves local `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
+### `readOnly` / `writeOnly` required direction
+
+When the source document is Swagger 2.0 or OpenAPI 3.0.x, the importer normalizes each schema with an explicit request or response direction before compiling it into `operations`:
+
+- **Request schemas:** a property marked `readOnly: true` that also appears in `required` is required only on responses, so its name is removed from request-side `required`. Required `writeOnly` properties stay required on requests.
+- **Response schemas:** a property marked `writeOnly: true` that also appears in `required` is required only on requests, so its name is removed from response-side `required`. Required `readOnly` properties stay required on responses.
+- The same filtering walks nested `properties`, `items`, and `allOf` / `oneOf` / `anyOf` members after local `$ref` resolution. Swagger 2.0 defines `readOnly` but not `writeOnly`, so only the request-side rule applies there.
+
+OpenAPI 3.1+ treats `readOnly` and `writeOnly` as JSON Schema annotations. Ferrum does **not** rewrite `required` for those versions; the authored `required` arrays are compiled as-is. Operators who want OAS 3.0-style direction rules on 3.1 documents should publish separate request and response schemas (or an application-specific convention) rather than relying on implicit rewriting.
+
 ## `x-ferrum-validate`
 
 `x-ferrum-validate` accepts `true`, `false`, or an object. `false` and `null` disable auto-injection.
@@ -137,8 +147,8 @@ The generated plugin config has this shape:
 | `fail_on_unknown_operation` | `true` | Reject requests that do not match any generated operation. |
 | `fail_on_missing_response_schema` | `false` | Reject responses whose status/content type has no schema and no `default` schema. |
 | `max_body_bytes` | `1048576` | Maximum raw or decompressed body size validated by the plugin. |
-| `schema_draft` | generated | `draft7`, `draft2020-12`, or `auto`. |
-| `operations` | required | Generated per-operation schema table. |
+| `schema_draft` | generated | Sole authoritative draft selector: `draft7`, `draft2020-12`, or `auto`. Emitted only at the top level; operations do not carry a draft field. |
+| `operations` | required | Generated per-operation schema table. Request and response media schemas are ordinary JSON Schema objects or OpenAPI 3.1 boolean schemas (`true` / `false`). |
 | `bypass.paths` | `[]` | Regexes that skip validation when the request path matches. |
 | `bypass.methods` | `[]` | HTTP methods that skip validation. |
 | `bypass.consumers` | `[]` | Authenticated identities or mapped consumer usernames that skip validation. |

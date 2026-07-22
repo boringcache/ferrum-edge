@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, decode_spool_file_for_tests, new_ulid,
-    replay_spool_once_for_tests, serialize_json_each_row,
+    SpoolManager, SpoolSettings, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
+    new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
+    serialize_json_each_row, write_private_file_atomically_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::ChargeComputation;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
@@ -117,7 +118,9 @@ async fn grpc_per_event_exports_billable_and_raw_terminal_statuses() {
         {"status_codes": [503], "price_per_call": 0.09}
     ]);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
 
+    plugin.commit_background_tasks();
     plugin.log(&grpc_summary("grpc-ok", "0")).await;
     plugin.log(&grpc_summary("grpc-unavailable", "14")).await;
 
@@ -264,6 +267,248 @@ async fn password_ref_requires_https_clickhouse_url() {
 }
 
 #[tokio::test]
+async fn password_ref_rejects_disabled_tls_verification() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://localhost:8443");
+    config["clickhouse"]["password_ref"] = json!("FERRUM_CLICKHOUSE_PASSWORD");
+    config["clickhouse"]["tls"] = json!({ "insecure_skip_verify": true });
+
+    let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("password_ref with insecure_skip_verify should be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.contains("password_ref cannot be used when ClickHouse TLS"));
+}
+
+/// Issue #2627: OpenAPI must reject the same required/cross-field failures the
+/// constructor rejects, and admit each minimal valid pricing shape.
+#[tokio::test]
+async fn openapi_schema_matches_runtime_admission_boundaries() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let sink_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackSinkConfig",
+        "components": spec["components"].clone()
+    });
+    let sink_validator = jsonschema::draft202012::options()
+        .build(&sink_schema)
+        .expect("ApiChargebackSinkConfig schema compiles");
+    let plugin_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig",
+        "components": spec["components"].clone()
+    });
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_schema)
+        .expect("PluginConfig schema compiles");
+
+    // Disable the default on-disk spool so runtime admission does not depend on
+    // creating /var/lib/ferrum/chargeback-spool in the unit-test environment.
+    let minimal_pricing_shapes = [
+        json!({
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }),
+        json!({
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "bandwidth_pricing": {"price_per_byte_sent": 0.000001}
+        }),
+        json!({
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "bandwidth_pricing": {"price_per_byte_received": 0.000002}
+        }),
+        json!({
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "stream_connection_pricing": {"price_per_connection": 0.1}
+        }),
+        json!({
+            "clickhouse": {
+                "url": "http://clickhouse.example:8123",
+                "password_ref": "   "
+            },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }),
+        json!({
+            "clickhouse": { "url": "HTTPS://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }),
+    ];
+    for config in &minimal_pricing_shapes {
+        assert!(
+            sink_validator.validate(config).is_ok(),
+            "minimal pricing shape should be schema-valid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", config).is_ok(),
+            "minimal pricing shape should pass runtime admission: {config}"
+        );
+    }
+
+    let missing_config_entry = json!({
+        "plugin_name": "api_chargeback_sink",
+        "scope": "global",
+        "enabled": true
+    });
+    assert!(
+        plugin_validator.validate(&missing_config_entry).is_err(),
+        "PluginConfig must require config for api_chargeback_sink"
+    );
+    let complete_entry = json!({
+        "plugin_name": "api_chargeback_sink",
+        "scope": "global",
+        "enabled": true,
+        "config": {
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }
+    });
+    assert!(
+        plugin_validator.validate(&complete_entry).is_ok(),
+        "PluginConfig must accept a runtime-valid api_chargeback_sink entry"
+    );
+
+    let schema_and_runtime_invalid = [
+        (
+            "missing clickhouse",
+            json!({
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        ("empty config object", json!({})),
+        (
+            "clickhouse without pricing",
+            json!({
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "spool": { "enabled": false }
+            }),
+        ),
+        (
+            "zero-only bandwidth pricing",
+            json!({
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "bandwidth_pricing": {
+                    "price_per_byte_sent": 0.0,
+                    "price_per_byte_received": 0.0
+                }
+            }),
+        ),
+        (
+            "zero-only stream pricing",
+            json!({
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "stream_connection_pricing": { "price_per_connection": 0.0 }
+            }),
+        ),
+        (
+            "snapshot without spool",
+            json!({
+                "mode": "snapshot",
+                "spool": { "enabled": false },
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "password_ref over http",
+            json!({
+                "clickhouse": {
+                    "url": "http://clickhouse.example:8123",
+                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD"
+                },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "password_ref with insecure_skip_verify",
+            json!({
+                "clickhouse": {
+                    "url": "https://clickhouse.example:8443",
+                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
+                    "tls": { "insecure_skip_verify": true }
+                },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "password_ref with verify_hostname disabled",
+            json!({
+                "clickhouse": {
+                    "url": "https://clickhouse.example:8443",
+                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
+                    "tls": { "verify_hostname": false }
+                },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "url with user-info",
+            json!({
+                "clickhouse": { "url": "https://user:pass@clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "url without host",
+            json!({
+                "clickhouse": { "url": "https://?query=1" },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+    ];
+    for (label, config) in schema_and_runtime_invalid {
+        assert!(
+            sink_validator.validate(&config).is_err(),
+            "{label} must be schema-invalid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", &config).is_err(),
+            "{label} must be runtime-rejected: {config}"
+        );
+    }
+
+    // OpenAPI cannot express max_delay_ms >= initial_delay_ms; document and
+    // cover both layers so inverted retry bounds stay constructor-gated.
+    let inverted_retry = json!({
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "retry": {
+            "initial_delay_ms": 1000,
+            "max_delay_ms": 100
+        }
+    });
+    assert!(
+        sink_validator.validate(&inverted_retry).is_ok(),
+        "inverted retry bounds remain schema-admitted when OpenAPI cannot compare fields"
+    );
+    let retry_err = validate_plugin_config("api_chargeback_sink", &inverted_retry)
+        .expect_err("inverted retry bounds must fail runtime admission");
+    assert!(
+        retry_err.contains("retry.max_delay_ms must be >= retry.initial_delay_ms"),
+        "unexpected retry admission error: {retry_err}"
+    );
+}
+
+#[tokio::test]
 async fn password_ref_must_use_ferrum_prefix() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = valid_config(temp.path());
@@ -381,18 +626,64 @@ fn snapshot_delta_computation_tracks_last_emitted_totals() {
     assert_eq!(zero[0].snapshot_id.as_deref(), Some("snap-4"));
 }
 
+fn encoded_event_len(event: &ChargeEvent, compression: SpoolCompression) -> u64 {
+    let body = serialize_json_each_row(std::slice::from_ref(event)).unwrap();
+    encode_spool_bytes_for_tests(body.as_bytes(), compression)
+        .unwrap()
+        .len() as u64
+}
+
+fn disk_owned_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let owned = name.ends_with(".ndjson")
+                || name.ends_with(".ndjson.zst")
+                || name.ends_with(".ndjson.tmp")
+                || name.ends_with(".ndjson.zst.tmp")
+                || name.ends_with(".ndjson.corrupt")
+                || name.ends_with(".ndjson.zst.corrupt");
+            if owned {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
 #[test]
 fn spool_write_round_trip_and_oldest_eviction() {
     let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-001");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    assert_eq!(
+        encoded_len,
+        encoded_event_len(&sample_event("evt-002"), SpoolCompression::None),
+        "fixture event ids must encode to equal sizes"
+    );
     let settings = SpoolSettings {
         enabled: true,
         dir: temp.path().to_path_buf(),
-        max_bytes: 1,
+        max_bytes: encoded_len,
         replay_interval_secs: 60,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
-    let event = sample_event("evt-1");
 
     let first = spool.write_events(std::slice::from_ref(&event)).unwrap();
     let decoded = decode_spool_file_for_tests(&first).unwrap();
@@ -401,7 +692,7 @@ fn spool_write_round_trip_and_oldest_eviction() {
         serialize_json_each_row(std::slice::from_ref(&event)).unwrap()
     );
 
-    let second = spool.write_events(&[sample_event("evt-2")]).unwrap();
+    let second = spool.write_events(&[sample_event("evt-002")]).unwrap();
     assert!(second.exists());
     assert!(
         !first.exists(),
@@ -409,15 +700,233 @@ fn spool_write_round_trip_and_oldest_eviction() {
     );
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&temp.path().join("node-a")),
+        "status bytes must match on-disk owned usage"
+    );
+}
+
+#[test]
+fn spool_rejects_empty_spool_oversized_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-oversized");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len.saturating_sub(1).max(1),
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let err = spool
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("one-byte-over batch must be rejected on an empty spool");
+    assert!(
+        err.contains("exceeds spool.max_bytes")
+            || err.contains("cannot fit within spool.max_bytes"),
+        "unexpected error: {err}"
+    );
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 0);
+    assert_eq!(stats.bytes, 0);
+    assert_eq!(disk_owned_bytes(&temp.path().join("node-a")), 0);
+}
+
+#[test]
+fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-ex-1");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    assert_eq!(
+        encoded_len,
+        encoded_event_len(&sample_event("evt-ex-2"), SpoolCompression::None)
+    );
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let path = spool.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(path.exists());
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+
+    // With the resident file still present, a second write of the same size must
+    // evict first (exact fit after eviction), not exceed the ceiling.
+    let second = spool.write_events(&[sample_event("evt-ex-2")]).unwrap();
+    assert!(second.exists());
+    assert!(!path.exists());
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+}
+
+#[test]
+fn spool_quota_uses_compressed_encoded_size() {
+    let temp = tempfile::tempdir().unwrap();
+    // Pad the event id so the uncompressed body is large enough that zstd
+    // typically changes the on-disk size versus the raw JSONEachRow bytes.
+    let event = sample_event(&format!("evt-zstd-{}", "x".repeat(2048)));
+    let encoded_len = encoded_event_len(&event, SpoolCompression::Zstd);
+    let uncompressed_len = encoded_event_len(&event, SpoolCompression::None);
+    assert_ne!(
+        encoded_len, uncompressed_len,
+        "fixture should produce a distinct compressed size so quota uses encoded bytes"
+    );
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::Zstd,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let path = spool.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(path.exists());
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+
+    // Using the uncompressed length as the ceiling must not be how admission
+    // decides: when compressed size exceeds an artificially smaller budget,
+    // the write is rejected.
+    let over = SpoolSettings {
+        enabled: true,
+        dir: temp.path().join("over"),
+        max_bytes: encoded_len.saturating_sub(1).max(1),
+        replay_interval_secs: 60,
+        compression: SpoolCompression::Zstd,
+    };
+    let over_spool = SpoolManager::for_tests(over, "node-a").unwrap();
+    let err = over_spool
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("compressed one-byte-over must reject");
+    assert!(err.contains("exceeds spool.max_bytes") || err.contains("cannot fit"));
+}
+
+#[test]
+fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-after-corrupt");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let corrupt_dir = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&corrupt_dir).unwrap();
+    let corrupt = corrupt_dir.join("00000000000000000000000000.ndjson.corrupt");
+    fs::write(&corrupt, vec![0u8; encoded_len as usize]).unwrap();
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let before = spool.scan_stats().unwrap();
+    assert_eq!(before.files, 1);
+    assert_eq!(before.bytes, encoded_len);
+    assert_eq!(before.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+
+    let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(written.exists());
+    assert!(
+        !corrupt.exists(),
+        "oldest owned corrupt file must be evictable to admit a new write"
+    );
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+}
+
+#[test]
+fn spool_reconciles_stale_tmp_files_at_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let day = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    fs::write(&stale_tmp, vec![0u8; 4096]).unwrap();
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    assert!(
+        !stale_tmp.exists(),
+        "startup must delete crash-left spool temp files"
+    );
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 0);
+    assert_eq!(stats.bytes, 0);
+    assert_eq!(disk_owned_bytes(&temp.path().join("node-a")), 0);
+}
+
+#[test]
+fn spool_counts_tmp_files_toward_quota_before_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-tmp-budget");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let day = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
+
+    // Construct without going through for_tests' reconcile by using a second
+    // manager after manually recreating a temp that appears between scans:
+    // first manager cleans startup temps; then plant a temp and assert accounting
+    // via scan_stats before the next write admission path removes oldest owned.
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    assert!(
+        !stale_tmp.exists(),
+        "startup reconcile should clear planted tmp"
+    );
+
+    fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+
+    let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(written.exists());
+    assert!(
+        !stale_tmp.exists(),
+        "admission eviction must drop owned temp files when they block the ceiling"
+    );
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, 1);
+    assert_eq!(after.bytes, encoded_len);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     let temp = tempfile::tempdir().unwrap();
+    let probe = sample_event("evt-00");
+    let encoded_len = encoded_event_len(&probe, SpoolCompression::None);
     let settings = SpoolSettings {
         enabled: true,
         dir: temp.path().to_path_buf(),
-        max_bytes: 1,
+        max_bytes: encoded_len,
         replay_interval_secs: 60,
         compression: SpoolCompression::None,
     };
@@ -426,7 +935,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     for idx in 0..24 {
         let spool = Arc::clone(&spool);
         handles.push(tokio::task::spawn_blocking(move || {
-            spool.write_events(&[sample_event(&format!("evt-{idx}"))])
+            spool.write_events(&[sample_event(&format!("evt-{idx:02}"))])
         }));
     }
 
@@ -435,6 +944,225 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     }
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&temp.path().join("node-a")),
+        "status bytes must match on-disk owned usage after concurrent writes"
+    );
+}
+
+#[tokio::test]
+async fn prometheus_counts_quarantined_owned_spool_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    let corrupt_bytes = 256u64;
+    let byte_line = format!("chargeback_sink_spool_bytes {corrupt_bytes}\n");
+
+    // ACTIVE_SINK is process-global; retry briefly if a parallel sink test races
+    // the published runtime between construction and scrape.
+    let mut matched_prom = None;
+    let mut held_plugin = None;
+    for _ in 0..20 {
+        let plugin =
+            ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+        plugin.start_background_tasks().expect("chargeback start");
+        plugin.commit_background_tasks();
+        // Committed spool preparation is intentionally asynchronous: the
+        // replayer wakes on the publication gate and creates/probes live
+        // storage on its first tick. Validation and pre-commit staging must
+        // not create this directory.
+        let mut node_dirs = Vec::new();
+        for _ in 0..200 {
+            node_dirs = fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            if node_dirs.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            node_dirs.len(),
+            1,
+            "committed spool should create exactly one node directory"
+        );
+        let day = node_dirs[0].join("20260524");
+        fs::create_dir_all(&day).unwrap();
+        let corrupt = day.join("00000000000000000000000000.ndjson.corrupt");
+        fs::write(&corrupt, vec![0u8; corrupt_bytes as usize]).unwrap();
+
+        let prom = render_prometheus();
+        if prom.contains(&byte_line) {
+            matched_prom = Some(prom);
+            held_plugin = Some(plugin);
+            break;
+        }
+        drop(plugin);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let prom = matched_prom.expect(
+        "ACTIVE_SINK never observed this sink's quarantined owned bytes in prometheus output",
+    );
+    assert!(
+        prom.contains(
+            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, and quarantined files)."
+        ),
+        "prometheus HELP must describe the owned-byte ceiling contract"
+    );
+    assert!(
+        prom.contains(
+            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, and quarantined files)."
+        ),
+        "prometheus HELP must describe owned file accounting"
+    );
+    assert!(
+        prom.contains("chargeback_sink_spool_files 1\n"),
+        "prometheus must count quarantined files toward spool.files; got:\n{prom}"
+    );
+    assert!(
+        prom.contains("chargeback_sink_spool_available 1\n"),
+        "prepared committed spool must report available; got:\n{prom}"
+    );
+    assert!(
+        prom.contains("chargeback_sink_spool_prepare_failures_total 0\n"),
+        "healthy committed spool must have no preparation failures; got:\n{prom}"
+    );
+    assert_eq!(
+        disk_owned_bytes(temp.path()),
+        corrupt_bytes,
+        "on-disk owned usage must include the planted .corrupt file"
+    );
+    drop(held_plugin);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn committed_unusable_spool_latches_status_and_metric_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocked = temp.path().join("not-a-directory");
+    fs::write(&blocked, b"file blocks spool directory creation").unwrap();
+    let config = valid_config(&blocked);
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+
+    plugin
+        .start_background_tasks()
+        .expect("stage chargeback sink");
+    plugin.commit_background_tasks();
+
+    let mut status = Value::Null;
+    for _ in 0..200 {
+        status = serde_json::from_str(&render_status_json()).expect("status json");
+        if status["spool"]["prepare_failures_total"]
+            .as_u64()
+            .is_some_and(|failures| failures > 0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(status["spool"]["enabled"], true);
+    assert_eq!(status["spool"]["available"], false);
+    assert!(
+        status["spool"]["prepare_failures_total"]
+            .as_u64()
+            .is_some_and(|failures| failures > 0),
+        "committed unusable spool must retain operational failure evidence: {status}"
+    );
+
+    let prometheus = render_prometheus();
+    assert!(prometheus.contains("chargeback_sink_spool_available 0\n"));
+    let failures = prometheus
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("chargeback_sink_spool_prepare_failures_total ")
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    assert!(
+        failures > 0,
+        "missing persistent failure counter:\n{prometheus}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let day = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    fs::write(&stale_tmp, vec![0u8; 128]).unwrap();
+
+    // Remove directory write bits so unlink of the planted temp fails. Startup
+    // must fail closed rather than ignore an undeletable owned temp.
+    let mut perms = fs::metadata(&day).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&day, perms).unwrap();
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let err = match SpoolManager::for_tests(settings, "node-a") {
+        Ok(_) => panic!("undeletable stale tmp must fail spool startup"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("failed to remove stale spool temp file"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        stale_tmp.exists(),
+        "fail-closed reconcile must leave the undeletable temp in place"
+    );
+
+    // Restore writability so TempDir cleanup can succeed.
+    let mut perms = fs::metadata(&day).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&day, perms).unwrap();
+}
+
+#[test]
+fn failed_atomic_spool_write_removes_tmp_and_does_not_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join("batch.ndjson");
+    let tmp_path = temp.path().join("batch.ndjson.tmp");
+    // Block rename so the write path reaches the error-cleanup branch after the
+    // temp body has already been created.
+    fs::create_dir(&final_path).unwrap();
+
+    let err = write_private_file_atomically_for_tests(&tmp_path, &final_path, b"{\"ok\":true}\n")
+        .expect_err("rename onto a directory must fail the atomic publish");
+    assert!(
+        err.contains("failed to rename spool temp file"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !tmp_path.exists(),
+        "failed atomic write must delete the leftover *.tmp so it cannot evade quota"
+    );
+    assert!(
+        final_path.is_dir(),
+        "failed publish must not replace the blocking path with a data file"
+    );
 }
 
 #[tokio::test]
@@ -493,6 +1221,8 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
     config["clickhouse"]["url"] = json!(server.uri());
     config["batch"]["size"] = json!(1);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
     assert!(plugin.requires_ws_disconnect_hooks());
 
     plugin
@@ -515,6 +1245,7 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
             error_class: None,
             consumer_username: Some("alice".to_string()),
             auth_method: None,
+            connection_id: 0,
             metadata: Default::default(),
         })
         .await;
@@ -539,7 +1270,9 @@ async fn connect_method_is_not_classified_as_websocket() {
     config["clickhouse"]["url"] = json!(server.uri());
     config["batch"]["size"] = json!(1);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
 
+    plugin.commit_background_tasks();
     plugin
         .log(&TransactionSummary {
             namespace: "ferrum".to_string(),

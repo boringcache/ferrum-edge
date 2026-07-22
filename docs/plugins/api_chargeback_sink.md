@@ -20,7 +20,11 @@ ClickHouse or the in-memory queue is unavailable. Idle snapshot keys are evicted
 after `snapshot.stale_entry_ttl_secs` and checked every
 `snapshot.cleanup_interval_secs`.
 
-Both modes use the same pricing fields as `api_chargeback`:
+Both modes use the same pricing fields as `api_chargeback`. At least one
+nonempty pricing dimension is mandatory and matches
+`PricingConfig::has_any_pricing`: a nonempty `pricing_tiers` list, bandwidth
+pricing with at least one strictly positive per-byte rate, or
+`stream_connection_pricing` with a strictly positive `price_per_connection`.
 
 - `pricing_tiers` for HTTP-family per-call pricing by billable status. Ordinary
   HTTP uses its wire status. Native gRPC and translated gRPC-Web use the final
@@ -31,6 +35,18 @@ Both modes use the same pricing fields as `api_chargeback`:
   fail closed to the `500` billing bucket.
 - `bandwidth_pricing` for client-to-backend and backend-to-client bytes.
 - `stream_connection_pricing` for TCP, TCP+TLS, UDP, and DTLS sessions.
+
+## Admission Layers
+
+Admin, file-mode, and CP-DP admission share the OpenAPI
+`ApiChargebackSinkConfig` contract plus the plugin constructor
+(`ApiChargebackSink::new` / `validate_plugin_config`). OpenAPI requires
+`config`, `clickhouse.url`, at least one valid pricing dimension, snapshot
+mode with `spool.enabled=true`, and compatible `password_ref`/TLS settings.
+Constructor validation additionally enforces relationships OpenAPI 3.1 cannot
+express safely (notably `retry.max_delay_ms >= retry.initial_delay_ms`),
+spool directory privacy, ClickHouse egress screening, and that a nonempty
+`password_ref` names a set `FERRUM_*` environment variable.
 
 ## ClickHouse Setup
 
@@ -125,25 +141,53 @@ Spool files are written under:
 
 The sink writes failed batches and queue high-water overflow to disk. Files are
 created with private permissions, written as `*.tmp`, fsynced, and renamed into
-place. The background replayer scans files in lexicographic order and removes a
-file only after ClickHouse accepts the whole file as one insert. Unreadable
-spool files are renamed with a `.corrupt` suffix so newer files can continue to
-replay.
+place. The background replayer scans durable data files (`*.ndjson` /
+`*.ndjson.zst`) in lexicographic order and removes a file only after ClickHouse
+accepts the whole file as one insert. Unreadable spool files are renamed with a
+`.corrupt` suffix so newer files can continue to replay. Stale `*.tmp` files left
+by an interrupted atomic write are deleted at spool startup and after a failed
+write/rename so they cannot accumulate indefinitely.
+
+Offline validation and candidate-generation staging do not create, chmod, or
+probe `spool.dir`. After cache publication, the committed replayer prepares and
+write-probes the private spool directories before replay or admission. A failed
+probe is persistent operational evidence: status reports `spool.available=false`,
+`chargeback_sink_spool_available` is `0`, and
+`chargeback_sink_spool_prepare_failures_total` increments until storage recovers.
+
+`spool.max_bytes` is a hard ceiling on **encoded** on-disk bytes owned by this
+sink under `<spool.dir>/<node_id>/` (after compression when `compression` is
+`zstd`). The budget and status/metrics count every retained file class:
+
+- active data files (`*.ndjson` / `*.ndjson.zst`)
+- in-progress atomic-write temps (`*.ndjson.tmp` / `*.ndjson.zst.tmp`)
+- quarantined files (`*.ndjson.corrupt` / `*.ndjson.zst.corrupt`)
+
+Pending writes are serialized/compressed and sized **before** quota admission.
+Admission holds the spool write lock with eviction so concurrent writers cannot
+over-admit. Existing owned bytes plus the incoming encoded file must stay within
+`max_bytes`; when space is short, the oldest owned file is dropped and
+`chargeback_sink_spool_drops_total` is incremented. If a single encoded batch
+still cannot fit after eviction (including on an empty spool), the write is
+**rejected** and the batch/event follows the existing spool-failure path
+(warned and not durably retained). The sink never silently exceeds the ceiling.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
-absorb:
+absorb, using **encoded** average event size (and headroom for any retained
+`.corrupt` quarantine files):
 
 ```text
-max_bytes >= peak_events_per_second * average_event_bytes * outage_seconds
+max_bytes >= peak_events_per_second * average_encoded_event_bytes * outage_seconds
 ```
 
-When the spool is full, the oldest file is dropped and
-`chargeback_sink_spool_drops_total` is incremented.
-
 When `spool.dir` is backed by persistent storage, set `FERRUM_NODE_ID` to a
-stable identity such as a StatefulSet ordinal. If the node ID changes across
-restarts, the sink logs a warning when it finds sibling spool directories that
-may contain events from an older identity.
+stable identity such as a StatefulSet ordinal (see
+[configuration.md](../configuration.md) and `ferrum.conf`). Accepted values
+are any non-empty trimmed string; whitespace-only is ignored and values longer
+than 512 characters are truncated. Resolution order is `FERRUM_NODE_ID`, then
+`HOSTNAME`, then `/etc/hostname`, then `unknown`. If the node ID changes
+across restarts, the sink logs a warning when it finds sibling spool
+directories that may contain events from an older identity.
 
 ## Reconciliation Queries
 
@@ -179,9 +223,11 @@ size, replay timestamps, and export counters. `/metrics` includes:
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
-- `chargeback_sink_spool_bytes`
-- `chargeback_sink_spool_files`
+- `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, and quarantined)
+- `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
+- `chargeback_sink_spool_available` (1 only while committed storage is writable)
+- `chargeback_sink_spool_prepare_failures_total`
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
 

@@ -833,11 +833,9 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         return Ok(Vec::new());
     };
     let mut operations = Vec::new();
-    let schema_draft = if version == "2.0" || version.starts_with("3.0.") {
-        "draft7"
-    } else {
-        "draft2020-12"
-    };
+    // Draft selection is emitted once on the top-level openapi_validator config
+    // (`schema_draft`). Runtime compiles every operation with that selector;
+    // per-operation copies are not part of the published Admin schema.
     for (path_template, path_item) in paths {
         let Some(path_object) = path_item.as_object() else {
             continue;
@@ -868,10 +866,6 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
             entry.insert(
                 "path_regex".to_string(),
                 Value::String(path_template_to_regex(path_template)?),
-            );
-            entry.insert(
-                "schema_draft".to_string(),
-                Value::String(schema_draft.to_string()),
             );
             if let Some((required, content)) = request_body {
                 entry.insert("request_required".to_string(), Value::Bool(required));
@@ -914,7 +908,7 @@ fn extract_openapi_request_body(
                 let schema = resolve_refs(root, schema, media_type, MAX_SCHEMA_REF_DEPTH)?;
                 content_schemas.insert(
                     media_type.clone(),
-                    normalize_schema_for_openapi(schema, version),
+                    normalize_schema_for_openapi(schema, version, SchemaDirection::Request),
                 );
             }
         }
@@ -947,7 +941,7 @@ fn extract_openapi_responses(
                     let schema = resolve_refs(root, schema, media_type, MAX_SCHEMA_REF_DEPTH)?;
                     content_schemas.insert(
                         media_type.clone(),
-                        normalize_schema_for_openapi(schema, version),
+                        normalize_schema_for_openapi(schema, version, SchemaDirection::Response),
                     );
                 }
             }
@@ -989,7 +983,7 @@ fn extract_swagger_request_body(
             continue;
         };
         let schema = resolve_refs(root, schema, "body", MAX_SCHEMA_REF_DEPTH)?;
-        let schema = normalize_schema_for_openapi(schema, version);
+        let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Request);
         let required = parameter_object
             .get("required")
             .and_then(Value::as_bool)
@@ -1023,7 +1017,7 @@ fn extract_swagger_responses(
             continue;
         };
         let schema = resolve_refs(root, schema, status, MAX_SCHEMA_REF_DEPTH)?;
-        let schema = normalize_schema_for_openapi(schema, version);
+        let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
         let mut content = Map::new();
         for media_type in &produces {
             content.insert(media_type.clone(), schema.clone());
@@ -1117,14 +1111,31 @@ fn resolve_refs(
     }
 }
 
-fn normalize_schema_for_openapi(schema: Value, version: &str) -> Value {
-    if version != "2.0" && !version.starts_with("3.0.") {
-        return schema;
-    }
-    normalize_legacy_schema(schema)
+/// Whether a schema is being compiled for request or response validation.
+///
+/// OpenAPI 3.0 and Swagger 2.0 apply `required` differently for `readOnly` /
+/// `writeOnly` properties depending on this direction. OpenAPI 3.1+ treats
+/// those keywords as JSON Schema annotations and does not inherit the 3.0 rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaDirection {
+    Request,
+    Response,
 }
 
-fn normalize_legacy_schema(schema: Value) -> Value {
+fn normalize_schema_for_openapi(schema: Value, version: &str, direction: SchemaDirection) -> Value {
+    if version != "2.0" && !version.starts_with("3.0.") {
+        // OpenAPI 3.1+: keep the schema as authored. `readOnly`/`writeOnly` are
+        // JSON Schema annotations; Ferrum does not rewrite `required` here.
+        return schema;
+    }
+    normalize_legacy_schema(schema, direction, version.starts_with("3.0."))
+}
+
+fn normalize_legacy_schema(
+    schema: Value,
+    direction: SchemaDirection,
+    supports_write_only: bool,
+) -> Value {
     match schema {
         Value::Object(mut object) => {
             let nullable = object
@@ -1157,8 +1168,14 @@ fn normalize_legacy_schema(schema: Value) -> Value {
                 object.remove("exclusiveMaximum");
             }
 
+            // Filter `required` against same-object `properties` before
+            // recursing so nested objects / composition members keep their
+            // own direction semantics.
+            apply_direction_required_semantics(&mut object, direction, supports_write_only);
+
             for child in object.values_mut() {
-                *child = normalize_legacy_schema(std::mem::take(child));
+                *child =
+                    normalize_legacy_schema(std::mem::take(child), direction, supports_write_only);
             }
             let value = Value::Object(object);
             if nullable {
@@ -1167,10 +1184,70 @@ fn normalize_legacy_schema(schema: Value) -> Value {
                 value
             }
         }
-        Value::Array(values) => {
-            Value::Array(values.into_iter().map(normalize_legacy_schema).collect())
-        }
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|child| normalize_legacy_schema(child, direction, supports_write_only))
+                .collect(),
+        ),
         other => other,
+    }
+}
+
+/// OpenAPI 3.0 / Swagger 2.0 direction-specific `required` filtering.
+///
+/// - Request: a required `readOnly: true` property applies only to responses.
+/// - Response: a required `writeOnly: true` property applies only to requests.
+///
+/// Swagger 2.0 defines `readOnly` but not `writeOnly`; response filtering is
+/// therefore a no-op for Swagger documents. Property schemas without a local
+/// `properties` entry (for example names satisfied only via sibling `allOf`
+/// members) are left in `required` so composition is not weakened.
+fn apply_direction_required_semantics(
+    object: &mut Map<String, Value>,
+    direction: SchemaDirection,
+    supports_write_only: bool,
+) {
+    let Some(required) = object.get("required").and_then(Value::as_array) else {
+        return;
+    };
+    if required.is_empty() {
+        return;
+    }
+    let Some(properties) = object.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+
+    let filtered: Vec<Value> = required
+        .iter()
+        .filter(|name| {
+            let Some(prop_name) = name.as_str() else {
+                // Preserve non-string entries rather than silently dropping them.
+                return true;
+            };
+            let Some(prop) = properties.get(prop_name).and_then(Value::as_object) else {
+                return true;
+            };
+            match direction {
+                SchemaDirection::Request => {
+                    prop.get("readOnly").and_then(Value::as_bool) != Some(true)
+                }
+                SchemaDirection::Response if supports_write_only => {
+                    prop.get("writeOnly").and_then(Value::as_bool) != Some(true)
+                }
+                SchemaDirection::Response => true,
+            }
+        })
+        .cloned()
+        .collect();
+
+    if filtered.len() == required.len() {
+        return;
+    }
+    if filtered.is_empty() {
+        object.remove("required");
+    } else {
+        object.insert("required".to_string(), Value::Array(filtered));
     }
 }
 

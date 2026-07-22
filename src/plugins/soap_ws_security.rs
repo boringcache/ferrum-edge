@@ -11,6 +11,18 @@
 //! Runs in `before_proxy` with request body buffering. Priority 1500 places
 //! it in the AuthN band after HMAC auth.
 //!
+//! ## Request body character encoding
+//!
+//! Matching SOAP media types are buffered as raw bytes
+//! (`ctx.request_body_bytes`). Before XML/WS-Security validation the plugin
+//! decodes UTF-8 and UTF-16 (LE/BE) deterministically from the BOM and/or
+//! `Content-Type` charset, rejects charset/BOM/XML-declaration conflicts and
+//! malformed sequences fail-closed, and leaves the original wire bytes
+//! unchanged for the backend. BOM-less, charset-less payloads whose leading
+//! bytes are unmistakably UTF-16 XML (`3c 00` / `00 3c`) are rejected rather
+//! than interpreted as UTF-8. Unsupported XML charsets are rejected with
+//! HTTP 415. Encoding diagnostics never log request bodies or credentials.
+//!
 //! ## XMLDSIG canonicalization (shared by X.509 and SAML signature paths)
 //!
 //! Both the WS-Security X.509 signature path and the SAML assertion signature
@@ -41,11 +53,12 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use ring::digest;
 use ring::signature as ring_sig;
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -84,6 +97,13 @@ const MAX_CANONICALIZATION_DEPTH: usize = 256;
 const MAX_INCLUSIVE_NAMESPACE_PREFIXES: usize = 64;
 const MAX_INCLUSIVE_PREFIX_LIST_BYTES: usize = 4_096;
 
+/// UTF-16→UTF-8 size is bounded by construction for well-formed input: each
+/// BMP code point uses 2 wire bytes and at most 3 UTF-8 bytes (≤ 3/2×), and
+/// supplementary planes use a surrogate pair (4 wire bytes → 4 UTF-8 bytes).
+/// UTF-8→UTF-8 is 1:1. A post-decode `len * 3/2` cap is therefore unreachable
+/// and is omitted; odd-length / invalid-surrogate sequences fail closed during
+/// incremental decoding instead.
+
 // ── Config types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,10 +131,43 @@ enum DigestAlgorithm {
     Sha1,
 }
 
+fn sha256_array(value: &[u8]) -> [u8; 32] {
+    let hashed = digest::digest(&digest::SHA256, value);
+    let mut output = [0u8; 32];
+    output.copy_from_slice(hashed.as_ref());
+    output
+}
+
 #[derive(Debug, Clone)]
 struct Credential {
     username: String,
     password: String,
+    /// Fixed-width digest used by PasswordText verification so known and
+    /// unknown principals take the same comparison path even when configured
+    /// secret lengths differ from the process-local dummy material.
+    password_text_hash: [u8; 32],
+}
+
+/// UsernameToken authentication outcomes that must not create a username oracle.
+///
+/// Structural token/policy failures remain distinguishable because they do not
+/// depend on whether the supplied principal exists. Credential failures
+/// (unknown user, wrong PasswordText, wrong PasswordDigest) share one public
+/// body and one stable telemetry class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UsernameTokenError {
+    Structural(String),
+    InvalidCredentials,
+}
+
+impl UsernameTokenError {
+    /// Stable operational failure class for credential rejection (no username).
+    const INVALID_CREDENTIALS_CLASS: &'static str = "username_token_invalid_credentials";
+    /// Stable structural failure class for malformed / policy-mismatch tokens.
+    const STRUCTURAL_CLASS: &'static str = "username_token_structural";
+    /// Client-visible JSON body shared by every invalid-credential outcome.
+    const INVALID_CREDENTIALS_BODY: &'static str =
+        r#"{"error":"WS-Security: invalid credentials"}"#;
 }
 
 struct TrustedCert {
@@ -143,6 +196,11 @@ pub struct SoapWsSecurity {
     username_token_enabled: bool,
     password_type: PasswordType,
     credentials: Vec<Credential>,
+    /// Process-local padding secret used only to equalize verification work on
+    /// username lookup misses. Never authenticates a principal.
+    dummy_password: String,
+    /// Fixed-width PasswordText verifier for `dummy_password`.
+    dummy_password_text_hash: [u8; 32],
 
     // X.509 signature verification
     x509_enabled: bool,
@@ -203,7 +261,12 @@ impl SoapWsSecurity {
                     .filter_map(|v| {
                         let username = v["username"].as_str()?.to_string();
                         let password = v["password"].as_str()?.to_string();
-                        Some(Credential { username, password })
+                        let password_text_hash = sha256_array(password.as_bytes());
+                        Some(Credential {
+                            username,
+                            password,
+                            password_text_hash,
+                        })
                     })
                     .collect()
             })
@@ -215,6 +278,12 @@ impl SoapWsSecurity {
                     .to_string(),
             );
         }
+
+        // Random process-local material so lookup misses still execute the same
+        // PasswordText / PasswordDigest verification work as known principals.
+        // This value is never accepted as a configured credential.
+        let dummy_password = format!("soap-ws-security-dummy:{}", uuid::Uuid::new_v4());
+        let dummy_password_text_hash = sha256_array(dummy_password.as_bytes());
 
         // ── X.509 signature config ──────────────────────────────────────
         let x509_cfg = config_obj.get("x509_signature").unwrap_or(&Value::Null);
@@ -500,6 +569,8 @@ impl SoapWsSecurity {
             username_token_enabled,
             password_type,
             credentials,
+            dummy_password,
+            dummy_password_text_hash,
             x509_enabled,
             trusted_certs,
             allowed_signature_algorithms,
@@ -573,18 +644,29 @@ impl SoapWsSecurity {
 
     // ── UsernameToken validation ────────────────────────────────────────
 
-    fn validate_username_token(&self, security_block: &str) -> Result<String, String> {
-        let ut_block = find_element_block(security_block, "UsernameToken")
-            .ok_or_else(|| "WS-Security: missing UsernameToken element".to_string())?;
+    fn validate_username_token(&self, security_block: &str) -> Result<String, UsernameTokenError> {
+        let ut_block = find_element_block(security_block, "UsernameToken").ok_or_else(|| {
+            UsernameTokenError::Structural("WS-Security: missing UsernameToken element".to_string())
+        })?;
 
-        let username = find_element_text(&ut_block, "Username")
-            .ok_or_else(|| "WS-Security: UsernameToken missing Username element".to_string())?;
+        let username = find_element_text(&ut_block, "Username").ok_or_else(|| {
+            UsernameTokenError::Structural(
+                "WS-Security: UsernameToken missing Username element".to_string(),
+            )
+        })?;
 
-        let password_element = find_element_block(&ut_block, "Password")
-            .ok_or_else(|| "WS-Security: UsernameToken missing Password element".to_string())?;
+        let password_element = find_element_block(&ut_block, "Password").ok_or_else(|| {
+            UsernameTokenError::Structural(
+                "WS-Security: UsernameToken missing Password element".to_string(),
+            )
+        })?;
 
         let password_value = extract_element_text_content(&password_element, "Password")
-            .ok_or_else(|| "WS-Security: Password element has no content".to_string())?;
+            .ok_or_else(|| {
+                UsernameTokenError::Structural(
+                    "WS-Security: Password element has no content".to_string(),
+                )
+            })?;
 
         // The verification mode is dictated solely by the operator-configured
         // `password_type`, NEVER by the client-supplied `Type` attribute.
@@ -607,73 +689,96 @@ impl SoapWsSecurity {
             if let Some(wire_type) = wire_type
                 && wire_type != self.password_type
             {
-                return Err(
+                return Err(UsernameTokenError::Structural(
                     "WS-Security: Password Type does not match the configured password_type"
                         .to_string(),
-                );
+                ));
             }
         }
         let effective_type = self.password_type;
 
-        // Find the matching credential
-        let cred = self
-            .credentials
-            .iter()
-            .find(|c| c.username == username)
-            .ok_or_else(|| {
-                format!(
-                    "WS-Security: unknown username '{}'",
-                    escape_xml_chars(&username)
-                )
-            })?;
+        // Always run verification against either the matched credential or
+        // process-local dummy material so lookup misses do not skip crypto work
+        // and do not produce a distinct public failure.
+        let cred = self.credentials.iter().find(|c| c.username == username);
+        let password_material = cred
+            .map(|c| c.password.as_str())
+            .unwrap_or(self.dummy_password.as_str());
+        let username_known = cred.is_some();
 
         match effective_type {
             PasswordType::PasswordText => {
-                // Constant-time compare: `password_value` is attacker-controlled
-                // and `cred.password` is the stored shared secret, so a
-                // short-circuiting `!=` leaks password bytes via timing. Mirrors
-                // basic_auth / hmac_auth; `constant_time_eq` handles length
-                // mismatches safely.
-                if !constant_time_eq(password_value.as_bytes(), cred.password.as_bytes()) {
-                    return Err("WS-Security: invalid password".to_string());
+                // Hash the attacker input once, then compare fixed-width
+                // digests. `constant_time_eq` intentionally returns early on a
+                // length mismatch, so comparing plaintext directly would make
+                // the dummy path observably different whenever the configured
+                // password and dummy material have different lengths.
+                let supplied_hash = sha256_array(password_value.as_bytes());
+                let expected_hash = cred
+                    .map(|credential| &credential.password_text_hash)
+                    .unwrap_or(&self.dummy_password_text_hash);
+                let matched = constant_time_eq(&supplied_hash, expected_hash);
+                // Dummy material is timing padding only and must never establish
+                // identity for an unregistered username.
+                if username_known && matched {
+                    Ok(username)
+                } else {
+                    Err(UsernameTokenError::InvalidCredentials)
                 }
             }
             PasswordType::PasswordDigest => {
+                // Structural Nonce/Created requirements are enforced before the
+                // known/unknown credential branch so missing digest inputs cannot
+                // themselves become a username oracle.
                 // PasswordDigest = Base64(SHA-1(nonce + created + password))
                 let nonce_b64 = find_element_text(&ut_block, "Nonce").ok_or_else(|| {
-                    "WS-Security: PasswordDigest requires Nonce element".to_string()
+                    UsernameTokenError::Structural(
+                        "WS-Security: PasswordDigest requires Nonce element".to_string(),
+                    )
                 })?;
 
-                let nonce_bytes = BASE64
-                    .decode(nonce_b64.trim())
-                    .map_err(|e| format!("WS-Security: invalid Nonce base64 encoding: {}", e))?;
+                let nonce_bytes = BASE64.decode(nonce_b64.trim()).map_err(|e| {
+                    UsernameTokenError::Structural(format!(
+                        "WS-Security: invalid Nonce base64 encoding: {}",
+                        e
+                    ))
+                })?;
 
                 let created = find_element_text(&ut_block, "Created").ok_or_else(|| {
-                    "WS-Security: PasswordDigest requires Created element".to_string()
+                    UsernameTokenError::Structural(
+                        "WS-Security: PasswordDigest requires Created element".to_string(),
+                    )
                 })?;
-
-                // Check nonce replay
-                self.check_nonce_replay(&nonce_b64)?;
 
                 // Compute expected digest: SHA-1(nonce + created + password)
                 let mut data =
-                    Vec::with_capacity(nonce_bytes.len() + created.len() + cred.password.len());
+                    Vec::with_capacity(nonce_bytes.len() + created.len() + password_material.len());
                 data.extend_from_slice(&nonce_bytes);
                 data.extend_from_slice(created.as_bytes());
-                data.extend_from_slice(cred.password.as_bytes());
+                data.extend_from_slice(password_material.as_bytes());
 
                 let computed = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
                 let expected_b64 = BASE64.encode(computed.as_ref());
 
                 // Constant-time compare for consistency with the PasswordText
-                // path (the digest is derived from the shared secret).
-                if !constant_time_eq(password_value.trim().as_bytes(), expected_b64.as_bytes()) {
-                    return Err("WS-Security: PasswordDigest verification failed".to_string());
+                // path (the digest is derived from the shared secret or dummy).
+                let matched =
+                    constant_time_eq(password_value.trim().as_bytes(), expected_b64.as_bytes());
+                if username_known && matched {
+                    // Only a successfully verified principal may consume a
+                    // nonce. Recording attacker-controlled failed attempts
+                    // would let an unknown-user or wrong-password request
+                    // poison a victim's nonce before the legitimate request
+                    // arrives. The atomic entry check also prevents two
+                    // concurrent valid requests from both accepting it.
+                    self.check_nonce_replay(&nonce_b64)
+                        .map_err(UsernameTokenError::Structural)?;
+                    Ok(username)
+                } else {
+                    Err(UsernameTokenError::InvalidCredentials)
                 }
             }
         }
-
-        Ok(username)
     }
 
     // ── Nonce replay protection ─────────────────────────────────────────
@@ -695,17 +800,18 @@ impl SoapWsSecurity {
 
         let now = Instant::now();
 
-        // Check if nonce was already seen
-        if let Some(entry) = self.nonce_cache.get(nonce) {
-            let age = now.duration_since(entry.inserted_at);
-            if age.as_secs() < self.nonce_cache_ttl_seconds {
-                return Err("WS-Security: nonce replay detected".to_string());
+        match self.nonce_cache.entry(nonce.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let age = now.duration_since(entry.get().inserted_at);
+                if age.as_secs() < self.nonce_cache_ttl_seconds {
+                    return Err("WS-Security: nonce replay detected".to_string());
+                }
+                entry.insert(NonceEntry { inserted_at: now });
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(NonceEntry { inserted_at: now });
             }
         }
-
-        // Record the nonce
-        self.nonce_cache
-            .insert(nonce.to_string(), NonceEntry { inserted_at: now });
 
         Ok(())
     }
@@ -1456,6 +1562,19 @@ impl Plugin for SoapWsSecurity {
         true
     }
 
+    fn needs_request_body_bytes(&self) -> bool {
+        // SOAP may arrive as UTF-16 (or other non-UTF-8 XML encodings). The
+        // shared proxy handoff only populates metadata["request_body"] when
+        // std::str::from_utf8 succeeds, so this plugin must retain raw bytes.
+        true
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        // Decode from request_body_bytes with strict BOM/charset rules instead
+        // of relying on the UTF-8-only metadata copy.
+        false
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         ctx.headers
             .get("content-type")
@@ -1475,10 +1594,11 @@ impl Plugin for SoapWsSecurity {
             _ => return PluginResult::Continue,
         };
 
-        // Get the buffered request body
-        let body = match ctx.metadata.get("request_body") {
-            Some(b) => b.clone(),
-            None => {
+        // Prefer bounded raw bytes (H1/H2/H3 handoff). Fall back to the UTF-8
+        // metadata key only for fixtures that pre-seed text without bytes.
+        let body = match resolve_soap_request_body(ctx, &content_type) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
                 if self.reject_missing_security_header {
                     return PluginResult::Reject {
                         status_code: 400,
@@ -1487,6 +1607,20 @@ impl Plugin for SoapWsSecurity {
                     };
                 }
                 return PluginResult::Continue;
+            }
+            Err(err) => {
+                // Fail closed on hostile/unsupported encodings. Never log the
+                // body, attacker-controlled Content-Type parameters, or
+                // credential material — only the stable error class.
+                warn!(
+                    error_class = err.class(),
+                    "soap_ws_security: SOAP body encoding rejected"
+                );
+                return PluginResult::Reject {
+                    status_code: err.status_code(),
+                    body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(err.message())),
+                    headers: HashMap::new(),
+                };
             }
         };
 
@@ -1546,22 +1680,45 @@ impl Plugin for SoapWsSecurity {
             };
         }
 
+        // Keep authenticated identities local until every validation that
+        // borrows the decoded request body has completed. Besides avoiding a
+        // mutable borrow of `ctx` while `body` may borrow its raw bytes, this
+        // prevents partially-authenticated metadata from escaping a later
+        // X.509 or SAML rejection.
+        let mut authenticated_username = None;
+        let mut authenticated_saml_subject = None;
+
         // Validate UsernameToken
         if self.username_token_enabled {
             match self.validate_username_token(&security_block) {
                 Ok(username) => {
-                    ctx.metadata
-                        .insert("soap_ws_username".to_string(), username);
+                    authenticated_username = Some(username);
                     debug!(
                         content_type = %content_type,
                         "soap_ws_security: UsernameToken validated"
                     );
                 }
-                Err(e) => {
-                    warn!("soap_ws_security: UsernameToken validation failed: {}", e);
+                Err(UsernameTokenError::InvalidCredentials) => {
+                    // Generic response + stable failure class: do not log the
+                    // candidate username or password/digest verification detail.
+                    warn!(
+                        failure_class = UsernameTokenError::INVALID_CREDENTIALS_CLASS,
+                        "soap_ws_security: UsernameToken authentication failed"
+                    );
                     return PluginResult::Reject {
                         status_code: 401,
-                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&e)),
+                        body: UsernameTokenError::INVALID_CREDENTIALS_BODY.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                Err(UsernameTokenError::Structural(detail)) => {
+                    warn!(
+                        failure_class = UsernameTokenError::STRUCTURAL_CLASS,
+                        "soap_ws_security: UsernameToken validation failed: {}", detail
+                    );
+                    return PluginResult::Reject {
+                        status_code: 401,
+                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&detail)),
                         headers: HashMap::new(),
                     };
                 }
@@ -1584,10 +1741,7 @@ impl Plugin for SoapWsSecurity {
         if self.saml_enabled {
             match self.validate_saml_assertion(&security_block, envelope, now) {
                 Ok(name_id) => {
-                    if let Some(subject) = name_id {
-                        ctx.metadata
-                            .insert("soap_ws_saml_subject".to_string(), subject);
-                    }
+                    authenticated_saml_subject = name_id;
                     debug!("soap_ws_security: SAML assertion accepted");
                 }
                 Err(e) => {
@@ -1599,6 +1753,15 @@ impl Plugin for SoapWsSecurity {
                     };
                 }
             }
+        }
+
+        if let Some(username) = authenticated_username {
+            ctx.metadata
+                .insert("soap_ws_username".to_string(), username);
+        }
+        if let Some(subject) = authenticated_saml_subject {
+            ctx.metadata
+                .insert("soap_ws_saml_subject".to_string(), subject);
         }
 
         PluginResult::Continue
@@ -2761,6 +2924,506 @@ fn extract_pem_der(pem: &str) -> Option<Vec<u8>> {
 fn contains_forbidden_xml_declaration(xml: &str) -> bool {
     contains_ascii_case_insensitive(xml, "<!doctype")
         || contains_ascii_case_insensitive(xml, "<!entity")
+}
+
+/// Encoding rejection at the SOAP hostile-input boundary.
+///
+/// Messages are stable and body-free so logs/responses never echo credentials
+/// or envelope contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoapBodyDecodeError {
+    UnsupportedCharset,
+    ConflictingCharset,
+    MalformedEncoding,
+}
+
+impl SoapBodyDecodeError {
+    fn status_code(self) -> u16 {
+        match self {
+            Self::UnsupportedCharset | Self::ConflictingCharset => 415,
+            Self::MalformedEncoding => 400,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::UnsupportedCharset => "SOAP request uses an unsupported character encoding",
+            Self::ConflictingCharset => {
+                "SOAP request character encoding metadata is conflicting or ambiguous"
+            }
+            Self::MalformedEncoding => "SOAP request body is not valid for its character encoding",
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Self::UnsupportedCharset => "unsupported_charset",
+            Self::ConflictingCharset => "conflicting_charset",
+            Self::MalformedEncoding => "malformed_encoding",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoapXmlEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl SoapXmlEncoding {
+    fn accepts_xml_decl_label(self, label: &str) -> bool {
+        match self {
+            Self::Utf8 => matches_utf8_label(label),
+            // XML declarations commonly say encoding="UTF-16" without endianness;
+            // the BOM / Content-Type already fixed the endian form.
+            Self::Utf16Le | Self::Utf16Be => {
+                matches_utf16_unspecified_label(label)
+                    || (self == Self::Utf16Le && matches_utf16le_label(label))
+                    || (self == Self::Utf16Be && matches_utf16be_label(label))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredCharset {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    /// `charset=utf-16` without an endian hint — BOM required.
+    Utf16Unspecified,
+}
+
+fn resolve_soap_request_body<'a>(
+    ctx: &'a RequestContext,
+    content_type: &str,
+) -> Result<Option<Cow<'a, str>>, SoapBodyDecodeError> {
+    if let Some(bytes) = ctx.request_body_bytes.as_ref() {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        return decode_soap_xml_body(bytes, content_type).map(Some);
+    }
+    // Fixture-only fallback: production prefers raw bytes. Still enforce the
+    // UTF-8 XML-declaration contract so encoding validation is not bypassed.
+    match ctx.metadata.get("request_body") {
+        Some(body) if body.is_empty() => Ok(None),
+        Some(body) => {
+            validate_xml_declaration_encoding(body, SoapXmlEncoding::Utf8)?;
+            Ok(Some(Cow::Borrowed(body.as_str())))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Decode a buffered SOAP body into UTF-8 text for XML validation.
+///
+/// UTF-8 payloads borrow the wire buffer; UTF-16 payloads allocate a decoded
+/// string. The original wire bytes in `ctx.request_body_bytes` are left
+/// untouched so the backend still receives the client representation.
+fn decode_soap_xml_body<'a>(
+    bytes: &'a [u8],
+    content_type: &str,
+) -> Result<Cow<'a, str>, SoapBodyDecodeError> {
+    let declared = parse_content_type_charset(content_type)?;
+    let (encoding, payload) = resolve_soap_xml_encoding(bytes, declared)?;
+    let decoded = decode_payload(encoding, payload)?;
+    validate_xml_declaration_encoding(&decoded, encoding)?;
+    Ok(decoded)
+}
+
+fn parse_content_type_charset(
+    content_type: &str,
+) -> Result<Option<DeclaredCharset>, SoapBodyDecodeError> {
+    let mut charset = None;
+    let mut rest = skip_content_type_media_type(content_type)?;
+    while let Some((name, value, next)) = next_content_type_parameter(rest)? {
+        rest = next;
+        if !name.eq_ignore_ascii_case("charset") {
+            continue;
+        }
+        if value.is_empty() {
+            return Err(SoapBodyDecodeError::UnsupportedCharset);
+        }
+        if charset.is_some() {
+            // Duplicate charset parameters are hostile/ambiguous metadata.
+            return Err(SoapBodyDecodeError::ConflictingCharset);
+        }
+        charset = Some(normalize_declared_charset(value)?);
+    }
+    Ok(charset)
+}
+
+/// Advance past the media type (`type/subtype`) to the parameter region.
+fn skip_content_type_media_type(content_type: &str) -> Result<&str, SoapBodyDecodeError> {
+    let bytes = content_type.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b';' => return Ok(&content_type[i..]),
+            // Media type tokens are not quoted; a quote here is hostile metadata.
+            b'"' | b'\'' | b'\\' => return Err(SoapBodyDecodeError::ConflictingCharset),
+            _ => i += 1,
+        }
+    }
+    Ok("")
+}
+
+/// Parse the next `name=value` Content-Type parameter.
+///
+/// Parameter values may be tokens or quoted-strings. Semicolons inside a
+/// quoted value do not terminate the parameter. Quoted-pair escapes (`\X`)
+/// are rejected fail-closed — charset labels never require them.
+fn next_content_type_parameter(
+    rest: &str,
+) -> Result<Option<(&str, &str, &str)>, SoapBodyDecodeError> {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b';' || bytes[i].is_ascii_whitespace()) {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return Ok(None);
+    }
+
+    let name_start = i;
+    while i < bytes.len() && bytes[i] != b'=' && bytes[i] != b';' && !bytes[i].is_ascii_whitespace()
+    {
+        i += 1;
+    }
+    if name_start == i {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
+    }
+    let name = &rest[name_start..i];
+
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'=' {
+        // Parameter without a value — ignore and continue after the next ';'.
+        while i < bytes.len() && bytes[i] != b';' {
+            i += 1;
+        }
+        return Ok(Some((name, "", &rest[i..])));
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return Ok(Some((name, "", "")));
+    }
+
+    let (value, after_value) = if bytes[i] == b'"' || bytes[i] == b'\'' {
+        parse_quoted_parameter_value(&rest[i..])?
+    } else {
+        let value_start = i;
+        while i < bytes.len() && bytes[i] != b';' {
+            if matches!(bytes[i], b'"' | b'\'' | b'\\') {
+                return Err(SoapBodyDecodeError::ConflictingCharset);
+            }
+            i += 1;
+        }
+        let raw = rest[value_start..i].trim_end();
+        (raw, &rest[i..])
+    };
+    Ok(Some((name, value, after_value)))
+}
+
+fn parse_quoted_parameter_value(raw: &str) -> Result<(&str, &str), SoapBodyDecodeError> {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
+    }
+    let quote = bytes[0];
+    if quote != b'"' && quote != b'\'' {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                // Quoted-pair escapes are rejected deterministically. Charset
+                // names are plain tokens and never require escaping.
+                return Err(SoapBodyDecodeError::UnsupportedCharset);
+            }
+            b if b == quote => {
+                let inner = &raw[1..i];
+                if inner.is_empty() {
+                    return Err(SoapBodyDecodeError::UnsupportedCharset);
+                }
+                let mut next = i + 1;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if next < bytes.len() && bytes[next] != b';' {
+                    return Err(SoapBodyDecodeError::ConflictingCharset);
+                }
+                return Ok((inner, &raw[next..]));
+            }
+            _ => i += 1,
+        }
+    }
+    Err(SoapBodyDecodeError::ConflictingCharset)
+}
+
+fn normalize_declared_charset(raw: &str) -> Result<DeclaredCharset, SoapBodyDecodeError> {
+    if matches_utf8_label(raw) {
+        Ok(DeclaredCharset::Utf8)
+    } else if matches_utf16le_label(raw) {
+        Ok(DeclaredCharset::Utf16Le)
+    } else if matches_utf16be_label(raw) {
+        Ok(DeclaredCharset::Utf16Be)
+    } else if matches_utf16_unspecified_label(raw) {
+        Ok(DeclaredCharset::Utf16Unspecified)
+    } else {
+        Err(SoapBodyDecodeError::UnsupportedCharset)
+    }
+}
+
+fn matches_utf8_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("utf-8")
+        || label.eq_ignore_ascii_case("utf8")
+        || label.eq_ignore_ascii_case("unicode-1-1-utf-8")
+}
+
+fn matches_utf16le_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("utf-16le") || label.eq_ignore_ascii_case("utf16le")
+}
+
+fn matches_utf16be_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("utf-16be")
+        || label.eq_ignore_ascii_case("utf16be")
+        || label.eq_ignore_ascii_case("unicodefffe")
+}
+
+fn matches_utf16_unspecified_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("utf-16") || label.eq_ignore_ascii_case("utf16")
+}
+
+fn detect_bom(bytes: &[u8]) -> Option<(SoapXmlEncoding, usize)> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Some((SoapXmlEncoding::Utf8, 3))
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        Some((SoapXmlEncoding::Utf16Be, 2))
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        Some((SoapXmlEncoding::Utf16Le, 2))
+    } else {
+        None
+    }
+}
+
+fn resolve_soap_xml_encoding(
+    bytes: &[u8],
+    declared: Option<DeclaredCharset>,
+) -> Result<(SoapXmlEncoding, &[u8]), SoapBodyDecodeError> {
+    let bom = detect_bom(bytes);
+    match (bom, declared) {
+        (Some((encoding, skip)), None) => Ok((encoding, &bytes[skip..])),
+        (Some((encoding, skip)), Some(DeclaredCharset::Utf8)) => {
+            if encoding == SoapXmlEncoding::Utf8 {
+                Ok((encoding, &bytes[skip..]))
+            } else {
+                Err(SoapBodyDecodeError::ConflictingCharset)
+            }
+        }
+        (Some((encoding, skip)), Some(DeclaredCharset::Utf16Le)) => {
+            if encoding == SoapXmlEncoding::Utf16Le {
+                Ok((encoding, &bytes[skip..]))
+            } else {
+                Err(SoapBodyDecodeError::ConflictingCharset)
+            }
+        }
+        (Some((encoding, skip)), Some(DeclaredCharset::Utf16Be)) => {
+            if encoding == SoapXmlEncoding::Utf16Be {
+                Ok((encoding, &bytes[skip..]))
+            } else {
+                Err(SoapBodyDecodeError::ConflictingCharset)
+            }
+        }
+        (Some((encoding, skip)), Some(DeclaredCharset::Utf16Unspecified)) => {
+            if matches!(
+                encoding,
+                SoapXmlEncoding::Utf16Le | SoapXmlEncoding::Utf16Be
+            ) {
+                Ok((encoding, &bytes[skip..]))
+            } else {
+                Err(SoapBodyDecodeError::ConflictingCharset)
+            }
+        }
+        (None, Some(DeclaredCharset::Utf8)) => {
+            if looks_like_bomless_utf16_xml(bytes) {
+                return Err(SoapBodyDecodeError::ConflictingCharset);
+            }
+            Ok((SoapXmlEncoding::Utf8, bytes))
+        }
+        (None, None) => {
+            // BOM-less, charset-less UTF-16 XML (`3c 00` / `00 3c`) is
+            // unmistakable and must not be treated as UTF-8 (NUL-containing
+            // bytes can otherwise pass leniently and be forwarded).
+            if looks_like_bomless_utf16_xml(bytes) {
+                return Err(SoapBodyDecodeError::ConflictingCharset);
+            }
+            Ok((SoapXmlEncoding::Utf8, bytes))
+        }
+        (None, Some(DeclaredCharset::Utf16Le)) => Ok((SoapXmlEncoding::Utf16Le, bytes)),
+        (None, Some(DeclaredCharset::Utf16Be)) => Ok((SoapXmlEncoding::Utf16Be, bytes)),
+        // charset=utf-16 without BOM/endian is ambiguous — fail closed.
+        (None, Some(DeclaredCharset::Utf16Unspecified)) => {
+            Err(SoapBodyDecodeError::ConflictingCharset)
+        }
+    }
+}
+
+/// True when the first code unit is ASCII '<' encoded as UTF-16LE or UTF-16BE
+/// without a BOM (`3c 00 …` / `00 3c …`).
+fn looks_like_bomless_utf16_xml(bytes: &[u8]) -> bool {
+    matches!(bytes, [0x3c, 0x00, ..] | [0x00, 0x3c, ..])
+}
+
+fn decode_payload<'a>(
+    encoding: SoapXmlEncoding,
+    payload: &'a [u8],
+) -> Result<Cow<'a, str>, SoapBodyDecodeError> {
+    match encoding {
+        SoapXmlEncoding::Utf8 => std::str::from_utf8(payload)
+            .map(Cow::Borrowed)
+            .map_err(|_| SoapBodyDecodeError::MalformedEncoding),
+        SoapXmlEncoding::Utf16Le => decode_utf16(payload, false).map(Cow::Owned),
+        SoapXmlEncoding::Utf16Be => decode_utf16(payload, true).map(Cow::Owned),
+    }
+}
+
+/// Incrementally decode UTF-16 into UTF-8 without an intermediate `Vec<u16>`.
+/// Odd length and unpaired / truncated surrogates fail closed.
+fn decode_utf16(payload: &[u8], big_endian: bool) -> Result<String, SoapBodyDecodeError> {
+    if !payload.len().is_multiple_of(2) {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+    // UTF-8 output is at most 3/2 of the UTF-16 wire length (see module note).
+    let mut out = String::with_capacity(payload.len().saturating_mul(3) / 2);
+    let mut chunks = payload.chunks_exact(2);
+    while let Some(pair) = chunks.next() {
+        let unit = if big_endian {
+            u16::from_be_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_le_bytes([pair[0], pair[1]])
+        };
+        if (0xD800..=0xDBFF).contains(&unit) {
+            let Some(low_pair) = chunks.next() else {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            };
+            let low = if big_endian {
+                u16::from_be_bytes([low_pair[0], low_pair[1]])
+            } else {
+                u16::from_le_bytes([low_pair[0], low_pair[1]])
+            };
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            }
+            let code = 0x10000 + (((u32::from(unit) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+            out.push(char::from_u32(code).ok_or(SoapBodyDecodeError::MalformedEncoding)?);
+        } else if (0xDC00..=0xDFFF).contains(&unit) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        } else {
+            // Non-surrogate BMP units are always valid scalar values.
+            let ch =
+                char::from_u32(u32::from(unit)).ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+            out.push(ch);
+        }
+    }
+    Ok(out)
+}
+
+fn validate_xml_declaration_encoding(
+    xml: &str,
+    resolved: SoapXmlEncoding,
+) -> Result<(), SoapBodyDecodeError> {
+    let trimmed = xml.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+    let bytes = trimmed.as_bytes();
+    if !bytes.starts_with(b"<?xml") || !bytes.get(5).is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        return Ok(());
+    }
+    let Some(end) = trimmed.find("?>") else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    };
+    let decl = &trimmed[..end + 2];
+    let Some(label) = extract_xml_decl_encoding(decl)? else {
+        return Ok(());
+    };
+    if resolved.accepts_xml_decl_label(&label) {
+        Ok(())
+    } else if matches_utf8_label(&label)
+        || matches_utf16le_label(&label)
+        || matches_utf16be_label(&label)
+        || matches_utf16_unspecified_label(&label)
+    {
+        Err(SoapBodyDecodeError::ConflictingCharset)
+    } else {
+        // Unknown declaration encodings (e.g. iso-8859-1) are unsupported.
+        Err(SoapBodyDecodeError::UnsupportedCharset)
+    }
+}
+
+fn extract_xml_decl_encoding(decl: &str) -> Result<Option<String>, SoapBodyDecodeError> {
+    let Some(mut rest) = decl.strip_prefix("<?xml") else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    };
+    rest = rest
+        .strip_suffix("?>")
+        .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+
+    let mut encoding = None;
+    while !rest.trim_start().is_empty() {
+        rest = rest.trim_start();
+        let name_len = rest
+            .bytes()
+            .take_while(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-' | b'.')
+            })
+            .count();
+        if name_len == 0 {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        let (name, after_name) = rest.split_at(name_len);
+        rest = after_name.trim_start();
+        rest = rest
+            .strip_prefix('=')
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?
+            .trim_start();
+        let quote = rest
+            .chars()
+            .next()
+            .filter(|quote| matches!(quote, '"' | '\''))
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        rest = &rest[quote.len_utf8()..];
+        let end = rest
+            .find(quote)
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        let value = &rest[..end];
+        rest = &rest[end + quote.len_utf8()..];
+
+        if name.eq_ignore_ascii_case("encoding") {
+            if encoding.is_some() || value.trim().is_empty() {
+                return Err(SoapBodyDecodeError::ConflictingCharset);
+            }
+            encoding = Some(value.trim().to_string());
+        }
+    }
+    Ok(encoding)
+}
+
+// Reached only via the lib target's `_test_support` shim (external unit tests).
+#[allow(dead_code)]
+pub(crate) fn decode_soap_xml_body_for_test(
+    bytes: &[u8],
+    content_type: &str,
+) -> Result<String, String> {
+    decode_soap_xml_body(bytes, content_type)
+        .map(Cow::into_owned)
+        .map_err(|err| err.message().to_string())
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {

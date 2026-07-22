@@ -86,6 +86,12 @@ pub const AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS: &[&str] = &[
     "semantic_embedding_timeout_ms",
 ];
 
+/// Suffix appended to `FERRUM_NAMESPACE` when `redis_key_prefix` is omitted.
+///
+/// The full runtime default is `{FERRUM_NAMESPACE}:ai_cache` (for example
+/// `ferrum:ai_cache` when the namespace is `ferrum`).
+pub const AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX: &str = "ai_cache";
+
 /// Every accepted top-level `ai_semantic_cache` configuration property.
 ///
 /// Union of root retention/isolation/size keys, semantic-policy keys, and the
@@ -172,6 +178,9 @@ struct CachedResponse {
 struct SemanticConfig {
     provider: EmbeddingProvider,
     endpoint: String,
+    /// Lowercased domain hostname used for DNS pre-warming, or `None` when
+    /// the endpoint uses a literal IP and requires no DNS lookup.
+    warmup_hostname: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
     auth_header: String,
@@ -2059,11 +2068,23 @@ impl Plugin for AiSemanticCache {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        if let Some(ref redis) = self.redis_client {
-            redis.warmup_hostname().into_iter().collect()
-        } else {
-            Vec::new()
+        let mut hosts = Vec::new();
+        if let Some(hostname) = self
+            .semantic
+            .as_ref()
+            .and_then(|semantic| semantic.warmup_hostname.as_ref())
+        {
+            hosts.push(hostname.clone());
         }
+        if let Some(ref redis) = self.redis_client
+            && let Some(hostname) = redis
+                .warmup_hostname()
+                .map(|hostname| hostname.to_ascii_lowercase())
+            && !hosts.contains(&hostname)
+        {
+            hosts.push(hostname);
+        }
+        hosts
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
@@ -2194,11 +2215,12 @@ fn parse_semantic_config(
         "ai_semantic_cache: 'semantic_embedding_endpoint' is required when semantic_similarity_enabled=true"
             .to_string()
     })?;
-    validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
+    let warmup_hostname = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
 
     Ok(Some(SemanticConfig {
         provider,
         endpoint,
+        warmup_hostname,
         model,
         api_key,
         auth_header,
@@ -2214,7 +2236,7 @@ fn parse_semantic_config(
 fn validate_semantic_embedding_endpoint(
     endpoint: &str,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let parsed_endpoint = url::Url::parse(endpoint)
         .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
     if !matches!(parsed_endpoint.scheme(), "http" | "https") {
@@ -2227,10 +2249,10 @@ fn validate_semantic_embedding_endpoint(
         "ai_semantic_cache: 'semantic_embedding_endpoint' must include a host".to_string()
     })?;
 
-    let literal_ip = match host {
-        Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
-        Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
-        Host::Domain(_) => None,
+    let (literal_ip, warmup_hostname) = match host {
+        Host::Ipv4(ip) => (Some(std::net::IpAddr::V4(ip)), None),
+        Host::Ipv6(ip) => (Some(std::net::IpAddr::V6(ip)), None),
+        Host::Domain(hostname) => (None, Some(hostname.to_ascii_lowercase())),
     };
 
     if let Some(ip) = literal_ip
@@ -2241,13 +2263,16 @@ fn validate_semantic_embedding_endpoint(
         ));
     }
 
-    Ok(())
+    Ok(warmup_hostname)
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
-    let mut prefix = String::with_capacity(namespace.len() + 9);
+    let mut prefix = String::with_capacity(
+        namespace.len() + 1 + AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX.len(),
+    );
     prefix.push_str(namespace);
-    prefix.push_str(":ai_cache");
+    prefix.push(':');
+    prefix.push_str(AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX);
     prefix
 }
 
@@ -2563,6 +2588,7 @@ mod tests {
         SemanticConfig {
             provider,
             endpoint: "http://127.0.0.1:1/embeddings".to_string(),
+            warmup_hostname: None,
             model: Some("test-embedding-model".to_string()),
             api_key: Some("test-key".to_string()),
             auth_header: provider.default_auth_header().to_string(),

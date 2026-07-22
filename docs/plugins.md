@@ -1047,7 +1047,29 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
 }
 ```
 
-Rejected requests have `backend_target: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
+Gateway admission rejections that occur before backend selection, including
+`allowed_methods`, have `backend_target: null`. Other rejection summaries may
+retain the matched proxy's configured target for attribution, but backend
+latency fields remain `-1.0`; a configured target in such a record is not proof
+that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
+phase or gateway admission gate that rejected the request. Possible values
+include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+`grpc_backend_error`, and `websocket_backend_error`. Gateway-generated gRPC
+errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
+sinks can distinguish gRPC failures even though the downstream HTTP status is
+`200`.
+
+##### Pre-plugin routing and method failures in transaction logs
+
+Terminal transaction logging is independent of ordinary request hooks:
+
+| Outcome | Status | Transaction log | Ordinary request hooks (`on_request_received`, auth, transform, mirror, …) |
+| --- | --- | --- | --- |
+| Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
+| Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
+| Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
+
+H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
 
 #### Example: TCP Stream
 
@@ -1386,15 +1408,20 @@ or an auth proxy that injects the `Authorization: Bearer <token>` header.
 ### `api_chargeback_sink`
 
 Exports durable charge events or snapshot deltas to ClickHouse using the same
-pricing blocks as `api_chargeback`. It supports per-event mode for
-transaction-level provenance, snapshot mode for lower ingest volume, an on-disk
-spool for ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics
-under `/metrics`. See [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md)
-for DDL, configuration, spool sizing, replay, and reconciliation guidance.
-Ordinary HTTP is priced by wire status. Native gRPC and translated gRPC-Web use
-the same canonical effective-status mapping documented for `api_chargeback`;
-durable events retain the billable `status_code`, raw `http_status_code`, and
-normalized final `grpc_status` as separate fields.
+pricing blocks as `api_chargeback`. Config is required: `clickhouse.url` plus
+at least one nonempty pricing dimension (`pricing_tiers`, `bandwidth_pricing`,
+or `stream_connection_pricing` with `PricingConfig::has_any_pricing`
+semantics). It supports per-event mode for transaction-level provenance,
+snapshot mode for lower ingest volume (requires `spool.enabled=true`), an
+on-disk spool for ClickHouse outages, `GET /charges/sink/status`, and
+Prometheus metrics under `/metrics`. See
+[plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
+configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
+reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
+persistent storage. Ordinary HTTP is priced by wire status. Native gRPC and
+translated gRPC-Web use the same canonical effective-status mapping documented
+for `api_chargeback`; durable events retain the billable `status_code`, raw
+`http_status_code`, and normalized final `grpc_status` as separate fields.
 
 **Priority:** 9351
 
@@ -1881,7 +1908,7 @@ Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP 
 
 Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, SAML 2.0 assertion validation with XMLDSIG signature verification, timestamp freshness checks, and nonce replay protection.
 
-The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) and parses the `wsse:Security` header from the SOAP envelope. Non-SOAP requests pass through untouched.
+The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) as raw bytes and decodes supported XML character encodings before parsing the `wsse:Security` header. Supported encodings are UTF-8 and UTF-16 (little- and big-endian). Encoding is resolved from an optional BOM and the `Content-Type` `charset` parameter; a BOM, charset, and XML declaration must agree, `charset=utf-16` without an endian BOM is rejected as ambiguous, and malformed or truncated byte sequences fail closed. Unsupported charsets return HTTP `415`; conflicting or malformed encodings return HTTP `415`/`400` respectively. Diagnostics never log the request body or credentials. The original wire bytes are forwarded unchanged to the backend so signature and representation semantics stay intact. Non-SOAP requests pass through untouched.
 
 > **XMLDSIG canonicalization support.** Both the WS-Security X.509 and SAML signature paths apply Exclusive XML Canonicalization (`xml-exc-c14n#`) to `<SignedInfo>` and referenced elements, including `InclusiveNamespaces PrefixList`. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n. Unsupported canonicalization or transform algorithms fail closed; inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
 
@@ -1913,6 +1940,8 @@ The plugin buffers request bodies with SOAP content types (`text/xml`, `applicat
 | `nonce.max_cache_size` | u64 | `10000` | Maximum nonce cache entries before eviction sweep |
 
 At least one security feature must be enabled (`timestamp.require`, `username_token`, `x509_signature`, or `saml`).
+
+UsernameToken credential failures (unknown username, wrong PasswordText, or wrong PasswordDigest) return the same HTTP `401` status, headers, and generic body (`{"error":"WS-Security: invalid credentials"}`). Client responses and warning logs do not include the supplied username or password/digest verification detail; operational telemetry uses the stable failure class `username_token_invalid_credentials`. Lookup misses still execute PasswordText or PasswordDigest verification against process-local dummy material so work is equalized with known principals. Structural token or policy failures (missing elements, password-type mismatch, nonce replay) remain distinct. Apply an authentication rate-limit policy as defense in depth against online guessing.
 
 #### UsernameToken — PasswordDigest
 
@@ -2378,7 +2407,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:rate_limiting` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
@@ -2770,7 +2799,17 @@ Returns configurable mock responses without proxying to the backend. Supports ma
 
 **Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family (HTTP, gRPC, WebSocket handshake)
 
-Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be in range 100–599. Runtime construction is the authoritative final boundary.
+Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599` or `101` (synthetic WebSocket handshake only). Other informational statuses (`100`, `102`–`199`) are rejected — a mock cannot emit a 1xx as a body-bearing final response. A configured `101` that matches an ordinary HTTP request fails closed with `500`; only a request already classified as a WebSocket handshake may receive it. Runtime construction and request-flavor enforcement are the authoritative final boundaries.
+
+**Status / body wire semantics (H1, H2, and H3):** A configured `body` is the representation the mock would return for a GET. Shared synthetic-response finalization then aligns every frontend:
+
+| Request / status | Wire body | `Content-Length` |
+|---|---|---|
+| `HEAD` with a body-capable status (not 204/205/304) | Omitted (no DATA / no payload) | Representation length (same as the GET body would have been) |
+| `204` / `205` / `304` (any method) | Omitted | Stripped, even when `body` is configured non-empty |
+| Other final statuses on GET/POST/… | Configured `body` | Unchanged unless a later hook sets it |
+
+gRPC and WebSocket frame streams are unchanged: gRPC rejects still normalize to trailers-only errors, and a matching WebSocket rule still short-circuits only the HTTP handshake.
 
 **Path matching by listen-path scope:**
 
@@ -2877,7 +2916,7 @@ Modifies request headers, query parameters, and JSON body fields before proxying
 config:
   rules:
     - operation: add       # add, remove, update, rename
-      target: header       # header, query, body (default: header)
+      target: header       # required: header, query, or body
       key: "X-Custom"
       value: "my-value"
     - operation: rename
@@ -2895,6 +2934,10 @@ config:
       target: body
       key: "meta.weird\\.key"     # \. = literal dot in a key
       value: "escaped"
+    - operation: add
+      target: body
+      key: "enabled"
+      value: true                 # native JSON types / null are valid for body
 ```
 
 **Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API), fail startup in file mode, or reject the new DB/CP reload snapshot while the gateway keeps serving the prior good config:
@@ -2906,7 +2949,7 @@ config:
 | `remove` | `key` | No-op if the field is absent. |
 | `rename` | `key`, `new_key` | `old → new`; if the destination path is unreachable, the value is restored at the old path (no data loss). Array indices (numeric segments) are rejected at plugin load time in `key` or `new_key` — see note below. |
 
-**Valid `target` values:** `header`, `query`, `body`. Omitted `target` defaults to `header`. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings.
+**Valid `target` values:** `header`, `query`, `body`. `target` is required on every rule — there is no default. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings. Header and query `value` must be strings; body `value` accepts any JSON type including explicit `null` (see below).
 
 **Header value constraints:** header `value` must not contain CR (`\r`) or LF (`\n`) — rejected at plugin load time as defence against header injection.
 
@@ -2914,7 +2957,7 @@ config:
 - **Nested objects** — `user.address.city`.
 - **Array indexing** — numeric segments index into arrays: `items.0.name`. Arrays are not auto-grown; out-of-bounds indices fail silently at request time (the rule is skipped for that request).
 - **Literal dots in keys** — escape with `\.`: `meta.weird\.key` targets a key literally named `weird.key`.
-- **Typed values** — string values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
+- **Typed values** — native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
 
 **`rename` does not support array indices in `key` or `new_key`.** Array mutation is ambiguous for rename (move? swap? overwrite?) and would risk data loss — `Vec::remove` shifts elements leftward, so a `rename("items.0" → "items.1")` on `["A","B","C"]` would silently drop `"C"`. Configs with numeric segments in a rename path are rejected at plugin load time. To relocate elements within an array, use `remove` followed by `add`. Escaped numeric segments (`counts\.0` — a literal key named `counts.0`) are still accepted.
 
@@ -2932,6 +2975,7 @@ Modifies response headers and JSON body fields before sending to the client. Whe
 config:
   rules:
     - operation: add
+      target: header             # required: header or body
       key: "X-Powered-By"
       value: "Ferrum-Gateway"
     - operation: rename
@@ -2941,15 +2985,19 @@ config:
     - operation: remove
       target: body
       key: "items.0"              # numeric segment removes an array element
+    - operation: add
+      target: body
+      key: "enabled"
+      value: true                 # native JSON types / null are valid for body
 ```
 
-Header rules default to `target: header` (no `target` field required). Body rules require explicit `target: body`.
+`target` is required on every rule — there is no default. Header rules must set `target: header`; body rules must set `target: body`.
 
 **Valid targets for `response_transformer` are `header` and `body` ONLY** — unlike `request_transformer`, there is no `query` target (query parameters are part of the request, not the response). Configs specifying `target: query` are rejected at plugin load time.
 
-**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected (no silent coercion).
+**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
 
-Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
+Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
 ### `security_headers`
 
@@ -3018,7 +3066,7 @@ config:
 
 ### `compression`
 
-On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3). Supports gzip and brotli.
+On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3), including the `identity` (uncoded) representation. Supports gzip and brotli.
 
 **Priority:** 4050
 
@@ -3032,7 +3080,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
 | `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
-| `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, 1=fastest, 9=best) |
+| `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
 
 **Request decompression** (opt-in):
@@ -3044,20 +3092,24 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 **Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
 
+**Content-type matching:** The whitelist is matched as an exact media-type token: the response `Content-Type` is split on the first semicolon, the token is trimmed, and compared ASCII case-insensitively against each configured entry. Parameters (e.g. `; charset=utf-8`) are ignored, so `application/json; charset=utf-8` matches `application/json`. Substring matching is intentionally avoided, so lexical near-misses such as `application/jsonp` or `application/json-patch-binary` do **not** match `application/json`, and parameter-only occurrences such as `application/octet-stream; profile="application/json"` do **not** match `application/json`. An empty or malformed media-type token fails closed (no match).
+
 **Response compression skip conditions** (checked in order):
 1. Response status is 204 or 304
 2. Request has `Cache-Control: no-transform` (skips gateway response compression only)
-3. Response is a range response (`206`, `Content-Range`, or an internal range marker)
+3. Response is a range response (`206`, `Content-Range`, or an internal range marker) — compression is skipped; identity acceptability still applies (406 when identity is unacceptable)
 4. Response has `Cache-Control: no-transform`
 5. Response already has `Content-Encoding` (no double-compression)
 6. Response has a strong `ETag` validator. Weak validators (`W/"..."`) remain eligible for compression
 7. Response `Content-Type` is not in the whitelist
 8. Response `Content-Length` is below `min_content_length`
-9. Client did not send `Accept-Encoding` with a supported algorithm
+9. Client did not send `Accept-Encoding` with a supported algorithm, or the `identity` (uncoded) representation is the most preferred acceptable one
+
+**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; a nonzero wildcard (`*;q=0.3`) does **not** lower that default identity quality — the wildcard assigns quality only to unlisted configured algorithms. Explicit algorithm and `identity` entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Only a well-formed `q=0` weight can forbid identity: a malformed qvalue on an `identity` or `*` entry is ignored rather than read as a refusal. When the client refuses identity and no acceptable coded representation is available — including when a configured algorithm would otherwise win but the response cannot be encoded because of content-type / `min_content_length` eligibility, `no-transform`, a strong `ETag`, or because the response is an identity range/delta (`206`/`226`, `Content-Range`, or the internal range marker) — the plugin rejects with `406 Not Acceptable` (`Vary: Accept-Encoding`) and does not commit compression headers or body transforms. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable) rather than protocol hard skips. No-body statuses (`204`/`205`/`304`) and responses that already carry `Content-Encoding` remain protocol hard skips and are left unchanged. On the synthetic reject path, fail-closed 406 replacement is scoped to `response_caching` HITs of identity variants (including legacy identity responses that omit `Vary: Accept-Encoding` per #2355) so a cache hit cannot bypass negotiation; unrelated auth/policy rejection statuses are not replaced.
 
 **Behavior:**
 - Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
-- Adds `Vary: Accept-Encoding` to compressed responses for cache correctness
+- Adds `Vary: Accept-Encoding` to eligible identity/default responses as well as gzip/Brotli responses whenever `Accept-Encoding` can select a different representation, so shared caches (including `response_caching`) do not replay an unvaried identity body for a later client that prefers or requires a coded variant. Existing `Vary` members are preserved and case-insensitively de-duplicated; an existing `Vary: *` is left unchanged. Permanently ineligible statuses/content/transforms (for example `204`/`304`, non-whitelisted `Content-Type`, below `min_content_length`, `no-transform`, strong `ETag`, or identity range/delta) do not nominate the field
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - Forces response body buffering on proxies where this plugin is enabled
 - When `decompress_request` is enabled, supported gzip/brotli request bodies are decoded before final request-body hooks and the forwarded request has `Content-Encoding` and `Content-Length` removed
@@ -3222,18 +3274,21 @@ representations explicitly outside the configured response-body scan scope.
 | `name` | string | `id` | Human-readable rule name. |
 | `category` | string | required | Category label, such as `sqli`, `xss`, or `custom`. |
 | `severity` | string | `medium` | `info`, `low`, `medium`, `high`, or `critical`. |
-| `target` | string/object | required | Scan target. Object targets support `type`, optional non-empty `names` only for request header values, and `path` only for JSON-path body rules. |
+| `target` | string/object | required | Scan target. Strings cover every target except `body_json_path` (object-only). Object form uses `type`; optional non-empty `names` only for `header_values`/`request_headers`; required non-empty `path` only for `body_json_path`. Aliases `request_headers`, `request_query`, `request_path`, `request_url`, `request_method`, and `request_body` are accepted. |
 | `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. |
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`; `~regex` entries are wrapped as `^(?:regex)`, so use `~.*pattern` for a floating substring match. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
-Supported targets: `header_names`, `header_values`, `query_keys`,
-`query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
-`body_json_path`, `response_headers`, and `response_body`.
+Supported targets: `header_names`, `header_values` (optional non-empty
+`names`), `query_keys`, `query_values`, `cookies`, `url_path`, `full_url`,
+`method`, `body_text`, `body_json_path` (object with required non-empty
+`path`), `response_headers`, and `response_body`. Aliases:
+`request_headers`, `request_query`, `request_path`, `request_url`,
+`request_method`, `request_body`.
 
 CIDR rules on free-form body text are heuristic token scans. They are useful
 for tightly scoped private-address leakage checks, but broad response-body CIDR
@@ -3243,9 +3298,10 @@ rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are
 prefix matches; entries starting with `~` are start-anchored regex patterns
-wrapped as `^(?:regex)`; all other entries are exact-path matches (so `/health`
-exempts only `/health`, not `/healthz` or `/health-admin`). Use `~.*pattern`
-for a floating substring match.
+wrapped as `^(?:regex)` (unlike unanchored per-rule `conditions.paths`); all
+other entries are exact-path matches (so `/health` exempts only `/health`, not
+`/healthz` or `/health-admin`). Use `~.*pattern` for a floating substring match
+under these start-anchored exemption semantics.
 
 ```yaml
 config:
@@ -3315,8 +3371,9 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
 | `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields |
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor |
+| `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Maximum decompressed gRPC protobuf payload size for both request and response validation. `0` disables the decompressed cap. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer; otherwise falls back to 10 MiB (10485760). |
 
-**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly.
+**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`.
 
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
@@ -3385,7 +3442,7 @@ Enforces per-proxy response body size limits. Rejects with HTTP 502.
 | `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent. Adds memory overhead — only enable when needed. |
 
 Enforcement happens in two places:
-- `after_proxy` rejects oversized `Content-Length` response headers via the fast path (no body buffering required).
+- `after_proxy` rejects oversized `Content-Length` via the fast path when the response can transfer a body (no body buffering required). Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a representation `Content-Length` while transferring zero body bytes and are not rejected on that declaration alone; body-bearing responses (including `206`) keep exact-boundary enforcement (`Content-Length == max_bytes` passes).
 - `on_final_response_body` re-checks the final post-transform body when buffering is active (either via `require_buffered_check: true` or because another plugin requires response buffering).
 
 For streaming responses without `Content-Length` where buffering is disabled, the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies via the gateway's `SizeLimitedStreamingResponse` adapter (frame-by-frame enforcement, no buffering).
@@ -3424,6 +3481,7 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | `invalidate_on_unsafe_methods` | bool | `true` | Invalidate cached entries for the same path prefix on non-cacheable methods such as `POST`, `PUT`, `PATCH`, and `DELETE` |
 
 Behavior:
+- Multiple `response_caching` instances on one proxy each receive a process-unique runtime staging id. Request metadata for base key, status, predictor key, request timing, and header snapshot is namespaced as `response_caching.<instance_id>.*`, so sibling instances with different query, consumer, Vary, method, SSE, or status policies cannot overwrite one another's staged inputs. Bypass, HIT, and REVALIDATED paths clear only the current instance's lookup staging. Reload reconstructions mint a new id and never read or clear a retired generation's namespaced keys.
 - The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
 - Freshness uses the response's corrected initial age plus cache residency time. Backend `Age` and valid `Date` headers are incorporated, `s-maxage` takes precedence over `max-age`, and cache hits replace any stored `Age` value with the current age.
@@ -3448,15 +3506,22 @@ Behavior:
 **Cacheability predictor**: The plugin maintains a bounded LRU of cache-key variants that were observed to be uncacheable (e.g., responses with `Set-Cookie`, `Cache-Control: no-store`, `private`, or non-cacheable status codes). Subsequent requests for those same variants short-circuit the cache lookup with `X-Cache-Status: PREDICTED-BYPASS`, avoiding the `DashMap` read on the hot path. The predictor is keyed on the *full* cache key (including Vary dimensions), so an uncacheable variant for one `Accept-Encoding` value does not suppress lookups for other variants. When a previously uncacheable variant becomes cacheable (e.g., the backend stops sending `Set-Cookie`), the predictor clears the entry on the next successful insert.
 
 Compression note:
-- The `compression` plugin (priority 4050) can generate gzip or brotli responses at the gateway. When both `response_caching` and `compression` are enabled on the same proxy, the cache stores the uncompressed backend response (since `response_caching` at 3500 runs before `compression` at 4050). Compression is applied after cache retrieval, so cached responses are compressed on each cache hit.
+- The `compression` plugin (priority 4050) generates gzip or brotli responses at the gateway during the response-body transform phase. `response_caching` stores the body in `on_final_response_body`, which runs **after** all response-body transforms — so the cache stores the final encoded representation (e.g. gzip bytes with `Content-Encoding: gzip`), not the uncompressed backend response. A cache `HIT` replays those stored bytes and headers directly via `RejectBinary` from `response_caching::before_proxy` (priority 3500), which short-circuits before `compression::before_proxy` (priority 4050) can run; the stored `Content-Encoding` is honored and no second compression pass occurs.
+- Cache variants are keyed by the full Vary dimensions, including `Accept-Encoding` when present, so a gzip variant and an identity variant are stored and served independently.
+- Changing `compression` settings (e.g. `gzip_level`, `brotli_quality`, or `algorithms`) does **not** rewrite existing cache entries: the store path only runs on a `MISS`, and a `HIT` replays the previously stored encoded representation regardless of current compression configuration.
+- Size limits and accounting use the stored encoded representation: `max_entry_size_bytes` compares the final encoded body length, while `max_total_size_bytes` and per-entry accounting use the entry's approximate footprint (that encoded body, stored headers, and fixed structural overhead).
 - Without the `compression` plugin, the gateway forwards backend `Content-Encoding` as-is and caches compressed variants correctly when the origin sends the matching `Vary` header.
 - The `body_validator` plugin decompresses gzip-compressed gRPC frames for protobuf validation, but this is internal to the validation path and does not affect the cached or forwarded body.
+
+Stored/hit `Content-Encoding`, body bytes, and `Vary: Accept-Encoding` keying are asserted by `test_backend_vary_accept_encoding_caches_binary_variant` in `tests/unit/plugins/response_caching_tests.rs`. Identity-first shared-cache population order (then gzip/Brotli, including `identity;q=0`) and H1/H2/H3 `after_proxy` chokepoint coverage live in `tests/unit/plugins/compression_tests.rs` (`test_identity_default_nominates_vary_accept_encoding`, `test_shared_cache_identity_first_then_gzip_brotli_variants`, `test_h1_h2_h3_paths_reach_shared_after_proxy_chokepoint`). The cache-hit short-circuit and preservation of the stored representation through compression's rejection-finalization boundary are covered by `test_response_cache_hit_cannot_bypass_required_406` and `test_response_cache_hit_preserves_identity_when_acceptable`.
 
 ### `graphql`
 
 GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-operation rate limiting.
 
-Request buffering is only enabled when at least one GraphQL policy is configured and the incoming request is a JSON `POST`.
+Request buffering is only enabled when at least one GraphQL policy is configured and the incoming request is a JSON `POST`. The inspectable transport is POST with a JSON content type and a JSON object body containing a non-empty string `query`. Other HTTP representations fail closed with HTTP 400 GraphQL-style JSON errors: GraphQL GET (`?query=`), GraphQL-over-SSE GET, raw `application/graphql`, JSON batch arrays, automatic persisted query (APQ) hash-only envelopes, multipart `operations`, and missing/unparseable bodies.
+
+**Protocols:** HTTP and WebSocket. On WebSocket proxies the plugin runs during the HTTP upgrade handshake and rejects the GET upgrade so uninspectable GraphQL-over-WebSocket frames are never admitted. It does not inspect WebSocket frames after upgrade. gRPC, TCP, and UDP are unsupported.
 
 **Priority:** 2850
 
@@ -3474,7 +3539,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"`. Must be non-empty when set. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1) |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds (must be ≥ 1) |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be ≥ 1). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be ≥ 1) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
@@ -3513,14 +3578,31 @@ Supports both encoding modes:
 - **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
 - **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
 
-On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. On the response path, `grpc_web` embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
+Message-format suffixes (`+proto`, `+json`, `+thrift`, or another valid custom `+subtype`) are preserved on the negotiated response `Content-Type`.
+
+On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. Request-body decoding mode follows request `Content-Type` only.
+
+On the response path, `grpc_web` embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, binary `*-bin` metadata, and valid ASCII custom trailing metadata such as `request-id` — as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` to the **negotiated** gRPC-Web variant. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and initial response headers are not copied into the trailer block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name.
+
+**Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
+
+- Absent or empty `Accept` defaults to the request `Content-Type`'s mode and message-format suffix.
+- Lists, parameters, quality values (`q=`), and wildcards (`*/*`, `application/*`) are honored; more specific entries override wildcards, and an explicit `q=0` refusal is not revived by `*`.
+- `Accept` selects binary versus text encoding but does not transcode message payloads. An exact media range with a different `+proto` / `+json` / `+thrift` / custom suffix is ineligible; the negotiated response preserves the request's effective message format (a missing suffix means `+proto`).
+- A present `Accept` that is structurally malformed, or that refuses every gRPC-Web representation the gateway can produce, fails closed with HTTP `406 Not Acceptable`.
+- Translated responses and gateway-generated gRPC-Web errors emit `Vary: Accept` (merged with any existing `Vary` value) so shared caches cannot mix binary, text, or message-format variants.
+- When `Accept` selects text while `Content-Type` is binary (or the reverse), request decoding and response encoding stay independent.
+
+**Malformed / non-gRPC backend responses:** When the backend or an intermediary returns a response without a present, numeric `grpc-status` (empty or non-numeric values count as absent), `grpc_web` synthesizes the trailer `grpc-status` from the official HTTP-to-gRPC client mapping ([http-grpc-status-mapping.md](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md)): `400→INTERNAL(13)`, `401→UNAUTHENTICATED(16)`, `403→PERMISSION_DENIED(7)`, `404→UNIMPLEMENTED(12)`, `429/502/503/504→UNAVAILABLE(14)`, and every other HTTP status (including `200`) → `UNKNOWN(2)`. A valid supplied `grpc-status` remains authoritative and is never overridden by the HTTP status. Existing `grpc-message` / `grpc-status-details-bin` metadata is preserved when present; synthesis does not invent a message. The client-visible HTTP status is left unchanged on this path (Ferrum does not force HTTP `200` for translated gRPC-Web backend responses), so wire observers still see the backend/intermediary HTTP failure while gRPC-Web clients read the mapped code from the body trailer frame.
+
+**Multiple instances:** A proxy may carry several `grpc_web` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Body translation is not idempotent, so the first effective instance in configured order claims request-scoped ownership and performs content-type rewrite, text-mode request decode, response trailer-frame embedding, and text-mode base64 encode exactly once. Sibling instances keep namespaced per-instance staging and contribute only their `expose_headers` union into `Access-Control-Expose-Headers`. Missing or malformed owner staging fails closed (no second claim, no speculative body rewrite). Reload snapshots remain atomic: an in-flight request sees one plugin generation end-to-end on H1, H2, and H3.
 
 **Priority:** 260 (runs before `grpc_method_router` at 275)
 **Protocols:** HTTP, gRPC
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `expose_headers` | String[] | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. |
+| `expose_headers` | String[] | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. When multiple `grpc_web` instances are effective, their lists are unioned in configured order. |
 
 Config must be a JSON/YAML object whose only accepted key is `expose_headers`. Empty `{}` is valid and uses defaults. Explicit top-level `null`, arrays, strings, numbers, and booleans are rejected with `grpc_web: config must be an object` — `null` is not an alias for `{}`. Unknown or misspelled keys (for example `expose_header`) are rejected with path-qualified diagnostics and spelling suggestions. The shared constructor enforces this for admin API, file mode, database/CP validation, and DP snapshot application; a rejected reload keeps the last-known-good plugin generation (`KeepLastKnownGood`).
 
@@ -3550,7 +3632,7 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router` | Redis key namespace prefix. Defaults to `ferrum:grpc_method_router` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
@@ -3637,7 +3719,7 @@ Mirror response metadata (status code, response size, latency) is logged as a se
 | `mirror_host` | String | **(required)** | Hostname or IP of the mirror target |
 | `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
 | `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
-| `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
+| `mirror_path` | String | _(none)_ | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
 | `max_response_body_bytes` | Integer | `1048576` | Cap on bytes read from a mirror response when sizing it. Only consulted when the response has no `content-length` header — streaming aborts as soon as the limit is crossed and the truncated count is recorded. The mirror task discards the bytes after sizing, so this only bounds memory pressure from a misbehaving mirror endpoint streaming an unbounded body to a fire-and-forget task. Default is 1 MiB |
@@ -3651,6 +3733,10 @@ enforcement. This prevents a rewritten, unauthorized client method from being
 replayed to the shadow destination. An explicit `mirror_path` remains an
 operator override, and proxies without backend-path policy retain the original
 request path default.
+
+**Outbound header boundary:** Mirror requests reuse Ferrum's canonical secondary-request sanitizer (the same backend-request strip predicates as primary dispatch — secondary builders call those predicates directly, so new strip arms are honored automatically). The filter snapshots RFC 9110 `Connection`-listed tokens before removing `Connection`, strips hop-by-hop / framing / `Trailer` / Ferrum request-only markers (`x-ferrum-original-content-encoding`, `x-grpc-web-mode`), drops client-supplied proxy-owned forwarding identity (`X-Forwarded-*`), and omits client `Host` so reqwest derives authority from the mirror URL. Forwarding identity is not regenerated for mirror traffic, so the mirror receives no Ferrum-authored `X-Forwarded-*` fields; this intentionally favors the off-mesh privacy/trust boundary over primary-vs-shadow identity-header parity. Reserved load-testing control headers are excluded defensively. On native gRPC mirrors (`application/grpc`, `application/grpc+…`, or parameters — not prefix-smuggled types such as `application/grpcfoo` / `application/grpc-web`), `te: trailers` is re-synthesised after the generic strip. Native gRPC mirror targets must support HTTP/2; HTTP/1.1 is not a supported native-gRPC mirror transport.
+
+**Query fidelity:** The mirror request-target prefers the original raw query string after the same auth credential strips primary dispatch applies (`auth.strip_query_param.*`), preserving repeated pairs, pair order, flag and empty parameters, `+`, encoded delimiters, percent escapes, and non-ASCII encoded bytes. The materialised single-value `query_params` map is used only when no raw query is available. Decoded `request_transformer` query-map mutations are not re-serialized onto the mirror URL, matching primary backend URL construction.
 
 ```yaml
 plugin_name: request_mirror
@@ -3678,7 +3764,7 @@ For multi-node deployments, `gateway_addresses` fans out once from the originati
 
 For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. A resolved gateway port of `0` (Ferrum's disabled-listener sentinel from `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`) is rejected at admission. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
 
-**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the exact buffered bytes for every accepted method that supplied a body (including DELETE/OPTIONS/extension methods — never silently rewritten to GET). Replay bodies have a hard 10 MiB plugin-local ceiling even when the global request-body limit is unlimited, and active local/fan-out replay work shares a 64 MiB process-wide retained-body budget; the strictest applicable limit wins. The original raw query string is preserved on every synthetic and fan-out request. Decoded query-map transforms are deliberately not serialized into the replay: the synthetic request re-enters the ordinary plugin pipeline, so configured query transforms apply exactly once without losing duplicate pairs or encoding. Requests with no key or a wrong key stay on the ordinary no-buffer hot path. Synthetic/fan-out headers snapshot RFC 9110 `Connection`-listed tokens before filtering, strip those names plus Ferrum's canonical backend/proxy-generated forwarding sets, and keep `Host` for host-based routing; client framing (`Content-Length` / `Transfer-Encoding`) is never copied — reqwest derives exact `Content-Length` from the attached body.
+**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the exact buffered bytes for every accepted method that supplied a body (including DELETE/OPTIONS/extension methods — never silently rewritten to GET). Replay bodies have a hard 10 MiB plugin-local ceiling even when the global request-body limit is unlimited, and active local/fan-out replay work shares a 64 MiB process-wide retained-body budget; the strictest applicable limit wins. The original raw query string is preserved on every synthetic and fan-out request. Decoded query-map transforms are deliberately not serialized into the replay: the synthetic request re-enters the ordinary plugin pipeline, so configured query transforms apply exactly once without losing duplicate pairs or encoding. Requests with no key or a wrong key stay on the ordinary no-buffer hot path. Synthetic/fan-out headers reuse Ferrum's canonical secondary-request sanitizer shared with `request_mirror` and primary backend dispatch: snapshot RFC 9110 `Connection`-listed tokens before filtering, strip those names plus Ferrum's hop-by-hop / framing / `Trailer` / request-only marker / proxy-generated forwarding sets, and keep `Host` for host-based routing; client framing (`Content-Length` / `Transfer-Encoding`) is never copied — reqwest derives exact `Content-Length` from the attached body.
 
 **Completion metrics:** The finish log reports unambiguous counters — `attempted_requests`, `responses_received`, `responses_completed`, `responses_truncated`, `response_body_errors`, `request_timeouts`, non-timeout `transport_errors`, HTTP status classes, `worker_failures`, `cancelled_workers`, and separate `completed_requests_per_second` / `attempted_requests_per_second`. Cooperative cancellation counts affected workers instead of disappearing into a successful result. Outcome is `Success`, `Degraded`, `Failed`, or `Cancelled`. Attempt-only loops are never labeled as completed throughput. Consecutive request-build, transport, timeout, and response-stream errors use a cancellation-aware exponential backoff from 10 ms to 250 ms; a completed or cap-truncated response resets the backoff so valid load is not throttled.
 
@@ -4515,12 +4601,12 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
+| `token_limit` | Integer | *(required)* | Maximum tokens allowed per window. Required at construction; there is no default. |
 | `window_seconds` | Integer | `60` | Sliding window duration in seconds |
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |
 | `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers |
-| `provider` | String | `"auto"` | LLM provider format for token extraction |
+| `provider` | String | `"auto"` | LLM provider format for token extraction: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, or `bedrock`. Unknown values are rejected at construction time. |
 | `on_unmetered_response` | String | `"charge_estimate"` | Action for successful responses without usage metadata: `charge_estimate` keeps the pre-request reservation, `reject` returns a 502 and keeps the reservation, `warn` logs and releases the reservation |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
@@ -4534,7 +4620,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
-`provider` is parsed case-insensitively and ignores surrounding whitespace.
+`provider` is parsed case-insensitively and ignores surrounding whitespace. Accepted values: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, `bedrock`. Gemini/Vertex payloads use `google`.
 
 When `limit_by: "ip"`, the request client identity has already canonicalized IPv4-mapped IPv6 to native IPv4 before plugin execution, so local and Redis keys share one token budget without per-limiter reparsing.
 
@@ -4577,7 +4663,7 @@ config:
 
 Scans AI/LLM request bodies for PII and either rejects, redacts, or warns.
 
-Request buffering is only enabled for matching bare-JSON `POST` requests when the plugin has at least one valid pattern to scan. Native gRPC and gRPC-Web bodies are framed wire formats even when their media type ends in `+json`; they are explicitly outside this JSON policy's inspection scope and are not buffered.
+This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-decoding contract, so the plugin is not registered for the gRPC protocol view and must not be treated as a fail-closed PII control for unary or streaming native gRPC traffic. Request buffering is only enabled for matching bare-JSON `POST` requests when the plugin has at least one valid pattern to scan. gRPC-Web framed bodies (including `application/grpc-web*+json`) remain outside this JSON policy: they are not buffered, decoded, or rewritten, so message framing is never corrupted.
 
 **Priority:** 2925
 
@@ -4956,7 +5042,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 | `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
 | `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Must be greater than zero and greater than or equal to `frames_per_second`. |
 | `close_reason` | String | `"Frame rate exceeded"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
-| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (externalized per-connection counters, namespaced per plugin/gateway instance; not portable across reconnects/rebuilds) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ws_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:ws_rate_limiting` when namespace is `"ferrum"` |
@@ -5005,6 +5091,8 @@ config:
 ```
 
 Frame log entries are emitted to the `ws_frame_log` tracing target with structured fields: `proxy_id`, `connection_id`, `direction` (`client->backend` or `backend->client`), `frame_type` (`text`, `binary`, `ping`, `pong`, `close`, `frame`), `size_bytes`, and (when `include_payload_preview` is true) `preview`.
+
+Disconnect events on the same `ws_frame_log` target include the same `connection_id` that every frame event for that session carried. The ID is allocated once at WebSocket upgrade admission and preserved through H1/H2/H3 relay teardown, peer close/error, plugin cancellation, idle/drain timeout, and H1/H2 upgrade-handoff failure — plugins receive it on `WsDisconnectContext` without a per-frame lookup map. The value is **process-local** (monotonic per gateway process), not globally unique across instances; when aggregating logs from multiple gateways, join on `(gateway_instance_id, proxy_id, connection_id)` (or an equivalent host/process identity + `proxy_id` + `connection_id` tuple). A live session keeps the accepting plugin snapshot and this admission `connection_id` across config reload.
 
 **Default filter compatibility.** The plugin defaults healthy per-frame and disconnect records to `log_level: info`; it does not turn routine traffic into warnings. Under the gateway default `FERRUM_LOG_LEVEL=warn`, constructing the plugin with `config: {}` emits an actionable construction-time warning naming the filtered `info` level, while frame records remain suppressed. Validation and cache publication can construct an enabled instance separately, so the diagnostic can repeat. A filter stricter than `warn` (or a directive such as `ws_frame_log=off`) also suppresses the diagnostic; operators using such a filter must ensure it deliberately admits the configured `ws_frame_log` level. Raise `FERRUM_LOG_LEVEL` (or use an equivalent EnvFilter directive) to `info` or more verbose to admit the default records. Explicit `trace` / `debug` similarly require a sufficiently verbose filter; `warn` is available only when an operator deliberately chooses warning-level frame output.
 

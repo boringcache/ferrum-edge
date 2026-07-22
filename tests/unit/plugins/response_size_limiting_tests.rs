@@ -6,9 +6,13 @@ use serde_json::json;
 use std::collections::HashMap;
 
 fn make_ctx() -> RequestContext {
+    make_ctx_with_method("GET")
+}
+
+fn make_ctx_with_method(method: &str) -> RequestContext {
     RequestContext::new(
         "127.0.0.1".to_string(),
-        "GET".to_string(),
+        method.to_string(),
         "/api".to_string(),
     )
 }
@@ -108,6 +112,65 @@ async fn test_invalid_content_length_passes() {
     headers.insert("content-length".to_string(), "bad".to_string());
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+// === Bodyless response semantics (issue #2343) ===
+// after_proxy is the shared H1/H2/H3 Content-Length fast path; method/status
+// coverage here applies to every HTTP-family protocol path.
+
+#[tokio::test]
+async fn test_oversized_content_length_on_head_passes() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx_with_method("HEAD");
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "10485760".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "HEAD may advertise representation Content-Length without a body"
+    );
+}
+
+#[tokio::test]
+async fn test_oversized_content_length_on_304_passes() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "10485760".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 304, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "304 may carry representation Content-Length with no message body"
+    );
+}
+
+#[tokio::test]
+async fn test_oversized_content_length_on_206_still_rejects() {
+    // Body-bearing control: partial content still transfers body bytes.
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "10485760".to_string());
+
+    match plugin.after_proxy(&mut ctx, 206, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => {
+            assert_eq!(status_code, 502);
+        }
+        _ => panic!("Expected Reject for oversized body-bearing 206"),
+    }
+}
+
+#[tokio::test]
+async fn test_body_bearing_exact_boundary_still_passes_for_206() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "1024".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 206, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -332,4 +395,44 @@ async fn test_genuine_sse_fails_closed_at_strict_route_limit() {
         }
         _ => panic!("Expected fail-closed event-stream rejection"),
     }
+}
+
+/// Keep `docs/size_limits.md` aligned with the streaming runtime contract that
+/// `response_size_limiting` points operators at (issue #2346). Unknown-length
+/// responses must not be documented as a full-buffer fallback that promises a
+/// post-commit JSON 502.
+#[test]
+fn test_size_limits_guide_matches_streaming_runtime_contract() {
+    let size_limits = include_str!("../../../docs/size_limits.md");
+    let streaming = include_str!("../../../docs/response_body_streaming.md");
+    let plugin_docs = include_str!("../../../docs/plugins.md");
+
+    assert!(
+        !size_limits.contains("falls back to buffering"),
+        "size_limits.md must not claim unknown-length responses fall back to buffering"
+    );
+    assert!(
+        size_limits.contains("SizeLimitedStreamingResponse"),
+        "size_limits.md must name SizeLimitedStreamingResponse for unknown-length streaming"
+    );
+    assert!(
+        size_limits.contains("post-commit"),
+        "size_limits.md must distinguish post-commit stream termination from pre-commit rejection"
+    );
+    assert!(
+        size_limits.contains("response_body_streaming.md#interaction-with-response-size-limits"),
+        "size_limits.md must link the streaming size-limit section"
+    );
+    assert!(
+        size_limits.contains("plugins.md#response_size_limiting"),
+        "size_limits.md must link the response_size_limiting plugin reference"
+    );
+
+    // Counterpart docs already describe the streaming adapter; keep the shared
+    // terminology from drifting back to a buffering-only story.
+    assert!(streaming.contains("SizeLimitedStreamingResponse"));
+    assert!(
+        plugin_docs.contains("SizeLimitedStreamingResponse"),
+        "response_size_limiting reference must mention the global streaming adapter"
+    );
 }
