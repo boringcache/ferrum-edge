@@ -2,6 +2,7 @@ use ferrum_edge::_test_support::{
     ai_semantic_cache_clear_vector_index_dirty_for_test, ai_semantic_cache_embedding,
     ai_semantic_cache_expire_all_entries_for_test, ai_semantic_cache_force_cleanup_for_test,
     ai_semantic_cache_scope_key, ai_semantic_cache_set_store_post_admit_hook_for_test,
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test,
     ai_semantic_cache_size_accounting_snapshot_for_test,
     ai_semantic_cache_vector_index_dirty_for_test, rebuild_ai_semantic_cache_vector_index,
     set_ai_semantic_cache_embedding, set_ai_semantic_cache_scope_key,
@@ -2908,6 +2909,7 @@ async fn test_same_key_replacement_dirties_vector_index_on_embedding_change() {
     store_with_cache_key(&plugin, &cache_key, br#""seed""#, None, None).await;
     ai_semantic_cache_clear_vector_index_dirty_for_test(&plugin);
     assert!(!ai_semantic_cache_vector_index_dirty_for_test(&plugin));
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(&plugin, true);
 
     store_with_cache_key(
         &plugin,
@@ -2921,16 +2923,19 @@ async fn test_same_key_replacement_dirties_vector_index_on_embedding_change() {
         ai_semantic_cache_vector_index_dirty_for_test(&plugin),
         "gaining an embedding on same-key replace must dirty the vector index"
     );
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(&plugin, false);
     assert_eq!(plugin.tracked_keys_count(), Some(1));
     assert_size_accounting_exact(&plugin);
 
     // Losing the embedding on a later replace must also dirty.
     ai_semantic_cache_clear_vector_index_dirty_for_test(&plugin);
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(&plugin, true);
     store_with_cache_key(&plugin, &cache_key, br#""no-embedding""#, None, None).await;
     assert!(
         ai_semantic_cache_vector_index_dirty_for_test(&plugin),
         "losing an embedding on same-key replace must dirty the vector index"
     );
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(&plugin, false);
     assert_eq!(plugin.tracked_keys_count(), Some(1));
     assert_size_accounting_exact(&plugin);
 }

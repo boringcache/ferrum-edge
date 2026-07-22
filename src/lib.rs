@@ -1120,6 +1120,13 @@ pub mod _test_support {
         plugin.clear_vector_index_dirty_for_tests();
     }
 
+    pub fn ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        blocked: bool,
+    ) {
+        plugin.set_vector_index_rebuild_blocked_for_tests(blocked);
+    }
+
     pub fn ai_semantic_cache_expire_all_entries_for_test(
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
     ) {

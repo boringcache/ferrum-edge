@@ -1052,6 +1052,15 @@ impl AiSemanticCache {
         self.vector_index_dirty.store(false, Ordering::Release);
     }
 
+    /// Hold or release the detached rebuild guard so tests can observe the
+    /// dirtying side effect without racing the asynchronous rebuild that
+    /// normally consumes the flag immediately.
+    #[allow(dead_code)]
+    pub(crate) fn set_vector_index_rebuild_blocked_for_tests(&self, blocked: bool) {
+        self.vector_index_rebuild_running
+            .store(blocked, Ordering::Release);
+    }
+
     /// Backdate every retained entry past TTL so a forced cleanup pass expires
     /// them without sleeping on the wall clock.
     #[allow(dead_code)]
