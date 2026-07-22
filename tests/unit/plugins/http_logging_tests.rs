@@ -627,7 +627,7 @@ async fn test_http_logging_delivers_stream_sni_hostname() {
         &json!({
             "endpoint_url": format!("http://{addr}/logs"),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
         }),
         default_client(),
