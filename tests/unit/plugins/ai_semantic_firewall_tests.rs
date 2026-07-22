@@ -4594,7 +4594,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
             .await,
     );
 
-    for (encoding, mut encoded_html) in [
+    for (encoding, encoded_html) in [
         (
             "gzip",
             gzip_bytes(b"<html><body>ordinary page</body></html>"),
