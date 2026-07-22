@@ -1574,6 +1574,30 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 }
+                let Some(header_object) = header_value.as_object() else {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'] must be a Header Object"
+                        ),
+                    });
+                };
+                if header_object.contains_key("content") {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'].content is not supported; use schema"
+                        ),
+                    });
+                }
+                if !header_object.contains_key("schema") {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'] must contain schema"
+                        ),
+                    });
+                }
                 if let Some(required) = header_value.get("required")
                     && !required.is_boolean()
                 {
@@ -1581,6 +1605,26 @@ fn normalize_request_body_encoding(
                         which: "requestBody.content.encoding",
                         error: format!(
                             "encoding['{property}'].headers['{header_name}'].required must be a boolean"
+                        ),
+                    });
+                }
+                if let Some(style) = header_value.get("style")
+                    && style.as_str() != Some("simple")
+                {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'].style must be 'simple'"
+                        ),
+                    });
+                }
+                if let Some(explode) = header_value.get("explode")
+                    && !explode.is_boolean()
+                {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
                         ),
                     });
                 }
