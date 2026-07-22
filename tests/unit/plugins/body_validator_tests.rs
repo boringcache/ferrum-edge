@@ -356,7 +356,7 @@ async fn test_request_parameter_collision_is_not_validated() {
 
 /// Malformed Content-Type is skipped without panic (Continue, not 400).
 #[tokio::test]
-async fn test_request_malformed_content_type_fails_closed() {
+async fn test_request_malformed_content_type_is_skipped() {
     let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
     for content_type in [
         "",
@@ -443,7 +443,7 @@ async fn test_response_parameter_collision_is_not_validated() {
 
 /// Response malformed Content-Type is skipped (Continue, not 502).
 #[tokio::test]
-async fn test_response_malformed_content_type_fails_closed() {
+async fn test_response_malformed_content_type_is_skipped() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
     for content_type in [
         "",
