@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 
+use super::generation_map::GenerationMap;
 use crate::util::sharding::pool_shard_amount;
 
 const N_BUCKETS: usize = 10;
@@ -310,10 +311,12 @@ pub struct RuleWindowSpec {
 
 /// `(rule_id → proxy_id → ownership_generation → WindowState)` map.
 ///
-/// The outer/proxy DashMaps avoid composite string keys on the hot path:
-/// `proxy_id` uses `String: Borrow<str>`, and the generation dimension is a
-/// plain `u64` so admission-tagged writes need no per-sample formatting.
-type GenerationWindows = DashMap<u64, WindowState>;
+/// Outer rule/proxy DashMaps use `pool_shard_amount` and avoid composite string
+/// keys on the hot path (`proxy_id` uses `String: Borrow<str>`). The generation
+/// dimension is a compact [`GenerationMap`] of `Arc<WindowState>` so typically
+/// one live incarnation does not pay for a fully pool-sharded DashMap, while
+/// record/snapshot still run lock-free on the window atomics after lookup.
+type GenerationWindows = GenerationMap<Arc<WindowState>>;
 type ProxyWindows = DashMap<String, Arc<GenerationWindows>>;
 type RuleWindows = DashMap<u32, Arc<ProxyWindows>>;
 
@@ -350,11 +353,27 @@ impl WindowStore {
         if let Some(existing) = inner.get(proxy_id) {
             return Some(Arc::clone(existing.value()));
         }
-        let shard_amount = self.inner_shard_amount;
         let entry = inner
             .entry(proxy_id.to_string())
-            .or_insert_with(|| Arc::new(DashMap::with_shard_amount(shard_amount)));
+            .or_insert_with(|| Arc::new(GenerationMap::new()));
         Some(Arc::clone(entry.value()))
+    }
+
+    fn window_for_generation(
+        generations: &GenerationWindows,
+        ownership_generation: u64,
+        spec: RuleWindowSpec,
+    ) -> Arc<WindowState> {
+        generations.get_or_insert_with(ownership_generation, || {
+            Arc::new(match spec.kind {
+                WindowKind::Counter => {
+                    WindowState::Counter(BucketedCounter::new(spec.window_seconds))
+                }
+                WindowKind::Histogram => {
+                    WindowState::Histogram(BucketedLatencyHistogram::new(spec.window_seconds))
+                }
+            })
+        })
     }
 
     pub fn record_count(
@@ -371,23 +390,8 @@ impl WindowStore {
         let Some(generations) = self.generations_for(rule_id, proxy_id) else {
             return;
         };
-        if let Some(state) = generations.get(&ownership_generation)
-            && let WindowState::Counter(c) = state.value()
-        {
-            c.record(matched, now_ms);
-            return;
-        }
-        let entry = generations
-            .entry(ownership_generation)
-            .or_insert_with(|| match spec.kind {
-                WindowKind::Counter => {
-                    WindowState::Counter(BucketedCounter::new(spec.window_seconds))
-                }
-                WindowKind::Histogram => {
-                    WindowState::Histogram(BucketedLatencyHistogram::new(spec.window_seconds))
-                }
-            });
-        if let WindowState::Counter(c) = entry.value() {
+        let state = Self::window_for_generation(&generations, ownership_generation, spec);
+        if let WindowState::Counter(c) = state.as_ref() {
             c.record(matched, now_ms);
         }
     }
@@ -406,23 +410,8 @@ impl WindowStore {
         let Some(generations) = self.generations_for(rule_id, proxy_id) else {
             return;
         };
-        if let Some(state) = generations.get(&ownership_generation)
-            && let WindowState::Histogram(h) = state.value()
-        {
-            h.record(latency_ms, now_ms);
-            return;
-        }
-        let entry = generations
-            .entry(ownership_generation)
-            .or_insert_with(|| match spec.kind {
-                WindowKind::Counter => {
-                    WindowState::Counter(BucketedCounter::new(spec.window_seconds))
-                }
-                WindowKind::Histogram => {
-                    WindowState::Histogram(BucketedLatencyHistogram::new(spec.window_seconds))
-                }
-            });
-        if let WindowState::Histogram(h) = entry.value() {
+        let state = Self::window_for_generation(&generations, ownership_generation, spec);
+        if let WindowState::Histogram(h) = state.as_ref() {
             h.record(latency_ms, now_ms);
         }
     }
@@ -440,10 +429,10 @@ impl WindowStore {
         let Some(generations) = inner.get(proxy_id) else {
             return (0, 0);
         };
-        let Some(state) = generations.get(&ownership_generation) else {
+        let Some(state) = generations.get_cloned(&ownership_generation) else {
             return (0, 0);
         };
-        match state.value() {
+        match state.as_ref() {
             WindowState::Counter(c) => c.snapshot(now_ms),
             WindowState::Histogram(_) => (0, 0),
         }
@@ -463,10 +452,10 @@ impl WindowStore {
         let Some(generations) = inner.get(proxy_id) else {
             return (None, 0);
         };
-        let Some(state) = generations.get(&ownership_generation) else {
+        let Some(state) = generations.get_cloned(&ownership_generation) else {
             return (None, 0);
         };
-        match state.value() {
+        match state.as_ref() {
             WindowState::Histogram(h) => h.percentile(percentile, now_ms),
             WindowState::Counter(_) => (None, 0),
         }

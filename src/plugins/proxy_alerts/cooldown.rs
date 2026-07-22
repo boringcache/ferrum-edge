@@ -24,14 +24,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 
+use super::generation_map::GenerationMap;
 use crate::util::sharding::pool_shard_amount;
 
 type CooldownKey = (u32, u32);
-type CooldownGenerationMap = DashMap<u64, Arc<AtomicU64>>;
+type CooldownGenerationMap = GenerationMap<Arc<AtomicU64>>;
 type SharedCooldownGenerationMap = Arc<CooldownGenerationMap>;
 type CooldownProxyMap = DashMap<String, SharedCooldownGenerationMap>;
 type SharedCooldownProxyMap = Arc<CooldownProxyMap>;
-type RecoveryGenerationMap = DashMap<u64, RuleState>;
+type RecoveryGenerationMap = GenerationMap<RuleState>;
 type SharedRecoveryGenerationMap = Arc<RecoveryGenerationMap>;
 type RecoveryRuleMap = DashMap<String, SharedRecoveryGenerationMap>;
 type SharedRecoveryRuleMap = Arc<RecoveryRuleMap>;
@@ -90,22 +91,13 @@ impl CooldownGate {
             Arc::clone(
                 per_proxy
                     .entry(proxy_id.to_string())
-                    .or_insert_with(|| {
-                        Arc::new(DashMap::with_shard_amount(self.inner_shard_amount))
-                    })
+                    .or_insert_with(|| Arc::new(GenerationMap::new()))
                     .value(),
             )
         };
-        let atomic = if let Some(existing) = per_generation.get(&ownership_generation) {
-            Arc::clone(existing.value())
-        } else {
-            Arc::clone(
-                per_generation
-                    .entry(ownership_generation)
-                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-                    .value(),
-            )
-        };
+        // Brief map lock for lookup/insert only; CAS below is lock-free.
+        let atomic = per_generation
+            .get_or_insert_with(ownership_generation, || Arc::new(AtomicU64::new(0)));
         let mut prev = atomic.load(Ordering::Acquire);
         loop {
             if prev != 0 && now_ms.saturating_sub(prev) < cooldown_ms {
@@ -247,17 +239,14 @@ impl RecoveryGate {
         ownership_generation: u64,
     ) -> LifecycleOutcome {
         let per_generation = self.per_proxy_generations(rule_id, proxy_id);
-        let mut entry = if let Some(existing) = per_generation.get_mut(&ownership_generation) {
-            existing
-        } else {
-            per_generation
-                .entry(ownership_generation)
-                .or_insert(RuleState::Healthy)
-        };
-        Self::transition(entry.value_mut(), breach, recovery_ms, now_ms)
+        per_generation.with_mut(
+            ownership_generation,
+            || RuleState::Healthy,
+            |state| Self::transition(state, breach, recovery_ms, now_ms),
+        )
     }
 
-    /// Evaluate the next lifecycle outcome without mutating state.
+    /// Evaluate the next lifecycle outcome without committing a transition.
     ///
     /// Used by the dispatch path so Trigger/Resolve transitions can be
     /// committed only after at least one notification channel accepts the
@@ -265,19 +254,18 @@ impl RecoveryGate {
     ///
     /// # Concurrency: deliberate TOCTOU + commit-or-drop
     ///
-    /// `evaluate()` reads state without a lock and `observe()` commits the
-    /// transition later, after dispatch permits + cooldowns are reserved. The
-    /// dispatch loop in `mod.rs` gates the commit on the freshly-observed
-    /// outcome still matching the originally-evaluated `event_action`; if the
-    /// state shifted between evaluate and observe (high-frequency
-    /// breach/recover oscillation, or a sibling worker racing the same
-    /// rule/proxy), the dispatch is dropped rather than fired against stale
-    /// reasoning.
+    /// `evaluate()` snapshots state and `observe()` commits the transition
+    /// later, after dispatch permits + cooldowns are reserved. The dispatch
+    /// loop in `mod.rs` gates the commit on the freshly-observed outcome
+    /// still matching the originally-evaluated `event_action`; if the state
+    /// shifted between evaluate and observe (high-frequency breach/recover
+    /// oscillation, or a sibling worker racing the same rule/proxy), the
+    /// dispatch is dropped rather than fired against stale reasoning.
     ///
     /// This is by design: under concurrent oscillation a missed alert is
-    /// preferable to a phantom alert. Adding a lock to make evaluate+commit
-    /// atomic would serialise every observation through a single critical
-    /// section per `(rule, proxy)` and defeat the lock-free hot path.
+    /// preferable to a phantom alert. Holding evaluate+commit across the
+    /// dispatch reservation would extend generation-map contention into
+    /// channel/permit work and is intentionally avoided.
     pub fn evaluate(
         &self,
         rule_id: u32,
@@ -292,9 +280,7 @@ impl RecoveryGate {
             .get(&rule_id)
             .and_then(|per_rule| {
                 per_rule.get(proxy_id).and_then(|generations| {
-                    generations
-                        .get(&ownership_generation)
-                        .map(|entry| *entry.value())
+                    generations.get_copied(&ownership_generation)
                 })
             })
             .unwrap_or(RuleState::Healthy);
@@ -310,9 +296,7 @@ impl RecoveryGate {
             Arc::clone(
                 per_rule
                     .entry(proxy_id.to_string())
-                    .or_insert_with(|| {
-                        Arc::new(DashMap::with_shard_amount(self.inner_shard_amount))
-                    })
+                    .or_insert_with(|| Arc::new(GenerationMap::new()))
                     .value(),
             )
         }
@@ -402,7 +386,7 @@ impl RecoveryGate {
         self.state.get(&rule_id).and_then(|per_rule| {
             per_rule
                 .get(proxy_id)
-                .and_then(|generations| generations.get(&ownership_generation).map(|e| *e.value()))
+                .and_then(|generations| generations.get_copied(&ownership_generation))
         })
     }
 
@@ -430,7 +414,7 @@ impl RecoveryGate {
     /// reset). Active/Recovering incidents are owned by
     /// [`Self::retain_proxies`] so a long-lived breach is never TTL-reset
     /// while its proxy remains in the active set.
-    pub fn evict_stale(&self, _now_ms: u64, _keep_ms: u64) {
+    pub fn evict_resolved(&self) {
         self.state.retain(|_, per_rule| {
             per_rule.retain(|_, generations| {
                 generations.retain(|_, state| !matches!(*state, RuleState::Healthy));

@@ -1621,7 +1621,7 @@ fn cooldown_evict_stale_drops_expired_timestamps() {
 }
 
 #[test]
-fn recovery_evict_stale_drops_only_healthy_rows() {
+fn recovery_evict_resolved_drops_only_healthy_rows() {
     let gate = RecoveryGate::new();
     gate.observe(1, "active", true, 60_000, 1_000, 0);
     gate.observe(1, "resolved", true, 60_000, 1_000, 0);
@@ -1630,7 +1630,7 @@ fn recovery_evict_stale_drops_only_healthy_rows() {
         gate.current_state(1, "resolved", 0),
         Some(RuleState::Healthy)
     );
-    gate.evict_stale(3_000, 60_000);
+    gate.evict_resolved();
     assert_eq!(gate.current_state(1, "resolved", 0), None);
     assert!(matches!(
         gate.current_state(1, "active", 0),
@@ -1823,6 +1823,117 @@ fn absent_id_cannot_repopulate_after_armed_retain() {
     // and the armed precheck must keep it out of the active ownership set.
     plugin.retain_proxies(&std::collections::HashMap::from([("keep", 1)]));
     assert!(!plugin.has_lifecycle_state_for_test("gone"));
+}
+
+#[test]
+fn retention_serialization_keeps_latest_rows_across_stale_sweep() {
+    // Deterministic serialization contract without sleeps:
+    // 1. Hold the cold-path retention lock (as a commit retain would).
+    // 2. Publish a newer ownership map and write current-generation rows.
+    // 3. Spawn a sweep that must block until the lock is released.
+    // 4. After release, the sweep loads the latest map and must preserve
+    //    current-generation rows (the old race deleted them).
+    let plugin = std::sync::Arc::new(ProxyAlerts::new(&minimal_config(), http_client()).unwrap());
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.seed_lifecycle_state_for_test("p1", 1);
+
+    let (sweep_started_tx, sweep_started_rx) = std::sync::mpsc::channel::<()>();
+    let (lock_held_tx, lock_held_rx) = std::sync::mpsc::channel::<()>();
+    let plugin_sweep = std::sync::Arc::clone(&plugin);
+    let sweep = std::thread::spawn(move || {
+        sweep_started_tx.send(()).unwrap();
+        lock_held_rx.recv().unwrap();
+        plugin_sweep.sweep_lifecycle_ownership_for_test();
+    });
+
+    sweep_started_rx.recv().unwrap();
+    plugin.with_retention_lock_for_test(|| {
+        plugin.publish_proxy_generations_for_test(&std::collections::HashMap::from([("p1", 2)]));
+        plugin.write_lifecycle_state_for_test("p1", 2);
+        assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 2));
+        // Sweep is waiting to enter retain; it must not be able to take the lock.
+        assert!(
+            !plugin.try_retention_lock_for_test(),
+            "commit retention guard must serialize the background ownership sweep"
+        );
+        lock_held_tx.send(()).unwrap();
+        // Hold the lock until the sweep is observably blocked on it. The
+        // try_lock check above already proved mutual exclusion; releasing
+        // after the signal lets the sweep proceed against the latest map.
+    });
+    sweep.join().expect("ownership sweep thread");
+
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
+        "serialized sweep must retain against the latest published map"
+    );
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "serialized sweep may still prune the retired generation"
+    );
+}
+
+#[test]
+fn concurrent_commit_retain_and_sweep_preserve_final_generation() {
+    let plugin = std::sync::Arc::new(ProxyAlerts::new(&minimal_config(), http_client()).unwrap());
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.write_lifecycle_state_for_test("p1", 1);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let commit_plugin = std::sync::Arc::clone(&plugin);
+    let commit_barrier = std::sync::Arc::clone(&barrier);
+    let commit = std::thread::spawn(move || {
+        commit_barrier.wait();
+        for generation in 2u64..=32 {
+            commit_plugin.retain_proxies(&std::collections::HashMap::from([("p1", generation)]));
+            commit_plugin.write_lifecycle_state_for_test("p1", generation);
+        }
+    });
+    let sweep_plugin = std::sync::Arc::clone(&plugin);
+    let sweep_barrier = std::sync::Arc::clone(&barrier);
+    let sweep = std::thread::spawn(move || {
+        sweep_barrier.wait();
+        for _ in 0..64 {
+            sweep_plugin.sweep_lifecycle_ownership_for_test();
+        }
+    });
+    barrier.wait();
+    commit.join().expect("commit retain thread");
+    sweep.join().expect("sweep thread");
+
+    plugin.sweep_lifecycle_ownership_for_test();
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 32),
+        "latest published generation rows must survive interleaved retain/sweep"
+    );
+    assert!(!plugin.has_lifecycle_state_for_generation_for_test("p1", 1));
+}
+
+#[test]
+fn generation_map_shares_cooldown_atomic_across_concurrent_acquires() {
+    // Compact generation storage must keep concurrent same-generation writers
+    // on one AtomicU64 (no lost inserts / duplicate rows).
+    let gate = std::sync::Arc::new(CooldownGate::new());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let gate = std::sync::Arc::clone(&gate);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            gate.try_acquire(1, "p1", 10, 60_000, 100, 7)
+        }));
+    }
+    let successes: usize = handles
+        .into_iter()
+        .map(|handle| usize::from(handle.join().expect("cooldown acquire thread")))
+        .sum();
+    assert_eq!(
+        successes, 1,
+        "one shared cooldown atomic must admit exactly one acquire at now_ms=100"
+    );
+    assert!(gate.contains_proxy_generation("p1", 7));
+    assert!(!gate.try_acquire(1, "p1", 10, 60_000, 100 + 1, 7));
 }
 
 #[test]

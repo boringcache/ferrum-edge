@@ -30,13 +30,16 @@
 //!   rows themselves are keyed by admission ownership generation so a stale
 //!   write that races past retain cannot populate or poison the replacement
 //!   incarnation. Samples carry the admission-time generation captured from
-//!   the published RequestEpoch/plugin-cache snapshot. Expired cooldown
-//!   timestamps and terminal Healthy recovery rows are also swept by the
-//!   background eviction task.
+//!   the published RequestEpoch/plugin-cache snapshot. Full retention passes
+//!   (commit-path retain and the background ownership sweep) share a
+//!   poison-recovering cold-path mutex so a stale sweep cannot delete rows
+//!   for the latest published map. Expired cooldown timestamps and terminal
+//!   Healthy recovery rows are also swept by the background eviction task.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -55,6 +58,7 @@ use super::{
 
 pub mod config;
 pub mod cooldown;
+mod generation_map;
 pub mod render;
 pub mod rules;
 pub mod windows;
@@ -86,6 +90,10 @@ pub struct ProxyAlerts {
     /// keep the historical ungated write path). After retain, writes require a
     /// matching admitted generation.
     active_proxy_generations: Arc<ArcSwap<Option<HashMap<String, u64>>>>,
+    /// Serializes full ownership retention passes (commit-path retain and the
+    /// background ownership sweep). Request observation only loads the
+    /// ArcSwap snapshot and never takes this lock.
+    retention_lock: Arc<Mutex<()>>,
     dispatch_sem: Arc<Semaphore>,
     http_client: PluginHttpClient,
     enabled: AtomicBool,
@@ -121,11 +129,13 @@ impl ProxyAlerts {
         let recovery = Arc::new(RecoveryGate::new());
         let lifecycle_keep_ms = lifecycle_keep_ms(parsed.rules.as_ref());
         let active_proxy_generations = Arc::new(ArcSwap::from_pointee(None));
+        let retention_lock = Arc::new(Mutex::new(()));
         let eviction_handle = start_lifecycle_eviction_task(
             Arc::clone(&windows),
             Arc::clone(&cooldowns),
             Arc::clone(&recovery),
             Arc::clone(&active_proxy_generations),
+            Arc::clone(&retention_lock),
             lifecycle_keep_ms,
         );
 
@@ -138,12 +148,19 @@ impl ProxyAlerts {
             cooldowns,
             recovery,
             active_proxy_generations,
+            retention_lock,
             dispatch_sem,
             http_client,
             enabled: AtomicBool::new(parsed.enabled),
             quiet_hours: Arc::new(parsed.quiet_hours),
             eviction_handle,
         })
+    }
+
+    fn retention_guard(&self) -> MutexGuard<'_, ()> {
+        self.retention_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Publish ownership generations and retire per-proxy window/cooldown/
@@ -157,16 +174,20 @@ impl ProxyAlerts {
             .iter()
             .map(|(id, generation)| ((*id).to_string(), *generation))
             .collect();
-        // Publish ownership first. The request epoch has already committed, so
-        // newly admitted samples must not be rejected while the cold-path
-        // retains walk potentially large historical maps. New-generation rows
-        // written concurrently are preserved by the generation-aware retains;
-        // old-generation writers remain isolated even if they raced past the
-        // admission check before this publication.
-        self.active_proxy_generations.store(Arc::new(Some(owned)));
-        self.windows.retain_proxies(active_proxy_generations);
-        self.cooldowns.retain_proxies(active_proxy_generations);
-        self.recovery.retain_proxies(active_proxy_generations);
+        // Serialize against the background ownership sweep. Publish under the
+        // same guard before the retain walks so admission sees the new map
+        // immediately while a concurrent sweep cannot still be retaining an
+        // older snapshot (which would delete current-generation rows).
+        let _guard = self.retention_guard();
+        self.active_proxy_generations
+            .store(Arc::new(Some(owned.clone())));
+        let borrowed: HashMap<&str, u64> = owned
+            .iter()
+            .map(|(proxy_id, generation)| (proxy_id.as_str(), *generation))
+            .collect();
+        self.windows.retain_proxies(&borrowed);
+        self.cooldowns.retain_proxies(&borrowed);
+        self.recovery.retain_proxies(&borrowed);
     }
 
     /// Compatibility helper for tests that only have an active-ID set.
@@ -262,7 +283,36 @@ impl ProxyAlerts {
             &self.cooldowns,
             &self.recovery,
             &self.active_proxy_generations,
+            &self.retention_lock,
         );
+    }
+
+    /// Hold the cold-path retention lock for deterministic serialization tests.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_retention_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.retention_guard();
+        f()
+    }
+
+    /// Whether the retention lock is free (`true`) or held (`false`).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn try_retention_lock_for_test(&self) -> bool {
+        self.retention_lock.try_lock().is_ok()
+    }
+
+    /// Publish ownership generations without retaining (test-only). Callers
+    /// must already hold [`Self::with_retention_lock_for_test`] when proving
+    /// the commit/sweep serialization contract.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn publish_proxy_generations_for_test(&self, active_proxy_generations: &HashMap<&str, u64>) {
+        let owned: HashMap<String, u64> = active_proxy_generations
+            .iter()
+            .map(|(id, generation)| ((*id).to_string(), *generation))
+            .collect();
+        self.active_proxy_generations.store(Arc::new(Some(owned)));
     }
 
     /// Whether an admitted sample may mutate lifecycle state for `proxy_id`.
@@ -484,6 +534,7 @@ fn start_lifecycle_eviction_task(
     cooldowns: Arc<CooldownGate>,
     recovery: Arc<RecoveryGate>,
     active_proxy_generations: Arc<ArcSwap<Option<HashMap<String, u64>>>>,
+    retention_lock: Arc<Mutex<()>>,
     keep_ms: u64,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -499,16 +550,19 @@ fn start_lifecycle_eviction_task(
             // commit-time retain. Generation-keying isolates that row from the
             // replacement; periodically reapplying the published ownership map
             // also bounds the orphan rather than leaving an old-generation
-            // Active/Recovering recovery row resident indefinitely.
+            // Active/Recovering recovery row resident indefinitely. The
+            // retention lock ensures this sweep loads the latest published map
+            // and cannot interleave with a commit-path retain pass.
             retain_published_proxy_generations(
                 &windows,
                 &cooldowns,
                 &recovery,
                 &active_proxy_generations,
+                &retention_lock,
             );
             windows.evict_stale(now_ms, keep_ms);
             cooldowns.evict_stale(now_ms, keep_ms);
-            recovery.evict_stale(now_ms, keep_ms);
+            recovery.evict_resolved();
         }
     }))
 }
@@ -518,7 +572,14 @@ fn retain_published_proxy_generations(
     cooldowns: &CooldownGate,
     recovery: &RecoveryGate,
     active_proxy_generations: &ArcSwap<Option<HashMap<String, u64>>>,
+    retention_lock: &Mutex<()>,
 ) {
+    let _guard = retention_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Load only after acquiring the serialization guard so a concurrent
+    // commit cannot publish a newer map and finish retaining before this
+    // pass still deletes against a stale snapshot.
     let active = active_proxy_generations.load();
     let Some(active) = active.as_ref() else {
         return;

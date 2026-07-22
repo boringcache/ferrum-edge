@@ -3841,9 +3841,13 @@ impl PluginCache {
             .collect();
         // `config` is the published generation that produced `inner`; keep the
         // parameter so call sites stay explicitly paired with that commit.
-        debug_assert_eq!(
-            active_proxy_generations.len(),
-            config.proxies.len(),
+        // Check per published proxy (not length equality) so duplicate IDs in
+        // `config.proxies` cannot trip a debug assertion by themselves.
+        debug_assert!(
+            config
+                .proxies
+                .iter()
+                .all(|proxy| active_proxy_generations.contains_key(proxy.id.as_str())),
             "lifecycle generations must cover every published proxy"
         );
         for plugin in inner.global_plugins.iter() {
