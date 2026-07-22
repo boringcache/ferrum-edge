@@ -36,6 +36,23 @@ pub mod pricing {
     /// Closed key set for each `pricing_tiers[]` object.
     const PRICING_TIER_KEYS: &[&str] = &["status_codes", "price_per_call"];
 
+    /// Maximum accepted unit price for every chargeback pricing dimension
+    /// (`price_per_call`, `price_per_byte_*`, `price_per_connection`).
+    ///
+    /// Bound is chosen so multiplying any accepted price by the largest
+    /// supported counter (`u64::MAX`) still yields a finite IEEE-754 binary64
+    /// value, with headroom to sum the three per-entry charge dimensions
+    /// (call + bytes_sent + bytes_received). Aggregation across many series can
+    /// still overflow; exporters must fail closed on non-finite totals rather
+    /// than emit JSON `null` or Prometheus `inf`.
+    ///
+    /// Arithmetic semantics: the stored `u64` counter is converted to binary64
+    /// and multiplied by the binary64 unit price at export (or per event for
+    /// the durable sink). Counters above 2^53 therefore follow normal IEEE-754
+    /// rounding. There is no decimal/currency-subunit rounding; Prometheus
+    /// samples format with 10 fractional digits (`{:.10}`).
+    pub const MAX_UNIT_PRICE: f64 = 1.0e288;
+
     /// Resolved pricing configuration for chargeback plugins.
     #[derive(Debug, Clone, Default)]
     pub struct PricingConfig {
@@ -58,6 +75,50 @@ pub mod pricing {
         pub charge_bytes_sent: f64,
         pub charge_bytes_received: f64,
         pub charge_total: f64,
+    }
+
+    /// Multiply an exact `u64` quantity by a unit price, rejecting non-finite
+    /// results (including overflow to ±infinity).
+    pub fn checked_mul_quantity(quantity: u64, unit_price: f64) -> Result<f64, String> {
+        if !unit_price.is_finite() || unit_price < 0.0 {
+            return Err(format!(
+                "chargeback unit price must be a finite non-negative number, got {unit_price}"
+            ));
+        }
+        let product = quantity as f64 * unit_price;
+        if !product.is_finite() {
+            return Err(format!(
+                "chargeback quantity×price overflowed to a non-finite value \
+                 (quantity={quantity}, unit_price={unit_price})"
+            ));
+        }
+        Ok(product)
+    }
+
+    /// Add two monetary values, rejecting non-finite sums.
+    pub fn checked_add_charge(lhs: f64, rhs: f64) -> Result<f64, String> {
+        if !lhs.is_finite() || !rhs.is_finite() {
+            return Err(
+                "chargeback cannot add a non-finite monetary value".to_string(),
+            );
+        }
+        let sum = lhs + rhs;
+        if !sum.is_finite() {
+            return Err(
+                "chargeback monetary aggregate overflowed to a non-finite value".to_string(),
+            );
+        }
+        Ok(sum)
+    }
+
+    /// Require a monetary sample to be finite before export.
+    pub fn require_finite_charge(value: f64, ctx: &str) -> Result<f64, String> {
+        if !value.is_finite() {
+            return Err(format!(
+                "chargeback {ctx} is non-finite and cannot be exported as a number"
+            ));
+        }
+        Ok(value)
     }
 
     impl PricingConfig {
@@ -135,6 +196,11 @@ pub mod pricing {
             bytes_sent: u64,
             bytes_received: u64,
         ) -> ChargeComputation {
+            // Admission bounds every unit price so each u64 multiplication and
+            // the three-way per-event sum remain finite. Keep the sink's
+            // existing infallible accounting contract: silently dropping a
+            // billable event would be worse than the export failure this issue
+            // is fixing.
             let charge_bytes_sent = bytes_sent as f64 * self.bandwidth_price_sent;
             let charge_bytes_received = bytes_received as f64 * self.bandwidth_price_received;
             ChargeComputation {
@@ -159,9 +225,25 @@ pub mod pricing {
             .ok_or_else(|| format!("{plugin_name}: '{ctx}' must be a number"))?;
         if !number.is_finite() || number < 0.0 {
             return Err(format!(
-                "{plugin_name}: '{ctx}' must be a finite non-negative number"
+                "{plugin_name}: '{ctx}' must be a finite non-negative number \
+                 no greater than {MAX_UNIT_PRICE}"
             ));
         }
+        if number > MAX_UNIT_PRICE {
+            return Err(format!(
+                "{plugin_name}: '{ctx}' must be a finite non-negative number \
+                 no greater than {MAX_UNIT_PRICE}, got {number}"
+            ));
+        }
+        // Reject rates whose product with the largest supported counter cannot
+        // stay finite even though the rate itself is below MAX_UNIT_PRICE
+        // (defensive against future bound tweaks / unusual float quirks).
+        let _ = checked_mul_quantity(u64::MAX, number).map_err(|_| {
+            format!(
+                "{plugin_name}: '{ctx}'={number} overflows when multiplied by \
+                 the maximum supported counter (u64::MAX)"
+            )
+        })?;
         Ok(number)
     }
 

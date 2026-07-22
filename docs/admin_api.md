@@ -635,6 +635,14 @@ The response is cached briefly (`FERRUM_METRICS_RUNTIME_CACHE_MS`, default `1000
 
 The `/charges` endpoint exposes per-consumer API usage charges tracked by the `api_chargeback` plugin. It requires the same admin JWT authentication as other sensitive admin endpoints.
 
+Monetary samples convert the stored `u64` counter to IEEE-754 binary64 and
+multiply it by the configured binary64 unit price (accepted rates are finite
+and ≤ `1e288`). Counters above 2^53 follow normal binary64 rounding; Ferrum
+applies no additional decimal or currency-subunit rounding. If export
+arithmetic would produce a non-finite value, the endpoint returns **HTTP 500**
+with `{"error":"<message>"}` for both Prometheus and JSON formats instead of
+emitting JSON `null` or Prometheus `inf`.
+
 ```bash
 # Prometheus text format (default)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges

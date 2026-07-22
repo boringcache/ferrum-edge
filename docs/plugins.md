@@ -1315,6 +1315,15 @@ Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
 in both Prometheus text and JSON formats for external billing system
 integration.
 
+**Arithmetic and export semantics:** every unit price is IEEE-754 binary64,
+finite, non-negative, and at most `1e288`. In-memory entries store exact `u64`
+call/byte counters, convert them to binary64, and derive monetary values once
+at export as `counter × unit_price`. Counters above 2^53 follow normal
+binary64 rounding; no additional decimal/currency-subunit rounding is applied.
+Prometheus monetary samples format with 10 fractional digits. If multiplication or
+aggregation would produce a non-finite value, `/charges` returns HTTP 500 with
+an explicit `{"error":...}` body rather than JSON `null` or Prometheus `inf`.
+
 Only transactions with an identified consumer (gateway Consumer or external
 authenticated identity) are charged — anonymous traffic is not tracked. For
 HTTP, status codes not listed in any pricing tier still record bandwidth (when
@@ -1334,12 +1343,12 @@ available in transaction logs.
 | `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance (global/proxy/proxy_group scope) stamps its own currency onto the charges it records and emits it per row, so instances with different currencies do not overwrite one another |
 | `pricing_tiers` | Array | _(optional)_ | Per-call HTTP-family pricing. Each tier maps ordinary HTTP status codes or canonical effective gRPC status mappings to a per-call price |
 | `pricing_tiers[].status_codes` | Array\<Integer\> | _(required inside a tier)_ | Billable status codes that trigger this tier's charge. Native gRPC and gRPC-Web terminal codes use the documented effective-HTTP mapping. A status code must appear in exactly one tier |
-| `pricing_tiers[].price_per_call` | Number | _(required inside a tier)_ | Charge per HTTP call (e.g. `0.00001`). Must be non-negative |
+| `pricing_tiers[].price_per_call` | Number | _(required inside a tier)_ | Charge per HTTP call (e.g. `0.00001`). Must be finite, non-negative, and ≤ `1e288` so `u64` counter × price stays finite in IEEE-754 binary64 |
 | `bandwidth_pricing` | Object | _(optional)_ | Bandwidth pricing block. Applies to HTTP-family and stream transactions |
-| `bandwidth_pricing.price_per_byte_sent` | Number | `0.0` | Per-byte charge for bytes flowed client→backend. Must be non-negative |
-| `bandwidth_pricing.price_per_byte_received` | Number | `0.0` | Per-byte charge for bytes flowed backend→client. Must be non-negative |
+| `bandwidth_pricing.price_per_byte_sent` | Number | `0.0` | Per-byte charge for bytes flowed client→backend. Finite, non-negative, ≤ `1e288` |
+| `bandwidth_pricing.price_per_byte_received` | Number | `0.0` | Per-byte charge for bytes flowed backend→client. Finite, non-negative, ≤ `1e288` |
 | `stream_connection_pricing` | Object | _(optional)_ | Per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS) |
-| `stream_connection_pricing.price_per_connection` | Number | _(required when block is set)_ | Per-session charge applied at stream disconnect. Must be non-negative |
+| `stream_connection_pricing.price_per_connection` | Number | _(required when block is set)_ | Per-session charge applied at stream disconnect. Finite, non-negative, ≤ `1e288` |
 | `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding |
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it |

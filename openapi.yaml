@@ -1434,6 +1434,13 @@ paths:
         `Authorization: Bearer <token>` credentials.
         Default format is Prometheus text exposition; use `?format=json` for JSON.
 
+        Monetary fields convert stored `u64` counters to IEEE-754 binary64 and
+        multiply them by configured binary64 unit prices. Counters above 2^53
+        follow normal binary64 rounding. Accepted unit prices are finite and at most
+        `1e288` so a single counter×price product stays finite; if aggregation
+        still overflows, this endpoint returns HTTP 500 with an explicit error
+        object instead of JSON `null` or Prometheus `inf`.
+
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
       tags: [Metrics]
@@ -1477,6 +1484,21 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "500":
+          description: |
+            Charge export failed because a monetary sample would be non-finite
+            (for example aggregate overflow). The response body is JSON
+            `{"error":"<message>"}` for both Prometheus and JSON formats so
+            clients never observe JSON null or Prometheus `inf` monetary values.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    example: chargeback monetary aggregate overflowed to a non-finite value
 
   /charges/sink/status:
     get:
@@ -20104,7 +20126,14 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
-                description: Charge per HTTP API call (e.g. 0.00001). Must be non-negative.
+                maximum: 1.0e288
+                description: |
+                  Charge per HTTP API call (e.g. 0.00001). Must be finite,
+                  non-negative, and at most 1e288 so `u64` counter × price stays
+                  finite in IEEE-754 binary64. Stored counters are converted to
+                  binary64 before multiplication, so values above 2^53 follow
+                  normal binary64 rounding; Ferrum applies no additional decimal
+                  rounding. Prometheus formats 10 fractional digits.
           description: |
             HTTP-family per-call pricing. Each tier maps a set of billable
             status codes to a per-call price. Ordinary HTTP uses its wire
@@ -20123,13 +20152,21 @@ components:
             price_per_byte_sent:
               type: number
               minimum: 0
+              maximum: 1.0e288
               default: 0.0
-              description: Per-byte charge for bytes flowed client->backend.
+              description: |
+                Per-byte charge for bytes flowed client->backend. Finite,
+                non-negative, at most 1e288 (same binary64 counter×price bound
+                as `price_per_call`).
             price_per_byte_received:
               type: number
               minimum: 0
+              maximum: 1.0e288
               default: 0.0
-              description: Per-byte charge for bytes flowed backend->client.
+              description: |
+                Per-byte charge for bytes flowed backend->client. Finite,
+                non-negative, at most 1e288 (same binary64 counter×price bound
+                as `price_per_call`).
         stream_connection_pricing:
           type: object
           additionalProperties: false
@@ -20143,7 +20180,11 @@ components:
             price_per_connection:
               type: number
               minimum: 0
-              description: Per-session charge applied at stream disconnect.
+              maximum: 1.0e288
+              description: |
+                Per-session charge applied at stream disconnect. Finite,
+                non-negative, at most 1e288 (same binary64 counter×price bound
+                as `price_per_call`).
         render_cache_ttl_seconds:
           type: integer
           default: 5
@@ -20219,11 +20260,13 @@ components:
                         price_per_byte_sent:
                           type: number
                           exclusiveMinimum: 0
+                          maximum: 1.0e288
                     - required: [price_per_byte_received]
                       properties:
                         price_per_byte_received:
                           type: number
                           exclusiveMinimum: 0
+                          maximum: 1.0e288
             - required: [stream_connection_pricing]
               properties:
                 stream_connection_pricing:
@@ -20233,6 +20276,7 @@ components:
                     price_per_connection:
                       type: number
                       exclusiveMinimum: 0
+                      maximum: 1.0e288
         - if:
             required: [mode]
             properties:
@@ -20340,6 +20384,10 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
+                maximum: 1.0e288
+                description: |
+                  Finite non-negative per-call price at most 1e288 (shared
+                  chargeback binary64 counter×price bound).
           description: HTTP-family per-call pricing by billable status. A status code must appear in at most one tier. A nonempty tiers list satisfies has_any_pricing even when prices are zero.
         bandwidth_pricing:
           type: object
@@ -20348,10 +20396,12 @@ components:
             price_per_byte_sent:
               type: number
               minimum: 0
+              maximum: 1.0e288
               default: 0.0
             price_per_byte_received:
               type: number
               minimum: 0
+              maximum: 1.0e288
               default: 0.0
           description: Optional per-byte pricing for client->backend and backend->client bytes. When this is the only pricing dimension, at least one rate must be strictly greater than zero (has_any_pricing).
         stream_connection_pricing:
@@ -20362,6 +20412,7 @@ components:
             price_per_connection:
               type: number
               minimum: 0
+              maximum: 1.0e288
           description: Optional flat per-session charge for TCP/TCP+TLS/UDP/DTLS disconnects. When this is the only pricing dimension, price_per_connection must be strictly greater than zero (has_any_pricing).
         clickhouse:
           type: object
