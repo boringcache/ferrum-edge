@@ -9,9 +9,7 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
     serialize_json_each_row, write_private_file_atomically_for_tests,
 };
-use ferrum_edge::plugins::chargeback::pricing::{
-    ChargeComputation, MAX_UNIT_PRICE, PricingConfig,
-};
+use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
 use serde_json::{Value, json};
 use wiremock::matchers::method;
@@ -478,13 +476,9 @@ fn sink_rejects_above_maximum_prices_in_both_export_modes() {
                 _ => unreachable!(),
             }
 
-            let error = ApiChargebackSink::new(
-                &config,
-                PluginHttpClient::default(),
-                "ferrum",
-            )
-            .err()
-            .unwrap_or_else(|| panic!("{mode} should reject {field} above MAX_UNIT_PRICE"));
+            let error = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+                .err()
+                .unwrap_or_else(|| panic!("{mode} should reject {field} above MAX_UNIT_PRICE"));
             assert!(
                 error.contains(field) && error.contains("no greater than"),
                 "unexpected {mode} rejection for {field}: {error}"

@@ -1497,7 +1497,8 @@ fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
         "EUR/team-b call row missing\n{prom}"
     );
 
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     let proxies = json["consumers"]["alice"]["proxies"].as_object().unwrap();
     assert_eq!(proxies.len(), 2);
     assert!(proxies.values().any(|proxy| {
@@ -1524,7 +1525,8 @@ fn test_json_top_level_currency_single_when_uniform() {
     registry.record_http(&s, "alice", "proxy-a", "API", 200, 1.0, 0, 0, 0.0, 0.0);
     registry.record_http(&s, "bob", "proxy-b", "API", 200, 1.0, 0, 0, 0.0, 0.0);
 
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     assert_eq!(json["currency"], "GBP");
 }
 
@@ -1593,7 +1595,8 @@ fn test_http_and_stream_share_proxy_id_render_is_deterministic() {
     assert!(http_sent_seen && stream_sent_seen);
 
     // --- JSON: stream sub-object always present, label "mixed", totals reconcile. ---
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     let proxy = &json["consumers"]["alice"]["proxies"]["proxy-1"];
     assert_eq!(proxy["protocol_family"], "mixed");
     // The stream sub-object must be present regardless of iteration order.
@@ -1699,7 +1702,9 @@ fn test_price_above_max_unit_price_is_rejected() {
     });
     let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(
-        err.contains("1e288") || err.contains(&MAX_UNIT_PRICE.to_string()) || err.contains("no greater than"),
+        err.contains("1e288")
+            || err.contains(&MAX_UNIT_PRICE.to_string())
+            || err.contains("no greater than"),
         "unexpected error: {err}"
     );
 }

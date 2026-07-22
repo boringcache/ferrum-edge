@@ -2503,11 +2503,7 @@ impl SnapshotTotals {
     fn delta_since(self, last: SnapshotTotals) -> Result<SnapshotTotals, String> {
         Ok(SnapshotTotals {
             call_count: self.call_count.saturating_sub(last.call_count),
-            charge_call: non_negative_delta(
-                self.charge_call,
-                last.charge_call,
-                "charge_call",
-            )?,
+            charge_call: non_negative_delta(self.charge_call, last.charge_call, "charge_call")?,
             bytes_sent: self.bytes_sent.saturating_sub(last.bytes_sent),
             bytes_received: self.bytes_received.saturating_sub(last.bytes_received),
             charge_bytes_sent: non_negative_delta(
@@ -2520,11 +2516,7 @@ impl SnapshotTotals {
                 last.charge_bytes_received,
                 "charge_bytes_received",
             )?,
-            charge_total: non_negative_delta(
-                self.charge_total,
-                last.charge_total,
-                "charge_total",
-            )?,
+            charge_total: non_negative_delta(self.charge_total, last.charge_total, "charge_total")?,
         })
     }
 

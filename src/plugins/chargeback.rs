@@ -98,9 +98,7 @@ pub mod pricing {
     /// Add two monetary values, rejecting non-finite sums.
     pub fn checked_add_charge(lhs: f64, rhs: f64) -> Result<f64, String> {
         if !lhs.is_finite() || !rhs.is_finite() {
-            return Err(
-                "chargeback cannot add a non-finite monetary value".to_string(),
-            );
+            return Err("chargeback cannot add a non-finite monetary value".to_string());
         }
         let sum = lhs + rhs;
         if !sum.is_finite() {
