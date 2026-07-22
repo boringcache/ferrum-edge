@@ -151,6 +151,7 @@ async fn test_statsd_logging_rejects_malformed_and_out_of_range_batching() {
         json!({"host": host, "flush_interval_ms": []}),
         json!({"host": host, "flush_interval_ms": {}}),
         json!({"host": host, "flush_interval_ms": 49}),
+        json!({"host": host, "flush_interval_ms": 600_001}),
         json!({"host": host, "buffer_capacity": null}),
         json!({"host": host, "buffer_capacity": false}),
         json!({"host": host, "buffer_capacity": 0}),
@@ -179,7 +180,7 @@ async fn test_statsd_logging_rejects_malformed_and_out_of_range_batching() {
             "host": host,
             "max_batch_lines": 1,
             "buffer_capacity": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 600_000,
             "max_retries": 10,
             "retry_delay_ms": 60_000
         }),

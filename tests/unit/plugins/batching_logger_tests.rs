@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, DeferredBatchingLogger, LoggerHooks,
-    MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
-    build_batch_config, handle_http_batch_response, parse_custom_headers, parse_http_endpoint,
-    validate_batch_config, wait_until_committed,
+    MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
+    MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config, handle_http_batch_response,
+    parse_custom_headers, parse_http_endpoint, validate_batch_config, wait_until_committed,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
@@ -91,6 +91,7 @@ fn build_batch_config_rejects_out_of_range_values() {
         json!({"buffer_capacity": 0}),
         json!({"buffer_capacity": MAX_BUFFER_CAPACITY as u64 + 1}),
         json!({"flush_interval_ms": 1}),
+        json!({"flush_interval_ms": MAX_BATCH_FLUSH_INTERVAL_MS + 1}),
         json!({"max_retries": MAX_BATCH_RETRIES + 1}),
         json!({"retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS + 1}),
     ] {
@@ -127,6 +128,7 @@ fn build_batch_config_applies_defaults_and_valid_boundaries() {
         &json!({
             "batch_size": MAX_BATCH_SIZE,
             "buffer_capacity": MAX_BUFFER_CAPACITY,
+            "flush_interval_ms": MAX_BATCH_FLUSH_INTERVAL_MS,
             "max_retries": MAX_BATCH_RETRIES,
             "retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS
         }),
@@ -136,6 +138,10 @@ fn build_batch_config_applies_defaults_and_valid_boundaries() {
     .expect("valid upper boundaries");
     assert_eq!(upper.batch_size, MAX_BATCH_SIZE);
     assert_eq!(upper.buffer_capacity, MAX_BUFFER_CAPACITY);
+    assert_eq!(
+        upper.flush_interval,
+        Duration::from_millis(MAX_BATCH_FLUSH_INTERVAL_MS)
+    );
     assert_eq!(upper.retry.max_attempts, (MAX_BATCH_RETRIES + 1) as u32);
     assert_eq!(
         upper.retry.delay,
@@ -195,6 +201,10 @@ fn validate_batch_config_rejects_malformed_and_out_of_range_values() {
             "buffer_capacity",
         ),
         (json!({"flush_interval_ms": 99}), "flush_interval_ms"),
+        (
+            json!({"flush_interval_ms": MAX_BATCH_FLUSH_INTERVAL_MS + 1}),
+            "flush_interval_ms",
+        ),
         (json!({"max_retries": MAX_BATCH_RETRIES + 1}), "max_retries"),
         (
             json!({"retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS + 1}),
@@ -229,7 +239,7 @@ fn validate_batch_config_rejects_malformed_and_out_of_range_values() {
             &json!({
                 "batch_size": MAX_BATCH_SIZE,
                 "buffer_capacity": MAX_BUFFER_CAPACITY,
-                "flush_interval_ms": 100,
+                "flush_interval_ms": MAX_BATCH_FLUSH_INTERVAL_MS,
                 "max_retries": MAX_BATCH_RETRIES,
                 "retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS
             }),

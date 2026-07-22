@@ -124,8 +124,9 @@ must name a `FERRUM_*` variable.
 
 A failed ClickHouse export uses `retry.max_attempts` total attempts (including
 the initial try; valid range **1–32**). `0` is rejected rather than silently
-rewritten. Batch `size` is capped at **10000** to match the shared
-`BatchingLogger` hard maximum. Each of `retry.initial_delay_ms` and
+rewritten. Batch `size` is capped at **10000** and `flush_interval_ms` at
+**600000** to match the shared `BatchingLogger` admission limits. Each of
+`retry.initial_delay_ms` and
 `retry.max_delay_ms` is capped at **60000** ms. The inter-attempt delay uses
 **bounded exponential backoff**: it starts at `retry.initial_delay_ms` and
 doubles each attempt, capped at `retry.max_delay_ms` (which must be

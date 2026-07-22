@@ -4110,6 +4110,7 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         schema["properties"]["retry_delay_ms"]["maximum"],
         json!(LOKI_MAX_RETRY_DELAY_MS)
     );
+    assert_eq!(schema["properties"]["flush_interval_ms"]["maximum"], 600000);
     assert_eq!(
         schema["properties"]["custom_headers"]["propertyNames"]["maxLength"],
         json!(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES)
@@ -4124,7 +4125,7 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         "include_status_class_label": true,
         "gzip": false,
         "batch_size": 10000,
-        "flush_interval_ms": 100,
+        "flush_interval_ms": 600000,
         "buffer_capacity": 1000000,
         "max_entry_bytes": LOKI_MAX_MAX_ENTRY_BYTES,
         "buffer_max_bytes": LOKI_MAX_BUFFER_MAX_BYTES,
@@ -4161,6 +4162,7 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         json!({"endpoint_url": "https://logs.example.com/push", "custom_headers": {"X-Bad": "bad\nvalue"}}),
         json!({"endpoint_url": "https://logs.example.com/push", "batch_size": 10001}),
         json!({"endpoint_url": "https://logs.example.com/push", "flush_interval_ms": 99}),
+        json!({"endpoint_url": "https://logs.example.com/push", "flush_interval_ms": 600001}),
         json!({"endpoint_url": "https://logs.example.com/push", "buffer_capacity": 1000001}),
         json!({"endpoint_url": "https://logs.example.com/push", "max_retries": 11}),
         json!({"endpoint_url": "https://logs.example.com/push", "retry_delay_ms": 0}),
@@ -4321,6 +4323,7 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
     assert_eq!(schema["properties"]["max_batch_lines"]["maximum"], 10000);
     assert_eq!(schema["properties"]["buffer_capacity"]["minimum"], 1);
     assert_eq!(schema["properties"]["buffer_capacity"]["maximum"], 1000000);
+    assert_eq!(schema["properties"]["flush_interval_ms"]["maximum"], 600000);
     assert_eq!(schema["properties"]["max_retries"]["maximum"], 10);
     assert_eq!(schema["properties"]["retry_delay_ms"]["maximum"], 60000);
 
@@ -4329,6 +4332,7 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         json!({"host": "statsd.example.test", "max_batch_lines": 10001}),
         json!({"host": "statsd.example.test", "buffer_capacity": 0}),
         json!({"host": "statsd.example.test", "flush_interval_ms": 49}),
+        json!({"host": "statsd.example.test", "flush_interval_ms": 600001}),
         json!({"host": "statsd.example.test", "max_retries": 11}),
         json!({"host": "statsd.example.test", "retry_delay_ms": 60001}),
         json!({"host": "statsd.example.test", "flush_interval_ms": "60000"}),
@@ -6212,12 +6216,23 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
                     "type": "http",
                     "endpoint_url": "https://audit.example.com/ingest",
                     "custom_headers": {"Authorization": "Bearer ${AUDIT_TOKEN}"},
+                    "flush_interval_ms": 600000,
                     "retry_delay_ms": 250
                 },
                 "capture": null,
                 "privacy": null
             }),
             true,
+        ),
+        (
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest",
+                    "flush_interval_ms": 600001
+                }
+            }),
+            false,
         ),
         (
             json!({

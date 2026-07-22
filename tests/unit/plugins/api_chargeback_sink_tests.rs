@@ -245,6 +245,7 @@ async fn config_validation_rejects_batch_and_retry_clamp_candidates() {
         ("batch.size", json!(10_001)),
         ("batch.size", json!(100_000)),
         ("batch.buffer_capacity", json!(1_000_001)),
+        ("batch.flush_interval_ms", json!(600_001)),
         ("retry.max_attempts", json!(0)),
         ("retry.max_attempts", json!(33)),
         ("retry.max_attempts", json!(4_294_967_295u64)),
@@ -255,6 +256,9 @@ async fn config_validation_rejects_batch_and_retry_clamp_candidates() {
         match path {
             "batch.size" => config["batch"]["size"] = value.clone(),
             "batch.buffer_capacity" => config["batch"]["buffer_capacity"] = value.clone(),
+            "batch.flush_interval_ms" => {
+                config["batch"]["flush_interval_ms"] = value.clone()
+            }
             "retry.max_attempts" => config["retry"]["max_attempts"] = value.clone(),
             "retry.initial_delay_ms" => config["retry"]["initial_delay_ms"] = value.clone(),
             "retry.max_delay_ms" => {
@@ -275,6 +279,7 @@ async fn config_validation_rejects_batch_and_retry_clamp_candidates() {
     let mut ok = valid_config(temp.path());
     ok["batch"]["size"] = json!(10_000);
     ok["batch"]["buffer_capacity"] = json!(1);
+    ok["batch"]["flush_interval_ms"] = json!(600_000);
     ok["retry"]["max_attempts"] = json!(1);
     assert!(
         ApiChargebackSink::new(&ok, PluginHttpClient::default(), "ferrum").is_ok(),

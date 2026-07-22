@@ -8,8 +8,8 @@ use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
 use super::response_body::{BoundedReadError, measure_response_body_bounded};
 use super::{
-    BatchConfig, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
-    RetryPolicy,
+    BatchConfig, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS,
+    MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
 };
 
 /// Hard cap on acknowledgement bodies drained from HTTP log sinks.
@@ -90,7 +90,8 @@ pub async fn drain_http_batch_response_body(response: reqwest::Response) -> Http
 /// Sink-specific defaults and minima for shared batch admission.
 ///
 /// Maxima for batch size, buffer capacity, retries, and retry delay are shared
-/// constants ([`MAX_BATCH_SIZE`], [`MAX_BUFFER_CAPACITY`], [`MAX_BATCH_RETRIES`],
+/// constants ([`MAX_BATCH_SIZE`], [`MAX_BUFFER_CAPACITY`],
+/// [`MAX_BATCH_FLUSH_INTERVAL_MS`], [`MAX_BATCH_RETRIES`], and
 /// [`MAX_BATCH_RETRY_DELAY_MS`]) so validation and builder cannot drift.
 #[derive(Clone, Copy)]
 pub struct BatchConfigDefaults {
@@ -179,7 +180,7 @@ fn admit_batch_fields(
         "flush_interval_ms",
         defaults.flush_interval_ms,
         defaults.min_flush_interval_ms,
-        u64::MAX,
+        MAX_BATCH_FLUSH_INTERVAL_MS,
     )?;
     let buffer_capacity = admit_batch_u64(
         config,
@@ -248,7 +249,8 @@ pub fn build_batch_config(
 /// documented minima/maxima (including values the historical builder would have
 /// silently clamped). Sink-specific keys and minima come from `defaults`;
 /// shared maxima are [`MAX_BATCH_SIZE`], [`MAX_BUFFER_CAPACITY`],
-/// [`MAX_BATCH_RETRIES`], and [`MAX_BATCH_RETRY_DELAY_MS`].
+/// [`MAX_BATCH_FLUSH_INTERVAL_MS`], [`MAX_BATCH_RETRIES`], and
+/// [`MAX_BATCH_RETRY_DELAY_MS`].
 pub fn validate_batch_config(
     config: &Value,
     plugin_name: &'static str,

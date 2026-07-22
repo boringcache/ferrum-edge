@@ -19,6 +19,11 @@ const DROP_WARN_EVERY: u64 = 100;
 pub const MAX_BATCH_SIZE: usize = 10_000;
 /// Hard ceiling for an admitted channel capacity across shared logging sinks.
 pub const MAX_BUFFER_CAPACITY: usize = 1_000_000;
+/// Hard ceiling for admitted batch flush intervals.
+///
+/// Besides bounding operator mistakes, this keeps Tokio interval arithmetic
+/// safely inside every supported platform's `Instant` range.
+pub const MAX_BATCH_FLUSH_INTERVAL_MS: u64 = 600_000;
 /// Hard ceiling for admitted `max_retries` (retries after the initial attempt).
 pub const MAX_BATCH_RETRIES: u64 = 10;
 /// Hard ceiling for admitted `retry_delay_ms` across shared logging sinks.

@@ -196,6 +196,7 @@ async fn test_loki_logging_strict_config_admission_and_bounds() {
         json!({"endpoint_url": endpoint, "batch_size": 10001}),
         json!({"endpoint_url": endpoint, "buffer_capacity": 1000001}),
         json!({"endpoint_url": endpoint, "flush_interval_ms": 99}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": 600001}),
         json!({"endpoint_url": endpoint, "max_retries": 11}),
         json!({"endpoint_url": endpoint, "retry_delay_ms": 0}),
         json!({"endpoint_url": endpoint, "max_entry_bytes": 1023}),

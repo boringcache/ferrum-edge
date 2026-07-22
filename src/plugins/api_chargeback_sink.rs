@@ -36,8 +36,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use super::chargeback::pricing::{ChargeComputation, PricingConfig};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
 use super::utils::{
-    BatchConfig, BatchingLogger, LoggerHooks, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
-    PluginHttpClient, RetryPolicy, wait_until_committed,
+    BatchConfig, BatchingLogger, LoggerHooks, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE,
+    MAX_BUFFER_CAPACITY, PluginHttpClient, RetryPolicy, wait_until_committed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -1469,9 +1469,11 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: batch.buffer_capacity must be between 1 and {MAX_BUFFER_CAPACITY}"
         ));
     }
-    if config.batch.flush_interval_ms == 0 {
+    if config.batch.flush_interval_ms == 0
+        || config.batch.flush_interval_ms > MAX_BATCH_FLUSH_INTERVAL_MS
+    {
         return Err(format!(
-            "{PLUGIN_NAME}: batch.flush_interval_ms must be at least 1"
+            "{PLUGIN_NAME}: batch.flush_interval_ms must be between 1 and {MAX_BATCH_FLUSH_INTERVAL_MS}"
         ));
     }
     if config.retry.max_attempts == 0 || config.retry.max_attempts > MAX_RETRY_MAX_ATTEMPTS {

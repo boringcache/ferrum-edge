@@ -262,6 +262,7 @@ async fn test_udp_logging_rejects_malformed_and_out_of_range_batching() {
         json!({"host": "127.0.0.1", "port": 9514, "buffer_capacity": 0}),
         json!({"host": "127.0.0.1", "port": 9514, "buffer_capacity": 1_000_001}),
         json!({"host": "127.0.0.1", "port": 9514, "flush_interval_ms": 99}),
+        json!({"host": "127.0.0.1", "port": 9514, "flush_interval_ms": 600_001}),
         json!({"host": "127.0.0.1", "port": 9514, "max_retries": 11}),
         json!({"host": "127.0.0.1", "port": 9514, "retry_delay_ms": 60_001}),
     ] {
@@ -278,7 +279,7 @@ async fn test_udp_logging_rejects_malformed_and_out_of_range_batching() {
                 "port": 9514,
                 "batch_size": 1,
                 "buffer_capacity": 1,
-                "flush_interval_ms": 100,
+                "flush_interval_ms": 600_000,
                 "max_retries": 10,
                 "retry_delay_ms": 0
             }),

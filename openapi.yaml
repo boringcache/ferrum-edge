@@ -11282,6 +11282,7 @@ components:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
@@ -11369,6 +11370,7 @@ components:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
@@ -11512,6 +11514,7 @@ components:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
@@ -11769,6 +11772,7 @@ components:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
@@ -11911,6 +11915,7 @@ components:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
@@ -12032,6 +12037,7 @@ components:
           type: integer
           default: 500
           minimum: 50
+          maximum: 600000
           description: Max milliseconds before flushing buffered metrics
         buffer_capacity:
           type: integer
@@ -18054,6 +18060,7 @@ components:
             flush_interval_ms:
               type: integer
               minimum: 100
+              maximum: 600000
               default: 1000
             buffer_capacity:
               type: integer
@@ -20354,6 +20361,7 @@ components:
             flush_interval_ms:
               type: integer
               minimum: 1
+              maximum: 600000
               default: 2000
             buffer_capacity:
               type: integer

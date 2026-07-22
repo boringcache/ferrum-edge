@@ -262,6 +262,7 @@ async fn test_http_logging_rejects_malformed_and_out_of_range_batching() {
         json!({"endpoint_url": endpoint, "flush_interval_ms": null}),
         json!({"endpoint_url": endpoint, "flush_interval_ms": "100"}),
         json!({"endpoint_url": endpoint, "flush_interval_ms": 99}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": 600_001}),
         json!({"endpoint_url": endpoint, "max_retries": null}),
         json!({"endpoint_url": endpoint, "max_retries": 11}),
         json!({"endpoint_url": endpoint, "retry_delay_ms": null}),
@@ -279,7 +280,7 @@ async fn test_http_logging_rejects_malformed_and_out_of_range_batching() {
                 "endpoint_url": endpoint,
                 "batch_size": 1,
                 "buffer_capacity": 1,
-                "flush_interval_ms": 100,
+                "flush_interval_ms": 600_000,
                 "max_retries": 10,
                 "retry_delay_ms": 0
             }),
