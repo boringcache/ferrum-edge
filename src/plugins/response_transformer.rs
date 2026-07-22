@@ -756,6 +756,12 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return;
         }
+        // Finalized cache/idempotent replays already carry post-transform
+        // headers. Consume any route override without re-applying it.
+        if ctx.finalized_response_replay {
+            let _ = ctx.route_override_response_transform.take();
+            return;
+        }
         self.apply_static_header_rules(response_headers, false, None);
         if let Some(route_rules) = ctx.route_override_response_transform.take() {
             apply_route_header_transforms(route_rules.as_ref(), response_headers);
@@ -964,6 +970,15 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return PluginResult::Continue;
         }
+        // `response_caching` HIT/REVALIDATED and idempotent replays store the
+        // final post-transform header map. Re-running static or route-level
+        // sequences (especially non-idempotent `add`) would mutate the cached
+        // representation. Consume the route override so a later sibling cannot
+        // apply it either; leave the replayed headers untouched.
+        if ctx.finalized_response_replay {
+            let _ = ctx.route_override_response_transform.take();
+            return PluginResult::Continue;
+        }
         // Collect fired whole-value writes only when a terminal replacement
         // rebuild could consult them, keeping the common path allocation-free.
         let track_owned = ctx.has_buffered_deadline_response_header_provenance();
@@ -1080,6 +1095,13 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        // Defense in depth: the shared synthetic path already skips ordinary
+        // presentation transforms when `finalized_response_replay` is set.
+        // Returning `None` here keeps direct callers from re-mutating a cached
+        // final body if they forget that gate.
+        if ctx.finalized_response_replay {
+            return None;
+        }
         if framed_grpc_request_without_proven_media_type(ctx, body) {
             return None;
         }

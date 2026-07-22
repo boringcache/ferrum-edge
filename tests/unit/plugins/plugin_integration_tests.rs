@@ -46,7 +46,10 @@ async fn run_buffered_response_lifecycle(
     mut response_headers: HashMap<String, String>,
     mut response_body: Vec<u8>,
 ) -> (u16, HashMap<String, String>, Vec<u8>) {
-    let mut proxy_headers = HashMap::new();
+    // Production `before_proxy` receives the live request header map (or a
+    // moved copy of `ctx.headers`), never an empty map. Cache key construction
+    // / Vary snapshots must see the same credentials as a later HIT lookup.
+    let mut proxy_headers = ctx.headers.clone();
     for plugin in plugins {
         if let Some((status_code, body, headers)) =
             reject_parts(plugin.before_proxy(ctx, &mut proxy_headers).await)
@@ -631,6 +634,413 @@ async fn test_response_caching_stores_transformed_body() {
     assert_eq!(status_code, 200);
     assert_eq!(String::from_utf8(body).unwrap(), r#"{"message":"gateway"}"#);
     assert_eq!(headers.get("x-cache-status"), Some(&"HIT".to_string()));
+    assert!(
+        ferrum_edge::_test_support::finalized_response_replay_for_test(&hit_ctx),
+        "HIT must mark the private finalized-replay capability"
+    );
+}
+
+/// #2381: store final post-transform representation; full synthetic HIT
+/// finalizer must not re-apply non-idempotent body or header sequences.
+#[tokio::test]
+async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
+    use ferrum_edge::_test_support::{
+        finalize_plugin_rejection_for_test, finalized_response_replay_for_test,
+    };
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RawRouteHeaderTransformRule, parse_route_header_transforms,
+    };
+
+    let plugins = sort_plugins(vec![
+        create_plugin(
+            "response_caching",
+            &json!({
+                "ttl_seconds": 60,
+                "add_cache_status_header": true,
+                "cache_key_include_consumer": true,
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+        create_plugin(
+            "response_transformer",
+            &json!({
+                "apply_route_overrides": true,
+                "rules": [
+                    {
+                        "target": "body",
+                        "operation": "rename",
+                        "key": "a",
+                        "new_key": "b"
+                    },
+                    {
+                        "target": "body",
+                        "operation": "add",
+                        "key": "a",
+                        "value": "second"
+                    },
+                    {
+                        "target": "header",
+                        "operation": "rename",
+                        "key": "x-a",
+                        "new_key": "x-b"
+                    },
+                    {
+                        "target": "header",
+                        "operation": "add",
+                        "key": "x-a",
+                        "value": "second"
+                    }
+                ]
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+        create_plugin(
+            "response_transformer",
+            &json!({
+                "rules": [
+                    {
+                        "target": "header",
+                        "operation": "add",
+                        "key": "x-second-transformer",
+                        "value": "sibling"
+                    }
+                ]
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+    ]);
+
+    let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "add", "target": "header", "key": "x-route-add", "value": "route"}
+    ]))
+    .unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "test.route").unwrap());
+
+    // Miss: transform once and store the final representation.
+    let mut miss_ctx = create_response_context("/cache-non-idempotent");
+    miss_ctx.route_override_response_transform = Some(route_rules.clone());
+    let mut miss_headers = HashMap::new();
+    miss_headers.insert("content-type".to_string(), "application/json".to_string());
+    miss_headers.insert("x-a".to_string(), "origin".to_string());
+    miss_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+
+    let (status, headers, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        miss_headers,
+        br#"{"a":"origin"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let miss_body = String::from_utf8(body).unwrap();
+    assert_eq!(miss_body, r#"{"b":"origin","a":"second"}"#);
+    assert_eq!(headers.get("x-b").map(String::as_str), Some("origin"));
+    assert_eq!(headers.get("x-a").map(String::as_str), Some("second"));
+    assert_eq!(
+        headers.get("x-second-transformer").map(String::as_str),
+        Some("sibling")
+    );
+    assert_eq!(headers.get("x-route-add").map(String::as_str), Some("route"));
+
+    // HIT: run the production synthetic rejection finalizer (inspect +
+    // transform gate + final hooks + reject-path after_proxy).
+    let mut hit_ctx = create_response_context("/cache-non-idempotent");
+    hit_ctx.route_override_response_transform = Some(route_rules);
+    let mut proxy_headers = hit_ctx.headers.clone();
+    let mut cache_hit = None;
+    for plugin in &plugins {
+        match plugin.before_proxy(&mut hit_ctx, &mut proxy_headers).await {
+            PluginResult::Continue => {}
+            result @ PluginResult::Reject { .. } | result @ PluginResult::RejectBinary { .. } => {
+                cache_hit = Some(result);
+                break;
+            }
+        }
+    }
+    let hit = cache_hit.expect("expected response_caching HIT");
+    assert!(finalized_response_replay_for_test(&hit_ctx));
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut hit_ctx, hit).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(
+                String::from_utf8(body.to_vec()).unwrap(),
+                r#"{"b":"origin","a":"second"}"#,
+                "HIT must replay the stored miss body, not re-apply rename+add"
+            );
+            assert_eq!(
+                headers.get("x-b").map(String::as_str),
+                Some("origin"),
+                "static header rename+add must not overwrite x-b on HIT"
+            );
+            assert_eq!(
+                headers.get("x-a").map(String::as_str),
+                Some("second"),
+                "static header rename+add must not reshape x-a on HIT"
+            );
+            assert_eq!(
+                headers.get("x-second-transformer").map(String::as_str),
+                Some("sibling"),
+                "second transformer instance must not re-mutate HIT headers"
+            );
+            assert_eq!(
+                headers.get("x-route-add").map(String::as_str),
+                Some("route"),
+                "route-level header add must not append again on HIT"
+            );
+            assert_eq!(headers.get("x-cache-status").map(String::as_str), Some("HIT"));
+        }
+        other => panic!("expected finalized HIT RejectBinary, got {other:?}"),
+    }
+    assert!(
+        hit_ctx.route_override_response_transform.is_none(),
+        "finalized replay must consume unused route overrides without applying them"
+    );
+}
+
+/// #2381: REVALIDATED keeps validators-only headers and skips representation
+/// transforms (body rewrite would have stripped ETag, so this path is
+/// header-focused).
+#[tokio::test]
+async fn test_response_cache_revalidated_lifecycle_skips_header_transforms() {
+    use ferrum_edge::_test_support::{
+        finalize_plugin_rejection_for_test, finalized_response_replay_for_test,
+    };
+    use ferrum_edge::plugins::utils::route_header_transform::{
+        RawRouteHeaderTransformRule, parse_route_header_transforms,
+    };
+
+    let plugins = sort_plugins(vec![
+        create_plugin(
+            "response_caching",
+            &json!({
+                "ttl_seconds": 60,
+                "add_cache_status_header": true,
+                "cache_key_include_consumer": true,
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+        create_plugin(
+            "response_transformer",
+            &json!({
+                "apply_route_overrides": true,
+                "rules": [
+                    {
+                        "target": "header",
+                        "operation": "rename",
+                        "key": "x-a",
+                        "new_key": "x-b"
+                    },
+                    {
+                        "target": "header",
+                        "operation": "add",
+                        "key": "x-a",
+                        "value": "second"
+                    }
+                ]
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+    ]);
+
+    let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "add", "target": "header", "key": "x-route-add", "value": "route"}
+    ]))
+    .unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "test.route").unwrap());
+
+    let mut miss_ctx = create_response_context("/cache-revalidated");
+    miss_ctx.route_override_response_transform = Some(route_rules.clone());
+    let mut miss_headers = HashMap::new();
+    miss_headers.insert("content-type".to_string(), "application/json".to_string());
+    miss_headers.insert("etag".to_string(), "\"v1\"".to_string());
+    miss_headers.insert("x-a".to_string(), "origin".to_string());
+    miss_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+
+    let (status, headers, _) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        miss_headers,
+        br#"{"ok":true}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("etag").map(String::as_str), Some("\"v1\""));
+    assert_eq!(headers.get("x-b").map(String::as_str), Some("origin"));
+    assert_eq!(headers.get("x-a").map(String::as_str), Some("second"));
+    assert_eq!(headers.get("x-route-add").map(String::as_str), Some("route"));
+
+    let mut reval_ctx = create_response_context("/cache-revalidated");
+    reval_ctx.route_override_response_transform = Some(route_rules);
+    let mut reval_headers = reval_ctx.headers.clone();
+    reval_headers.insert("if-none-match".to_string(), "\"v1\"".to_string());
+    let mut revalidated = None;
+    for plugin in &plugins {
+        match plugin
+            .before_proxy(&mut reval_ctx, &mut reval_headers)
+            .await
+        {
+            PluginResult::Continue => {}
+            result @ PluginResult::Reject { .. } | result @ PluginResult::RejectBinary { .. } => {
+                revalidated = Some(result);
+                break;
+            }
+        }
+    }
+    let revalidated = revalidated.expect("expected response_caching REVALIDATED");
+    assert!(finalized_response_replay_for_test(&reval_ctx));
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut reval_ctx, revalidated).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 304);
+            assert!(body.is_empty());
+            assert_eq!(headers.get("etag").map(String::as_str), Some("\"v1\""));
+            assert!(
+                !headers.contains_key("x-a")
+                    && !headers.contains_key("x-b")
+                    && !headers.contains_key("x-route-add"),
+                "REVALIDATED must keep not-modified validators only; got {headers:?}"
+            );
+            assert_eq!(
+                headers.get("x-cache-status").map(String::as_str),
+                Some("REVALIDATED")
+            );
+        }
+        other => panic!("expected finalized REVALIDATED RejectBinary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_finalized_response_replay_is_not_spoofable_via_metadata() {
+    use ferrum_edge::_test_support::finalize_plugin_rejection_for_test;
+
+    let transformer = create_plugin(
+        "response_transformer",
+        &json!({
+            "rules": [
+                {
+                    "target": "body",
+                    "operation": "rename",
+                    "key": "a",
+                    "new_key": "b"
+                },
+                {
+                    "target": "body",
+                    "operation": "add",
+                    "key": "a",
+                    "value": "second"
+                },
+                {
+                    "target": "header",
+                    "operation": "rename",
+                    "key": "x-a",
+                    "new_key": "x-b"
+                },
+                {
+                    "target": "header",
+                    "operation": "add",
+                    "key": "x-a",
+                    "value": "second"
+                }
+            ]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let plugins = sort_plugins(vec![transformer]);
+
+    // Unrelated synthetic short-circuit without the private capability must
+    // still run ordinary presentation transforms. Spoofed public metadata
+    // must not suppress them.
+    let mut ctx = create_response_context("/spoof-check");
+    ctx.metadata.insert(
+        "ferrum:synthetic_short_circuit".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata
+        .insert("finalized_response_replay".to_string(), "true".to_string());
+    ctx.metadata.insert(
+        "ferrum:finalized_response_replay".to_string(),
+        "true".to_string(),
+    );
+    assert!(!ferrum_edge::_test_support::finalized_response_replay_for_test(
+        &ctx
+    ));
+
+    let ordinary = PluginResult::RejectBinary {
+        status_code: 200,
+        body: bytes::Bytes::from_static(br#"{"a":"origin"}"#),
+        headers: HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-a".to_string(), "origin".to_string()),
+        ]),
+    };
+    match finalize_plugin_rejection_for_test(&plugins, &mut ctx, ordinary).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(
+                String::from_utf8(body.to_vec()).unwrap(),
+                r#"{"b":"origin","a":"second"}"#,
+                "metadata spoofing must not suppress body transforms"
+            );
+            assert_eq!(
+                headers.get("x-b").map(String::as_str),
+                Some("origin"),
+                "metadata spoofing must not suppress header rename"
+            );
+            assert_eq!(
+                headers.get("x-a").map(String::as_str),
+                Some("second"),
+                "metadata spoofing must not suppress header add after rename"
+            );
+        }
+        other => panic!("expected transformed synthetic response, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_h1_h2_h3_reject_paths_share_finalized_replay_chokepoint() {
+    // Behavioral coverage above exercises
+    // `apply_reject_after_proxy_and_synthetic_body_hooks`. Pin that every
+    // frontend reject surface reaches that shared helper so HIT/REVALIDATED
+    // finalized-replay skipping stays protocol-parity.
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert!(
+        h1_h2.contains("apply_reject_after_proxy_and_synthetic_body_hooks(")
+            && h1_h2.contains("ctx.finalized_response_replay"),
+        "H1/H2 reject finalizer must gate presentation transforms on finalized_response_replay"
+    );
+    assert!(
+        h3.contains("apply_reject_after_proxy_and_synthetic_body_hooks("),
+        "native H3 reject path must use the shared synthetic finalizer"
+    );
+    assert!(
+        h3_cross.contains("apply_reject_after_proxy_and_synthetic_body_hooks(")
+            || h3_cross.contains("crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks("),
+        "H3 cross-protocol reject path must use the shared synthetic finalizer"
+    );
 }
 
 #[tokio::test]

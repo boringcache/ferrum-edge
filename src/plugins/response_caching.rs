@@ -1752,6 +1752,12 @@ impl Plugin for ResponseCaching {
                     // lookup staging so a later final hook cannot mix it with
                     // another instance's store path.
                     self.clear_lookup_staging(ctx);
+                    // Stored validators/headers are already the final
+                    // post-transform representation. Mark the private finalized
+                    // replay capability so synthetic presentation transforms
+                    // (body + response_transformer header rules) do not mutate
+                    // them again while inspection/final hooks still run.
+                    ctx.finalized_response_replay = true;
                     return PluginResult::RejectBinary {
                         status_code: 304,
                         body: Bytes::new(),
@@ -1764,6 +1770,10 @@ impl Plugin for ResponseCaching {
                 self.add_cache_status_header(&mut headers, "HIT");
                 self.set_cache_status(ctx, "HIT");
                 self.clear_lookup_staging(ctx);
+                // Same finalized-replay contract as REVALIDATED / idempotent
+                // replay: the entry was stored after transform_response_body
+                // and after_proxy header rules on the miss path.
+                ctx.finalized_response_replay = true;
 
                 return PluginResult::RejectBinary {
                     status_code: entry.status_code,

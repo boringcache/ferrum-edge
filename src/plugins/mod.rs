@@ -1823,14 +1823,16 @@ pub struct RequestContext {
     /// bounded by the configured deduplication instances on the matched proxy.
     pub(crate) request_deduplication_states:
         HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
-    /// Whether `request_deduplication` supplied an already-finalized committed
-    /// representation for this request. The shared synthetic rejection path
-    /// must not run ordinary presentation transforms over it again. Inspection
-    /// and final-body validation still run over the replayed client
-    /// representation, and a current redaction decision can require its own
-    /// transform or fail closed.
-    /// Kept private so request metadata cannot suppress response inspection.
-    pub(crate) deduplication_replay_response_finalized: bool,
+    /// Whether this request is replaying an already-finalized client
+    /// representation — a `response_caching` HIT/REVALIDATED or a
+    /// `request_deduplication` idempotent replay. The shared synthetic
+    /// rejection path must not run ordinary presentation transforms (body or
+    /// response-header rewrite rules) over it again. Inspection and final-body
+    /// validation still run over the replayed client representation, and a
+    /// current redaction decision can require its own transform or fail closed.
+    /// Kept private so request metadata cannot suppress transforms or inspection,
+    /// and unrelated synthetic short-circuits cannot opt into the skip.
+    pub(crate) finalized_response_replay: bool,
     /// Deduplication instances whose in-flight ownership can be released after
     /// a serverless rejection proven to occur before external invocation. Each
     /// committed hook consumes only its own entry, preserving exactly-once
@@ -2249,7 +2251,7 @@ impl RequestContext {
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
-            deduplication_replay_response_finalized: false,
+            finalized_response_replay: false,
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
@@ -2933,7 +2935,7 @@ impl RequestContext {
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
-            deduplication_replay_response_finalized: self.deduplication_replay_response_finalized,
+            finalized_response_replay: self.finalized_response_replay,
             serverless_pre_invocation_rejection_owners: self
                 .serverless_pre_invocation_rejection_owners
                 .clone(),
@@ -6308,7 +6310,8 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Whether this plugin's response inspection just determined that its
-    /// transform is required to make an already-finalized deduplication replay
+    /// transform is required to make an already-finalized response replay
+    /// (`response_caching` HIT/REVALIDATED or `request_deduplication` replay)
     /// safe under current policy.
     ///
     /// Ordinary presentation transforms do not run twice over replayed bytes.
