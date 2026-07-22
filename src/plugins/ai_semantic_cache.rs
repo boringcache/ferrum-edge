@@ -1925,7 +1925,7 @@ impl Plugin for AiSemanticCache {
         body: &[u8],
     ) -> PluginResult {
         // Only cache successful JSON responses
-        if !(200..300).contains(&response_status) {
+        if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
 
@@ -1963,16 +1963,26 @@ impl Plugin for AiSemanticCache {
             None => return PluginResult::Continue,
         };
 
-        // Don't cache streaming responses
+        // Cache admission is shared by the local and Redis paths below. A
+        // successful status alone is not proof of an LLM response: upstreams
+        // sometimes return 200 maintenance pages or malformed provider bodies.
+        // Those responses still pass through to the original client, but must
+        // not be retained and amplified for the cache TTL.
         let content_type = response_headers
-            .get("content-type")
-            .map(|s| s.as_str())
+            .iter()
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-type")
+                    .then_some(value.as_str())
+            })
             .unwrap_or("");
         if is_event_stream_content_type(content_type) {
             debug!("ai_semantic_cache: skipping SSE streaming response");
             return PluginResult::Continue;
         }
-
+        if !is_json_content_type(content_type) {
+            debug!("ai_semantic_cache: skipping response without a JSON-compatible content type");
+            return PluginResult::Continue;
+        }
         // Size checks
         if body.len() > self.max_entry_size_bytes {
             debug!(
@@ -1981,6 +1991,10 @@ impl Plugin for AiSemanticCache {
                 max_size = self.max_entry_size_bytes,
                 "ai_semantic_cache: response exceeds max_entry_size_bytes, skipping"
             );
+            return PluginResult::Continue;
+        }
+        if serde_json::from_slice::<Value>(body).is_err() {
+            debug!("ai_semantic_cache: skipping syntactically invalid JSON response");
             return PluginResult::Continue;
         }
 

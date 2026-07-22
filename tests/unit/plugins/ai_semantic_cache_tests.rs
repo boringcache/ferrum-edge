@@ -905,7 +905,7 @@ async fn exact_cache_key_differs_for_different_image_url() {
         &plugin,
         &serde_json::to_string(&body_a).unwrap(),
         None,
-        b"A",
+        br#""A""#,
     )
     .await;
 
@@ -923,13 +923,13 @@ async fn exact_cache_key_differs_for_different_image_url() {
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
     let _ = plugin
-        .on_final_response_body(&mut ctx_b, 200, &response_headers, b"B")
+        .on_final_response_body(&mut ctx_b, 200, &response_headers, br#""B""#)
         .await;
 
     let (_, result) = run_before_proxy(&plugin, &body_b_str, None).await;
     match result {
         PluginResult::RejectBinary { body, .. } => {
-            assert_eq!(&body[..], b"B");
+            assert_eq!(&body[..], br#""B""#);
         }
         other => panic!("Expected exact cache HIT for request B, got {other:?}"),
     }
@@ -995,7 +995,7 @@ async fn exact_cache_key_differs_for_base64_audio_and_file_parts() {
             &plugin,
             &serde_json::to_string(&body_a).unwrap(),
             None,
-            b"A",
+            br#""A""#,
         )
         .await;
 
@@ -1041,7 +1041,7 @@ async fn exact_cache_key_treats_mixed_case_text_type_as_non_text() {
         &plugin,
         &serde_json::to_string(&lowercase_body).unwrap(),
         None,
-        b"A",
+        br#""A""#,
     )
     .await;
 
@@ -1101,7 +1101,7 @@ async fn exact_cache_key_treats_text_type_without_string_text_as_non_text() {
         &plugin,
         &serde_json::to_string(&body_a).unwrap(),
         None,
-        b"A",
+        br#""A""#,
     )
     .await;
 
@@ -1133,7 +1133,7 @@ async fn semantic_cache_scope_differs_for_different_image_url() {
         &plugin,
         &serde_json::to_string(&body_a).unwrap(),
         None,
-        b"A",
+        br#""A""#,
     )
     .await;
 
@@ -1199,7 +1199,7 @@ async fn scope_by_consumer_false_still_does_not_cross_replay_multimodal() {
         &plugin,
         &serde_json::to_string(&body_a).unwrap(),
         Some(alice),
-        b"alice-image-answer",
+        br#""alice-image-answer""#,
     )
     .await;
 
@@ -1238,7 +1238,7 @@ async fn cache_multimodal_reject_bypasses_multimodal_and_text_only_still_caches(
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
     let _ = plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, b"A")
+        .on_final_response_body(&mut ctx, 200, &response_headers, br#""A""#)
         .await;
     assert_eq!(plugin.tracked_keys_count(), Some(0));
 
@@ -1259,11 +1259,11 @@ async fn cache_multimodal_reject_bypasses_multimodal_and_text_only_still_caches(
         "messages": [{"role": "user", "content": "What is the capital of France?"}]
     });
     let text_body_str = serde_json::to_string(&text_body).unwrap();
-    store_response(&plugin, &text_body_str, None, b"Paris").await;
+    store_response(&plugin, &text_body_str, None, br#""Paris""#).await;
 
     let (_, result) = run_before_proxy(&plugin, &text_body_str, None).await;
     match result {
-        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"Paris"),
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], br#""Paris""#),
         other => panic!("Expected text-only exact cache HIT under reject mode, got {other:?}"),
     }
 }
@@ -1316,7 +1316,7 @@ async fn test_semantic_similarity_hit_after_exact_miss() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"Paris",
+        br#""Paris""#,
     )
     .await;
 
@@ -1343,7 +1343,7 @@ async fn test_semantic_similarity_hit_after_exact_miss() {
                 headers.get("x-ai-cache-match").map(String::as_str),
                 Some("semantic")
             );
-            assert_eq!(&body[..], b"Paris");
+            assert_eq!(&body[..], br#""Paris""#);
             assert_eq!(
                 ctx.metadata.get("ai_cache_match").map(String::as_str),
                 Some("semantic")
@@ -1376,7 +1376,7 @@ async fn test_semantic_similarity_miss_below_threshold() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"first",
+        br#""first""#,
     )
     .await;
 
@@ -1420,7 +1420,7 @@ async fn test_semantic_embedding_failure_falls_back_to_miss() {
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
     let _ = plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, b"backend")
+        .on_final_response_body(&mut ctx, 200, &response_headers, br#""backend""#)
         .await;
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
@@ -1448,7 +1448,7 @@ async fn test_semantic_similarity_respects_response_shaping_scope() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"one-choice",
+        br#""one-choice""#,
     )
     .await;
 
@@ -1522,7 +1522,7 @@ async fn test_google_gemini_semantic_provider_uses_provider_response_shape() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"Paris",
+        br#""Paris""#,
     )
     .await;
 
@@ -1554,7 +1554,7 @@ async fn test_semantic_embedding_size_counts_against_total_cache_limit() {
         &plugin,
         &serde_json::to_string(&body).unwrap(),
         None,
-        b"Paris",
+        br#""Paris""#,
     )
     .await;
 
@@ -1586,7 +1586,7 @@ async fn test_semantic_similarity_respects_consumer_scope() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         Some(alice),
-        b"alice-account-data",
+        br#""alice-account-data""#,
     )
     .await;
 
@@ -1637,9 +1637,10 @@ async fn test_different_prompts_no_cache_hit() {
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
     let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
-    let response_headers = HashMap::new();
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let _ = plugin
-        .on_final_response_body(&mut ctx1, 200, &response_headers, b"cached")
+        .on_final_response_body(&mut ctx1, 200, &response_headers, br#""cached""#)
         .await;
 
     // Different prompt — should MISS
@@ -1687,9 +1688,10 @@ async fn test_whitespace_normalization_cache_hit() {
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
     let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
-    let response_headers = HashMap::new();
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let _ = plugin
-        .on_final_response_body(&mut ctx1, 200, &response_headers, b"Paris")
+        .on_final_response_body(&mut ctx1, 200, &response_headers, br#""Paris""#)
         .await;
 
     // Same prompt with extra whitespace and case differences — should HIT
@@ -1741,9 +1743,10 @@ async fn test_different_model_no_cache_hit() {
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
     let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
-    let response_headers = HashMap::new();
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let _ = plugin
-        .on_final_response_body(&mut ctx1, 200, &response_headers, b"hi")
+        .on_final_response_body(&mut ctx1, 200, &response_headers, br#""hi""#)
         .await;
 
     // Same prompt but different model — should MISS
@@ -1825,12 +1828,128 @@ async fn test_error_response_not_cached() {
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
 
     // 500 response should not be cached
-    let response_headers = HashMap::new();
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let _ = plugin
         .on_final_response_body(&mut ctx, 500, &response_headers, b"error")
         .await;
 
     assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+#[tokio::test]
+async fn response_admission_requires_valid_json_media_type_and_body() {
+    struct Case {
+        name: &'static str,
+        status: u16,
+        content_type: Option<&'static str>,
+        body: &'static [u8],
+        cached: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "application/json",
+            status: 200,
+            content_type: Some("application/json; charset=utf-8"),
+            body: br#"{"choices":[]}"#,
+            cached: true,
+        },
+        Case {
+            name: "mixed-case +json",
+            status: 200,
+            content_type: Some("Application/Vnd.Acme+Json; version=2"),
+            body: br#"["ok"]"#,
+            cached: true,
+        },
+        Case {
+            name: "missing content type",
+            status: 200,
+            content_type: None,
+            body: br#"{"ok":true}"#,
+            cached: false,
+        },
+        Case {
+            name: "HTML maintenance response",
+            status: 200,
+            content_type: Some("text/html"),
+            body: b"<html>maintenance</html>",
+            cached: false,
+        },
+        Case {
+            name: "plain text response",
+            status: 200,
+            content_type: Some("text/plain"),
+            body: b"temporarily unavailable",
+            cached: false,
+        },
+        Case {
+            name: "malformed JSON",
+            status: 200,
+            content_type: Some("application/json"),
+            body: br#"{"choices": [}"#,
+            cached: false,
+        },
+        Case {
+            name: "empty JSON body",
+            status: 200,
+            content_type: Some("application/json"),
+            body: b"",
+            cached: false,
+        },
+        Case {
+            name: "empty 204",
+            status: 204,
+            content_type: Some("application/json"),
+            body: b"",
+            cached: false,
+        },
+        Case {
+            name: "empty 205",
+            status: 205,
+            content_type: Some("application/json"),
+            body: b"",
+            cached: false,
+        },
+        Case {
+            name: "SSE",
+            status: 200,
+            content_type: Some("text/event-stream"),
+            body: b"data: {\"ok\":true}\n\n",
+            cached: false,
+        },
+    ];
+
+    for case in cases {
+        let plugin = make_plugin(json!({"ttl_seconds": 300}));
+        let request = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": case.name}]
+        });
+        let (mut ctx, result) =
+            run_before_proxy(&plugin, &serde_json::to_string(&request).unwrap(), None).await;
+        assert!(matches!(result, PluginResult::Continue));
+
+        let mut response_headers = HashMap::new();
+        if let Some(content_type) = case.content_type {
+            response_headers.insert("Content-Type".to_string(), content_type.to_string());
+        }
+        let result = plugin
+            .on_final_response_body(&mut ctx, case.status, &response_headers, case.body)
+            .await;
+
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{} must pass through unchanged",
+            case.name
+        );
+        assert_eq!(
+            plugin.tracked_keys_count(),
+            Some(usize::from(case.cached)),
+            "unexpected cache admission for {}",
+            case.name
+        );
+    }
 }
 
 #[test]
@@ -1884,7 +2003,7 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
     response_headers.insert("x-ai-ratelimit-remaining".to_string(), "999".to_string());
 
     let _ = plugin
-        .on_final_response_body(&mut ctx1, 200, &response_headers, b"Hello back")
+        .on_final_response_body(&mut ctx1, 200, &response_headers, br#""Hello back""#)
         .await;
 
     // Second request from a different consumer (different IP) hits the cache.
@@ -1965,7 +2084,7 @@ async fn test_different_system_prompt_no_cache_hit() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"Hello!",
+        br#""Hello!""#,
     )
     .await;
 
@@ -1998,7 +2117,7 @@ async fn test_different_system_array_form_no_cache_hit() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"pong",
+        br#""pong""#,
     )
     .await;
 
@@ -2033,7 +2152,7 @@ async fn test_different_temperature_no_cache_hit_with_default_config() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"poem-from-temp-0",
+        br#""poem-from-temp-0""#,
     )
     .await;
 
@@ -2065,7 +2184,7 @@ async fn test_sub_cent_sampling_params_do_not_collapse() {
         &temperature_plugin,
         &serde_json::to_string(&low_temperature).unwrap(),
         None,
-        b"poem-from-temp-0.001",
+        br#""poem-from-temp-0.001""#,
     )
     .await;
 
@@ -2096,7 +2215,7 @@ async fn test_sub_cent_sampling_params_do_not_collapse() {
         &top_p_plugin,
         &serde_json::to_string(&low_top_p).unwrap(),
         None,
-        b"poem-from-top-p-0.001",
+        br#""poem-from-top-p-0.001""#,
     )
     .await;
 
@@ -2138,7 +2257,7 @@ async fn test_numerically_equivalent_sampling_params_collapse() {
         &plugin,
         &serde_json::to_string(&stored).unwrap(),
         None,
-        b"poem-from-temp-1",
+        br#""poem-from-temp-1""#,
     )
     .await;
 
@@ -2167,7 +2286,13 @@ async fn test_same_request_different_consumer_no_cache_hit_with_default_config()
     let alice = make_consumer("alice");
     let bob = make_consumer("bob");
 
-    store_response(&plugin, &body_str, Some(alice.clone()), b"alice-only-data").await;
+    store_response(
+        &plugin,
+        &body_str,
+        Some(alice.clone()),
+        br#""alice-only-data""#,
+    )
+    .await;
 
     let hit = run_before_proxy_get_status(&plugin, &body_str, Some(bob.clone())).await;
     assert!(
@@ -2201,7 +2326,13 @@ async fn test_same_request_same_consumer_same_params_cache_hit_positive() {
     });
     let body_str = serde_json::to_string(&body).unwrap();
 
-    store_response(&plugin, &body_str, Some(consumer.clone()), b"hello-back").await;
+    store_response(
+        &plugin,
+        &body_str,
+        Some(consumer.clone()),
+        br#""hello-back""#,
+    )
+    .await;
 
     let hit = run_before_proxy_get_status(&plugin, &body_str, Some(consumer)).await;
     assert!(
@@ -2270,7 +2401,7 @@ async fn test_different_tools_no_cache_hit() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"weather-tool-call",
+        br#""weather-tool-call""#,
     )
     .await;
 
@@ -2336,7 +2467,7 @@ async fn test_different_seed_no_cache_hit() {
         &plugin,
         &serde_json::to_string(&body1).unwrap(),
         None,
-        b"joke-seed-42",
+        br#""joke-seed-42""#,
     )
     .await;
 
