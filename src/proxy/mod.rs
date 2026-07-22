@@ -15168,6 +15168,13 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         }
     }
 
+    // This is internal ownership bookkeeping, not transaction metadata. Keep
+    // it visible for the complete committed-hook lifecycle (including an owned
+    // context transferred to detached deadline cleanup), then remove it from
+    // the request context before later logging/summary hooks can copy it.
+    ctx.metadata
+        .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
+
     // Final wire shape for synthetic/reject responses: HEAD keeps representation
     // metadata (Content-Length) but omits content bytes; 204/205/304 omit both
     // content and Content-Length. Applied here so H1/H2 finalize and every H3

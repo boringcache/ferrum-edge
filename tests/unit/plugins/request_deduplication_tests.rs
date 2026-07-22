@@ -872,12 +872,10 @@ async fn finalize_empty_synthetic_and_assert_second_request_continues(
         } => assert_eq!(final_status, status_code),
         other => panic!("expected finalized RejectBinary, got {other:?}"),
     }
-    assert_eq!(
-        ctx.metadata
-            .get(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY)
-            .map(String::as_str),
-        Some("true"),
-        "shared reject finalizer must record the body-independent finalized-synthetic signal"
+    assert!(
+        !ctx.metadata
+            .contains_key(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY),
+        "internal finalized-synthetic signal must be consumed before transaction logging"
     );
     assert_eq!(
         assert_completed_size_exact(&dedup),
