@@ -41,8 +41,8 @@ use super::utils::log_schema::{
     TimestampFormat, resolve_schema,
 };
 use super::utils::{
-    BatchConfigDefaults, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    validate_batch_config, wait_until_committed,
+    BatchConfigDefaults, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_RETRIES, MAX_BATCH_SIZE,
+    MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config, wait_until_committed,
 };
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
@@ -63,9 +63,9 @@ const WS_DROP_WARN_EVERY: u64 = 100;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_WRITE_TIMEOUT_MS: u64 = 5_000;
 const MIN_TIMEOUT_MS: u64 = 100;
-const MAX_RETRY_DELAY_MS: u64 = 60_000;
-const MAX_RECONNECT_DELAY_MS: u64 = 60_000;
-const MAX_RETRIES: u64 = 10;
+const MAX_RETRY_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
+const MAX_RECONNECT_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
+const MAX_RETRIES: u64 = MAX_BATCH_RETRIES;
 
 /// Pre-serialized log entry admitted under slot + byte budgets.
 ///
@@ -494,6 +494,7 @@ impl WsLogging {
             buffer_capacity: 10_000,
             max_retries: 3,
             retry_delay_ms: 1000,
+            min_retry_delay_ms: 1,
         };
         validate_batch_config(config, "ws_logging", batch_defaults)?;
         for key in [

@@ -4301,9 +4301,9 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
         );
     }
 
-    // OpenAPI rejects typed nulls on every declared property. Shared batch-builder
-    // defaults still absorb some null numerics (#2562); unknown-key closure is the
-    // #2620 contract under test here.
+    // OpenAPI rejects typed nulls on every declared property. Shared batch
+    // admission (#2562) now rejects null/wrong-type/out-of-range batching
+    // fields at construction as well.
     for key in STATSD_LOGGING_CONFIG_KEYS {
         let mut config = json!({"host": "statsd.example.test"});
         config
@@ -4311,6 +4311,35 @@ async fn statsd_logging_schema_matches_strict_runtime_config_contract() {
             .expect("config object")
             .insert((*key).to_string(), serde_json::Value::Null);
         assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+        assert!(
+            StatsdLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime must reject explicit null for `{key}`"
+        );
+    }
+
+    assert_eq!(schema["properties"]["max_batch_lines"]["minimum"], 1);
+    assert_eq!(schema["properties"]["max_batch_lines"]["maximum"], 10000);
+    assert_eq!(schema["properties"]["buffer_capacity"]["minimum"], 1);
+    assert_eq!(schema["properties"]["buffer_capacity"]["maximum"], 1000000);
+    assert_eq!(schema["properties"]["max_retries"]["maximum"], 10);
+    assert_eq!(schema["properties"]["retry_delay_ms"]["maximum"], 60000);
+
+    for config in [
+        json!({"host": "statsd.example.test", "max_batch_lines": 0}),
+        json!({"host": "statsd.example.test", "max_batch_lines": 10001}),
+        json!({"host": "statsd.example.test", "buffer_capacity": 0}),
+        json!({"host": "statsd.example.test", "flush_interval_ms": 49}),
+        json!({"host": "statsd.example.test", "max_retries": 11}),
+        json!({"host": "statsd.example.test", "retry_delay_ms": 60001}),
+        json!({"host": "statsd.example.test", "flush_interval_ms": "60000"}),
+        json!({"host": "statsd.example.test", "buffer_capacity": false}),
+        json!({"host": "statsd.example.test", "max_batch_lines": []}),
+    ] {
+        assert_component_validity(&spec, "StatsdLoggingConfig", &config, false);
+        assert!(
+            StatsdLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted invalid StatsD batching config: {config}"
+        );
     }
 }
 

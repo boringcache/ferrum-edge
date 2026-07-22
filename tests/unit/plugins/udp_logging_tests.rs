@@ -251,6 +251,45 @@ async fn test_udp_logging_rejects_invalid_config_shapes() {
 }
 
 #[tokio::test]
+async fn test_udp_logging_rejects_malformed_and_out_of_range_batching() {
+    for config in [
+        json!({"host": "127.0.0.1", "port": 9514, "batch_size": null}),
+        json!({"host": "127.0.0.1", "port": 9514, "batch_size": false}),
+        json!({"host": "127.0.0.1", "port": 9514, "batch_size": []}),
+        json!({"host": "127.0.0.1", "port": 9514, "batch_size": 0}),
+        json!({"host": "127.0.0.1", "port": 9514, "batch_size": 10_001}),
+        json!({"host": "127.0.0.1", "port": 9514, "buffer_capacity": null}),
+        json!({"host": "127.0.0.1", "port": 9514, "buffer_capacity": 0}),
+        json!({"host": "127.0.0.1", "port": 9514, "buffer_capacity": 1_000_001}),
+        json!({"host": "127.0.0.1", "port": 9514, "flush_interval_ms": 99}),
+        json!({"host": "127.0.0.1", "port": 9514, "max_retries": 11}),
+        json!({"host": "127.0.0.1", "port": 9514, "retry_delay_ms": 60_001}),
+    ] {
+        assert!(
+            UdpLogging::new(&config, test_client()).is_err(),
+            "expected batching rejection for {config}"
+        );
+    }
+
+    assert!(
+        UdpLogging::new(
+            &json!({
+                "host": "127.0.0.1",
+                "port": 9514,
+                "batch_size": 1,
+                "buffer_capacity": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 10,
+                "retry_delay_ms": 0
+            }),
+            test_client(),
+        )
+        .is_ok(),
+        "valid batching boundaries must be admitted"
+    );
+}
+
+#[tokio::test]
 async fn test_udp_logging_log_does_not_panic() {
     // When the endpoint is unreachable, log() should still accept entries
     let plugin = UdpLogging::new(

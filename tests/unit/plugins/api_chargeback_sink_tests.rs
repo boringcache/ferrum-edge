@@ -239,6 +239,50 @@ async fn config_validation_rejects_bad_shapes() {
 }
 
 #[tokio::test]
+async fn config_validation_rejects_batch_and_retry_clamp_candidates() {
+    let temp = tempfile::tempdir().unwrap();
+    for (path, value) in [
+        ("batch.size", json!(10_001)),
+        ("batch.size", json!(100_000)),
+        ("batch.buffer_capacity", json!(1_000_001)),
+        ("retry.max_attempts", json!(0)),
+        ("retry.max_attempts", json!(33)),
+        ("retry.max_attempts", json!(4_294_967_295u64)),
+    ] {
+        let mut config = valid_config(temp.path());
+        match path {
+            "batch.size" => config["batch"]["size"] = value.clone(),
+            "batch.buffer_capacity" => config["batch"]["buffer_capacity"] = value.clone(),
+            "retry.max_attempts" => config["retry"]["max_attempts"] = value.clone(),
+            _ => unreachable!(),
+        }
+        let err = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection for {path}={value}"));
+        assert!(
+            err.contains(path) || err.contains(path.replace('.', "_").as_str()),
+            "expected field-specific error for {path}={value}, got {err}"
+        );
+    }
+
+    let mut ok = valid_config(temp.path());
+    ok["batch"]["size"] = json!(10_000);
+    ok["batch"]["buffer_capacity"] = json!(1);
+    ok["retry"]["max_attempts"] = json!(1);
+    assert!(
+        ApiChargebackSink::new(&ok, PluginHttpClient::default(), "ferrum").is_ok(),
+        "valid batch/retry boundaries must be admitted"
+    );
+
+    let mut ok_max = valid_config(temp.path());
+    ok_max["retry"]["max_attempts"] = json!(32);
+    assert!(
+        ApiChargebackSink::new(&ok_max, PluginHttpClient::default(), "ferrum").is_ok(),
+        "max_attempts=32 must be admitted"
+    );
+}
+
+#[tokio::test]
 async fn config_validation_rejects_snapshot_without_spool() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = valid_config(temp.path());

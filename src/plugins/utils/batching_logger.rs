@@ -11,8 +11,18 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 const DROP_WARN_EVERY: u64 = 100;
+/// Hard ceiling for an admitted batch size across shared logging sinks.
+///
+/// Admission (`validate_batch_config` / `build_batch_config`) rejects values
+/// outside `1..=MAX_BATCH_SIZE`. [`BatchingLogger::spawn`] still clamps as a
+/// defense for programmatic `BatchConfig` construction.
 pub const MAX_BATCH_SIZE: usize = 10_000;
+/// Hard ceiling for an admitted channel capacity across shared logging sinks.
 pub const MAX_BUFFER_CAPACITY: usize = 1_000_000;
+/// Hard ceiling for admitted `max_retries` (retries after the initial attempt).
+pub const MAX_BATCH_RETRIES: u64 = 10;
+/// Hard ceiling for admitted `retry_delay_ms` across shared logging sinks.
+pub const MAX_BATCH_RETRY_DELAY_MS: u64 = 60_000;
 const MAX_TOKIO_SLEEP_MS: u64 = i64::MAX as u64;
 static JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
 static JITTER_SEED: LazyLock<u64> = LazyLock::new(|| {

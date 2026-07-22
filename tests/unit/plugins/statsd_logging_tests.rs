@@ -142,6 +142,56 @@ async fn test_statsd_logging_invalid_scalar_types() {
 }
 
 #[tokio::test]
+async fn test_statsd_logging_rejects_malformed_and_out_of_range_batching() {
+    let host = "127.0.0.1";
+    for config in [
+        json!({"host": host, "flush_interval_ms": null}),
+        json!({"host": host, "flush_interval_ms": "60000"}),
+        json!({"host": host, "flush_interval_ms": false}),
+        json!({"host": host, "flush_interval_ms": []}),
+        json!({"host": host, "flush_interval_ms": {}}),
+        json!({"host": host, "flush_interval_ms": 49}),
+        json!({"host": host, "buffer_capacity": null}),
+        json!({"host": host, "buffer_capacity": false}),
+        json!({"host": host, "buffer_capacity": 0}),
+        json!({"host": host, "buffer_capacity": 1_000_001}),
+        json!({"host": host, "max_batch_lines": null}),
+        json!({"host": host, "max_batch_lines": []}),
+        json!({"host": host, "max_batch_lines": 0}),
+        json!({"host": host, "max_batch_lines": 10_001}),
+        json!({"host": host, "max_retries": "1"}),
+        json!({"host": host, "max_retries": -1}),
+        json!({"host": host, "max_retries": 11}),
+        json!({"host": host, "retry_delay_ms": true}),
+        json!({"host": host, "retry_delay_ms": 60_001}),
+    ] {
+        let err = StatsdLogging::new(&config, default_client())
+            .err()
+            .unwrap_or_else(|| panic!("expected batching rejection for {config}"));
+        assert!(
+            err.contains("statsd_logging:"),
+            "expected field-specific statsd error for {config}, got {err}"
+        );
+    }
+
+    let valid_bounds = StatsdLogging::new(
+        &json!({
+            "host": host,
+            "max_batch_lines": 1,
+            "buffer_capacity": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 10,
+            "retry_delay_ms": 60_000
+        }),
+        default_client(),
+    );
+    assert!(
+        valid_bounds.is_ok(),
+        "valid batching boundaries must be admitted: {valid_bounds:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_statsd_logging_empty_prefix_rejected() {
     let result = StatsdLogging::new(
         &json!({"host": "127.0.0.1", "prefix": "   "}),

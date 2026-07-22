@@ -36,7 +36,7 @@ use crate::config::types::MAX_ID_LENGTH;
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, HttpBatchDrainOutcome,
-    MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient, RetryPolicy, build_batch_config,
+    MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_RETRIES, PluginHttpClient, RetryPolicy, build_batch_config,
     drain_http_batch_response_body, parse_custom_headers, parse_http_endpoint,
     validate_batch_config,
 };
@@ -65,8 +65,8 @@ pub const LOKI_DEFAULT_MAX_ENTRY_BYTES: usize = 64 * 1024;
 pub const LOKI_MAX_MAX_ENTRY_BYTES: usize = 1024 * 1024;
 pub const LOKI_DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const LOKI_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
-pub const LOKI_MAX_RETRIES: u64 = 10;
-pub const LOKI_MAX_RETRY_DELAY_MS: u64 = 60_000;
+pub const LOKI_MAX_RETRIES: u64 = MAX_BATCH_RETRIES;
+pub const LOKI_MAX_RETRY_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
 pub const LOKI_MAX_CUSTOM_HEADER_NAME_BYTES: usize = u16::MAX as usize;
 
 const LOKI_MIN_RESOURCE_BYTES: usize = 1024;
@@ -354,13 +354,14 @@ impl LokiLogging {
             buffer_capacity: 10000,
             max_retries: 3,
             retry_delay_ms: 1000,
+            min_retry_delay_ms: 1,
         };
         validate_batch_config(config, "loki_logging", batch_defaults)?;
         let (max_entry_bytes, buffer_max_bytes, retry) =
             validate_loki_resource_config(config, batch_defaults)?;
         let schema = resolve_schema(config, "loki_logging", SchemaCapabilities::BASE)?;
         validate_minimum_entry_budget(&label_config, schema.as_deref(), max_entry_bytes)?;
-        let mut batch_config = build_batch_config(config, "loki_logging", batch_defaults);
+        let mut batch_config = build_batch_config(config, "loki_logging", batch_defaults)?;
         batch_config.retry = retry;
         let flush_config = LokiFlushConfig {
             endpoint_url,
@@ -538,41 +539,17 @@ fn validate_loki_resource_config(
     config: &Value,
     defaults: BatchConfigDefaults,
 ) -> Result<(usize, usize, RetryPolicy), String> {
-    bounded_u64(
-        config,
-        defaults.batch_size_key,
-        defaults.batch_size,
-        1,
-        MAX_BATCH_SIZE as u64,
-    )?;
-    bounded_u64(
-        config,
-        "flush_interval_ms",
-        defaults.flush_interval_ms,
-        defaults.min_flush_interval_ms,
-        u64::MAX,
-    )?;
-    bounded_u64(
-        config,
-        "buffer_capacity",
-        defaults.buffer_capacity,
-        1,
-        MAX_BUFFER_CAPACITY as u64,
-    )?;
-    let max_retries = bounded_u64(
-        config,
-        "max_retries",
-        defaults.max_retries,
-        0,
-        LOKI_MAX_RETRIES,
-    )?;
-    let retry_delay_ms = bounded_u64(
-        config,
-        "retry_delay_ms",
-        defaults.retry_delay_ms,
-        1,
-        LOKI_MAX_RETRY_DELAY_MS,
-    )?;
+    // Batch size / flush / buffer / max_retries / retry_delay_ms are admitted by
+    // the shared validator before this helper runs. Re-read the resolved values
+    // (absent → defaults) without a second drifting range contract.
+    let max_retries = config
+        .get("max_retries")
+        .and_then(Value::as_u64)
+        .unwrap_or(defaults.max_retries);
+    let retry_delay_ms = config
+        .get("retry_delay_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(defaults.retry_delay_ms);
     let max_entry_bytes = bounded_u64(
         config,
         "max_entry_bytes",
@@ -604,7 +581,7 @@ fn validate_loki_resource_config(
             max_delay: Duration::from_millis(
                 retry_delay_ms
                     .saturating_mul(8)
-                    .min(LOKI_MAX_RETRY_DELAY_MS),
+                    .min(MAX_BATCH_RETRY_DELAY_MS),
             ),
             jitter: true,
         },

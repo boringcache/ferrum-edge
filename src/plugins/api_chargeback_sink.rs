@@ -36,7 +36,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use super::chargeback::pricing::{ChargeComputation, PricingConfig};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
 use super::utils::{
-    BatchConfig, BatchingLogger, LoggerHooks, PluginHttpClient, RetryPolicy, wait_until_committed,
+    BatchConfig, BatchingLogger, LoggerHooks, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
+    RetryPolicy, wait_until_committed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -51,6 +52,10 @@ const MAX_FIELD_LEN: usize = 512;
 const MAX_METADATA_FIELD_LEN: usize = 256;
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const GRPC_STATUS_OTHER_SENTINEL: u32 = u32::MAX;
+/// Deployment-safe ceiling for ClickHouse export attempt count (total attempts,
+/// including the initial try). Rejects the historical silent `.max(1)` rewrite
+/// of `0` and unbounded `u32::MAX` budgets that can pin the sole flush worker.
+const MAX_RETRY_MAX_ATTEMPTS: u32 = 32;
 
 static ACTIVE_SINK: OnceLock<ArcSwap<Option<Arc<SinkRuntime>>>> = OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
@@ -761,7 +766,7 @@ impl ApiChargebackSink {
                 // backoff from initial_delay_ms up to max_delay_ms, with
                 // optional full jitter (finding #77).
                 retry: RetryPolicy {
-                    max_attempts: self.config.retry.max_attempts.max(1),
+                    max_attempts: self.config.retry.max_attempts,
                     delay: Duration::from_millis(self.config.retry.initial_delay_ms),
                     max_delay: Duration::from_millis(self.config.retry.max_delay_ms),
                     jitter: self.config.retry.jitter,
@@ -1396,19 +1401,24 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     }
     validate_query_params(&config.clickhouse.insert_query_params)?;
 
-    if config.batch.size == 0 || config.batch.size > 100_000 {
+    if config.batch.size == 0 || config.batch.size > MAX_BATCH_SIZE {
         return Err(format!(
-            "{PLUGIN_NAME}: batch.size must be between 1 and 100000"
+            "{PLUGIN_NAME}: batch.size must be between 1 and {MAX_BATCH_SIZE}"
         ));
     }
-    if config.batch.buffer_capacity == 0 || config.batch.buffer_capacity > 1_000_000 {
+    if config.batch.buffer_capacity == 0 || config.batch.buffer_capacity > MAX_BUFFER_CAPACITY {
         return Err(format!(
-            "{PLUGIN_NAME}: batch.buffer_capacity must be between 1 and 1000000"
+            "{PLUGIN_NAME}: batch.buffer_capacity must be between 1 and {MAX_BUFFER_CAPACITY}"
         ));
     }
     if config.batch.flush_interval_ms == 0 {
         return Err(format!(
             "{PLUGIN_NAME}: batch.flush_interval_ms must be at least 1"
+        ));
+    }
+    if config.retry.max_attempts == 0 || config.retry.max_attempts > MAX_RETRY_MAX_ATTEMPTS {
+        return Err(format!(
+            "{PLUGIN_NAME}: retry.max_attempts must be between 1 and {MAX_RETRY_MAX_ATTEMPTS}"
         ));
     }
     if config.retry.max_delay_ms < config.retry.initial_delay_ms {

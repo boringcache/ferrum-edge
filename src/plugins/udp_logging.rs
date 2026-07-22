@@ -176,7 +176,7 @@ impl UdpLogging {
         }));
 
         Ok(Self {
-            batch_config: build_batch_config(config, "udp_logging", batch_defaults),
+            batch_config: build_batch_config(config, "udp_logging", batch_defaults)?,
             flush_config,
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname: socket_host_warmup,
@@ -278,6 +278,7 @@ fn parse_udp_logging_config(
         buffer_capacity: 10000,
         max_retries: 1,
         retry_delay_ms: 500,
+        min_retry_delay_ms: 0,
     };
     validate_batch_config(config, "udp_logging", batch_defaults)?;
     let schema = resolve_schema(config, "udp_logging", SchemaCapabilities::BASE)?;

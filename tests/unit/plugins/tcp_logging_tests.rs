@@ -589,3 +589,49 @@ async fn test_tcp_logging_rejects_timeouts_above_recovery_bound() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_tcp_logging_rejects_malformed_and_out_of_range_batching() {
+    for config in [
+        json!({"host": "localhost", "port": 5140, "batch_size": null}),
+        json!({"host": "localhost", "port": 5140, "batch_size": "50"}),
+        json!({"host": "localhost", "port": 5140, "batch_size": true}),
+        json!({"host": "localhost", "port": 5140, "batch_size": []}),
+        json!({"host": "localhost", "port": 5140, "batch_size": {}}),
+        json!({"host": "localhost", "port": 5140, "batch_size": 0}),
+        json!({"host": "localhost", "port": 5140, "batch_size": 10_001}),
+        json!({"host": "localhost", "port": 5140, "buffer_capacity": null}),
+        json!({"host": "localhost", "port": 5140, "buffer_capacity": 0}),
+        json!({"host": "localhost", "port": 5140, "buffer_capacity": 1_000_001}),
+        json!({"host": "localhost", "port": 5140, "flush_interval_ms": 99}),
+        json!({"host": "localhost", "port": 5140, "max_retries": 11}),
+        json!({"host": "localhost", "port": 5140, "retry_delay_ms": 60_001}),
+        json!({"host": "localhost", "port": 5140, "connect_timeout_ms": null}),
+        json!({"host": "localhost", "port": 5140, "connect_timeout_ms": 99}),
+        json!({"host": "localhost", "port": 5140, "connect_timeout_ms": -1}),
+    ] {
+        assert!(
+            TcpLogging::new(&config, default_client()).is_err(),
+            "expected batching/timeout rejection for {config}"
+        );
+    }
+
+    assert!(
+        TcpLogging::new(
+            &json!({
+                "host": "localhost",
+                "port": 5140,
+                "batch_size": 1,
+                "buffer_capacity": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 10,
+                "retry_delay_ms": 0,
+                "connect_timeout_ms": 100,
+                "write_timeout_ms": 60_000
+            }),
+            default_client(),
+        )
+        .is_ok(),
+        "valid batching and connect-timeout boundaries must be admitted"
+    );
+}

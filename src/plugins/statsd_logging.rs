@@ -24,7 +24,7 @@ use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema
 use super::utils::{
     BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient,
     UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
-    resolve_udp_endpoint,
+    resolve_udp_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::config::types::MAX_NAMESPACE_LENGTH;
@@ -560,19 +560,18 @@ impl StatsdLogging {
             dns_cache: http_client.dns_cache().cloned(),
             schema,
         };
-        let batch_config = build_batch_config(
-            config,
-            "statsd_logging",
-            BatchConfigDefaults {
-                batch_size_key: "max_batch_lines",
-                batch_size: 50,
-                flush_interval_ms: 500,
-                min_flush_interval_ms: 50,
-                buffer_capacity: 10000,
-                max_retries: 0,
-                retry_delay_ms: 0,
-            },
-        );
+        let batch_defaults = BatchConfigDefaults {
+            batch_size_key: "max_batch_lines",
+            batch_size: 50,
+            flush_interval_ms: 500,
+            min_flush_interval_ms: 50,
+            buffer_capacity: 10000,
+            max_retries: 0,
+            retry_delay_ms: 0,
+            min_retry_delay_ms: 0,
+        };
+        validate_batch_config(config, "statsd_logging", batch_defaults)?;
+        let batch_config = build_batch_config(config, "statsd_logging", batch_defaults)?;
 
         Ok(Self {
             batch_config,

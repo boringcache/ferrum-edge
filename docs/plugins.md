@@ -179,11 +179,11 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 |---|---|---|---|
 | `endpoint_url` | String | `""` | URL to POST transaction logs to |
 | `custom_headers` | Object | *(none)* | Key-value pairs of custom HTTP headers to include on every batch request |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
-| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first.
 
@@ -415,10 +415,10 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 | `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Sanitized for line-protocol safety; max 256 bytes after sanitization. |
 | `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`) or any effective key introduced by a schema rename. Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-| `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing |
-| `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (shared batching logger) |
-| `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
+| `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing (1–10000) |
+| `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (0–10; shared batching logger) |
+| `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts (0–60000) |
 | `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
@@ -581,11 +581,11 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 | `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
 | `tls` | Boolean | `false` | Enable TLS encryption for the connection |
 | `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name (no URL scheme, path, query, fragment, credentials, whitespace, or host:port); invalid values fail admission. |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
-| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
 | `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
 | `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
@@ -640,11 +640,11 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
 | `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier) |
 | `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only; requires `dtls: true`) |
-| `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch |
+| `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch (1–10000) |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
-| `max_retries` | Integer | `1` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `max_retries` | Integer | `1` | Retry attempts on failed batch delivery (0–10) |
+| `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts (0–60000) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 

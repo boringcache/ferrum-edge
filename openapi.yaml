@@ -11274,6 +11274,8 @@ components:
         batch_size:
           type: integer
           default: 50
+          minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11283,14 +11285,20 @@ components:
         max_retries:
           type: integer
           default: 3
+          minimum: 0
+          maximum: 10
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 0
+          maximum: 60000
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
@@ -11354,6 +11362,7 @@ components:
           type: integer
           default: 50
           minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11364,16 +11373,19 @@ components:
           type: integer
           default: 3
           minimum: 0
+          maximum: 10
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
           minimum: 0
+          maximum: 60000
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
           minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
         connect_timeout_ms:
           type: integer
@@ -11492,6 +11504,8 @@ components:
         batch_size:
           type: integer
           default: 10
+          minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -11501,14 +11515,20 @@ components:
         max_retries:
           type: integer
           default: 1
+          minimum: 0
+          maximum: 10
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 500
+          minimum: 0
+          maximum: 60000
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
@@ -12015,15 +12035,20 @@ components:
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
         max_batch_lines:
           type: integer
           default: 50
+          minimum: 1
+          maximum: 10000
           description: Max metric entries to batch before flushing
         max_retries:
           type: integer
           default: 0
           minimum: 0
+          maximum: 10
           description: >-
             Retry attempts after the initial UDP send fails. Defaults to 0
             (no retries). Consumed by the shared batching logger.
@@ -12031,6 +12056,7 @@ components:
           type: integer
           default: 0
           minimum: 0
+          maximum: 60000
           description: >-
             Delay in milliseconds between retry attempts. Defaults to 0.
             Consumed by the shared batching logger when `max_retries` > 0.
@@ -18022,6 +18048,7 @@ components:
             batch_size:
               type: integer
               minimum: 1
+              maximum: 10000
               default: 50
             flush_interval_ms:
               type: integer
@@ -18030,14 +18057,17 @@ components:
             buffer_capacity:
               type: integer
               minimum: 1
+              maximum: 1000000
               default: 10000
             max_retries:
               type: integer
               minimum: 0
+              maximum: 10
               default: 3
             retry_delay_ms:
               type: integer
               minimum: 0
+              maximum: 60000
               default: 1000
               description: "Fixed delay between batch send retries for transient collector failures."
             on_buffer_full:
@@ -20315,7 +20345,7 @@ components:
             size:
               type: integer
               minimum: 1
-              maximum: 100000
+              maximum: 10000
               default: 500
             flush_interval_ms:
               type: integer
@@ -20332,11 +20362,13 @@ components:
           description: |
             Retry budget and bounded exponential backoff. OpenAPI cannot express
             `max_delay_ms >= initial_delay_ms`; the plugin constructor rejects
-            inverted bounds during Admin/file/CP-DP admission.
+            inverted bounds during Admin/file/CP-DP admission. `max_attempts` is
+            the total attempt count (including the initial try); `0` is rejected.
           properties:
             max_attempts:
               type: integer
-              minimum: 0
+              minimum: 1
+              maximum: 32
               default: 5
             initial_delay_ms:
               type: integer
