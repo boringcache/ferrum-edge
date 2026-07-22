@@ -291,7 +291,7 @@ fn deep_path_item_ref_chain_hits_depth_limit() {
     for i in 0..40 {
         let next = i + 1;
         path_items.push_str(&format!(
-            r#"  "P{i}": {{"$ref": "#/components/pathItems/P{next}"}}"#
+            r##"  "P{i}": {{"$ref": "#/components/pathItems/P{next}"}}"##
         ));
         if i < 39 {
             path_items.push(',');
