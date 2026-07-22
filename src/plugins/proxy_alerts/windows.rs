@@ -2,7 +2,8 @@
 //!
 //! Two flavors share the same fixed-bucket layout:
 //! - [`BucketedCounter`] for matched-vs-total counters (error_rate,
-//!   status_code_count, error_class, stream_disconnect_cause).
+//!   status_code_count, grpc_status_count, grpc_status_rate, error_class,
+//!   stream_disconnect_cause).
 //! - [`BucketedLatencyHistogram`] for percentile estimation against a fixed
 //!   log-scale bin layout.
 //!

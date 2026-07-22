@@ -5244,7 +5244,7 @@ See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [p
 
 ### `proxy_alerts`
 
-Evaluates in-gateway anomaly rules over completed HTTP, stream, and WebSocket transactions, then sends notifications through configured channels. It is a normal operator-configurable plugin.
+Evaluates in-gateway anomaly rules over completed HTTP/gRPC, stream, and WebSocket transactions, then sends notifications through configured channels. It is a normal operator-configurable plugin. HTTP status rules stay independent of terminal gRPC application status; use `grpc_status_count` / `grpc_status_rate` for RPC outcome alerts.
 
 See [Proxy Alerts](proxy_alerts.md) for rule types, channel configuration, templates, and tuning guidance.
 

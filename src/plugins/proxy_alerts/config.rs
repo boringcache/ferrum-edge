@@ -19,8 +19,9 @@ use crate::retry::ErrorClass;
 use crate::util::unknown_keys::{near_miss_for_missing_key, reject_unknown_keys};
 
 use super::rules::{
-    ErrorClassRule, ErrorRateRule, LatencyMetric, LatencyPercentileRule, RecoveryConfig, Rule,
-    RuleCommon, StatusCodeCountRule, StreamDisconnectCauseRule,
+    ErrorClassRule, ErrorRateRule, GrpcStatusCountRule, GrpcStatusMatch, GrpcStatusRateRule,
+    LatencyMetric, LatencyPercentileRule, RecoveryConfig, Rule, RuleCommon, StatusCodeCountRule,
+    StreamDisconnectCauseRule,
 };
 use super::windows::MAX_FINITE_LATENCY_BOUND_MS;
 
@@ -107,6 +108,31 @@ const STREAM_DISCONNECT_CAUSE_KEYS: &[&str] = &[
     "severity",
     "causes",
     "threshold_count",
+];
+const GRPC_STATUS_COUNT_KEYS: &[&str] = &[
+    "name",
+    "enabled",
+    "type",
+    "window_seconds",
+    "channels",
+    "cooldown_seconds",
+    "recovery",
+    "severity",
+    "grpc_statuses",
+    "threshold_count",
+];
+const GRPC_STATUS_RATE_KEYS: &[&str] = &[
+    "name",
+    "enabled",
+    "type",
+    "window_seconds",
+    "channels",
+    "cooldown_seconds",
+    "recovery",
+    "severity",
+    "grpc_statuses",
+    "threshold_percent",
+    "min_request_count",
 ];
 
 #[derive(Debug)]
@@ -387,8 +413,18 @@ fn parse_rule(
             let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
             parse_stream_disconnect_cause(common, raw).map(Rule::StreamDisconnectCause)
         }
+        "grpc_status_count" => {
+            reject_unknown_keys(obj, &rule_path, GRPC_STATUS_COUNT_KEYS, "proxy_alerts: ")?;
+            let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
+            parse_grpc_status_count(common, raw).map(Rule::GrpcStatusCount)
+        }
+        "grpc_status_rate" => {
+            reject_unknown_keys(obj, &rule_path, GRPC_STATUS_RATE_KEYS, "proxy_alerts: ")?;
+            let common = build_rule_common(id, &name, raw, channel_id_by_name, channels, defaults)?;
+            parse_grpc_status_rate(common, raw, defaults).map(Rule::GrpcStatusRate)
+        }
         other => Err(format!(
-            "proxy_alerts: rule '{name}': unknown type '{other}' (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause)"
+            "proxy_alerts: rule '{name}': unknown type '{other}' (expected one of: error_rate, status_code_count, latency_percentile, error_class, stream_disconnect_cause, grpc_status_count, grpc_status_rate)"
         )),
     }
 }
@@ -646,6 +682,98 @@ fn parse_stream_disconnect_cause(
         causes,
         threshold_count,
     })
+}
+
+fn parse_grpc_status_count(
+    common: RuleCommon,
+    raw: &Value,
+) -> Result<GrpcStatusCountRule, String> {
+    let grpc_statuses = read_grpc_statuses(raw, &common.name)?;
+    let threshold_count = read_threshold_count(raw, &common.name)?;
+    Ok(GrpcStatusCountRule {
+        common,
+        grpc_statuses,
+        threshold_count,
+    })
+}
+
+fn parse_grpc_status_rate(
+    common: RuleCommon,
+    raw: &Value,
+    defaults: RuleDefaults,
+) -> Result<GrpcStatusRateRule, String> {
+    let grpc_statuses = read_grpc_statuses(raw, &common.name)?;
+    let threshold_percent = raw
+        .get("threshold_percent")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            format!(
+                "proxy_alerts: rule '{}': 'threshold_percent' is required",
+                common.name
+            )
+        })?;
+    if !(0.0 < threshold_percent && threshold_percent <= 100.0) {
+        return Err(format!(
+            "proxy_alerts: rule '{}': 'threshold_percent' must be in (0.0, 100.0] (got {threshold_percent})",
+            common.name
+        ));
+    }
+    let min_request_count = read_min_request_count(raw, &common.name, defaults.min_request_count)?;
+    Ok(GrpcStatusRateRule {
+        common,
+        grpc_statuses,
+        threshold_percent,
+        min_request_count,
+    })
+}
+
+fn read_grpc_statuses(raw: &Value, rule_name: &str) -> Result<Vec<GrpcStatusMatch>, String> {
+    let arr = raw
+        .get("grpc_statuses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "proxy_alerts: rule '{rule_name}': 'grpc_statuses' is required (array of 0..=16 integers or \"OTHER\")"
+            )
+        })?;
+    if arr.is_empty() {
+        return Err(format!(
+            "proxy_alerts: rule '{rule_name}': 'grpc_statuses' must contain at least one entry"
+        ));
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let selector = match item {
+            Value::String(s) if s.eq_ignore_ascii_case("OTHER") => GrpcStatusMatch::Other,
+            Value::String(s) => {
+                return Err(format!(
+                    "proxy_alerts: rule '{rule_name}': unknown 'grpc_statuses' entry '{s}' (expected 0..=16 or \"OTHER\")"
+                ));
+            }
+            Value::Number(n) => {
+                let Some(v) = n.as_u64() else {
+                    return Err(format!(
+                        "proxy_alerts: rule '{rule_name}': 'grpc_statuses' entries must be unsigned integers 0..=16 or \"OTHER\""
+                    ));
+                };
+                if v > 16 {
+                    return Err(format!(
+                        "proxy_alerts: rule '{rule_name}': 'grpc_statuses' entry {v} is not in [0, 16] (use \"OTHER\" for out-of-range codes)"
+                    ));
+                }
+                GrpcStatusMatch::Code(v as u8)
+            }
+            _ => {
+                return Err(format!(
+                    "proxy_alerts: rule '{rule_name}': 'grpc_statuses' entries must be unsigned integers 0..=16 or \"OTHER\""
+                ));
+            }
+        };
+        if !out.contains(&selector) {
+            out.push(selector);
+        }
+    }
+    Ok(out)
 }
 
 fn read_status_codes(raw: &Value, rule_name: &str) -> Result<Vec<u16>, String> {

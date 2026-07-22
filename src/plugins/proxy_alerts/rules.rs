@@ -95,6 +95,49 @@ pub struct StreamDisconnectCauseRule {
     pub threshold_count: u64,
 }
 
+/// Selector for the authoritative terminal gRPC application status.
+///
+/// Standard codes `0..=16` match exactly. [`GrpcStatusMatch::Other`] matches
+/// any status outside that range (malformed `u32::MAX` sentinel and future
+/// non-standard codes), mirroring the bounded StatsD/Prometheus `OTHER`
+/// bucket. HTTP transport status remains a separate rule dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcStatusMatch {
+    Code(u8),
+    Other,
+}
+
+impl GrpcStatusMatch {
+    pub fn matches(self, status: u32) -> bool {
+        match self {
+            Self::Code(code) => status == u32::from(code),
+            Self::Other => status > 16,
+        }
+    }
+
+    pub fn as_display(&self) -> String {
+        match self {
+            Self::Code(code) => code.to_string(),
+            Self::Other => "OTHER".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GrpcStatusCountRule {
+    pub common: RuleCommon,
+    pub grpc_statuses: Vec<GrpcStatusMatch>,
+    pub threshold_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GrpcStatusRateRule {
+    pub common: RuleCommon,
+    pub grpc_statuses: Vec<GrpcStatusMatch>,
+    pub threshold_percent: f64,
+    pub min_request_count: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum Rule {
     ErrorRate(ErrorRateRule),
@@ -102,6 +145,8 @@ pub enum Rule {
     LatencyPercentile(LatencyPercentileRule),
     ErrorClass(ErrorClassRule),
     StreamDisconnectCause(StreamDisconnectCauseRule),
+    GrpcStatusCount(GrpcStatusCountRule),
+    GrpcStatusRate(GrpcStatusRateRule),
 }
 
 impl Rule {
@@ -112,6 +157,8 @@ impl Rule {
             Self::LatencyPercentile(r) => &r.common,
             Self::ErrorClass(r) => &r.common,
             Self::StreamDisconnectCause(r) => &r.common,
+            Self::GrpcStatusCount(r) => &r.common,
+            Self::GrpcStatusRate(r) => &r.common,
         }
     }
 
@@ -143,6 +190,8 @@ impl Rule {
             Self::LatencyPercentile(_) => "latency_percentile",
             Self::ErrorClass(_) => "error_class",
             Self::StreamDisconnectCause(_) => "stream_disconnect_cause",
+            Self::GrpcStatusCount(_) => "grpc_status_count",
+            Self::GrpcStatusRate(_) => "grpc_status_rate",
         }
     }
 
@@ -150,7 +199,10 @@ impl Rule {
         match self {
             Self::LatencyPercentile(r) => r.metric == LatencyMetric::StreamDurationMs,
             Self::ErrorClass(_) | Self::StreamDisconnectCause(_) => true,
-            Self::ErrorRate(_) | Self::StatusCodeCount(_) => false,
+            Self::ErrorRate(_)
+            | Self::StatusCodeCount(_)
+            | Self::GrpcStatusCount(_)
+            | Self::GrpcStatusRate(_) => false,
         }
     }
 }
@@ -229,6 +281,14 @@ enum RuleObservationDetail {
     },
     StreamDisconnectCause {
         matched_total: u64,
+    },
+    GrpcStatusCount {
+        matched_total: u64,
+    },
+    GrpcStatusRate {
+        matched_total: u64,
+        total: u64,
+        percent: f64,
     },
 }
 
@@ -316,6 +376,38 @@ impl RuleObservation {
                     ),
                 }
             }
+            (
+                RuleObservationDetail::GrpcStatusCount { matched_total },
+                Rule::GrpcStatusCount(rule),
+            ) => {
+                let statuses = format_grpc_status_matches(&rule.grpc_statuses);
+                RenderedRuleObservation {
+                    observed: matched_total.to_string(),
+                    threshold: rule.threshold_count.to_string(),
+                    reason: format!(
+                        "{matched_total} gRPC transactions with status in {statuses} over {}s",
+                        rule.common.window_seconds
+                    ),
+                }
+            }
+            (
+                RuleObservationDetail::GrpcStatusRate {
+                    matched_total,
+                    total,
+                    percent,
+                },
+                Rule::GrpcStatusRate(rule),
+            ) => {
+                let statuses = format_grpc_status_matches(&rule.grpc_statuses);
+                RenderedRuleObservation {
+                    observed: format!("{percent:.2}%"),
+                    threshold: format!("{:.2}%", rule.threshold_percent),
+                    reason: format!(
+                        "{matched_total}/{total} gRPC transactions matched {statuses} over {}s",
+                        rule.common.window_seconds
+                    ),
+                }
+            }
             _ => RenderedRuleObservation {
                 observed: "n/a".to_string(),
                 threshold: "n/a".to_string(),
@@ -357,6 +449,12 @@ impl Rule {
             }
             Rule::StreamDisconnectCause(r) => {
                 observe_stream_disconnect(r, sample, proxy_id, ownership_generation, store, now_ms)
+            }
+            Rule::GrpcStatusCount(r) => {
+                observe_grpc_status_count(r, sample, proxy_id, ownership_generation, store, now_ms)
+            }
+            Rule::GrpcStatusRate(r) => {
+                observe_grpc_status_rate(r, sample, proxy_id, ownership_generation, store, now_ms)
             }
         }
     }
@@ -570,6 +668,93 @@ fn observe_stream_disconnect(
         sample_count: matched_total,
         detail: RuleObservationDetail::StreamDisconnectCause { matched_total },
     })
+}
+
+fn observe_grpc_status_count(
+    rule: &GrpcStatusCountRule,
+    sample: SampleInput<'_>,
+    proxy_id: &str,
+    ownership_generation: u64,
+    store: &WindowStore,
+    now_ms: u64,
+) -> Option<RuleObservation> {
+    let SampleInput::Http(s) = sample else {
+        return None;
+    };
+    // Plain HTTP never matches; still record so the sliding window ages.
+    // Evaluation runs from `log()` after terminal completion (buffered,
+    // trailers-only, streamed H2/H3, and gateway-generated rejections), so
+    // trailer-borne statuses are visible before this sample is counted.
+    let matched = s
+        .grpc_status()
+        .is_some_and(|status| grpc_status_matches(&rule.grpc_statuses, status));
+    store.record_count(
+        rule.common.id,
+        proxy_id,
+        ownership_generation,
+        matched,
+        now_ms,
+    );
+    let (matched_total, _) =
+        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
+    let breach = matched_total >= rule.threshold_count;
+    Some(RuleObservation {
+        breach,
+        sample_count: matched_total,
+        detail: RuleObservationDetail::GrpcStatusCount { matched_total },
+    })
+}
+
+fn observe_grpc_status_rate(
+    rule: &GrpcStatusRateRule,
+    sample: SampleInput<'_>,
+    proxy_id: &str,
+    ownership_generation: u64,
+    store: &WindowStore,
+    now_ms: u64,
+) -> Option<RuleObservation> {
+    let SampleInput::Http(s) = sample else {
+        return None;
+    };
+    // Denominator is gRPC transactions only so plain HTTP does not dilute
+    // the rate. Non-gRPC HTTP still returns a snapshot observation so
+    // recovery/resolve can progress without recording into the window.
+    if let Some(status) = s.grpc_status() {
+        let matched = grpc_status_matches(&rule.grpc_statuses, status);
+        store.record_count(
+            rule.common.id,
+            proxy_id,
+            ownership_generation,
+            matched,
+            now_ms,
+        );
+    }
+    let (matched_total, total) =
+        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
+    let percent = if total == 0 {
+        0.0
+    } else {
+        (matched_total as f64 / total as f64) * 100.0
+    };
+    let breach = total >= rule.min_request_count && percent >= rule.threshold_percent;
+    Some(RuleObservation {
+        breach,
+        sample_count: total,
+        detail: RuleObservationDetail::GrpcStatusRate {
+            matched_total,
+            total,
+            percent,
+        },
+    })
+}
+
+fn grpc_status_matches(selectors: &[GrpcStatusMatch], status: u32) -> bool {
+    selectors.iter().any(|selector| selector.matches(status))
+}
+
+fn format_grpc_status_matches(selectors: &[GrpcStatusMatch]) -> String {
+    let rendered: Vec<String> = selectors.iter().map(GrpcStatusMatch::as_display).collect();
+    format!("{rendered:?}")
 }
 
 fn websocket_disconnect_cause(ctx: &WsDisconnectContext) -> DisconnectCause {

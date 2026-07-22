@@ -12238,7 +12238,7 @@ components:
           format: uint64
           minimum: 1
           default: 50
-          description: Per-rule fallback for error-rate and latency-percentile rules.
+          description: Per-rule fallback for error-rate, latency-percentile, and grpc-status-rate rules.
         default_window_seconds:
           type: integer
           format: uint32
@@ -12286,6 +12286,8 @@ components:
               - $ref: "#/components/schemas/ProxyAlertsLatencyPercentileRule"
               - $ref: "#/components/schemas/ProxyAlertsErrorClassRule"
               - $ref: "#/components/schemas/ProxyAlertsStreamDisconnectCauseRule"
+              - $ref: "#/components/schemas/ProxyAlertsGrpcStatusCountRule"
+              - $ref: "#/components/schemas/ProxyAlertsGrpcStatusRateRule"
       example:
         enabled: true
         default_cooldown_seconds: 300
@@ -12475,6 +12477,8 @@ components:
         - $ref: "#/components/schemas/ProxyAlertsLatencyPercentileRule"
         - $ref: "#/components/schemas/ProxyAlertsErrorClassRule"
         - $ref: "#/components/schemas/ProxyAlertsStreamDisconnectCauseRule"
+        - $ref: "#/components/schemas/ProxyAlertsGrpcStatusCountRule"
+        - $ref: "#/components/schemas/ProxyAlertsGrpcStatusRateRule"
       discriminator:
         propertyName: type
         mapping:
@@ -12483,6 +12487,8 @@ components:
           latency_percentile: "#/components/schemas/ProxyAlertsLatencyPercentileRule"
           error_class: "#/components/schemas/ProxyAlertsErrorClassRule"
           stream_disconnect_cause: "#/components/schemas/ProxyAlertsStreamDisconnectCauseRule"
+          grpc_status_count: "#/components/schemas/ProxyAlertsGrpcStatusCountRule"
+          grpc_status_rate: "#/components/schemas/ProxyAlertsGrpcStatusRateRule"
 
     ProxyAlertsDisabledDraftRule:
       type: object
@@ -12675,6 +12681,55 @@ components:
               minimum: 1
               description: Alert when at least this many matching disconnects occur in the window.
 
+    ProxyAlertsGrpcStatusCountRule:
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, grpc_statuses, threshold_count, channels]
+          properties:
+            type:
+              type: string
+              enum: [grpc_status_count]
+            grpc_statuses:
+              $ref: "#/components/schemas/ProxyAlertsGrpcStatusList"
+            threshold_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: |
+                Alert when at least this many completed gRPC transactions carry a
+                matching terminal application status in the window. Evaluated from
+                the terminal `log()` summary after buffered, trailers-only, and
+                streamed bodies finish. HTTP transport status is not consulted.
+
+    ProxyAlertsGrpcStatusRateRule:
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/ProxyAlertsRuleCommon"
+        - type: object
+          required: [name, type, grpc_statuses, threshold_percent, channels]
+          properties:
+            type:
+              type: string
+              enum: [grpc_status_rate]
+            grpc_statuses:
+              $ref: "#/components/schemas/ProxyAlertsGrpcStatusList"
+            threshold_percent:
+              type: number
+              format: double
+              exclusiveMinimum: 0
+              maximum: 100
+              description: |
+                Alert when the matching gRPC-status percentage among gRPC
+                transactions is at least this value. Plain HTTP samples do not
+                enter the denominator.
+            min_request_count:
+              type: integer
+              format: uint64
+              minimum: 1
+              description: Minimum gRPC transactions in the window before the percentage can alert.
+
     ProxyAlertsStatusCodeList:
       type: array
       minItems: 1
@@ -12682,6 +12737,22 @@ components:
         type: integer
         minimum: 100
         maximum: 599
+
+    ProxyAlertsGrpcStatusList:
+      type: array
+      minItems: 1
+      description: |
+        Terminal gRPC application statuses to match. Integers are standard codes
+        `0..=16`. The string `OTHER` matches malformed (`u32::MAX`) and future
+        out-of-range codes, matching the bounded StatsD/Prometheus bucket.
+        Distinct from HTTP `status_codes`.
+      items:
+        oneOf:
+          - type: integer
+            minimum: 0
+            maximum: 16
+          - type: string
+            enum: [OTHER]
 
     ErrorClass:
       type: string

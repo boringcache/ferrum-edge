@@ -2,7 +2,8 @@
 //!
 //! Coverage:
 //! - Config validation (empty channels/rules, unknown channel refs, range
-//!   checks per rule type, severity strings, error class strings).
+//!   checks per rule type, severity strings, error class strings,
+//!   grpc_statuses 0..=16 / OTHER).
 //! - Bucketed sliding-window correctness (record/snapshot under synthetic
 //!   `now_ms`).
 //! - Cooldown gate per `(rule_id, proxy_id, channel_id)`.
@@ -10,6 +11,8 @@
 //!   Healthy / Recovering → Active flap).
 //! - Lifecycle retention: prune removed proxies, expire cooldown rows, drop
 //!   terminal Healthy recovery state, and clear inherited ID-reuse state.
+//! - gRPC terminal-status count/rate rules across buffered, streamed,
+//!   trailers-only, H2/H3, and gateway-rejection summary shapes.
 //! - Plugin construction wires everything end-to-end.
 
 use chrono::{TimeZone, Utc};
@@ -1043,7 +1046,11 @@ async fn accepts_all_rule_types() {
             { "name": "r4", "type": "error_class", "classes": ["connection_refused", "tls_error"],
               "threshold_count": 10, "channels": ["c"] },
             { "name": "r5", "type": "stream_disconnect_cause", "causes": ["backend_error"],
-              "threshold_count": 5, "channels": ["c"] }
+              "threshold_count": 5, "channels": ["c"] },
+            { "name": "r6", "type": "grpc_status_count", "grpc_statuses": [14, "OTHER"],
+              "threshold_count": 10, "channels": ["c"] },
+            { "name": "r7", "type": "grpc_status_rate", "grpc_statuses": [13, 14],
+              "threshold_percent": 5.0, "min_request_count": 10, "channels": ["c"] }
         ]
     });
     let plugin = ProxyAlerts::new(&cfg, http_client()).unwrap();
@@ -2096,4 +2103,390 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
         .expect("websocket sample should apply");
     assert!(ws_observation.breach);
     assert_eq!(ws_observation.sample_count, 1);
+}
+
+// ---------------------------------------------------- gRPC status count/rate
+
+fn grpc_summary(
+    proxy_id: &str,
+    grpc_status: Option<&str>,
+    streamed: bool,
+    body_completed: bool,
+    rejection: bool,
+) -> TransactionSummary {
+    let mut summary = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: Some(proxy_id.to_string()),
+        proxy_name: Some("grpc-api".to_string()),
+        response_status_code: 200,
+        response_streamed: streamed,
+        body_completed,
+        ..TransactionSummary::default()
+    };
+    summary
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    if let Some(status) = grpc_status {
+        summary
+            .metadata
+            .insert("grpc_status".to_string(), status.to_string());
+    }
+    if rejection {
+        summary
+            .metadata
+            .insert("rejection_phase".to_string(), "authorize".to_string());
+    }
+    summary
+}
+
+#[test]
+fn rejects_out_of_range_grpc_status_selector() {
+    let cfg = json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [{
+            "name": "bad",
+            "type": "grpc_status_count",
+            "grpc_statuses": [17],
+            "threshold_count": 1,
+            "channels": ["c"]
+        }]
+    });
+    let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
+    assert!(
+        err.contains("not in [0, 16]") && err.contains("OTHER"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn rejects_unknown_grpc_status_selector_string() {
+    let cfg = json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [{
+            "name": "bad",
+            "type": "grpc_status_count",
+            "grpc_statuses": ["UNAVAILABLE"],
+            "threshold_count": 1,
+            "channels": ["c"]
+        }]
+    });
+    let err = ProxyAlerts::new(&cfg, http_client()).unwrap_err();
+    assert!(err.contains("unknown 'grpc_statuses' entry"), "got: {err}");
+}
+
+#[test]
+fn grpc_status_count_keeps_http_status_distinct_across_shapes() {
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [{
+            "name": "grpc_failures",
+            "type": "grpc_status_count",
+            "grpc_statuses": [14, 13, 16, "OTHER"],
+            "threshold_count": 1,
+            "channels": ["c"]
+        }]
+    }))
+    .unwrap();
+
+    for (case, status, streamed, body_completed, rejection, expect_match) in [
+        ("buffered_h2_ok", Some("0"), false, true, false, false),
+        ("buffered_h2_unavailable", Some("14"), false, true, false, true),
+        ("trailers_only_internal", Some("13"), false, true, false, true),
+        ("streamed_h2_ok", Some("0"), true, true, false, false),
+        ("streamed_h2_unavailable", Some("14"), true, true, false, true),
+        ("native_h3_ok", Some("0"), true, true, false, false),
+        ("native_h3_internal", Some("13"), true, true, false, true),
+        ("bridge_h3_unauthenticated", Some("16"), true, true, false, true),
+        ("gateway_rejection", Some("16"), false, true, true, true),
+        ("missing_terminal_unknown", None, true, true, false, false),
+        ("malformed_other", Some("bad"), true, true, false, true),
+    ] {
+        let specs = parsed
+            .rules
+            .iter()
+            .map(|r| (r.id(), r.window_spec()))
+            .collect();
+        let store = WindowStore::new(specs);
+        let summary = grpc_summary("p1", status, streamed, body_completed, rejection);
+        assert_eq!(
+            summary.response_status_code, 200,
+            "{case}: HTTP status must stay 200"
+        );
+        let expected_status = match status {
+            Some(value) => value.parse::<u32>().unwrap_or(u32::MAX),
+            None => 2, // missing terminal on known gRPC → UNKNOWN
+        };
+        assert_eq!(
+            summary.grpc_status(),
+            Some(expected_status),
+            "{case}: authoritative grpc_status contract"
+        );
+        let observation = parsed.rules[0]
+            .observe(SampleInput::Http(&summary), &store, 1_000)
+            .expect("http/gRPC sample should apply");
+        assert_eq!(
+            observation.breach, expect_match,
+            "{case}: breach={} expected={expect_match}",
+            observation.breach
+        );
+        assert_eq!(
+            observation.sample_count,
+            if expect_match { 1 } else { 0 },
+            "{case}: matched count"
+        );
+        let rendered = observation.render(&parsed.rules[0]);
+        assert!(
+            rendered.reason.contains("gRPC transactions"),
+            "{case}: reason should name gRPC, got {}",
+            rendered.reason
+        );
+    }
+
+    // Plain HTTP 500 never matches a gRPC-status selector.
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|r| (r.id(), r.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+    let plain = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: Some("p1".to_string()),
+        response_status_code: 500,
+        ..TransactionSummary::default()
+    };
+    let plain_obs = parsed.rules[0]
+        .observe(SampleInput::Http(&plain), &store, 1_000)
+        .expect("plain HTTP still ages the count window");
+    assert!(!plain_obs.breach);
+    assert_eq!(plain_obs.sample_count, 0);
+    assert!(plain.grpc_status().is_none());
+}
+
+#[test]
+fn grpc_status_rate_uses_grpc_only_denominator_and_respects_min_count() {
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [{
+            "name": "grpc_error_rate",
+            "type": "grpc_status_rate",
+            "grpc_statuses": [14],
+            "threshold_percent": 50.0,
+            "min_request_count": 4,
+            "channels": ["c"]
+        }]
+    }))
+    .unwrap();
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|r| (r.id(), r.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+
+    // Three UNAVAILABLE + one OK would be 75%, but min_request_count=4 needs
+    // a fourth gRPC sample before breach can fire.
+    for (idx, status) in ["14", "14", "14"].into_iter().enumerate() {
+        let summary = grpc_summary("p1", Some(status), idx % 2 == 0, true, false);
+        let obs = parsed.rules[0]
+            .observe(SampleInput::Http(&summary), &store, 1_000 + idx as u64)
+            .unwrap();
+        assert!(
+            !obs.breach,
+            "below min_request_count must not breach (sample {})",
+            idx + 1
+        );
+    }
+
+    // Plain HTTP must not dilute or satisfy the denominator.
+    let plain = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: Some("p1".to_string()),
+        response_status_code: 200,
+        ..TransactionSummary::default()
+    };
+    let after_plain = parsed.rules[0]
+        .observe(SampleInput::Http(&plain), &store, 5_000)
+        .unwrap();
+    assert_eq!(after_plain.sample_count, 3);
+    assert!(!after_plain.breach);
+
+    let fourth = grpc_summary("p1", Some("0"), true, true, false);
+    let breached = parsed.rules[0]
+        .observe(SampleInput::Http(&fourth), &store, 6_000)
+        .unwrap();
+    assert_eq!(breached.sample_count, 4);
+    assert!(
+        breached.breach,
+        "3/4 UNAVAILABLE (75%) must breach 50% once min_request_count is met"
+    );
+    let rendered = breached.render(&parsed.rules[0]);
+    assert!(rendered.observed.contains('%'));
+    assert!(rendered.reason.contains("3/4"));
+}
+
+#[test]
+fn grpc_status_count_zero_ok_can_be_selected_explicitly() {
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [{
+            "name": "grpc_ok_spike",
+            "type": "grpc_status_count",
+            "grpc_statuses": [0],
+            "threshold_count": 2,
+            "channels": ["c"]
+        }]
+    }))
+    .unwrap();
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|r| (r.id(), r.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+
+    let first = grpc_summary("p1", Some("0"), false, true, false);
+    let obs1 = parsed.rules[0]
+        .observe(SampleInput::Http(&first), &store, 1_000)
+        .unwrap();
+    assert!(!obs1.breach);
+    assert_eq!(obs1.sample_count, 1);
+
+    let second = grpc_summary("p1", Some("0"), true, true, false);
+    let obs2 = parsed.rules[0]
+        .observe(SampleInput::Http(&second), &store, 2_000)
+        .unwrap();
+    assert!(obs2.breach);
+    assert_eq!(obs2.sample_count, 2);
+
+    let fail = grpc_summary("p1", Some("14"), true, true, false);
+    let obs3 = parsed.rules[0]
+        .observe(SampleInput::Http(&fail), &store, 3_000)
+        .unwrap();
+    assert!(obs3.breach);
+    assert_eq!(
+        obs3.sample_count, 2,
+        "non-OK must not increase an OK-only matched count"
+    );
+}
+
+#[test]
+fn grpc_status_rules_ignore_stream_and_websocket_samples() {
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [
+            {
+                "name": "count",
+                "type": "grpc_status_count",
+                "grpc_statuses": [14],
+                "threshold_count": 1,
+                "channels": ["c"]
+            },
+            {
+                "name": "rate",
+                "type": "grpc_status_rate",
+                "grpc_statuses": [14],
+                "threshold_percent": 1.0,
+                "min_request_count": 1,
+                "channels": ["c"]
+            }
+        ]
+    }))
+    .unwrap();
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|r| (r.id(), r.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+    let stream = StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: "tcp-1".to_string(),
+        proxy_lifecycle_generation: None,
+        proxy_name: Some("tcp".to_string()),
+        client_ip: "10.0.0.1".to_string(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: "10.0.0.2:9000".to_string(),
+        backend_resolved_ip: None,
+        protocol: "tcp".to_string(),
+        listen_port: 9000,
+        duration_ms: 10.0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
+        sni_hostname: None,
+        metadata: Default::default(),
+    };
+    assert!(
+        parsed.rules[0]
+            .observe(SampleInput::Stream(&stream), &store, 1_000)
+            .is_none()
+    );
+    assert!(
+        parsed.rules[1]
+            .observe(SampleInput::Stream(&stream), &store, 1_000)
+            .is_none()
+    );
+    assert!(!parsed.rules[0].observes_ws_disconnect());
+    assert!(!parsed.rules[1].observes_ws_disconnect());
+}
+
+#[test]
+fn grpc_status_count_trigger_and_resolve_via_recovery_gate() {
+    let gate = RecoveryGate::new();
+    // Trigger on breach.
+    assert_eq!(
+        gate.observe(1, "grpc-p", true, 60_000, 1_000, 0),
+        LifecycleOutcome::Trigger
+    );
+    // Still active while above threshold.
+    assert_eq!(
+        gate.observe(1, "grpc-p", true, 60_000, 2_000, 0),
+        LifecycleOutcome::StillActive
+    );
+    // Drop below threshold → recovering, then resolve after quiet window.
+    assert_eq!(
+        gate.observe(1, "grpc-p", false, 60_000, 3_000, 0),
+        LifecycleOutcome::EnteringRecovery
+    );
+    assert_eq!(
+        gate.observe(1, "grpc-p", false, 60_000, 63_000, 0),
+        LifecycleOutcome::Resolve
+    );
+}
+
+#[tokio::test]
+async fn grpc_status_http_only_rules_do_not_opt_into_websocket_disconnect_hook() {
+    let cfg = json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [{
+            "name": "grpc_failures",
+            "type": "grpc_status_count",
+            "grpc_statuses": [14],
+            "threshold_count": 1,
+            "channels": ["c"]
+        }]
+    });
+    let plugin = ProxyAlerts::new(&cfg, http_client()).unwrap();
+    assert!(!plugin.requires_ws_disconnect_hooks());
 }
