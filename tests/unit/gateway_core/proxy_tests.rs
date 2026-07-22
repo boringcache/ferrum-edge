@@ -47,7 +47,7 @@ fn terminal_final_body_dispatch_follows_path_policy_and_precedes_backend_breaker
         .find("run_final_request_body_hooks(")
         .expect("terminal final-body hook must run before the backend breaker");
     let synthetic_pipeline = src[terminal_dispatch..breaker]
-        .find("finalize_reject_response_with_after_proxy_hooks(")
+        .find("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
         .expect("terminal response must use the synthetic response pipeline");
     let backend_transport = src
         .find("async fn proxy_to_backend(")
