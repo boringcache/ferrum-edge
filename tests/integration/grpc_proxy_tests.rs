@@ -495,11 +495,7 @@ async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) 
 /// reached its service. Prebuffer cancellation tests use the counter to prove
 /// an incomplete frontend upload never dispatches a partial primary request.
 async fn start_counting_grpc_echo_backend()
--> (
-    SocketAddr,
-    Arc<AtomicUsize>,
-    tokio::task::JoinHandle<()>,
-) {
+-> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -1781,7 +1777,8 @@ async fn request_mirror_prebuffer_enforces_native_grpc_receive_ceiling() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn request_mirror_prebuffer_handles_client_stream_and_cancellation_without_partial_dispatch() {
+async fn request_mirror_prebuffer_handles_client_stream_and_cancellation_without_partial_dispatch()
+{
     use std::convert::Infallible;
 
     use http_body::Frame;
@@ -1828,7 +1825,10 @@ async fn request_mirror_prebuffer_handles_client_stream_and_cancellation_without
         .body(StreamBody::new(ReceiverStream::new(body_rx)))
         .unwrap();
     let response_task = tokio::spawn(async move {
-        let response = sender.send_request(request).await.map_err(|e| e.to_string())?;
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|e| e.to_string())?;
         response
             .into_body()
             .collect()

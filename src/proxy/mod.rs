@@ -19082,11 +19082,10 @@ async fn handle_proxy_request_inner(
                                 authorize_body_requirements.needs_bytes,
                                 authorize_body_requirements.needs_digests,
                             );
-                            ctx.bytes_sent_observed
-                                .fetch_max(
-                                    buffered.body.len() as u64,
-                                    std::sync::atomic::Ordering::Release,
-                                );
+                            ctx.bytes_sent_observed.fetch_max(
+                                buffered.body.len() as u64,
+                                std::sync::atomic::Ordering::Release,
+                            );
                         }
                         buffered
                     }
@@ -19291,11 +19290,10 @@ async fn handle_proxy_request_inner(
                             // size instead of 0. `fetch_max` is safe against
                             // later proxy_to_backend updates — the largest
                             // observed value always wins.
-                            ctx.bytes_sent_observed
-                                .fetch_max(
-                                    buffered.body.len() as u64,
-                                    std::sync::atomic::Ordering::Release,
-                                );
+                            ctx.bytes_sent_observed.fetch_max(
+                                buffered.body.len() as u64,
+                                std::sync::atomic::Ordering::Release,
+                            );
                         }
                         buffered
                     }
@@ -21237,13 +21235,15 @@ async fn handle_proxy_request_inner(
                 // propagate the streaming decision to the response so
                 // trailers reach the client immediately when safe.
                 let collected = match client_request_body {
-                    ClientRequestBody::Streaming(request) => grpc_proxy::collect_grpc_request_body(
-                        *request,
-                        state.max_grpc_recv_size_bytes,
-                        proxy.backend_read_timeout_ms,
-                        ctx.grpc_deadline_at(),
-                    )
-                    .await,
+                    ClientRequestBody::Streaming(request) => {
+                        grpc_proxy::collect_grpc_request_body(
+                            *request,
+                            state.max_grpc_recv_size_bytes,
+                            proxy.backend_read_timeout_ms,
+                            ctx.grpc_deadline_at(),
+                        )
+                        .await
+                    }
                     ClientRequestBody::Buffered(buffered) => {
                         if state.max_grpc_recv_size_bytes > 0
                             && buffered.body.len() > state.max_grpc_recv_size_bytes
