@@ -23,10 +23,18 @@
 //!
 //! ## WebSocket handshake
 //!
-//! `response_mock` participates in the HTTP-family protocol set, including
-//! WebSocket upgrade handshakes. A matching rule short-circuits only the HTTP
-//! handshake response (`PluginResult::Reject`). It does **not** establish or
-//! mock an upgraded WebSocket frame stream — even when `status_code` is `101`.
+//! `response_mock` supports HTTP and WebSocket upgrade handshakes. A matching
+//! rule short-circuits only the HTTP handshake response (`PluginResult::Reject`).
+//! It does **not** establish or mock an upgraded WebSocket frame stream — even
+//! when `status_code` is `101`.
+//!
+//! ## Native gRPC
+//!
+//! Native gRPC is **not** supported. Gateway reject normalization turns plugin
+//! `Reject` results into trailers-only gRPC errors and discards the configured
+//! body, so advertising gRPC would make a default `status_code: 200` mock
+//! surface as `grpc-status: 13` (`INTERNAL`) without a payload. Configure HTTP
+//! or WebSocket mocks only; native gRPC traffic continues to the backend.
 //!
 //! ## Config
 //!
@@ -108,6 +116,12 @@ pub const RESPONSE_MOCK_RULE_KEYS: &[&str] = &[
 /// slot during graceful shutdown. Matches `fault_injection` and
 /// `mesh_route_dispatch`. (Finding #63.)
 const MAX_DELAY_MS: u64 = 3_600_000;
+
+/// HTTP + WebSocket handshake only. Native gRPC is excluded because
+/// `PluginResult::Reject` is normalized to trailers-only gRPC errors that drop
+/// configured bodies (issue #2442).
+const RESPONSE_MOCK_PROTOCOLS: &[super::ProxyProtocol] =
+    &[super::ProxyProtocol::Http, super::ProxyProtocol::WebSocket];
 
 enum PathMatcher {
     Exact(String),
@@ -362,7 +376,7 @@ impl Plugin for ResponseMock {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
+        RESPONSE_MOCK_PROTOCOLS
     }
 
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {

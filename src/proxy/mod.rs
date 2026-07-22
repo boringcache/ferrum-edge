@@ -200,6 +200,19 @@ pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_
 /// precise signal; the normal buffered backend-response path never sets it.
 pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
+/// Body-independent lifecycle signal set once a plugin short-circuit has been
+/// finalized as a successful synthetic response (final HTTP 2xx), including
+/// empty 200 and 204/205 shapes that intentionally skip the synthetic
+/// response-body hook pipeline. Unlike
+/// [`SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`] (scoped to the body-hook phase only),
+/// this marker remains visible through `on_response_committed` so ownership
+/// plugins such as `request_deduplication` can release token-matched local and
+/// Redis in-flight markers after empty/no-body synthetic successes. Non-2xx
+/// plugin rejects and downstream rejection replacements do **not** set this
+/// marker — those keep in-flight ownership until `inflight_ttl` by design.
+pub(crate) const FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY: &str =
+    "ferrum:finalized_synthetic_response";
+
 /// One-shot request-method override used only while synthetic response-body
 /// hooks inspect a plugin-generated representation. `spec_expose` sets `GET`
 /// for canonical HEAD responses so response guards evaluate the representation
@@ -14772,6 +14785,12 @@ pub(crate) async fn apply_plugin_rejection_response(
 ///   contract and keeps preflight/mock-heavy proxies from paying three extra
 ///   async plugin sweeps per request.
 ///
+/// Empty 200 and 204/205 successes still finalize through
+/// [`apply_reject_after_proxy_and_synthetic_body_hooks`], which records
+/// [`FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY`] so ownership plugins can
+/// release in-flight markers from `on_response_committed` without depending on
+/// this body-hook gate.
+///
 /// [`Plugin::should_buffer_response_body`]: crate::plugins::Plugin::should_buffer_response_body
 fn should_apply_synthetic_response_body_hooks(
     status_code: u16,
@@ -15108,6 +15127,21 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         strip_websocket_transport_managed_response_header_map(headers);
     }
 
+    // Body-independent finalized-synthetic signal. Empty 200 and 204/205
+    // short-circuits skip the synthetic body-hook pipeline (and therefore never
+    // see `SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`), but ownership plugins still
+    // need a durable success signal through `on_response_committed`. Gate on the
+    // *final* status after body-hook replacement and reject-path `after_proxy`
+    // so a downstream non-2xx rejection replacement remains TTL-backed instead
+    // of clearing in-flight ownership. H1/H2 and H3 share this finalizer, so
+    // local and Redis request-dedup modes observe the same lifecycle.
+    if (200..300).contains(status) {
+        ctx.metadata.insert(
+            FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+
     // Observe every client-visible rejection that flows through this finalizer —
     // synthetic short-circuits, gRPC rejects, non-2xx rejects, empty-body rejects
     // — only after final-body validators, rejection replacement, and the
@@ -15153,6 +15187,13 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             break;
         }
     }
+
+    // This is internal ownership bookkeeping, not transaction metadata. Keep
+    // it visible for the complete committed-hook lifecycle (including an owned
+    // context transferred to detached deadline cleanup), then remove it from
+    // the request context before later logging/summary hooks can copy it.
+    ctx.metadata
+        .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
 
     // Final wire shape for synthetic/reject responses: HEAD keeps representation
     // metadata (Content-Length) but omits content bytes; 204/205/304 omit both

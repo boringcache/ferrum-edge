@@ -156,6 +156,7 @@ async fn test_ws_logging_rejects_invalid_config_shapes() {
         json!({"endpoint_url": 42}),
         json!({"endpoint_url": "ws://localhost:9300/logs", "batch_size": "many"}),
         json!({"endpoint_url": "ws://localhost:9300/logs", "flush_interval_ms": false}),
+        json!({"endpoint_url": "ws://localhost:9300/logs", "flush_interval_ms": 600001}),
         json!({"endpoint_url": "ws://localhost:9300/logs", "buffer_capacity": -1}),
         json!({"endpoint_url": "ws://localhost:9300/logs", "max_retries": "3"}),
         json!({"endpoint_url": "ws://localhost:9300/logs", "retry_delay_ms": {}}),
