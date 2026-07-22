@@ -632,9 +632,11 @@ where
     ) -> Option<RateLimitOutcome> {
         match self {
             Self::Local(local) => local.check_at_with_capacity(key, op, now, max_entries),
-            Self::Failover(failover) => failover
-                .fallback
-                .check_at_with_capacity(key, op, now, max_entries),
+            Self::Failover(failover) => {
+                failover
+                    .fallback
+                    .check_at_with_capacity(key, op, now, max_entries)
+            }
         }
     }
 
@@ -3222,17 +3224,18 @@ mod tests {
         let algorithm = TestAlgorithm {
             redis_ok: Arc::new(AtomicBool::new(true)),
         };
-        let backend: RateLimitBackend<String, TestAlgorithm> = RateLimitBackend::from_plugin_config(
-            "udp_rate_limiting",
-            &json!({
-                "sync_mode": "redis",
-                "redis_url": "redis://127.0.0.1:9/0",
-                "redis_health_check_interval_seconds": 1
-            }),
-            &http_client,
-            algorithm,
-        )
-        .expect("failover backend");
+        let backend: RateLimitBackend<String, TestAlgorithm> =
+            RateLimitBackend::from_plugin_config(
+                "udp_rate_limiting",
+                &json!({
+                    "sync_mode": "redis",
+                    "redis_url": "redis://127.0.0.1:9/0",
+                    "redis_health_check_interval_seconds": 1
+                }),
+                &http_client,
+                algorithm,
+            )
+            .expect("failover backend");
         assert!(matches!(backend, RateLimitBackend::Failover(_)));
 
         // Seed local fallback state the way Redis-outage / test seeding does.

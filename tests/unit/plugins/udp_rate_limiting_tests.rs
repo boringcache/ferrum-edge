@@ -508,14 +508,10 @@ async fn on_udp_datagram_steady_admission_skips_all_shard_len() {
         udp_rate_limiting_with_shards_for_test,
     };
 
-    let plugin_4 = udp_rate_limiting_with_shards_for_test(
-        &json!({"datagrams_per_second": 1_000_000}),
-        4,
-    );
-    let plugin_256 = udp_rate_limiting_with_shards_for_test(
-        &json!({"datagrams_per_second": 1_000_000}),
-        256,
-    );
+    let plugin_4 =
+        udp_rate_limiting_with_shards_for_test(&json!({"datagrams_per_second": 1_000_000}), 4);
+    let plugin_256 =
+        udp_rate_limiting_with_shards_for_test(&json!({"datagrams_per_second": 1_000_000}), 256);
 
     for plugin in [&plugin_4, &plugin_256] {
         for idx in 0..8u8 {
