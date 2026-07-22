@@ -5,6 +5,11 @@
 //! decompression is opt-in and decompresses `Content-Encoding: gzip|br` request
 //! bodies before other plugins inspect them.
 //!
+//! Multiple effective instances compose with first-wins ownership: one instance
+//! owns request decode and one owns response encode per request so Content-
+//! Encoding stays 1:1 with body coding layers across the shared H1/H2/H3
+//! transform loops.
+//!
 //! Modeled after Envoy's compressor filter: content-type whitelist, minimum
 //! content length, ETag awareness, no double-compression, and `Vary` header
 //! injection.
@@ -14,6 +19,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, warn};
 
 use crate::util::http_headers::{headers_have_cache_control_directive, headers_have_strong_etag};
@@ -97,6 +103,25 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
+/// Request-scoped owner of the one-shot request decode (instance id string).
+///
+/// Multiple `compression` instances may coexist on one proxy. Body decode is
+/// not idempotent: the first effective instance that claims a supported
+/// `Content-Encoding` owns strip + transform exactly once. Siblings must not
+/// delete the owner's internal marker or re-decode.
+const REQUEST_DECODE_OWNER_METADATA_KEY: &str = "compression:request_decode_owner";
+
+/// Request-scoped owner of the one-shot response encode (instance id string).
+///
+/// The first instance that commits a gateway `Content-Encoding` owns the single
+/// coding layer. Sibling transforms see the committed encoding but must not
+/// compress again.
+const RESPONSE_ENCODE_OWNER_METADATA_KEY: &str = "compression:response_encode_owner";
+
+/// Process-unique instance ids so ownership tokens cannot collide across
+/// reload generations that temporarily overlap in flight.
+static NEXT_COMPRESSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// The client's original `Accept-Encoding`, saved in `before_proxy` before
 /// `remove_accept_encoding` can strip it from the backend-bound request.
 ///
@@ -129,6 +154,8 @@ struct CompressionConfig {
 
 pub struct CompressionPlugin {
     config: CompressionConfig,
+    /// Process-unique id for multi-instance ownership tokens.
+    instance_id_str: String,
 }
 
 impl CompressionPlugin {
@@ -231,6 +258,7 @@ impl CompressionPlugin {
             );
         }
 
+        let instance_id = NEXT_COMPRESSION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             config: CompressionConfig {
                 algorithms,
@@ -242,7 +270,20 @@ impl CompressionPlugin {
                 gzip_level,
                 brotli_quality,
             },
+            instance_id_str: instance_id.to_string(),
         })
+    }
+
+    fn is_request_decode_owner(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata
+            .get(REQUEST_DECODE_OWNER_METADATA_KEY)
+            .is_some_and(|owner| owner == &self.instance_id_str)
+    }
+
+    fn is_response_encode_owner(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata
+            .get(RESPONSE_ENCODE_OWNER_METADATA_KEY)
+            .is_some_and(|owner| owner == &self.instance_id_str)
     }
 
     /// Parse `Accept-Encoding` and negotiate the representation coding among
@@ -1067,12 +1108,14 @@ impl Plugin for CompressionPlugin {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Always drop any client-supplied value of the gateway-internal marker.
-        // Without this, a client could set `x-ferrum-original-content-encoding: gzip`
-        // on a plaintext body and trick `transform_request_body` into attempting
-        // decompression (wasted CPU; with a crafted gzip-bomb payload, bounded by
-        // `max_decompressed_request_size` but still unnecessary work).
-        headers.remove("x-ferrum-original-content-encoding");
+        // Strip client-spoofed values of the gateway-internal marker only
+        // before any compression instance has claimed request-decode ownership.
+        // Once claimed, siblings must leave the owner's handoff intact —
+        // deleting the marker here is what previously left encoded uploads
+        // with no Content-Encoding and no decoder.
+        if !ctx.metadata.contains_key(REQUEST_DECODE_OWNER_METADATA_KEY) {
+            headers.remove("x-ferrum-original-content-encoding");
+        }
 
         // RFC 9111 no-transform on requests opts out of gateway response
         // compression, but it must not disable request decompression when
@@ -1094,7 +1137,8 @@ impl Plugin for CompressionPlugin {
         if !has_request_no_transform {
             if let Some(ae) = headers.get("accept-encoding") {
                 ctx.metadata
-                    .insert(REQUEST_ACCEPT_ENCODING_METADATA_KEY.to_string(), ae.clone());
+                    .entry(REQUEST_ACCEPT_ENCODING_METADATA_KEY.to_string())
+                    .or_insert_with(|| ae.clone());
             }
 
             // Strip Accept-Encoding from the backend request so the backend
@@ -1108,7 +1152,11 @@ impl Plugin for CompressionPlugin {
         // removing it, so transform_request_body can find it. The private header
         // x-ferrum-original-content-encoding is used because transform_request_body
         // receives the same headers map (with content-encoding already removed).
+        // Only the first claiming instance may strip public encoding metadata —
+        // stripping without a guaranteed owner transform would forward encoded
+        // bytes without Content-Encoding.
         if self.config.decompress_request
+            && !ctx.metadata.contains_key(REQUEST_DECODE_OWNER_METADATA_KEY)
             && let Some(ce) = headers.get("content-encoding")
             && let Some(encoding) = supported_request_encoding(ce)
         {
@@ -1149,6 +1197,10 @@ impl Plugin for CompressionPlugin {
                 }
             }
 
+            ctx.metadata.insert(
+                REQUEST_DECODE_OWNER_METADATA_KEY.to_string(),
+                self.instance_id_str.clone(),
+            );
             ctx.metadata.insert(
                 "compression:request_encoding".to_string(),
                 encoding.to_string(),
@@ -1230,6 +1282,13 @@ impl Plugin for CompressionPlugin {
                     // from an encoded origin response without trusting a spoofable key.
                     ctx.mark_gateway_response_compression(algo.content_encoding());
 
+                    // First instance to commit Content-Encoding owns the single
+                    // coding layer. Sibling transforms must not compress again.
+                    ctx.metadata.insert(
+                        RESPONSE_ENCODE_OWNER_METADATA_KEY.to_string(),
+                        self.instance_id_str.clone(),
+                    );
+
                     // Retain the existing observable decision metadata.
                     ctx.metadata.insert(
                         RESPONSE_ALGORITHM_METADATA_KEY.to_string(),
@@ -1310,11 +1369,17 @@ impl Plugin for CompressionPlugin {
 
     async fn transform_request_body_with_context(
         &self,
-        _ctx: &mut RequestContext,
+        ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        // Production H1/H2/H3 loops call this context-aware path. Only the
+        // instance that claimed decode ownership in `before_proxy` may rewrite
+        // the body — siblings return None so the bytes are decoded exactly once.
+        if !self.is_request_decode_owner(ctx) {
+            return None;
+        }
         self.transform_request_body(body, content_type, request_headers)
             .await
     }
@@ -1348,11 +1413,14 @@ impl Plugin for CompressionPlugin {
 
         // The algorithm decision was made in `after_proxy` and recorded in
         // private request-context state. Its presence proves the gateway, not
-        // the origin, committed a response encoding. Encode according to the
-        // final Content-Encoding header so a later supported header rewrite
-        // (for example `br` -> `gzip`) still leaves headers and body consistent.
+        // the origin, committed a response encoding. Only the owning instance
+        // may emit the coding layer so Content-Encoding stays 1:1 with body
+        // layers across multi-instance transform loops.
         let encoding = response_headers.get("content-encoding")?;
         ctx.gateway_response_compression_algorithm()?;
+        if !self.is_response_encode_owner(ctx) {
+            return None;
+        }
         let encoding = if encoding.eq_ignore_ascii_case("gzip") {
             "gzip"
         } else if encoding.eq_ignore_ascii_case("br") {
