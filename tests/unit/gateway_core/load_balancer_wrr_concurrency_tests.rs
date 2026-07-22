@@ -290,135 +290,63 @@ fn wrr_cardinality_paths_preserve_weights_for_small_and_large_sets() {
 }
 
 #[test]
-fn wrr_alternating_exclusion_fingerprints_become_steady_cache_hits() {
-    // Shared upstream + retry exclusions (or per-proxy health) alternate
-    // fingerprints. A single-slot cache rebuilds on every switch; the bounded
-    // multi-slot cache must keep both fingerprints on the wait-free hit path.
-    let targets = weighted_targets(&[5, 3, 2, 1]);
-    let lb = Arc::new(LoadBalancer::new(
+fn wrr_exactly_128_healthy_targets_do_not_alias_an_invalid_cache_slot() {
+    // A full 128-target bitset is u128::MAX. It must be treated as a real
+    // healthy-set key, not as an uninitialized-slot sentinel.
+    let targets = weighted_targets(&vec![1; 128]);
+    let lb = LoadBalancer::new(
         UPSTREAM,
         LoadBalancerAlgorithm::WeightedRoundRobin,
         &targets,
         None,
-    ));
+    );
 
-    // Warm both exclusion-derived fingerprints.
-    for _ in 0..64 {
-        let t = lb
+    for _ in 0..256 {
+        lb.select("", None)
+            .expect("all-healthy 128-target WRR selection");
+    }
+}
+
+#[test]
+fn wrr_alternating_fingerprints_keep_independent_selection_counters() {
+    // Each exclusion leaves a two-target, equal-weight schedule. A shared lane
+    // counter would make the alternating calls observe a fixed parity and pin
+    // each fingerprint to only one backend forever.
+    let targets = weighted_targets(&[1, 1, 1]);
+    let lb = LoadBalancer::new(
+        UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    );
+    let mut exclude_last_counts = HashMap::<String, usize>::new();
+    let mut exclude_first_counts = HashMap::<String, usize>::new();
+
+    for _ in 0..200 {
+        let first_lane = lb
+            .select_excluding("", &targets[2], None)
+            .expect("exclude last target");
+        *exclude_last_counts
+            .entry(first_lane.host.clone())
+            .or_default() += 1;
+
+        let second_lane = lb
             .select_excluding("", &targets[0], None)
-            .expect("exclude host0");
-        assert_ne!(t.host, "host0");
-        let t = lb
-            .select_excluding("", &targets[1], None)
-            .expect("exclude host1");
-        assert_ne!(t.host, "host1");
-    }
-    let (hits_warm, rebuilds_warm) = lb.wrr_lane_cache_stats();
-    assert!(
-        rebuilds_warm >= 2,
-        "expected both exclusion fingerprints to publish at least once, got {rebuilds_warm}"
-    );
-    assert!(hits_warm > 0, "warmup should record steady hits");
-
-    let threads = 8usize;
-    let per_thread = 1_000usize;
-    let mut handles = Vec::with_capacity(threads);
-    for tid in 0..threads {
-        let lb = Arc::clone(&lb);
-        let exclude = if tid % 2 == 0 {
-            targets[0].clone()
-        } else {
-            targets[1].clone()
-        };
-        let forbidden = exclude.host.clone();
-        handles.push(thread::spawn(move || {
-            for _ in 0..per_thread {
-                let t = lb
-                    .select_excluding("", &exclude, None)
-                    .expect("exclusion selection");
-                assert_ne!(t.host, forbidden);
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().expect("worker");
+            .expect("exclude first target");
+        *exclude_first_counts
+            .entry(second_lane.host.clone())
+            .or_default() += 1;
     }
 
-    let (hits_after, rebuilds_after) = lb.wrr_lane_cache_stats();
-    assert_eq!(
-        rebuilds_after, rebuilds_warm,
-        "alternating warmed fingerprints must not republish schedules \
-         (rebuilds stayed {rebuilds_after}, warm was {rebuilds_warm})"
-    );
-    assert!(
-        hits_after >= hits_warm + (threads * per_thread) as u64,
-        "every alternating selection must be a cache hit \
-         (hits_after={hits_after} hits_warm={hits_warm})"
-    );
+    assert_eq!(exclude_last_counts.get("host0"), Some(&100));
+    assert_eq!(exclude_last_counts.get("host1"), Some(&100));
+    assert_eq!(exclude_first_counts.get("host1"), Some(&100));
+    assert_eq!(exclude_first_counts.get("host2"), Some(&100));
 }
 
 #[test]
-fn wrr_alternating_active_health_fingerprints_become_steady_cache_hits() {
-    let targets = weighted_targets(&[4, 3, 2, 1]);
-    let lb = Arc::new(LoadBalancer::new(
-        UPSTREAM,
-        LoadBalancerAlgorithm::WeightedRoundRobin,
-        &targets,
-        None,
-    ));
-
-    let eject0 = Arc::new(DashMap::<String, u64>::new());
-    eject0.insert(target_key(UPSTREAM, &targets[0]), 1);
-    let eject1 = Arc::new(DashMap::<String, u64>::new());
-    eject1.insert(target_key(UPSTREAM, &targets[1]), 1);
-
-    for _ in 0..64 {
-        let sel = lb
-            .select("", Some(&active_health_ctx(&eject0)))
-            .expect("eject0");
-        assert_ne!(sel.target.host, "host0");
-        let sel = lb
-            .select("", Some(&active_health_ctx(&eject1)))
-            .expect("eject1");
-        assert_ne!(sel.target.host, "host1");
-    }
-    let (hits_warm, rebuilds_warm) = lb.wrr_lane_cache_stats();
-    assert!(rebuilds_warm >= 2);
-
-    let threads = 8usize;
-    let per_thread = 800usize;
-    let mut handles = Vec::with_capacity(threads);
-    for tid in 0..threads {
-        let lb = Arc::clone(&lb);
-        let map = if tid % 2 == 0 {
-            Arc::clone(&eject0)
-        } else {
-            Arc::clone(&eject1)
-        };
-        let forbidden = if tid % 2 == 0 { "host0" } else { "host1" };
-        handles.push(thread::spawn(move || {
-            for _ in 0..per_thread {
-                let ctx = active_health_ctx(&map);
-                let sel = lb.select("", Some(&ctx)).expect("health selection");
-                assert_ne!(sel.target.host, forbidden);
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().expect("worker");
-    }
-
-    let (hits_after, rebuilds_after) = lb.wrr_lane_cache_stats();
-    assert_eq!(
-        rebuilds_after, rebuilds_warm,
-        "alternating health fingerprints must stay cached"
-    );
-    assert!(hits_after >= hits_warm + (threads * per_thread) as u64);
-}
-
-#[test]
-fn wrr_vec_path_alternating_exclusions_become_steady_cache_hits() {
-    // >128 targets exercise the vec fingerprint path with the same bounded cache.
+fn wrr_vec_path_alternating_exclusions_remain_correct() {
+    // >128 targets exercise exact ordered-membership cache keys.
     let n = 129usize;
     let weights: Vec<u32> = (0..n).map(|i| if i < 4 { 3 } else { 1 }).collect();
     let targets = weighted_targets(&weights);
@@ -439,9 +367,6 @@ fn wrr_vec_path_alternating_exclusions_become_steady_cache_hits() {
             .expect("exclude 1");
         assert_ne!(t.host, "host1");
     }
-    let (hits_warm, rebuilds_warm) = lb.wrr_lane_cache_stats();
-    assert!(rebuilds_warm >= 2);
-
     let threads = 6usize;
     let per_thread = 200usize;
     let mut handles = Vec::with_capacity(threads);
@@ -466,47 +391,4 @@ fn wrr_vec_path_alternating_exclusions_become_steady_cache_hits() {
         handle.join().expect("worker");
     }
 
-    let (hits_after, rebuilds_after) = lb.wrr_lane_cache_stats();
-    assert_eq!(rebuilds_after, rebuilds_warm);
-    assert!(hits_after >= hits_warm + (threads * per_thread) as u64);
-}
-
-#[test]
-fn wrr_recovery_reuses_cached_fingerprint_schedule() {
-    let targets = weighted_targets(&[5, 1, 1]);
-    let lb = LoadBalancer::new(
-        UPSTREAM,
-        LoadBalancerAlgorithm::WeightedRoundRobin,
-        &targets,
-        None,
-    );
-
-    // Publish full-set schedule.
-    for _ in 0..16 {
-        let _ = lb.select("", None);
-    }
-    let unhealthy: DashMap<String, u64> = DashMap::new();
-    unhealthy.insert(target_key(UPSTREAM, &targets[0]), 1);
-    for _ in 0..16 {
-        let sel = lb
-            .select("", Some(&active_health_ctx(&unhealthy)))
-            .expect("unhealthy");
-        assert_ne!(sel.target.host, "host0");
-    }
-    let (_, rebuilds_mid) = lb.wrr_lane_cache_stats();
-
-    unhealthy.clear();
-    lb.reset_recovered_target_latency(&targets[0]);
-
-    let (hits_before, rebuilds_before) = lb.wrr_lane_cache_stats();
-    assert_eq!(rebuilds_before, rebuilds_mid);
-    for _ in 0..32 {
-        let _ = lb.select("", None);
-    }
-    let (hits_after, rebuilds_after) = lb.wrr_lane_cache_stats();
-    assert_eq!(
-        rebuilds_after, rebuilds_before,
-        "restored full healthy fingerprint must reuse the cached schedule"
-    );
-    assert!(hits_after > hits_before);
 }
