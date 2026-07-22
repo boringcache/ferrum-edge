@@ -684,10 +684,7 @@ fn parse_stream_disconnect_cause(
     })
 }
 
-fn parse_grpc_status_count(
-    common: RuleCommon,
-    raw: &Value,
-) -> Result<GrpcStatusCountRule, String> {
+fn parse_grpc_status_count(common: RuleCommon, raw: &Value) -> Result<GrpcStatusCountRule, String> {
     let grpc_statuses = read_grpc_statuses(raw, &common.name)?;
     let threshold_count = read_threshold_count(raw, &common.name)?;
     Ok(GrpcStatusCountRule {
