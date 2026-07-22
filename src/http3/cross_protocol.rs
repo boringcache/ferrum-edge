@@ -4453,6 +4453,17 @@ where
                     &resp.headers,
                     &resp.trailers,
                 );
+            // Same gRPC-Web trailer-frame provenance as the H1/H2 buffered path:
+            // record backend trailer names and collision values so the body
+            // frame neither copies initial-header-only fields nor substitutes
+            // an initial value for a same-name backend trailer.
+            if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
+                crate::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
+                    &mut ctx.metadata,
+                    &resp.headers,
+                    &resp.trailers,
+                );
+            }
             let mut authoritative_trailers_only_terminal_metadata = (resp.body.is_empty()
                 && resp.trailers.is_empty())
             .then(|| {
@@ -4496,9 +4507,11 @@ where
             } else {
                 None
             };
-            let mut buffered_initial_response_header_policy_state =
-                ctx.take_buffered_initial_response_header_policy();
+            // Keep policy state on `ctx` through body transforms so gRPC-Web
+            // trailer framing sees BufferedInitialResponseHeaderPolicyState
+            // outcomes; take it after transform for wire reconciliation.
             if let Some(reject) = after_proxy_reject {
+                let _ = ctx.take_buffered_initial_response_header_policy();
                 let reject_status = reject.status_code;
                 let mut outcome = match write_final_body_reject(
                     stream,
@@ -4613,12 +4626,9 @@ where
                     // Same ordering contract as the transform phase below: the
                     // decode-only normalize rewrite must not let the trailer
                     // retirement masquerade as a policy-owned header removal.
-                    if let Some(policy_state) =
-                        buffered_initial_response_header_policy_state.as_mut()
-                    {
-                        Arc::make_mut(policy_state)
-                            .record_later_response_header_mutations(&mut plugin_response_headers);
-                    }
+                    ctx.record_buffered_initial_response_header_later_mutations(
+                        &mut plugin_response_headers,
+                    );
                     crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
                         &mut plugin_response_headers,
                         &mut response_trailers,
@@ -4672,12 +4682,17 @@ where
                             &mut response_trailers,
                             &mut authoritative_trailers_only_terminal_metadata,
                         );
-                        buffered_initial_response_header_policy_state = None;
+                        let _ = ctx.take_buffered_initial_response_header_policy();
                         response_body_rejected = true;
                         break;
                     }
                 }
             }
+            // Capture normalize / inspect header mutations before gRPC-Web
+            // frames trailers from the live compatibility view.
+            ctx.record_buffered_initial_response_header_later_mutations(
+                &mut plugin_response_headers,
+            );
             // A response-body transform like grpc_web reads the gRPC status from
             // the headers map it is handed. The merged view already carries the
             // gRPC trailers (grpc-status / grpc-message and any trailer-only
@@ -4716,7 +4731,7 @@ where
                     &mut response_trailers,
                     &mut authoritative_trailers_only_terminal_metadata,
                 );
-                buffered_initial_response_header_policy_state = None;
+                let _ = ctx.take_buffered_initial_response_header_policy();
                 terminal_metadata_is_body_framed |= grpc_web_response_content_type.is_some();
                 response_body_rejected = true;
             }
@@ -4761,6 +4776,7 @@ where
                                 &mut response_trailers,
                                 &mut authoritative_trailers_only_terminal_metadata,
                             );
+                            let _ = ctx.take_buffered_initial_response_header_policy();
                             terminal_metadata_is_body_framed |=
                                 client_terminal_metadata_is_body_framed;
                             response_body_rejected = true;
@@ -4784,21 +4800,20 @@ where
                     );
                 }
             }
-            // Mirror the main buffered gRPC path: record genuine transform-phase
-            // edits before retiring stale compatibility-view trailers, so a
-            // policy-owned initial header the backend also sent as a trailer is
-            // not mistaken for a later intentional removal.
+            // Mirror the main buffered gRPC path: take policy state for wire
+            // reconciliation and record genuine transform-phase edits before
+            // later trailer retirement. Discarding application trailers here
+            // (before reconcile + gRPC-Web body-frame sync) would leave only
+            // reserved terminal keys and sync would rebuild a sparse frame
+            // that drops ASCII/binary custom metadata on properly framed
+            // H3→H2 bodies.
+            let mut buffered_initial_response_header_policy_state =
+                ctx.take_buffered_initial_response_header_policy();
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)
                     .record_later_response_header_mutations(&mut plugin_response_headers);
             }
-            if representation_rewritten {
-                crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
-                    &mut plugin_response_headers,
-                    &mut response_trailers,
-                    &header_shadowed_trailer_keys,
-                );
-            }
+            let defer_application_trailer_discard = representation_rewritten;
             if !response_body_rejected {
                 for plugin in plugins.iter() {
                     let result = match crate::plugins::await_grpc_deadline(
@@ -4870,6 +4885,38 @@ where
                 &header_shadowed_trailer_keys,
                 buffered_initial_response_header_policy_state.as_deref(),
             );
+            // Body-framed gRPC-Web trailers must match reconciled wire trailers.
+            if !terminal_metadata_is_body_framed
+                && crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+            {
+                let http_status = ctx
+                    .metadata
+                    .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
+                    .and_then(|value| value.parse::<u16>().ok());
+                let content_type = plugin_response_headers
+                    .get("content-type")
+                    .map(String::as_str);
+                if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                    &mut response_body,
+                    content_type,
+                    &response_trailers,
+                    http_status,
+                ) {
+                    plugin_response_headers.insert(
+                        "content-length".to_string(),
+                        response_body.len().to_string(),
+                    );
+                }
+            }
+            // Retire compatibility-view application trailers only after the
+            // body frame has been synced from the reconciled map.
+            if defer_application_trailer_discard {
+                crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                    &mut plugin_response_headers,
+                    &mut response_trailers,
+                    &header_shadowed_trailer_keys,
+                );
+            }
             // Admission retains the pristine backend status; transaction
             // metadata follows the post-hook status that the H3 client sees.
             crate::proxy::grpc_proxy::refresh_grpc_status_metadata_with_body_framed_terminal(
@@ -5031,7 +5078,11 @@ where
                 }
             }
             if body_completed && !response_trailers.is_empty() {
-                let trailer_map = headers_to_header_map(&response_trailers);
+                // Split LF-joined duplicate metadata before HeaderValue
+                // construction — same native buffered emit path as H2.
+                let trailer_map = crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(
+                    &response_trailers,
+                );
                 let trailer_write = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
                         grpc_deadline_at,
@@ -6462,19 +6513,6 @@ fn collect_reqwest_response_headers(response: &reqwest::Response) -> HashMap<Str
         }
     }
     headers
-}
-
-fn headers_to_header_map(map: &HashMap<String, String>) -> HeaderMap {
-    let mut hmap = HeaderMap::new();
-    for (k, v) in map {
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            hmap.append(name, val);
-        }
-    }
-    hmap
 }
 
 // ---------------------------------------------------------------------------
