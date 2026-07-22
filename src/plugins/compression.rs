@@ -88,6 +88,9 @@ const DEFAULT_CONTENT_TYPES: &[&str] = &[
 ];
 
 /// HTTP status codes that should never be compressed (no body or cache-only).
+///
+/// Includes `205 Reset Content` (RFC 9110 §15.3.6 forbids response content)
+/// alongside the classic `204` / `304` no-body statuses.
 const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 205, 304];
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
@@ -400,16 +403,31 @@ impl CompressionPlugin {
     /// and must not invent a negotiation failure for an absent payload or an
     /// already-coded upstream response.
     ///
+    /// `HEAD` is included because the wire body is always empty: gateway
+    /// compression cannot derive the encoded length of the corresponding GET
+    /// representation without encoding that body, so inventing
+    /// `Content-Encoding` / an encoded-empty `Content-Length` would violate
+    /// RFC 9110 §9.3.2 / §8.6. Preserve valid backend representation
+    /// metadata instead.
+    ///
     /// Identity range/delta responses are *not* hard skips: they are
     /// non-transformable (see [`Self::is_non_transformable_range_or_delta`])
     /// and still subject to identity-acceptability / 406 negotiation.
     fn is_protocol_hard_skip(
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
+        Self::is_bodyless_for_compression(ctx, response_status)
             || response_headers.contains_key("content-encoding")
+    }
+
+    /// Statuses / methods that never carry a compressible message body on
+    /// the wire. Used by protocol hard-skips and response-buffer refinement.
+    #[inline]
+    fn is_bodyless_for_compression(ctx: &RequestContext, response_status: u16) -> bool {
+        UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
+            || ctx.method.eq_ignore_ascii_case("HEAD")
     }
 
     /// Range/delta representations Ferrum must not re-encode, but which remain
@@ -919,8 +937,11 @@ impl Plugin for CompressionPlugin {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Skip response buffering when the client doesn't accept any encoding
-        // we support — there's nothing to compress.
+        // we support — there's nothing to compress. HEAD never carries a wire
+        // body the gateway can re-encode, so do not pin it onto the buffered
+        // path either (preserves backend representation metadata).
         !self.config.algorithms.is_empty()
+            && !ctx.method.eq_ignore_ascii_case("HEAD")
             && ctx.headers.contains_key("accept-encoding")
             && !ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
             && !ctx
@@ -951,7 +972,10 @@ impl Plugin for CompressionPlugin {
         // here too; otherwise the partial body stays pinned on the buffered path
         // (uncompressed, since `transform_response_body` is buffered-only) and
         // can trip the response body size limit instead of streaming.
-        if UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
+        //
+        // `204` / `205` / `304` and `HEAD` are bodyless for compression: never
+        // buffer them for a transform that cannot legally rewrite the wire body.
+        if Self::is_bodyless_for_compression(ctx, response_status)
             || !super::response_body_rewrite_allowed(response_status)
             || response_headers.contains_key("content-range")
             || ctx
@@ -978,7 +1002,7 @@ impl Plugin for CompressionPlugin {
         response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
+        Self::is_bodyless_for_compression(ctx, response_status)
             || !super::response_body_rewrite_allowed(response_status)
             || response_headers.contains_key("content-range")
             || ctx
@@ -1156,8 +1180,9 @@ impl Plugin for CompressionPlugin {
         // rejections keep their original status.
         let on_rejection = ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY);
 
-        // No-body statuses and already-coded upstream responses are
-        // protocol-correct as-is; negotiation does not invent a 406 for them.
+        // No-body statuses (`204`/`205`/`304`), HEAD, and already-coded
+        // upstream responses are protocol-correct as-is; negotiation does not
+        // invent a 406 for them or rewrite representation metadata.
         if Self::is_protocol_hard_skip(ctx, response_status, response_headers) {
             return PluginResult::Continue;
         }
@@ -1314,6 +1339,13 @@ impl Plugin for CompressionPlugin {
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        // HEAD never transfers content bytes. Even if an earlier phase
+        // incorrectly committed a Content-Encoding, refuse to synthesize an
+        // encoded-empty body / Content-Length (RFC 9110 §9.3.2 / §8.6).
+        if ctx.method.eq_ignore_ascii_case("HEAD") {
+            return None;
+        }
+
         // The algorithm decision was made in `after_proxy` and recorded in
         // private request-context state. Its presence proves the gateway, not
         // the origin, committed a response encoding. Encode according to the

@@ -1492,6 +1492,56 @@ async fn test_skips_204_no_content() {
 }
 
 #[tokio::test]
+async fn test_skips_205_reset_content_absent_and_zero_content_length() {
+    // Issue #2356: 205 must never be gateway-encoded. Preserve backend
+    // Content-Length (absent or zero) and do not nominate Vary.
+    let plugin = make_plugin(json!({"min_content_length": 1}));
+
+    for content_length in [None, Some("0")] {
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        if let Some(cl) = content_length {
+            resp_headers.insert("content-length".to_string(), cl.to_string());
+        }
+
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 205, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !resp_headers.contains_key("content-encoding"),
+            "205 must not commit Content-Encoding (cl={content_length:?})"
+        );
+        assert_eq!(
+            resp_headers.get("content-length").map(String::as_str),
+            content_length,
+            "205 must preserve backend Content-Length (cl={content_length:?})"
+        );
+        assert!(
+            !resp_headers.contains_key("vary"),
+            "205 hard skip must not nominate Vary (cl={content_length:?})"
+        );
+
+        // Empty wire body must not be gzip/Brotli-encoded either.
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &[],
+                    Some("application/json"),
+                    &resp_headers,
+                )
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_skips_304_not_modified() {
     let plugin = make_plugin(json!({}));
     let mut ctx = make_ctx(Some("gzip"));
@@ -1503,6 +1553,60 @@ async fn test_skips_304_not_modified() {
 
     plugin.after_proxy(&mut ctx, 304, &mut resp_headers).await;
     assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_skips_head_present_and_absent_content_length() {
+    // Issue #2356: HEAD has no wire body the gateway can re-encode. Skip
+    // gateway compression and preserve backend representation metadata
+    // rather than inventing an encoded-empty Content-Length.
+    let plugin = make_plugin(json!({"min_content_length": 256}));
+
+    for content_length in [None, Some("1024")] {
+        let mut ctx = make_ctx(Some("gzip"));
+        ctx.method = "HEAD".to_string();
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        if let Some(cl) = content_length {
+            resp_headers.insert("content-length".to_string(), cl.to_string());
+        }
+
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !resp_headers.contains_key("content-encoding"),
+            "HEAD must not commit Content-Encoding (cl={content_length:?})"
+        );
+        assert_eq!(
+            resp_headers.get("content-length").map(String::as_str),
+            content_length,
+            "HEAD must preserve backend Content-Length (cl={content_length:?})"
+        );
+        assert!(
+            !resp_headers.contains_key("vary"),
+            "HEAD hard skip must not nominate Vary (cl={content_length:?})"
+        );
+
+        // No gateway compression was committed, so the empty HEAD wire body
+        // must not be transformed into a compressed member.
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &[],
+                    Some("application/json"),
+                    &resp_headers,
+                )
+                .await
+                .is_none(),
+            "HEAD must never gzip an empty wire body (cl={content_length:?})"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1876,6 +1980,20 @@ fn test_response_buffering_skips_range_responses() {
                 .should_release_response_body_before_content_type_rewrite(&ctx, status, &no_range)
         );
     }
+
+    // HEAD never buffers for compression (no wire body to re-encode).
+    let mut head_ctx = make_ctx(Some("gzip"));
+    head_ctx.method = "HEAD".to_string();
+    assert!(!plugin.should_buffer_response_body(&head_ctx));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &head_ctx,
+        Some("text/html"),
+        200,
+        &no_range
+    ));
+    assert!(
+        plugin.should_release_response_body_before_content_type_rewrite(&head_ctx, 200, &no_range)
+    );
 
     // A Content-Range header on a non-206 status also opts out.
     let mut range_headers = HashMap::new();
@@ -2367,13 +2485,30 @@ async fn test_ineligible_identity_does_not_nominate_vary() {
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert!(!resp_headers.contains_key("vary"));
 
-    // No-body status (protocol hard skip).
-    let mut ctx = make_ctx(None);
+    // No-body statuses (protocol hard skips), including 205.
+    for status in [204u16, 205, 304] {
+        let mut ctx = make_ctx(None);
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+        plugin.after_proxy(&mut ctx, status, &mut resp_headers).await;
+        assert!(
+            !resp_headers.contains_key("vary"),
+            "{status} hard skip must not nominate Vary"
+        );
+    }
+
+    // HEAD is permanently ineligible for gateway coding.
+    let mut ctx = make_ctx(Some("gzip"));
+    ctx.method = "HEAD".to_string();
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-type".to_string(), "application/json".to_string());
-    plugin.after_proxy(&mut ctx, 204, &mut resp_headers).await;
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert!(!resp_headers.contains_key("vary"));
 
     // Strong ETag forbids transform permanently for this representation.
