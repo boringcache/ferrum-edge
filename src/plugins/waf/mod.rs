@@ -23,6 +23,8 @@ mod stream;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::warn;
 
@@ -127,6 +129,36 @@ pub struct Waf {
     /// Protocols this instance attaches to. Includes the stream protocols only
     /// when `stream` inspection is configured, so HTTP-only WAFs are unchanged.
     supported_protocols: &'static [ProxyProtocol],
+    /// Process-unique runtime id used as the private request-score map key.
+    instance_id: u64,
+    /// Stable plugin-config identity (sanitized) for transaction-log ownership.
+    identity: Arc<str>,
+    /// Precomputed `waf.instances.<identity>.score` metadata key (cold path).
+    score_metadata_key: Arc<str>,
+}
+
+static NEXT_WAF_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Sanitize a plugin-config id for use as a metadata key segment.
+///
+/// Keeps the operator-visible identity stable and bounded while rejecting
+/// characters that would make `waf.instances.<id>.score` ambiguous.
+fn sanitize_waf_instance_identity(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(64));
+    for (index, ch) in raw.chars().enumerate() {
+        if index >= 64 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("instance");
+    }
+    out
 }
 
 impl Waf {
@@ -174,6 +206,17 @@ impl Waf {
     }
 
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_with_config_id(config, None)
+    }
+
+    /// Construct a WAF instance with an optional stable plugin-config resource id.
+    ///
+    /// Production `PluginCache` passes `Some(&pc.id)` so request-private anomaly
+    /// scores and transaction metadata are owned by that configured instance.
+    /// Direct/test construction may pass `None` and receives a process-unique
+    /// `standalone-<n>` identity so sibling `Waf::new` calls never share an
+    /// accumulator.
+    pub fn new_with_config_id(config: &Value, config_id: Option<&str>) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "waf: config must be an object".to_string())?;
@@ -316,6 +359,13 @@ impl Waf {
         } else {
             HTTP_FAMILY_PROTOCOLS
         };
+        let instance_id = NEXT_WAF_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        let identity: Arc<str> = match config_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => Arc::from(sanitize_waf_instance_identity(id)),
+            None => Arc::from(format!("standalone-{instance_id}")),
+        };
+        let score_metadata_key: Arc<str> =
+            Arc::from(format!("waf.instances.{identity}.score"));
         Ok(Self {
             config,
             compiled,
@@ -324,6 +374,9 @@ impl Waf {
             active,
             stream,
             supported_protocols,
+            instance_id,
+            identity,
+            score_metadata_key,
         })
     }
 
@@ -604,14 +657,19 @@ impl Waf {
             self.warn_hit(ctx, hit);
         }
 
-        // Accumulate across all scan phases of this request (carried in
-        // metadata) so weak signals in the query, body, and response add up to
-        // a single transaction score that can cross the block threshold even
-        // when no individual rule is set to enforce.
+        // Accumulate across all scan phases of this instance (carried in
+        // request-private per-instance state) so weak signals in the query,
+        // body, and response add up to a single instance score that can cross
+        // that instance's block threshold. Sibling WAF instances never share
+        // this accumulator.
         let total_score = self.config.scoring.as_ref().map(|scoring| {
             ctx.ensure_waf_metadata_initialized();
-            ctx.waf_score = ctx.waf_score.saturating_add(phase_score);
-            (ctx.waf_score, scoring.block_threshold)
+            let total = ctx.accumulate_waf_instance_score(
+                self.instance_id,
+                &self.identity,
+                phase_score,
+            );
+            (total, scoring.block_threshold)
         });
         let score_block = enforce_actions
             && self.config.mode == GlobalMode::Enforce
@@ -630,7 +688,7 @@ impl Waf {
             ctx.set_waf_metadata("waf.severity", highest.as_str());
             ctx.set_waf_metadata("waf.paranoia", self.config.paranoia_level.to_string());
             if let Some((total, _)) = total_score {
-                ctx.set_waf_metadata("waf.score", total.to_string());
+                self.publish_instance_score_metadata(ctx, total);
             }
             if outcome.truncated {
                 ctx.set_waf_metadata("waf.scan_truncated", "true");
@@ -642,12 +700,46 @@ impl Waf {
             } else if score_block {
                 ctx.set_waf_metadata("waf.action", "blocked");
                 ctx.set_waf_metadata_if_absent("waf.block_reason", "score");
+                ctx.set_waf_metadata_if_absent("waf.scoring_instance", self.identity.as_ref());
             } else if ctx.waf_metadata_value("waf.action") != Some("blocked") {
                 ctx.set_waf_metadata("waf.action", "monitored");
             }
         }
 
         first_blocking_rule.is_some() || score_block
+    }
+
+    /// Publish this instance's score and a deterministic multi-instance aggregate.
+    ///
+    /// - Always writes `waf.instances.<identity>.score` for the updating instance.
+    /// - When exactly one instance has scored on this request, also writes
+    ///   `waf.score` (single-policy compatibility).
+    /// - When multiple instances have scored, writes sorted
+    ///   `waf.instance_scores` as `id=score,...` and clears conflated `waf.score`.
+    fn publish_instance_score_metadata(&self, ctx: &mut RequestContext, total: u32) {
+        ctx.set_waf_metadata(self.score_metadata_key.as_ref(), total.to_string());
+        if ctx.waf_instance_scores.len() <= 1 {
+            ctx.set_waf_metadata("waf.score", total.to_string());
+            ctx.clear_waf_metadata("waf.instance_scores");
+            return;
+        }
+        let mut parts: Vec<(&str, u32)> = ctx
+            .waf_instance_scores
+            .values()
+            .map(|state| (state.identity.as_ref(), state.score))
+            .collect();
+        parts.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut aggregate = String::new();
+        for (index, (identity, score)) in parts.iter().enumerate() {
+            if index > 0 {
+                aggregate.push(',');
+            }
+            aggregate.push_str(identity);
+            aggregate.push('=');
+            push_decimal_u32(&mut aggregate, *score);
+        }
+        ctx.set_waf_metadata("waf.instance_scores", aggregate);
+        ctx.clear_waf_metadata("waf.score");
     }
 
     fn finish_timeout(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -1412,6 +1504,23 @@ fn optional_u64(object: &serde_json::Map<String, Value>, key: &str) -> Result<Op
             .ok_or_else(|| format!("waf: '{key}' must be a non-negative integer")),
         Some(other) => Err(format!("waf: '{key}' must be an integer, got {other}")),
     }
+}
+
+/// Append a decimal `u32` without allocating an intermediate `String`.
+fn push_decimal_u32(buf: &mut String, value: u32) {
+    let mut digits = [0u8; 10];
+    let mut remaining = value;
+    let mut index = digits.len();
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (remaining % 10) as u8;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    // Digits are ASCII by construction.
+    buf.push_str(std::str::from_utf8(&digits[index..]).unwrap_or("0"));
 }
 
 #[cfg(test)]

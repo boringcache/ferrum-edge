@@ -19920,7 +19920,7 @@ async fn handle_proxy_request_inner(
                     }
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                     ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                    ctx.waf_score = body_hook_ctx.waf_score;
+                    ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -20214,7 +20214,7 @@ async fn handle_proxy_request_inner(
                     }
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                     ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                    ctx.waf_score = body_hook_ctx.waf_score;
+                    ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -20813,7 +20813,7 @@ async fn handle_proxy_request_inner(
                 }
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                 ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-                ctx.waf_score = body_hook_ctx.waf_score;
+                ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
             }
             match final_body_result {
                 PluginResult::Continue => {}
@@ -23478,7 +23478,7 @@ async fn handle_proxy_request_inner(
             }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-            ctx.waf_score = body_hook_ctx.waf_score;
+            ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -23887,7 +23887,7 @@ async fn handle_proxy_request_inner(
             }
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
-            ctx.waf_score = body_hook_ctx.waf_score;
+            ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {
@@ -35767,7 +35767,7 @@ mod tests {
         }
         ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
         ctx.waf_owned_metadata = hook_ctx.waf_owned_metadata;
-        ctx.waf_score = hook_ctx.waf_score;
+        ctx.waf_instance_scores = hook_ctx.waf_instance_scores;
 
         // The hook's metadata write propagated back to the live context.
         assert_eq!(

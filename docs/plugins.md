@@ -3250,7 +3250,7 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `rule_modes` | object | `{}` | Per-rule action overrides keyed by rule ID. Values: `enforce`, `monitor`, `disabled` (aliases like `block` and `off` are accepted). |
 | `default_rule_action` | string | _(unset)_ | Bulk action for built-in rules: `enforce`, `monitor`, or `disabled`. Unset keeps the safe monitor-only default for built-ins. |
 | `rule_overrides` | object | `{}` | Per-rule field overrides for supported rule metadata such as action/severity/paranoia tuning. |
-| `scoring` | object | _(none)_ | Optional anomaly scoring. Configure `block_threshold` and optional severity weights so multiple monitored hits can block when the accumulated score crosses the threshold. |
+| `scoring` | object | _(none)_ | Optional anomaly scoring. Configure `block_threshold` and optional severity weights so multiple monitored hits can block when **that instance's** accumulated score crosses the threshold. Scores are isolated per WAF plugin-config instance; see [Anomaly scoring](waf.md#anomaly-scoring). |
 | `custom_rules` | object[] | `[]` | Additional rules. See custom rule fields below. |
 | `global_exemptions` | object | `{}` | Request-level exemptions and false-positive filters. |
 | `request_inspection` | bool | `true` | Inspect request path, query, headers, cookies, method, and configured request bodies. |
@@ -3271,6 +3271,13 @@ scanning the parsed key/value map and a best-effort reconstructed URL.
 | `reject_status_code` | u16 | `403` | HTTP status for enforced rejects. Must be 400-599. |
 | `reject_content_type` | string | `application/json` | Content-Type header for enforced rejects. |
 | `reject_body` | string | `{"error":"Forbidden"}` | Body returned for enforced rejects. |
+
+**Multi-instance scoring:** Multiple scoped `waf` instances on one proxy keep
+independent anomaly accumulators keyed by plugin-config identity. Each instance
+thresholds only its own score across the shared H1/H2/H3 authorize / body /
+response lifecycle. Metadata uses `waf.instances.<id>.score` plus deterministic
+`waf.instance_scores` when more than one instance contributes; `waf.score` is
+emitted only for single-instance scoring. See [waf.md](waf.md#anomaly-scoring).
 
 **Unbounded SSE responses:** Request-controlled `Accept: text/event-stream` and
 internal streaming markers never bypass response-body policy. When the pristine
