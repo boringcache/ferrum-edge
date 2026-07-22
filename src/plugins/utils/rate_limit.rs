@@ -2541,11 +2541,7 @@ mod tests {
         let t0 = Instant::now();
 
         for idx in 0..4 {
-            assert!(
-                limiter
-                    .check_at(format!("stale:{idx}"), &op, t0)
-                    .allowed
-            );
+            assert!(limiter.check_at(format!("stale:{idx}"), &op, t0).allowed);
         }
         let t_active = t0 + Duration::from_secs(20);
         assert!(
