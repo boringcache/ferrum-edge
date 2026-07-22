@@ -1115,6 +1115,11 @@ type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
 
 /// Indexes local schema resources and plain-name anchors for `$ref` resolution.
 ///
+/// Only OpenAPI Schema Object entry points and nested JSON Schema subschema
+/// positions are indexed. Non-schema OpenAPI data (extensions, plugin config,
+/// examples) and schema annotation payloads (`default` / `examples` / `const` /
+/// `enum`) are ignored so `$id` / `id` / `$anchor` there cannot bind fragments.
+///
 /// External network fetches are never performed. A `$ref` whose absolute URI
 /// (without fragment) is not an `$id` declared in this document is rejected as
 /// [`ExtractError::UnsupportedExternalRef`].
@@ -1152,7 +1157,7 @@ impl LocalSchemaResolver {
         resolver
             .resource_roots
             .push((String::new(), document_base.as_str().to_string()));
-        resolver.index_value(root, &document_base, "", MAX_SCHEMA_INDEX_DEPTH)?;
+        resolver.index_openapi_schemas(root, &document_base, MAX_SCHEMA_INDEX_DEPTH)?;
         // Longest JSON Pointer prefix wins when locating a node's resource.
         resolver
             .resource_roots
@@ -1164,7 +1169,294 @@ impl LocalSchemaResolver {
         &self.document_base
     }
 
-    fn index_value(
+    /// Walk OpenAPI Schema Object locations only (not the entire document tree).
+    fn index_openapi_schemas(
+        &mut self,
+        root: &Value,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        if let Some(definitions) = root.get("definitions").and_then(Value::as_object) {
+            self.index_schema_map(definitions, "/definitions", base, depth)?;
+        }
+        if let Some(parameters) = root.get("parameters").and_then(Value::as_object) {
+            self.index_parameter_map(parameters, "/parameters", base, depth)?;
+        }
+        if let Some(responses) = root.get("responses").and_then(Value::as_object) {
+            self.index_response_map(responses, "/responses", base, depth)?;
+        }
+        if let Some(components) = root.get("components").and_then(Value::as_object) {
+            self.index_components(components, "/components", base, depth)?;
+        }
+        if let Some(paths) = root.get("paths").and_then(Value::as_object) {
+            self.index_path_item_map(paths, "/paths", base, depth)?;
+        }
+        if let Some(webhooks) = root.get("webhooks").and_then(Value::as_object) {
+            self.index_path_item_map(webhooks, "/webhooks", base, depth)?;
+        }
+        Ok(())
+    }
+
+    fn index_components(
+        &mut self,
+        components: &Map<String, Value>,
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        if let Some(schemas) = components.get("schemas").and_then(Value::as_object) {
+            self.index_schema_map(
+                schemas,
+                &append_json_pointer(pointer, "schemas"),
+                base,
+                depth,
+            )?;
+        }
+        if let Some(parameters) = components.get("parameters").and_then(Value::as_object) {
+            self.index_parameter_map(
+                parameters,
+                &append_json_pointer(pointer, "parameters"),
+                base,
+                depth,
+            )?;
+        }
+        if let Some(headers) = components.get("headers").and_then(Value::as_object) {
+            self.index_header_map(headers, &append_json_pointer(pointer, "headers"), base, depth)?;
+        }
+        if let Some(request_bodies) = components
+            .get("requestBodies")
+            .and_then(Value::as_object)
+        {
+            for (name, body) in request_bodies {
+                let body_pointer =
+                    append_json_pointer(&append_json_pointer(pointer, "requestBodies"), name);
+                self.index_media_schema_container(body, &body_pointer, base, depth)?;
+            }
+        }
+        if let Some(responses) = components.get("responses").and_then(Value::as_object) {
+            self.index_response_map(
+                responses,
+                &append_json_pointer(pointer, "responses"),
+                base,
+                depth,
+            )?;
+        }
+        if let Some(callbacks) = components.get("callbacks").and_then(Value::as_object) {
+            for (name, callback) in callbacks {
+                let callback_pointer =
+                    append_json_pointer(&append_json_pointer(pointer, "callbacks"), name);
+                if let Some(path_items) = callback.as_object() {
+                    self.index_path_item_map(path_items, &callback_pointer, base, depth)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn index_path_item_map(
+        &mut self,
+        items: &Map<String, Value>,
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        for (name, item) in items {
+            let item_pointer = append_json_pointer(pointer, name);
+            let Some(item_object) = item.as_object() else {
+                continue;
+            };
+            if let Some(parameters) = item_object.get("parameters").and_then(Value::as_array) {
+                self.index_parameter_list(
+                    parameters,
+                    &append_json_pointer(&item_pointer, "parameters"),
+                    base,
+                    depth,
+                )?;
+            }
+            for method in HTTP_METHODS {
+                let Some(operation) = item_object.get(*method).and_then(Value::as_object) else {
+                    continue;
+                };
+                let op_pointer = append_json_pointer(&item_pointer, method);
+                if let Some(parameters) = operation.get("parameters").and_then(Value::as_array) {
+                    self.index_parameter_list(
+                        parameters,
+                        &append_json_pointer(&op_pointer, "parameters"),
+                        base,
+                        depth,
+                    )?;
+                }
+                if let Some(request_body) = operation.get("requestBody") {
+                    self.index_media_schema_container(
+                        request_body,
+                        &append_json_pointer(&op_pointer, "requestBody"),
+                        base,
+                        depth,
+                    )?;
+                }
+                if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
+                    self.index_response_map(
+                        responses,
+                        &append_json_pointer(&op_pointer, "responses"),
+                        base,
+                        depth,
+                    )?;
+                }
+                if let Some(callbacks) = operation.get("callbacks").and_then(Value::as_object) {
+                    for (cb_name, callback) in callbacks {
+                        let cb_pointer = append_json_pointer(
+                            &append_json_pointer(&op_pointer, "callbacks"),
+                            cb_name,
+                        );
+                        if let Some(path_items) = callback.as_object() {
+                            self.index_path_item_map(path_items, &cb_pointer, base, depth)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn index_parameter_map(
+        &mut self,
+        parameters: &Map<String, Value>,
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        for (name, parameter) in parameters {
+            self.index_parameter_object(
+                parameter,
+                &append_json_pointer(pointer, name),
+                base,
+                depth,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn index_parameter_list(
+        &mut self,
+        parameters: &[Value],
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        for (index, parameter) in parameters.iter().enumerate() {
+            self.index_parameter_object(
+                parameter,
+                &append_json_pointer(pointer, &index.to_string()),
+                base,
+                depth,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn index_parameter_object(
+        &mut self,
+        parameter: &Value,
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        let Some(object) = parameter.as_object() else {
+            return Ok(());
+        };
+        if let Some(schema) = object.get("schema") {
+            self.index_schema(schema, base, &append_json_pointer(pointer, "schema"), depth)?;
+        }
+        self.index_media_schema_container(parameter, pointer, base, depth)
+    }
+
+    fn index_header_map(
+        &mut self,
+        headers: &Map<String, Value>,
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        for (name, header) in headers {
+            self.index_parameter_object(header, &append_json_pointer(pointer, name), base, depth)?;
+        }
+        Ok(())
+    }
+
+    fn index_response_map(
+        &mut self,
+        responses: &Map<String, Value>,
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        for (status, response) in responses {
+            let response_pointer = append_json_pointer(pointer, status);
+            let Some(object) = response.as_object() else {
+                continue;
+            };
+            // Swagger 2.0 response schema.
+            if let Some(schema) = object.get("schema") {
+                self.index_schema(
+                    schema,
+                    base,
+                    &append_json_pointer(&response_pointer, "schema"),
+                    depth,
+                )?;
+            }
+            if let Some(headers) = object.get("headers").and_then(Value::as_object) {
+                self.index_header_map(
+                    headers,
+                    &append_json_pointer(&response_pointer, "headers"),
+                    base,
+                    depth,
+                )?;
+            }
+            self.index_media_schema_container(response, &response_pointer, base, depth)?;
+        }
+        Ok(())
+    }
+
+    fn index_media_schema_container(
+        &mut self,
+        container: &Value,
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        let Some(content) = container.get("content").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        for (media_type, media) in content {
+            let media_pointer = append_json_pointer(&append_json_pointer(pointer, "content"), media_type);
+            if let Some(schema) = media.get("schema") {
+                self.index_schema(
+                    schema,
+                    base,
+                    &append_json_pointer(&media_pointer, "schema"),
+                    depth,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn index_schema_map(
+        &mut self,
+        schemas: &Map<String, Value>,
+        pointer: &str,
+        base: &Url,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        for (name, schema) in schemas {
+            self.index_schema(schema, base, &append_json_pointer(pointer, name), depth)?;
+        }
+        Ok(())
+    }
+
+    /// Index a Schema Object: interpret `$id`/`$anchor` here, then only descend
+    /// into applicator / definition keywords that hold subschemas.
+    fn index_schema(
         &mut self,
         value: &Value,
         base: &Url,
@@ -1176,24 +1468,95 @@ impl LocalSchemaResolver {
                 location: pointer.to_string(),
             });
         }
-        match value {
-            Value::Object(object) => {
-                let child_base = self.index_object_keywords(object, base, pointer)?;
-                for (key, child) in object {
-                    let child_pointer = append_json_pointer(pointer, key);
-                    self.index_value(child, &child_base, &child_pointer, depth - 1)?;
-                }
-                Ok(())
+        let Value::Object(object) = value else {
+            // Boolean schemas and non-objects have no identifier keywords.
+            return Ok(());
+        };
+        let child_base = self.index_object_keywords(object, base, pointer)?;
+        self.index_subschemas(object, &child_base, pointer, depth - 1)
+    }
+
+    fn index_subschemas(
+        &mut self,
+        object: &Map<String, Value>,
+        base: &Url,
+        pointer: &str,
+        depth: usize,
+    ) -> Result<(), ExtractError> {
+        for key in [
+            "properties",
+            "patternProperties",
+            "dependentSchemas",
+            "$defs",
+            "definitions",
+        ] {
+            if let Some(map) = object.get(key).and_then(Value::as_object) {
+                self.index_schema_map(map, &append_json_pointer(pointer, key), base, depth)?;
             }
-            Value::Array(values) => {
-                for (index, child) in values.iter().enumerate() {
-                    let child_pointer = append_json_pointer(pointer, &index.to_string());
-                    self.index_value(child, base, &child_pointer, depth - 1)?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
         }
+        for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+            if let Some(values) = object.get(key).and_then(Value::as_array) {
+                for (index, child) in values.iter().enumerate() {
+                    self.index_schema(
+                        child,
+                        base,
+                        &append_json_pointer(&append_json_pointer(pointer, key), &index.to_string()),
+                        depth,
+                    )?;
+                }
+            }
+        }
+        for key in [
+            "additionalProperties",
+            "unevaluatedProperties",
+            "additionalItems",
+            "unevaluatedItems",
+            "contains",
+            "not",
+            "if",
+            "then",
+            "else",
+            "propertyNames",
+            "contentSchema",
+        ] {
+            if let Some(child) = object.get(key) {
+                self.index_schema(child, base, &append_json_pointer(pointer, key), depth)?;
+            }
+        }
+        // Draft 7 `items` may be a schema or a tuple array; 2020-12 is a schema.
+        match object.get("items") {
+            Some(Value::Array(values)) => {
+                for (index, child) in values.iter().enumerate() {
+                    self.index_schema(
+                        child,
+                        base,
+                        &append_json_pointer(
+                            &append_json_pointer(pointer, "items"),
+                            &index.to_string(),
+                        ),
+                        depth,
+                    )?;
+                }
+            }
+            Some(child) => {
+                self.index_schema(child, base, &append_json_pointer(pointer, "items"), depth)?;
+            }
+            None => {}
+        }
+        // Draft 7 `dependencies`: object values may be schemas or property-name arrays.
+        if let Some(dependencies) = object.get("dependencies").and_then(Value::as_object) {
+            for (name, child) in dependencies {
+                if child.is_object() {
+                    self.index_schema(
+                        child,
+                        base,
+                        &append_json_pointer(&append_json_pointer(pointer, "dependencies"), name),
+                        depth,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn index_object_keywords(
@@ -1245,12 +1608,21 @@ impl LocalSchemaResolver {
                 child_base = resource;
             } else {
                 let resource_uri = resource_uri_key(&resolved);
-                self.resources.insert(resource_uri.clone(), ());
-                if !self
+                // Same-document resource `$id` URIs must be unique; otherwise
+                // `resource_root_pointer` would pick an arbitrary root.
+                if let Some((existing_pointer, _)) = self
                     .resource_roots
                     .iter()
-                    .any(|(p, u)| p == pointer && u == &resource_uri)
+                    .find(|(_, uri)| uri == &resource_uri)
                 {
+                    if existing_pointer.as_str() != pointer {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "x-ferrum-validate",
+                            error: format!("duplicate schema $id '{id_value}'"),
+                        });
+                    }
+                } else {
+                    self.resources.insert(resource_uri.clone(), ());
                     self.resource_roots
                         .push((pointer.to_string(), resource_uri));
                 }
