@@ -1536,6 +1536,7 @@ mod tests {
             error_class: Some(crate::retry::ErrorClass::ConnectionReset),
             consumer_username: Some("alice".to_string()),
             auth_method: Some("jwt_auth"),
+            connection_id: 0,
             metadata,
         };
         let entry = WsDisconnectLogEntry::from(&ctx);

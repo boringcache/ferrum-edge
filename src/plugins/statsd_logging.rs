@@ -1271,6 +1271,7 @@ mod tests {
             error_class: None,
             consumer_username: None,
             auth_method: None,
+            connection_id: 0,
             metadata: Default::default(),
         };
         let mut buf = String::new();
