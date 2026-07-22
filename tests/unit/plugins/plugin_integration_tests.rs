@@ -744,7 +744,10 @@ async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
         headers.get("x-second-transformer").map(String::as_str),
         Some("sibling")
     );
-    assert_eq!(headers.get("x-route-add").map(String::as_str), Some("route"));
+    assert_eq!(
+        headers.get("x-route-add").map(String::as_str),
+        Some("route")
+    );
 
     // HIT: run the production synthetic rejection finalizer (inspect +
     // transform gate + final hooks + reject-path after_proxy).
@@ -796,7 +799,10 @@ async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
                 Some("route"),
                 "route-level header add must not append again on HIT"
             );
-            assert_eq!(headers.get("x-cache-status").map(String::as_str), Some("HIT"));
+            assert_eq!(
+                headers.get("x-cache-status").map(String::as_str),
+                Some("HIT")
+            );
         }
         other => panic!("expected finalized HIT RejectBinary, got {other:?}"),
     }
@@ -879,7 +885,10 @@ async fn test_response_cache_revalidated_lifecycle_skips_header_transforms() {
     assert_eq!(headers.get("etag").map(String::as_str), Some("\"v1\""));
     assert_eq!(headers.get("x-b").map(String::as_str), Some("origin"));
     assert_eq!(headers.get("x-a").map(String::as_str), Some("second"));
-    assert_eq!(headers.get("x-route-add").map(String::as_str), Some("route"));
+    assert_eq!(
+        headers.get("x-route-add").map(String::as_str),
+        Some("route")
+    );
 
     let mut reval_ctx = create_response_context("/cache-revalidated");
     reval_ctx.route_override_response_transform = Some(route_rules);
@@ -978,9 +987,7 @@ async fn test_finalized_response_replay_is_not_spoofable_via_metadata() {
         "ferrum:finalized_response_replay".to_string(),
         "true".to_string(),
     );
-    assert!(!ferrum_edge::_test_support::finalized_response_replay_for_test(
-        &ctx
-    ));
+    assert!(!ferrum_edge::_test_support::finalized_response_replay_for_test(&ctx));
 
     let ordinary = PluginResult::RejectBinary {
         status_code: 200,
@@ -1038,7 +1045,8 @@ fn test_h1_h2_h3_reject_paths_share_finalized_replay_chokepoint() {
     );
     assert!(
         h3_cross.contains("apply_reject_after_proxy_and_synthetic_body_hooks(")
-            || h3_cross.contains("crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks("),
+            || h3_cross
+                .contains("crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks("),
         "H3 cross-protocol reject path must use the shared synthetic finalizer"
     );
 }
