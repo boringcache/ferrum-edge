@@ -297,6 +297,14 @@ When reviewing an actions Dependabot PR:
    to.
 3. Do not accept a PR that reintroduces a mutable tag ref.
 
+The ARM64 Cross build and publication contracts are deliberately frozen
+byte-for-byte by the trusted `pull_request_target` verifier. Six checkout uses
+inside those protected job blocks still carry the historical `# v6` annotation,
+although their pinned `3d3c42e5...` SHA resolves to v7.0.1. An ordinary pull
+request cannot alter those comments without failing the trust gate; correct them
+only as part of an authorized, coordinated rotation of the protected verifier
+and workflow hashes. Do not copy the legacy annotation to unprotected jobs.
+
 ### Refreshing kind / kubectl / Helm versions and checksums
 
 Versions and digests live as defaults on the

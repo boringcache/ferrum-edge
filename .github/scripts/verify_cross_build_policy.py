@@ -137,7 +137,7 @@ DOCKER_CONTEXT_STEP = (
 # contract in the same commit.
 DOCKER_PUBLISH_STEPS_PREFIX = (
     "    steps:\n"
-    "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+    "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
     "\n"
     "      - name: Download Linux binary\n"
     "        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8\n"
@@ -322,7 +322,7 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
 # Changing one is a trusted-base change, exactly like the protected build job.
 
 CI_LATEST_RELEASE_STEPS = r"""    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       # Download exactly the five trusted build artifacts by name. A wildcard
       # pattern would also accept any other artifact whose name happened to
@@ -492,7 +492,7 @@ CI_DOCKER_MANIFEST_STEPS = r"""    steps:
 """
 
 RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       # Download exactly the five trusted build artifacts by name. A wildcard
       # pattern would also accept any other artifact whose name happened to
