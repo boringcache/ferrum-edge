@@ -15687,8 +15687,9 @@ components:
           type: string
           description: |
             Required for add/update; must not be set for remove/rename.
-            Must be a valid HTTP HeaderValue (visible ASCII and HTAB only;
-            CR, LF, DEL, and other C0 controls are rejected).
+            Must be a valid HTTP HeaderValue (HTAB, visible ASCII, and
+            obs-text are accepted; CR, LF, DEL, and other C0 controls are
+            rejected).
         new_key:
           type: string
           description: |

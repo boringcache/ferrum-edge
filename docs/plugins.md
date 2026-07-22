@@ -3001,7 +3001,7 @@ config:
 - Unknown operations and unknown targets (valid here: `header` or `body`) are rejected.
 - Header operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints.
 - Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
-- Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission — so CR/LF and other forbidden control bytes fail construction instead of being dropped later at a protocol boundary.
+- Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF, DEL, and other forbidden control bytes fail construction instead of being dropped later at a protocol boundary.
 - Non-string values for `target`, `operation`, `key`, or `new_key` are rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
 
 Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.

@@ -670,6 +670,7 @@ async fn test_response_transformer_accepts_valid_header_value_edge_cases() {
         "plain",
         "a b",
         "tab\there",
+        "café",
         "!#$%&'*+-.^_`|~",
     ] {
         let plugin = ResponseTransformer::new(&json!({
