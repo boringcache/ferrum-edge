@@ -33,8 +33,10 @@
 //!
 //! The spawned task captures mirror response metadata (status code, response
 //! size, latency) and writes it to a `tokio::sync::watch` channel. Transaction
-//! logging consumes that channel from a separate detached task, so all logging
-//! plugins receive mirror metadata without delaying the client response.
+//! logging consumes that channel from a separate detached task for the mirror
+//! task's full configured lifetime, so late results remain visible without
+//! delaying the client response. The channel is seeded with a sanitized task
+//! failure fallback; concurrency drops are published as completed failures.
 //!
 //! Mirror timeout defaults to the proxy's `backend_read_timeout_ms`, ensuring
 //! shadow requests respect the same timeout budget as the real backend call.
@@ -121,6 +123,10 @@ use crate::proxy::headers::{
 /// response over a fire-and-forget task.
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
+const MIRROR_TASK_INCOMPLETE_ERROR: &str =
+    "mirror task ended before publishing a result (cancelled or failed)";
+const MIRROR_CONCURRENCY_DROP_ERROR: &str =
+    "mirror request dropped because max_in_flight limit was reached";
 
 /// Sampling period for percentage decisions: threshold is tenths of a percent
 /// in `0..=SAMPLE_PERIOD`, so each complete cycle of `SAMPLE_PERIOD` requests
@@ -129,6 +135,23 @@ const SAMPLE_PERIOD: u64 = 1000;
 
 fn strip_query_params(url: &str) -> &str {
     url.split_once('?').map_or(url, |(base, _)| base)
+}
+
+fn mirror_failure_meta(target_url: String, error: &'static str) -> MirrorResponseMeta {
+    MirrorResponseMeta {
+        mirror_target_url: target_url,
+        mirror_response_status_code: None,
+        mirror_response_size_bytes: None,
+        mirror_latency_ms: 0.0,
+        mirror_error: Some(error.to_string()),
+    }
+}
+
+fn completed_mirror_result(
+    meta: MirrorResponseMeta,
+) -> tokio::sync::watch::Receiver<Option<MirrorResponseMeta>> {
+    let (_tx, rx) = tokio::sync::watch::channel(Some(meta));
+    rx
 }
 
 /// Quantize a configured percentage to the integer tenth-percent threshold
@@ -572,6 +595,10 @@ impl Plugin for RequestMirror {
                     "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
                     method, mirror_url_for_log
                 );
+                ctx.mirror_result_rx = Some(completed_mirror_result(mirror_failure_meta(
+                    mirror_url_for_log,
+                    MIRROR_CONCURRENCY_DROP_ERROR,
+                )));
                 return PluginResult::Continue;
             }
         };
@@ -600,10 +627,15 @@ impl Plugin for RequestMirror {
             }
         });
 
-        // Create a watch channel for the spawned task to send mirror response
-        // metadata back. Transaction logging consumes it from another detached
-        // task after the primary summary is available.
-        let (tx, rx) = tokio::sync::watch::channel(None);
+        // Seed the channel with a sanitized failure result. The detached
+        // collector waits for the task's update, but if the task is cancelled
+        // or panics its sender closes and the fallback becomes the explicit
+        // mirror outcome instead of disappearing from observability.
+        let task_fallback = mirror_failure_meta(
+            mirror_url_for_log.clone(),
+            MIRROR_TASK_INCOMPLETE_ERROR,
+        );
+        let (tx, rx) = tokio::sync::watch::channel(Some(task_fallback));
         ctx.mirror_result_rx = Some(rx);
 
         let http_client = self.http_client.clone();
@@ -665,24 +697,27 @@ impl Plugin for RequestMirror {
                     // unbounded — a misbehaving mirror sink could exhaust gateway
                     // memory in a fire-and-forget task. Stream and bound by
                     // `max_response_body_bytes`, discarding the bytes after sizing.
-                    let size = match resp.content_length() {
-                        Some(cl) => Some(cl),
+                    let (size, body_error) = match resp.content_length() {
+                        Some(cl) => (Some(cl), None),
                         None => match measure_response_body_bounded(resp, max_response_body_bytes)
                             .await
                         {
-                            Ok(n) => Some(n),
+                            Ok(n) => (Some(n), None),
                             Err(BoundedReadError::LimitExceeded { read_so_far, .. }) => {
                                 warn!(
                                     "request_mirror: response from {} truncated at {} bytes \
                                          (max_response_body_bytes = {})",
                                     mirror_url_for_log, read_so_far, max_response_body_bytes
                                 );
-                                Some(read_so_far as u64)
+                                (Some(read_so_far as u64), None)
                             }
-                            Err(BoundedReadError::Stream(_)) => None,
+                            Err(BoundedReadError::Stream(_)) => (
+                                None,
+                                Some("mirror response body stream failed".to_string()),
+                            ),
                         },
                     };
-                    (Some(status), size, None)
+                    (Some(status), size, body_error)
                 }
                 Err(err) => {
                     // `err` is already sanitized by `execute_redacted`
@@ -707,9 +742,9 @@ impl Plugin for RequestMirror {
                 mirror_error: error_msg,
             };
 
-            // Send to the watch channel. If the receiver was dropped (request
-            // completed and logged before mirror finished), the send fails
-            // silently — this is expected for the fire-and-forget pattern.
+            // Send to the watch channel. Transaction logging owns a detached
+            // receiver for the task's full configured request lifetime, so a
+            // late-but-valid result is not discarded at an unrelated cutoff.
             let _ = tx.send(Some(meta));
         });
 
