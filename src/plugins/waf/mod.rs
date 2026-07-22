@@ -183,6 +183,9 @@ impl Waf {
         PluginResult::Continue
     }
 
+    // Kept for direct construction by the external integration-test suites;
+    // the production plugin cache always supplies the stable config id below.
+    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::new_with_config_id(config, None)
     }

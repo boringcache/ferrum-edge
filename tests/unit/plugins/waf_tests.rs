@@ -2740,9 +2740,10 @@ async fn scoring_preserves_distinct_valid_config_ids_in_metadata() {
 fn scoring_rejects_invalid_or_blank_config_ids() {
     let config = json!({"scoring": {"enabled": true, "block_threshold": 10}});
     for id in ["", "   ", "bad/id"] {
-        let error = Waf::new_with_config_id(&config, Some(id))
-            .err()
-            .expect("invalid id must fail closed");
+        let error = match Waf::new_with_config_id(&config, Some(id)) {
+            Ok(_) => panic!("invalid id must fail closed"),
+            Err(error) => error,
+        };
         assert!(error.contains("invalid plugin config id"), "{error}");
     }
 }
