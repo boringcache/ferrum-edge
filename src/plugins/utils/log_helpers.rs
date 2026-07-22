@@ -7,7 +7,10 @@ use url::{Host, Url};
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
 use super::response_body::{BoundedReadError, measure_response_body_bounded};
-use super::{BatchConfig, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy};
+use super::{
+    BatchConfig, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS,
+    MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
+};
 
 /// Hard cap on acknowledgement bodies drained from HTTP log sinks.
 ///
@@ -84,6 +87,12 @@ pub async fn drain_http_batch_response_body(response: reqwest::Response) -> Http
     }
 }
 
+/// Sink-specific defaults and minima for shared batch admission.
+///
+/// Maxima for batch size, buffer capacity, retries, and retry delay are shared
+/// constants ([`MAX_BATCH_SIZE`], [`MAX_BUFFER_CAPACITY`],
+/// [`MAX_BATCH_FLUSH_INTERVAL_MS`], [`MAX_BATCH_RETRIES`], and
+/// [`MAX_BATCH_RETRY_DELAY_MS`]) so validation and builder cannot drift.
 #[derive(Clone, Copy)]
 pub struct BatchConfigDefaults {
     pub batch_size_key: &'static str,
@@ -93,6 +102,12 @@ pub struct BatchConfigDefaults {
     pub buffer_capacity: u64,
     pub max_retries: u64,
     pub retry_delay_ms: u64,
+    /// Minimum admitted `retry_delay_ms` when the field is present.
+    ///
+    /// StatsD (and other sinks that default delay to `0`) use `0`. Loki / WS
+    /// require at least `1` so a configured delay cannot silently become a
+    /// busy-loop.
+    pub min_retry_delay_ms: u64,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -114,72 +129,134 @@ impl From<&StreamTransactionSummary> for SummaryLogEntry {
     }
 }
 
+/// Admit one optional unsigned integer config field.
+///
+/// Absent keys resolve to `default`. Present keys must be JSON unsigned
+/// integers inside `[minimum, maximum]` — wrong scalar types and out-of-range
+/// values are rejected with field-specific errors (no silent clamp/replace).
+fn admit_batch_u64(
+    config: &Value,
+    plugin_name: &'static str,
+    key: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    match config.get(key) {
+        None => Ok(default),
+        Some(value) => {
+            let Some(parsed) = value.as_u64() else {
+                return Err(format!(
+                    "{plugin_name}: '{key}' must be an unsigned integer"
+                ));
+            };
+            if !(minimum..=maximum).contains(&parsed) {
+                return Err(format!(
+                    "{plugin_name}: '{key}' must be between {minimum} and {maximum}"
+                ));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+/// Resolve shared batch fields using the same bounds as [`validate_batch_config`].
+fn admit_batch_fields(
+    config: &Value,
+    plugin_name: &'static str,
+    defaults: BatchConfigDefaults,
+) -> Result<(usize, u64, usize, u64, u64), String> {
+    let batch_size = admit_batch_u64(
+        config,
+        plugin_name,
+        defaults.batch_size_key,
+        defaults.batch_size,
+        1,
+        MAX_BATCH_SIZE as u64,
+    )? as usize;
+    let flush_interval_ms = admit_batch_u64(
+        config,
+        plugin_name,
+        "flush_interval_ms",
+        defaults.flush_interval_ms,
+        defaults.min_flush_interval_ms,
+        MAX_BATCH_FLUSH_INTERVAL_MS,
+    )?;
+    let buffer_capacity = admit_batch_u64(
+        config,
+        plugin_name,
+        "buffer_capacity",
+        defaults.buffer_capacity,
+        1,
+        MAX_BUFFER_CAPACITY as u64,
+    )? as usize;
+    let max_retries = admit_batch_u64(
+        config,
+        plugin_name,
+        "max_retries",
+        defaults.max_retries,
+        0,
+        MAX_BATCH_RETRIES,
+    )?;
+    let retry_delay_ms = admit_batch_u64(
+        config,
+        plugin_name,
+        "retry_delay_ms",
+        defaults.retry_delay_ms,
+        defaults.min_retry_delay_ms,
+        MAX_BATCH_RETRY_DELAY_MS,
+    )?;
+    Ok((
+        batch_size,
+        flush_interval_ms,
+        buffer_capacity,
+        max_retries,
+        retry_delay_ms,
+    ))
+}
+
+/// Build a [`BatchConfig`] from plugin JSON using the shared admission contract.
+///
+/// Callers that already ran [`validate_batch_config`] still go through the same
+/// resolver so builder and validator cannot drift. Invalid present values are
+/// errors — never silently clamped or replaced with defaults.
 pub fn build_batch_config(
     config: &Value,
     plugin_name: &'static str,
     defaults: BatchConfigDefaults,
-) -> BatchConfig {
-    let batch_size = config[defaults.batch_size_key]
-        .as_u64()
-        .unwrap_or(defaults.batch_size)
-        .max(1)
-        .min(MAX_BATCH_SIZE as u64)
-        .min(usize::MAX as u64) as usize;
-    let buffer_capacity = config["buffer_capacity"]
-        .as_u64()
-        .unwrap_or(defaults.buffer_capacity)
-        .max(1)
-        .min(MAX_BUFFER_CAPACITY as u64)
-        .min(usize::MAX as u64) as usize;
-    let max_retries = config["max_retries"]
-        .as_u64()
-        .unwrap_or(defaults.max_retries);
+) -> Result<BatchConfig, String> {
+    let (batch_size, flush_interval_ms, buffer_capacity, max_retries, retry_delay_ms) =
+        admit_batch_fields(config, plugin_name, defaults)?;
 
-    BatchConfig {
+    Ok(BatchConfig {
         batch_size,
-        flush_interval: Duration::from_millis(
-            config["flush_interval_ms"]
-                .as_u64()
-                .unwrap_or(defaults.flush_interval_ms)
-                .max(defaults.min_flush_interval_ms),
-        ),
+        flush_interval: Duration::from_millis(flush_interval_ms),
         buffer_capacity,
         // Plugin config remains `max_retries`; RetryPolicy stores total
         // attempts, so add the initial try here. These loggers use a constant
         // inter-attempt delay (no backoff/jitter), so build a fixed policy.
         retry: RetryPolicy::fixed(
-            max_retries.saturating_add(1).min(u64::from(u32::MAX)) as u32,
-            Duration::from_millis(
-                config["retry_delay_ms"]
-                    .as_u64()
-                    .unwrap_or(defaults.retry_delay_ms),
-            ),
+            max_retries.saturating_add(1) as u32,
+            Duration::from_millis(retry_delay_ms),
         ),
         plugin_name,
-    }
+    })
 }
 
+/// Authoritative type + range admission for shared batching fields.
+///
+/// Rejects wrong scalar types and every numeric value outside the sink's
+/// documented minima/maxima (including values the historical builder would have
+/// silently clamped). Sink-specific keys and minima come from `defaults`;
+/// shared maxima are [`MAX_BATCH_SIZE`], [`MAX_BUFFER_CAPACITY`],
+/// [`MAX_BATCH_FLUSH_INTERVAL_MS`], [`MAX_BATCH_RETRIES`], and
+/// [`MAX_BATCH_RETRY_DELAY_MS`].
 pub fn validate_batch_config(
     config: &Value,
     plugin_name: &'static str,
     defaults: BatchConfigDefaults,
 ) -> Result<(), String> {
-    for key in [
-        defaults.batch_size_key,
-        "flush_interval_ms",
-        "buffer_capacity",
-        "max_retries",
-        "retry_delay_ms",
-    ] {
-        if let Some(value) = config.get(key)
-            && value.as_u64().is_none()
-        {
-            return Err(format!(
-                "{plugin_name}: '{key}' must be an unsigned integer"
-            ));
-        }
-    }
-    Ok(())
+    admit_batch_fields(config, plugin_name, defaults).map(|_| ())
 }
 
 pub fn parse_http_endpoint(

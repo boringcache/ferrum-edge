@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 
 use super::plugin_utils::{
     create_test_stream_transaction_summary, create_test_transaction_summary,
-    read_http11_request_headers,
+    read_http11_request_body, read_http11_request_headers,
 };
 
 fn default_client() -> PluginHttpClient {
@@ -247,6 +247,51 @@ async fn test_http_logging_rejects_invalid_config_shapes() {
 }
 
 #[tokio::test]
+async fn test_http_logging_rejects_malformed_and_out_of_range_batching() {
+    let endpoint = "http://127.0.0.1:1/logs";
+    for config in [
+        json!({"endpoint_url": endpoint, "batch_size": null}),
+        json!({"endpoint_url": endpoint, "batch_size": true}),
+        json!({"endpoint_url": endpoint, "batch_size": []}),
+        json!({"endpoint_url": endpoint, "batch_size": {}}),
+        json!({"endpoint_url": endpoint, "batch_size": 0}),
+        json!({"endpoint_url": endpoint, "batch_size": 10_001}),
+        json!({"endpoint_url": endpoint, "buffer_capacity": null}),
+        json!({"endpoint_url": endpoint, "buffer_capacity": 0}),
+        json!({"endpoint_url": endpoint, "buffer_capacity": 1_000_001}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": null}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": "100"}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": 99}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": 600_001}),
+        json!({"endpoint_url": endpoint, "max_retries": null}),
+        json!({"endpoint_url": endpoint, "max_retries": 11}),
+        json!({"endpoint_url": endpoint, "retry_delay_ms": null}),
+        json!({"endpoint_url": endpoint, "retry_delay_ms": 60_001}),
+    ] {
+        assert!(
+            HttpLogging::new(&config, default_client()).is_err(),
+            "expected batching rejection for {config}"
+        );
+    }
+
+    assert!(
+        HttpLogging::new(
+            &json!({
+                "endpoint_url": endpoint,
+                "batch_size": 1,
+                "buffer_capacity": 1,
+                "flush_interval_ms": 600_000,
+                "max_retries": 10,
+                "retry_delay_ms": 0
+            }),
+            default_client(),
+        )
+        .is_ok(),
+        "valid batching boundaries must be admitted"
+    );
+}
+
+#[tokio::test]
 async fn test_http_logging_rejects_invalid_header_name() {
     // Header names with spaces or non-ASCII characters are rejected at config load time
     let result = HttpLogging::new(
@@ -459,7 +504,7 @@ async fn test_http_logging_reuses_http11_connection_across_successful_batches() 
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "retry_delay_ms": 1,
         }),
@@ -486,7 +531,7 @@ async fn test_http_logging_reuses_http11_connection_across_retry() {
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 1,
             "retry_delay_ms": 1,
         }),
@@ -534,7 +579,7 @@ async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
         &json!({
             "endpoint_url": format!("http://{addr}/logs"),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
         }),
         default_client(),
@@ -546,4 +591,72 @@ async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
     plugin.log(&create_test_transaction_summary()).await;
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_count(&requests, 2).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_http_logging_delivers_stream_sni_hostname() {
+    // Issue #2531: terminating-DTLS (and other stream paths) must ship
+    // `sni_hostname` unchanged through http_logging's JSON batch.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let bodies_task = Arc::clone(&bodies);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let bodies = Arc::clone(&bodies_task);
+            tokio::spawn(async move {
+                loop {
+                    let Some(body) = read_http11_request_body(&mut socket).await else {
+                        break;
+                    };
+                    bodies.lock().unwrap_or_else(|e| e.into_inner()).push(body);
+                    let response =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+                    if socket.write_all(response).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": format!("http://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_http_logging(&plugin);
+
+    let mut summary = create_test_stream_transaction_summary();
+    summary.protocol = "dtls".to_string();
+    summary.sni_hostname = Some("device.example".to_string());
+    plugin.on_stream_disconnect(&summary).await;
+
+    for _ in 0..100 {
+        if !bodies.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let captured = bodies.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        !captured.is_empty(),
+        "http_logging must POST the stream summary batch"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&captured[0]).unwrap();
+    let entries = payload
+        .as_array()
+        .expect("http_logging posts a JSON array batch");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["sni_hostname"], "device.example");
+    assert_eq!(entries[0]["protocol"], "dtls");
 }

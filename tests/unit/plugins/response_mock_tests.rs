@@ -814,7 +814,10 @@ fn test_supported_protocols() {
 
     assert_eq!(
         plugin.supported_protocols(),
-        ferrum_edge::plugins::HTTP_FAMILY_PROTOCOLS
+        &[
+            ferrum_edge::plugins::ProxyProtocol::Http,
+            ferrum_edge::plugins::ProxyProtocol::WebSocket,
+        ]
     );
     assert!(
         plugin
@@ -822,12 +825,18 @@ fn test_supported_protocols() {
             .contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket),
         "response_mock intentionally participates in WebSocket upgrade handshakes"
     );
+    assert!(
+        !plugin
+            .supported_protocols()
+            .contains(&ferrum_edge::plugins::ProxyProtocol::Grpc),
+        "native gRPC must be excluded (#2442): Reject cannot carry framed unary payloads"
+    );
 }
 
 // === WebSocket handshake short-circuit (HTTP Upgrade / Extended CONNECT) ===
 //
 // Runtime classifies upgrades as ProxyProtocol::WebSocket and still selects
-// this plugin via HTTP_FAMILY_PROTOCOLS. Matching only Rejects the handshake
+// this plugin for HTTP + WebSocket. Matching only Rejects the handshake
 // HTTP response; it never establishes a frame stream — including status 101.
 
 #[tokio::test]

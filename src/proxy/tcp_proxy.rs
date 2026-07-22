@@ -1586,6 +1586,10 @@ async fn run_tcp_accept_loop(
                             disconnect_cause,
                             timestamp_connected: connected_wall_at.to_rfc3339(),
                             timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
+                            // TCP TLS termination and TLS passthrough both stash
+                            // ClientHello/handshake SNI on stream_ctx; keep it on
+                            // the disconnect summary for logging-sink parity with
+                            // DTLS termination and UDP/DTLS passthrough (#2531).
                             sni_hostname: stream_ctx.sni_hostname.clone(),
                             metadata: if !plugins.is_empty() {
                                 stream_ctx.take_metadata()

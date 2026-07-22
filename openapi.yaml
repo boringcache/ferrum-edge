@@ -1483,10 +1483,11 @@ paths:
       operationId: getChargebackSinkStatus
       summary: API chargeback sink status
       description: |
-        Returns queue depth, spool size, replay timestamps, and export counters
-        for the `api_chargeback_sink` plugin. Requires a valid admin JWT because
-        sink status can expose billing topology and ClickHouse endpoint metadata.
-        Credentials and URL user-info are never returned.
+        Returns effective batch and retry settings, queue depth, spool size,
+        replay timestamps, and export counters for the `api_chargeback_sink`
+        plugin. Requires a valid admin JWT because sink status can expose
+        billing topology and ClickHouse endpoint metadata. Credentials and URL
+        user-info are never returned.
       tags: [Metrics]
       responses:
         "200":
@@ -11274,23 +11275,32 @@ components:
         batch_size:
           type: integer
           default: 50
+          minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
           default: 3
+          minimum: 0
+          maximum: 10
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
+          minimum: 0
+          maximum: 60000
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
@@ -11354,26 +11364,31 @@ components:
           type: integer
           default: 50
           minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
           default: 3
           minimum: 0
+          maximum: 10
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 1000
           minimum: 0
+          maximum: 60000
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
           minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
         connect_timeout_ms:
           type: integer
@@ -11492,23 +11507,32 @@ components:
         batch_size:
           type: integer
           default: 10
+          minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
           default: 1
+          minimum: 0
+          maximum: 10
           description: Retry attempts on failed batch delivery
         retry_delay_ms:
           type: integer
           default: 500
+          minimum: 0
+          maximum: 60000
           description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
@@ -11748,6 +11772,7 @@ components:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
@@ -11890,6 +11915,7 @@ components:
           type: integer
           default: 1000
           minimum: 100
+          maximum: 600000
           description: Max milliseconds before flushing a partial batch
         max_retries:
           type: integer
@@ -11952,7 +11978,7 @@ components:
         Admin validation. Nested `global_tags` remains an intentionally open
         string map, but keys must match [A-Za-z_][A-Za-z0-9_.-]* (max 64 bytes)
         and cannot override reserved or schema-renamed runtime tags (namespace, method, status,
-        status_class, proxy, protocol, error, cause, direction, body_outcome,
+        status_class, grpc_status, proxy, protocol, error, cause, direction, body_outcome,
         body_error, result, io_side, error_class). The authoritative namespace
         tag is always appended and preserves the full validated Ferrum namespace
         (up to 254 bytes). Metric prefixes are sanitized and capped at 256
@@ -11961,10 +11987,13 @@ components:
         ceiling; indivisible oversized lines are dropped rather than fragmented.
         Mirror summaries are excluded from request.* families. Timers require
         finite non-negative samples (the -1.0 no-backend TTFB sentinel is
-        omitted). WebSocket session completion emits websocket.* families via
-        on_ws_disconnect. Registration policy is OptionalFailOpen (invalid
-        enabled configs warn and omit the plugin on file-mode load / cache
-        rebuild rather than aborting the gateway). See docs/plugins.md.
+        omitted). gRPC transactions add a bounded grpc_status tag and
+        request.grpc_status.{code} counter (0-16 or OTHER) while keeping HTTP
+        status/status_class distinct. WebSocket session completion emits
+        websocket.* families via on_ws_disconnect. Registration policy is
+        OptionalFailOpen (invalid enabled configs warn and omit the plugin on
+        file-mode load / cache rebuild rather than aborting the gateway). See
+        docs/plugins.md.
       required:
         - host
       properties:
@@ -12011,19 +12040,25 @@ components:
           type: integer
           default: 500
           minimum: 50
+          maximum: 600000
           description: Max milliseconds before flushing buffered metrics
         buffer_capacity:
           type: integer
           default: 10000
+          minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
         max_batch_lines:
           type: integer
           default: 50
+          minimum: 1
+          maximum: 10000
           description: Max metric entries to batch before flushing
         max_retries:
           type: integer
           default: 0
           minimum: 0
+          maximum: 10
           description: >-
             Retry attempts after the initial UDP send fails. Defaults to 0
             (no retries). Consumed by the shared batching logger.
@@ -12031,6 +12066,7 @@ components:
           type: integer
           default: 0
           minimum: 0
+          maximum: 60000
           description: >-
             Delay in milliseconds between retry attempts. Defaults to 0.
             Consumed by the shared batching logger when `max_retries` > 0.
@@ -15461,13 +15497,19 @@ components:
 
     RequestTransformerConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: request_transformer — Modifies request headers, query params,
-        and JSON body. Rules are validated at plugin load time; unknown
-        operations or targets, missing `value` on add/update, missing
-        `new_key` on rename, and CR/LF in header values are rejected.
-        Every rule must set an explicit `target` (`header`, `query`, or
-        `body`); there is no default.
+        and JSON body. Configuration is fail-closed: unknown top-level keys
+        and unknown per-rule keys are rejected at plugin load time. Header
+        and query rules enforce operation-exact fields (only add/update
+        accept `value`; only rename accepts `new_key`; remove accepts
+        neither). Every configured header `value` must be a valid HTTP
+        `HeaderValue` (same complete syntax accepted at H1/H2/H3 emission),
+        including rejection of CR/LF and other forbidden control bytes.
+        Unknown operations / targets and missing required fields are also
+        rejected. Every rule must set an explicit `target` (`header`,
+        `query`, or `body`); there is no default.
 
         When `apply_route_overrides: true`, the plugin also consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -15522,6 +15564,7 @@ components:
 
     RequestTransformerHeaderRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15534,6 +15577,9 @@ components:
             update: write the header value.
             remove: delete the header.
             rename: move old → new header name.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: header
@@ -15543,14 +15589,18 @@ components:
         value:
           type: string
           description: |
-            Required for add/update. Must be a string and must not contain
-            CR or LF.
+            Required for add/update; must not be set for remove/rename.
+            Must be a valid HTTP HeaderValue (HTAB, visible ASCII, and
+            obs-text are accepted; CR, LF, DEL, and other C0 controls are
+            rejected).
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     RequestTransformerQueryRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15561,6 +15611,9 @@ components:
             update: write the query parameter value.
             remove: delete the query parameter.
             rename: move old → new query parameter name.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: query
@@ -15569,13 +15622,16 @@ components:
           description: Query parameter name.
         value:
           type: string
-          description: Required for add/update. Must be a string.
+          description: |
+            Required for add/update; must not be set for remove/rename.
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     RequestTransformerBodyRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15586,6 +15642,9 @@ components:
             update: write, creating intermediate objects as needed.
             remove: delete the field.
             rename: move old → new, with rollback if the destination is unreachable.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: body
@@ -15605,15 +15664,22 @@ components:
             as a JSON string.
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     ResponseTransformerConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: response_transformer — Modifies response headers and JSON
-        body. Same validation rules as request_transformer (unknown
-        operations / targets, missing value / new_key, and CR/LF in header
-        values are rejected at plugin load time). Every rule must set an
+        body. Configuration is fail-closed: unknown top-level keys and
+        unknown per-rule keys are rejected at plugin load time. Header
+        rules enforce operation-exact fields (only add/update accept
+        `value`; only rename accepts `new_key`; remove accepts neither).
+        Every configured header `value` must be a valid HTTP `HeaderValue`
+        (same complete syntax accepted at emission), including rejection of
+        non-CR/LF forbidden control bytes. Unknown operations / targets and
+        missing required fields are also rejected. Every rule must set an
         explicit `target` (`header` or `body`); there is no default. Valid
         targets are `header` and `body` only — unlike request_transformer,
         there is no `query` target.
@@ -15657,6 +15723,7 @@ components:
 
     ResponseTransformerHeaderRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15667,6 +15734,9 @@ components:
             update: write the header value.
             remove: delete the header.
             rename: move old → new header name.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: header
@@ -15676,14 +15746,18 @@ components:
         value:
           type: string
           description: |
-            Required for add/update. Must be a string and must not contain
-            CR or LF.
+            Required for add/update; must not be set for remove/rename.
+            Must be a valid HTTP HeaderValue (HTAB, visible ASCII, and
+            obs-text are accepted; CR, LF, DEL, and other C0 controls are
+            rejected).
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     ResponseTransformerBodyRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15694,6 +15768,9 @@ components:
             update: write, creating intermediate objects as needed.
             remove: delete the field.
             rename: move old → new, with rollback if the destination is unreachable.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: body
@@ -15704,14 +15781,15 @@ components:
             ('items.0'), and backslash-escaped literal dots.
         value:
           description: |
-            Required for add/update. Accepts any JSON value — strings,
-            numbers, booleans, objects, arrays, and explicit null.
-            Strings that parse as JSON (e.g., "42", "true", '{"a":1}')
-            are inserted as the parsed type at runtime; otherwise kept
-            as a JSON string.
+            Required for add/update; must not be set for remove/rename.
+            Accepts any JSON value — strings, numbers, booleans, objects,
+            arrays, and explicit null. Strings that parse as JSON
+            (e.g., "42", "true", '{"a":1}') are inserted as the parsed
+            type at runtime; otherwise kept as a JSON string.
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     SecurityHeadersConfig:
       type: object
@@ -15976,7 +16054,7 @@ components:
         expose_headers:
           type: boolean
           default: false
-          description: Inject x-ratelimit-* headers on requests and responses
+          description: Inject x-ratelimit-* headers on requests and responses. Every admitted (counted) request's client-visible response carries the headers, including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections from plugins that run after rate limiting.
         limits:
           type: array
           minItems: 1
@@ -16620,7 +16698,13 @@ components:
           items:
             type: string
           default: ["application/json", "application/xml", "text/xml"]
-          description: MIME types to validate
+          description: >-
+            Request media types to validate. Matching uses the Content-Type
+            type/subtype essence only (parameters stripped, OWS trimmed, ASCII
+            case-insensitive). Distinct neighbors such as application/json-seq
+            and parameter values that merely contain a configured string do not
+            match. Empty or parameter-only entries are rejected; malformed
+            actual headers do not match and are skipped.
         response_json_schema:
           type: object
           description: JSON Schema for response body validation
@@ -16643,6 +16727,10 @@ components:
           items:
             type: string
           default: ["application/json", "application/xml", "text/xml"]
+          description: >-
+            Response media types to validate. Same exact type/subtype matching
+            semantics as content_types (parameters stripped; neighbors and
+            parameter collisions and malformed headers do not match).
         protobuf_descriptor_path:
           type: string
           description: Path to compiled FileDescriptorSet binary (protoc --descriptor_set_out --include_imports)
@@ -16973,9 +17061,12 @@ components:
         Plugin: response_mock — Returns mock responses for API testing before
         backends are ready. Rule paths are relative to a prefix listen_path;
         exact (`=`), regex (`~`), root (`/`), and host-only scopes match the
-        full request path. Supports HTTP, gRPC, and WebSocket upgrade
-        handshakes: a match short-circuits only the HTTP handshake response and
-        does not establish or mock an upgraded WebSocket frame stream. Unknown
+        full request path. Supports HTTP and WebSocket upgrade handshakes only:
+        a match short-circuits only the HTTP handshake response and does not
+        establish or mock an upgraded WebSocket frame stream. Native gRPC
+        (`application/grpc` on H2/H3) is unsupported — the plugin is not
+        selected for that protocol because Reject results normalize to
+        trailers-only gRPC errors that discard configured bodies. Unknown
         top-level and per-rule keys are rejected; the free-form headers map
         remains open for string-valued response headers. Status codes must be
         final (200–599) or 101 for a synthetic WebSocket handshake; other
@@ -17233,7 +17324,16 @@ components:
           minimum: 0.0
           maximum: 100.0
           default: 100.0
-          description: "Percentage of requests to mirror. Granularity is 0.1% (deterministic counter-based sampling, no RNG)."
+          description: >
+            Percentage of requests to mirror (0.0–100.0). Quantized to 0.1%
+            steps as round(percentage × 10) in 0..=1000. Sampling is
+            deterministic and evenly spaced (Bresenham phase accumulator over
+            a 1,000-request cycle): 0% never selects, 100% always selects, and
+            other thresholds mirror exactly that many requests per cycle with
+            gaps of floor(1000/threshold) or ceil(1000/threshold). No RNG.
+            Construction/reload resets the phase to 0 so the first selection
+            is deferred (no mirrored prefix burst). The phase stays bounded in
+            0..1000 via lock-free atomic updates on the request hot path.
         mirror_request_body:
           type: boolean
           default: true
@@ -17464,7 +17564,7 @@ components:
           format: uint64
           minimum: 1
           default: 104857600
-          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; oversized entries are not cached. Must be greater than zero.
+          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; expired entries are reclaimed before a store is rejected for byte pressure; oversized entries are not cached. Must be greater than zero.
         cacheable_methods:
           type: array
           minItems: 1
@@ -17513,7 +17613,7 @@ components:
         invalidate_on_unsafe_methods:
           type: [boolean, "null"]
           default: true
-          description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on non-cacheable methods (POST, PUT, PATCH, DELETE)"
+          description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on unsafe methods (POST, PUT, PATCH, DELETE, and extension methods, which are conservatively treated as unsafe). Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating"
 
     GraphqlConfig:
       type: object
@@ -18022,22 +18122,27 @@ components:
             batch_size:
               type: integer
               minimum: 1
+              maximum: 10000
               default: 50
             flush_interval_ms:
               type: integer
               minimum: 100
+              maximum: 600000
               default: 1000
             buffer_capacity:
               type: integer
               minimum: 1
+              maximum: 1000000
               default: 10000
             max_retries:
               type: integer
               minimum: 0
+              maximum: 10
               default: 3
             retry_delay_ms:
               type: integer
               minimum: 0
+              maximum: 60000
               default: 1000
               description: "Fixed delay between batch send retries for transient collector failures."
             on_buffer_full:
@@ -20072,6 +20177,9 @@ components:
         Runtime admission layer (not safely expressible as OpenAPI 3.1
         comparisons or input-independent checks):
         `retry.max_delay_ms >= retry.initial_delay_ms`;
+        worst-case cumulative inter-attempt delay
+        (`retry.max_attempts` / `retry.initial_delay_ms` / `retry.max_delay_ms`)
+        must not exceed 600000 ms;
         nonempty `password_ref` must name a set `FERRUM_*` process environment
         variable; spool directory privacy/permissions
         (`ensure_private_dir`); ClickHouse URL egress IP screening; and
@@ -20315,11 +20423,12 @@ components:
             size:
               type: integer
               minimum: 1
-              maximum: 100000
+              maximum: 10000
               default: 500
             flush_interval_ms:
               type: integer
               minimum: 1
+              maximum: 600000
               default: 2000
             buffer_capacity:
               type: integer
@@ -20331,22 +20440,31 @@ components:
           additionalProperties: false
           description: |
             Retry budget and bounded exponential backoff. OpenAPI cannot express
-            `max_delay_ms >= initial_delay_ms`; the plugin constructor rejects
-            inverted bounds during Admin/file/CP-DP admission.
+            `max_delay_ms >= initial_delay_ms` or the worst-case cumulative
+            inter-attempt delay budget; the plugin constructor rejects inverted
+            bounds and budgets over 600000 ms during Admin/file/CP-DP admission.
+            `max_attempts` is the total attempt count (including the initial try);
+            `0` is rejected. Each delay field is capped at 60000 ms.
           properties:
             max_attempts:
               type: integer
-              minimum: 0
+              minimum: 1
+              maximum: 32
               default: 5
             initial_delay_ms:
               type: integer
               minimum: 0
+              maximum: 60000
               default: 250
             max_delay_ms:
               type: integer
               minimum: 0
+              maximum: 60000
               default: 10000
-              description: Cap on inter-attempt delay. Runtime requires max_delay_ms >= initial_delay_ms.
+              description: |
+                Cap on inter-attempt delay. Runtime requires max_delay_ms >=
+                initial_delay_ms and that the worst-case cumulative inter-attempt
+                delay stays within 600000 ms.
             jitter:
               type: boolean
               default: true
@@ -20535,6 +20653,38 @@ components:
               type: string
             table:
               type: string
+        batch:
+          type: object
+          description: Effective admitted batching settings used by the live sink. Values are zero while the sink is disabled.
+          properties:
+            size:
+              type: integer
+              minimum: 0
+              maximum: 10000
+            flush_interval_ms:
+              type: integer
+              minimum: 0
+        retry:
+          type: object
+          description: |
+            Effective admitted retry settings used by the live sink. Disabled
+            status uses the same object shape with zeroed numeric fields and
+            `jitter: false`.
+          properties:
+            max_attempts:
+              type: integer
+              minimum: 0
+              maximum: 32
+            initial_delay_ms:
+              type: integer
+              minimum: 0
+              maximum: 60000
+            max_delay_ms:
+              type: integer
+              minimum: 0
+              maximum: 60000
+            jitter:
+              type: boolean
         queue:
           type: object
           properties:
@@ -20658,7 +20808,13 @@ components:
           type: string
           minLength: 1
           default: "ferrum:dedup"
-          description: Key prefix for all Redis keys. Must be non-empty when supplied.
+          description: >-
+            Key prefix for all Redis keys. Must be non-empty when supplied.
+            Defaults to `{FERRUM_NAMESPACE}:dedup` (for example `ferrum:dedup`).
+            Sibling request_deduplication instances remain isolated under a
+            shared default or explicit prefix because logical keys include the
+            stable plugin-config id; corresponding copies of one config still
+            share locks and completed values across gateways.
         redis_pool_size:
           type: integer
           minimum: 1

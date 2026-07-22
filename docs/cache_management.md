@@ -166,13 +166,13 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### Response Caching
 
-**What it stores:** Cached backend response bodies with headers, keyed by request path and cache key rules.
+**What it stores:** Cached backend response bodies with headers, keyed by request path and cache key rules. The cache, Vary-index, and uncacheable-predictor DashMaps use the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
 **Default limit:** 10,000 entries and 100 MiB retained response-entry bytes.
 
 **Config fields:** `max_entries`, `max_entry_size_bytes`, and `max_total_size_bytes` (in plugin config JSON).
 
-**Cleanup mechanism:** Freshness-based expiration (`ttl_seconds` fallback plus backend `Cache-Control`, `Age`, and `Date`). Cache hits emit a current `Age` header. Stores hold a narrow admission/accounting lock so `max_total_size_bytes` is an exact upper bound across concurrent stores and replacements. When the cache exceeds `max_entries`, expired entries are evicted first, then oldest entries are removed to bring the count below the limit.
+**Cleanup mechanism:** Freshness-based expiration (`ttl_seconds` fallback plus backend `Cache-Control`, `Age`, and `Date`). Cache hits emit a current `Age` header. Stores hold a narrow admission/accounting lock so `max_total_size_bytes` is an exact upper bound across concurrent stores and replacements. When a store would exceed `max_total_size_bytes`, expired entries are reclaimed first and the store is skipped only if it still does not fit. When the cache exceeds `max_entries`, expired entries are evicted first, then oldest entries are removed to bring the count below the limit.
 
 ### AI Semantic Cache
 

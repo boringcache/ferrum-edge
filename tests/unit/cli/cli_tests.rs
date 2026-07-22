@@ -416,6 +416,27 @@ fn pin_absent_conf_file(temp_dir: &TempDir) {
     unsafe { std::env::set_var("FERRUM_CONF_PATH", &missing) };
 }
 
+fn write_non_file_conf(path: &Path, mode: &str) {
+    std::fs::write(
+        path,
+        format!(
+            "FERRUM_MODE = {mode}\n\
+             FERRUM_DB_TYPE = sqlite\n\
+             FERRUM_DB_URL = sqlite::memory:\n\
+             FERRUM_ADMIN_JWT_SECRET = fixture-admin-jwt-secret-not-a-real-credential\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn write_empty_resources(path: &Path) {
+    std::fs::write(
+        path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+}
+
 /// Mode inference is no longer part of `apply_*_overrides`; it is a separate,
 /// explicitly-ordered step that `main()` runs *after* startup secret
 /// resolution. See `cli::infer_file_mode`.
@@ -452,10 +473,6 @@ fn test_infer_file_mode_from_spec_path() {
 
             ferrum_edge::cli::infer_file_mode();
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
-            unsafe {
-                std::env::remove_var("FERRUM_MODE");
-                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
-            };
         },
     );
 }
@@ -482,10 +499,6 @@ fn test_apply_run_overrides_explicit_mode_not_overridden_by_spec() {
             ferrum_edge::cli::infer_file_mode();
             // Mode should remain "database", not inferred to "file"
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "database");
-            unsafe {
-                std::env::remove_var("FERRUM_MODE");
-                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
-            };
         },
     );
 }
@@ -513,10 +526,6 @@ fn test_infer_file_mode_yields_to_resolved_mode_env_var() {
                 "database",
                 "an externally resolved FERRUM_MODE must not be downgraded to the smart default"
             );
-            unsafe {
-                std::env::remove_var("FERRUM_MODE");
-                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
-            };
         },
     );
 }
@@ -544,10 +553,6 @@ fn test_infer_file_mode_yields_to_conf_file_mode() {
                 std::env::var("FERRUM_MODE").is_err(),
                 "a configured conf-file mode must not be overridden by the file-mode smart default"
             );
-            unsafe {
-                std::env::remove_var("FERRUM_MODE");
-                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
-            };
         },
     );
 }
@@ -570,10 +575,80 @@ fn test_infer_file_mode_treats_blank_conf_mode_as_unset() {
             ferrum_edge::cli::infer_file_mode();
 
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
-            unsafe {
-                std::env::remove_var("FERRUM_MODE");
-                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
+        },
+    );
+}
+
+/// Explicit `--spec` installs the resources path but must not promote file mode
+/// over a non-file `FERRUM_MODE` in the selected settings file (`run` path).
+#[test]
+fn test_run_explicit_spec_does_not_override_conf_file_mode() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            let temp_dir = TempDir::new().unwrap();
+            let conf_path = temp_dir.path().join("ferrum.conf");
+            let spec_path = temp_dir.path().join("resources.yaml");
+            write_non_file_conf(&conf_path, "database");
+            write_empty_resources(&spec_path);
+
+            let args = RunArgs {
+                settings: Some(conf_path.clone()),
+                spec: Some(spec_path.clone()),
+                mode: None,
+                verbose: 0,
             };
+            ferrum_edge::cli::apply_run_overrides(&args);
+            assert!(
+                std::env::var("FERRUM_FILE_CONFIG_PATH")
+                    .unwrap()
+                    .ends_with("resources.yaml"),
+                "explicit --spec must install FERRUM_FILE_CONFIG_PATH"
+            );
+            assert!(
+                std::env::var("FERRUM_MODE").is_err(),
+                "overrides must not synthesize a mode before inference"
+            );
+
+            ferrum_edge::cli::infer_file_mode();
+
+            assert!(
+                std::env::var("FERRUM_MODE").is_err(),
+                "explicit --spec must not promote file mode over ferrum.conf FERRUM_MODE=database"
+            );
+        },
+    );
+}
+
+/// Same `--spec` / conf-mode contract on the `validate` override path.
+#[test]
+fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            let temp_dir = TempDir::new().unwrap();
+            let conf_path = temp_dir.path().join("ferrum.conf");
+            let spec_path = temp_dir.path().join("resources.yaml");
+            write_non_file_conf(&conf_path, "cp");
+            write_empty_resources(&spec_path);
+
+            let args = ValidateArgs {
+                settings: Some(conf_path),
+                spec: Some(spec_path),
+            };
+            ferrum_edge::cli::apply_validate_overrides(&args);
+            ferrum_edge::cli::infer_file_mode();
+
+            assert!(
+                std::env::var("FERRUM_MODE").is_err(),
+                "explicit --spec must not promote file mode over ferrum.conf FERRUM_MODE=cp"
+            );
+            assert!(
+                std::env::var("FERRUM_FILE_CONFIG_PATH")
+                    .unwrap()
+                    .ends_with("resources.yaml"),
+                "explicit --spec must still install the resources path"
+            );
         },
     );
 }
@@ -598,10 +673,6 @@ fn test_apply_validate_overrides_sets_spec_path() {
             );
             ferrum_edge::cli::infer_file_mode();
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
-            unsafe {
-                std::env::remove_var("FERRUM_FILE_CONFIG_PATH");
-                std::env::remove_var("FERRUM_MODE");
-            };
         },
     );
 }

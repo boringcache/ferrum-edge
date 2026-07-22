@@ -274,7 +274,7 @@ Per-pod authorization scope is published only after a mesh slice is accepted by 
 
 #### BPF SOCK_OPS observability (GAP-SC3)
 
-The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only and surfaces the TCP-layer counters published by the `BPF_PROG_TYPE_SOCK_OPS` program. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState` that the plugin reads on each `/metrics` scrape. Metrics emitted (Prometheus text format):
+The `__mesh_bpf_metrics` plugin is auto-injected on `NodeWaypoint` topology only and surfaces the TCP-layer counters published by the `BPF_PROG_TYPE_SOCK_OPS` program. The userspace consumer (`src/ebpf/event_consumer.rs::SockOpsConsumer`) drains the per-CPU ringbuf and increments a shared `BpfMetricsState`. Authenticated production `GET /metrics` appends that surface exactly once from the current plugin-cache generation's precomputed exporter (configured `prefix` preserved; absent from the scrape when the plugin is not in the published configuration). Metrics emitted (Prometheus text format):
 
 - `ferrum_mesh_bpf_tcp_events_total{event="connect"|"accept_established"|"rst_sent"|"rst_received"|"fin_sent"|"fin_received"}` — per-TCP-event counts. Operators correlate `accept` vs `connect` rates to spot stuck pods or pre-handshake drops.
 - `ferrum_mesh_bpf_drops_total{reason="bypass_uid_hit"|"exclude_cidr_hit"|"not_in_include_cidr"|"exclude_port_hit"}` — how often each BPF drop reason fired. Previously invisible.

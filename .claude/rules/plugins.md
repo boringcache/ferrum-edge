@@ -74,7 +74,7 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - gRPC uses `GrpcBody::Streaming(Incoming)` when there are no body plugins and no retries; otherwise `Buffered(Full<Bytes>)`.
 - In `before_proxy(ctx, headers)`, read headers from the `headers` parameter, never `ctx.headers`. The handler may have moved headers out of `ctx.headers` when no plugin modifies request headers.
 - `ctx.authenticated_identity` is first-class for rate-limit/cache keys, log summaries, and backend identity header injection.
-- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It participates in WebSocket upgrade handshakes via `HTTP_FAMILY_PROTOCOLS` but only short-circuits the HTTP handshake response; it does not mock upgraded frame streams.
+- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams. Native gRPC is excluded because `Reject` normalizes to trailers-only errors that discard configured bodies.
 
 ## Mesh Authz Plugin
 

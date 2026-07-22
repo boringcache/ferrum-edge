@@ -641,6 +641,7 @@ impl AiTranscriptAudit {
             buffer_capacity: 10000,
             max_retries: 3,
             retry_delay_ms: 1000,
+            min_retry_delay_ms: 0,
         };
         validate_batch_config(sink_obj, "ai_transcript_audit", batch_defaults)?;
         let on_buffer_full = match cfg_str(sink_obj, "on_buffer_full", "sink")?.unwrap_or("drop") {
@@ -673,7 +674,7 @@ impl AiTranscriptAudit {
             http_client,
             sink_healthy: Arc::clone(&sink_healthy),
         };
-        let batch_config = build_batch_config(sink_obj, "ai_transcript_audit", batch_defaults);
+        let batch_config = build_batch_config(sink_obj, "ai_transcript_audit", batch_defaults)?;
 
         let active = capture.request || capture.response || streaming != StreamingCapture::Off;
         let namespace = std::env::var("FERRUM_NAMESPACE")

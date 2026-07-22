@@ -1039,6 +1039,68 @@ async fn handle_h3_request(
     // flavor around lets every dispatch and rejection stay flavor-aware
     // (trailers-only gRPC status vs JSON).
     let detected_http_flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    // Enforce configured HTTP/3 header limits before deriving any gRPC-Web
+    // response encoding from request headers. gRPC-Web media negotiation may
+    // preserve custom +suffix values in owned response Content-Type strings,
+    // so oversized hostile headers must fail closed before that parsing runs.
+    let mut total_header_size: usize = 0;
+    for (name, value) in req.headers() {
+        let header_size = name.as_str().len() + value.len();
+        if header_size > state.max_single_header_size_bytes {
+            record_h3_flavor_aware_reject(&state, detected_http_flavor, 431);
+            let body = format!(
+                r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
+                name.as_str(),
+                state.max_single_header_size_bytes
+            );
+            send_h3_error_flavor_aware(
+                &mut stream,
+                detected_http_flavor,
+                None,
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                &body,
+                crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                "Request header exceeds maximum size",
+            )
+            .await?;
+            return Ok(());
+        }
+        total_header_size += header_size;
+    }
+    if total_header_size > state.max_header_size_bytes {
+        record_h3_flavor_aware_reject(&state, detected_http_flavor, 431);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            detected_http_flavor,
+            None,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            r#"{"error":"Total request headers exceed maximum size"}"#,
+            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Total request headers exceed maximum size",
+        )
+        .await?;
+        return Ok(());
+    }
+    if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
+        record_h3_flavor_aware_reject(&state, detected_http_flavor, 431);
+        let body = format!(
+            r#"{{"error":"Request header count ({}) exceeds maximum of {}"}}"#,
+            req.headers().len(),
+            state.max_header_count
+        );
+        send_h3_error_flavor_aware(
+            &mut stream,
+            detected_http_flavor,
+            None,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            &body,
+            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Request header count exceeds maximum",
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Extended CONNECT classification takes precedence over Content-Type.
     // Besides selecting the WebSocket plugin chain below, suppress gRPC-Web
     // rejection shaping so a spoofed header cannot turn a WS policy reject
@@ -1129,66 +1191,6 @@ async fn handle_h3_request(
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = peer_spiffe_extraction_cache;
-
-    // Validate header sizes without materializing headers into owned Strings.
-    // The raw HeaderMap is stored on ctx for deferred materialization.
-    let mut total_header_size: usize = 0;
-    for (name, value) in req.headers() {
-        let header_size = name.as_str().len() + value.len();
-        if header_size > state.max_single_header_size_bytes {
-            record_h3_flavor_aware_reject(&state, http_flavor, 431);
-            let body = format!(
-                r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
-                name.as_str(),
-                state.max_single_header_size_bytes
-            );
-            send_h3_error_flavor_aware(
-                &mut stream,
-                http_flavor,
-                grpc_web_response_content_type,
-                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-                &body,
-                crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                "Request header exceeds maximum size",
-            )
-            .await?;
-            return Ok(());
-        }
-        total_header_size += header_size;
-    }
-    if total_header_size > state.max_header_size_bytes {
-        record_h3_flavor_aware_reject(&state, http_flavor, 431);
-        send_h3_error_flavor_aware(
-            &mut stream,
-            http_flavor,
-            grpc_web_response_content_type,
-            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-            r#"{"error":"Total request headers exceed maximum size"}"#,
-            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-            "Total request headers exceed maximum size",
-        )
-        .await?;
-        return Ok(());
-    }
-    if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
-        record_h3_flavor_aware_reject(&state, http_flavor, 431);
-        let body = format!(
-            r#"{{"error":"Request header count ({}) exceeds maximum of {}"}}"#,
-            req.headers().len(),
-            state.max_header_count
-        );
-        send_h3_error_flavor_aware(
-            &mut stream,
-            http_flavor,
-            grpc_web_response_content_type,
-            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-            &body,
-            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-            "Request header count exceeds maximum",
-        )
-        .await?;
-        return Ok(());
-    }
 
     // Store raw headers for deferred materialization.
     ctx.set_raw_headers(req.headers().clone());
