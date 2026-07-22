@@ -1,8 +1,29 @@
 //! Tests for response_transformer plugin
 
-use ferrum_edge::plugins::{Plugin, RequestContext, response_transformer::ResponseTransformer};
+use ferrum_edge::_test_support::{
+    apply_synthetic_response_body_hooks_for_test,
+    discard_grpc_application_trailers_after_body_rewrite_for_test,
+    stamp_original_response_metadata_for_test,
+    transform_buffered_response_body_with_deadline_full_for_test,
+};
+use ferrum_edge::plugins::response_caching::ResponseCaching;
+use ferrum_edge::plugins::response_transformer::ResponseTransformer;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::plugin_utils::create_test_proxy;
+
+/// Origin validators / integrity fields that become stale after a body rewrite.
+const STALE_REPRESENTATION_HEADERS: &[&str] = &[
+    "etag",
+    "last-modified",
+    "content-digest",
+    "repr-digest",
+    "digest",
+    "content-md5",
+];
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -10,6 +31,52 @@ fn make_ctx() -> RequestContext {
         "GET".to_string(),
         "/test".to_string(),
     )
+}
+
+fn body_update_plugin() -> ResponseTransformer {
+    ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "state", "value": "public"}
+        ]
+    }))
+    .unwrap()
+}
+
+fn insert_stale_representation_headers(headers: &mut HashMap<String, String>) {
+    // Mixed-case names prove case-insensitive cleanup rather than exact-key deletes.
+    headers.insert("ETag".to_string(), "\"origin-v1\"".to_string());
+    headers.insert(
+        "Last-Modified".to_string(),
+        "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+    );
+    headers.insert(
+        "Content-Digest".to_string(),
+        "sha-256=:stale-content:".to_string(),
+    );
+    headers.insert(
+        "Repr-Digest".to_string(),
+        "sha-256=:stale-repr:".to_string(),
+    );
+    headers.insert("Digest".to_string(), "sha-256=stale-legacy".to_string());
+    headers.insert("Content-MD5".to_string(), "stale-md5".to_string());
+}
+
+fn assert_stale_representation_headers_absent(headers: &HashMap<String, String>) {
+    for name in STALE_REPRESENTATION_HEADERS {
+        assert!(
+            headers.keys().all(|key| !key.eq_ignore_ascii_case(name)),
+            "stale representation field {name} must be removed after a body rewrite"
+        );
+    }
+}
+
+fn assert_stale_representation_headers_present(headers: &HashMap<String, String>) {
+    for name in STALE_REPRESENTATION_HEADERS {
+        assert!(
+            headers.keys().any(|key| key.eq_ignore_ascii_case(name)),
+            "representation field {name} must be preserved when the body is unchanged"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1175,7 +1242,6 @@ fn test_response_transformer_strong_etag_preflight_reports_conservative_capabili
 use ferrum_edge::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, parse_route_header_transforms,
 };
-use std::sync::Arc;
 
 #[tokio::test]
 async fn test_response_transformer_apply_route_overrides_accepts_empty_rules() {
@@ -1462,5 +1528,430 @@ async fn test_response_transformer_default_disabled_skips_response_buffering() {
     assert!(
         !plugin.should_buffer_response_body(&ctx),
         "default_enabled=false scope must not buffer the response"
+    );
+}
+
+// ────────────────────── Representation validators after body rewrite (#2382) ──────────────────────
+
+/// Direct hook coverage: an actual rewrite must strip mixed-case validators
+/// while preserving unrelated headers such as Cache-Control.
+#[tokio::test]
+async fn body_rewrite_hook_strips_stale_representation_validators() {
+    let plugin = body_update_plugin();
+    let original = br#"{"state":"origin"}"#;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("cache-control".to_string(), "private".to_string()),
+        ("content-length".to_string(), original.len().to_string()),
+    ]);
+    insert_stale_representation_headers(&mut headers);
+
+    let rewritten = plugin
+        .transform_response_body(original, Some("application/json"), &headers)
+        .await
+        .expect("body update must rewrite bytes");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap()["state"],
+        "public"
+    );
+
+    let mut rewritten_headers = headers.clone();
+    let mut ctx = make_ctx();
+    plugin.on_response_body_transformed(&mut ctx, &mut rewritten_headers);
+    assert_stale_representation_headers_absent(&rewritten_headers);
+    assert_eq!(
+        rewritten_headers.get("cache-control").map(String::as_str),
+        Some("private")
+    );
+}
+
+/// Semantic no-ops (add of an already-present field) return `None` and leave
+/// origin validators untouched; the hook is only invoked after `Some`.
+#[tokio::test]
+async fn semantic_noop_preserves_representation_validators() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "body", "key": "state", "value": "public"}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"state":"origin"}"#;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), body.len().to_string()),
+    ]);
+    insert_stale_representation_headers(&mut headers);
+    let before = headers.clone();
+
+    assert!(
+        plugin
+            .transform_response_body(body, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "add of an existing field is a semantic no-op"
+    );
+    assert_eq!(headers, before);
+    assert_stale_representation_headers_present(&headers);
+
+    // Lifecycle path must likewise leave validators when transform returns None.
+    let plugin = Arc::new(plugin) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx();
+    let mut status = 200u16;
+    let mut body_buf = body.to_vec();
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body_buf,
+        None,
+        false,
+    )
+    .await;
+    assert!(!rewritten);
+    assert_eq!(body_buf, body);
+    assert_stale_representation_headers_present(&headers);
+}
+
+/// Parse failures and non-JSON media types return `None` from the transform.
+/// Direct callers never invoke the cleanup hook; the buffered lifecycle leaves
+/// validators untouched when the plugin does not claim the representation.
+#[tokio::test]
+async fn parse_failure_and_non_json_preserve_representation_validators() {
+    let plugin = body_update_plugin();
+    let malformed = b"{not-json";
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), malformed.len().to_string()),
+    ]);
+    insert_stale_representation_headers(&mut headers);
+    let before = headers.clone();
+
+    assert!(
+        plugin
+            .transform_response_body(malformed, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "malformed JSON must not rewrite bytes"
+    );
+    assert_eq!(headers, before);
+    assert_stale_representation_headers_present(&headers);
+
+    // Non-JSON responses are unclaimed, so the buffered lifecycle skips finalize.
+    let plugin = Arc::new(plugin) as Arc<dyn Plugin>;
+    let html = b"<html></html>";
+    let mut ctx = make_ctx();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/html".to_string());
+    headers.insert("content-length".to_string(), html.len().to_string());
+    insert_stale_representation_headers(&mut headers);
+    let before = headers.clone();
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let mut body_buf = html.to_vec();
+    let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body_buf,
+        None,
+        false,
+    )
+    .await;
+    assert!(!replaced);
+    assert!(!rewritten);
+    assert_eq!(body_buf, html);
+    assert_eq!(headers, before);
+    assert_stale_representation_headers_present(&headers);
+}
+
+/// Shared buffered transform lifecycle must strip validators after an actual
+/// rewrite and repair Content-Length for the new bytes.
+#[tokio::test]
+async fn buffered_lifecycle_strips_stale_validators_on_rewrite() {
+    let plugin = Arc::new(body_update_plugin()) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx();
+    let original = br#"{"state":"origin"}"#.to_vec();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-length".to_string(), original.len().to_string());
+    headers.insert("x-correlation-id".to_string(), "corr-1".to_string());
+    insert_stale_representation_headers(&mut headers);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let mut body = original.clone();
+    let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(!replaced);
+    assert!(rewritten);
+    assert_ne!(body, original);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["state"],
+        "public"
+    );
+    let expected_len = body.len().to_string();
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some(expected_len.as_str())
+    );
+    assert_stale_representation_headers_absent(&headers);
+    assert_eq!(
+        headers.get("x-correlation-id").map(String::as_str),
+        Some("corr-1"),
+        "unrelated decorator headers must survive finalize"
+    );
+}
+
+/// Synthetic short-circuit publication uses the same finalize contract.
+#[tokio::test]
+async fn synthetic_lifecycle_strips_stale_validators_on_rewrite() {
+    let plugin = Arc::new(body_update_plugin()) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx();
+    let original = br#"{"state":"origin"}"#.to_vec();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-length".to_string(), original.len().to_string());
+    insert_stale_representation_headers(&mut headers);
+
+    let mut body = original.clone();
+    apply_synthetic_response_body_hooks_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert_ne!(body, original);
+    assert_stale_representation_headers_absent(&headers);
+    let expected_len = body.len().to_string();
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some(expected_len.as_str())
+    );
+}
+
+/// Multiple transformer instances preserve configured order; each rewrite that
+/// changes bytes re-runs finalize before the next instance.
+#[tokio::test]
+async fn multiple_transformer_instances_strip_validators_in_order() {
+    let first = Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [
+                {"operation": "update", "target": "body", "key": "state", "value": "mid"}
+            ]
+        }))
+        .unwrap(),
+    ) as Arc<dyn Plugin>;
+    let second = Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [
+                {"operation": "add", "target": "body", "key": "stage", "value": "final"}
+            ]
+        }))
+        .unwrap(),
+    ) as Arc<dyn Plugin>;
+
+    let mut ctx = make_ctx();
+    let original = br#"{"state":"origin"}"#.to_vec();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-length".to_string(), original.len().to_string());
+    insert_stale_representation_headers(&mut headers);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let mut body = original.clone();
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[first, second],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(rewritten);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["state"], "mid");
+    assert_eq!(json["stage"], "final");
+    assert_stale_representation_headers_absent(&headers);
+}
+
+/// Digests present in the merged header+trailer view are removed by finalize;
+/// buffered gRPC then retires trailer-channel copies while keeping grpc-status.
+#[tokio::test]
+async fn trailer_integrity_fields_retired_after_body_rewrite() {
+    let plugin = Arc::new(body_update_plugin()) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx();
+    let original = br#"{"state":"origin"}"#.to_vec();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-length".to_string(), original.len().to_string());
+    insert_stale_representation_headers(&mut headers);
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+
+    let mut body = original.clone();
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    assert!(rewritten);
+    assert_stale_representation_headers_absent(&headers);
+
+    let mut trailers = HashMap::new();
+    insert_stale_representation_headers(&mut trailers);
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    discard_grpc_application_trailers_after_body_rewrite_for_test(&mut headers, &mut trailers, &[]);
+    assert_eq!(
+        trailers,
+        HashMap::from([("grpc-status".to_string(), "0".to_string())]),
+        "application trailer digests must be retired; terminal status preserved"
+    );
+    assert_stale_representation_headers_absent(&headers);
+}
+
+/// After a rewrite strips origin ETag / Last-Modified, response_caching must
+/// store the cleaned headers so a later If-None-Match for the origin validator
+/// cannot produce a conditional 304 for the transformed body.
+#[tokio::test]
+async fn response_caching_does_not_revalidate_stripped_origin_etag() {
+    let transformer = Arc::new(body_update_plugin()) as Arc<dyn Plugin>;
+    let caching = ResponseCaching::new(&json!({
+        "ttl_seconds": 60,
+        "add_cache_status_header": true
+    }))
+    .unwrap();
+
+    let path = "/transformed-cache";
+    let original = br#"{"state":"origin"}"#.to_vec();
+    let mut transform_ctx = make_ctx();
+    transform_ctx.path = path.to_string();
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-length".to_string(), original.len().to_string());
+    headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    insert_stale_representation_headers(&mut headers);
+    stamp_original_response_metadata_for_test(&mut transform_ctx, status, &headers);
+
+    let mut body = original.clone();
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[transformer],
+        &mut transform_ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    assert!(rewritten);
+    assert_stale_representation_headers_absent(&headers);
+
+    // Store the post-rewrite representation through the final-body hook.
+    let mut store_ctx = make_ctx();
+    store_ctx.path = path.to_string();
+    store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let mut request_headers = HashMap::new();
+    assert!(matches!(
+        caching
+            .before_proxy(&mut store_ctx, &mut request_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        caching
+            .after_proxy(&mut store_ctx, status, &mut headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        caching
+            .on_final_response_body(&mut store_ctx, status, &headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // A client carrying the origin ETag must not receive 304 — that validator
+    // never identified the transformed bytes and was not stored.
+    let mut hit_ctx = make_ctx();
+    hit_ctx.path = path.to_string();
+    hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let mut conditional =
+        HashMap::from([("if-none-match".to_string(), "\"origin-v1\"".to_string())]);
+    match caching.before_proxy(&mut hit_ctx, &mut conditional).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body: hit_body,
+            headers: hit_headers,
+        } => {
+            assert_eq!(status_code, 200, "must serve the transformed body, not 304");
+            assert_eq!(hit_body.as_ref(), body.as_slice());
+            assert!(
+                hit_headers
+                    .keys()
+                    .all(|key| !key.eq_ignore_ascii_case("etag")),
+                "cached entry must not revive the stripped origin ETag"
+            );
+            assert_eq!(
+                hit_headers.get("x-cache-status").map(String::as_str),
+                Some("HIT")
+            );
+        }
+        other => panic!("expected cache HIT with transformed body, got {other:?}"),
+    }
+}
+
+/// Pin that H1/H2 buffered + synthetic paths and H3 buffered / cross-protocol
+/// paths all reach the shared finalize contract used above.
+#[test]
+fn h1_h2_h3_paths_reach_shared_body_transform_finalize() {
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert!(
+        h1_h2.contains("crate::plugins::finalize_response_body_transformation("),
+        "H1/H2 buffered/synthetic paths must finalize after a body rewrite"
+    );
+    assert!(
+        h1_h2.contains("transform_buffered_response_body_with_deadline("),
+        "H1/H2 buffered path must use the shared transform helper"
+    );
+    assert!(
+        h3.contains("crate::proxy::transform_buffered_response_body_with_deadline("),
+        "native H3 buffered path must use the shared transform helper"
+    );
+    assert!(
+        h3_cross.contains("crate::plugins::finalize_response_body_transformation("),
+        "H3 cross-protocol path must finalize after a body rewrite"
     );
 }
