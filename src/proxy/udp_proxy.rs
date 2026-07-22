@@ -4783,10 +4783,7 @@ backend_tls_verify_server_cert: false
             disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
         });
 
-        assert_eq!(
-            summary.sni_hostname.as_deref(),
-            Some("passthrough.example")
-        );
+        assert_eq!(summary.sni_hostname.as_deref(), Some("passthrough.example"));
         let json = serde_json::to_value(&summary).expect("udp summary serializes");
         assert_eq!(json["sni_hostname"], "passthrough.example");
     }

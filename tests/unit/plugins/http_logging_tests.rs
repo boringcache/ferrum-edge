@@ -567,11 +567,9 @@ async fn test_http_logging_delivers_stream_sni_hostname() {
                     let Some(body) = read_http11_request_body(&mut socket).await else {
                         break;
                     };
-                    bodies
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(body);
-                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+                    bodies.lock().unwrap_or_else(|e| e.into_inner()).push(body);
+                    let response =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
                     if socket.write_all(response).await.is_err() {
                         break;
                     }
@@ -598,20 +596,13 @@ async fn test_http_logging_delivers_stream_sni_hostname() {
     plugin.on_stream_disconnect(&summary).await;
 
     for _ in 0..100 {
-        if !bodies
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-        {
+        if !bodies.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let captured = bodies
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let captured = bodies.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert!(
         !captured.is_empty(),
         "http_logging must POST the stream summary batch"
