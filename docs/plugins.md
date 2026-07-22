@@ -850,7 +850,7 @@ Only set when the gateway itself could not communicate with the backend (or when
 | `disconnect_cause` | String or null | Session termination cause: `"idle_timeout"`, `"recv_error"` (frontend recv failed), `"backend_error"` (backend recv failed), or `"graceful_shutdown"`. Disambiguates idle timeouts from recv errors (previously both presented as `error_class: null`). Omitted when null |
 | `timestamp_connected` | String (RFC 3339) | Connection start time |
 | `timestamp_disconnected` | String (RFC 3339) | Connection end time |
-| `sni_hostname` | String or null | SNI from TLS/DTLS ClientHello when passthrough mode is enabled; omitted from JSON when null |
+| `sni_hostname` | String or null | SNI from the frontend TLS/DTLS ClientHello for TCP TLS termination, DTLS termination, and TLS/DTLS passthrough; omitted from JSON when null |
 | `metadata` | Object | Plugin-injected key-value pairs; omitted from JSON when empty |
 
 #### Example: HTTP/1.1 or HTTP/2 (Buffered Response)
