@@ -1438,6 +1438,122 @@ async fn functional_cli_validate_conf_mode_beats_external_spec_inference() {
     );
 }
 
+/// Issue #2392 reproduction: a coincidental `./resources.yaml` next to a
+/// non-file `ferrum.conf` must not flip `validate` into file mode.
+///
+/// Smart discovery installs `FERRUM_FILE_CONFIG_PATH` from the CWD candidate,
+/// but mode inference is a smart default and must yield to the selected
+/// settings file.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_conf_mode_beats_smart_discovered_spec() {
+    let temp_dir = TempDir::new().unwrap();
+
+    std::fs::write(
+        temp_dir.path().join("resources.yaml"),
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
+    let conf_path = temp_dir.path().join("ferrum.conf");
+    std::fs::write(
+        &conf_path,
+        "FERRUM_MODE = database\nFERRUM_DB_TYPE = sqlite\nFERRUM_DB_URL = sqlite::memory:\n\
+         FERRUM_ADMIN_JWT_SECRET = fixture-admin-jwt-secret-not-a-real-credential\n",
+    )
+    .unwrap();
+
+    // hermetic helper pins an empty FERRUM_CONF_PATH and sets current_dir to the
+    // temp dir so ./resources.yaml is the discovery candidate. --settings wins
+    // for the settings path; FERRUM_MODE and FERRUM_FILE_CONFIG_PATH stay unset
+    // so only conf + discovery drive the decision.
+    let output = hermetic_validate_command(
+        &temp_dir,
+        &["--settings", conf_path.to_str().unwrap()],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "database-mode validate should succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Mode: Database"),
+        "conf-file mode must win over smart-discovered resources: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Mode: File"),
+        "smart-discovered resources must not promote file mode: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Spec ("),
+        "database mode must not validate a spec surface: {stdout}"
+    );
+}
+
+/// Explicit `--spec` installs the resources path but must not demote a
+/// non-file mode from the selected settings file.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_conf_mode_beats_explicit_spec() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let spec_path = temp_dir.path().join("resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
+    let conf_path = temp_dir.path().join("ferrum.conf");
+    std::fs::write(
+        &conf_path,
+        "FERRUM_MODE = database\nFERRUM_DB_TYPE = sqlite\nFERRUM_DB_URL = sqlite::memory:\n\
+         FERRUM_ADMIN_JWT_SECRET = fixture-admin-jwt-secret-not-a-real-credential\n",
+    )
+    .unwrap();
+
+    let output = hermetic_validate_command(
+        &temp_dir,
+        &[
+            "--settings",
+            conf_path.to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+        ],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "database-mode validate should succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Mode: Database"),
+        "conf-file mode must win over explicit --spec: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Mode: File"),
+        "explicit --spec must not promote file mode over ferrum.conf: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Spec ("),
+        "database mode must not validate a spec surface: {stdout}"
+    );
+}
+
 // ── run ─────────────────────────────────────────────────────────────────────
 
 #[ignore]
