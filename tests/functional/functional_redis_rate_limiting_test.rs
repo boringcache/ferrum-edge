@@ -1183,10 +1183,7 @@ async fn test_ai_rate_limiter_redis_expose_headers_match_reconciled_bucket() {
         let _backend = start_ai_backend_with_usage(backend_port, 10, actual_completion)
             .await
             .unwrap();
-        let unique_prefix = format!(
-            "ferrum:test:ai:expose:pos:{}",
-            Uuid::new_v4().simple()
-        );
+        let unique_prefix = format!("ferrum:test:ai:expose:pos:{}", Uuid::new_v4().simple());
 
         setup_proxy_with_plugins(
             &harness,
@@ -1294,10 +1291,7 @@ async fn test_ai_rate_limiter_redis_expose_headers_match_reconciled_bucket() {
         let _backend = start_ai_backend_with_usage(backend_port, 10, actual_completion)
             .await
             .unwrap();
-        let unique_prefix = format!(
-            "ferrum:test:ai:expose:neg:{}",
-            Uuid::new_v4().simple()
-        );
+        let unique_prefix = format!("ferrum:test:ai:expose:neg:{}", Uuid::new_v4().simple());
 
         setup_proxy_with_plugins(
             &harness,
