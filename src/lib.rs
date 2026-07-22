@@ -962,6 +962,70 @@ pub mod _test_support {
         crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw).await
     }
 
+    /// Prepare deferred delivery observations for the final post-plugin message.
+    pub fn prepare_ws_frame_deliveries_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        message: &Message,
+    ) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
+        crate::proxy::prepare_ws_frame_deliveries(plugins, message)
+    }
+
+    /// Emit previously prepared delivery observations after a successful sink accept.
+    pub fn emit_ws_frame_deliveries_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        prepared: Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>,
+    ) {
+        crate::proxy::emit_ws_frame_deliveries(
+            plugins,
+            proxy_id,
+            connection_id,
+            direction,
+            prepared,
+        )
+    }
+
+    /// Apply the shared Ping/Pong control-frame guard used after frame plugins.
+    pub fn guard_ws_control_transform_for_test(
+        original: &Message,
+        transformed: Message,
+        direction: crate::plugins::WebSocketFrameDirection,
+    ) -> Message {
+        crate::proxy::guard_ws_control_transform(original, transformed, direction)
+    }
+
+    /// Simulate the shared relay's post-plugin success boundary: run plugins,
+    /// apply the control guard, prepare delivery observations from the final
+    /// message, then emit them (as if the destination sink accepted the write).
+    pub async fn apply_ws_frame_plugins_and_emit_delivery_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        raw: Message,
+    ) -> Message {
+        let outgoing =
+            crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw)
+                .await;
+        if matches!(&outgoing, Message::Close(_)) {
+            // Policy Close is already recorded by observational `on_ws_frame`
+            // hooks inside the applicator; the production relay does not also
+            // emit a delivered observation for that rejection path.
+            return outgoing;
+        }
+        let prepared = crate::proxy::prepare_ws_frame_deliveries(plugins, &outgoing);
+        crate::proxy::emit_ws_frame_deliveries(
+            plugins,
+            proxy_id,
+            connection_id,
+            direction,
+            prepared,
+        );
+        outgoing
+    }
+
     /// Report the production parser-policy and post-reassembly hook lists.
     pub fn websocket_relay_plugin_names_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],

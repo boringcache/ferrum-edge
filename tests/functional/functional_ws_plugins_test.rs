@@ -837,6 +837,152 @@ async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
     println!("test_ws_frame_logging_connection_id_correlates_frame_and_disconnect PASSED");
 }
 
+/// Peer Close must produce a delivered `frame_type=close` record with code /
+/// reason length (never raw reason), and the disconnect record must carry
+/// success-only byte totals plus `io_side` (issues #2554 / #2556 / #2563).
+#[ignore]
+#[tokio::test]
+async fn test_ws_frame_logging_peer_close_and_disconnect_fields() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{Arc, Mutex};
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config_with_plugins(
+        &config_path,
+        backend_port,
+        r#"  - id: "ws-logging"
+    plugin_name: "ws_frame_logging"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      log_level: "info""#,
+        r#"      - plugin_config_id: "ws-logging""#,
+    );
+
+    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
+    let gateway_port = free_port().await;
+    let log_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_lines_reader = Arc::clone(&log_lines);
+
+    let mut gateway = std::process::Command::new(gateway_binary_path())
+        .env("FERRUM_MODE", "file")
+        .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
+        .env("FERRUM_PROXY_HTTP_PORT", gateway_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_LOG_LEVEL", "info")
+        .env("RUST_LOG", "ws_frame_log=info")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn gateway");
+
+    let stdout = gateway.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("ws_frame_log") {
+                log_lines_reader.lock().unwrap().push(line);
+            }
+        }
+    });
+
+    wait_for_gateway(gateway_port)
+        .await
+        .expect("gateway readiness");
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect");
+
+    ws.send(Message::Text("hello-close".into()))
+        .await
+        .expect("send text");
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("echo timeout")
+        .expect("echo stream ended")
+        .expect("echo error");
+
+    let secret_reason = "password=should-never-appear-in-logs";
+    ws.send(Message::Close(Some(CloseFrame {
+        code: CloseCode::Normal,
+        reason: secret_reason.into(),
+    })))
+    .await
+    .expect("send close");
+    // Drain until the peer acknowledges close / stream ends.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(_)) = ws.next().await {}
+    })
+    .await;
+
+    // Allow disconnect logging to flush.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let logs = log_lines.lock().unwrap().clone();
+    let close_lines: Vec<_> = logs
+        .iter()
+        .filter(|line| line.contains("frame_type") && line.contains("close"))
+        .cloned()
+        .collect();
+    assert!(
+        !close_lines.is_empty(),
+        "expected a delivered close frame log; logs={logs:?}"
+    );
+    assert!(
+        close_lines.iter().any(|line| {
+            line.contains("outcome")
+                && line.contains("delivered")
+                && line.contains("close_code")
+                && line.contains("1000")
+        }),
+        "close log must carry outcome=delivered and close_code=1000; close_lines={close_lines:?}"
+    );
+    assert!(
+        logs.iter().all(|line| !line.contains("should-never-appear")),
+        "raw Close reason must never appear in logs; logs={logs:?}"
+    );
+
+    let disconnect_lines: Vec<_> = logs
+        .iter()
+        .filter(|line| line.contains("event") && line.contains("disconnect"))
+        .cloned()
+        .collect();
+    assert!(
+        !disconnect_lines.is_empty(),
+        "expected a disconnect record; logs={logs:?}"
+    );
+    assert!(
+        disconnect_lines.iter().any(|line| {
+            line.contains("bytes_c2b")
+                && line.contains("bytes_b2c")
+                && line.contains("io_side")
+                && line.contains("frames_c2b")
+        }),
+        "disconnect must expose success-only byte totals and io_side; disconnect_lines={disconnect_lines:?}"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_ws_frame_logging_peer_close_and_disconnect_fields PASSED");
+}
+
 // ============================================================================
 // ws_rate_limiting E2E
 // ============================================================================

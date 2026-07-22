@@ -1,14 +1,17 @@
 //! WebSocket Frame Logging Plugin
 //!
-//! Logs metadata for every WebSocket frame passing through the proxy.
+//! Logs metadata for every WebSocket frame that the shared H1/H2/H3 relay
+//! successfully delivers (post-plugin, post-control-frame guard), plus
+//! plugin-generated policy Close decisions observed in the mutating chain.
 //! Provides frame-level observability without requiring packet captures.
 //!
-//! Each frame log entry includes: proxy_id, connection_id, direction,
-//! frame type, payload size in bytes, and an optional payload fingerprint.
-//! Disconnect events on the same `ws_frame_log` target reuse that admission
-//! `connection_id` so operators can join the terminal record to the frame
-//! stream. The ID is process-local; multi-instance aggregation must include a
-//! gateway instance identity alongside `proxy_id` and `connection_id`.
+//! Each delivered frame log entry includes: proxy_id, connection_id, direction,
+//! frame type, payload size in bytes, optional close code / reason length, and
+//! an optional payload fingerprint. Disconnect events on the same
+//! `ws_frame_log` target reuse that admission `connection_id` so operators can
+//! join the terminal record to the frame stream. The ID is process-local;
+//! multi-instance aggregation must include a gateway instance identity
+//! alongside `proxy_id` and `connection_id`.
 //!
 //! This plugin never transforms or drops frames — it is purely observational.
 //!
@@ -25,6 +28,10 @@
 //! offline payload guessing from log access alone while still letting operators
 //! correlate identical payloads observed by that plugin instance; the length is
 //! always also available as the dedicated `size_bytes` field.
+//!
+//! Application Close reasons are arbitrary payload and may contain secrets.
+//! Close records expose only `close_code` and `close_reason_len` (never the
+//! reason string).
 //!
 //! Config:
 //! ```json
@@ -47,7 +54,7 @@ use tracing::{Level, Metadata, warn};
 
 use super::{
     Direction, Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
-    WsDisconnectContext,
+    WsDisconnectContext, WsFrameDeliveryObservation,
 };
 
 /// Allowed configuration keys for `ws_frame_logging`.
@@ -136,6 +143,15 @@ impl LogLevel {
             Self::Debug => filter_probe_metadata!(Level::DEBUG),
             Self::Info => filter_probe_metadata!(Level::INFO),
             Self::Warn => filter_probe_metadata!(Level::WARN),
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        match self {
+            Self::Trace => tracing::enabled!(target: "ws_frame_log", tracing::Level::TRACE),
+            Self::Debug => tracing::enabled!(target: "ws_frame_log", tracing::Level::DEBUG),
+            Self::Info => tracing::enabled!(target: "ws_frame_log", tracing::Level::INFO),
+            Self::Warn => tracing::enabled!(target: "ws_frame_log", tracing::Level::WARN),
         }
     }
 }
@@ -266,9 +282,10 @@ impl WsFrameLogging {
                 target: "ws_frame_log",
                 configured_level = log_level.as_str(),
                 "ws_frame_logging is enabled but its configured log_level is filtered by the active tracing EnvFilter \
-                 (gateway default FERRUM_LOG_LEVEL=warn). Frame parsing, plugin selection, and on_ws_frame dispatch \
-                 still occur; fingerprint/event construction is skipped. Raise FERRUM_LOG_LEVEL or set log_level to \
-                 a level admitted by the filter (default plugin log_level is info)."
+                 (gateway default FERRUM_LOG_LEVEL=warn). Frame parsing, plugin selection, and on_ws_frame / \
+                 delivery-observation dispatch still occur; fingerprint/event construction is skipped. Raise \
+                 FERRUM_LOG_LEVEL or set log_level to a level admitted by the filter (default plugin log_level \
+                 is info)."
             );
         }
 
@@ -304,19 +321,29 @@ impl WsFrameLogging {
         }
     }
 
+    /// Operator-visible size for `size_bytes`.
+    ///
+    /// Close frames with a status code report `2 + reason.len()` — the two
+    /// status-code bytes plus the UTF-8 reason length — never the reason text.
+    /// Close without a code reports `0`.
     fn frame_size(message: &Message) -> usize {
         match message {
             Message::Text(s) => s.len(),
             Message::Binary(b) => b.len(),
             Message::Ping(d) | Message::Pong(d) => d.len(),
-            // Close frames carry a 2-byte status code (when present) plus an
-            // optional UTF-8 reason. Report the reason length — which is the
-            // operator-visible payload — rather than 0.
-            Message::Close(Some(cf)) => cf.reason.len(),
+            Message::Close(Some(cf)) => 2usize.saturating_add(cf.reason.len()),
             Message::Close(None) => 0,
             // `Frame` is raw-frame mode (unused by the gateway's WS path but
             // exposed for plugin flexibility). Use its payload length.
             Message::Frame(f) => f.payload().len(),
+        }
+    }
+
+    fn close_metadata(message: &Message) -> (Option<u16>, Option<usize>) {
+        match message {
+            Message::Close(Some(cf)) => (Some(u16::from(cf.code)), Some(cf.reason.len())),
+            Message::Close(None) => (None, None),
+            _ => (None, None),
         }
     }
 
@@ -354,6 +381,71 @@ impl WsFrameLogging {
             truncated,
         ))
     }
+
+    fn observation_from_message(&self, message: &Message) -> Option<WsFrameDeliveryObservation> {
+        if !self.log_ping_pong && matches!(message, Message::Ping(_) | Message::Pong(_)) {
+            return None;
+        }
+        if !self.log_level.is_enabled() {
+            return None;
+        }
+        let (close_code, close_reason_len) = Self::close_metadata(message);
+        Some(WsFrameDeliveryObservation {
+            frame_type: Self::frame_type_label(message),
+            size_bytes: Self::frame_size(message),
+            preview: self.payload_preview(message),
+            close_code,
+            close_reason_len,
+        })
+    }
+
+    fn emit_observation(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        observation: &WsFrameDeliveryObservation,
+        outcome: &'static str,
+    ) {
+        let dir_label = match direction {
+            WebSocketFrameDirection::ClientToBackend => "client->backend",
+            WebSocketFrameDirection::BackendToClient => "backend->client",
+        };
+        match self.log_level {
+            LogLevel::Trace => emit_ws_frame_log!(
+                trace,
+                proxy_id,
+                connection_id,
+                dir_label,
+                observation,
+                outcome
+            ),
+            LogLevel::Debug => emit_ws_frame_log!(
+                debug,
+                proxy_id,
+                connection_id,
+                dir_label,
+                observation,
+                outcome
+            ),
+            LogLevel::Info => emit_ws_frame_log!(
+                info,
+                proxy_id,
+                connection_id,
+                dir_label,
+                observation,
+                outcome
+            ),
+            LogLevel::Warn => emit_ws_frame_log!(
+                warn,
+                proxy_id,
+                connection_id,
+                dir_label,
+                observation,
+                outcome
+            ),
+        }
+    }
 }
 
 fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
@@ -390,34 +482,127 @@ fn payload_fingerprint(key: &[u8; 32], hashed: &[u8], full_len: usize, truncated
     format!("hmac-sha256:{prefix}{marker} len={full_len}")
 }
 
-/// Emit a structured log at the given tracing level.
+/// Emit a structured frame log at the given tracing level.
 ///
-/// tracing macros require the level as a compile-time token, so we use a macro
-/// to deduplicate the field list across Trace/Debug/Info/Warn without copy-paste.
+/// Close code / reason length and preview are optional: the macro branches so
+/// absent fields are omitted entirely rather than logged as empty sentinels.
 macro_rules! emit_ws_frame_log {
-    ($level:ident, $proxy_id:expr, $conn_id:expr, $dir:expr, $ftype:expr, $size:expr, $preview:expr) => {
-        if let Some(ref p) = $preview {
-            tracing::$level!(
-                target: "ws_frame_log",
-                proxy_id = %$proxy_id,
-                connection_id = $conn_id,
-                direction = $dir,
-                frame_type = $ftype,
-                size_bytes = $size,
-                preview = %p,
-                "WebSocket frame"
-            );
-        } else {
-            tracing::$level!(
-                target: "ws_frame_log",
-                proxy_id = %$proxy_id,
-                connection_id = $conn_id,
-                direction = $dir,
-                frame_type = $ftype,
-                size_bytes = $size,
-                "WebSocket frame"
-            );
+    ($level:ident, $proxy_id:expr, $conn_id:expr, $dir:expr, $obs:expr, $outcome:expr) => {{
+        let obs = $obs;
+        match (
+            &obs.preview,
+            obs.close_code,
+            obs.close_reason_len,
+        ) {
+            (Some(preview), Some(code), Some(reason_len)) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    preview = %preview,
+                    close_code = code,
+                    close_reason_len = reason_len,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            (Some(preview), None, None) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    preview = %preview,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            (None, Some(code), Some(reason_len)) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    close_code = code,
+                    close_reason_len = reason_len,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            (None, None, None) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            // Close(None) or inconsistent close metadata: omit close fields.
+            (Some(preview), _, _) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    preview = %preview,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
+            (None, _, _) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    proxy_id = %$proxy_id,
+                    connection_id = $conn_id,
+                    direction = $dir,
+                    frame_type = obs.frame_type,
+                    size_bytes = obs.size_bytes,
+                    outcome = $outcome,
+                    "WebSocket frame"
+                );
+            }
         }
+    }};
+}
+
+macro_rules! emit_ws_disconnect_log {
+    ($level:ident, $ctx:expr, $direction_label:expr, $error_class_label:expr, $io_side_label:expr, $correlation_id:expr) => {
+        tracing::$level!(
+            target: "ws_frame_log",
+            namespace = %$ctx.namespace,
+            proxy_id = %$ctx.proxy_id,
+            connection_id = $ctx.connection_id,
+            proxy_name = %$ctx.proxy_name.as_deref().unwrap_or("-"),
+            client_ip = %$ctx.client_ip,
+            backend_target = %$ctx.backend_target,
+            listen_port = $ctx.listen_port,
+            duration_ms = $ctx.duration_ms,
+            frames_c2b = $ctx.frames_client_to_backend,
+            frames_b2c = $ctx.frames_backend_to_client,
+            bytes_c2b = $ctx.bytes_client_to_backend,
+            bytes_b2c = $ctx.bytes_backend_to_client,
+            direction = $direction_label,
+            io_side = $io_side_label,
+            error_class = %$error_class_label,
+            consumer = $ctx.consumer_username.as_deref().unwrap_or("-"),
+            auth_method = $ctx.auth_method.unwrap_or("-"),
+            correlation_id = %$correlation_id,
+            event = "disconnect",
+            "WebSocket session ended"
+        )
     };
 }
 
@@ -456,83 +641,41 @@ impl Plugin for WsFrameLogging {
         direction: WebSocketFrameDirection,
         message: &Message,
     ) -> Option<Message> {
-        // Skip ping/pong logging unless explicitly enabled
-        if !self.log_ping_pong && matches!(message, Message::Ping(_) | Message::Pong(_)) {
-            return None;
+        // Ordinary frames are logged only after successful delivery via
+        // prepare/emit. This mutating-chain hook records plugin-generated
+        // policy Close decisions so they are neither missed nor double-counted
+        // with peer Close / cancellation polite-close paths.
+        if matches!(message, Message::Close(_))
+            && let Some(observation) = self.observation_from_message(message)
+        {
+            self.emit_observation(
+                proxy_id,
+                connection_id,
+                direction,
+                &observation,
+                "policy_close",
+            );
         }
-
-        let dir_label = match direction {
-            WebSocketFrameDirection::ClientToBackend => "client->backend",
-            WebSocketFrameDirection::BackendToClient => "backend->client",
-        };
-        let frame_type = Self::frame_type_label(message);
-        let size = Self::frame_size(message);
-
-        // Defer preview computation — only allocate if the tracing level is active.
-        // tracing macros short-circuit when the level is filtered, so we compute
-        // the preview inside the macro guard to avoid wasted work. Frame parsing
-        // and this hook dispatch have already occurred by the time we get here.
-        match self.log_level {
-            LogLevel::Trace => {
-                if tracing::enabled!(target: "ws_frame_log", tracing::Level::TRACE) {
-                    let preview = self.payload_preview(message);
-                    emit_ws_frame_log!(
-                        trace,
-                        proxy_id,
-                        connection_id,
-                        dir_label,
-                        frame_type,
-                        size,
-                        preview
-                    );
-                }
-            }
-            LogLevel::Debug => {
-                if tracing::enabled!(target: "ws_frame_log", tracing::Level::DEBUG) {
-                    let preview = self.payload_preview(message);
-                    emit_ws_frame_log!(
-                        debug,
-                        proxy_id,
-                        connection_id,
-                        dir_label,
-                        frame_type,
-                        size,
-                        preview
-                    );
-                }
-            }
-            LogLevel::Info => {
-                if tracing::enabled!(target: "ws_frame_log", tracing::Level::INFO) {
-                    let preview = self.payload_preview(message);
-                    emit_ws_frame_log!(
-                        info,
-                        proxy_id,
-                        connection_id,
-                        dir_label,
-                        frame_type,
-                        size,
-                        preview
-                    );
-                }
-            }
-            LogLevel::Warn => {
-                if tracing::enabled!(target: "ws_frame_log", tracing::Level::WARN) {
-                    let preview = self.payload_preview(message);
-                    emit_ws_frame_log!(
-                        warn,
-                        proxy_id,
-                        connection_id,
-                        dir_label,
-                        frame_type,
-                        size,
-                        preview
-                    );
-                }
-            }
-        }
-
         // Never transform frames — purely observational
         None
+    }
+
+    fn prepare_ws_frame_delivery(&self, message: &Message) -> Option<WsFrameDeliveryObservation> {
+        // Called only for frames the relay intends to forward after the final
+        // control-frame guard (ordinary data/control and peer Close). Plugin
+        // policy Close is recorded separately in `on_ws_frame` with
+        // `outcome=policy_close` and never reaches this helper.
+        self.observation_from_message(message)
+    }
+
+    fn emit_ws_frame_delivery(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        observation: WsFrameDeliveryObservation,
+    ) {
+        self.emit_observation(proxy_id, connection_id, direction, &observation, "delivered");
     }
 
     fn requires_ws_disconnect_hooks(&self) -> bool {
@@ -542,13 +685,20 @@ impl Plugin for WsFrameLogging {
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
         // Match the frame-level log's structure so operators can correlate
         // the session end with the per-frame stream on the same `ws_frame_log`
-        // target via shared `connection_id`. Direction/error_class/frames are
-        // always emitted so even clean closes produce a final record suitable
-        // for session accounting.
+        // target via shared `connection_id`. Direction/io_side/error_class/
+        // frames/bytes are always emitted so even clean closes produce a final
+        // record suitable for session accounting. Frame and byte totals are
+        // success-only (incremented only after the destination sink accepts a
+        // forward).
         let direction_label = match ctx.direction {
             Some(Direction::ClientToBackend) => "client_to_backend",
             Some(Direction::BackendToClient) => "backend_to_client",
             Some(Direction::Unknown) => "unknown",
+            None => "none",
+        };
+        let io_side_label = match ctx.io_side {
+            Some(crate::proxy::tcp_proxy::StreamIoSide::Read) => "read",
+            Some(crate::proxy::tcp_proxy::StreamIoSide::Write) => "write",
             None => "none",
         };
         let error_class_label = ctx
@@ -568,85 +718,37 @@ impl Plugin for WsFrameLogging {
         // `connection_id` is the same process-local admission ID carried on
         // every frame event for this session (see `WsDisconnectContext`).
         match self.log_level {
-            LogLevel::Trace => tracing::trace!(
-                target: "ws_frame_log",
-                namespace = %ctx.namespace,
-                proxy_id = %ctx.proxy_id,
-                connection_id = ctx.connection_id,
-                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
-                client_ip = %ctx.client_ip,
-                backend_target = %ctx.backend_target,
-                listen_port = ctx.listen_port,
-                duration_ms = ctx.duration_ms,
-                frames_c2b = ctx.frames_client_to_backend,
-                frames_b2c = ctx.frames_backend_to_client,
-                direction = direction_label,
-                error_class = %error_class_label,
-                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
-                auth_method = ctx.auth_method.unwrap_or("-"),
-                correlation_id = %correlation_id,
-                event = "disconnect",
-                "WebSocket session ended"
+            LogLevel::Trace => emit_ws_disconnect_log!(
+                trace,
+                ctx,
+                direction_label,
+                error_class_label,
+                io_side_label,
+                correlation_id
             ),
-            LogLevel::Debug => tracing::debug!(
-                target: "ws_frame_log",
-                namespace = %ctx.namespace,
-                proxy_id = %ctx.proxy_id,
-                connection_id = ctx.connection_id,
-                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
-                client_ip = %ctx.client_ip,
-                backend_target = %ctx.backend_target,
-                listen_port = ctx.listen_port,
-                duration_ms = ctx.duration_ms,
-                frames_c2b = ctx.frames_client_to_backend,
-                frames_b2c = ctx.frames_backend_to_client,
-                direction = direction_label,
-                error_class = %error_class_label,
-                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
-                auth_method = ctx.auth_method.unwrap_or("-"),
-                correlation_id = %correlation_id,
-                event = "disconnect",
-                "WebSocket session ended"
+            LogLevel::Debug => emit_ws_disconnect_log!(
+                debug,
+                ctx,
+                direction_label,
+                error_class_label,
+                io_side_label,
+                correlation_id
             ),
-            LogLevel::Info => tracing::info!(
-                target: "ws_frame_log",
-                namespace = %ctx.namespace,
-                proxy_id = %ctx.proxy_id,
-                connection_id = ctx.connection_id,
-                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
-                client_ip = %ctx.client_ip,
-                backend_target = %ctx.backend_target,
-                listen_port = ctx.listen_port,
-                duration_ms = ctx.duration_ms,
-                frames_c2b = ctx.frames_client_to_backend,
-                frames_b2c = ctx.frames_backend_to_client,
-                direction = direction_label,
-                error_class = %error_class_label,
-                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
-                auth_method = ctx.auth_method.unwrap_or("-"),
-                correlation_id = %correlation_id,
-                event = "disconnect",
-                "WebSocket session ended"
+            LogLevel::Info => emit_ws_disconnect_log!(
+                info,
+                ctx,
+                direction_label,
+                error_class_label,
+                io_side_label,
+                correlation_id
             ),
-            LogLevel::Warn => tracing::warn!(
-                target: "ws_frame_log",
-                namespace = %ctx.namespace,
-                proxy_id = %ctx.proxy_id,
-                connection_id = ctx.connection_id,
-                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
-                client_ip = %ctx.client_ip,
-                backend_target = %ctx.backend_target,
-                listen_port = ctx.listen_port,
-                duration_ms = ctx.duration_ms,
-                frames_c2b = ctx.frames_client_to_backend,
-                frames_b2c = ctx.frames_backend_to_client,
-                direction = direction_label,
-                error_class = %error_class_label,
-                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
-                auth_method = ctx.auth_method.unwrap_or("-"),
-                correlation_id = %correlation_id,
-                event = "disconnect",
-                "WebSocket session ended"
+            LogLevel::Warn => emit_ws_disconnect_log!(
+                warn,
+                ctx,
+                direction_label,
+                error_class_label,
+                io_side_label,
+                correlation_id
             ),
         }
     }
@@ -659,17 +761,30 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     #[test]
-    fn frame_size_close_reports_reason_length() {
+    fn frame_size_close_includes_status_code_bytes() {
         let cf = CloseFrame {
             code: CloseCode::Normal,
             reason: "client went away".into(),
         };
         let msg = Message::Close(Some(cf));
-        assert_eq!(WsFrameLogging::frame_size(&msg), "client went away".len());
+        assert_eq!(
+            WsFrameLogging::frame_size(&msg),
+            2 + "client went away".len()
+        );
     }
 
     #[test]
-    fn frame_size_close_without_reason_is_zero() {
+    fn frame_size_close_without_reason_is_status_code_only() {
+        let cf = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        };
+        let msg = Message::Close(Some(cf));
+        assert_eq!(WsFrameLogging::frame_size(&msg), 2);
+    }
+
+    #[test]
+    fn frame_size_close_without_code_is_zero() {
         let msg = Message::Close(None);
         assert_eq!(WsFrameLogging::frame_size(&msg), 0);
     }

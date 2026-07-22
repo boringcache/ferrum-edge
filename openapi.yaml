@@ -8429,9 +8429,19 @@ components:
       description: |
         Configuration for the `ws_frame_logging` plugin. Logs WebSocket frame
         metadata (direction, frame type, payload size, optional payload
-        fingerprint) under the `ws_frame_log` tracing target. Logs Text and
-        Binary frames by default; Ping/Pong are opt-in via `log_ping_pong`. The
+        fingerprint, Close code / reason length) under the `ws_frame_log`
+        tracing target after the shared H1/H2/H3 relay successfully delivers
+        the final post-plugin message (`outcome=delivered`), and records
+        plugin-generated rejection Closes separately (`outcome=policy_close`).
+        Logs Text and Binary frames by default; Ping/Pong are opt-in via
+        `log_ping_pong`. Peer Close frames are logged on the delivery path with
+        `close_code` / `close_reason_len` (raw reason text is never logged).
+        `size_bytes` for Close with a status code is `2 + reason.len()`. The
         plugin never transforms or drops frames — it is purely observational.
+        Cancelled or failed destination writes produce no frame event; frame
+        and disconnect `frames_*` / `bytes_*` counters share that success-only
+        boundary. Disconnect records also emit `io_side` (`read`/`write`/`none`)
+        and success-only `bytes_c2b` / `bytes_b2c`.
 
         Default `log_level` is `info` so healthy frame traffic does not become
         warning-level noise. Under the gateway's default
@@ -8445,9 +8455,10 @@ components:
         `debug` likewise require a matching (or more verbose) runtime filter;
         `warn` is available only when selected deliberately. Filtering skips
         fingerprint computation and tracing event construction only — frame
-        parsing, plugin selection (`requires_ws_frame_hooks`), and `on_ws_frame`
-        dispatch still occur, so H1 raw-copy tunnel mode remains unavailable
-        while this plugin is attached.
+        parsing, plugin selection (`requires_ws_frame_hooks`), mutating-chain
+        `on_ws_frame` (policy Close observation), delivery prepare/emit, and
+        disconnect dispatch still occur, so H1 raw-copy tunnel mode remains
+        unavailable while this plugin is attached.
 
         Admission contract: only the keys below are allowed; unknown keys and
         explicit `null` field values are rejected. `payload_preview_bytes`
@@ -8466,7 +8477,8 @@ components:
         `hmac-sha256:<12 hex chars> len=<bytes>` (with a trailing `+` after the
         digest when only a prefix of the payload was hashed). The key is
         generated per plugin instance and is not exposed in logs, so log access
-        alone cannot confirm guessed payloads offline.
+        alone cannot confirm guessed payloads offline. Close reasons are treated
+        as application payload and are never logged in the clear.
       properties:
         log_level:
           type: string
