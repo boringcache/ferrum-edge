@@ -26,6 +26,17 @@ nonempty pricing dimension is mandatory and matches
 pricing with at least one strictly positive per-byte rate, or
 `stream_connection_pricing` with a strictly positive `price_per_connection`.
 
+Every unit price is an IEEE-754 binary64 value that must be finite,
+non-negative, and at most `1e288`. Per-event mode multiplies each transaction's
+`u64` quantities by those binary64 prices; snapshot mode accumulates the same
+finite event charges and emits non-negative deltas. Integer quantities above
+2^53 follow normal binary64 conversion rounding, and Ferrum applies no extra
+decimal or currency-subunit rounding. The shared bound keeps every supported
+per-event or snapshot counter state finite. As a final fail-closed guard,
+JSONEachRow serialization rejects non-finite monetary fields, and snapshot
+arithmetic reports a metered export failure instead of silently substituting a
+zero delta.
+
 - `pricing_tiers` for HTTP-family per-call pricing by billable status. Ordinary
   HTTP uses its wire status. Native gRPC and translated gRPC-Web use the final
   normalized `grpc-status` mapped to Ferrum's canonical effective HTTP status:

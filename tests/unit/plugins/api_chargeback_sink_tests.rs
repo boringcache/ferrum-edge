@@ -163,7 +163,9 @@ fn grpc_snapshot_keeps_terminal_statuses_that_share_a_billing_bucket_separate() 
     accumulator.record_http_for_test(&grpc_summary("grpc-shared-500", "2"), "alice", charge);
     accumulator.record_http_for_test(&grpc_summary("grpc-shared-500", "13"), "alice", charge);
 
-    let mut events = accumulator.compute_deltas(&config, "node-a", 100, "snap-grpc");
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-grpc")
+        .unwrap();
     events.sort_by_key(|event| event.grpc_status);
     assert_eq!(events.len(), 2);
     assert!(
@@ -194,7 +196,9 @@ fn grpc_snapshot_bounds_non_standard_terminal_status_cardinality() {
     accumulator.record_http_for_test(&grpc_summary("grpc-nonstandard", "17"), "alice", charge);
     accumulator.record_http_for_test(&grpc_summary("grpc-nonstandard", "18"), "alice", charge);
 
-    let events = accumulator.compute_deltas(&config, "node-a", 100, "snap-grpc");
+    let events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-grpc")
+        .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].status_code, 500);
     assert_eq!(events[0].http_status_code, Some(200));
@@ -423,7 +427,8 @@ fn maximum_prices_remain_finite_in_per_event_and_snapshot_exports() {
         "node-a",
         1_774_000_000_000_000_000,
         "maximum-price-snapshot",
-    );
+    )
+    .unwrap();
     assert_eq!(events.len(), 1);
     let snapshot_json: Value =
         serde_json::from_str(&serialize_json_each_row(&events).unwrap()).unwrap();
@@ -852,6 +857,45 @@ fn json_each_row_serialization_is_line_delimited_and_omits_none() {
 }
 
 #[test]
+fn json_each_row_rejects_non_finite_monetary_fields() {
+    let mut event = sample_event("non-finite-event");
+    event.charge_total = f64::INFINITY;
+
+    let error = serialize_json_each_row(std::slice::from_ref(&event)).unwrap_err();
+    assert!(error.contains("charge_total"), "unexpected error: {error}");
+    assert!(error.contains("non-finite"), "unexpected error: {error}");
+}
+
+#[test]
+fn snapshot_delta_rejects_non_finite_state_instead_of_substituting_zero() {
+    let config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        ChargeComputation {
+            call_count: 1,
+            charge_call: f64::INFINITY,
+            charge_total: f64::INFINITY,
+            ..ChargeComputation::default()
+        },
+    );
+
+    let error = accumulator
+        .compute_deltas(&config, "node-a", 100, "non-finite-snapshot")
+        .unwrap_err();
+    assert!(error.contains("charge_call"), "unexpected error: {error}");
+    assert!(error.contains("non-finite"), "unexpected error: {error}");
+}
+
+#[test]
 fn snapshot_delta_computation_tracks_last_emitted_totals() {
     let mut config = ApiChargebackSinkConfig {
         mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
@@ -879,12 +923,16 @@ fn snapshot_delta_computation_tracks_last_emitted_totals() {
             charge_total: 0.33,
         },
     );
-    let first = accumulator.compute_deltas(&config, "node-a", 100, "snap-1");
+    let first = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-1")
+        .unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].call_count, 3);
     assert_eq!(first[0].bytes_received, 200);
 
-    let second = accumulator.compute_deltas(&config, "node-a", 200, "snap-2");
+    let second = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
     assert!(second.is_empty());
 
     accumulator.record_for_test(
@@ -904,13 +952,17 @@ fn snapshot_delta_computation_tracks_last_emitted_totals() {
             charge_total: 0.095,
         },
     );
-    let third = accumulator.compute_deltas(&config, "node-a", 300, "snap-3");
+    let third = accumulator
+        .compute_deltas(&config, "node-a", 300, "snap-3")
+        .unwrap();
     assert_eq!(third.len(), 1);
     assert_eq!(third[0].call_count, 2);
     assert_eq!(third[0].bytes_sent, 50);
 
     config.snapshot.emit_zero_deltas = true;
-    let zero = accumulator.compute_deltas(&config, "node-a", 400, "snap-4");
+    let zero = accumulator
+        .compute_deltas(&config, "node-a", 400, "snap-4")
+        .unwrap();
     assert_eq!(zero.len(), 1);
     assert_eq!(zero[0].call_count, 0);
     assert_eq!(zero[0].snapshot_id.as_deref(), Some("snap-4"));
@@ -1615,6 +1667,7 @@ fn snapshot_cleanup_removes_idle_entries_and_last_emitted() {
     assert_eq!(
         accumulator
             .compute_deltas(&config, "node-a", 100, "snap-1")
+            .unwrap()
             .len(),
         1
     );
@@ -1623,6 +1676,7 @@ fn snapshot_cleanup_removes_idle_entries_and_last_emitted() {
     assert!(
         accumulator
             .compute_deltas(&config, "node-a", 200, "snap-2")
+            .unwrap()
             .is_empty()
     );
 }

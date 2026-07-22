@@ -33,7 +33,7 @@ use url::Url;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use super::chargeback::pricing::{ChargeComputation, PricingConfig};
+use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
 use super::utils::{
     BatchConfig, BatchingLogger, LoggerHooks, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE,
@@ -1417,6 +1417,19 @@ async fn post_json_each_row(
 pub fn serialize_json_each_row(batch: &[ChargeEvent]) -> Result<String, String> {
     let mut output = String::new();
     for (idx, event) in batch.iter().enumerate() {
+        for (field, value) in [
+            ("charge_call", event.charge_call),
+            ("charge_bytes_sent", event.charge_bytes_sent),
+            ("charge_bytes_received", event.charge_bytes_received),
+            ("charge_total", event.charge_total),
+        ] {
+            require_finite_charge(value, field).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: event '{}' cannot be serialized: {error}",
+                    event.event_id
+                )
+            })?;
+        }
         if idx > 0 {
             output.push('\n');
         }
@@ -2487,19 +2500,32 @@ pub struct SnapshotTotals {
 }
 
 impl SnapshotTotals {
-    fn delta_since(self, last: SnapshotTotals) -> SnapshotTotals {
-        SnapshotTotals {
+    fn delta_since(self, last: SnapshotTotals) -> Result<SnapshotTotals, String> {
+        Ok(SnapshotTotals {
             call_count: self.call_count.saturating_sub(last.call_count),
-            charge_call: non_negative_delta(self.charge_call, last.charge_call),
+            charge_call: non_negative_delta(
+                self.charge_call,
+                last.charge_call,
+                "charge_call",
+            )?,
             bytes_sent: self.bytes_sent.saturating_sub(last.bytes_sent),
             bytes_received: self.bytes_received.saturating_sub(last.bytes_received),
-            charge_bytes_sent: non_negative_delta(self.charge_bytes_sent, last.charge_bytes_sent),
+            charge_bytes_sent: non_negative_delta(
+                self.charge_bytes_sent,
+                last.charge_bytes_sent,
+                "charge_bytes_sent",
+            )?,
             charge_bytes_received: non_negative_delta(
                 self.charge_bytes_received,
                 last.charge_bytes_received,
-            ),
-            charge_total: non_negative_delta(self.charge_total, last.charge_total),
-        }
+                "charge_bytes_received",
+            )?,
+            charge_total: non_negative_delta(
+                self.charge_total,
+                last.charge_total,
+                "charge_total",
+            )?,
+        })
     }
 
     fn is_zero(self) -> bool {
@@ -2686,8 +2712,9 @@ impl SnapshotAccumulator {
         node_id: &str,
         received_at: i64,
         snapshot_id: &str,
-    ) -> Vec<ChargeEvent> {
+    ) -> Result<Vec<ChargeEvent>, String> {
         let mut events = Vec::new();
+        let mut emitted_totals = Vec::new();
         for entry in self.entries.iter() {
             let key = entry.key().clone();
             let current = entry.value().totals.snapshot();
@@ -2696,7 +2723,7 @@ impl SnapshotAccumulator {
                 .get(&key)
                 .map(|value| *value)
                 .unwrap_or_default();
-            let delta = current.delta_since(last);
+            let delta = current.delta_since(last)?;
             if !delta.is_zero() || config.snapshot.emit_zero_deltas {
                 events.push(event_from_snapshot(
                     &entry.value().meta,
@@ -2706,10 +2733,13 @@ impl SnapshotAccumulator {
                     received_at,
                     snapshot_id,
                 ));
-                self.last_emitted.insert(key, current);
+                emitted_totals.push((key, current));
             }
         }
-        events
+        for (key, current) in emitted_totals {
+            self.last_emitted.insert(key, current);
+        }
+        Ok(events)
     }
 
     #[allow(dead_code)]
@@ -2808,7 +2838,25 @@ fn start_snapshot_task(
                 _ = snapshot_timer.tick() => {
                     let snapshot_id = new_ulid();
                     let received_at = unix_timestamp_nanos();
-                    let events = accumulator.compute_deltas(&config, &node_id, received_at, &snapshot_id);
+                    let events = match accumulator.compute_deltas(
+                        &config,
+                        &node_id,
+                        received_at,
+                        &snapshot_id,
+                    ) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            runtime
+                                .metrics
+                                .record_failure(FailureReason::Serialize, error.clone());
+                            warn!(
+                                plugin = PLUGIN_NAME,
+                                error = %error,
+                                "Chargeback sink snapshot arithmetic failed; no delta was advanced"
+                            );
+                            continue;
+                        }
+                    };
                     if events.is_empty() {
                         continue;
                     }
@@ -3109,12 +3157,18 @@ fn normalize_snapshot_grpc_status(status: u32) -> u32 {
     }
 }
 
-fn non_negative_delta(current: f64, last: f64) -> f64 {
-    if current.is_finite() && last.is_finite() && current >= last {
-        current - last
-    } else {
-        0.0
+fn non_negative_delta(current: f64, last: f64, field: &str) -> Result<f64, String> {
+    if !current.is_finite() || !last.is_finite() {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot {field} is non-finite (current={current}, last={last})"
+        ));
     }
+    if current < last {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot {field} regressed (current={current}, last={last})"
+        ));
+    }
+    Ok(current - last)
 }
 
 fn saturating_u64_to_u32(value: u64) -> u32 {
