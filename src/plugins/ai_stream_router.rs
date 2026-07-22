@@ -2325,9 +2325,7 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         };
         if next_len > NORMALIZE_DECODE_LIMITS.max_cumulative_bytes {
             return self
-                .fail_decode(
-                    "encoded Anthropic SSE exceeds the streaming size limit".to_string(),
-                )
+                .fail_decode("encoded Anthropic SSE exceeds the streaming size limit".to_string())
                 .await;
         }
         self.encoded.extend_from_slice(chunk);
@@ -2338,10 +2336,8 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         if self.inner.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        let decoded = match prepare_sse_bytes_for_normalization(
-            &self.encoded,
-            Some(self.encoding),
-        ) {
+        let decoded = match prepare_sse_bytes_for_normalization(&self.encoded, Some(self.encoding))
+        {
             Ok(bytes) => bytes.into_owned(),
             Err(message) => return self.fail_decode(message).await,
         };
