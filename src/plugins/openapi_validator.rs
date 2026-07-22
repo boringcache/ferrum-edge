@@ -92,17 +92,20 @@ enum EncodingStyle {
     DeepObject,
 }
 
-#[derive(Debug, Clone)]
 struct PropertyEncoding {
     style: EncodingStyle,
     explode: bool,
-    /// Retained from the Encoding Object for config fidelity. Form parsing always
-    /// percent-decodes, so reserved characters are accepted either way.
-    #[allow(dead_code)]
+    /// Whether URI-reserved bytes may appear literally in an encoded form value.
+    /// When false (the default), reserved bytes must be percent-encoded.
     allow_reserved: bool,
     content_type: Option<String>,
     /// Additional multipart part-header schemas (OpenAPI Header Objects / schemas).
-    headers: AHashMap<String, Value>,
+    headers: AHashMap<String, EncodingHeaderValidator>,
+}
+
+struct EncodingHeaderValidator {
+    schema: Value,
+    validator: jsonschema::Validator,
 }
 
 /// Hostile-input caps for multipart parsing (RFC 2046 / RFC 7578).
@@ -1031,7 +1034,7 @@ fn compile_media_validator(
     schema_draft: SchemaDraft,
 ) -> Result<MediaValidator, String> {
     let validator = compile_schema(schema, schema_draft).map_err(|error| error.to_string())?;
-    let encoding = parse_encoding_map(encoding, media_type, schema)?;
+    let encoding = parse_encoding_map(encoding, media_type, schema, schema_draft)?;
     Ok(MediaValidator {
         schema: Arc::new(schema.clone()),
         validator,
@@ -1041,23 +1044,25 @@ fn compile_media_validator(
 
 /// Split a request-body content entry into schema + optional encoding.
 ///
-/// Accepts the historical bare-schema form and the Media Type Object form
-/// `{ "schema": ..., "encoding": ... }` (optional `example` / `examples`).
+/// A bare JSON Schema remains the canonical form when no Encoding Object is
+/// present. The wrapper is recognized only when the explicit `encoding` field
+/// is present, which keeps a schema containing an ordinary/custom `schema`
+/// keyword from being misclassified as a Media Type Object.
 fn split_media_type_value(value: &Value) -> Result<(&Value, Option<&Value>), String> {
     let Some(object) = value.as_object() else {
         return Ok((value, None));
     };
-    if !object.contains_key("schema") {
+    if !object.contains_key("encoding") {
         return Ok((value, None));
     }
-    let only_media_type_fields = object.keys().all(|key| {
-        matches!(
-            key.as_str(),
-            "schema" | "encoding" | "example" | "examples"
-        )
-    });
+    let only_media_type_fields = object
+        .keys()
+        .all(|key| matches!(key.as_str(), "schema" | "encoding"));
     if !only_media_type_fields {
-        return Ok((value, None));
+        return Err(
+            "media type object with encoding may contain only 'schema' and 'encoding'"
+                .to_string(),
+        );
     }
     let schema = object
         .get("schema")
@@ -1069,27 +1074,26 @@ fn parse_encoding_map(
     encoding: Option<&Value>,
     media_type: &str,
     schema: &Value,
+    schema_draft: SchemaDraft,
 ) -> Result<AHashMap<String, PropertyEncoding>, String> {
     let Some(encoding) = encoding else {
         return Ok(AHashMap::new());
     };
-    if encoding.is_null() {
-        return Ok(AHashMap::new());
-    }
     let object = encoding
         .as_object()
         .ok_or_else(|| "encoding must be an object".to_string())?;
     let normalized = media_type.to_ascii_lowercase();
     let supports_style = normalized == "application/x-www-form-urlencoded"
         || normalized == "multipart/form-data";
-    if !supports_style && !object.is_empty() {
+    if !supports_style {
         return Err(format!(
             "encoding is only supported for application/x-www-form-urlencoded and multipart/form-data (got {media_type})"
         ));
     }
     let mut out = AHashMap::new();
     for (property, value) in object {
-        let parsed = parse_property_encoding(property, value, &normalized, schema)?;
+        let parsed =
+            parse_property_encoding(property, value, &normalized, schema, schema_draft)?;
         out.insert(property.clone(), parsed);
     }
     Ok(out)
@@ -1100,7 +1104,11 @@ fn parse_property_encoding(
     value: &Value,
     media_type: &str,
     schema: &Value,
+    schema_draft: SchemaDraft,
 ) -> Result<PropertyEncoding, String> {
+    let property_schema = property_schema_from_object(schema, property).ok_or_else(|| {
+        format!("encoding['{property}'] does not name a request-body schema property")
+    })?;
     let object = value.as_object().ok_or_else(|| {
         format!("encoding['{property}'] must be an object")
     })?;
@@ -1115,10 +1123,11 @@ fn parse_property_encoding(
         }
     }
 
-    let style_raw = object
-        .get("style")
-        .and_then(Value::as_str)
-        .unwrap_or("form");
+    let style_raw = match object.get("style") {
+        None => "form",
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => return Err(format!("encoding['{property}'].style must be a string")),
+    };
     let style = match style_raw {
         "form" => EncodingStyle::Form,
         "spaceDelimited" => EncodingStyle::SpaceDelimited,
@@ -1131,14 +1140,20 @@ fn parse_property_encoding(
         }
     };
 
-    let explode = match object.get("explode").and_then(Value::as_bool) {
-        Some(value) => value,
+    let explode = match object.get("explode") {
         None => style == EncodingStyle::Form,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(format!("encoding['{property}'].explode must be a boolean")),
     };
-    let allow_reserved = object
-        .get("allowReserved")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let allow_reserved = match object.get("allowReserved") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(format!(
+                "encoding['{property}'].allowReserved must be a boolean"
+            ));
+        }
+    };
 
     match (style, explode) {
         (EncodingStyle::Form, _) => {}
@@ -1157,8 +1172,6 @@ fn parse_property_encoding(
     }
 
     if style == EncodingStyle::DeepObject {
-        let property_schema =
-            property_schema_from_object(schema, property).unwrap_or(&Value::Null);
         if !schema_accepts_object(property_schema) {
             return Err(format!(
                 "encoding['{property}']: style 'deepObject' requires an object schema property"
@@ -1212,7 +1225,10 @@ fn parse_property_encoding(
         }
         for (header_name, header_schema) in headers_object {
             let name = header_name.trim().to_ascii_lowercase();
-            if name.is_empty() || name.len() > 256 {
+            if name.is_empty()
+                || name.len() > 256
+                || http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+            {
                 return Err(format!(
                     "encoding['{property}'].headers contains an invalid header name"
                 ));
@@ -1230,7 +1246,18 @@ fn parse_property_encoding(
                 .as_object()
                 .and_then(|object| object.get("schema"))
                 .unwrap_or(header_schema);
-            headers.insert(name, schema_value.clone());
+            let validator = compile_schema(schema_value, schema_draft).map_err(|error| {
+                format!(
+                    "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
+                )
+            })?;
+            headers.insert(
+                name,
+                EncodingHeaderValidator {
+                    schema: schema_value.clone(),
+                    validator,
+                },
+            );
         }
     }
 
@@ -1249,15 +1276,18 @@ fn property_schema_from_object<'a>(schema: &'a Value, property: &str) -> Option<
         .and_then(Value::as_object)
         .and_then(|properties| properties.get(property))
         .or_else(|| {
-            // Walk allOf so deepObject checks see composed object properties.
-            schema
-                .get("allOf")
-                .and_then(Value::as_array)
-                .and_then(|branches| {
-                    branches
-                        .iter()
-                        .find_map(|branch| property_schema_from_object(branch, property))
-                })
+            // Walk every composition branch so Encoding Objects can target a
+            // property declared in an allOf/oneOf/anyOf object branch.
+            ["allOf", "oneOf", "anyOf"].into_iter().find_map(|keyword| {
+                schema
+                    .get(keyword)
+                    .and_then(Value::as_array)
+                    .and_then(|branches| {
+                        branches
+                            .iter()
+                            .find_map(|branch| property_schema_from_object(branch, property))
+                    })
+            })
         })
 }
 
@@ -1511,6 +1541,7 @@ fn form_urlencoded_to_value(
     schema: &Value,
     encoding: &AHashMap<String, PropertyEncoding>,
 ) -> Result<Value, String> {
+    validate_form_serialization(body, encoding)?;
     let mut fields: HashMap<String, Vec<String>> = HashMap::new();
     for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
         fields
@@ -1519,6 +1550,71 @@ fn form_urlencoded_to_value(
             .push(value.into_owned());
     }
     fields_to_schema_object(fields, schema, encoding, "form")
+}
+
+fn validate_form_serialization(
+    body: &str,
+    encoding: &AHashMap<String, PropertyEncoding>,
+) -> Result<(), String> {
+    for pair in body.split('&') {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        validate_percent_encoding(raw_key)?;
+        validate_percent_encoding(raw_value)?;
+        let decoded_key = url::form_urlencoded::parse(pair.as_bytes())
+            .next()
+            .map(|(key, _)| key.into_owned())
+            .unwrap_or_default();
+        let property = decoded_key
+            .split_once('[')
+            .map(|(base, _)| base)
+            .unwrap_or(decoded_key.as_str());
+        let property_encoding = encoding.get(property);
+        let allow_reserved =
+            property_encoding.is_some_and(|property_encoding| property_encoding.allow_reserved);
+        let comma_is_style_delimiter = property_encoding.is_some_and(|property_encoding| {
+            property_encoding.style == EncodingStyle::Form && !property_encoding.explode
+        });
+        if !allow_reserved
+            && raw_value.bytes().any(|byte| {
+                is_unescaped_form_reserved_byte(byte)
+                    && !(comma_is_style_delimiter && byte == b',')
+            })
+        {
+            return Err(format!(
+                "Form field '{property}' contains an unescaped reserved character while allowReserved=false"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_percent_encoding(value: &str) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err("Form body contains malformed percent-encoding".to_string());
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn is_unescaped_form_reserved_byte(byte: u8) -> bool {
+    // RFC 3986 gen-delims + sub-delims that can occur inside the raw value.
+    // `&` is already the field delimiter and `+` is the form-space encoding.
+    matches!(
+        byte,
+        b':' | b'/' | b'?' | b'#' | b'[' | b']' | b'@' | b'!' | b'$' | b'\'' | b'(' | b')'
+            | b'*' | b',' | b';' | b'='
+    )
 }
 
 #[derive(Debug)]
@@ -1552,17 +1648,16 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
     let close_bytes = close_marker.as_bytes();
 
     let mut parts = Vec::new();
-    let mut pos = 0usize;
     let mut saw_close = false;
 
     // Locate the opening boundary (optional preamble before it).
-    let Some(mut next) = find_mime_boundary(body, 0, delim_bytes, close_bytes)? else {
+    let Some(opening) = find_mime_boundary(body, 0, delim_bytes, close_bytes)? else {
         return Err("Malformed multipart body: missing opening boundary".to_string());
     };
-    if next.is_close {
+    if opening.is_close {
         return Err("Malformed multipart body: empty closed multipart".to_string());
     }
-    pos = next.after;
+    let mut pos = opening.after;
 
     while !saw_close {
         let Some(end) = find_mime_boundary(body, pos, delim_bytes, close_bytes)? else {
@@ -1575,51 +1670,50 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
         // Part body excludes the CRLF that precedes the next boundary.
         segment = trim_trailing_line_break(segment);
 
-        if !segment.is_empty() {
-            if parts.len() >= MAX_MULTIPART_PARTS {
-                return Err(format!(
-                    "Multipart body exceeds {MAX_MULTIPART_PARTS} parts"
-                ));
-            }
-            let Some((header_bytes, part_body)) = split_header_body(segment) else {
-                return Err("Malformed multipart part: missing header/body separator".to_string());
-            };
-            if header_bytes.len() > MAX_MULTIPART_HEADER_BYTES {
-                return Err(format!(
-                    "Multipart part headers exceed {MAX_MULTIPART_HEADER_BYTES} bytes"
-                ));
-            }
-            let headers = parse_part_headers(header_bytes)?;
-            let Some(disposition) = headers.get("content-disposition") else {
-                return Err("Malformed multipart part: missing Content-Disposition".to_string());
-            };
-            let params = parse_header_params(disposition)?;
-            let Some(name) = params.get("name").filter(|value| !value.is_empty()) else {
-                return Err("Malformed multipart part: missing form-data name".to_string());
-            };
-            if name.len() > MAX_MULTIPART_PARAM_BYTES {
-                return Err("Multipart form-data name exceeds size limit".to_string());
-            }
-            if let Some(filename) = params.get("filename")
-                && filename.len() > MAX_MULTIPART_PARAM_BYTES
-            {
-                return Err("Multipart filename exceeds size limit".to_string());
-            }
-            parts.push(MultipartPart {
-                name: name.clone(),
-                filename: params.get("filename").cloned(),
-                content_type: headers.get("content-type").cloned(),
-                headers,
-                body: part_body.to_vec(),
-            });
+        if segment.is_empty() {
+            return Err("Malformed multipart body: empty part".to_string());
         }
+        if parts.len() >= MAX_MULTIPART_PARTS {
+            return Err(format!(
+                "Multipart body exceeds {MAX_MULTIPART_PARTS} parts"
+            ));
+        }
+        let Some((header_bytes, part_body)) = split_header_body(segment) else {
+            return Err("Malformed multipart part: missing header/body separator".to_string());
+        };
+        if header_bytes.len() > MAX_MULTIPART_HEADER_BYTES {
+            return Err(format!(
+                "Multipart part headers exceed {MAX_MULTIPART_HEADER_BYTES} bytes"
+            ));
+        }
+        let headers = parse_part_headers(header_bytes)?;
+        let Some(disposition) = headers.get("content-disposition") else {
+            return Err("Malformed multipart part: missing Content-Disposition".to_string());
+        };
+        let params = parse_header_params(disposition)?;
+        let Some(name) = params.get("name").filter(|value| !value.is_empty()) else {
+            return Err("Malformed multipart part: missing form-data name".to_string());
+        };
+        if name.len() > MAX_MULTIPART_PARAM_BYTES {
+            return Err("Multipart form-data name exceeds size limit".to_string());
+        }
+        if let Some(filename) = params.get("filename")
+            && filename.len() > MAX_MULTIPART_PARAM_BYTES
+        {
+            return Err("Multipart filename exceeds size limit".to_string());
+        }
+        parts.push(MultipartPart {
+            name: name.clone(),
+            filename: params.get("filename").cloned(),
+            content_type: headers.get("content-type").cloned(),
+            headers,
+            body: part_body.to_vec(),
+        });
 
         saw_close = end.is_close;
         pos = end.after;
-        next = end;
     }
 
-    let _ = next;
     // Trailing epilogue after the close boundary is ignored.
     Ok(parts)
 }
@@ -1959,31 +2053,20 @@ fn multipart_part_to_schema_value(
                 ));
             }
         }
-        for (header_name, header_schema) in &encoding.headers {
+        for (header_name, header_validator) in &encoding.headers {
             let Some(header_value) = part.headers.get(header_name) else {
                 return Err(format!(
                     "Multipart field '{}' is missing required encoding header '{header_name}'",
                     part.name
                 ));
             };
-            let converted = scalar_to_schema_value(header_value, header_schema)?;
-            // Lightweight structural check: if the header schema declares type,
-            // ensure conversion produced a compatible JSON value. Full draft
-            // validation of part headers is intentionally best-effort here.
-            let _ = converted;
-            if header_schema.get("const").is_some()
-                || header_schema.get("enum").is_some()
-                || header_schema.get("pattern").is_some()
-            {
-                let compiled = jsonschema::validator_for(header_schema)
-                    .map_err(|error| format!("Invalid encoding header schema: {error}"))?;
-                compiled.validate(&converted).map_err(|error| {
-                    format!(
-                        "Multipart field '{}' header '{header_name}' failed validation: {error}",
-                        part.name
-                    )
-                })?;
-            }
+            let converted = scalar_to_schema_value(header_value, &header_validator.schema)?;
+            header_validator.validator.validate(&converted).map_err(|error| {
+                format!(
+                    "Multipart field '{}' header '{header_name}' failed validation: {error}",
+                    part.name
+                )
+            })?;
         }
     }
 
@@ -2105,37 +2188,73 @@ fn scalar_to_schema_value(value: &str, schema: &Value) -> Result<Value, String> 
     }
 
     let composed = schema_is_composed(schema);
-    let multi = types.len() > 1 || composed;
+    if composed {
+        let validator = jsonschema::validator_for(schema)
+            .map_err(|error| format!("Invalid composed scalar schema: {error}"))?;
+        let mut parsed = Vec::with_capacity(4);
+
+        // Serialized form fields do not carry a native JSON type. Try every
+        // compatible primitive in a stable order, but accept a conversion only
+        // when the complete composed property schema validates it. This avoids
+        // both branch-order selection and the old failure where an integer
+        // parse succeeded even though its branch constraints failed while a
+        // string/boolean candidate would have satisfied another branch.
+        if types.contains(&ScalarType::Integer)
+            && let Ok(candidate) = parse_integer_value(value)
+        {
+            parsed.push(candidate);
+        }
+        if types.contains(&ScalarType::Number)
+            && let Ok(candidate) = parse_number_value(value)
+            && !parsed.contains(&candidate)
+        {
+            parsed.push(candidate);
+        }
+        if types.contains(&ScalarType::Boolean)
+            && let Ok(candidate) = parse_boolean_value(value)
+        {
+            parsed.push(candidate);
+        }
+        if types.contains(&ScalarType::String) {
+            parsed.push(Value::String(value.to_string()));
+        }
+        if let Some(candidate) = parsed
+            .into_iter()
+            .find(|candidate| validator.is_valid(candidate))
+        {
+            return Ok(candidate);
+        }
+        return Err(format!(
+            "No compatible composed-schema scalar conversion for '{value}'"
+        ));
+    }
+
+    let multi = types.len() > 1;
     let mut last_error = None;
 
     // Deterministic try order — never depends on oneOf/anyOf branch order.
-    if types.contains(ScalarType::Integer) {
+    if types.contains(&ScalarType::Integer) {
         match parse_integer_value(value) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
-    if types.contains(ScalarType::Number) {
+    if types.contains(&ScalarType::Number) {
         match parse_number_value(value) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
-    if types.contains(ScalarType::Boolean) {
+    if types.contains(&ScalarType::Boolean) {
         match parse_boolean_value(value) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
-    if types.contains(ScalarType::String) {
-        return Ok(Value::String(value.to_string()));
-    }
-    // Composed schemas that only mention null still accept the textual form as a
-    // string so the JSON Schema engine can evaluate nullable branches.
-    if multi && types.contains(ScalarType::Null) {
+    if types.contains(&ScalarType::String) {
         return Ok(Value::String(value.to_string()));
     }
     Err(last_error.unwrap_or_else(|| format!("Unsupported scalar conversion for '{value}'")))
@@ -2307,9 +2426,18 @@ fn merge_composition_object_fields(
     }
     if let Some(props) = schema.get("properties").and_then(Value::as_object) {
         for (key, value) in props {
-            properties
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
+            match properties.entry(key.clone()) {
+                serde_json::map::Entry::Vacant(entry) => {
+                    entry.insert(value.clone());
+                }
+                serde_json::map::Entry::Occupied(mut entry) => {
+                    // Conversion needs every branch's possible property type.
+                    // Use an order-insensitive union here; the original root
+                    // schema remains authoritative for final validation.
+                    let existing = entry.get().clone();
+                    entry.insert(json!({"anyOf": [existing, value.clone()]}));
+                }
+            }
         }
     }
     if let Some(req) = schema.get("required").and_then(Value::as_array) {
@@ -2534,7 +2662,9 @@ fn parse_header_params(value: &str) -> Result<HashMap<String, String>, String> {
         if decoded.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err(format!("Header parameter '{key}' exceeds size limit"));
         }
-        params.insert(key, decoded);
+        if params.insert(key.clone(), decoded).is_some() {
+            return Err(format!("Duplicate header parameter '{key}'"));
+        }
     }
     Ok(params)
 }
@@ -2627,10 +2757,14 @@ fn parse_part_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, St
             return Err("Malformed multipart header line".to_string());
         };
         let name = name.trim().to_ascii_lowercase();
-        if name.is_empty() {
+        if name.is_empty() || http::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
             return Err("Malformed multipart header name".to_string());
         }
-        if out.insert(name, value.trim().to_string()).is_some() {
+        let value = value.trim();
+        if http::HeaderValue::from_bytes(value.as_bytes()).is_err() {
+            return Err("Malformed multipart header value".to_string());
+        }
+        if out.insert(name, value.to_string()).is_some() {
             return Err("Malformed multipart part: duplicate header".to_string());
         }
     }

@@ -16978,8 +16978,8 @@ components:
                 $ref: "#/components/schemas/OpenapiValidatorMediaTypeContent"
               description: >
                 Media type to schema map. Each entry is either a bare JSON Schema
-                (object or boolean) or a Media Type Object with `schema` plus
-                optional OpenAPI Encoding Objects for form-urlencoded / multipart.
+                (object or boolean) or, when encoding metadata is present, a Media
+                Type Object with required `schema` and `encoding` fields.
             content_type:
               type: string
               description: Alternate single-schema form.
@@ -17005,20 +17005,23 @@ components:
 
     OpenapiValidatorMediaTypeContent:
       description: >
-        Request-body content entry. Accepts the historical bare JSON Schema form
-        or an OpenAPI Media Type Object that preserves Encoding Objects.
-      anyOf:
-        - $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+        Request-body content entry. A bare JSON Schema is canonical when no
+        Encoding Object is present. An entry with `encoding` must use the strict
+        Media Type Object shape, preventing ambiguous schema/wrapper parsing.
+      oneOf:
+        - allOf:
+            - $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+            - not:
+                type: object
+                required: [encoding]
         - type: object
-          required: [schema]
+          required: [schema, encoding]
           additionalProperties: false
           properties:
             schema:
               $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
             encoding:
               $ref: "#/components/schemas/OpenapiValidatorEncodingMap"
-            example: {}
-            examples: {}
 
     OpenapiValidatorEncodingMap:
       type: object
@@ -17051,15 +17054,21 @@ components:
           type: boolean
           default: false
           description: >
-            OpenAPI allowReserved flag. Runtime form parsing always percent-decodes
-            values; reserved characters are accepted whether encoded or not.
+            OpenAPI allowReserved flag. When false, literal RFC 3986 reserved
+            bytes in form values are rejected and must be percent-encoded
+            (serialization delimiters such as the form explode=false comma remain valid).
         contentType:
           type: string
+          minLength: 1
+          maxLength: 4096
           description: >
             Expected multipart part Content-Type (comma-separated list allowed).
             Only valid for multipart/form-data.
         headers:
           type: object
+          maxProperties: 32
+          propertyNames:
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties: true
           description: >
             Additional multipart part headers to require/validate. Only valid for

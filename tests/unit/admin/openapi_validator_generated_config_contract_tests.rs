@@ -330,3 +330,31 @@ fn published_schema_accepts_media_type_object_with_encoding() {
     });
     assert_valid_against_admin_schema(&config, "media type object with encoding");
 }
+
+#[test]
+fn published_schema_rejects_ambiguous_media_type_objects() {
+    let validator = openapi_validator_config_validator();
+    for invalid_entry in [
+        json!({"encoding": {}}),
+        json!({"schema": true, "encoding": null}),
+        json!({"schema": true, "encoding": {}, "example": "ambiguous"}),
+    ] {
+        let config = json!({
+            "schema_draft": "draft2020-12",
+            "operations": [{
+                "method": "POST",
+                "path_template": "/strict",
+                "path_regex": "^/strict$",
+                "request_body": {
+                    "content": {
+                        "application/x-www-form-urlencoded": invalid_entry
+                    }
+                }
+            }]
+        });
+        assert!(
+            validator.validate(&config).is_err(),
+            "ambiguous media type object must fail the published schema: {config}"
+        );
+    }
+}
