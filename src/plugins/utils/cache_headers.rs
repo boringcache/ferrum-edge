@@ -23,10 +23,9 @@
 
 use std::collections::HashMap;
 
-/// Exact-match sensitive response headers. Comparisons are ASCII
-/// case-insensitive (RFC 9110 §5.1). See [`SENSITIVE_HEADER_PREFIXES`] for
-/// families that must match by prefix instead (provider rate-limit
-/// variants, multi-header B3 tracing).
+/// Exact-match sensitive response headers other than per-request trace
+/// identifiers. Comparisons are ASCII case-insensitive (RFC 9110 §5.1).
+/// See [`SENSITIVE_HEADER_PREFIXES`] for families that must match by prefix.
 const SENSITIVE_EXACT_HEADERS: &[&str] = &[
     // Per-response identity / session state.
     "set-cookie",
@@ -39,18 +38,6 @@ const SENSITIVE_EXACT_HEADERS: &[&str] = &[
     "x-amz-apigw-id",
     "x-amzn-request-id",
     "x-amzn-requestid",
-    "x-amzn-trace-id",
-    // Per-request trace identifiers — replaying these would splice the
-    // original request's trace into every subsequent cache hit.
-    "x-request-id",
-    "x-correlation-id",
-    "x-trace-id",
-    "traceparent",
-    "tracestate",
-    // Zipkin B3 single-header format (RFC-less; defined by openzipkin/b3-propagation).
-    // Multi-header B3 (`x-b3-traceid`, `x-b3-spanid`, `x-b3-parentspanid`,
-    // `x-b3-sampled`, `x-b3-flags`) is covered by the `x-b3-` prefix below.
-    "b3",
     // Per-request retry signal — the stored value reflects the original
     // response's retry timing and is misleading on a cache hit.
     "retry-after",
@@ -69,20 +56,50 @@ const SENSITIVE_EXACT_HEADERS: &[&str] = &[
 ///   (`-limit`, `-remaining`, `-window`, `-usage`) and future additions.
 /// - `anthropic-ratelimit-` covers Anthropic's rate-limit family
 ///   (`anthropic-ratelimit-requests-limit`, `-tokens-remaining`, etc.).
-/// - `x-b3-` covers the multi-header B3 tracing variant
-///   (`x-b3-traceid`, `-spanid`, `-parentspanid`, `-sampled`, `-flags`).
 const SENSITIVE_HEADER_PREFIXES: &[&str] = &[
     "x-ratelimit-",
     "x-ai-ratelimit-",
     "anthropic-ratelimit-",
-    "x-b3-",
 ];
+
+/// Return whether `name` is a per-request tracing or request-correlation
+/// header whose value must not affect request identity or be replayed from a
+/// cached response. The classifier is deliberately narrow: ordinary custom,
+/// routing, security, and representation headers remain semantic.
+pub fn is_per_request_trace_header(name: &str) -> bool {
+    const TRACE_HEADERS: &[&str] = &[
+        "traceparent",
+        "tracestate",
+        "x-request-id",
+        "x-correlation-id",
+        "correlation-id",
+        "x-trace-id",
+        "x-amzn-trace-id",
+        "b3",
+    ];
+
+    if TRACE_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+    {
+        return true;
+    }
+
+    // Zipkin B3 multi-header format (`x-b3-traceid`, `x-b3-spanid`,
+    // `x-b3-parentspanid`, `x-b3-sampled`, and `x-b3-flags`).
+    name.as_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"x-b3-"))
+}
 
 /// Case-insensitive check for whether a header name is sensitive.
 /// Uses byte-slice `eq_ignore_ascii_case` to avoid a per-call
 /// `to_ascii_lowercase` allocation. Prefix match is safe on byte
 /// boundaries because all prefixes are ASCII.
 pub fn is_sensitive_header(name: &str) -> bool {
+    if is_per_request_trace_header(name) {
+        return true;
+    }
     if SENSITIVE_EXACT_HEADERS
         .iter()
         .any(|s| name.eq_ignore_ascii_case(s))
@@ -126,6 +143,7 @@ mod tests {
         headers.insert("X-Amz-Apigw-Id".to_string(), "api-gw-123".to_string());
         headers.insert("X-Amzn-Request-Id".to_string(), "amzn-req-123".to_string());
         headers.insert("X-Amzn-Trace-Id".to_string(), "Root=1-abc".to_string());
+        headers.insert("Correlation-Id".to_string(), "correlation-123".to_string());
         headers.insert("X-AI-RateLimit-Remaining".to_string(), "42".to_string());
         headers.insert("retry-after".to_string(), "30".to_string());
         headers.insert("x-custom-app-header".to_string(), "keep-me".to_string());
@@ -148,8 +166,41 @@ mod tests {
         assert!(!sanitized.contains_key("X-Amz-Apigw-Id"));
         assert!(!sanitized.contains_key("X-Amzn-Request-Id"));
         assert!(!sanitized.contains_key("X-Amzn-Trace-Id"));
+        assert!(!sanitized.contains_key("Correlation-Id"));
         assert!(!sanitized.contains_key("X-AI-RateLimit-Remaining"));
         assert!(!sanitized.contains_key("retry-after"));
+    }
+
+    #[test]
+    fn per_request_trace_classifier_is_narrow_and_case_insensitive() {
+        for name in [
+            "traceparent",
+            "TraceState",
+            "X-Request-ID",
+            "x-correlation-id",
+            "Correlation-Id",
+            "X-Trace-Id",
+            "X-AmZn-TrAcE-Id",
+            "B3",
+            "X-B3-TraceId",
+            "x-b3-spanid",
+        ] {
+            assert!(is_per_request_trace_header(name), "expected {name} to match");
+        }
+
+        for name in [
+            "x-b3",
+            "x-b30-traceid",
+            "x-amzn-request-id",
+            "x-request-policy",
+            "x-canary",
+            "content-type",
+        ] {
+            assert!(
+                !is_per_request_trace_header(name),
+                "expected {name} to remain semantic"
+            );
+        }
     }
 
     #[test]
