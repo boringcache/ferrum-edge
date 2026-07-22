@@ -471,6 +471,17 @@ where
         }
     }
 
+    /// Seed or refresh a local/fallback key at a controllable instant.
+    ///
+    /// Test-support only: production admission always uses wall-clock `check`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn check_local_at(&self, key: K, op: &A::Op, now: Instant) -> RateLimitOutcome {
+        match self {
+            Self::Local(local) => local.check_at(key, op, now),
+            Self::Failover(failover) => failover.fallback.check_at(key, op, now),
+        }
+    }
+
     pub fn contains_local_key(&self, key: &K) -> bool {
         match self {
             Self::Local(local) => local.contains_key(key),
@@ -483,6 +494,28 @@ where
             Self::Local(_) => None,
             Self::Failover(failover) => failover.warmup_hostname(),
         }
+    }
+}
+
+/// Shared consumer cleanup branch: below-cap prune vs over-cap force eviction.
+///
+/// Every rate-limit consumer wrapper routes through this helper so omitted or
+/// reversed `prune_stale_at` / `enforce_capacity` wiring is a single shared
+/// failure mode rather than six divergent copies.
+#[inline]
+pub fn apply_rate_limit_cleanup<K, A>(
+    limiter: &RateLimitBackend<K, A>,
+    max_entries: usize,
+    now: Instant,
+    over_capacity: bool,
+) where
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    A: RateLimitAlgorithm + Clone,
+{
+    if over_capacity {
+        limiter.enforce_capacity(max_entries, now);
+    } else {
+        limiter.prune_stale_at(now);
     }
 }
 

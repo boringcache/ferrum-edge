@@ -2428,7 +2428,7 @@ Returns HTTP `429 Too Many Requests` when exceeded.
 
 **Counter storage** (`sync_mode`): only `local` and `redis` are supported. There is intentionally no database-backed counter policy; database writes on the hot path are non-performant and can cause operational issues.
 
-**Memory protection:** Local (and Redis-fallback) state is capped at 100,000 keys. Sampled piggyback sweeps prune idle keys even below that hard cap; when active state still exceeds the cap after prune, remaining keys are force-evicted.
+**Memory protection:** Local (and Redis-fallback) state is capped at 100,000 keys. Sampled piggyback sweeps (every 1,024 requests, cooldown-gated to at most once per second) prune idle keys even below that hard cap; when active state still exceeds the cap after prune, remaining keys are force-evicted immediately without the sample/cooldown gate.
 
 For grouped consumer rules, the list is not a shared budget. For example, `consumers: [premium-app, partner-app]` with `requests_per_minute: 1000` gives `premium-app` 1000/minute and `partner-app` 1000/minute independently.
 
@@ -3552,7 +3552,7 @@ The plugin requires at least one effective rule (`max_depth`, `max_complexity`, 
 
 Populates `ctx.metadata` with `graphql_operation_type`, `graphql_operation_name`, `graphql_depth`, and `graphql_complexity`.
 
-**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Explicit `redis_*` fields are validated even while `sync_mode` is `local`, so a later mode switch cannot activate malformed latent settings. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically. Local and Redis-fallback maps are capped at 100,000 keys with sampled below-cap stale pruning and over-cap force eviction after prune.
+**Counter storage** (`sync_mode`): GraphQL rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Explicit `redis_*` fields are validated even while `sync_mode` is `local`, so a later mode switch cannot activate malformed latent settings. Redis mode uses the shared failover limiter, so an unavailable Redis endpoint falls back to local counters and recovers automatically. Local and Redis-fallback maps are capped at 100,000 keys with sampled below-cap stale pruning (every 1,024 rate checks, cooldown-gated to at most once per second) and immediate over-cap force eviction after prune.
 
 ```yaml
 plugin_name: graphql
@@ -3649,7 +3649,7 @@ The plugin requires at least one effective rule (`allow_methods`, a non-empty `d
 
 The backend-path boundary is shared by the HTTP/1.1 + HTTP/2 handler (including gRPC-Web requests classified as gRPC) and the HTTP/3 frontend, including its H3-to-H2 gRPC bridge.
 
-**Counter storage** (`sync_mode`): gRPC method rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter and falls back to local counters while Redis is unavailable. Local and Redis-fallback maps are capped at 100,000 keys with sampled below-cap stale pruning and over-cap force eviction after prune.
+**Counter storage** (`sync_mode`): gRPC method rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter and falls back to local counters while Redis is unavailable. Local and Redis-fallback maps are capped at 100,000 keys with sampled below-cap stale pruning (every 1,024 rate checks, cooldown-gated to at most once per second) and immediate over-cap force eviction after prune.
 
 ```yaml
 plugin_name: grpc_method_router
@@ -4628,7 +4628,7 @@ When `limit_by: "ip"`, the request client identity has already canonicalized IPv
 
 **Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. Database-backed token counters are intentionally unsupported.
 
-**Memory protection:** Local (and Redis-fallback) token-state maps are capped at 100,000 keys. Sampled piggyback sweeps prune idle identity state below that hard cap; when active state still exceeds the cap after prune, remaining keys are force-evicted.
+**Memory protection:** Local (and Redis-fallback) token-state maps are capped at 100,000 keys. Sampled piggyback sweeps (every 1,024 requests, cooldown-gated to at most once per second) prune idle identity state below that hard cap; when active state still exceeds the cap after prune, remaining keys are force-evicted immediately without the sample/cooldown gate.
 
 **Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted when the final usage signal is available. Configure OpenAI-compatible clients to send `stream_options.include_usage: true` whenever possible. If a streamed 2xx response has no final usage, the default `on_unmetered_response: "charge_estimate"` keeps the pre-request reservation so streaming is not free. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
 
@@ -5060,7 +5060,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 **Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Uses Redis-native counters (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Database-backed frame counters are intentionally unsupported.
 
-**Memory protection:** Local (and Redis-fallback) connection state is capped at 50,000 keys. Sampled periodic sweeps prune idle connections below that hard cap; when active state still exceeds the cap after prune, remaining keys are force-evicted.
+**Memory protection:** Local (and Redis-fallback) connection state is capped at 50,000 keys. Sampled periodic sweeps (every 100,000 frame hooks, cooldown-gated to at most once per second) prune idle connections below that hard cap; when active state still exceeds the cap after prune, remaining keys are force-evicted immediately without the sample/cooldown gate.
 
 ```yaml
 plugin_name: ws_rate_limiting

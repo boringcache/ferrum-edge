@@ -1,143 +1,187 @@
-//! Controllable-time coverage for shared rate-limit stale pruning (#2316).
+//! Controllable-time coverage for shared rate-limit consumer cleanup wrappers (#2316).
 //!
-//! Periodic sweeps must reclaim idle keys below the hard cap while preserving
-//! active keys, for every shared local algorithm and the Redis-fallback map.
+//! These tests invoke each plugin's sampled/cooldown cleanup path through
+//! `_test_support` hooks — not `LocalLimiter::prune_stale_at` directly — so an
+//! omitted or reversed `prune_stale_at`/`enforce_capacity` branch fails.
 
+use ferrum_edge::_test_support::RateLimitCleanupHarness;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::utils::rate_limit::{
-    AiRateLimitOp, AiTokenRateAlgorithm, DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp,
-    LocalLimiter, RateLimitBackend, RateLimitWindowSpec, UdpRateLimitAlgorithm, UdpRateLimitOp,
-    WsFrameRateAlgorithm, WsRateLimitOp,
+    DynamicHttpRateLimitAlgorithm, RateLimitBackend,
 };
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-fn shard_amount() -> usize {
-    PluginHttpClient::default().pool_shard_amount()
-}
-
 #[test]
-fn udp_below_cap_periodic_prune_removes_stale_preserves_active() {
-    let epoch = Instant::now();
-    let limiter: LocalLimiter<String, _> = LocalLimiter::new(
-        UdpRateLimitAlgorithm::new(Some(1_000), None, 1, epoch),
-        shard_amount(),
-    );
-    let op = UdpRateLimitOp { datagram_size: 1 };
+fn udp_sampled_cooldown_path_prunes_stale_preserves_active_below_cap() {
+    let h = RateLimitCleanupHarness::new();
+    let epoch = h.udp_epoch_base();
 
-    assert!(limiter.check_at("10.0.0.1".to_string(), &op, epoch).allowed);
-    assert!(limiter.check_at("10.0.0.2".to_string(), &op, epoch).allowed);
+    h.seed_udp("10.0.0.1", epoch);
+    h.seed_udp("10.0.0.2", epoch);
     // Idle threshold is max(window_seconds * 2, 10) == 10s for window=1.
     let active_at = epoch + Duration::from_secs(11);
-    assert!(
-        limiter
-            .check_at("10.0.0.3".to_string(), &op, active_at)
-            .allowed
-    );
-    assert_eq!(limiter.tracked_keys_count(), 3);
+    h.seed_udp("10.0.0.3", active_at);
+    assert_eq!(h.udp_tracked(), Some(3));
 
-    limiter.prune_stale_at(active_at);
-    assert_eq!(limiter.tracked_keys_count(), 1);
-    assert!(limiter.contains_key(&"10.0.0.3".to_string()));
-    assert!(!limiter.contains_key(&"10.0.0.1".to_string()));
-    assert!(!limiter.contains_key(&"10.0.0.2".to_string()));
+    // Cooldown still open: armed sample must not scan.
+    h.arm_udp_periodic();
+    h.block_udp_cooldown_at(active_at);
+    let _ = h.maybe_evict_udp_at(active_at);
+    assert_eq!(h.udp_tracked(), Some(3));
+
+    // Clear cooldown and hit the sampled periodic path.
+    h.arm_udp_periodic();
+    let _ = h.maybe_evict_udp_at(active_at);
+    assert_eq!(h.udp_tracked(), Some(1));
+    assert!(h.udp_contains("10.0.0.3"));
+    assert!(!h.udp_contains("10.0.0.1"));
+    assert!(!h.udp_contains("10.0.0.2"));
 }
 
 #[test]
-fn dynamic_http_below_cap_prune_covers_rate_limiting_graphql_grpc() {
-    // Shared by rate_limiting, graphql, and grpc_method_router.
-    let limiter: LocalLimiter<String, _> =
-        LocalLimiter::new(DynamicHttpRateLimitAlgorithm::new(), shard_amount());
-    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
-        limit: 100,
-        duration: Duration::from_secs(1),
-    }]);
-    let t0 = Instant::now();
+fn udp_cleanup_branch_force_evicts_over_cap_and_prunes_below() {
+    let h = RateLimitCleanupHarness::new();
+    let epoch = h.udp_epoch_base();
+    h.seed_udp("10.0.0.1", epoch);
+    h.seed_udp("10.0.0.2", epoch);
+    h.seed_udp("10.0.0.3", epoch);
+    assert_eq!(h.udp_tracked(), Some(3));
 
-    assert!(limiter.check_at("ip:1".to_string(), &op, t0).allowed);
-    assert!(limiter.check_at("ip:2".to_string(), &op, t0).allowed);
-    // Token-bucket activity window is 2× duration for windows ≤ 5s.
+    // Below-cap branch must prune only idle keys (all three are still active).
+    h.udp_apply_branch(epoch, false, 1);
+    assert_eq!(h.udp_tracked(), Some(3));
+
+    // Over-cap branch force-evicts even while keys remain active.
+    h.udp_apply_branch(epoch, true, 1);
+    assert!(h.udp_tracked().unwrap_or(0) <= 1);
+}
+
+#[test]
+fn rate_limiting_wrapper_prunes_stale_and_force_evicts_over_cap() {
+    let h = RateLimitCleanupHarness::new();
+    let t0 = Instant::now();
+    h.seed_rate_limiting("ip:1", t0);
+    h.seed_rate_limiting("ip:2", t0);
     let active_at = t0 + Duration::from_secs(3);
-    assert!(limiter.check_at("ip:3".to_string(), &op, active_at).allowed);
-    assert_eq!(limiter.tracked_keys_count(), 3);
+    h.seed_rate_limiting("ip:3", active_at);
+    assert_eq!(h.rate_limiting_tracked(), Some(3));
 
-    limiter.prune_stale_at(active_at);
-    assert_eq!(limiter.tracked_keys_count(), 1);
-    assert!(limiter.contains_key(&"ip:3".to_string()));
-    assert!(!limiter.contains_key(&"ip:1".to_string()));
-    assert!(!limiter.contains_key(&"ip:2".to_string()));
+    h.arm_rate_limiting_periodic();
+    h.block_rate_limiting_cooldown_at(active_at);
+    h.maybe_evict_rate_limiting_at(active_at);
+    assert_eq!(h.rate_limiting_tracked(), Some(3));
+
+    h.arm_rate_limiting_periodic();
+    h.maybe_evict_rate_limiting_at(active_at);
+    assert_eq!(h.rate_limiting_tracked(), Some(1));
+    assert!(h.rate_limiting_contains("ip:3"));
+    assert!(!h.rate_limiting_contains("ip:1"));
+    assert!(!h.rate_limiting_contains("ip:2"));
+
+    h.seed_rate_limiting("ip:a", active_at);
+    h.seed_rate_limiting("ip:b", active_at);
+    h.seed_rate_limiting("ip:c", active_at);
+    h.rate_limiting_apply_branch(active_at, true, 1);
+    assert!(h.rate_limiting_tracked().unwrap_or(0) <= 1);
 }
 
 #[test]
-fn ai_token_below_cap_prune_removes_stale_preserves_active() {
-    let limiter: LocalLimiter<String, _> =
-        LocalLimiter::new(AiTokenRateAlgorithm::new(1_000, 1), shard_amount());
-    let reserve = AiRateLimitOp::Reserve { tokens: 1 };
+fn ai_wrapper_prunes_stale_and_force_evicts_over_cap() {
+    let h = RateLimitCleanupHarness::new();
     let t0 = Instant::now();
-
-    assert!(
-        limiter
-            .check_at("consumer:a".to_string(), &reserve, t0)
-            .allowed
-    );
-    assert!(
-        limiter
-            .check_at("consumer:b".to_string(), &reserve, t0)
-            .allowed
-    );
+    h.seed_ai("consumer:a", t0);
+    h.seed_ai("consumer:b", t0);
     let active_at = t0 + Duration::from_secs(2);
-    assert!(
-        limiter
-            .check_at("consumer:c".to_string(), &reserve, active_at)
-            .allowed
-    );
-    assert_eq!(limiter.tracked_keys_count(), 3);
+    h.seed_ai("consumer:c", active_at);
+    assert_eq!(h.ai_tracked(), Some(3));
 
-    limiter.prune_stale_at(active_at);
-    assert_eq!(limiter.tracked_keys_count(), 1);
-    assert!(limiter.contains_key(&"consumer:c".to_string()));
-    assert!(!limiter.contains_key(&"consumer:a".to_string()));
-    assert!(!limiter.contains_key(&"consumer:b".to_string()));
+    h.arm_ai_periodic();
+    h.maybe_evict_ai_at(active_at);
+    assert_eq!(h.ai_tracked(), Some(1));
+    assert!(h.ai_contains("consumer:c"));
+    assert!(!h.ai_contains("consumer:a"));
+    assert!(!h.ai_contains("consumer:b"));
+
+    h.seed_ai("consumer:x", active_at);
+    h.seed_ai("consumer:y", active_at);
+    h.ai_apply_branch(active_at, true, 1);
+    assert!(h.ai_tracked().unwrap_or(0) <= 1);
 }
 
 #[test]
-fn ws_frame_below_cap_prune_removes_stale_preserves_active() {
-    let limiter: LocalLimiter<u64, _> =
-        LocalLimiter::new(WsFrameRateAlgorithm::new(100.0, 100.0), shard_amount());
-    let op = WsRateLimitOp;
+fn graphql_wrapper_prunes_stale_and_force_evicts_over_cap() {
+    let h = RateLimitCleanupHarness::new();
     let t0 = Instant::now();
+    h.seed_graphql("gql:1", t0);
+    h.seed_graphql("gql:2", t0);
+    let active_at = t0 + Duration::from_secs(3);
+    h.seed_graphql("gql:3", active_at);
+    assert_eq!(h.graphql_tracked(), Some(3));
 
-    assert!(limiter.check_at(1u64, &op, t0).allowed);
-    assert!(limiter.check_at(2u64, &op, t0).allowed);
+    h.arm_graphql_periodic();
+    h.maybe_evict_graphql_at(active_at);
+    assert_eq!(h.graphql_tracked(), Some(1));
+    assert!(h.graphql_contains("gql:3"));
+    assert!(!h.graphql_contains("gql:1"));
+    assert!(!h.graphql_contains("gql:2"));
+
+    h.seed_graphql("gql:a", active_at);
+    h.seed_graphql("gql:b", active_at);
+    h.graphql_apply_branch(active_at, true, 1);
+    assert!(h.graphql_tracked().unwrap_or(0) <= 1);
+}
+
+#[test]
+fn grpc_wrapper_prunes_stale_and_force_evicts_over_cap() {
+    let h = RateLimitCleanupHarness::new();
+    let t0 = Instant::now();
+    h.seed_grpc("grpc:1", t0);
+    h.seed_grpc("grpc:2", t0);
+    let active_at = t0 + Duration::from_secs(3);
+    h.seed_grpc("grpc:3", active_at);
+    assert_eq!(h.grpc_tracked(), Some(3));
+
+    h.arm_grpc_periodic();
+    h.maybe_evict_grpc_at(active_at);
+    assert_eq!(h.grpc_tracked(), Some(1));
+    assert!(h.grpc_contains("grpc:3"));
+    assert!(!h.grpc_contains("grpc:1"));
+    assert!(!h.grpc_contains("grpc:2"));
+
+    h.seed_grpc("grpc:a", active_at);
+    h.seed_grpc("grpc:b", active_at);
+    h.grpc_apply_branch(active_at, true, 1);
+    assert!(h.grpc_tracked().unwrap_or(0) <= 1);
+}
+
+#[test]
+fn ws_sampled_cooldown_path_prunes_stale_preserves_active_below_cap() {
+    let h = RateLimitCleanupHarness::new();
+    let t0 = Instant::now();
+    h.seed_ws(1, t0);
+    h.seed_ws(2, t0);
     // Token-bucket activity window is 2× (burst / fps) == 2s.
     let active_at = t0 + Duration::from_secs(3);
-    assert!(limiter.check_at(3u64, &op, active_at).allowed);
-    assert_eq!(limiter.tracked_keys_count(), 3);
+    h.seed_ws(3, active_at);
+    assert_eq!(h.ws_tracked(), Some(3));
 
-    limiter.prune_stale_at(active_at);
-    assert_eq!(limiter.tracked_keys_count(), 1);
-    assert!(limiter.contains_key(&3u64));
-    assert!(!limiter.contains_key(&1u64));
-    assert!(!limiter.contains_key(&2u64));
-}
+    h.arm_ws_periodic();
+    h.block_ws_cooldown_at(active_at);
+    let _ = h.maybe_evict_ws_at(active_at);
+    assert_eq!(h.ws_tracked(), Some(3));
 
-#[test]
-fn enforce_capacity_still_force_evicts_active_over_cap() {
-    let limiter: LocalLimiter<String, _> =
-        LocalLimiter::new(DynamicHttpRateLimitAlgorithm::new(), shard_amount());
-    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
-        limit: 100,
-        duration: Duration::from_secs(60),
-    }]);
-    let now = Instant::now();
+    h.arm_ws_periodic();
+    let _ = h.maybe_evict_ws_at(active_at);
+    assert_eq!(h.ws_tracked(), Some(1));
+    assert!(h.ws_contains(3));
+    assert!(!h.ws_contains(1));
+    assert!(!h.ws_contains(2));
 
-    for idx in 0..5 {
-        assert!(limiter.check_at(format!("k:{idx}"), &op, now).allowed);
-    }
-    assert_eq!(limiter.tracked_keys_count(), 5);
-
-    limiter.enforce_capacity(2, now);
-    assert!(limiter.tracked_keys_count() <= 2);
+    h.seed_ws(10, active_at);
+    h.seed_ws(11, active_at);
+    h.ws_apply_branch(active_at, true, 1);
+    assert!(h.ws_tracked().unwrap_or(0) <= 1);
 }
 
 #[test]

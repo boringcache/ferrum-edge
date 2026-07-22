@@ -9,12 +9,15 @@ use tracing::warn;
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
-    RateLimitWindowSpec,
+    RateLimitWindowSpec, apply_rate_limit_cleanup,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
+/// Bounds below-cap full-map scans under high RPS. Over-cap enforcement is not
+/// cooldown-gated so admission pressure still reclaims space immediately.
+const EVICTION_COOLDOWN_SECS: u64 = 1;
 const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +34,8 @@ pub struct RateLimiting {
     consumer_overrides: HashMap<String, DynamicRateLimitOp>,
     limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
     request_counter: AtomicU64,
+    epoch_base: Instant,
+    last_periodic_sweep_secs: AtomicU64,
 }
 
 impl RateLimiting {
@@ -63,6 +68,8 @@ impl RateLimiting {
             consumer_overrides: parsed_limits.consumer_overrides,
             limiter,
             request_counter: AtomicU64::new(0),
+            epoch_base: Instant::now(),
+            last_periodic_sweep_secs: AtomicU64::new(0),
         })
     }
 
@@ -72,25 +79,92 @@ impl RateLimiting {
         self.limiter.local_map_shard_amount()
     }
 
-    fn maybe_evict_stale_entries(&self) {
-        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
-        if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
-            return;
-        }
+    /// Controllable-time seed for external cleanup tests. Not a production API.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn seed_key_at_for_test(&self, key: String, now: Instant) {
+        let _ = self
+            .limiter
+            .check_local_at(key, &self.default_limit, now);
+    }
 
+    /// Arm the sampled below-cap gate without spinning 1024 requests. Test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn arm_periodic_eviction_for_test(&self) {
+        self.request_counter
+            .store(EVICTION_CHECK_INTERVAL_REQUESTS, Ordering::Relaxed);
+        self.last_periodic_sweep_secs.store(0, Ordering::Relaxed);
+    }
+
+    /// Block the below-cap cooldown so an armed sample does not scan. Test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn block_periodic_cooldown_at_for_test(&self, now: Instant) {
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+        self.last_periodic_sweep_secs
+            .store(now_secs, Ordering::Relaxed);
+    }
+
+    /// Invoke the production cleanup wrapper at `now`. Test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn maybe_evict_stale_entries_at_for_test(&self, now: Instant) {
+        self.maybe_evict_stale_entries_at(now);
+    }
+
+    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn apply_cleanup_branch_for_test(
+        &self,
+        now: Instant,
+        over_capacity: bool,
+        max_entries: usize,
+    ) {
+        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn contains_key_for_test(&self, key: &str) -> bool {
+        self.limiter.contains_local_key(&key.to_string())
+    }
+
+    fn maybe_evict_stale_entries(&self) {
+        self.maybe_evict_stale_entries_at(Instant::now());
+    }
+
+    fn maybe_evict_stale_entries_at(&self, now: Instant) {
         let len = self.limiter.tracked_keys_count();
         if len == 0 {
             return;
         }
 
-        // Sampled piggyback sweeps prune idle keys below the hard cap;
-        // only over-cap pressure force-evicts still-active entries.
-        let now = Instant::now();
+        // Over-cap pressure force-evicts immediately after pruning idle keys.
+        // This path is not sample/cooldown gated so high RPS cannot delay
+        // hard-cap reclamation.
         if len > MAX_STATE_ENTRIES {
-            self.limiter.enforce_capacity(MAX_STATE_ENTRIES, now);
-        } else {
-            self.limiter.prune_stale_at(now);
+            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+            return;
         }
+
+        // Below the hard cap: sample every 1024 requests and cooldown-gate to
+        // at most one full DashMap retain per second so high RPS cannot turn
+        // periodic reclamation into an unbounded scan storm.
+        let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
+            return;
+        }
+
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+        let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(last_sweep) < EVICTION_COOLDOWN_SECS {
+            return;
+        }
+        if self
+            .last_periodic_sweep_secs
+            .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, false);
     }
 
     fn request_key(&self, ctx: &RequestContext) -> String {

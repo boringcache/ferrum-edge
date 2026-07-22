@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::warn;
 
-use super::utils::rate_limit::{RateLimitBackend, UdpRateLimitAlgorithm, UdpRateLimitOp};
+use super::utils::rate_limit::{
+    RateLimitBackend, UdpRateLimitAlgorithm, UdpRateLimitOp, apply_rate_limit_cleanup,
+};
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
     UdpDatagramVerdict,
@@ -72,6 +74,63 @@ impl UdpRateLimiting {
         self.limiter.local_map_shard_amount()
     }
 
+    /// Controllable-time seed for external cleanup tests. Not a production API.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn seed_client_at_for_test(
+        &self,
+        client_ip: Arc<str>,
+        datagram_size: u64,
+        now: Instant,
+    ) {
+        let _ = self.limiter.check_local_at(
+            client_ip,
+            &UdpRateLimitOp { datagram_size },
+            now,
+        );
+    }
+
+    /// Arm the sampled periodic gate without spinning 100k hooks. Test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn arm_periodic_eviction_for_test(&self) {
+        self.check_counter
+            .store(EVICTION_CHECK_INTERVAL, Ordering::Relaxed);
+        self.last_eviction_secs.store(0, Ordering::Relaxed);
+    }
+
+    /// Force the cooldown clock so the next armed periodic sweep is blocked.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn block_eviction_cooldown_at_for_test(&self, now: Instant) {
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+        self.last_eviction_secs.store(now_secs, Ordering::Relaxed);
+    }
+
+    /// Invoke the production sampled/cooldown eviction path at `now`. Test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn maybe_evict_at_for_test(&self, now: Instant) -> bool {
+        self.maybe_evict_at(now)
+    }
+
+    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn apply_cleanup_branch_for_test(
+        &self,
+        now: Instant,
+        over_capacity: bool,
+        max_entries: usize,
+    ) {
+        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn contains_client_for_test(&self, client_ip: &Arc<str>) -> bool {
+        self.limiter.contains_local_key(client_ip)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn epoch_base_for_test(&self) -> Instant {
+        self.epoch_base
+    }
+
     fn redis_ip_key(client_ip: &str) -> String {
         let mut key = String::with_capacity(3 + client_ip.len());
         key.push_str("ip:");
@@ -79,18 +138,18 @@ impl UdpRateLimiting {
         key
     }
 
-    fn secs_since_base(&self) -> u64 {
-        Instant::now().duration_since(self.epoch_base).as_secs()
+    fn maybe_evict(&self) -> bool {
+        self.maybe_evict_at(Instant::now())
     }
 
-    fn maybe_evict(&self) -> bool {
+    fn maybe_evict_at(&self, now: Instant) -> bool {
         let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
         let len = self.limiter.tracked_keys_count();
         let over_capacity = len > MAX_STATE_ENTRIES;
         let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
 
         if over_capacity || periodic {
-            let now_secs = self.secs_since_base();
+            let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
             let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
             if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
                 && self
@@ -104,12 +163,12 @@ impl UdpRateLimiting {
                 // the map at `MAX_STATE_ENTRIES + 1` and leave the
                 // `over_capacity && !contains_local_key` guard dropping
                 // every new client IP indefinitely.
-                let now = Instant::now();
-                if over_capacity {
-                    self.limiter.enforce_capacity(MAX_STATE_ENTRIES, now);
-                } else {
-                    self.limiter.prune_stale_at(now);
-                }
+                apply_rate_limit_cleanup(
+                    &self.limiter,
+                    MAX_STATE_ENTRIES,
+                    now,
+                    over_capacity,
+                );
             }
         }
 
