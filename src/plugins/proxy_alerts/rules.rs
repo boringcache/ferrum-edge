@@ -346,33 +346,18 @@ impl Rule {
             Rule::ErrorRate(r) => {
                 observe_error_rate(r, sample, proxy_id, ownership_generation, store, now_ms)
             }
-            Rule::StatusCodeCount(r) => observe_status_code_count(
-                r,
-                sample,
-                proxy_id,
-                ownership_generation,
-                store,
-                now_ms,
-            ),
-            Rule::LatencyPercentile(r) => observe_latency_percentile(
-                r,
-                sample,
-                proxy_id,
-                ownership_generation,
-                store,
-                now_ms,
-            ),
+            Rule::StatusCodeCount(r) => {
+                observe_status_code_count(r, sample, proxy_id, ownership_generation, store, now_ms)
+            }
+            Rule::LatencyPercentile(r) => {
+                observe_latency_percentile(r, sample, proxy_id, ownership_generation, store, now_ms)
+            }
             Rule::ErrorClass(r) => {
                 observe_error_class(r, sample, proxy_id, ownership_generation, store, now_ms)
             }
-            Rule::StreamDisconnectCause(r) => observe_stream_disconnect(
-                r,
-                sample,
-                proxy_id,
-                ownership_generation,
-                store,
-                now_ms,
-            ),
+            Rule::StreamDisconnectCause(r) => {
+                observe_stream_disconnect(r, sample, proxy_id, ownership_generation, store, now_ms)
+            }
         }
     }
 }

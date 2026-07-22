@@ -397,7 +397,8 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.country_mmdb_retained_load()
     }
     fn retain_active_proxy_state(&self, active_proxy_generations: &HashMap<&str, u64>) {
-        self.inner.retain_active_proxy_state(active_proxy_generations);
+        self.inner
+            .retain_active_proxy_state(active_proxy_generations);
     }
     fn seed_proxy_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
         self.inner
@@ -3082,9 +3083,9 @@ pub(crate) fn build_proxy_lifecycle_generations(
         if let Some(&generation) = previous.get(&proxy.id) {
             next.insert(proxy.id.clone(), generation);
         } else {
-            high = high.checked_add(1).ok_or_else(|| {
-                "proxy lifecycle generation counter exhausted".to_string()
-            })?;
+            high = high
+                .checked_add(1)
+                .ok_or_else(|| "proxy lifecycle generation counter exhausted".to_string())?;
             next.insert(proxy.id.clone(), high);
         }
     }

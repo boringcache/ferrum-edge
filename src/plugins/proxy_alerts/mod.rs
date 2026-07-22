@@ -158,8 +158,7 @@ impl ProxyAlerts {
         self.windows.retain_proxies(active_proxy_generations);
         self.cooldowns.retain_proxies(active_proxy_generations);
         self.recovery.retain_proxies(active_proxy_generations);
-        self.active_proxy_generations
-            .store(Arc::new(Some(owned)));
+        self.active_proxy_generations.store(Arc::new(Some(owned)));
     }
 
     /// Compatibility helper for tests that only have an active-ID set.
@@ -194,8 +193,7 @@ impl ProxyAlerts {
             .clone()
             .unwrap_or_default();
         map.insert(proxy_id.to_string(), generation);
-        self.active_proxy_generations
-            .store(Arc::new(Some(map)));
+        self.active_proxy_generations.store(Arc::new(Some(map)));
         let _ = self
             .cooldowns
             .try_acquire(0, proxy_id, 0, 60_000, 1, generation);
@@ -225,9 +223,7 @@ impl ProxyAlerts {
             || self
                 .recovery
                 .contains_proxy_generation(proxy_id, generation)
-            || self
-                .windows
-                .contains_proxy_generation(proxy_id, generation)
+            || self.windows.contains_proxy_generation(proxy_id, generation)
     }
 
     /// Direct store write that bypasses the admission precheck — used by
@@ -296,9 +292,9 @@ impl ProxyAlerts {
         let ownership_generation = sample
             .proxy_lifecycle_generation()
             .unwrap_or(UNARMED_PROXY_LIFECYCLE_GENERATION);
-        let previous_state =
-            self.recovery
-                .current_state(rule.id(), proxy_id, ownership_generation);
+        let previous_state = self
+            .recovery
+            .current_state(rule.id(), proxy_id, ownership_generation);
         if observation.breach
             && in_quiet
             && matches!(previous_state, None | Some(RuleState::Healthy))
@@ -852,22 +848,12 @@ mod tests {
             ]
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
-        plugin.recovery.observe(
-            0,
-            "p1",
-            true,
-            5_000,
-            1,
-            UNARMED_PROXY_LIFECYCLE_GENERATION,
-        );
-        plugin.recovery.observe(
-            0,
-            "p1",
-            false,
-            5_000,
-            2,
-            UNARMED_PROXY_LIFECYCLE_GENERATION,
-        );
+        plugin
+            .recovery
+            .observe(0, "p1", true, 5_000, 1, UNARMED_PROXY_LIFECYCLE_GENERATION);
+        plugin
+            .recovery
+            .observe(0, "p1", false, 5_000, 2, UNARMED_PROXY_LIFECYCLE_GENERATION);
         assert!(matches!(
             plugin
                 .recovery

@@ -400,11 +400,9 @@ impl RecoveryGate {
         ownership_generation: u64,
     ) -> Option<RuleState> {
         self.state.get(&rule_id).and_then(|per_rule| {
-            per_rule.get(proxy_id).and_then(|generations| {
-                generations
-                    .get(&ownership_generation)
-                    .map(|e| *e.value())
-            })
+            per_rule
+                .get(proxy_id)
+                .and_then(|generations| generations.get(&ownership_generation).map(|e| *e.value()))
         })
     }
 

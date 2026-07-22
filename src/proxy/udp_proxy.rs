@@ -3313,9 +3313,7 @@ async fn create_session(
         backend_scheme,
         consumer_index,
     );
-    stream_ctx.proxy_lifecycle_generation = epoch
-        .plugin_cache
-        .proxy_lifecycle_generation(proxy_id);
+    stream_ctx.proxy_lifecycle_generation = epoch.plugin_cache.proxy_lifecycle_generation(proxy_id);
     stream_ctx.sni_hostname = sni_hostname;
     // The constructor intentionally leaves node-waypoint per-pod policy scope
     // absent: plain UDP cannot wire it without a new capture path. Identity is
