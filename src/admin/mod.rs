@@ -1497,6 +1497,18 @@ pub async fn handle_admin_request(
         metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
+        // Append the active `__mesh_bpf_metrics` surface exactly once from the
+        // current plugin-cache generation. Absent when the plugin is not in
+        // the published configuration; zero-valued when active without an
+        // attached BPF consumer. Auth and observability-detail gates above
+        // are unchanged — this never rides unauthenticated paths.
+        if let Some(exporter) = state
+            .proxy_state
+            .as_ref()
+            .and_then(|ps| ps.plugin_cache.mesh_bpf_metrics_exporter())
+        {
+            metrics_output.push_str(&exporter.render_prometheus());
+        }
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

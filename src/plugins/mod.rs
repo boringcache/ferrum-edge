@@ -5261,6 +5261,18 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Cold-path scrape exporter for `__mesh_bpf_metrics`.
+    ///
+    /// Plugin-cache generations extract this once from the constructed global
+    /// instance so authenticated `GET /metrics` can append the BPF surface
+    /// without scanning plugins or allocating a new representation per scrape.
+    /// Ordinary plugins retain the allocation-free default.
+    fn mesh_bpf_metrics_exporter(
+        &self,
+    ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
+        None
+    }
+
     /// Returns the execution priority (lower = runs first).
     ///
     /// Plugins are sorted by priority within each lifecycle phase.
