@@ -1556,6 +1556,17 @@ impl AiUsageExport {
     }
 }
 
+/// Per-instance WAF anomaly accumulator for one request.
+///
+/// `identity` is the stable validated plugin-config id used in transaction
+/// metadata. `score` accumulates only that instance's rule contributions across
+/// request/response phases.
+#[derive(Debug, Clone)]
+pub(crate) struct WafInstanceScoreState {
+    pub(crate) identity: std::sync::Arc<str>,
+    pub(crate) score: u32,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1897,7 +1908,13 @@ pub struct RequestContext {
     /// data cannot spoof WAF transaction-log fields.
     pub(crate) waf_metadata_initialized: bool,
     pub(crate) waf_owned_metadata: HashMap<String, String>,
-    pub(crate) waf_score: u32,
+    /// Per-WAF-instance anomaly scores for the current request.
+    ///
+    /// Keyed by the process-unique runtime id of each `waf` plugin instance so
+    /// sibling policies on the same proxy accumulate and threshold-check in
+    /// isolation. Bounded by the number of attached WAF instances (operator
+    /// configuration), never by request content.
+    pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
     /// JWT audiences emitted by mesh `jwks_auth` for Istio
     /// `request.auth.audiences` conditions. Kept out of `metadata` so JWT
     /// claim material does not flow into transaction logs.
@@ -2242,7 +2259,7 @@ impl RequestContext {
             mcp_response_resource_binding: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
-            waf_score: 0,
+            waf_instance_scores: HashMap::new(),
             mesh_request_auth_audiences: Vec::new(),
             mesh_request_auth_claims: HashMap::new(),
             tls_client_cert_der: None,
@@ -2897,7 +2914,7 @@ impl RequestContext {
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
-            waf_score: self.waf_score,
+            waf_instance_scores: self.waf_instance_scores.clone(),
             mesh_request_auth_audiences: self.mesh_request_auth_audiences.clone(),
             mesh_request_auth_claims: self.mesh_request_auth_claims.clone(),
             tls_client_cert_der: self.tls_client_cert_der.clone(),
@@ -3008,12 +3025,41 @@ impl RequestContext {
         self.metadata.insert(key.to_string(), value);
     }
 
+    pub(crate) fn clear_waf_metadata(&mut self, key: &str) {
+        self.ensure_waf_metadata_initialized();
+        self.waf_owned_metadata.remove(key);
+        self.metadata.remove(key);
+    }
+
     pub(crate) fn set_waf_metadata_if_absent(&mut self, key: &str, value: impl Into<String>) {
         self.ensure_waf_metadata_initialized();
         if self.waf_owned_metadata.contains_key(key) {
             return;
         }
         self.set_waf_metadata(key, value);
+    }
+
+    /// Accumulate anomaly score for one WAF instance and return its new total.
+    /// A never-seen zero contribution remains absent so a noncontributing
+    /// sibling cannot turn single-instance metadata into a multi-instance view.
+    pub(crate) fn accumulate_waf_instance_score(
+        &mut self,
+        instance_id: u64,
+        identity: &std::sync::Arc<str>,
+        contribution: u32,
+    ) -> Option<u32> {
+        if contribution == 0 && !self.waf_instance_scores.contains_key(&instance_id) {
+            return None;
+        }
+        let entry = self
+            .waf_instance_scores
+            .entry(instance_id)
+            .or_insert_with(|| WafInstanceScoreState {
+                identity: std::sync::Arc::clone(identity),
+                score: 0,
+            });
+        entry.score = entry.score.saturating_add(contribution);
+        Some(entry.score)
     }
 
     pub(crate) fn merge_waf_metadata(&mut self, key: &str, value: &str) {
@@ -6621,9 +6667,10 @@ pub trait Plugin: Send + Sync {
 /// pooled client across all plugins for connection reuse and keepalive.
 ///
 /// Plugins that partition state by configured identity (notably
-/// `request_deduplication`) should be constructed through
-/// [`create_plugin_with_http_client_and_config_id`] with the stable plugin-config
-/// resource id. Direct construction here uses a validation-only default identity.
+/// `request_deduplication` and `waf` anomaly scoring) should be constructed
+/// through [`create_plugin_with_http_client_and_config_id`] with the stable
+/// plugin-config resource id. Direct construction here uses a validation-only
+/// default identity.
 #[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
     create_plugin_with_http_client(name, config, PluginHttpClient::default())
@@ -6659,7 +6706,8 @@ pub fn create_plugin_with_http_client(
 /// `plugin_config_id` is the configured plugin-config resource id (global /
 /// proxy / proxy_group). Production `PluginCache` passes `Some(&pc.id)` so
 /// Redis-backed `request_deduplication` instances partition logical keys by that
-/// identity. Pass `None` for config-validation and direct/test construction that
+/// identity and `waf` instances isolate anomaly-score accumulators / ownership
+/// metadata. Pass `None` for config-validation and direct/test construction that
 /// does not need sibling isolation (uses the plugin's standalone default id).
 /// Blank ids fail closed when supplied.
 pub fn create_plugin_with_http_client_and_config_id(
@@ -6824,7 +6872,10 @@ pub fn create_plugin_with_http_client_and_config_id(
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config)?,
         ))),
-        "waf" => Ok(Some(Arc::new(waf::Waf::new(config)?))),
+        "waf" => Ok(Some(Arc::new(waf::Waf::new_with_config_id(
+            config,
+            plugin_config_id,
+        )?))),
         "response_size_limiting" => Ok(Some(Arc::new(
             response_size_limiting::ResponseSizeLimiting::new(config)?,
         ))),

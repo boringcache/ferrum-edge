@@ -173,11 +173,39 @@ each rule stays `monitor`:
 ```
 
 When enabled, every matched rule contributes its severity weight (or a per-rule
-`score` override) to a request total. If the total reaches `block_threshold`
-and the global mode is `enforce`, the request is rejected with
-`waf.block_reason = "score"`. Hard per-rule `enforce` still blocks immediately
-when the global mode is `enforce`.
-The total is recorded in `waf.score` metadata regardless of mode.
+`score` override) to **that WAF instance's** request total. If the instance
+total reaches its own `block_threshold` and the global mode is `enforce`, the
+request is rejected with `waf.block_reason = "score"` and
+`waf.scoring_instance` set to the blocking plugin-config identity. Hard per-rule
+`enforce` still blocks immediately when the global mode is `enforce`.
+
+### Multi-instance ownership
+
+Ferrum allows multiple scoped `waf` instances on one proxy. Anomaly scores are
+**not** shared across instances:
+
+- Each instance accumulates only its own rule hits across request metadata,
+  final request body, response headers, and final response body.
+- Each instance compares its private total against its own `block_threshold` and
+  weights. Individually sub-threshold policies never reject merely because their
+  arithmetic sum would cross another instance's threshold.
+- Transaction metadata keeps ownership explicit:
+  - `waf.instances.<plugin-config-id>.score` — per-instance running total
+  - `waf.instance_scores` — deterministic sorted `id=score,...` aggregate when
+    more than one scoring-enabled instance contributed on the request
+  - `waf.score` — emitted only when a single instance scored (single-policy
+    compatibility); omitted when multiple instances contributed so totals are
+    never silently conflated
+  - `waf.scoring_instance` — identity of the instance that crossed its score
+    threshold
+
+Cross-instance aggregation is intentionally unsupported. If you want one
+combined scoring policy, configure a single WAF instance (or one shared
+`proxy_group`-scoped instance) rather than attaching multiple scoring-enabled
+WAFs to the same proxy.
+
+The per-instance total is recorded in the metadata fields above regardless of
+mode.
 
 ## Per-rule overrides and exemptions
 
@@ -405,13 +433,14 @@ access-controlled and shipped to a SIEM.
 When `log_to_metadata` is true (default), every WAF-evaluated request carries
 `waf.*` fields in its transaction summary `metadata`, emitted by whatever
 logging sinks are configured (stdout, http, tcp, kafka, loki, …):
-`waf.rule_hits`, `waf.target`, `waf.severity`, `waf.score`, `waf.action`
+`waf.rule_hits`, `waf.target`, `waf.severity`, `waf.score` /
+`waf.instances.<id>.score` / `waf.instance_scores`, `waf.action`
 (`blocked` / `monitored` / `clean`), `waf.first_blocking_rule`,
-`waf.block_reason`, `waf.would_block_reason`, `waf.paranoia`, plus
-`waf.scan_truncated` / `waf.scan_timed_out`. Blocked requests reject before
-backend dispatch and still produce a transaction summary carrying these
-fields, so blocks are visible in the same per-request log line as allowed
-traffic.
+`waf.block_reason`, `waf.scoring_instance`, `waf.would_block_reason`,
+`waf.paranoia`, plus `waf.scan_truncated` / `waf.scan_timed_out`. Blocked
+requests reject before backend dispatch and still produce a transaction summary
+carrying these fields, so blocks are visible in the same per-request log line as
+allowed traffic.
 
 `waf.block_reason` names why a request was blocked: `rule`, `score`, or
 `body_too_large` for HTTP-family traffic, and `tcp_require_tls`,
@@ -425,7 +454,8 @@ above, whose would-blocks carry no `waf.rule_hits` to infer from.
 `log_to_stdout` additionally emits a dedicated structured `warn!`
 (`target: "waf"`) per matched rule, independent of any logging plugin.
 
-The per-request anomaly score is carried in `waf.score`. Run in `monitor`
+The per-instance anomaly score is carried in `waf.instances.<id>.score` (and
+`waf.score` when only one scoring instance contributed). Run in `monitor`
 first, watch the logs for `waf.action="monitored"` volume and which rules
 fire, then switch to `enforce`.
 

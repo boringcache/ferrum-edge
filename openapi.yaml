@@ -16257,10 +16257,14 @@ components:
           type: object
           description: >-
             Anomaly scoring. When enabled, every matched rule contributes its
-            severity weight (or per-rule score) to a cumulative transaction
-            score; the request is rejected when the score reaches
-            block_threshold and mode is enforce, even when no individual rule
-            is set to enforce. The running total is exposed as waf.score.
+            severity weight (or per-rule score) to this WAF instance's cumulative
+            score; the request is rejected when that instance's score reaches its
+            block_threshold and mode is enforce, even when no individual rule is
+            set to enforce. Sibling WAF instances on the same proxy accumulate
+            and threshold independently. Per-instance totals are exposed as
+            waf.instances.<plugin-config-id>.score; waf.score is emitted only
+            when a single scoring instance contributed, otherwise
+            waf.instance_scores carries a deterministic sorted id=score list.
           properties:
             enabled:
               type: boolean

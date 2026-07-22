@@ -2610,6 +2610,378 @@ async fn per_rule_score_override_drives_blocking() {
     );
 }
 
+fn scoring_instance(config_id: &str, pattern: &str, score: u32, threshold: u32) -> Waf {
+    Waf::new_with_config_id(
+        &json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "scoring": {
+                "enabled": true,
+                "block_threshold": threshold,
+                "weights": { "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4 }
+            },
+            "custom_rules": [{
+                "id": format!("CUSTOM-{pattern}"),
+                "name": format!("match {pattern}"),
+                "category": "custom",
+                "severity": "low",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": pattern,
+                "action": "monitor",
+                "score": score
+            }]
+        }),
+        Some(config_id),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn scoring_isolates_two_instances_when_combined_sum_crosses_threshold() {
+    // Issue #2326 reproduction: A scores 5 / threshold 7, B scores 3 / threshold 7.
+    // Combined 8 must not cause a reject once scores are instance-owned.
+    let alpha = scoring_instance("waf-alpha", "alpha", 5, 7);
+    let beta = scoring_instance("waf-beta", "beta", 3, 7);
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=alpha-beta".into());
+
+    assert!(matches!(
+        alpha.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        beta.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf-alpha.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf-beta.score")
+            .map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.instance_scores").map(String::as_str),
+        Some("waf-alpha=5,waf-beta=3")
+    );
+    assert!(
+        !ctx.metadata.contains_key("waf.score"),
+        "multi-instance transactions must not emit a conflated waf.score"
+    );
+    assert!(!ctx.metadata.contains_key("waf.block_reason"));
+}
+
+#[tokio::test]
+async fn scoring_noncontributing_sibling_preserves_single_instance_metadata() {
+    let contributor = scoring_instance("waf-hit", "needle", 5, 10);
+    let noncontributor = scoring_instance("waf-miss", "absent", 7, 10);
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+
+    assert!(matches!(
+        contributor.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        noncontributor.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf-hit.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert!(!ctx.metadata.contains_key("waf.instances.waf-miss.score"));
+    assert!(!ctx.metadata.contains_key("waf.instance_scores"));
+}
+
+#[tokio::test]
+async fn scoring_preserves_distinct_valid_config_ids_in_metadata() {
+    let dotted = scoring_instance("waf.alpha", "needle", 2, 10);
+    let underscored = scoring_instance("waf_alpha", "needle", 3, 10);
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+
+    assert!(matches!(
+        dotted.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        underscored.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf.alpha.score")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf_alpha.score")
+            .map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.instance_scores").map(String::as_str),
+        Some("waf.alpha=2,waf_alpha=3")
+    );
+}
+
+#[test]
+fn scoring_rejects_invalid_or_blank_config_ids() {
+    let config = json!({"scoring": {"enabled": true, "block_threshold": 10}});
+    for id in ["", "   ", "bad/id"] {
+        let error = match Waf::new_with_config_id(&config, Some(id)) {
+            Ok(_) => panic!("invalid id must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("invalid plugin config id"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn scoring_instances_use_own_weights_and_thresholds() {
+    // Different weights/thresholds: first stays sub-threshold; second crosses
+    // only its own threshold from its own contribution.
+    let soft = Waf::new_with_config_id(
+        &json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "scoring": {
+                "enabled": true,
+                "block_threshold": 10,
+                "weights": { "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4 }
+            },
+            "custom_rules": [{
+                "id": "SOFT-HIT",
+                "category": "custom",
+                "severity": "high",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "action": "monitor"
+            }]
+        }),
+        Some("waf-soft"),
+    )
+    .unwrap();
+    let hard = Waf::new_with_config_id(
+        &json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "scoring": {
+                "enabled": true,
+                "block_threshold": 4,
+                "weights": { "info": 0, "low": 1, "medium": 2, "high": 5, "critical": 10 }
+            },
+            "custom_rules": [{
+                "id": "HARD-HIT",
+                "category": "custom",
+                "severity": "high",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "action": "monitor"
+            }]
+        }),
+        Some("waf-hard"),
+    )
+    .unwrap();
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=needle".into());
+
+    assert!(matches!(
+        soft.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf-soft.score")
+            .map(String::as_str),
+        Some("3")
+    );
+
+    let result = hard.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf-hard.score")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("score")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.scoring_instance").map(String::as_str),
+        Some("waf-hard")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.instance_scores").map(String::as_str),
+        Some("waf-hard=5,waf-soft=3")
+    );
+}
+
+#[tokio::test]
+async fn scoring_preserves_same_instance_accumulation_across_lifecycle_phases() {
+    // Same instance must still accumulate across request metadata, final
+    // request body, response headers, and final response body — the shared
+    // H1/H2/H3 plugin lifecycle surfaces.
+    let plugin = Waf::new_with_config_id(
+        &json!({
+            "mode": "enforce",
+            "include_default_rules": false,
+            "response_inspection": true,
+            "response_body_inspection": true,
+            "scoring": { "enabled": true, "block_threshold": 20 },
+            "custom_rules": [
+                {
+                    "id": "PHASE-QUERY",
+                    "category": "custom",
+                    "severity": "low",
+                    "target": "query_values",
+                    "match_kind": "contains",
+                    "pattern": "qhit",
+                    "action": "monitor",
+                    "score": 2
+                },
+                {
+                    "id": "PHASE-REQ-BODY",
+                    "category": "custom",
+                    "severity": "low",
+                    "target": "body_text",
+                    "match_kind": "contains",
+                    "pattern": "bhit",
+                    "action": "monitor",
+                    "score": 3
+                },
+                {
+                    "id": "PHASE-RESP-HEADER",
+                    "category": "custom",
+                    "severity": "low",
+                    "target": "response_headers",
+                    "match_kind": "contains",
+                    "pattern": "rhhit",
+                    "action": "monitor",
+                    "score": 5
+                },
+                {
+                    "id": "PHASE-RESP-BODY",
+                    "category": "custom",
+                    "severity": "low",
+                    "target": "response_body",
+                    "match_kind": "contains",
+                    "pattern": "rbhit",
+                    "action": "monitor",
+                    "score": 7
+                }
+            ]
+        }),
+        Some("waf-lifecycle"),
+    )
+    .unwrap();
+
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    ctx.set_raw_query_string("q=qhit".into());
+
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("2"));
+
+    let req_headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &req_headers, br#"{"n":"bhit"}"#)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.metadata.get("waf.score").map(String::as_str), Some("5"));
+
+    let mut response_headers = HashMap::from([
+        ("content-type".into(), "application/json".into()),
+        ("x-trace".into(), "rhhit".into()),
+    ]);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("waf.score").map(String::as_str),
+        Some("10")
+    );
+
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, br#"{"out":"rbhit"}"#)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("waf.score").map(String::as_str),
+        Some("17")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.instances.waf-lifecycle.score")
+            .map(String::as_str),
+        Some("17")
+    );
+}
+
+#[tokio::test]
+async fn scoring_two_instances_lifecycle_shared_across_h1_h2_h3_authorize_path() {
+    // H1/H2 and H3 all invoke authorize plugins sequentially until one rejects.
+    // Drive the shared plugin lifecycle with two scoring instances and confirm
+    // isolation; source pinning below locks the protocol call sites.
+    let alpha = scoring_instance("waf-h-alpha", "alpha", 5, 7);
+    let beta = scoring_instance("waf-h-beta", "beta", 3, 7);
+    let mut ctx = ctx("GET", "/search");
+    ctx.set_raw_query_string("q=alpha-beta".into());
+
+    for plugin in [&alpha, &beta] {
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+    }
+    assert_eq!(
+        ctx.metadata.get("waf.instance_scores").map(String::as_str),
+        Some("waf-h-alpha=5,waf-h-beta=3")
+    );
+}
+
+#[test]
+fn scoring_h1_h2_h3_authorize_paths_invoke_plugins_sequentially() {
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+    assert!(
+        h1_h2.contains("for plugin in authorize_plugins.iter()")
+            && h1_h2.contains("plugin.authorize(&mut ctx)"),
+        "H1/H2 must run authorize plugins sequentially, including every WAF instance"
+    );
+    assert!(
+        h3.contains("for plugin in authorize_plugins.iter()")
+            && h3.contains("plugin.authorize(&mut ctx)"),
+        "H3 must run authorize plugins sequentially, including every WAF instance"
+    );
+}
+
 // ── Stream (TCP/UDP) WAF ─────────────────────────────────────────────────
 
 use ferrum_edge::ConsumerIndex;
