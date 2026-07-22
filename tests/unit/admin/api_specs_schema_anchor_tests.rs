@@ -791,10 +791,7 @@ fn annotation_payload_identifiers_and_refs_remain_opaque_instance_data() {
     );
     let schema = first_request_schema(&spec);
     assert_eq!(schema["default"]["id"], "http://[invalid-authority");
-    assert_eq!(
-        schema["default"]["$ref"],
-        "#not-a-schema-reference"
-    );
+    assert_eq!(schema["default"]["$ref"], "#not-a-schema-reference");
 }
 
 #[test]

@@ -1740,12 +1740,9 @@ impl LocalSchemaResolver {
                 resource
             }
             Some(uri) => {
-                let joined =
-                    current_base
-                        .join(uri)
-                        .map_err(|_| {
-                            schema_reference_error(format!("invalid internal $ref '{reference}'"))
-                        })?;
+                let joined = current_base.join(uri).map_err(|_| {
+                    schema_reference_error(format!("invalid internal $ref '{reference}'"))
+                })?;
                 let mut resource = joined;
                 resource.set_fragment(None);
                 resource
@@ -1790,10 +1787,7 @@ impl LocalSchemaResolver {
             } else {
                 format!("{resource_root_pointer}{decoded_fragment}")
             };
-            return Ok((
-                target,
-                self.resource_for_pointer(&absolute_pointer).clone(),
-            ));
+            return Ok((target, self.resource_for_pointer(&absolute_pointer).clone()));
         }
 
         if !self.valid_anchor_name(&decoded_fragment) {
@@ -1812,10 +1806,9 @@ impl LocalSchemaResolver {
         let target = if pointer.is_empty() {
             root
         } else {
-            root.pointer(pointer)
-                .ok_or_else(|| {
-                    schema_reference_error(format!("unresolved internal $ref '{reference}'"))
-                })?
+            root.pointer(pointer).ok_or_else(|| {
+                schema_reference_error(format!("unresolved internal $ref '{reference}'"))
+            })?
         };
         Ok((target, target_resource))
     }
@@ -1929,9 +1922,7 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
         }
     }
     String::from_utf8(out).map_err(|_| {
-        schema_reference_error(format!(
-            "malformed percent-encoding in $ref '{reference}'"
-        ))
+        schema_reference_error(format!("malformed percent-encoding in $ref '{reference}'"))
     })
 }
 
@@ -1963,9 +1954,7 @@ fn is_valid_draft7_anchor_name(name: &str) -> bool {
         Some(c) if c.is_ascii_alphabetic() => {}
         _ => return false,
     }
-    chars.all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':')
-    })
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':'))
 }
 
 fn schema_reference_error(message: String) -> ExtractError {
@@ -1983,17 +1972,22 @@ enum ResolveContext {
 
 fn schema_child_context(key: &str, value: &Value) -> ResolveContext {
     match key {
-        "$defs"
-        | "definitions"
-        | "properties"
-        | "patternProperties"
-        | "dependentSchemas"
+        "$defs" | "definitions" | "properties" | "patternProperties" | "dependentSchemas"
         | "dependencies" => ResolveContext::SchemaMap,
         "allOf" | "anyOf" | "oneOf" | "prefixItems" => ResolveContext::SchemaArray,
         "items" if value.is_array() => ResolveContext::SchemaArray,
-        "items" | "additionalProperties" | "unevaluatedProperties" | "additionalItems"
-        | "unevaluatedItems" | "contains" | "not" | "if" | "then" | "else"
-        | "propertyNames" | "contentSchema" => ResolveContext::Schema,
+        "items"
+        | "additionalProperties"
+        | "unevaluatedProperties"
+        | "additionalItems"
+        | "unevaluatedItems"
+        | "contains"
+        | "not"
+        | "if"
+        | "then"
+        | "else"
+        | "propertyNames"
+        | "contentSchema" => ResolveContext::Schema,
         _ => ResolveContext::Opaque,
     }
 }
