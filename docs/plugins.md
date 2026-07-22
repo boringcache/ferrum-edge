@@ -3336,6 +3336,8 @@ Validates JSON, XML, and gRPC protobuf request and response bodies against schem
 
 Request-side validation only buffers matching request bodies: methods that can carry a body and whose `content-type` matches `content_types`. Response-only configs do not force request buffering.
 
+**Media-type matching:** `content_types` / `response_content_types` compare the `Content-Type` media-type essence (`type`/`subtype` before the first `;`, OWS-trimmed) to each configured entry with ASCII case-insensitive equality. Parameters such as `; charset=utf-8` are ignored for applicability, so `application/json; charset=utf-8` matches configured `application/json`. Distinct neighbors such as `application/json-seq`, and parameter values that merely contain a configured string (for example `application/octet-stream; profile="application/json"`), do not match unless that distinct type itself is configured. Configured entries are normalized the same way (parameters stripped); empty or parameter-only entries are rejected. Malformed or empty actual media-type tokens do not match and are skipped without panic. Once a type matches, JSON vs XML dispatch uses the same essence: exact `application/json` or an RFC 6838 `+json` suffix for JSON, and exact `application/xml` / `text/xml` or a `+xml` suffix for XML.
+
 **Priority:** 2950
 
 **Request validation:**
@@ -3348,7 +3350,7 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `required_xml_elements` | String[] | `[]` | Required XML element names |
 | `xml_max_entities` | usize | `100` | Maximum `<!ENTITY` declarations allowed in XML DOCTYPEs before rejecting as possible entity-expansion abuse. Applies to request and response XML validation. |
 | `xml_reject_nested_entities` | bool | `true` | Reject XML entity definitions, including parameter-entity expansions, that reference or generate other entity definitions. |
-| `content_types` | String[] | `["application/json","application/xml","text/xml"]` | MIME types to validate |
+| `content_types` | String[] | `["application/json","application/xml","text/xml"]` | Request media types to validate (exact type/subtype; see matching rules above) |
 
 **Response validation:**
 
@@ -3360,7 +3362,7 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `response_required_xml_elements` | String[] | `[]` | Required XML elements in responses |
 | `xml_max_entities` | usize | `100` | Shared request/response cap for XML entity declarations. |
 | `xml_reject_nested_entities` | bool | `true` | Shared request/response protection against nested or declaration-generating XML entities. |
-| `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response MIME types to validate |
+| `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response media types to validate (exact type/subtype; see matching rules above) |
 
 **Protobuf validation (gRPC):**
 
