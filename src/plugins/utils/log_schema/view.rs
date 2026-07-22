@@ -435,8 +435,6 @@ impl SchemaSerializable for TransactionSummary {
 // ---------------------------------------------------------------------------
 
 impl SchemaSerializable for StreamTransactionSummary {
-            proxy_lifecycle_generation: None,
-
     fn owns_native(&self, source: &str) -> bool {
         STREAM_FIELDS.iter().any(|f| f.name == source)
     }
