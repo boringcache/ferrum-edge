@@ -14,12 +14,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Origin integrity fields that become stale after gateway compression.
-const INTEGRITY_DIGEST_HEADERS: &[&str] = &[
-    "content-digest",
-    "repr-digest",
-    "digest",
-    "content-md5",
-];
+const INTEGRITY_DIGEST_HEADERS: &[&str] =
+    &["content-digest", "repr-digest", "digest", "content-md5"];
 
 fn insert_stale_integrity_digests(headers: &mut HashMap<String, String>) {
     // Mixed-case names prove case-insensitive cleanup rather than exact-key deletes.
@@ -38,9 +34,7 @@ fn insert_stale_integrity_digests(headers: &mut HashMap<String, String>) {
 fn assert_integrity_digests_absent(headers: &HashMap<String, String>) {
     for name in INTEGRITY_DIGEST_HEADERS {
         assert!(
-            headers
-                .keys()
-                .all(|key| !key.eq_ignore_ascii_case(name)),
+            headers.keys().all(|key| !key.eq_ignore_ascii_case(name)),
             "stale integrity field {name} must be removed after compression"
         );
     }
@@ -49,9 +43,7 @@ fn assert_integrity_digests_absent(headers: &HashMap<String, String>) {
 fn assert_integrity_digests_present(headers: &HashMap<String, String>) {
     for name in INTEGRITY_DIGEST_HEADERS {
         assert!(
-            headers
-                .keys()
-                .any(|key| key.eq_ignore_ascii_case(name)),
+            headers.keys().any(|key| key.eq_ignore_ascii_case(name)),
             "integrity field {name} must be preserved when compression does not rewrite bytes"
         );
     }
@@ -3970,8 +3962,7 @@ fn test_h1_h2_h3_paths_finalize_transformed_response_metadata() {
         "native H3 buffered path must use the shared transform helper that finalizes"
     );
     assert!(
-        h3.contains("response_trailers = None")
-            && h3.contains("body_transformed"),
+        h3.contains("response_trailers = None") && h3.contains("body_transformed"),
         "native H3 must drop backend trailers after a body rewrite so trailer digests cannot describe compressed bytes"
     );
     assert!(
@@ -4002,10 +3993,7 @@ async fn test_compression_transform_strips_stale_integrity_digests() {
     let mut status = 200u16;
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    headers.insert(
-        "content-length".to_string(),
-        original.len().to_string(),
-    );
+    headers.insert("content-length".to_string(), original.len().to_string());
     insert_stale_integrity_digests(&mut headers);
     headers.insert("etag".to_string(), "W/\"weak-origin\"".to_string());
 
@@ -4034,7 +4022,10 @@ async fn test_compression_transform_strips_stale_integrity_digests() {
 
     assert!(!replaced);
     assert!(rewritten, "compression must rewrite the buffered body");
-    assert_ne!(body, original, "wire bytes must be the compressed representation");
+    assert_ne!(
+        body, original,
+        "wire bytes must be the compressed representation"
+    );
     assert!(body.len() < original.len());
     assert_eq!(
         headers.get("content-encoding").map(String::as_str),
@@ -4080,10 +4071,7 @@ async fn test_brotli_compression_transform_strips_stale_integrity_digests() {
     let mut status = 200u16;
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    headers.insert(
-        "content-length".to_string(),
-        original.len().to_string(),
-    );
+    headers.insert("content-length".to_string(), original.len().to_string());
     insert_stale_integrity_digests(&mut headers);
 
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
@@ -4133,10 +4121,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         let mut status = 200u16;
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        headers.insert(
-            "content-length".to_string(),
-            original.len().to_string(),
-        );
+        headers.insert("content-length".to_string(), original.len().to_string());
         headers.insert("etag".to_string(), "\"strong-origin\"".to_string());
         insert_stale_integrity_digests(&mut headers);
 
@@ -4161,7 +4146,10 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         assert!(!rewritten);
         assert_eq!(body, original);
         assert_integrity_digests_present(&headers);
-        assert_eq!(headers.get("etag").map(String::as_str), Some("\"strong-origin\""));
+        assert_eq!(
+            headers.get("etag").map(String::as_str),
+            Some("\"strong-origin\"")
+        );
     }
 
     // Identity preferred: skip compression, keep digests.
@@ -4174,10 +4162,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         let mut status = 200u16;
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        headers.insert(
-            "content-length".to_string(),
-            original.len().to_string(),
-        );
+        headers.insert("content-length".to_string(), original.len().to_string());
         insert_stale_integrity_digests(&mut headers);
 
         stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
@@ -4205,7 +4190,8 @@ async fn test_skipped_compression_preserves_integrity_digests() {
 
     // Below min_content_length: skip compression, keep digests.
     {
-        let plugin = Arc::new(make_plugin(json!({"min_content_length": 10_000}))) as Arc<dyn Plugin>;
+        let plugin =
+            Arc::new(make_plugin(json!({"min_content_length": 10_000}))) as Arc<dyn Plugin>;
         let mut ctx = make_ctx(Some("gzip"));
         let mut req_headers = HashMap::new();
         plugin.before_proxy(&mut ctx, &mut req_headers).await;
@@ -4214,10 +4200,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         let mut status = 200u16;
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        headers.insert(
-            "content-length".to_string(),
-            original.len().to_string(),
-        );
+        headers.insert("content-length".to_string(), original.len().to_string());
         insert_stale_integrity_digests(&mut headers);
 
         stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
@@ -4254,10 +4237,7 @@ async fn test_compression_noop_transform_preserves_integrity_digests() {
     let mut status = 200u16;
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    headers.insert(
-        "content-length".to_string(),
-        original.len().to_string(),
-    );
+    headers.insert("content-length".to_string(), original.len().to_string());
     // Origin encoding without gateway commit metadata must not compress.
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     insert_stale_integrity_digests(&mut headers);
@@ -4293,10 +4273,7 @@ async fn test_synthetic_compression_transform_strips_stale_integrity_digests() {
     let mut status = 200u16;
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    headers.insert(
-        "content-length".to_string(),
-        original.len().to_string(),
-    );
+    headers.insert("content-length".to_string(), original.len().to_string());
     insert_stale_integrity_digests(&mut headers);
 
     assert!(matches!(
@@ -4340,10 +4317,7 @@ async fn test_trailer_integrity_digests_retired_after_compression_rewrite() {
     // Merged header+trailer compatibility view: digests present only via trailer names.
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    headers.insert(
-        "content-length".to_string(),
-        original.len().to_string(),
-    );
+    headers.insert("content-length".to_string(), original.len().to_string());
     insert_stale_integrity_digests(&mut headers);
 
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
@@ -4371,11 +4345,7 @@ async fn test_trailer_integrity_digests_retired_after_compression_rewrite() {
     let mut trailers = HashMap::new();
     insert_stale_integrity_digests(&mut trailers);
     trailers.insert("grpc-status".to_string(), "0".to_string());
-    discard_grpc_application_trailers_after_body_rewrite_for_test(
-        &mut headers,
-        &mut trailers,
-        &[],
-    );
+    discard_grpc_application_trailers_after_body_rewrite_for_test(&mut headers, &mut trailers, &[]);
     assert_eq!(
         trailers,
         HashMap::from([("grpc-status".to_string(), "0".to_string())]),
