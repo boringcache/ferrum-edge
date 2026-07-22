@@ -6,7 +6,10 @@
 //! FinSent/Received, SRTT samples, BPF drop-reason hits) to a userspace
 //! ringbuf. The [`crate::ebpf::event_consumer::SockOpsConsumer`] drains
 //! that ringbuf and updates a shared [`BpfMetricsState`]. This plugin
-//! exposes that state in Prometheus exposition format.
+//! exposes that state in Prometheus exposition format via the
+//! authenticated production `GET /metrics` scrape (appended once from the
+//! current plugin-cache generation's precomputed
+//! [`MeshBpfMetricsExporter`]).
 //!
 //! ## Auto-injection
 //!
@@ -31,8 +34,6 @@
 //!   as `_sum`/`_count` so operators can derive averages. Histogram
 //!   buckets are deferred.
 
-#![allow(dead_code)]
-
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -46,10 +47,14 @@ use crate::plugins::{ALL_PROTOCOLS, Plugin, ProxyProtocol, priority};
 /// prefix marks it as a reserved auto-injected mesh plugin.
 pub const PLUGIN_NAME: &str = "__mesh_bpf_metrics";
 
+/// Default Prometheus metric-name prefix when the operator does not override
+/// `prefix` in the plugin config.
+pub const DEFAULT_METRIC_PREFIX: &str = "ferrum_mesh_bpf";
+
 /// Operator-facing config knobs.
 #[derive(Debug, Clone)]
 struct BpfMetricsConfig {
-    /// Optional metric prefix override. Defaults to `ferrum_mesh_bpf`.
+    /// Optional metric prefix override. Defaults to [`DEFAULT_METRIC_PREFIX`].
     /// Operators with multiple gateway instances on a node can use this
     /// to disambiguate the time series, mirroring the existing
     /// `prometheus_metrics` plugin's namespace_label pattern.
@@ -59,8 +64,44 @@ struct BpfMetricsConfig {
 impl Default for BpfMetricsConfig {
     fn default() -> Self {
         Self {
-            prefix: "ferrum_mesh_bpf".to_string(),
+            prefix: DEFAULT_METRIC_PREFIX.to_string(),
         }
+    }
+}
+
+/// Precomputed scrape handle for the active `__mesh_bpf_metrics` instance.
+///
+/// Plugin-cache generations extract this once from the constructed plugin so
+/// authenticated `GET /metrics` can append the surface with a single
+/// `ArcSwap` load — no plugin-list scan and no new plugin allocation on the
+/// scrape path. When the plugin is absent from the published configuration
+/// the cache stores `None` and `/metrics` emits nothing from this renderer.
+#[derive(Debug, Clone)]
+pub struct MeshBpfMetricsExporter {
+    prefix: Arc<str>,
+    state: Arc<BpfMetricsState>,
+}
+
+impl MeshBpfMetricsExporter {
+    /// Metric-name prefix preserved from the active plugin config.
+    pub fn prefix(&self) -> &str {
+        self.prefix.as_ref()
+    }
+
+    /// Shared counter store read on each scrape.
+    pub fn metrics_state(&self) -> Arc<BpfMetricsState> {
+        self.state.clone()
+    }
+
+    /// Render the BPF metrics in Prometheus text exposition format.
+    ///
+    /// Cold path — called once per authenticated `/metrics` scrape. Emits
+    /// TYPE and HELP comments for each metric so the output is
+    /// self-describing. When the attached state has never received events
+    /// (plugin active without a live BPF consumer), this still emits the
+    /// documented stable zero-valued surface.
+    pub fn render_prometheus(&self) -> String {
+        render_prometheus_snapshot(self.prefix.as_ref(), &self.state.snapshot())
     }
 }
 
@@ -70,8 +111,9 @@ impl Default for BpfMetricsConfig {
 /// [`crate::ebpf::event_consumer::SockOpsConsumer`]. The Plugin trait
 /// hooks are intentionally no-ops — this plugin's role is to register
 /// itself in the plugin chain (so its presence is operator-visible via
-/// `available_plugins()` / `/admin/plugins`) and to expose
-/// [`Self::render_prometheus`] for the metrics endpoint to call.
+/// `available_plugins()` / `/admin/plugins`) and to expose a
+/// [`MeshBpfMetricsExporter`] that the plugin cache publishes into the
+/// authenticated `/metrics` scrape.
 pub struct MeshBpfMetrics {
     config: BpfMetricsConfig,
     state: Arc<BpfMetricsState>,
@@ -119,154 +161,166 @@ impl MeshBpfMetrics {
         self.state.snapshot()
     }
 
+    /// Cheap scrape handle sharing this instance's prefix and state Arc.
+    pub fn exporter(&self) -> MeshBpfMetricsExporter {
+        MeshBpfMetricsExporter {
+            prefix: Arc::from(self.config.prefix.as_str()),
+            state: self.state.clone(),
+        }
+    }
+
     /// Render the BPF metrics in Prometheus text exposition format.
     ///
-    /// Cold path — called once per `/metrics` scrape. Emits TYPE and
-    /// HELP comments for each metric so the output is self-describing.
+    /// Cold path — used by unit tests and by
+    /// [`MeshBpfMetricsExporter::render_prometheus`] on each authenticated
+    /// `/metrics` scrape.
     pub fn render_prometheus(&self) -> String {
-        let snap = self.state.snapshot();
-        let mut out = String::with_capacity(2048);
-        let p = self.config.prefix.as_str();
-
-        // TCP-layer event counters.
-        let _ = writeln!(
-            out,
-            "# HELP {p}_tcp_events_total TCP-layer events captured by the BPF SOCK_OPS program."
-        );
-        let _ = writeln!(out, "# TYPE {p}_tcp_events_total counter");
-        let _ = writeln!(
-            out,
-            "{p}_tcp_events_total{{event=\"connect\"}} {}",
-            snap.connect
-        );
-        let _ = writeln!(
-            out,
-            "{p}_tcp_events_total{{event=\"accept_established\"}} {}",
-            snap.accept_established
-        );
-        let _ = writeln!(
-            out,
-            "{p}_tcp_events_total{{event=\"rst_sent\"}} {}",
-            snap.rst_sent
-        );
-        let _ = writeln!(
-            out,
-            "{p}_tcp_events_total{{event=\"rst_received\"}} {}",
-            snap.rst_received
-        );
-        let _ = writeln!(
-            out,
-            "{p}_tcp_events_total{{event=\"fin_sent\"}} {}",
-            snap.fin_sent
-        );
-        let _ = writeln!(
-            out,
-            "{p}_tcp_events_total{{event=\"fin_received\"}} {}",
-            snap.fin_received
-        );
-
-        // Drop-reason counters.
-        let _ = writeln!(
-            out,
-            "# HELP {p}_drops_total Connection-bypass decisions by reason. \
-            These were previously invisible to operators."
-        );
-        let _ = writeln!(out, "# TYPE {p}_drops_total counter");
-        for (reason, count) in snap.drop_reasons() {
-            let _ = writeln!(
-                out,
-                "{p}_drops_total{{reason=\"{}\"}} {count}",
-                reason.label()
-            );
-        }
-        // Mention the well-known reasons we know about, even at 0, so
-        // dashboards stay informative on fresh installs.
-        let _ = writeln!(
-            out,
-            "# HELP {p}_drop_reasons Well-known BPF drop reason labels (gauge=1 to make the label set self-documenting)."
-        );
-        let _ = writeln!(out, "# TYPE {p}_drop_reasons gauge");
-        for reason in [
-            BpfDropReason::BypassUidHit,
-            BpfDropReason::ExcludeCidrHit,
-            BpfDropReason::NotInIncludeCidr,
-            BpfDropReason::ExcludePortHit,
-        ] {
-            let _ = writeln!(out, "{p}_drop_reasons{{reason=\"{}\"}} 1", reason.label());
-        }
-
-        // Latency sum/count aggregates (TCP-layer only; app-layer stays
-        // in workload_metrics).
-        let _ = writeln!(
-            out,
-            "# HELP {p}_srtt_microseconds TCP smoothed RTT samples (sum + count for mean derivation)."
-        );
-        let _ = writeln!(out, "# TYPE {p}_srtt_microseconds summary");
-        let _ = writeln!(out, "{p}_srtt_microseconds_sum {}", snap.srtt_sample_us_sum);
-        let _ = writeln!(out, "{p}_srtt_microseconds_count {}", snap.srtt_count);
-
-        let _ = writeln!(
-            out,
-            "# HELP {p}_syn_to_ack_microseconds Time between SYN send and ACK observation."
-        );
-        let _ = writeln!(out, "# TYPE {p}_syn_to_ack_microseconds summary");
-        let _ = writeln!(
-            out,
-            "{p}_syn_to_ack_microseconds_sum {}",
-            snap.syn_to_ack_us_sum
-        );
-        let _ = writeln!(
-            out,
-            "{p}_syn_to_ack_microseconds_count {}",
-            snap.syn_to_ack_count
-        );
-
-        let _ = writeln!(
-            out,
-            "# HELP {p}_accept_to_first_byte_microseconds Time between accept and first inbound data byte."
-        );
-        let _ = writeln!(out, "# TYPE {p}_accept_to_first_byte_microseconds summary");
-        let _ = writeln!(
-            out,
-            "{p}_accept_to_first_byte_microseconds_sum {}",
-            snap.accept_to_first_byte_us_sum
-        );
-        let _ = writeln!(
-            out,
-            "{p}_accept_to_first_byte_microseconds_count {}",
-            snap.accept_to_first_byte_count
-        );
-
-        // Ringbuf health.
-        let _ = writeln!(
-            out,
-            "# HELP {p}_ringbuf_events_total Total events drained from the SOCK_OPS ringbuf."
-        );
-        let _ = writeln!(out, "# TYPE {p}_ringbuf_events_total counter");
-        let _ = writeln!(
-            out,
-            "{p}_ringbuf_events_total {}",
-            snap.ringbuf_events_consumed
-        );
-        let _ = writeln!(
-            out,
-            "# HELP {p}_ringbuf_overruns_total Ringbuf overrun count. Non-zero = userspace consumer fell behind and the kernel dropped events. Set FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES higher."
-        );
-        let _ = writeln!(out, "# TYPE {p}_ringbuf_overruns_total counter");
-        let _ = writeln!(out, "{p}_ringbuf_overruns_total {}", snap.ringbuf_overruns);
-        let _ = writeln!(
-            out,
-            "# HELP {p}_ringbuf_in_overrun_regime 1 while the consumer is in an overrun regime, 0 after recovery. Pair with `_overruns_total` for alerting."
-        );
-        let _ = writeln!(out, "# TYPE {p}_ringbuf_in_overrun_regime gauge");
-        let _ = writeln!(
-            out,
-            "{p}_ringbuf_in_overrun_regime {}",
-            if snap.in_overrun_regime { 1 } else { 0 }
-        );
-
-        out
+        self.exporter().render_prometheus()
     }
+}
+
+fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String {
+    let mut out = String::with_capacity(2048);
+    let p = prefix;
+
+    // TCP-layer event counters.
+    let _ = writeln!(
+        out,
+        "# HELP {p}_tcp_events_total TCP-layer events captured by the BPF SOCK_OPS program."
+    );
+    let _ = writeln!(out, "# TYPE {p}_tcp_events_total counter");
+    let _ = writeln!(
+        out,
+        "{p}_tcp_events_total{{event=\"connect\"}} {}",
+        snap.connect
+    );
+    let _ = writeln!(
+        out,
+        "{p}_tcp_events_total{{event=\"accept_established\"}} {}",
+        snap.accept_established
+    );
+    let _ = writeln!(
+        out,
+        "{p}_tcp_events_total{{event=\"rst_sent\"}} {}",
+        snap.rst_sent
+    );
+    let _ = writeln!(
+        out,
+        "{p}_tcp_events_total{{event=\"rst_received\"}} {}",
+        snap.rst_received
+    );
+    let _ = writeln!(
+        out,
+        "{p}_tcp_events_total{{event=\"fin_sent\"}} {}",
+        snap.fin_sent
+    );
+    let _ = writeln!(
+        out,
+        "{p}_tcp_events_total{{event=\"fin_received\"}} {}",
+        snap.fin_received
+    );
+
+    // Drop-reason counters.
+    let _ = writeln!(
+        out,
+        "# HELP {p}_drops_total Connection-bypass decisions by reason. \
+            These were previously invisible to operators."
+    );
+    let _ = writeln!(out, "# TYPE {p}_drops_total counter");
+    for (reason, count) in snap.drop_reasons() {
+        let _ = writeln!(
+            out,
+            "{p}_drops_total{{reason=\"{}\"}} {count}",
+            reason.label()
+        );
+    }
+    // Mention the well-known reasons we know about, even at 0, so
+    // dashboards stay informative on fresh installs.
+    let _ = writeln!(
+        out,
+        "# HELP {p}_drop_reasons Well-known BPF drop reason labels (gauge=1 to make the label set self-documenting)."
+    );
+    let _ = writeln!(out, "# TYPE {p}_drop_reasons gauge");
+    for reason in [
+        BpfDropReason::BypassUidHit,
+        BpfDropReason::ExcludeCidrHit,
+        BpfDropReason::NotInIncludeCidr,
+        BpfDropReason::ExcludePortHit,
+    ] {
+        let _ = writeln!(out, "{p}_drop_reasons{{reason=\"{}\"}} 1", reason.label());
+    }
+
+    // Latency sum/count aggregates (TCP-layer only; app-layer stays
+    // in workload_metrics).
+    let _ = writeln!(
+        out,
+        "# HELP {p}_srtt_microseconds TCP smoothed RTT samples (sum + count for mean derivation)."
+    );
+    let _ = writeln!(out, "# TYPE {p}_srtt_microseconds summary");
+    let _ = writeln!(out, "{p}_srtt_microseconds_sum {}", snap.srtt_sample_us_sum);
+    let _ = writeln!(out, "{p}_srtt_microseconds_count {}", snap.srtt_count);
+
+    let _ = writeln!(
+        out,
+        "# HELP {p}_syn_to_ack_microseconds Time between SYN send and ACK observation."
+    );
+    let _ = writeln!(out, "# TYPE {p}_syn_to_ack_microseconds summary");
+    let _ = writeln!(
+        out,
+        "{p}_syn_to_ack_microseconds_sum {}",
+        snap.syn_to_ack_us_sum
+    );
+    let _ = writeln!(
+        out,
+        "{p}_syn_to_ack_microseconds_count {}",
+        snap.syn_to_ack_count
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP {p}_accept_to_first_byte_microseconds Time between accept and first inbound data byte."
+    );
+    let _ = writeln!(out, "# TYPE {p}_accept_to_first_byte_microseconds summary");
+    let _ = writeln!(
+        out,
+        "{p}_accept_to_first_byte_microseconds_sum {}",
+        snap.accept_to_first_byte_us_sum
+    );
+    let _ = writeln!(
+        out,
+        "{p}_accept_to_first_byte_microseconds_count {}",
+        snap.accept_to_first_byte_count
+    );
+
+    // Ringbuf health.
+    let _ = writeln!(
+        out,
+        "# HELP {p}_ringbuf_events_total Total events drained from the SOCK_OPS ringbuf."
+    );
+    let _ = writeln!(out, "# TYPE {p}_ringbuf_events_total counter");
+    let _ = writeln!(
+        out,
+        "{p}_ringbuf_events_total {}",
+        snap.ringbuf_events_consumed
+    );
+    let _ = writeln!(
+        out,
+        "# HELP {p}_ringbuf_overruns_total Ringbuf overrun count. Non-zero = userspace consumer fell behind and the kernel dropped events. Set FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES higher."
+    );
+    let _ = writeln!(out, "# TYPE {p}_ringbuf_overruns_total counter");
+    let _ = writeln!(out, "{p}_ringbuf_overruns_total {}", snap.ringbuf_overruns);
+    let _ = writeln!(
+        out,
+        "# HELP {p}_ringbuf_in_overrun_regime 1 while the consumer is in an overrun regime, 0 after recovery. Pair with `_overruns_total` for alerting."
+    );
+    let _ = writeln!(out, "# TYPE {p}_ringbuf_in_overrun_regime gauge");
+    let _ = writeln!(
+        out,
+        "{p}_ringbuf_in_overrun_regime {}",
+        if snap.in_overrun_regime { 1 } else { 0 }
+    );
+
+    out
 }
 
 fn parse_config(config: &Value) -> Result<BpfMetricsConfig, String> {
@@ -311,6 +365,10 @@ impl Plugin for MeshBpfMetrics {
         ALL_PROTOCOLS
     }
 
+    fn mesh_bpf_metrics_exporter(&self) -> Option<MeshBpfMetricsExporter> {
+        Some(self.exporter())
+    }
+
     // No hot-path hooks. The plugin is a passive metrics surface; all
     // counter updates happen on the event-consumer task that shares the
     // same `Arc<BpfMetricsState>`. The Plugin trait's default no-op
@@ -338,7 +396,7 @@ mod tests {
     #[test]
     fn default_config_accepted() {
         let plugin = MeshBpfMetrics::with_state(&Value::Null, metrics()).unwrap();
-        assert_eq!(plugin.config.prefix, "ferrum_mesh_bpf");
+        assert_eq!(plugin.config.prefix, DEFAULT_METRIC_PREFIX);
     }
 
     #[test]
