@@ -47,12 +47,13 @@ paths:
                     type: boolean
 ```
 
-The importer generates a proxy-scoped `openapi_validator` plugin, resolves local `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
+The importer generates a proxy-scoped `openapi_validator` plugin, resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
 Local reference forms resolved at import time:
 
-- JSON Pointer fragments (`#/…`), including percent-encoded pointer tokens. Empty fragments resolve to a Schema Object `$id` resource root; bare `#` against the OpenAPI document root is rejected (the OpenAPI root is not a Schema Object).
-- OpenAPI 3.1+ Draft 2020-12 `$anchor` plain-name fragments (`#Order`), indexed only on Schema Objects and nested subschemas, including `components.pathItems` (not annotation payloads or non-schema OpenAPI fields).
+- **Path Item Object `$ref`** (Swagger 2.0 and OpenAPI 3.x): references such as `#/components/pathItems/Pets` or `#/paths/~1shared` are resolved before HTTP methods are enumerated, so reusable Path Item definitions contribute operations to the generated table. Sibling Path Item fields overlay the referenced object (OpenAPI leaves conflicts undefined; Ferrum uses sibling-wins). External Path Item refs, unresolved local Path Item refs, and cyclic/deep Path Item chains fail closed with the same `UnsupportedExternalRef` / `SchemaReference` / `SchemaTooDeep` admission errors as schema refs.
+- JSON Pointer fragments (`#/…`) for schemas, including percent-encoded pointer tokens. Empty fragments resolve to a Schema Object `$id` resource root; bare `#` against the OpenAPI document root is rejected (the OpenAPI root is not a Schema Object).
+- OpenAPI 3.1+ Draft 2020-12 `$anchor` plain-name fragments (`#Order`), indexed only on Schema Objects and nested subschemas, including schemas nested under `components.pathItems` (not annotation payloads or non-schema OpenAPI fields).
 - Swagger 2.0 / OpenAPI 3.0.x Draft 7 fragment `$id` / `id` plain-name anchors, including the Draft 7 `:` character.
 - Same-document `$id` targets (URI matches an in-document Schema Object `$id`; no network fetch). Duplicate resource `$id` URIs fail closed.
 
