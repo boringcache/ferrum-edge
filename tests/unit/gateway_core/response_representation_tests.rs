@@ -1179,7 +1179,7 @@ impl Plugin for InitialBodyRejector {
         &self,
         _ctx: &mut RequestContext,
         _response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        _response_headers: &mut HashMap<String, String>,
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Reject {

@@ -2699,7 +2699,7 @@ impl Plugin for AiToolGovernor {
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
-        response_headers: &HashMap<String, String>,
+        response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         // `any_buffered_response()` also covers a streaming-only config whose

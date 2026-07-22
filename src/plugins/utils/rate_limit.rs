@@ -1323,10 +1323,18 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                         // reservation).
                         state.current_usage(now);
                     }
-                    return RateLimitOutcome::allow();
+                } else {
+                    state.adjust_usage(now, reservation_id, delta);
                 }
-                state.adjust_usage(now, reservation_id, delta);
+                // Surface post-reconcile bucket state so `expose_headers` can
+                // refresh `x-ai-ratelimit-usage` / `remaining` after admission.
+                let usage = state.current_usage(now);
+                let remaining = state.remaining(now);
                 RateLimitOutcome::allow()
+                    .with_limit(self.token_limit)
+                    .with_window(self.window_seconds)
+                    .with_usage(usage)
+                    .with_remaining(remaining)
             }
         }
     }
@@ -1446,9 +1454,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // `actual_tokens == 0` (full release of a local reservation)
                     // is a no-op against Redis — there is nothing on this backend
                     // to release, and the local reservation expires on its own.
-                    return Ok(RateLimitOutcome::allow());
-                }
-                if delta != 0 {
+                } else if delta != 0 {
                     // Debit the window the reservation actually credited (carried
                     // back from the `Reserve` outcome) so a request that
                     // straddles a window rollover corrects the right counter. If
@@ -1470,7 +1476,22 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                         .incrby_with_expire_floor_zero(&redis_key, delta, ttl)
                         .await?;
                 }
-                Ok(RateLimitOutcome::allow())
+                // Read the post-reconcile weighted usage so exposed headers can
+                // describe the bucket after the reservation correction lands.
+                let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
+                let prev_idx = curr_idx.saturating_sub(1);
+                let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(self.window_seconds);
+                let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
+                let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+                let (prev_count, curr_count) = redis.get_two_counters(&prev_key, &curr_key).await?;
+                let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+                let usage = weighted.max(0.0) as u64;
+                let remaining = self.token_limit.saturating_sub(usage);
+                Ok(RateLimitOutcome::allow()
+                    .with_limit(self.token_limit)
+                    .with_window(self.window_seconds)
+                    .with_usage(usage)
+                    .with_remaining(remaining))
             }
         }
     }
@@ -2195,7 +2216,37 @@ mod tests {
     }
 
     #[test]
-    fn ai_token_window_adjust_usage_positive_delta_charges_more() {
+    fn ai_token_window_adjust_usage_returns_post_reconcile_usage_remaining() {
+        // #2261: AdjustUsage must surface the post-reconcile bucket so expose_headers
+        // can refresh x-ai-ratelimit-usage / remaining after admission.
+        let algorithm = AiTokenRateAlgorithm::new(1000, 60);
+        let mut state = algorithm.new_state();
+        let now = Instant::now();
+
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, now);
+        let id = reserved.reservation_id.expect("reserve returns an id");
+        assert_eq!(reserved.usage, Some(100));
+        assert_eq!(reserved.remaining, Some(900));
+
+        let adjusted = algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(id),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: 10,
+                delta: -90,
+            },
+            now,
+        );
+        assert!(adjusted.allowed);
+        assert_eq!(adjusted.usage, Some(10));
+        assert_eq!(adjusted.remaining, Some(990));
+        assert_eq!(adjusted.limit, Some(1000));
+        assert_eq!(adjusted.window_seconds, Some(60));
+    }
+
         // Reconciliation with a positive delta (actual > reserved) must add the
         // shortfall to the window — exercising the `delta > 0` branch of
         // `adjust_usage`.

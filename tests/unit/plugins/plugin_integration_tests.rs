@@ -73,7 +73,7 @@ async fn run_buffered_response_lifecycle(
 
     for plugin in plugins {
         match plugin
-            .on_response_body(ctx, response_status, &response_headers, &response_body)
+            .on_response_body(ctx, response_status, &mut response_headers, &response_body)
             .await
         {
             PluginResult::Continue => {}

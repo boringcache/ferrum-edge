@@ -4287,7 +4287,7 @@ async fn configured_token_metrics_rates_price_trusted_federation_usage_determini
     );
     for metrics in [&zeta, &mismatched, &alpha] {
         metrics
-            .on_response_body(&mut ctx, 200, &json_headers(), &response_body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &response_body)
             .await;
     }
 

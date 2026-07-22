@@ -139,7 +139,7 @@ async fn test_pii_detection_reject() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     match result {
         PluginResult::Reject {
@@ -204,7 +204,7 @@ async fn guard_still_rejects_bad_synthetic_short_circuit_body() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     match result {
         PluginResult::Reject {
@@ -245,7 +245,7 @@ async fn test_pii_detection_warn() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(ctx.metadata.contains_key("ai_response_guard_detected"));
@@ -278,7 +278,7 @@ async fn test_pii_detection_redact() {
 
     // on_response_body marks for redaction
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
@@ -307,7 +307,7 @@ async fn test_all_mode_decodes_json_escaped_pii_for_redaction() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
 
@@ -339,7 +339,7 @@ async fn test_all_mode_detects_blocked_phrase_in_object_key() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
         "a blocked phrase in a JSON object key must be detected in scan-all mode"
@@ -363,7 +363,7 @@ async fn test_all_mode_detects_pii_in_numeric_scalar() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
         "a numeric SSN scalar must be detected in scan-all mode"
@@ -391,7 +391,7 @@ async fn test_all_mode_detects_cross_token_custom_pattern() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
         "a cross-token custom pattern must still match the serialized JSON in scan-all mode"
@@ -416,7 +416,7 @@ async fn test_all_mode_detects_pii_in_duplicate_key() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
         "PII in an overwritten duplicate key must be detected via the raw-body union pass"
@@ -441,7 +441,7 @@ async fn test_all_mode_redact_fails_closed_on_unredactable_residual() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
         "redact mode must reject when a detected numeric PII scalar cannot be redacted"
@@ -465,7 +465,7 @@ async fn test_all_mode_redact_passes_when_residual_is_redactable() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "redact mode must not reject when the PII is fully redactable"
@@ -509,7 +509,7 @@ async fn test_blocked_phrase_detection() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(matches!(result, PluginResult::Reject { .. }));
 }
@@ -540,7 +540,7 @@ async fn test_clean_response_passes() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -562,7 +562,7 @@ async fn test_content_mode_non_json_fails_closed() {
     headers.insert("content-type".to_string(), "text/html".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, b"Your SSN is 123-45-6789")
+        .on_response_body(&mut ctx, 200, &mut headers, b"Your SSN is 123-45-6789")
         .await;
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert_eq!(
@@ -594,7 +594,7 @@ async fn test_error_status_skipped() {
 
     // 4xx/5xx responses are not scanned
     let result = plugin
-        .on_response_body(&mut ctx, 400, &headers, &body)
+        .on_response_body(&mut ctx, 400, &mut headers, &body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -621,7 +621,7 @@ async fn test_required_fields_missing() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     match result {
         PluginResult::Reject {
@@ -660,7 +660,7 @@ async fn test_max_completion_length() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(matches!(result, PluginResult::Reject { .. }));
 }
@@ -690,7 +690,7 @@ async fn test_anthropic_response_format() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(matches!(result, PluginResult::Reject { .. }));
 }
@@ -850,7 +850,7 @@ async fn test_json_event_stream_profile_stays_on_json_guard_path() {
     let mut reject_ctx = ctx_with_content_type("GET", "application/json");
     assert!(matches!(
         reject
-            .on_response_body(&mut reject_ctx, 200, &headers, &body)
+            .on_response_body(&mut reject_ctx, 200, &mut headers, &body)
             .await,
         PluginResult::Reject {
             status_code: 502,
@@ -865,7 +865,7 @@ async fn test_json_event_stream_profile_stays_on_json_guard_path() {
     let mut redact_ctx = ctx_with_content_type("GET", "application/json");
     assert!(matches!(
         redact
-            .on_response_body(&mut redact_ctx, 200, &headers, &body)
+            .on_response_body(&mut redact_ctx, 200, &mut headers, &body)
             .await,
         PluginResult::Continue
     ));
@@ -1019,7 +1019,7 @@ async fn test_all_mode_does_not_redact_structural_keys() {
 
     // First trigger detection; then call transform_response_body to apply.
     let _ = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     let transformed = plugin
         .transform_response_body(&body, Some("application/json"), &headers)
@@ -1063,7 +1063,7 @@ async fn test_all_mode_uses_structured_redaction_when_choices_present() {
     let mut ctx = super::plugin_utils::create_test_context();
     ctx.method = "POST".to_string();
     let _ = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     let transformed = plugin
         .transform_response_body(&body, Some("application/json"), &headers)
@@ -1109,7 +1109,7 @@ async fn test_all_mode_redacts_sibling_fields_when_choices_present() {
     let mut ctx = super::plugin_utils::create_test_context();
     ctx.method = "POST".to_string();
     let _ = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     let transformed = plugin
         .transform_response_body(&body, Some("application/json"), &headers)
@@ -1189,7 +1189,7 @@ async fn test_sse_pii_detection_reject() {
     let body = openai_sse_body(&["Your SSN is ", "123-45-6789", " ok?"]);
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
         .await;
     match result {
         PluginResult::Reject {
@@ -1219,7 +1219,7 @@ async fn test_sse_pii_detection_warn() {
     let body = openai_sse_body(&["Contact ", "admin@secret.com", " now"]);
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(
@@ -1239,7 +1239,7 @@ async fn test_sse_pii_redaction() {
 
     // on_response_body marks for redaction
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
@@ -1279,7 +1279,7 @@ async fn test_sse_scan_all_decodes_escaped_pii_for_redaction() {
     let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"Contact user\\u0040example.com\"}}]}\n\ndata: [DONE]\n\n";
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
@@ -1304,7 +1304,7 @@ async fn test_sse_clean_response_passes() {
     let body = openai_sse_body(&["The weather ", "is nice today"]);
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -1320,7 +1320,7 @@ async fn test_sse_max_completion_length_across_deltas() {
     let body = openai_sse_body(&["Hello ", "wonderful ", "world!"]);
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
         .await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
@@ -1352,7 +1352,7 @@ async fn test_sse_anthropic_streaming_format() {
     body.push_str("data: {\"type\":\"message_stop\"}\n\n");
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
         .await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
@@ -1380,7 +1380,7 @@ async fn test_sse_anthropic_redaction() {
     let body = body_str.as_bytes();
 
     let _ = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
         .await;
     let transformed = plugin
         .transform_response_body(body, Some("text/event-stream"), &sse_headers())
@@ -1411,7 +1411,7 @@ async fn test_sse_gemini_streaming_format() {
     }
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
         .await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
@@ -1436,7 +1436,7 @@ async fn test_sse_scan_all_mode() {
     );
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
         .await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
@@ -1463,7 +1463,7 @@ async fn test_sse_scan_all_detects_pii_in_unparseable_frame() {
 data: contact user@example.com\n\ndata: [DONE]\n\n";
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
         .await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
@@ -1485,7 +1485,7 @@ async fn test_sse_scan_all_detects_pii_when_no_frame_parses() {
     let body = "data: contact user@example.com\n\ndata: [DONE]\n\n";
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
         .await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
@@ -1510,7 +1510,7 @@ async fn test_sse_scan_all_redaction() {
     );
 
     let _ = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
         .await;
     let transformed = plugin
         .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
@@ -1532,7 +1532,7 @@ async fn test_sse_blocked_phrase_detection() {
     let body = openai_sse_body(&["This has ", "harmful content", " in it"]);
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
         .await;
     assert!(matches!(result, PluginResult::Reject { .. }));
 }
@@ -1547,7 +1547,7 @@ async fn test_sse_error_status_skipped() {
     let body = openai_sse_body(&["SSN: 123-45-6789"]);
 
     let result = plugin
-        .on_response_body(&mut ctx, 500, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 500, &mut sse_headers(), &body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -1562,7 +1562,7 @@ async fn test_sse_empty_frames_pass() {
     let body = b"data: [DONE]\n\n";
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
         .await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -1739,7 +1739,7 @@ async fn test_sse_oversize_body_fails_closed_in_detection() {
     assert!(body.len() > 64);
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
         .await;
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert_eq!(
@@ -1762,7 +1762,7 @@ async fn test_sse_cross_frame_pii_redact_fails_closed() {
     let body = openai_sse_body(&["my ssn is 123-", "45-6789 ok"]);
 
     let detect = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
         .await;
     assert!(matches!(detect, PluginResult::Reject { .. }));
     assert!(
@@ -1807,7 +1807,7 @@ async fn test_sse_accumulated_text_order_is_deterministic() {
     }
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
         .await;
     assert!(
         matches!(result, PluginResult::Reject { .. }),
@@ -1911,7 +1911,7 @@ async fn test_redaction_placeholder_dollar_literal_in_scan_all_walker() {
     ctx.method = "POST".to_string();
 
     let _ = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     let transformed = plugin
         .transform_response_body(&body, Some("application/json"), &headers)
@@ -1954,7 +1954,7 @@ async fn test_all_mode_redacts_pii_nested_under_structural_key() {
     ctx.method = "POST".to_string();
 
     let _ = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     let transformed = plugin
         .transform_response_body(&body, Some("application/json"), &headers)
@@ -2017,7 +2017,7 @@ async fn test_all_mode_redacts_deeply_nested_pii_under_structural_key() {
     ctx.method = "POST".to_string();
 
     let _ = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     let transformed = plugin
         .transform_response_body(&body, Some("application/json"), &headers)
@@ -2059,7 +2059,7 @@ async fn test_sse_scan_all_redacts_pii_nested_under_structural_key() {
     let mut ctx = ctx_with_content_type("POST", "text/event-stream");
     assert!(matches!(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
             .await,
         PluginResult::Continue
     ));
@@ -2104,7 +2104,7 @@ async fn test_sse_scan_all_preserves_structural_only_match_without_rewrite() {
     let mut ctx = ctx_with_content_type("POST", "text/event-stream");
     assert!(matches!(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), body)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
             .await,
         PluginResult::Continue
     ));
@@ -2142,7 +2142,7 @@ async fn test_sse_scan_all_unredactable_raw_bytes_fail_closed() {
         assert!(
             matches!(
                 plugin
-                    .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+                    .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
                     .await,
                 PluginResult::Reject { .. }
             ),
@@ -2185,7 +2185,7 @@ async fn test_sse_scan_all_duplicate_structural_members_fail_closed() {
         assert!(
             matches!(
                 plugin
-                    .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+                    .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
                     .await,
                 PluginResult::Reject { .. }
             ),
@@ -2216,7 +2216,7 @@ async fn test_sse_scan_all_masks_only_last_duplicate_structural_scalar() {
     let mut ctx = ctx_with_content_type("POST", "text/event-stream");
     assert!(matches!(
         plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), body)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
             .await,
         PluginResult::Continue
     ));
@@ -2256,7 +2256,7 @@ async fn test_max_completion_length_counts_characters_not_bytes() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(
         matches!(result, PluginResult::Continue),
@@ -2284,7 +2284,7 @@ async fn test_max_completion_length_rejects_when_chars_exceed() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     match result {
         PluginResult::Reject {
@@ -2317,7 +2317,7 @@ async fn test_max_completion_length_applies_in_scan_all_json() {
 
     assert!(matches!(
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
         PluginResult::Reject { .. }
     ));
@@ -2378,7 +2378,7 @@ async fn test_blocked_phrase_value_is_not_exposed_by_any_action() {
         }));
         let mut ctx = ctx_with_content_type("POST", "application/json");
         let result = plugin
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await;
 
         match (action, result) {
@@ -2435,7 +2435,7 @@ async fn test_max_scan_boundary_and_oversize_dispositions() {
     }));
     let mut ctx = ctx_with_content_type("POST", "application/json");
     let result = at_limit
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(matches!(result, PluginResult::Reject { .. }));
     assert_eq!(
@@ -2452,7 +2452,7 @@ async fn test_max_scan_boundary_and_oversize_dispositions() {
         }));
         let mut ctx = ctx_with_content_type("POST", "application/json");
         let result = plugin
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await;
         assert!(
             matches!(result, PluginResult::Reject { .. }),
@@ -2470,7 +2470,7 @@ async fn test_max_scan_boundary_and_oversize_dispositions() {
         "max_scan_bytes": body.len() - 1
     }));
     let mut ctx = ctx_with_content_type("POST", "application/json");
-    let result = warn.on_response_body(&mut ctx, 200, &headers, &body).await;
+    let result = warn.on_response_body(&mut ctx, 200, &mut headers, &body).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
         ctx.metadata.get("ai_response_guard_warning"),
@@ -2490,7 +2490,7 @@ async fn test_max_scan_boundary_and_oversize_dispositions() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
         structural
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
         PluginResult::Reject { .. }
     ));
@@ -2510,7 +2510,7 @@ async fn test_oversized_non_json_error_body_is_bounded_for_every_action() {
         }));
         let mut ctx = ctx_with_content_type("GET", "text/plain");
         let result = plugin
-            .on_response_body(&mut ctx, 503, &headers, &body)
+            .on_response_body(&mut ctx, 503, &mut headers, &body)
             .await;
 
         if action == "warn" {
@@ -2547,13 +2547,13 @@ async fn test_require_json_checks_actual_representation() {
 
     let mut valid_ctx = ctx_with_content_type("GET", "text/plain");
     let valid = plugin
-        .on_response_body(&mut valid_ctx, 200, &headers, br#"{"id":"ok"}"#)
+        .on_response_body(&mut valid_ctx, 200, &mut headers, br#"{"id":"ok"}"#)
         .await;
     assert!(matches!(valid, PluginResult::Continue));
 
     let mut invalid_ctx = ctx_with_content_type("GET", "text/plain");
     let invalid = plugin
-        .on_response_body(&mut invalid_ctx, 200, &headers, b"not json")
+        .on_response_body(&mut invalid_ctx, 200, &mut headers, b"not json")
         .await;
     assert!(matches!(invalid, PluginResult::Reject { .. }));
     assert_eq!(
@@ -2574,7 +2574,7 @@ async fn test_non_json_scan_all_is_governed_and_redactable() {
     }));
     let mut ctx = ctx_with_content_type("GET", "text/plain");
     assert!(matches!(
-        reject.on_response_body(&mut ctx, 200, &headers, body).await,
+        reject.on_response_body(&mut ctx, 200, &mut headers, body).await,
         PluginResult::Reject { .. }
     ));
 
@@ -2585,7 +2585,7 @@ async fn test_non_json_scan_all_is_governed_and_redactable() {
     }));
     let mut ctx = ctx_with_content_type("GET", "text/plain");
     assert!(matches!(
-        redact.on_response_body(&mut ctx, 200, &headers, body).await,
+        redact.on_response_body(&mut ctx, 200, &mut headers, body).await,
         PluginResult::Continue
     ));
     let transformed = redact
@@ -2616,7 +2616,7 @@ async fn redaction_findings_on_range_and_delta_responses_fail_closed() {
     for status in [206, 226] {
         let mut governed_ctx = ctx_with_content_type("GET", "application/json");
         let result = plugin
-            .on_response_body(&mut governed_ctx, status, &headers, &governed)
+            .on_response_body(&mut governed_ctx, status, &mut headers, &governed)
             .await;
         assert!(
             matches!(
@@ -2642,7 +2642,7 @@ async fn redaction_findings_on_range_and_delta_responses_fail_closed() {
         let mut clean_ctx = ctx_with_content_type("GET", "application/json");
         assert!(matches!(
             plugin
-                .on_response_body(&mut clean_ctx, status, &headers, &clean)
+                .on_response_body(&mut clean_ctx, status, &mut headers, &clean)
                 .await,
             PluginResult::Continue
         ));
@@ -2663,7 +2663,7 @@ async fn test_uninspectable_sse_fails_closed_except_warn_mode() {
             }));
             let mut ctx = ctx_with_content_type("POST", "text/event-stream");
             assert!(matches!(
-                plugin.on_response_body(&mut ctx, 200, &headers, body).await,
+                plugin.on_response_body(&mut ctx, 200, &mut headers, body).await,
                 PluginResult::Reject { .. }
             ));
             assert_eq!(
@@ -2678,7 +2678,7 @@ async fn test_uninspectable_sse_fails_closed_except_warn_mode() {
         }));
         let mut ctx = ctx_with_content_type("POST", "text/event-stream");
         assert!(matches!(
-            warn.on_response_body(&mut ctx, 200, &headers, body).await,
+            warn.on_response_body(&mut ctx, 200, &mut headers, body).await,
             PluginResult::Continue
         ));
         assert_eq!(
@@ -2701,7 +2701,7 @@ async fn test_multiline_sse_event_redaction_uses_complete_event() {
         );
         let mut ctx = ctx_with_content_type("POST", "text/event-stream");
         let result = plugin
-            .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
             .await;
         assert!(matches!(result, PluginResult::Continue));
         assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
@@ -2753,7 +2753,7 @@ async fn test_common_buffered_output_shapes_are_detected_and_redacted() {
         assert!(
             matches!(
                 reject
-                    .on_response_body(&mut ctx, 200, &headers, &body)
+                    .on_response_body(&mut ctx, 200, &mut headers, &body)
                     .await,
                 PluginResult::Reject { .. }
             ),
@@ -2767,7 +2767,7 @@ async fn test_common_buffered_output_shapes_are_detected_and_redacted() {
         let mut ctx = ctx_with_content_type("POST", "application/json");
         assert!(matches!(
             redact
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
             PluginResult::Continue
         ));
@@ -2802,7 +2802,7 @@ async fn test_tool_arguments_participate_in_completion_length_enforcement() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
         PluginResult::Reject { .. }
     ));
@@ -2824,7 +2824,7 @@ async fn test_streaming_tool_and_responses_deltas_are_governed() {
         let mut ctx = ctx_with_content_type("POST", "text/event-stream");
         assert!(matches!(
             reject
-                .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+                .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
                 .await,
             PluginResult::Reject { .. }
         ));
@@ -2836,7 +2836,7 @@ async fn test_streaming_tool_and_responses_deltas_are_governed() {
         let mut ctx = ctx_with_content_type("POST", "text/event-stream");
         assert!(matches!(
             redact
-                .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+                .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
                 .await,
             PluginResult::Continue
         ));
@@ -2872,7 +2872,7 @@ async fn test_sse_scan_all_decodes_responses_arguments_and_preserves_json_scalar
     let mut ctx = ctx_with_content_type("POST", "text/event-stream");
     assert!(matches!(
         reject
-            .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
             .await,
         PluginResult::Reject { .. }
     ));
@@ -2885,7 +2885,7 @@ async fn test_sse_scan_all_decodes_responses_arguments_and_preserves_json_scalar
     let mut ctx = ctx_with_content_type("POST", "text/event-stream");
     assert!(matches!(
         redact
-            .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), &body)
             .await,
         PluginResult::Continue
     ));
@@ -3003,7 +3003,7 @@ async fn test_cross_part_content_matches_are_joined_and_fail_closed() {
         assert!(
             matches!(
                 reject
-                    .on_response_body(&mut ctx, 200, &headers, &body)
+                    .on_response_body(&mut ctx, 200, &mut headers, &body)
                     .await,
                 PluginResult::Reject { .. }
             ),
@@ -3013,7 +3013,7 @@ async fn test_cross_part_content_matches_are_joined_and_fail_closed() {
         let warn = make_plugin(json!({"pii_patterns": ["email"], "action": "warn"}));
         let mut ctx = ctx_with_content_type("POST", "application/json");
         assert!(matches!(
-            warn.on_response_body(&mut ctx, 200, &headers, &body).await,
+            warn.on_response_body(&mut ctx, 200, &mut headers, &body).await,
             PluginResult::Continue
         ));
         assert_eq!(
@@ -3029,7 +3029,7 @@ async fn test_cross_part_content_matches_are_joined_and_fail_closed() {
         assert!(
             matches!(
                 redact
-                    .on_response_body(&mut ctx, 200, &headers, &body)
+                    .on_response_body(&mut ctx, 200, &mut headers, &body)
                     .await,
                 PluginResult::Reject { .. }
             ),
@@ -3052,7 +3052,7 @@ async fn test_non_adjacent_text_parts_are_not_joined() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
         PluginResult::Continue
     ));
@@ -3071,7 +3071,7 @@ async fn test_completion_length_enforced_across_adjacent_parts() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
         reject
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
         PluginResult::Reject { .. }
     ));
@@ -3079,7 +3079,7 @@ async fn test_completion_length_enforced_across_adjacent_parts() {
     let warn = make_plugin(json!({"max_completion_length": 8, "action": "warn"}));
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
-        warn.on_response_body(&mut ctx, 200, &headers, &body).await,
+        warn.on_response_body(&mut ctx, 200, &mut headers, &body).await,
         PluginResult::Continue
     ));
     assert!(ctx.metadata.contains_key("ai_response_guard_warning"));
@@ -3089,7 +3089,7 @@ async fn test_completion_length_enforced_across_adjacent_parts() {
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
         under_limit
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
         PluginResult::Continue
     ));
@@ -3115,7 +3115,7 @@ async fn test_refusal_content_is_scanned_and_redacted() {
         assert!(
             matches!(
                 reject
-                    .on_response_body(&mut ctx, 200, &headers, &body)
+                    .on_response_body(&mut ctx, 200, &mut headers, &body)
                     .await,
                 PluginResult::Reject { .. }
             ),
@@ -3126,7 +3126,7 @@ async fn test_refusal_content_is_scanned_and_redacted() {
         let mut ctx = ctx_with_content_type("POST", "application/json");
         assert!(matches!(
             redact
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
             PluginResult::Continue
         ));
@@ -3170,7 +3170,7 @@ async fn test_escaped_tool_arguments_are_decoded_before_scanning() {
             assert!(
                 matches!(
                     reject
-                        .on_response_body(&mut ctx, 200, &headers, &body)
+                        .on_response_body(&mut ctx, 200, &mut headers, &body)
                         .await,
                     PluginResult::Reject { .. }
                 ),
@@ -3181,7 +3181,7 @@ async fn test_escaped_tool_arguments_are_decoded_before_scanning() {
         let warn = make_plugin(json!({"pii_patterns": ["email"], "action": "warn"}));
         let mut ctx = ctx_with_content_type("POST", "application/json");
         assert!(matches!(
-            warn.on_response_body(&mut ctx, 200, &headers, &body).await,
+            warn.on_response_body(&mut ctx, 200, &mut headers, &body).await,
             PluginResult::Continue
         ));
         assert_eq!(
@@ -3195,7 +3195,7 @@ async fn test_escaped_tool_arguments_are_decoded_before_scanning() {
         let mut ctx = ctx_with_content_type("POST", "application/json");
         assert!(matches!(
             redact
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
             PluginResult::Continue
         ));
@@ -3234,7 +3234,7 @@ async fn test_unrewritable_escaped_argument_key_fails_closed_in_redact_mode() {
         assert!(
             matches!(
                 redact
-                    .on_response_body(&mut ctx, 200, &headers, &body)
+                    .on_response_body(&mut ctx, 200, &mut headers, &body)
                     .await,
                 PluginResult::Reject { .. }
             ),
@@ -3268,7 +3268,7 @@ async fn test_unrewritable_argument_keys_and_numeric_scalars_fail_closed() {
             assert!(
                 matches!(
                     redact
-                        .on_response_body(&mut ctx, 200, &headers, &body)
+                        .on_response_body(&mut ctx, 200, &mut headers, &body)
                         .await,
                     PluginResult::Reject { .. }
                 ),
@@ -3307,7 +3307,7 @@ async fn test_nested_argument_string_values_redact_with_valid_json_semantics() {
         let mut ctx = ctx_with_content_type("POST", "application/json");
         assert!(matches!(
             redact
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
             PluginResult::Continue
         ));
@@ -3350,7 +3350,7 @@ async fn test_sse_refusal_deltas_are_scanned_and_fail_closed_when_split() {
         let mut ctx = ctx_with_content_type("POST", "text/event-stream");
         assert!(matches!(
             reject
-                .on_response_body(&mut ctx, 200, &sse_headers(), body)
+                .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
                 .await,
             PluginResult::Reject { .. }
         ));
@@ -3360,7 +3360,7 @@ async fn test_sse_refusal_deltas_are_scanned_and_fail_closed_when_split() {
         let mut ctx = ctx_with_content_type("POST", "text/event-stream");
         assert!(matches!(
             redact
-                .on_response_body(&mut ctx, 200, &sse_headers(), body)
+                .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
                 .await,
             PluginResult::Reject { .. }
         ));
@@ -3412,7 +3412,7 @@ async fn test_sse_escaped_tool_arguments_are_decoded_after_reassembly() {
             assert!(
                 matches!(
                     reject
-                        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+                        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
                         .await,
                     PluginResult::Reject { .. }
                 ),
@@ -3430,7 +3430,7 @@ async fn test_sse_escaped_tool_arguments_are_decoded_after_reassembly() {
             assert!(
                 matches!(
                     redact
-                        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+                        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
                         .await,
                     PluginResult::Reject { .. }
                 ),

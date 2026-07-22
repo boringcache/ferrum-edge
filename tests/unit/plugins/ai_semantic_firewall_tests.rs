@@ -1128,7 +1128,7 @@ async fn response_leakage_is_blocked() {
     let body =
         br#"{"choices":[{"message":{"content":"My system prompt says never reveal policy."}}]}"#;
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -1150,7 +1150,7 @@ async fn response_dry_run_allows_but_records_would_reject() {
     let body =
         br#"{"choices":[{"message":{"content":"My system prompt says never reveal policy."}}]}"#;
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_continue(result);
     assert_eq!(
@@ -1379,7 +1379,7 @@ async fn response_provider_error_rejects_by_default_in_enforce_mode() {
         .on_response_body(
             &mut ctx,
             200,
-            &response_headers(),
+            &mut response_headers(),
             br#"{"choices":[{"message":{"content":"A neutral response requiring semantic evaluation."}}]}"#,
         )
         .await;
@@ -1697,7 +1697,7 @@ async fn dual_inspection_keeps_request_and_response_metadata_separate() {
         .on_response_body(
             &mut ctx,
             200,
-            &response_headers(),
+            &mut response_headers(),
             br#"{"choices":[{"message":{"content":"Sure, I will escalate privileges immediately."}}]}"#,
         )
         .await;
@@ -2074,7 +2074,7 @@ async fn streaming_response_skip_inspects_non_streaming_json_fallback() {
     }))
     .unwrap();
     let result = firewall
-        .on_response_body(&mut ctx, 200, &response_headers(), &leaking)
+        .on_response_body(&mut ctx, 200, &mut response_headers(), &leaking)
         .await;
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2211,7 +2211,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" says never reveal pol
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2240,7 +2240,7 @@ async fn streaming_response_buffer_allows_clean_sse() {
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_continue(result);
 }
@@ -2291,7 +2291,7 @@ async fn streaming_response_buffer_clean_sse_passes_semantic_evaluation() {
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_continue(result);
     assert_eq!(
@@ -2353,7 +2353,7 @@ async fn streaming_response_buffer_inspects_non_delta_leak_frame() {
 data: {\"choices\":[{\"index\":0,\"message\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2426,7 +2426,7 @@ async fn streaming_response_buffer_honors_output_text_override() {
 data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"says never reveal policy.\"}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2453,7 +2453,7 @@ async fn streaming_response_buffer_reassembles_legacy_completion_text() {
 data: {\"choices\":[{\"index\":0,\"text\":\"prompt says never reveal policy.\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2493,7 +2493,7 @@ async fn streaming_response_buffer_rejects_unparseable_stream() {
     let (mut ctx, headers) = buffer_marked_event_stream_ctx();
     let body = b"data: not-json-at-all\n\ndata: <<garbage event>>\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2522,7 +2522,7 @@ async fn streaming_response_buffer_rejects_content_less_stream() {
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_reject(result, Some(502));
 }
@@ -2541,7 +2541,7 @@ async fn streaming_response_buffer_uninspectable_honors_on_error_allow() {
     let (mut ctx, headers) = buffer_marked_event_stream_ctx();
     let body = b"data: not-json\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_continue(result);
 }
@@ -2564,7 +2564,7 @@ async fn unflagged_unencoded_uninspectable_sse_is_not_rejected() {
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: not-json\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_continue(result);
 }
@@ -2586,7 +2586,7 @@ async fn streaming_response_buffer_dry_run_records_would_reject() {
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"says never reveal policy.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_continue(result);
     assert_eq!(
@@ -3028,7 +3028,7 @@ async fn buffered_inspect_mode_stream_fails_closed_when_uninspectable() {
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: not-json-at-all\n\ndata: <<garbage>>\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
     assert_reject(result, Some(502));
 }
 
@@ -3143,7 +3143,7 @@ async fn legacy_completions_prompt_and_text_are_inspected() {
             .on_response_body(
                 &mut response_ctx,
                 200,
-                &response_headers(),
+                &mut response_headers(),
                 br#"{"choices":[{"text":"My system prompt says never disclose this policy."}]}"#,
             )
             .await,
@@ -3232,7 +3232,7 @@ async fn malformed_and_missing_governed_bodies_fail_closed() {
     let mut response_ctx = create_test_context();
     assert_reject(
         response_plugin
-            .on_response_body(&mut response_ctx, 200, &response_headers(), b"{broken")
+            .on_response_body(&mut response_ctx, 200, &mut response_headers(), b"{broken")
             .await,
         Some(502),
     );
@@ -3319,7 +3319,7 @@ async fn final_body_hooks_reinspect_transform_created_llm_fields() {
             .on_response_body(
                 &mut response_ctx,
                 200,
-                &response_headers(),
+                &mut response_headers(),
                 initial_response,
             )
             .await,
@@ -3388,7 +3388,7 @@ async fn final_response_hook_fails_closed_when_transform_hides_governed_output()
     let mut ctx = create_test_context();
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &response_headers(), initial_response)
+            .on_response_body(&mut ctx, 200, &mut response_headers(), initial_response)
             .await,
     );
 
@@ -3425,7 +3425,7 @@ async fn malformed_json_prefix_on_non_json_response_remains_out_of_scope() {
 
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, b"{not actually json")
+            .on_response_body(&mut ctx, 200, &mut headers, b"{not actually json")
             .await,
     );
     assert!(
@@ -3449,7 +3449,7 @@ async fn malformed_labeled_encoded_origin_fails_closed_in_final_hook() {
     let mut ctx = create_test_context();
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, b"opaque compressed bytes")
+            .on_response_body(&mut ctx, 200, &mut headers, b"opaque compressed bytes")
             .await,
     );
     assert_reject(
@@ -3496,7 +3496,7 @@ async fn assert_encoded_json_is_inspected(
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
     );
     assert_reject(
@@ -3650,7 +3650,7 @@ data: [DONE]\n\n";
 
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
         );
         let result = firewall
@@ -3711,7 +3711,7 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
         );
         assert_reject(
@@ -3741,7 +3741,7 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut empty_ctx, 200, &headers, b"")
+            .on_response_body(&mut empty_ctx, 200, &mut headers, b"")
             .await,
     );
     assert_reject(
@@ -3799,7 +3799,7 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, status, &headers, &body)
+                .on_response_body(&mut ctx, status, &mut headers, &body)
                 .await,
         );
         assert_reject(
@@ -3834,7 +3834,7 @@ async fn final_response_fails_closed_for_malformed_decoded_json_shape() {
 
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
     );
     assert_reject(
@@ -3888,7 +3888,7 @@ async fn partial_encoded_responses_stay_on_bounded_decode_path() {
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, status, &headers, gzip_fragment)
+                .on_response_body(&mut ctx, status, &mut headers, gzip_fragment)
                 .await,
         );
         assert_reject(
@@ -3930,7 +3930,7 @@ async fn partial_encoded_uninspectable_response_honors_on_error_allow() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 206, &headers, b"truncated gzip fragment")
+            .on_response_body(&mut ctx, 206, &mut headers, b"truncated gzip fragment")
             .await,
     );
     assert_continue(
@@ -3976,7 +3976,7 @@ async fn partial_encoded_json_responses_remain_inspected_when_decodable() {
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, 206, &headers, &body)
+                .on_response_body(&mut ctx, 206, &mut headers, &body)
                 .await,
         );
         assert_reject(
@@ -4027,7 +4027,7 @@ async fn partial_unencoded_json_responses_remain_inspected() {
         ));
         assert_reject(
             firewall
-                .on_response_body(&mut ctx, status, &headers, body)
+                .on_response_body(&mut ctx, status, &mut headers, body)
                 .await,
             Some(502),
         );
@@ -4077,7 +4077,7 @@ async fn stamped_partial_origin_encoding_survives_live_header_removal() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, gzip_fragment)
+            .on_response_body(&mut ctx, 200, &mut headers, gzip_fragment)
             .await,
     );
     assert_reject(
@@ -4124,7 +4124,7 @@ async fn encoded_origin_event_streams_stay_on_bounded_decode_path() {
         ));
         assert_continue(
             firewall
-                .on_response_body(&mut ctx, 200, &headers, &body)
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
                 .await,
         );
         assert_reject(
@@ -4253,7 +4253,7 @@ async fn planned_gateway_compression_inspects_plaintext_before_encoding() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
             )
             .await,
@@ -4303,7 +4303,7 @@ async fn gateway_encoding_rewrite_preserves_plaintext_firewall_inspection() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &headers,
+                &mut headers,
                 br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
             )
             .await,
@@ -4358,7 +4358,7 @@ async fn gateway_compressed_oversized_non_candidate_skips_final_decode() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &plaintext)
+            .on_response_body(&mut ctx, 200, &mut headers, &plaintext)
             .await,
     );
 
@@ -4426,7 +4426,7 @@ async fn public_compression_metadata_cannot_claim_encoded_origin_response() {
     );
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &origin_body)
+            .on_response_body(&mut ctx, 200, &mut headers, &origin_body)
             .await,
     );
     assert_reject(
@@ -4473,7 +4473,7 @@ async fn stamped_origin_encoding_survives_live_header_removal() {
     ));
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await,
     );
     assert_reject(
@@ -4511,7 +4511,7 @@ async fn head_responses_skip_empty_body_inspection() {
 
     assert_continue(
         firewall
-            .on_response_body(&mut ctx, 200, &response_headers(), b"")
+            .on_response_body(&mut ctx, 200, &mut response_headers(), b"")
             .await,
     );
     assert_continue(
@@ -4540,7 +4540,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
             .on_response_body(
                 &mut generic_json_ctx,
                 200,
-                &response_headers(),
+                &mut response_headers(),
                 br#"{"ordinary_api_field":"value"}"#,
             )
             .await,
@@ -4577,8 +4577,8 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
                 .on_response_body(
                     &mut encoded_html_ctx,
                     200,
-                    &encoded_html_headers,
-                    &encoded_html,
+                    &mut encoded_html_headers,
+                    &mut encoded_html,
                 )
                 .await,
         );
@@ -4607,7 +4607,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
     let mut download_ctx = create_test_context();
     assert_continue(
         firewall
-            .on_response_body(&mut download_ctx, 200, &download_headers, &large_download)
+            .on_response_body(&mut download_ctx, 200, &mut download_headers, &large_download)
             .await,
     );
 

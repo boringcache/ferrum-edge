@@ -1465,7 +1465,7 @@ impl Plugin for AiResponseGuard {
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
-        response_headers: &HashMap<String, String>,
+        response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         // Enforce the aggregate scan/work bound before the successful-response

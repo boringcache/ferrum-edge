@@ -228,7 +228,7 @@ async fn test_openai_format() {
     .unwrap();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_continue(result);
 
@@ -256,7 +256,7 @@ async fn test_anthropic_format() {
     .unwrap();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_continue(result);
 
@@ -288,7 +288,7 @@ async fn test_google_format() {
     .unwrap();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_continue(result);
 
@@ -318,7 +318,7 @@ async fn test_cohere_format() {
     .unwrap();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_continue(result);
 
@@ -350,7 +350,7 @@ async fn test_cohere_v2_buffered_format() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
 
     assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "cohere");
@@ -376,7 +376,7 @@ async fn test_cohere_v2_streaming_format() {
     )
     .as_bytes();
 
-    plugin.on_response_body(&mut ctx, 200, &headers, sse).await;
+    plugin.on_response_body(&mut ctx, 200, &mut headers, sse).await;
 
     assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "cohere");
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "64");
@@ -401,7 +401,7 @@ async fn test_bedrock_format() {
     .unwrap();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_continue(result);
 
@@ -425,7 +425,7 @@ async fn test_explicit_provider_openai() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "openai");
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "15");
@@ -453,7 +453,7 @@ async fn test_explicit_provider_mistral() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "mistral");
 }
@@ -471,7 +471,7 @@ async fn test_custom_prefix() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_eq!(ctx.metadata.get("llm_total_tokens").unwrap(), "15");
     assert_eq!(ctx.metadata.get("llm_prompt_tokens").unwrap(), "10");
@@ -495,7 +495,7 @@ async fn test_cost_calculation() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     // Cost = 1000 * 0.00001 + 500 * 0.00003 = 0.01 + 0.015 = 0.025
     assert_eq!(ctx.metadata.get("ai_estimated_cost").unwrap(), "0.025000");
@@ -516,7 +516,7 @@ async fn test_cost_calculation_prompt_only() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     // Cost = 1000 * 0.0001 + 0 * 0.0 = 0.1
     assert_eq!(ctx.metadata.get("ai_estimated_cost").unwrap(), "0.100000");
@@ -533,7 +533,7 @@ async fn test_cost_not_calculated_when_no_rates() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(!ctx.metadata.contains_key("ai_estimated_cost"));
 }
@@ -552,7 +552,7 @@ async fn test_include_model_false() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert!(!ctx.metadata.contains_key("ai_model"));
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "15");
@@ -571,7 +571,7 @@ async fn test_include_token_details_false() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "15");
     assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
@@ -588,7 +588,7 @@ async fn test_non_json_content_type() {
     headers.insert("content-type".to_string(), "text/html".to_string());
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, b"not json")
+        .on_response_body(&mut ctx, 200, &mut headers, b"not json")
         .await;
     assert_continue(result);
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
@@ -600,7 +600,7 @@ async fn test_empty_body() {
     let mut ctx = create_test_context();
     let headers = json_headers();
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, b"").await;
+    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, b"").await;
     assert_continue(result);
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
 }
@@ -612,7 +612,7 @@ async fn test_malformed_json() {
     let headers = json_headers();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, b"not valid json")
+        .on_response_body(&mut ctx, 200, &mut headers, b"not valid json")
         .await;
     assert_continue(result);
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
@@ -626,7 +626,7 @@ async fn test_missing_usage_fields() {
     let body = serde_json::to_vec(&json!({"id": "chatcmpl-123"})).unwrap();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_continue(result);
     // No provider detected, no metadata written
@@ -644,7 +644,7 @@ async fn test_zero_tokens() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "0");
     assert_eq!(ctx.metadata.get("ai_prompt_tokens").unwrap(), "0");
@@ -671,7 +671,7 @@ async fn test_bedrock_computed_total() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "150");
 }
@@ -691,7 +691,7 @@ async fn test_skips_4xx_responses() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 401, &headers, &body)
+        .on_response_body(&mut ctx, 401, &mut headers, &body)
         .await;
     assert!(
         !ctx.metadata.contains_key("ai_total_tokens"),
@@ -710,7 +710,7 @@ async fn test_skips_5xx_responses() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 503, &headers, &body)
+        .on_response_body(&mut ctx, 503, &mut headers, &body)
         .await;
     assert!(
         !ctx.metadata.contains_key("ai_total_tokens"),
@@ -731,7 +731,7 @@ async fn test_processes_2xx_responses() {
     .unwrap();
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "30");
 }
@@ -865,7 +865,7 @@ async fn synthetic_short_circuit_body_is_not_token_accounted() {
     .unwrap();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_continue(result);
 
@@ -899,7 +899,7 @@ async fn genuine_response_is_token_accounted_without_synthetic_marker() {
     .unwrap();
 
     let result = plugin
-        .on_response_body(&mut ctx, 200, &headers, &body)
+        .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
     assert_continue(result);
 
@@ -925,7 +925,7 @@ async fn anthropic_sse_merges_cumulative_terminal_usage_without_double_counting(
     );
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
         .await;
 
     assert_eq!(
@@ -957,7 +957,7 @@ async fn anthropic_sse_without_message_start_keeps_explicit_partial_usage() {
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
 
-    plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
 
     assert_eq!(
         ctx.metadata.get("ai_completion_tokens").map(String::as_str),
@@ -983,7 +983,7 @@ async fn partial_sse_component_update_retains_earlier_authoritative_total() {
     );
 
     plugin
-        .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
         .await;
 
     assert_eq!(
@@ -1027,7 +1027,7 @@ async fn openai_responses_buffered_and_completed_sse_are_supported() {
             .on_response_body(
                 &mut ctx,
                 200,
-                &json_headers(),
+                &mut json_headers(),
                 &serde_json::to_vec(&buffered).unwrap(),
             )
             .await;
@@ -1067,7 +1067,7 @@ async fn openai_responses_buffered_and_completed_sse_are_supported() {
         })
     );
     plugin
-        .on_response_body(&mut ctx, 200, &headers, event.as_bytes())
+        .on_response_body(&mut ctx, 200, &mut headers, event.as_bytes())
         .await;
     assert_eq!(
         ctx.metadata.get("ai_total_tokens").map(String::as_str),
@@ -1091,7 +1091,7 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
             json!({"type": event_type, "response": {"usage": {"input_tokens": 5}}})
         );
         plugin
-            .on_response_body(&mut ctx, 200, &headers, event.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut headers, event.as_bytes())
             .await;
         assert!(!ctx.metadata.contains_key("ai_provider"));
         assert!(!ctx.metadata.contains_key("ai_estimated_cost"));
@@ -1104,7 +1104,7 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
     }))
     .unwrap();
     plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &malformed)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &malformed)
         .await;
     assert!(ctx.metadata.is_empty());
 }
@@ -1125,7 +1125,7 @@ async fn google_sse_merges_repeated_partial_usage_for_auto_and_fixed_provider() 
         let plugin = AiTokenMetrics::new(&config).unwrap();
         let mut ctx = create_test_context();
         plugin
-            .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
+            .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
             .await;
         assert_eq!(
             ctx.metadata.get("ai_provider").map(String::as_str),
@@ -1164,7 +1164,7 @@ async fn bedrock_titan_invoke_model_is_supported_without_ambiguous_result_summin
     }))
     .unwrap();
     plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_eq!(
         ctx.metadata.get("ai_provider").map(String::as_str),
@@ -1195,7 +1195,7 @@ async fn bedrock_titan_invoke_model_is_supported_without_ambiguous_result_summin
         }))
         .unwrap();
         plugin
-            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
             .await;
         assert_eq!(
             ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
@@ -1233,7 +1233,7 @@ async fn encoded_json_supports_gzip_brotli_and_coding_chains_without_mutation() 
         ]);
         let mut ctx = create_test_context();
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &encoded)
+            .on_response_body(&mut ctx, 200, &mut headers, &encoded)
             .await;
         assert_eq!(
             ctx.metadata.get("ai_total_tokens").map(String::as_str),
@@ -1270,7 +1270,7 @@ async fn encoded_sse_is_inspected_only_when_stream_buffering_is_enabled() {
         let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": enabled})).unwrap();
         let mut ctx = create_test_context();
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &encoded)
+            .on_response_body(&mut ctx, 200, &mut headers, &encoded)
             .await;
         assert_eq!(
             ctx.metadata.get("ai_total_tokens").map(String::as_str),
@@ -1300,7 +1300,7 @@ async fn encoded_json_rejects_malformed_unsupported_concatenated_and_oversized_c
         ]);
         let mut ctx = create_test_context();
         plugin
-            .on_response_body(&mut ctx, 200, &headers, &body)
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
             .await;
         assert!(
             !ctx.metadata.contains_key("ai_total_tokens"),
@@ -1318,7 +1318,7 @@ async fn checked_usage_arithmetic_never_saturates_into_invented_totals() {
     }))
     .unwrap();
     plugin
-        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
         .await;
     assert_eq!(
         ctx.metadata.get("ai_prompt_tokens").map(String::as_str),

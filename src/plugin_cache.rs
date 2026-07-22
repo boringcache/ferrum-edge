@@ -686,7 +686,7 @@ impl Plugin for PriorityOverridePlugin {
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
-        response_headers: &std::collections::HashMap<String, String>,
+        response_headers: &mut std::collections::HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         self.inner
