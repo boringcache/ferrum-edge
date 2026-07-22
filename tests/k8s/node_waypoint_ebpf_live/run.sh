@@ -3454,4 +3454,53 @@ run_traffic_checks
 run_ipv6_checks
 ferrum_live_assertions_require_all_passed "$LIVE_ASSERTIONS_FILE" "${REQUIRED_LIVE_ASSERTIONS[@]}"
 
+# Issue #2218 requires a real NodeWaypoint bypass and its exported metric, not
+# only synthetic producer/consumer coverage. Run this after the traffic checks
+# so at least one proxy-UID or configured capture-policy bypass has occurred.
+(
+  token="$(admin_bearer_token)"
+  pod="$(first_pod_for "$MESH_NS" 'app.kubernetes.io/name=ferrum-mesh-ambient')"
+  port=19450
+  metrics_dir="$RESULTS_DIR/mesh-bpf-metrics"
+  metrics_file="$metrics_dir/ambient.prom"
+  pf_log="$metrics_dir/port-forward.log"
+  mkdir -p "$metrics_dir"
+
+  kubectl -n "$MESH_NS" port-forward "pod/$pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+  pf_pid=$!
+  fetched=false
+  for _ in $(seq 1 30); do
+    if curl -fsS -H "Authorization: Bearer $token" \
+      "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
+      fetched=true
+      break
+    fi
+    sleep 0.5
+  done
+  kill "$pf_pid" 2>/dev/null || true
+  wait "$pf_pid" 2>/dev/null || true
+
+  if [[ "$fetched" != "true" ]]; then
+    echo "failed to fetch ambient /metrics for the BPF bypass assertion" >&2
+    cat "$pf_log" >&2 || true
+    exit 1
+  fi
+  if ! grep -Eq \
+    'ferrum_mesh_bpf_drops_total\{reason="(bypass_uid_hit|exclude_cidr_hit|not_in_include_cidr|exclude_port_hit)"\} [1-9][0-9]*' \
+    "$metrics_file"; then
+    echo "expected a real nonzero BPF capture-bypass counter after live traffic" >&2
+    head -n 80 "$metrics_file" >&2 || true
+    exit 1
+  fi
+  record_live_assertion \
+    node_waypoint.ebpf.mesh_bpf_bypass_metric \
+    pass \
+    "" \
+    "" \
+    "real-bypass-exported" \
+    "" \
+    "" \
+    "mesh-bpf-metrics/ambient.prom"
+)
+
 log "live NodeWaypoint eBPF datapath checks passed"
