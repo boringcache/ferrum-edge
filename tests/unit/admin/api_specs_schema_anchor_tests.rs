@@ -586,7 +586,10 @@ fn deeply_nested_callback_schema_indexing_is_bounded() {
             "responses": {"204": {"description": "ok"}}
         }
     });
-    for _ in 0..65 {
+    // One more than the explicit Path Item/callback index budget (24). This
+    // remains below serde_yaml's structural recursion ceiling, so the resolver
+    // guard itself—not the parser—is what rejects the document.
+    for _ in 0..25 {
         path_item = json!({
             "post": {
                 "callbacks": {"next": {"/callback": path_item}},
@@ -602,7 +605,7 @@ fn deeply_nested_callback_schema_indexing_is_bounded() {
         "paths": {"/start": path_item}
     });
     // YAML parsing accepts this deliberately deep literal tree so the resolver
-    // limit, rather than serde_json's own nesting limit, is what rejects it.
+    // limit, rather than a serializer/parser nesting limit, is what rejects it.
     let yaml = serde_yaml::to_string(&spec).expect("deep callback fixture must serialize");
     let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod")
         .expect_err("deep callback indexing must fail closed");

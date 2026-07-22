@@ -1119,6 +1119,11 @@ fn swagger_media_types(
 
 const MAX_SCHEMA_REF_DEPTH: usize = 32;
 const MAX_SCHEMA_INDEX_DEPTH: usize = 64;
+/// Path Item recursion grows several YAML/JSON container levels per callback.
+/// Keep its explicit resolver budget below the parsers' own recursion ceiling
+/// so hostile callback chains are rejected deterministically as schema depth,
+/// while ordinary Schema Object indexing retains its larger independent cap.
+const MAX_PATH_ITEM_INDEX_DEPTH: usize = 24;
 /// Synthetic document base for local-only URI resolution. Never fetched.
 const LOCAL_SCHEMA_DOCUMENT_BASE: &str = "https://ferrum.invalid/local-schema";
 type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
@@ -1206,10 +1211,20 @@ impl LocalSchemaResolver {
             self.index_components(components, "/components", base, depth)?;
         }
         if let Some(paths) = root.get("paths").and_then(Value::as_object) {
-            self.index_path_item_map(paths, "/paths", base, depth)?;
+            self.index_path_item_map(
+                paths,
+                "/paths",
+                base,
+                depth.min(MAX_PATH_ITEM_INDEX_DEPTH),
+            )?;
         }
         if let Some(webhooks) = root.get("webhooks").and_then(Value::as_object) {
-            self.index_path_item_map(webhooks, "/webhooks", base, depth)?;
+            self.index_path_item_map(
+                webhooks,
+                "/webhooks",
+                base,
+                depth.min(MAX_PATH_ITEM_INDEX_DEPTH),
+            )?;
         }
         Ok(())
     }
@@ -1265,7 +1280,12 @@ impl LocalSchemaResolver {
                 let callback_pointer =
                     append_json_pointer(&append_json_pointer(pointer, "callbacks"), name);
                 if let Some(path_items) = callback.as_object() {
-                    self.index_path_item_map(path_items, &callback_pointer, base, depth)?;
+                    self.index_path_item_map(
+                        path_items,
+                        &callback_pointer,
+                        base,
+                        depth.min(MAX_PATH_ITEM_INDEX_DEPTH),
+                    )?;
                 }
             }
         }
@@ -1274,7 +1294,7 @@ impl LocalSchemaResolver {
                 path_items,
                 &append_json_pointer(pointer, "pathItems"),
                 base,
-                depth,
+                depth.min(MAX_PATH_ITEM_INDEX_DEPTH),
             )?;
         }
         Ok(())
