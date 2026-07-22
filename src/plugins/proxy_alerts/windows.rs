@@ -313,8 +313,12 @@ pub struct RuleWindowSpec {
 /// The outer/proxy DashMaps avoid composite string keys on the hot path:
 /// `proxy_id` uses `String: Borrow<str>`, and the generation dimension is a
 /// plain `u64` so admission-tagged writes need no per-sample formatting.
+type GenerationWindows = DashMap<u64, WindowState>;
+type ProxyWindows = DashMap<String, Arc<GenerationWindows>>;
+type RuleWindows = DashMap<u32, Arc<ProxyWindows>>;
+
 pub struct WindowStore {
-    by_rule: DashMap<u32, Arc<DashMap<String, Arc<DashMap<u64, WindowState>>>>>,
+    by_rule: RuleWindows,
     rule_specs: HashMap<u32, RuleWindowSpec>,
     inner_shard_amount: usize,
 }
@@ -329,10 +333,7 @@ impl WindowStore {
         }
     }
 
-    fn inner_for(
-        &self,
-        rule_id: u32,
-    ) -> Option<Arc<DashMap<String, Arc<DashMap<u64, WindowState>>>>> {
+    fn inner_for(&self, rule_id: u32) -> Option<Arc<ProxyWindows>> {
         if let Some(existing) = self.by_rule.get(&rule_id) {
             return Some(Arc::clone(existing.value()));
         }
@@ -348,10 +349,8 @@ impl WindowStore {
         &self,
         rule_id: u32,
         proxy_id: &str,
-    ) -> Option<Arc<DashMap<u64, WindowState>>> {
-        let Some(inner) = self.inner_for(rule_id) else {
-            return None;
-        };
+    ) -> Option<Arc<GenerationWindows>> {
+        let inner = self.inner_for(rule_id)?;
         if let Some(existing) = inner.get(proxy_id) {
             return Some(Arc::clone(existing.value()));
         }
