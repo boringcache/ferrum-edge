@@ -142,7 +142,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Sampled periodic sweeps (every 100,000 datagram hooks, cooldown-gated to once per second) prune idle client state below the 100,000 hard cap; exceeding the cap force-evicts after that prune. When using `sync_mode: "redis"`, datagram and byte counters are stored in Redis and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled periodic sweeps (every 100,000 datagram hooks, cooldown-gated to once per second) prune idle client state below the 100,000 hard cap. An over-cap observation keeps strict new-IP admission closed and may force-evict after pruning, but the shared atomic gate permits at most one full-map scan per second. When using `sync_mode: "redis"`, datagram and byte counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### GraphQL Rate Limiting
 

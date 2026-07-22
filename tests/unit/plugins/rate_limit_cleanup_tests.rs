@@ -38,7 +38,7 @@ fn udp_sampled_cooldown_path_prunes_stale_preserves_active_below_cap() {
 }
 
 #[test]
-fn udp_over_cap_path_bypasses_periodic_cooldown() {
+fn udp_over_cap_path_keeps_strict_admission_and_rate_limits_full_scans() {
     let h = RateLimitCleanupHarness::new();
     let epoch = h.udp_epoch_base();
     h.seed_udp("10.0.0.1", epoch);
@@ -46,12 +46,25 @@ fn udp_over_cap_path_bypasses_periodic_cooldown() {
     h.seed_udp("10.0.0.3", epoch);
     assert_eq!(h.udp_tracked(), Some(3));
 
-    // A just-recorded periodic sweep must not block hard-cap enforcement. All
-    // keys remain active here, so the production wrapper must force-evict.
+    // A just-recorded sweep blocks another full-map scan, but the over-cap
+    // result must remain true so on_udp_datagram rejects an unseen IP in O(1).
     let now = epoch + Duration::from_secs(1);
     h.block_udp_cooldown_at(now);
-    assert!(!h.maybe_evict_udp_at_with_cap(now, 1));
+    assert!(h.maybe_evict_udp_at_with_cap(now, 1));
+    assert_eq!(h.udp_tracked(), Some(3));
+
+    // The next second admits exactly one enforcing scan. The current caller
+    // still observes strict admission even though cleanup reaches the cap.
+    let next = now + Duration::from_secs(1);
+    assert!(h.maybe_evict_udp_at_with_cap(next, 1));
     assert!(h.udp_tracked().unwrap_or(0) <= 1);
+
+    // New active entries in the same second cannot retrigger another scan.
+    h.seed_udp("10.0.0.4", next);
+    h.seed_udp("10.0.0.5", next);
+    let before = h.udp_tracked();
+    assert!(h.maybe_evict_udp_at_with_cap(next, 1));
+    assert_eq!(h.udp_tracked(), before);
 }
 
 #[test]

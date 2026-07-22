@@ -148,17 +148,29 @@ impl UdpRateLimiting {
         let len = self.limiter.tracked_keys_count();
         let over_capacity = len > max_entries;
         let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        // Capacity enforcement must not wait for the periodic cooldown. If it
-        // did, the caller's new-client guard would reject every unseen IP until
-        // the cooldown elapsed after crossing the cap.
+        // Keep strict admission active for every over-cap observation, even
+        // when this call wins cleanup and brings the map back to the cap. That
+        // prevents a spoofed new-IP stream from defeating the caller's O(1)
+        // rejection guard by alternating insertion with full-map eviction.
+        // Reuse the periodic timestamp as a once-per-second single-flight gate
+        // so attacker-controlled datagrams cannot trigger retain/eviction on
+        // every packet.
         if over_capacity {
-            apply_rate_limit_cleanup(&self.limiter, max_entries, now, true);
-            return self.limiter.tracked_keys_count() > max_entries;
+            let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
+            if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
+                && self
+                    .last_eviction_secs
+                    .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                apply_rate_limit_cleanup(&self.limiter, max_entries, now, true);
+            }
+            return true;
         }
 
         if periodic {
-            let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
             let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
             if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
                 && self
@@ -167,11 +179,9 @@ impl UdpRateLimiting {
                     .is_ok()
             {
                 // Periodic sweeps prune idle keys even while the map is
-                // below the hard cap. Over-cap pressure still force-evicts
-                // after that prune so sustained per-IP traffic cannot pin
-                // the map at `MAX_STATE_ENTRIES + 1` and leave the
-                // `over_capacity && !contains_local_key` guard dropping
-                // every new client IP indefinitely.
+                // below the hard cap. A later over-cap observation keeps the
+                // strict new-IP guard active and force-evicts at most once per
+                // second after pruning.
                 apply_rate_limit_cleanup(&self.limiter, max_entries, now, false);
             }
         }

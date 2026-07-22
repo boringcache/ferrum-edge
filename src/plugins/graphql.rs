@@ -291,18 +291,20 @@ impl GraphqlPlugin {
         if len == 0 {
             return;
         }
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
         // Sampled over-cap observation force-enforces after pruning idle keys.
         // The below-cap cooldown must not suppress this branch once pressure
         // is seen on a sampled pass.
         if len > MAX_STATE_ENTRIES {
             apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+            self.last_periodic_sweep_secs
+                .store(now_secs, Ordering::Release);
             return;
         }
 
         // At/below the hard cap: cooldown-gate to at most one full DashMap
         // retain per second under high RPS.
-        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
         if now_secs.saturating_sub(last_sweep) < EVICTION_COOLDOWN_SECS {
             return;
