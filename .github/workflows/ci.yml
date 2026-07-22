@@ -604,6 +604,7 @@ jobs:
               integration::k8s_controller_istio_status_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests
+              integration::mesh_bpf_metrics_scrape_tests
               integration::mesh_federation_poller_tests
               integration::mesh_file_source_tests
               integration::mesh_multicluster_discovery_tests

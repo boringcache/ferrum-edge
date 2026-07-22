@@ -1466,3 +1466,382 @@ async fn test_request_transformer_overlay_gate_observable_end_to_end() {
 
     runtime_overlay::reset_for_test();
 }
+
+// ── Issue #2374: unknown keys, operation-exact fields, HeaderValue admission ──
+
+#[tokio::test]
+async fn test_request_transformer_rejects_unknown_top_level_key() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Color", "value": "blue"}
+        ],
+        "runtime_overlay_scpoe": "internal"
+    }))
+    .err()
+    .expect("expected error for unknown top-level key");
+    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("runtime_overlay_scpoe"), "got: {err}");
+    assert!(err.contains("under 'config'"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_unknown_header_rule_key() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "vaule": "green"
+            }
+        ]
+    }))
+    .err()
+    .expect("expected error for unknown header rule key");
+    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("vaule"), "got: {err}");
+    assert!(err.contains("config.rules[0]"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_unknown_query_and_body_rule_keys() {
+    let query_err = RequestTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "add",
+                "target": "query",
+                "key": "color",
+                "value": "blue",
+                "typo_key": 1
+            }
+        ]
+    }))
+    .err()
+    .expect("expected error for unknown query rule key");
+    assert!(query_err.contains("typo_key"), "got: {query_err}");
+    assert!(query_err.contains("config.rules[0]"), "got: {query_err}");
+
+    let body_err = RequestTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "add",
+                "target": "body",
+                "key": "enabled",
+                "value": true,
+                "extra_field": 1
+            }
+        ]
+    }))
+    .err()
+    .expect("expected error for unknown body rule key");
+    assert!(body_err.contains("extra_field"), "got: {body_err}");
+    assert!(body_err.contains("config.rules[0]"), "got: {body_err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_incompatible_header_and_query_fields() {
+    for (rule, needle) in [
+        (
+            json!({
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": "X-Ignored"
+            }),
+            "'new_key' must not be set for header 'add'",
+        ),
+        (
+            json!({
+                "operation": "update",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": "X-Ignored"
+            }),
+            "'new_key' must not be set for header 'update'",
+        ),
+        (
+            json!({
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "X-New",
+                "value": "ignored"
+            }),
+            "'value' must not be set for header 'rename'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "value": "ignored"
+            }),
+            "'value' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "new_key": "X-Ignored"
+            }),
+            "'new_key' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "add",
+                "target": "query",
+                "key": "color",
+                "value": "blue",
+                "new_key": "ignored"
+            }),
+            "'new_key' must not be set for query 'add'",
+        ),
+        (
+            json!({
+                "operation": "update",
+                "target": "query",
+                "key": "color",
+                "value": "blue",
+                "new_key": "ignored"
+            }),
+            "'new_key' must not be set for query 'update'",
+        ),
+        (
+            json!({
+                "operation": "rename",
+                "target": "query",
+                "key": "old",
+                "new_key": "new",
+                "value": "ignored"
+            }),
+            "'value' must not be set for query 'rename'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "query",
+                "key": "color",
+                "value": "ignored"
+            }),
+            "'value' must not be set for query 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "query",
+                "key": "color",
+                "new_key": "ignored"
+            }),
+            "'new_key' must not be set for query 'remove'",
+        ),
+        (
+            json!({
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }),
+            "'new_key' must not be set for header 'add'",
+        ),
+        (
+            json!({
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "X-New",
+                "value": null
+            }),
+            "'value' must not be set for header 'rename'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "value": null
+            }),
+            "'value' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "new_key": null
+            }),
+            "'new_key' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "add",
+                "target": "query",
+                "key": "color",
+                "value": "blue",
+                "new_key": null
+            }),
+            "'new_key' must not be set for query 'add'",
+        ),
+        (
+            json!({
+                "operation": "rename",
+                "target": "query",
+                "key": "old",
+                "new_key": "new",
+                "value": null
+            }),
+            "'value' must not be set for query 'rename'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "query",
+                "key": "color",
+                "value": null
+            }),
+            "'value' must not be set for query 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "query",
+                "key": "color",
+                "new_key": null
+            }),
+            "'new_key' must not be set for query 'remove'",
+        ),
+    ] {
+        let err = RequestTransformer::new(&json!({ "rules": [rule] }))
+            .err()
+            .expect("expected incompatible field rejection");
+        assert!(
+            err.contains(needle),
+            "expected needle {needle:?}, got: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_forbidden_header_control_bytes() {
+    for (label, value) in [
+        ("NUL", "ok\u{0000}bad"),
+        ("SOH", "ok\u{0001}bad"),
+        ("BEL", "ok\u{0007}bad"),
+        ("DEL", "ok\u{007f}bad"),
+    ] {
+        let err = RequestTransformer::new(&json!({
+            "rules": [
+                {"operation": "update", "target": "header", "key": "X-Color", "value": value}
+            ]
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("expected HeaderValue rejection for {label}"));
+        assert!(err.contains("valid HTTP HeaderValue"), "{label}: got {err}");
+    }
+}
+
+#[tokio::test]
+async fn test_request_transformer_accepts_valid_header_value_edge_cases() {
+    for value in [
+        "",
+        " ",
+        "\t",
+        "plain",
+        "a b",
+        "tab\there",
+        "café",
+        "!#$%&'*+-.^_`|~",
+    ] {
+        let plugin = RequestTransformer::new(&json!({
+            "rules": [
+                {"operation": "add", "target": "header", "key": "X-Edge", "value": value}
+            ]
+        }));
+        if let Err(error) = plugin {
+            panic!("valid HeaderValue edge case rejected: {value:?} -> {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_request_transformer_accepted_values_pass_backend_adapter_gates() {
+    // Outbound Hyper / native H3 / reqwest adapters all parse outbound header
+    // values through `HeaderValue::from_str` (or the same http type). Values
+    // admitted by construction must therefore succeed on every adapter gate.
+    let values = [
+        "plain",
+        "a b",
+        "tab\there",
+        "café",
+        "!#$%&'*+-.^_`|~",
+        "",
+        " ",
+    ];
+    for value in values {
+        RequestTransformer::new(&json!({
+            "rules": [
+                {"operation": "update", "target": "header", "key": "X-Parity", "value": value}
+            ]
+        }))
+        .unwrap_or_else(|e| panic!("construction rejected {value:?}: {e}"));
+
+        assert!(
+            http::HeaderValue::from_str(value).is_ok(),
+            "http HeaderValue rejected admitted value {value:?}"
+        );
+        assert!(
+            hyper::header::HeaderValue::from_str(value).is_ok(),
+            "hyper HeaderValue rejected admitted value {value:?}"
+        );
+        assert!(
+            reqwest::header::HeaderValue::from_str(value).is_ok(),
+            "reqwest HeaderValue rejected admitted value {value:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_request_transformer_route_level_rejects_invalid_control_values() {
+    // Route-level transforms share the same HeaderValue + CR/LF admission gate.
+    let crlf: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "update", "target": "header", "key": "X-Bad", "value": "a\r\nInjected: 1"}
+    ]))
+    .unwrap();
+    let crlf_err = parse_route_header_transforms(&crlf, "route_override").unwrap_err();
+    assert!(crlf_err.contains("CR or LF"), "got: {crlf_err}");
+
+    let nul: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "add", "target": "header", "key": "X-Bad", "value": "ok\u{0000}bad"}
+    ]))
+    .unwrap();
+    let nul_err = parse_route_header_transforms(&nul, "route_override").unwrap_err();
+    assert!(nul_err.contains("valid HTTP HeaderValue"), "got: {nul_err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_route_level_accepted_value_applies() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [],
+        "apply_route_overrides": true,
+    }))
+    .unwrap();
+
+    let raw: Vec<RawRouteHeaderTransformRule> = serde_json::from_value(json!([
+        {"operation": "update", "target": "header", "key": "X-Route", "value": "tab\there"}
+    ]))
+    .unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "route_override").unwrap());
+
+    let mut ctx = make_ctx();
+    ctx.route_override_request_transform = Some(route_rules);
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        headers.get("x-route").map(String::as_str),
+        Some("tab\there")
+    );
+}

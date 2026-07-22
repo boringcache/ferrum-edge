@@ -887,12 +887,22 @@ fn optional_content_types(
     let Some(values) = optional_string_vec(config, field)? else {
         return Ok(None);
     };
-    Ok(Some(
-        values
-            .into_iter()
-            .map(|value| value.to_ascii_lowercase())
-            .collect(),
-    ))
+    let mut parsed = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        // Normalize configured media types the same way actual headers are
+        // compared: type/subtype only, parameters stripped, ASCII-lowercased.
+        let normalized = media_type_essence(&value)
+            .ok_or_else(|| {
+                format!(
+                    "body_validator: '{field}' entries must be valid media types \
+                     (type/subtype), not empty, parameter-only, or malformed \
+                     (invalid entry at index {index})"
+                )
+            })?
+            .to_ascii_lowercase();
+        parsed.push(normalized);
+    }
+    Ok(Some(parsed))
 }
 
 fn default_content_types() -> Vec<String> {
@@ -903,15 +913,79 @@ fn default_content_types() -> Vec<String> {
     ]
 }
 
+/// Media-type essence (`type`/`subtype`) from a `Content-Type` value: the token
+/// before the first `;`, with surrounding OWS trimmed. Both components must be
+/// non-empty RFC token values and exactly one slash must separate them.
+fn media_type_essence(content_type: &str) -> Option<&str> {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim_matches(|ch| ch == ' ' || ch == '\t');
+    let (type_name, subtype) = essence.split_once('/')?;
+    if type_name.is_empty()
+        || subtype.is_empty()
+        || subtype.contains('/')
+        || !type_name.bytes().all(is_media_type_token_byte)
+        || !subtype.bytes().all(is_media_type_token_byte)
+    {
+        return None;
+    }
+    Some(essence)
+}
+
+fn is_media_type_token_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
+}
+
+/// Exact type/subtype match against configured media types.
+///
+/// Compares the normalized essence of `content_type` (parameters stripped,
+/// OWS trimmed, ASCII case-insensitive) to each configured entry. Distinct
+/// neighbors such as `application/json-seq` and parameter values that merely
+/// contain a configured string do not match. An empty configured list means
+/// "match all valid media types" (legacy). A malformed actual value never
+/// matches, including when the configured list is empty.
 fn content_type_matches(configured: &[String], content_type: &str) -> bool {
-    configured.is_empty()
-        || configured
-            .iter()
-            .any(|expected| ascii_contains_ignore_case(content_type, expected))
+    let Some(actual) = media_type_essence(content_type) else {
+        return false;
+    };
+    if configured.is_empty() {
+        return true;
+    }
+    configured
+        .iter()
+        .any(|expected| actual.eq_ignore_ascii_case(expected))
 }
 
 fn is_grpc_content_type(content_type: &str) -> bool {
-    ascii_starts_with_ignore_case(content_type, "application/grpc")
+    // gRPC media types use application/grpc or a registered representation
+    // suffix such as application/grpc+proto. Parameters never participate.
+    let Some(media_type) = media_type_essence(content_type) else {
+        return false;
+    };
+    media_type.eq_ignore_ascii_case("application/grpc")
+        || ascii_starts_with_ignore_case(media_type, "application/grpc+")
 }
 
 /// Reject XML whose DOCTYPE declares an entity-expansion bomb ("billion
@@ -1241,12 +1315,27 @@ fn numeric_char_ref_at(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
     Some((cp, i + 1))
 }
 
+/// JSON dispatch over a media-type essence: exact `application/json` or an
+/// RFC 6838 structured suffix `+json`. Operates on type/subtype only so
+/// parameter values and neighboring types such as `application/json-seq` are
+/// not treated as single-document JSON.
 fn is_json_like_content_type(content_type: &str) -> bool {
-    ascii_contains_ignore_case(content_type, "json")
+    let Some(media_type) = media_type_essence(content_type) else {
+        return false;
+    };
+    media_type.eq_ignore_ascii_case("application/json")
+        || ascii_ends_with_ignore_case(media_type, "+json")
 }
 
+/// XML dispatch over a media-type essence: exact `application/xml` /
+/// `text/xml`, or an RFC 6838 structured suffix `+xml`.
 fn is_xml_like_content_type(content_type: &str) -> bool {
-    ascii_contains_ignore_case(content_type, "xml")
+    let Some(media_type) = media_type_essence(content_type) else {
+        return false;
+    };
+    media_type.eq_ignore_ascii_case("application/xml")
+        || media_type.eq_ignore_ascii_case("text/xml")
+        || ascii_ends_with_ignore_case(media_type, "+xml")
 }
 
 fn ascii_starts_with_ignore_case(value: &str, prefix: &str) -> bool {
@@ -1259,25 +1348,14 @@ fn ascii_starts_with_ignore_case(value: &str, prefix: &str) -> bool {
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
-fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
-    let haystack = haystack.as_bytes();
-    let needle = needle.as_bytes();
-    if needle.is_empty() {
-        return true;
-    }
-    if needle.len() > haystack.len() {
-        return false;
-    }
-    'outer: for start in 0..=(haystack.len() - needle.len()) {
-        for offset in 0..needle.len() {
-            if haystack[start + offset].eq_ignore_ascii_case(&needle[offset]) {
-                continue;
-            }
-            continue 'outer;
-        }
-        return true;
-    }
-    false
+fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
+    let value = value.as_bytes();
+    let suffix = suffix.as_bytes();
+    value.len() >= suffix.len()
+        && value[value.len() - suffix.len()..]
+            .iter()
+            .zip(suffix)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 /// Load protobuf validation config from the plugin config JSON.
