@@ -1,12 +1,13 @@
 use ferrum_edge::_test_support::{
-    apply_buffered_request_body_normalization_before_before_proxy_for_test,
     ai_semantic_cache_clear_vector_index_dirty_for_test, ai_semantic_cache_embedding,
     ai_semantic_cache_expire_all_entries_for_test, ai_semantic_cache_force_cleanup_for_test,
     ai_semantic_cache_scope_key, ai_semantic_cache_set_store_post_admit_hook_for_test,
     ai_semantic_cache_set_vector_index_rebuild_blocked_for_test,
     ai_semantic_cache_size_accounting_snapshot_for_test,
-    ai_semantic_cache_vector_index_dirty_for_test, rebuild_ai_semantic_cache_vector_index,
-    set_ai_semantic_cache_embedding, set_ai_semantic_cache_scope_key,
+    ai_semantic_cache_vector_index_dirty_for_test,
+    apply_buffered_request_body_normalization_before_before_proxy_for_test,
+    rebuild_ai_semantic_cache_vector_index, set_ai_semantic_cache_embedding,
+    set_ai_semantic_cache_scope_key,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
@@ -817,16 +818,13 @@ async fn configured_decompression_preserves_semantic_cache_miss_store_hit_lifecy
 
     for encoding in ["gzip", "br"] {
         let cache = make_plugin(json!({"ttl_seconds": 300}));
-        let compression = Arc::new(
-            CompressionPlugin::new(&json!({"decompress_request": true})).unwrap(),
-        );
+        let compression =
+            Arc::new(CompressionPlugin::new(&json!({"decompress_request": true})).unwrap());
 
         let (mut first_ctx, mut first_headers, first_body) =
             normalize_semantic_cache_request(&compression, encoding, &body).await;
         assert_eq!(first_body, body);
-        let first = cache
-            .before_proxy(&mut first_ctx, &mut first_headers)
-            .await;
+        let first = cache.before_proxy(&mut first_ctx, &mut first_headers).await;
         assert!(matches!(first, PluginResult::Continue));
         assert_eq!(
             first_ctx
