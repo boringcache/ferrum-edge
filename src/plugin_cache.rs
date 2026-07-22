@@ -3022,8 +3022,7 @@ pub(crate) struct PluginCacheInner {
     /// Authenticated `/metrics` appends this exactly once per scrape via a
     /// single `ArcSwap` load — never by scanning plugins and never by
     /// retaining a stale removed/replaced instance across reloads.
-    mesh_bpf_metrics_exporter:
-        Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter>,
+    mesh_bpf_metrics_exporter: Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter>,
 }
 
 /// Extract the active `__mesh_bpf_metrics` scrape exporter from a global

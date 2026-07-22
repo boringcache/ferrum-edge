@@ -20,8 +20,8 @@ use ferrum_edge::ebpf::bpf_metrics::BpfMetricsState;
 use ferrum_edge::modes::mesh::MESH_BPF_METRICS_PLUGIN_ID;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::mesh::bpf_metrics::{DEFAULT_METRIC_PREFIX, PLUGIN_NAME};
-use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
+use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::collections::HashSet;
@@ -224,7 +224,9 @@ async fn authenticated_metrics_includes_seeded_mesh_bpf_families() {
         "seeded accept counter missing from /metrics:\n{body}"
     );
     assert!(
-        body.contains(&format!("{DEFAULT_METRIC_PREFIX}_srtt_microseconds_sum 250")),
+        body.contains(&format!(
+            "{DEFAULT_METRIC_PREFIX}_srtt_microseconds_sum 250"
+        )),
         "seeded srtt sum missing from /metrics:\n{body}"
     );
     assert_single_tcp_events_family(&body, DEFAULT_METRIC_PREFIX);
@@ -308,16 +310,17 @@ async fn plugin_cache_reload_switches_exporter_atomically() {
         ConfigApplyOutcome::Applied
     );
     assert!(
-        proxy_state.plugin_cache.mesh_bpf_metrics_exporter().is_none(),
+        proxy_state
+            .plugin_cache
+            .mesh_bpf_metrics_exporter()
+            .is_none(),
         "removed plugin must clear the precomputed exporter"
     );
 
     // Re-add without an attached BPF state on a fresh cache → stable zeros.
-    let zero_cache = PluginCache::with_http_client(
-        &gateway_with_bpf_metrics(None),
-        PluginHttpClient::default(),
-    )
-    .expect("cache with zero-state bpf metrics");
+    let zero_cache =
+        PluginCache::with_http_client(&gateway_with_bpf_metrics(None), PluginHttpClient::default())
+            .expect("cache with zero-state bpf metrics");
     let zero_body = zero_cache
         .mesh_bpf_metrics_exporter()
         .expect("zero-state exporter")
