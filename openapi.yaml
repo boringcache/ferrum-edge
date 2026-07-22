@@ -15609,11 +15609,17 @@ components:
 
     ResponseTransformerConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: response_transformer — Modifies response headers and JSON
-        body. Same validation rules as request_transformer (unknown
-        operations / targets, missing value / new_key, and CR/LF in header
-        values are rejected at plugin load time). Every rule must set an
+        body. Configuration is fail-closed: unknown top-level keys and
+        unknown per-rule keys are rejected at plugin load time. Header
+        rules enforce operation-exact fields (only add/update accept
+        `value`; only rename accepts `new_key`; remove accepts neither).
+        Every configured header `value` must be a valid HTTP `HeaderValue`
+        (same complete syntax accepted at emission), including rejection of
+        non-CR/LF forbidden control bytes. Unknown operations / targets and
+        missing required fields are also rejected. Every rule must set an
         explicit `target` (`header` or `body`); there is no default. Valid
         targets are `header` and `body` only — unlike request_transformer,
         there is no `query` target.
@@ -15657,6 +15663,7 @@ components:
 
     ResponseTransformerHeaderRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15667,6 +15674,9 @@ components:
             update: write the header value.
             remove: delete the header.
             rename: move old → new header name.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: header
@@ -15676,14 +15686,18 @@ components:
         value:
           type: string
           description: |
-            Required for add/update. Must be a string and must not contain
-            CR or LF.
+            Required for add/update; must not be set for remove/rename.
+            Must be a valid HTTP HeaderValue (HTAB, visible ASCII, and
+            obs-text are accepted; CR, LF, DEL, and other C0 controls are
+            rejected).
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     ResponseTransformerBodyRule:
       type: object
+      additionalProperties: false
       required: [operation, target, key]
       properties:
         operation:
@@ -15694,6 +15708,9 @@ components:
             update: write, creating intermediate objects as needed.
             remove: delete the field.
             rename: move old → new, with rollback if the destination is unreachable.
+            Operation-incompatible extras are rejected: only add/update
+            may set `value`; only rename may set `new_key`; remove may
+            set neither.
         target:
           type: string
           const: body
@@ -15704,14 +15721,15 @@ components:
             ('items.0'), and backslash-escaped literal dots.
         value:
           description: |
-            Required for add/update. Accepts any JSON value — strings,
-            numbers, booleans, objects, arrays, and explicit null.
-            Strings that parse as JSON (e.g., "42", "true", '{"a":1}')
-            are inserted as the parsed type at runtime; otherwise kept
-            as a JSON string.
+            Required for add/update; must not be set for remove/rename.
+            Accepts any JSON value — strings, numbers, booleans, objects,
+            arrays, and explicit null. Strings that parse as JSON
+            (e.g., "42", "true", '{"a":1}') are inserted as the parsed
+            type at runtime; otherwise kept as a JSON string.
         new_key:
           type: string
-          description: Required for rename operations.
+          description: |
+            Required for rename; must not be set for add/update/remove.
 
     SecurityHeadersConfig:
       type: object

@@ -2995,7 +2995,14 @@ config:
 
 **Valid targets for `response_transformer` are `header` and `body` ONLY** — unlike `request_transformer`, there is no `query` target (query parameters are part of the request, not the response). Configs specifying `target: query` are rejected at plugin load time.
 
-**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
+**Operations and required fields** match `request_transformer` (see the table above). Configuration is fail-closed at plugin load time:
+
+- Unknown top-level keys and unknown header/body rule keys are rejected with path-qualified diagnostics (for example `config.rules[0]`).
+- Unknown operations and unknown targets (valid here: `header` or `body`) are rejected.
+- Header operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints.
+- Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
+- Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF, DEL, and other forbidden control bytes fail construction instead of being dropped later at a protocol boundary.
+- Non-string values for `target`, `operation`, `key`, or `new_key` are rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
 
 Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
