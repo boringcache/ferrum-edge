@@ -500,7 +500,10 @@ fn wrr_vec_path_fingerprint_churn_beyond_cache_capacity_amortizes_publishes() {
     }
 
     let (publishes, fallbacks) = lb.wrr_parent_schedule_counters();
-    assert!(fallbacks > 0, "vec churn must use allocation-free miss fallback");
+    assert!(
+        fallbacks > 0,
+        "vec churn must use allocation-free miss fallback"
+    );
     let max_publishes = (CACHE_SLOTS as u64) + selections / 32 + 1;
     assert!(
         publishes <= max_publishes,
