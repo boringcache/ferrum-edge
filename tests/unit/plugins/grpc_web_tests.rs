@@ -701,14 +701,14 @@ fn test_buffer_request_body_text_mode() {
 }
 
 #[test]
-fn test_no_buffer_request_body_binary_mode() {
+fn test_buffer_request_body_binary_mode_for_complete_validation() {
     let plugin = create_plugin_default();
     let mut ctx = create_grpc_web_context("application/grpc-web");
 
     ctx.metadata
         .insert("grpc_web_mode".to_string(), "binary".to_string());
 
-    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert!(plugin.should_buffer_request_body(&ctx));
 }
 
 #[test]
@@ -815,72 +815,143 @@ async fn test_transform_request_body_empty() {
 
 // ── on_final_request_body — validation ──
 
-#[tokio::test]
-async fn test_final_request_body_valid_grpc_framing() {
-    let plugin = create_plugin_default();
-
-    let mut body = vec![0x00u8]; // data frame flag
-    body.extend_from_slice(&5u32.to_be_bytes());
-    body.extend_from_slice(b"hello");
-
-    let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
-
-    let result = plugin.on_final_request_body(&headers, &body).await;
-    assert!(matches!(result, PluginResult::Continue));
+fn request_frame(flag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(flag);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
 }
 
-#[tokio::test]
-async fn test_final_request_body_rejects_too_short() {
-    let plugin = create_plugin_default();
-
-    let body = b"abc"; // Too short for gRPC framing (needs >= 5 bytes)
-
+fn request_mode_headers(mode: &str) -> HashMap<String, String> {
     let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
+    headers.insert("x-grpc-web-mode".to_string(), mode.to_string());
+    headers
+}
 
-    let result = plugin.on_final_request_body(&headers, body).await;
-    assert!(matches!(
-        result,
+fn assert_grpc_web_request_rejected(result: PluginResult, case: &str) {
+    match result {
         PluginResult::Reject {
-            status_code: 400,
-            ..
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 400, "{case}");
+            assert!(body.contains("Invalid gRPC-Web request"), "{case}: {body}");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/grpc"),
+                "{case}"
+            );
         }
-    ));
+        other => panic!("{case}: expected rejection, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn test_final_request_body_rejects_invalid_flag() {
+async fn test_final_request_body_accepts_complete_single_and_multiple_frames_in_both_modes() {
     let plugin = create_plugin_default();
+    let single = request_frame(0x00, b"hello");
+    let mut multiple = request_frame(0x00, b"one");
+    multiple.extend_from_slice(&request_frame(0x00, b"two"));
 
-    let mut body = vec![0x42u8]; // Invalid flag byte (not 0x00 or 0x80)
-    body.extend_from_slice(&5u32.to_be_bytes());
-    body.extend_from_slice(b"hello");
-
-    let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
-
-    let result = plugin.on_final_request_body(&headers, &body).await;
-    assert!(matches!(
-        result,
-        PluginResult::Reject {
-            status_code: 400,
-            ..
+    for mode in ["text", "binary"] {
+        let headers = request_mode_headers(mode);
+        for body in [&single, &multiple] {
+            assert!(matches!(
+                plugin.on_final_request_body(&headers, body).await,
+                PluginResult::Continue
+            ));
         }
-    ));
+    }
 }
 
 #[tokio::test]
-async fn test_final_request_body_skips_binary_mode() {
+async fn test_final_request_body_compressed_flag_requires_declared_non_identity_encoding() {
     let plugin = create_plugin_default();
+    let body = request_frame(0x01, b"compressed-payload");
 
-    let body = b"anything"; // Invalid gRPC framing, but binary mode skips validation
+    for mode in ["text", "binary"] {
+        let mut valid = request_mode_headers(mode);
+        valid.insert("Grpc-Encoding".to_string(), "gzip".to_string());
+        assert!(matches!(
+            plugin.on_final_request_body(&valid, &body).await,
+            PluginResult::Continue
+        ));
 
-    let mut headers = HashMap::new();
-    headers.insert("x-grpc-web-mode".to_string(), "binary".to_string());
+        for (case, encoding) in [
+            ("missing", None),
+            ("empty", Some("")),
+            ("identity", Some("identity")),
+            ("list", Some("gzip, br")),
+            ("invalid token", Some("gzip br")),
+        ] {
+            let mut invalid = request_mode_headers(mode);
+            if let Some(encoding) = encoding {
+                invalid.insert("grpc-encoding".to_string(), encoding.to_string());
+            }
+            assert_grpc_web_request_rejected(
+                plugin.on_final_request_body(&invalid, &body).await,
+                case,
+            );
+        }
 
-    let result = plugin.on_final_request_body(&headers, body).await;
-    assert!(matches!(result, PluginResult::Continue));
+        let mut duplicate = request_mode_headers(mode);
+        duplicate.insert("grpc-encoding".to_string(), "gzip".to_string());
+        duplicate.insert("Grpc-Encoding".to_string(), "br".to_string());
+        assert_grpc_web_request_rejected(
+            plugin.on_final_request_body(&duplicate, &body).await,
+            "duplicate grpc-encoding",
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_final_request_body_rejects_every_malformed_envelope_boundary() {
+    let plugin = create_plugin_default();
+    let complete = request_frame(0x00, b"ok");
+    let mut invalid_later_flag = complete.clone();
+    invalid_later_flag.extend_from_slice(&request_frame(0x42, b"later"));
+    let mut data_then_trailer = complete.clone();
+    data_then_trailer.extend_from_slice(&request_frame(0x80, b"grpc-status: 0\r\n"));
+    let mut trailer_then_data = request_frame(0x80, b"grpc-status: 0\r\n");
+    trailer_then_data.extend_from_slice(&complete);
+    let mut trailing_byte = complete.clone();
+    trailing_byte.push(0);
+
+    let mut cases = vec![
+        ("empty", Vec::new()),
+        ("invalid first flag", request_frame(0x42, b"bad")),
+        ("invalid later flag", invalid_later_flag),
+        ("request trailer", request_frame(0x80, b"grpc-status: 0\r\n")),
+        ("compressed request trailer", request_frame(0x81, b"trailers")),
+        ("data then trailer", data_then_trailer),
+        ("trailer then data", trailer_then_data),
+        ("trailing byte", trailing_byte),
+        ("u32 max declared length", vec![0x00, 0xff, 0xff, 0xff, 0xff]),
+    ];
+    for header_len in 1..5 {
+        cases.push(("truncated first header", vec![0; header_len]));
+        let mut later = complete.clone();
+        later.extend_from_slice(&[0; 4][..header_len]);
+        cases.push(("truncated later header", later));
+    }
+    for present in 0..5 {
+        let mut truncated = vec![0x00];
+        truncated.extend_from_slice(&5u32.to_be_bytes());
+        truncated.extend_from_slice(&b"hello"[..present]);
+        cases.push(("truncated payload", truncated));
+    }
+
+    for mode in ["text", "binary"] {
+        let headers = request_mode_headers(mode);
+        for (case, body) in &cases {
+            assert_grpc_web_request_rejected(
+                plugin.on_final_request_body(&headers, body).await,
+                case,
+            );
+        }
+    }
 }
 
 #[tokio::test]

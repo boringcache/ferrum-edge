@@ -632,6 +632,30 @@ async fn send_http_request_with_body_and_accept(
     accept: Option<&str>,
     body: Bytes,
 ) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    send_http_request_with_body_accept_and_encoding(
+        gateway_addr,
+        version,
+        method,
+        path,
+        content_type,
+        accept,
+        None,
+        body,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_http_request_with_body_accept_and_encoding(
+    gateway_addr: SocketAddr,
+    version: TestHttpVersion,
+    method: Method,
+    path: &str,
+    content_type: &str,
+    accept: Option<&str>,
+    grpc_encoding: Option<&str>,
+    body: Bytes,
+) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     let stream = tokio::net::TcpStream::connect(gateway_addr).await?;
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
@@ -642,6 +666,9 @@ async fn send_http_request_with_body_and_accept(
         .header("content-type", content_type);
     if let Some(accept) = accept {
         request = request.header("accept", accept);
+    }
+    if let Some(grpc_encoding) = grpc_encoding {
+        request = request.header("grpc-encoding", grpc_encoding);
     }
     let request = request.body(Full::new(body))?;
 
@@ -685,6 +712,31 @@ async fn send_http_request_with_body_and_accept(
         .map(|collected| collected.to_bytes().to_vec())
         .unwrap_or_default();
     Ok((status, headers, body))
+}
+
+fn assert_integration_grpc_web_status(
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    text_mode: bool,
+    expected_status: u32,
+) {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let decoded;
+    let framed = if text_mode {
+        decoded = BASE64.decode(body).expect("gRPC-Web text response base64");
+        decoded.as_slice()
+    } else {
+        body
+    };
+    let expected = format!("grpc-status: {expected_status}");
+    assert!(
+        framed
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "missing {expected} in gRPC-Web body; headers={headers:?}, body={framed:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -818,6 +870,133 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
             assert_eq!(headers.get("vary").map(String::as_str), Some("Accept"));
             assert!(!headers.contains_key("x-ferrum-grpc-web-accept-rejected"));
             assert!(String::from_utf8_lossy(&body).contains("Not Acceptable"));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_request_envelopes_are_validated_on_h1_and_h2_binary_and_text() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
+    let mut proxy = create_grpc_proxy("grpc-web-envelope", "/grpc-envelope", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    attach_test_plugin(&mut proxy, "grpc-web-envelope-plugin");
+    let plugin = test_plugin_config(
+        "grpc-web-envelope-plugin",
+        "grpc_web",
+        "grpc-web-envelope",
+        serde_json::json!({}),
+    );
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let mut compressed = vec![0x01, 0, 0, 0, 4];
+    compressed.extend_from_slice(b"data");
+    let mut complete_then_invalid = vec![0x00, 0, 0, 0, 0];
+    complete_then_invalid.extend_from_slice(&[0x42, 0, 0, 0, 0]);
+    let mut data_then_trailer = vec![0x00, 0, 0, 0, 0];
+    data_then_trailer.extend_from_slice(&[0x80, 0, 0, 0, 0]);
+
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        for (content_type, text_mode) in [
+            ("application/grpc-web+proto", false),
+            ("application/grpc-web-text+proto", true),
+        ] {
+            let wire = if text_mode {
+                Bytes::from(BASE64.encode(&compressed))
+            } else {
+                Bytes::from(compressed.clone())
+            };
+            let mut accepted = false;
+            for _attempt in 0..5 {
+                let (status, headers, body) = send_http_request_with_body_accept_and_encoding(
+                    gateway_addr,
+                    version,
+                    Method::POST,
+                    "/grpc-envelope/my.Service/Unary",
+                    content_type,
+                    None,
+                    Some("gzip"),
+                    wire.clone(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{version:?} compressed {content_type} request failed: {error}")
+                });
+                if status == 200 {
+                    let decoded = text_mode
+                        .then(|| BASE64.decode(&body).expect("text success response base64"));
+                    let framed = decoded.as_deref().unwrap_or(&body);
+                    if framed
+                        .windows(b"grpc-status: 0".len())
+                        .any(|window| window == b"grpc-status: 0")
+                    {
+                        accepted = true;
+                        assert_eq!(
+                            headers.get("content-type").map(String::as_str),
+                            Some(content_type)
+                        );
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(accepted, "{version:?} valid compressed {content_type} rejected");
+
+            let malformed = if text_mode {
+                vec![
+                    ("invalid base64", Bytes::from_static(b"not!base64")),
+                    (
+                        "truncated payload",
+                        Bytes::from(BASE64.encode([0x00, 0, 0, 0, 5, b'x'])),
+                    ),
+                    (
+                        "invalid later flag",
+                        Bytes::from(BASE64.encode(&complete_then_invalid)),
+                    ),
+                    (
+                        "request trailer after data",
+                        Bytes::from(BASE64.encode(&data_then_trailer)),
+                    ),
+                ]
+            } else {
+                vec![
+                    (
+                        "truncated payload",
+                        Bytes::from_static(&[0x00, 0, 0, 0, 5, b'x']),
+                    ),
+                    (
+                        "invalid later flag",
+                        Bytes::from(complete_then_invalid.clone()),
+                    ),
+                    (
+                        "request trailer after data",
+                        Bytes::from(data_then_trailer.clone()),
+                    ),
+                ]
+            };
+            for (case, wire) in malformed {
+                let (status, headers, body) = send_http_request_with_body_and_accept(
+                    gateway_addr,
+                    version,
+                    Method::POST,
+                    "/grpc-envelope/my.Service/Unary",
+                    content_type,
+                    None,
+                    wire,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{version:?} {case} request failed: {error}"));
+                assert_eq!(status, 200, "{version:?} {case}");
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some(content_type),
+                    "{version:?} {case}"
+                );
+                assert_integration_grpc_web_status(&headers, &body, text_mode, 3);
+            }
         }
     }
 }
