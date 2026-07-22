@@ -80,6 +80,7 @@ const RESERVED_TAG_KEYS: &[&str] = &[
     "method",
     "status",
     "status_class",
+    "grpc_status",
     "proxy",
     "protocol",
     "error",
@@ -327,6 +328,45 @@ pub fn bounded_method_tag(method: &str) -> &'static str {
         .find(|known| **known == method)
         .copied()
         .unwrap_or(OTHER_METHOD)
+}
+
+/// Bound a terminal gRPC application status for StatsD tags/counters.
+///
+/// Standard codes retain their decimal representation (`0`–`16`). Malformed
+/// input (`u32::MAX` from [`crate::proxy::grpc_proxy::parse_grpc_status_value`])
+/// and future non-standard codes share one `OTHER` bucket so trailer-controlled
+/// values cannot drive unbounded tag/metric cardinality. HTTP transport status
+/// remains a separate `status` / `status_class` dimension.
+pub fn bounded_grpc_status_tag(status: u32) -> &'static str {
+    match status {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        10 => "10",
+        11 => "11",
+        12 => "12",
+        13 => "13",
+        14 => "14",
+        15 => "15",
+        16 => "16",
+        _ => "OTHER",
+    }
+}
+
+/// Authoritative bounded gRPC outcome for StatsD, when the transaction is gRPC.
+///
+/// Uses [`TransactionSummary::grpc_status`] so buffered, trailers-only,
+/// streamed, native H3, and gateway-generated rejection paths share one
+/// contract. Non-gRPC HTTP transactions return `None` (no tag / counter).
+pub fn http_grpc_status_tag(summary: &TransactionSummary) -> Option<&'static str> {
+    summary.grpc_status().map(bounded_grpc_status_tag)
 }
 
 fn validate_statsd_schema_keys(schema: Option<&SummarySchema>) -> Result<HashSet<String>, String> {
@@ -673,6 +713,7 @@ pub fn format_http_metrics(
     let method = bounded_method_tag(&summary.http_method);
     let status = summary.response_status_code;
     let status_class = format!("{}xx", status / 100);
+    let grpc_status = http_grpc_status_tag(summary);
     let proxy_raw = summary
         .proxy_name
         .as_deref()
@@ -698,6 +739,12 @@ pub fn format_http_metrics(
     }
     if let Some(k) = resolve_tag_key(effective_schema, "proxy", HTTP_TAG_NATIVE) {
         let _ = builder.push(k, format_args!("{proxy_tag}"));
+    }
+    // Derived / bounded: always emitted under the reserved `grpc_status` key
+    // when the summary carries an authoritative terminal gRPC status. Schema
+    // rename/omit do not apply (same class as `status_class` / `body_outcome`).
+    if let Some(grpc_status) = grpc_status {
+        let _ = builder.push("grpc_status", format_args!("{grpc_status}"));
     }
     let _ = builder.push("body_outcome", format_args!("{body_outcome}"));
     let _ = builder.push("body_error", format_args!("{body_error}"));
@@ -734,6 +781,10 @@ pub fn format_http_metrics(
         &tags,
     );
     let _ = writeln!(buf, "{prefix}.request.status.{status_class}:1|c{tags}");
+    // Classic StatsD-friendly counter family; DogStatsD also has the tag above.
+    if let Some(grpc_status) = grpc_status {
+        let _ = writeln!(buf, "{prefix}.request.grpc_status.{grpc_status}:1|c{tags}");
+    }
     if summary.client_disconnected {
         let _ = writeln!(buf, "{prefix}.request.client_disconnect:1|c{tags}");
     }

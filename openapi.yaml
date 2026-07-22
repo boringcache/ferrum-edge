@@ -11952,7 +11952,7 @@ components:
         Admin validation. Nested `global_tags` remains an intentionally open
         string map, but keys must match [A-Za-z_][A-Za-z0-9_.-]* (max 64 bytes)
         and cannot override reserved or schema-renamed runtime tags (namespace, method, status,
-        status_class, proxy, protocol, error, cause, direction, body_outcome,
+        status_class, grpc_status, proxy, protocol, error, cause, direction, body_outcome,
         body_error, result, io_side, error_class). The authoritative namespace
         tag is always appended and preserves the full validated Ferrum namespace
         (up to 254 bytes). Metric prefixes are sanitized and capped at 256
@@ -11961,10 +11961,13 @@ components:
         ceiling; indivisible oversized lines are dropped rather than fragmented.
         Mirror summaries are excluded from request.* families. Timers require
         finite non-negative samples (the -1.0 no-backend TTFB sentinel is
-        omitted). WebSocket session completion emits websocket.* families via
-        on_ws_disconnect. Registration policy is OptionalFailOpen (invalid
-        enabled configs warn and omit the plugin on file-mode load / cache
-        rebuild rather than aborting the gateway). See docs/plugins.md.
+        omitted). gRPC transactions add a bounded grpc_status tag and
+        request.grpc_status.{code} counter (0-16 or OTHER) while keeping HTTP
+        status/status_class distinct. WebSocket session completion emits
+        websocket.* families via on_ws_disconnect. Registration policy is
+        OptionalFailOpen (invalid enabled configs warn and omit the plugin on
+        file-mode load / cache rebuild rather than aborting the gateway). See
+        docs/plugins.md.
       required:
         - host
       properties:

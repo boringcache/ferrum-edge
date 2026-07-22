@@ -413,7 +413,7 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 | `host` | String | *(required)* | StatsD server hostname or IP address |
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
 | `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Sanitized for line-protocol safety; max 256 bytes after sanitization. |
-| `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`) or any effective key introduced by a schema rename. Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
+| `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `grpc_status`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`) or any effective key introduced by a schema rename. Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing |
@@ -442,10 +442,19 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 | `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead |
 | `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
 | `{prefix}.request.status.{N}xx` | Counter | HTTP header status-code bucket (2xx, 4xx, 5xx, etc.) — preserved even when the body later fails |
+| `{prefix}.request.grpc_status.{code}` | Counter | Terminal gRPC application status for gRPC transactions only (`0`–`16`, or `OTHER` for malformed/future codes). Absent for plain HTTP |
 | `{prefix}.request.client_disconnect` | Counter | Emitted only when the terminal HTTP summary records `client_disconnected: true` |
 | `{prefix}.request.body_incomplete` | Counter | Emitted when terminal body delivery did not complete (`body_outcome:incomplete`) |
 
-Tags: `method`, `status`, `status_class`, `proxy`, `body_outcome`, `body_error`, `namespace` (plus any `global_tags`).
+Tags: `method`, `status`, `status_class`, `grpc_status` (gRPC only), `proxy`, `body_outcome`, `body_error`, `namespace` (plus any `global_tags`).
+
+**`grpc_status` composition.** Native gRPC RPCs normally complete with HTTP `200` and carry the application outcome in trailers. StatsD keeps HTTP `status` / `status_class` as the transport dimension and adds a separate bounded `grpc_status` tag (and matching `request.grpc_status.{code}` counter) from the authoritative terminal summary value:
+
+- Standard codes `0`–`16` retain their decimal label
+- Malformed or non-standard codes collapse to `OTHER` (cardinality bound)
+- Missing terminal status on a known gRPC transaction normalizes to `2` (`UNKNOWN`), matching the shared `TransactionSummary::grpc_status` contract
+- Ordinary backend failures and gateway-generated gRPC rejections use the same tag/counter family
+- Plain HTTP / non-gRPC transactions omit both the tag and the counter
 
 **`body_outcome` / `body_error` composition.** `status` / `status_class` always reflect the HTTP response headers. Terminal body state is separate:
 
