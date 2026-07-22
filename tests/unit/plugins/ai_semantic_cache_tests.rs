@@ -1,4 +1,5 @@
 use ferrum_edge::_test_support::{
+    apply_buffered_request_body_normalization_before_before_proxy_for_test,
     ai_semantic_cache_clear_vector_index_dirty_for_test, ai_semantic_cache_embedding,
     ai_semantic_cache_expire_all_entries_for_test, ai_semantic_cache_force_cleanup_for_test,
     ai_semantic_cache_scope_key, ai_semantic_cache_set_store_post_admit_hook_for_test,
@@ -11,6 +12,7 @@ use ferrum_edge::config::types::Consumer;
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::ai_semantic_cache::AiSemanticCache;
+use ferrum_edge::plugins::compression::CompressionPlugin;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
@@ -145,6 +147,65 @@ async fn store_response(
 
 fn make_plugin(config: serde_json::Value) -> AiSemanticCache {
     AiSemanticCache::new(&config, PluginHttpClient::default()).unwrap()
+}
+
+fn compress_semantic_cache_request(encoding: &str, plaintext: &[u8]) -> Vec<u8> {
+    match encoding {
+        "gzip" => {
+            use flate2::write::GzEncoder;
+            use std::io::Write;
+
+            let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(plaintext).unwrap();
+            encoder.finish().unwrap()
+        }
+        "br" => {
+            let params = brotli::enc::BrotliEncoderParams::default();
+            let mut compressed = Vec::new();
+            brotli::BrotliCompress(&mut &plaintext[..], &mut compressed, &params).unwrap();
+            compressed
+        }
+        other => panic!("unsupported test encoding {other}"),
+    }
+}
+
+async fn normalize_semantic_cache_request(
+    compression: &Arc<CompressionPlugin>,
+    encoding: &str,
+    plaintext: &[u8],
+) -> (RequestContext, HashMap<String, String>, Vec<u8>) {
+    let mut body = compress_semantic_cache_request(encoding, plaintext);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), encoding.to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(&body));
+    let mut headers = ctx.headers.clone();
+    headers.insert("content-length".to_string(), body.len().to_string());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(compression) as Arc<dyn Plugin>];
+
+    let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+    ctx.headers = headers.clone();
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body, plaintext);
+    assert_eq!(
+        ctx.metadata.get("request_body").map(String::as_bytes),
+        Some(plaintext)
+    );
+    assert!(!headers.contains_key("content-encoding"));
+    assert!(!headers.contains_key("content-length"));
+    (ctx, headers, body)
 }
 
 async fn mount_embedding_mock(server: &MockServer, expected_calls: u64) {
@@ -742,6 +803,65 @@ async fn test_cache_miss_then_hit() {
             assert_eq!(&body[..], response_body);
         }
         _ => panic!("Expected cache HIT (RejectBinary), got {:?}", result),
+    }
+}
+
+#[tokio::test]
+async fn configured_decompression_preserves_semantic_cache_miss_store_hit_lifecycle() {
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "compressed cache identity"}]
+    }))
+    .unwrap();
+    let response_body = br#"{"choices":[{"message":{"content":"cached"}}]}"#;
+
+    for encoding in ["gzip", "br"] {
+        let cache = make_plugin(json!({"ttl_seconds": 300}));
+        let compression = Arc::new(
+            CompressionPlugin::new(&json!({"decompress_request": true})).unwrap(),
+        );
+
+        let (mut first_ctx, mut first_headers, first_body) =
+            normalize_semantic_cache_request(&compression, encoding, &body).await;
+        assert_eq!(first_body, body);
+        let first = cache
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await;
+        assert!(matches!(first, PluginResult::Continue));
+        assert_eq!(
+            first_ctx
+                .metadata
+                .get("ai_cache_status")
+                .map(String::as_str),
+            Some("MISS")
+        );
+
+        let response_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let stored = cache
+            .on_final_response_body(&mut first_ctx, 200, &response_headers, response_body)
+            .await;
+        assert!(matches!(stored, PluginResult::Continue));
+
+        let (mut retry_ctx, mut retry_headers, retry_body) =
+            normalize_semantic_cache_request(&compression, encoding, &body).await;
+        assert_eq!(retry_body, body);
+        match cache.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body: cached_body,
+                ..
+            } => {
+                assert_eq!(status_code, 200);
+                assert_eq!(
+                    headers.get("x-ai-cache-status").map(String::as_str),
+                    Some("HIT")
+                );
+                assert_eq!(cached_body.as_slice(), response_body);
+            }
+            other => panic!("expected {encoding} cache HIT after normalization, got {other:?}"),
+        }
     }
 }
 
