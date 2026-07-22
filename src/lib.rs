@@ -967,7 +967,13 @@ pub mod _test_support {
         plugins: &[Arc<dyn crate::plugins::Plugin>],
         message: &Message,
     ) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
-        crate::proxy::prepare_ws_frame_deliveries(plugins, message).into_vec()
+        match crate::proxy::prepare_ws_frame_deliveries(plugins, message) {
+            crate::proxy::WsFrameDeliveryBatch::None => Vec::new(),
+            crate::proxy::WsFrameDeliveryBatch::One(index, observation) => {
+                vec![(index, observation)]
+            }
+            crate::proxy::WsFrameDeliveryBatch::Many(entries) => entries,
+        }
     }
 
     /// Emit previously prepared delivery observations after a successful sink accept.
@@ -978,12 +984,24 @@ pub mod _test_support {
         direction: crate::plugins::WebSocketFrameDirection,
         prepared: Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>,
     ) {
+        let prepared = match prepared.len() {
+            0 => crate::proxy::WsFrameDeliveryBatch::None,
+            1 => {
+                let mut prepared = prepared;
+                if let Some((index, observation)) = prepared.pop() {
+                    crate::proxy::WsFrameDeliveryBatch::One(index, observation)
+                } else {
+                    crate::proxy::WsFrameDeliveryBatch::None
+                }
+            }
+            _ => crate::proxy::WsFrameDeliveryBatch::Many(prepared),
+        };
         crate::proxy::emit_ws_frame_deliveries(
             plugins,
             proxy_id,
             connection_id,
             direction,
-            crate::proxy::WsFrameDeliveryBatch::from_vec(prepared),
+            prepared,
         )
     }
 

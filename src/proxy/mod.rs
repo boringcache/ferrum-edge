@@ -11638,30 +11638,6 @@ impl WsFrameDeliveryBatch {
             }
         };
     }
-
-    pub(crate) fn into_vec(self) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
-        match self {
-            Self::None => Vec::new(),
-            Self::One(index, observation) => vec![(index, observation)],
-            Self::Many(entries) => entries,
-        }
-    }
-
-    pub(crate) fn from_vec(
-        mut entries: Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>,
-    ) -> Self {
-        match entries.len() {
-            0 => Self::None,
-            1 => {
-                if let Some((index, observation)) = entries.pop() {
-                    Self::One(index, observation)
-                } else {
-                    Self::None
-                }
-            }
-            _ => Self::Many(entries),
-        }
-    }
 }
 
 pub(crate) fn prepare_ws_frame_deliveries(
