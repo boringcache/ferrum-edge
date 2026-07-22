@@ -390,5 +390,4 @@ fn wrr_vec_path_alternating_exclusions_remain_correct() {
     for handle in handles {
         handle.join().expect("worker");
     }
-
 }

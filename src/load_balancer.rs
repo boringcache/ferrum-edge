@@ -414,10 +414,7 @@ impl WrrLaneState {
 
     /// Steady-state bitset hit: lookup + hit counter.
     #[inline]
-    fn hit_bitset_schedule(
-        &self,
-        fingerprint: u128,
-    ) -> Option<arc_swap::Guard<Arc<WrrSchedule>>> {
+    fn hit_bitset_schedule(&self, fingerprint: u128) -> Option<arc_swap::Guard<Arc<WrrSchedule>>> {
         let guard = self.lookup_bitset_schedule(fingerprint)?;
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
         Some(guard)
@@ -445,8 +442,7 @@ impl WrrLaneState {
         if slot_count == 0 {
             return;
         }
-        let idx =
-            (self.publish_cursor.fetch_add(1, Ordering::Relaxed) as usize) % slot_count;
+        let idx = (self.publish_cursor.fetch_add(1, Ordering::Relaxed) as usize) % slot_count;
         self.slots[idx].store(schedule);
         self.rebuilds.fetch_add(1, Ordering::Relaxed);
     }
@@ -3674,9 +3670,7 @@ impl LoadBalancer {
                 };
                 Some(Arc::clone(&self.targets[target_idx]))
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => {
-                self.select_wrr_bitset(healthy, wrr_state)
-            }
+            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr_bitset(healthy, wrr_state),
             LoadBalancerAlgorithm::LeastConnections => {
                 self.select_least_connections_bitset(healthy)
             }
@@ -3769,9 +3763,7 @@ impl LoadBalancer {
                 let hash = golden_ratio_hash(idx) as usize;
                 Some(Arc::clone(candidates[hash % candidates.len()].1))
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => {
-                self.select_wrr_vec(candidates, wrr_state)
-            }
+            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr_vec(candidates, wrr_state),
             LoadBalancerAlgorithm::LeastConnections => {
                 self.select_least_connections_vec(candidates)
             }
