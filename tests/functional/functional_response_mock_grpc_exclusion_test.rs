@@ -226,7 +226,8 @@ async fn h2_response_mock_excludes_native_grpc_unary_success() {
         .flat_map(|f| f.iter().copied())
         .collect::<Vec<_>>();
     assert!(
-        !raw.windows(MOCK_BODY.len()).any(|w| w == MOCK_BODY.as_bytes()),
+        !raw.windows(MOCK_BODY.len())
+            .any(|w| w == MOCK_BODY.as_bytes()),
         "configured mock body must not appear on the native gRPC wire"
     );
 }
@@ -320,7 +321,9 @@ async fn h3_response_mock_excludes_native_grpc_unary_success() {
         "backend framed unary payload must reach the H3 client"
     );
     assert!(
-        !body.windows(MOCK_BODY.len()).any(|w| w == MOCK_BODY.as_bytes()),
+        !body
+            .windows(MOCK_BODY.len())
+            .any(|w| w == MOCK_BODY.as_bytes()),
         "configured mock body must not appear on the H3 gRPC wire"
     );
 }
