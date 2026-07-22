@@ -3479,6 +3479,22 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
         "body value must remain unconstrained JSON (including null)"
     );
 
+    for component in [
+        "RequestTransformerConfig",
+        "RequestTransformerHeaderRule",
+        "RequestTransformerQueryRule",
+        "RequestTransformerBodyRule",
+    ] {
+        assert_eq!(
+            spec.pointer(&format!(
+                "/components/schemas/{component}/additionalProperties"
+            ))
+            .unwrap_or_else(|| panic!("{component}.additionalProperties")),
+            &json!(false),
+            "{component} must reject unknown properties"
+        );
+    }
+
     let runtime_overlay = spec
         .pointer("/components/schemas/RequestTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
@@ -3565,6 +3581,14 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime_overlay_scope": "internal",
             "default_enabled": false
         }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Edge",
+                "value": "tab\there"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, true);
         assert!(
@@ -3605,6 +3629,24 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             }],
             "runtime_overlay_scope": " \t "
         }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue"
+            }],
+            "runtime_overlay_scpoe": "internal"
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "vaule": "green"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, false);
         assert!(
@@ -3612,6 +3654,23 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid request_transformer config: {config}"
         );
     }
+
+    // Operation-incompatible extras are known OpenAPI properties but still fail
+    // runtime construction (schema cannot encode per-operation field sets).
+    let incompatible = json!({
+        "rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": "X-Color",
+            "value": "blue",
+            "new_key": "X-Ignored"
+        }]
+    });
+    assert_component_validity(&spec, "RequestTransformerConfig", &incompatible, true);
+    assert!(
+        RequestTransformer::new(&incompatible).is_err(),
+        "runtime must reject operation-incompatible header fields: {incompatible}"
+    );
 }
 
 #[test]
@@ -3667,6 +3726,21 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
         "body value must remain unconstrained JSON (including null)"
     );
 
+    for component in [
+        "ResponseTransformerConfig",
+        "ResponseTransformerHeaderRule",
+        "ResponseTransformerBodyRule",
+    ] {
+        assert_eq!(
+            spec.pointer(&format!(
+                "/components/schemas/{component}/additionalProperties"
+            ))
+            .unwrap_or_else(|| panic!("{component}.additionalProperties")),
+            &json!(false),
+            "{component} must reject unknown properties"
+        );
+    }
+
     let runtime_overlay = spec
         .pointer("/components/schemas/ResponseTransformerConfig/properties/runtime_overlay_scope")
         .expect("runtime_overlay_scope remains published");
@@ -3702,6 +3776,11 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime_overlay_scope": "internal",
             "default_enabled": false
         }),
+        json!({
+            "rules": [{
+                "operation": "add", "target": "header", "key": "X-Edge", "value": "tab\there"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "ResponseTransformerConfig", &config, true);
         assert!(
@@ -3725,6 +3804,21 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             }],
             "runtime_overlay_scope": " \t "
         }),
+        json!({
+            "rules": [{
+                "operation": "add", "target": "header", "key": "X-Color", "value": "blue"
+            }],
+            "runtime_overlay_scpoe": "internal"
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "vaule": "green"
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "ResponseTransformerConfig", &config, false);
         assert!(
@@ -3732,6 +3826,23 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
             "runtime accepted OpenAPI-invalid response_transformer config: {config}"
         );
     }
+
+    // Operation-incompatible extras are known OpenAPI properties but still fail
+    // runtime construction (schema cannot encode per-operation field sets).
+    let incompatible = json!({
+        "rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": "X-Color",
+            "value": "blue",
+            "new_key": "X-Ignored"
+        }]
+    });
+    assert_component_validity(&spec, "ResponseTransformerConfig", &incompatible, true);
+    assert!(
+        ResponseTransformer::new(&incompatible).is_err(),
+        "runtime must reject operation-incompatible header fields: {incompatible}"
+    );
 }
 
 #[test]
@@ -7804,6 +7915,10 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(description.contains("WebSocket"));
     assert!(description.contains("frame stream"));
     assert!(
+        description.contains("Native gRPC") && description.contains("unsupported"),
+        "ResponseMockConfig must document native gRPC exclusion: {description}"
+    );
+    assert!(
         description.contains("204")
             && description.contains("205")
             && description.contains("304")
@@ -7935,13 +8050,15 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
     assert!(guide.contains("Status / body wire semantics"));
     assert!(guide.contains("informational statuses"));
+    assert!(guide.contains("Native gRPC exclusion"));
+    assert!(guide.contains("native gRPC unsupported"));
 
     let matrix = include_str!("../../docs/plugin_execution_order.md");
     assert!(
         matrix.contains(
-            "| `response_mock` | ✓ | ✓ | ✓ | | | Short-circuits HTTP/gRPC and WebSocket upgrade handshakes"
+            "| `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes"
         ),
-        "protocol matrix must mark WebSocket support for response_mock"
+        "protocol matrix must mark HTTP+WebSocket support and exclude native gRPC for response_mock"
     );
 }
 

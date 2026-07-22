@@ -1192,6 +1192,45 @@ async fn test_loki_logging_stream_disconnect_does_not_panic() {
 }
 
 #[tokio::test]
+async fn test_loki_logging_delivers_stream_sni_hostname() {
+    // Full-summary sinks serialize StreamTransactionSummary unchanged; SNI must
+    // survive Loki push payloads the same way http_logging does (#2531).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let plugin = LokiLogging::new(
+        &json!({
+            "endpoint_url": format!("{}/loki/api/v1/push", server.uri()),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "gzip": false
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut summary = create_test_stream_transaction_summary();
+    summary.protocol = "dtls".to_string();
+    summary.sni_hostname = Some("device.example".to_string());
+    plugin.on_stream_disconnect(&summary).await;
+
+    let requests = wait_for_requests(&server, 1).await;
+    let payload: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let line = payload["streams"][0]["values"][0][1]
+        .as_str()
+        .expect("loki line JSON");
+    let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(entry["sni_hostname"], "device.example");
+    assert_eq!(entry["protocol"], "dtls");
+}
+
+#[tokio::test]
 async fn test_loki_logging_label_options_disabled() {
     let plugin = LokiLogging::new(
         &json!({

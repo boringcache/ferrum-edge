@@ -4782,9 +4782,10 @@ pub struct StreamConnectionContext {
     /// DER-encoded CA/intermediate certificates from the client's certificate chain.
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    /// SNI hostname from the frontend TLS/DTLS ClientHello or terminated TLS
-    /// handshake when available. Available to plugins for logging, routing, or
-    /// access control.
+    /// SNI hostname from the frontend TLS/DTLS ClientHello (passthrough peek or
+    /// terminating handshake) when available. Available to plugins for logging,
+    /// routing, or access control. The same value is carried into
+    /// `StreamTransactionSummary.sni_hostname` on disconnect.
     pub sni_hostname: Option<String>,
     /// Mesh traffic direction stamped by the stream listener that accepted this
     /// connection. Mirrors `RequestContext::mesh_direction`; `None` for stream
@@ -4976,7 +4977,11 @@ pub struct StreamTransactionSummary {
     pub disconnect_cause: Option<DisconnectCause>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
-    /// SNI hostname extracted from the TLS/DTLS ClientHello during passthrough mode.
+    /// SNI hostname from the frontend TLS/DTLS ClientHello when available.
+    /// Populated for TCP TLS termination, DTLS termination, and TLS/DTLS
+    /// passthrough (ClientHello peek). Omitted from JSON when null so sinks
+    /// that serialize `StreamTransactionSummary` unchanged (e.g. `http_logging`,
+    /// `loki_logging`) retain connect/disconnect parity for every stream path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sni_hostname: Option<String>,
     /// Plugin-injected metadata (e.g., correlation ID, trace ID) carried
@@ -5258,6 +5263,18 @@ pub trait Plugin: Send + Sync {
     /// `FERRUM_REAL_IP_HEADER`, or ambiguous writers.
     #[doc(hidden)]
     fn correlation_id_header_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Cold-path scrape exporter for `__mesh_bpf_metrics`.
+    ///
+    /// Plugin-cache generations extract this once from the constructed global
+    /// instance so authenticated `GET /metrics` can append the BPF surface
+    /// without scanning plugins or allocating a new representation per scrape.
+    /// Ordinary plugins retain the allocation-free default.
+    fn mesh_bpf_metrics_exporter(
+        &self,
+    ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
         None
     }
 
@@ -6532,6 +6549,11 @@ pub trait Plugin: Send + Sync {
 /// Uses a default `PluginHttpClient` for plugins that make outbound HTTP calls.
 /// Prefer [`create_plugin_with_http_client`] in production to share the gateway's
 /// pooled client across all plugins for connection reuse and keepalive.
+///
+/// Plugins that partition state by configured identity (notably
+/// `request_deduplication`) should be constructed through
+/// [`create_plugin_with_http_client_and_config_id`] with the stable plugin-config
+/// resource id. Direct construction here uses a validation-only default identity.
 #[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
     create_plugin_with_http_client(name, config, PluginHttpClient::default())
@@ -6550,10 +6572,31 @@ pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin
 /// - `Ok(Some(plugin))` — plugin created successfully
 /// - `Ok(None)` — unknown plugin name
 /// - `Err(msg)` — plugin config validation failed
+///
+/// For runtime construction of identity-partitioned plugins, prefer
+/// [`create_plugin_with_http_client_and_config_id`].
 pub fn create_plugin_with_http_client(
     name: &str,
     config: &Value,
     http_client: PluginHttpClient,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    create_plugin_with_http_client_and_config_id(name, config, http_client, None)
+}
+
+/// Create a plugin instance with a shared HTTP client and optional stable
+/// plugin-config resource id.
+///
+/// `plugin_config_id` is the configured plugin-config resource id (global /
+/// proxy / proxy_group). Production `PluginCache` passes `Some(&pc.id)` so
+/// Redis-backed `request_deduplication` instances partition logical keys by that
+/// identity. Pass `None` for config-validation and direct/test construction that
+/// does not need sibling isolation (uses the plugin's standalone default id).
+/// Blank ids fail closed when supplied.
+pub fn create_plugin_with_http_client_and_config_id(
+    name: &str,
+    config: &Value,
+    http_client: PluginHttpClient,
+    plugin_config_id: Option<&str>,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     // Fail CLOSED before constructing plugins with literal endpoints. LDAP uses
     // a dedicated fresh, policy-screened dial resolver; kafka_logging and
@@ -6693,9 +6736,21 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
-        "request_deduplication" => Ok(Some(Arc::new(
-            request_deduplication::RequestDeduplication::new(config, http_client.clone())?,
-        ))),
+        "request_deduplication" => {
+            let plugin = match plugin_config_id {
+                Some(config_id) => {
+                    request_deduplication::RequestDeduplication::new_with_instance_id(
+                        config,
+                        http_client.clone(),
+                        config_id,
+                    )?
+                }
+                None => {
+                    request_deduplication::RequestDeduplication::new(config, http_client.clone())?
+                }
+            };
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config)?,
         ))),
@@ -6713,9 +6768,12 @@ pub fn create_plugin_with_http_client(
         "request_termination" => Ok(Some(Arc::new(
             request_termination::RequestTermination::new(config)?,
         ))),
-        "response_caching" => Ok(Some(Arc::new(response_caching::ResponseCaching::new(
-            config,
-        )?))),
+        "response_caching" => Ok(Some(Arc::new(
+            response_caching::ResponseCaching::new_with_pool_shard_amount(
+                config,
+                http_client.pool_shard_amount(),
+            )?,
+        ))),
         "fault_injection" => Ok(Some(Arc::new(fault_injection::FaultInjectionPlugin::new(
             config,
         )?))),

@@ -604,6 +604,7 @@ jobs:
               integration::k8s_controller_istio_status_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests
+              integration::mesh_bpf_metrics_scrape_tests
               integration::mesh_federation_poller_tests
               integration::mesh_file_source_tests
               integration::mesh_multicluster_discovery_tests
@@ -974,6 +975,7 @@ jobs:
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
               functional_request_termination_h3_test
+              functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
               functional_websocket_limits_test
           - shard: data-plane
@@ -1195,7 +1197,9 @@ jobs:
             --run-ignored=all \
             --no-fail-fast \
             -j 1 \
-            'test_request_deduplication_redis_blocks_concurrent_cross_instance|test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks'
+            test_request_deduplication_redis_blocks_concurrent_cross_instance \
+            test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict \
+            test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks
         env:
           FERRUM_SKIP_GATEWAY_BUILD: "1"
           FERRUM_REDIS_REQUIRED: "1"
@@ -1207,6 +1211,7 @@ jobs:
           echo "## Plugin Hardening Redis Regression" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
+          echo "- test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks" >> $GITHUB_STEP_SUMMARY
 
   mesh-multicluster-federation:

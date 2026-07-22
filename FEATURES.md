@@ -164,7 +164,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ### Response Mock Plugin
 
-- **Response Mock** — returns configurable mock responses without proxying to the backend. Mock rule paths are relative to the proxy's `listen_path`, so rules are scoped to the proxy they're configured on. Supports matching by HTTP method and path pattern (exact or regex with `~` prefix), configurable status codes, headers, body, and optional latency simulation via `delay_ms`. When `passthrough_on_no_match` is true, unmatched requests continue to the real backend. Useful for early API testing, contract testing, and local development
+- **Response Mock** — returns configurable mock responses without proxying to the backend. Mock rule paths are relative to the proxy's `listen_path`, so rules are scoped to the proxy they're configured on. Supports matching by HTTP method and path pattern (exact or regex with `~` prefix), configurable status codes, headers, body, and optional latency simulation via `delay_ms`. When `passthrough_on_no_match` is true, unmatched requests continue to the real backend. Supports HTTP and WebSocket upgrade handshakes only — native gRPC is excluded because plugin rejects normalize to trailers-only errors that discard configured bodies. Useful for early API testing, contract testing, and local development
 
 ### Spec Expose Plugin
 
@@ -180,7 +180,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Response Transformer** — add, remove, update, or rename response headers and JSON body fields with the same validation and rollback guarantees as `request_transformer`. Header rules also run on gateway-generated rejection responses
 - **Compression** — on-the-fly response compression (gzip, brotli) with Accept-Encoding negotiation, content-type filtering, minimum body size threshold, and optional request decompression with zip bomb protection
 - **Response Caching** — cache backend responses with TTL, cache key rules, and conditional caching
-- **Request Mirror** — duplicate live proxy traffic to a secondary destination for shadow testing, validation, or migration checks. Fire-and-forget — mirror latency never blocks the primary client response. Configurable percentage sampling (0.1% granularity), optional body forwarding (binary-safe for gRPC protobuf), and proxy-aware timeouts. Mirror response metadata flows through transaction logs
+- **Request Mirror** — duplicate live proxy traffic to a secondary destination for shadow testing, validation, or migration checks. Fire-and-forget — mirror latency never blocks the primary client response. Configurable deterministic evenly spaced percentage sampling (0.1% granularity; no contiguous 1,000-request prefix), optional body forwarding (binary-safe for gRPC protobuf), and proxy-aware timeouts. Mirror response metadata flows through transaction logs
 - **Request Termination** — return static responses without proxying
 
 ### Load Testing Plugin
