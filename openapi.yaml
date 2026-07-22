@@ -16975,14 +16975,22 @@ components:
             content:
               type: object
               additionalProperties:
-                $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
-              description: Media type to JSON Schema map (object or boolean schemas).
+                $ref: "#/components/schemas/OpenapiValidatorMediaTypeContent"
+              description: >
+                Media type to schema map. Each entry is either a bare JSON Schema
+                (object or boolean) or a Media Type Object with `schema` plus
+                optional OpenAPI Encoding Objects for form-urlencoded / multipart.
             content_type:
               type: string
               description: Alternate single-schema form.
             schema:
               $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
               description: Alternate single-schema form (object or boolean schema).
+            encoding:
+              $ref: "#/components/schemas/OpenapiValidatorEncodingMap"
+              description: >
+                Alternate single-schema form encoding map. Only valid with
+                application/x-www-form-urlencoded or multipart/form-data.
           description: Request body schemas by media type.
         responses:
           type: object
@@ -16994,6 +17002,69 @@ components:
             Status code to media type to JSON Schema map (object or boolean schemas).
             Exact status codes are checked first, OpenAPI wildcard ranges such as `4XX`
             are checked next, and `default` is used as the final fallback.
+
+    OpenapiValidatorMediaTypeContent:
+      description: >
+        Request-body content entry. Accepts the historical bare JSON Schema form
+        or an OpenAPI Media Type Object that preserves Encoding Objects.
+      anyOf:
+        - $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+        - type: object
+          required: [schema]
+          additionalProperties: false
+          properties:
+            schema:
+              $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+            encoding:
+              $ref: "#/components/schemas/OpenapiValidatorEncodingMap"
+            example: {}
+            examples: {}
+
+    OpenapiValidatorEncodingMap:
+      type: object
+      additionalProperties:
+        $ref: "#/components/schemas/OpenapiValidatorEncodingObject"
+      description: >
+        OpenAPI Encoding Object map keyed by schema property name. Supported for
+        application/x-www-form-urlencoded and multipart/form-data. Unsupported
+        style/explode combinations are rejected at admission.
+
+    OpenapiValidatorEncodingObject:
+      type: object
+      additionalProperties: false
+      properties:
+        style:
+          type: string
+          enum: [form, spaceDelimited, pipeDelimited, deepObject]
+          default: form
+          description: >
+            Serialization style. `form` (default), `spaceDelimited`,
+            `pipeDelimited`, and `deepObject` are supported. Path/header styles
+            such as `matrix`, `label`, and `simple` are rejected.
+        explode:
+          type: boolean
+          description: >
+            Defaults to true for `form`, false otherwise. `spaceDelimited` and
+            `pipeDelimited` require explode=false; `deepObject` requires
+            explode=true.
+        allowReserved:
+          type: boolean
+          default: false
+          description: >
+            OpenAPI allowReserved flag. Runtime form parsing always percent-decodes
+            values; reserved characters are accepted whether encoded or not.
+        contentType:
+          type: string
+          description: >
+            Expected multipart part Content-Type (comma-separated list allowed).
+            Only valid for multipart/form-data.
+        headers:
+          type: object
+          additionalProperties: true
+          description: >
+            Additional multipart part headers to require/validate. Only valid for
+            multipart/form-data. Must not redefine Content-Type,
+            Content-Disposition, or Content-Transfer-Encoding.
 
     RequestTerminationConfig:
       type: object

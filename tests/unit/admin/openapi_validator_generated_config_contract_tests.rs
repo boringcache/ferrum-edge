@@ -203,3 +203,130 @@ fn published_schema_rejects_per_operation_schema_draft() {
         "OpenapiValidatorOperation must reject undeclared schema_draft"
     );
 }
+
+#[test]
+fn importer_preserves_form_encoding_objects_in_generated_config() {
+    let spec = r##"{
+  "openapi": "3.1.0",
+  "info": {"title": "Form API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "form-api",
+    "backend_host": "form.internal",
+    "backend_port": 8080
+  },
+  "paths": {
+    "/tags": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": ["tags"],
+                "properties": {
+                  "tags": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {"type": "string"}
+                  }
+                }
+              },
+              "encoding": {
+                "tags": {"style": "form", "explode": false}
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {"description": "ok"}
+        }
+      }
+    }
+  }
+}"##;
+
+    let config = extract_validator_config(spec);
+    let media = &config["operations"][0]["request_body"]["content"]
+        ["application/x-www-form-urlencoded"];
+    assert_eq!(media["encoding"]["tags"]["style"], "form");
+    assert_eq!(media["encoding"]["tags"]["explode"], false);
+    assert!(media["schema"]["properties"]["tags"].is_object());
+    assert_valid_against_admin_schema(&config, "form encoding importer config");
+}
+
+#[test]
+fn importer_rejects_unsupported_encoding_style_at_admission() {
+    let spec = r##"{
+  "openapi": "3.1.0",
+  "info": {"title": "Bad Form API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "bad-form-api",
+    "backend_host": "form.internal",
+    "backend_port": 8080
+  },
+  "paths": {
+    "/tags": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "tags": {"type": "array", "items": {"type": "string"}}
+                }
+              },
+              "encoding": {
+                "tags": {"style": "matrix"}
+              }
+            }
+          }
+        },
+        "responses": {"204": {"description": "ok"}}
+      }
+    }
+  }
+}"##;
+
+    let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("unsupported") || message.contains("matrix"),
+        "unsupported encoding must fail closed, got {message}"
+    );
+}
+
+#[test]
+fn published_schema_accepts_media_type_object_with_encoding() {
+    let config = json!({
+        "schema_draft": "draft2020-12",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/tags",
+            "path_regex": "^/tags$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "tags": {"type": "array", "items": {"type": "string"}}
+                            }
+                        },
+                        "encoding": {
+                            "tags": {
+                                "style": "form",
+                                "explode": false,
+                                "allowReserved": true
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    });
+    assert_valid_against_admin_schema(&config, "media type object with encoding");
+}

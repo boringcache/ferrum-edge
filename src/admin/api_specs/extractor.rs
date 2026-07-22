@@ -1342,21 +1342,38 @@ fn extract_openapi_request_body(
     let mut content_schemas = Map::new();
     if let Some(content) = object.get("content").and_then(Value::as_object) {
         for (media_type, media) in content {
-            if let Some(schema) = media.get("schema") {
-                let schema = resolve_refs(
-                    root,
-                    schema,
+            let Some(media_object) = media.as_object() else {
+                continue;
+            };
+            let Some(schema) = media_object.get("schema") else {
+                continue;
+            };
+            let schema = resolve_refs(
+                root,
+                schema,
+                media_type,
+                MAX_SCHEMA_REF_DEPTH,
+                resolver.document_base(),
+                resolver,
+                ResolveContext::Schema,
+            )?;
+            let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Request);
+            let encoding = match media_object.get("encoding") {
+                None | Some(Value::Null) => None,
+                Some(encoding) => Some(normalize_request_body_encoding(
                     media_type,
-                    MAX_SCHEMA_REF_DEPTH,
-                    resolver.document_base(),
-                    resolver,
-                    ResolveContext::Schema,
-                )?;
-                content_schemas.insert(
-                    media_type.clone(),
-                    normalize_schema_for_openapi(schema, version, SchemaDirection::Request),
-                );
-            }
+                    encoding,
+                    &schema,
+                )?),
+            };
+            let media_value = match encoding {
+                Some(encoding) => json!({
+                    "schema": schema,
+                    "encoding": encoding,
+                }),
+                None => schema,
+            };
+            content_schemas.insert(media_type.clone(), media_value);
         }
     }
     if content_schemas.is_empty() {
@@ -1364,6 +1381,166 @@ fn extract_openapi_request_body(
     } else {
         Ok(Some((required, content_schemas)))
     }
+}
+
+/// Preserve and validate OpenAPI Encoding Objects for form-urlencoded / multipart.
+///
+/// Unsupported styles and media-type combinations fail closed at admission so
+/// generated validator config never silently drops serialization metadata.
+fn normalize_request_body_encoding(
+    media_type: &str,
+    encoding: &Value,
+    schema: &Value,
+) -> Result<Value, ExtractError> {
+    let base = media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase();
+    let object = encoding.as_object().ok_or_else(|| ExtractError::MalformedExtension {
+        which: "requestBody.content.encoding",
+        error: format!("encoding for media type '{media_type}' must be an object"),
+    })?;
+    if object.is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    if base != "application/x-www-form-urlencoded" && base != "multipart/form-data" {
+        return Err(ExtractError::MalformedExtension {
+            which: "requestBody.content.encoding",
+            error: format!(
+                "encoding is only supported for application/x-www-form-urlencoded and multipart/form-data (got '{media_type}')"
+            ),
+        });
+    }
+
+    let mut out = Map::new();
+    for (property, value) in object {
+        let property_object =
+            value
+                .as_object()
+                .ok_or_else(|| ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!("encoding['{property}'] must be an object"),
+                })?;
+        for key in property_object.keys() {
+            if !matches!(
+                key.as_str(),
+                "style" | "explode" | "allowReserved" | "contentType" | "headers"
+            ) {
+                return Err(ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!(
+                        "encoding['{property}'] contains unsupported field '{key}'"
+                    ),
+                });
+            }
+        }
+
+        let style = property_object
+            .get("style")
+            .and_then(Value::as_str)
+            .unwrap_or("form");
+        if !matches!(
+            style,
+            "form" | "spaceDelimited" | "pipeDelimited" | "deepObject"
+        ) {
+            return Err(ExtractError::MalformedExtension {
+                which: "requestBody.content.encoding",
+                error: format!(
+                    "encoding['{property}'].style '{style}' is unsupported for request bodies"
+                ),
+            });
+        }
+        let explode = match property_object.get("explode").and_then(Value::as_bool) {
+            Some(value) => value,
+            None => style == "form",
+        };
+        match (style, explode) {
+            ("form", _) | ("spaceDelimited" | "pipeDelimited", false) | ("deepObject", true) => {}
+            ("spaceDelimited" | "pipeDelimited", true) => {
+                return Err(ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!(
+                        "encoding['{property}']: style '{style}' requires explode=false"
+                    ),
+                });
+            }
+            ("deepObject", false) => {
+                return Err(ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!(
+                        "encoding['{property}']: style 'deepObject' requires explode=true"
+                    ),
+                });
+            }
+            _ => {}
+        }
+
+        if style == "deepObject" {
+            let property_schema = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get(property));
+            let accepts_object = property_schema.is_some_and(|property_schema| {
+                property_schema.get("type").and_then(Value::as_str) == Some("object")
+                    || property_schema.get("properties").is_some()
+                    || property_schema
+                        .get("allOf")
+                        .and_then(Value::as_array)
+                        .is_some_and(|branches| {
+                            branches.iter().any(|branch| {
+                                branch.get("type").and_then(Value::as_str) == Some("object")
+                                    || branch.get("properties").is_some()
+                            })
+                        })
+            });
+            if !accepts_object {
+                return Err(ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!(
+                        "encoding['{property}']: style 'deepObject' requires an object schema property"
+                    ),
+                });
+            }
+        }
+
+        if let Some(content_type) = property_object.get("contentType") {
+            if base != "multipart/form-data" {
+                return Err(ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!(
+                        "encoding['{property}'].contentType is only valid for multipart/form-data"
+                    ),
+                });
+            }
+            if !content_type.is_string() {
+                return Err(ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!("encoding['{property}'].contentType must be a string"),
+                });
+            }
+        }
+        if let Some(headers) = property_object.get("headers") {
+            if base != "multipart/form-data" {
+                return Err(ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!(
+                        "encoding['{property}'].headers is only valid for multipart/form-data"
+                    ),
+                });
+            }
+            if !headers.is_object() {
+                return Err(ExtractError::MalformedExtension {
+                    which: "requestBody.content.encoding",
+                    error: format!("encoding['{property}'].headers must be an object"),
+                });
+            }
+        }
+
+        out.insert(property.clone(), Value::Object(property_object.clone()));
+    }
+    Ok(Value::Object(out))
 }
 
 fn extract_openapi_responses(
