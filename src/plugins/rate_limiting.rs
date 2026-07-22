@@ -283,6 +283,15 @@ impl Plugin for RateLimiting {
         matches!(self.limit_by, LimitBy::Consumer | LimitBy::SpiffeIdentity)
     }
 
+    /// Participate in the shared rejection/synthetic finalizer so an admitted,
+    /// counted request still receives `x-ratelimit-*` decoration (and identity
+    /// stripping) when a later plugin short-circuits or rejects. `after_proxy`
+    /// remains a no-op for header injection when metadata is absent, so requests
+    /// that never reached the rate-limit check are not given synthesized values.
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

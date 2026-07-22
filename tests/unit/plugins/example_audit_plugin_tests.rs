@@ -554,6 +554,21 @@ fn test_metadata_selection_is_deterministic_with_collision_and_omission_markers(
     );
 }
 
+#[test]
+fn test_degraded_drop_warning_avoids_request_rate_log_and_atomic_write_amplification() {
+    let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    assert!(
+        source.contains("drop_warning_emitted.load(Ordering::Relaxed)")
+            && source
+                .contains(".compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)"),
+        "degraded audit drops must use a cheap steady-state load and a one-time transition"
+    );
+    assert!(
+        !source.contains("drop_warning_emitted.swap(true"),
+        "degraded requests must not perform a write-style atomic swap on every drop"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_log_and_stream_hooks_enqueue_without_panic() {
     if !example_audit_plugin_registered() {

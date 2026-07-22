@@ -165,7 +165,7 @@ proxies:
 - Only valid on stream proxies (`tcp`, `tcps`, `udp`, `dtls`)
 - Backend TLS fields (`backend_tls_client_cert_path`, etc.) cannot be set — the proxy does not originate its own TLS
 - Plugins that require decrypted content cannot run; connection-level plugins (IP restriction, rate limiting, logging, throttle) still operate normally
-- SNI hostname is available in `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` for logging plugins
+- SNI hostname is available in `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` for logging plugins (TLS/DTLS passthrough ClientHello peek, TCP TLS termination, and DTLS termination)
 - When sharing a port, all proxies must have `passthrough: true`, hosts must not overlap, and at most one catch-all (empty `hosts`) is allowed
 
 **What's available in passthrough logs:**
@@ -179,7 +179,7 @@ proxies:
 
 Set `frontend_tls: true` to accept TLS connections from clients. The gateway uses its configured TLS certificates (same as HTTPS) to terminate the connection, then forwards plaintext to the backend.
 
-For TLS-terminating TCP proxies, Ferrum completes the client-to-gateway TLS handshake before opening the backend connection. Stream lifecycle plugins then run with frontend TLS context, including client certificate material when mTLS is enabled, before any backend socket is consumed. Clients that fail the frontend TLS handshake, or are rejected by `on_stream_connect` plugins, are closed on the frontend side without dialing the backend. Frontend TLS failures remain frontend setup failures and are not recorded as backend circuit-breaker failures.
+For TLS-terminating TCP proxies, Ferrum completes the client-to-gateway TLS handshake before opening the backend connection. Stream lifecycle plugins then run with frontend TLS context, including client certificate material when mTLS is enabled, before any backend socket is consumed. Clients that fail the frontend TLS handshake, or are rejected by `on_stream_connect` plugins, are closed on the frontend side without dialing the backend. Frontend TLS failures remain frontend setup failures and are not recorded as backend circuit-breaker failures. Negotiated ClientHello/handshake SNI is available on `StreamConnectionContext.sni_hostname` and preserved on `StreamTransactionSummary.sni_hostname` for disconnect logging.
 
 Latency trade-off: backend connect now starts after frontend TLS instead of overlapping with it, so legitimate TCP+TLS sessions may add roughly one backend RTT to first-byte latency compared with backend-first setup. The benefit is that failed frontend handshakes, plugin rejects, and already-open backend circuit breakers do not spend backend sockets or handshakes on unadmitted clients. If a backend circuit breaker is already open, Ferrum still completes frontend TLS before refusing the stream, so the cost shifts to bounded frontend TLS CPU instead of backend capacity.
 
@@ -198,7 +198,7 @@ Backend TLS settings are controlled by the proxy's `backend_tls_*` fields:
 
 Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections from clients. The gateway uses ECDSA P-256 or P-384 certificates (configured via env vars) to terminate DTLS, then forwards decrypted datagrams to the backend.
 
-Like TCP+TLS, frontend DTLS handshakes complete before backend session creation. `on_stream_connect` plugins run after DTLS accept with client certificate context available when DTLS mTLS is enabled; handshake failures and plugin rejections do not create backend UDP or DTLS sessions.
+Like TCP+TLS, frontend DTLS handshakes complete before backend session creation. `on_stream_connect` plugins run after DTLS accept with client certificate context available when DTLS mTLS is enabled; handshake failures and plugin rejections do not create backend UDP or DTLS sessions. Negotiated ClientHello SNI is exposed on `StreamConnectionContext.sni_hostname` at connect and preserved on `StreamTransactionSummary.sni_hostname` at disconnect for logging sinks.
 
 Frontend DTLS uses `dimpl`, which currently surfaces only the client leaf certificate to Ferrum. Stream plugins receive that leaf in `StreamConnectionContext.tls_client_cert_der`; `tls_client_cert_chain_der` remains `None` for DTLS even when the client sent intermediates. Configure `FERRUM_DTLS_CLIENT_CA_CERT_PATH` with the CA/intermediate certificates needed to validate client leaves.
 

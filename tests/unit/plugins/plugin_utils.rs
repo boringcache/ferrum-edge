@@ -17,20 +17,26 @@ use tokio::net::TcpStream;
 /// unread body bytes on the socket breaks reuse for later POSTs on the connection
 /// (transaction-summary batches are often larger than a single 1 KiB read).
 pub async fn read_http11_request_headers(socket: &mut TcpStream) -> bool {
+    read_http11_request_body(socket).await.is_some()
+}
+
+/// Read one HTTP/1.1 request and return its body bytes (after draining
+/// `Content-Length`). Returns `None` on EOF or malformed framing.
+pub async fn read_http11_request_body(socket: &mut TcpStream) -> Option<Vec<u8>> {
     let mut request = Vec::new();
     let mut buf = [0u8; 1024];
     let header_end = loop {
         let n = match socket.read(&mut buf).await {
-            Ok(0) => return false,
+            Ok(0) => return None,
             Ok(n) => n,
-            Err(_) => return false,
+            Err(_) => return None,
         };
         request.extend_from_slice(&buf[..n]);
         if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
             break pos + 4;
         }
         if request.len() > 64 * 1024 {
-            return false;
+            return None;
         }
     };
 
@@ -46,16 +52,17 @@ pub async fn read_http11_request_headers(socket: &mut TcpStream) -> bool {
         })
         .unwrap_or(0);
 
-    let mut body_read = request.len().saturating_sub(header_end);
-    while body_read < content_length {
-        let want = (content_length - body_read).min(buf.len());
+    let mut body = request[header_end..].to_vec();
+    while body.len() < content_length {
+        let want = (content_length - body.len()).min(buf.len());
         match socket.read(&mut buf[..want]).await {
-            Ok(0) => return false,
-            Ok(n) => body_read += n,
-            Err(_) => return false,
+            Ok(0) => return None,
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Err(_) => return None,
         }
     }
-    true
+    body.truncate(content_length);
+    Some(body)
 }
 
 /// Test-only HMAC secret matching the value set in test env vars.

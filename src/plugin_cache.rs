@@ -407,6 +407,11 @@ impl Plugin for PriorityOverridePlugin {
     fn has_proxy_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
         self.inner.has_proxy_lifecycle_state_for_test(proxy_id)
     }
+    fn mesh_bpf_metrics_exporter(
+        &self,
+    ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
+        self.inner.mesh_bpf_metrics_exporter()
+    }
     fn correlation_id_header_name(&self) -> Option<&str> {
         self.inner.correlation_id_header_name()
     }
@@ -3060,6 +3065,12 @@ pub(crate) struct PluginCacheInner {
     /// Survives empty active maps so remove-to-empty then identical-ID recreate
     /// cannot reuse a prior generation.
     proxy_lifecycle_generation_high_water: u64,
+    /// Active `__mesh_bpf_metrics` scrape exporter for this generation, or
+    /// `None` when the plugin is not present in the published configuration.
+    /// Authenticated `/metrics` appends this exactly once per scrape via a
+    /// single `ArcSwap` load — never by scanning plugins and never by
+    /// retaining a stale removed/replaced instance across reloads.
+    mesh_bpf_metrics_exporter: Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter>,
 }
 
 /// Advance or assign per-proxy lifecycle ownership generations for `config`.
@@ -3092,6 +3103,29 @@ pub(crate) fn build_proxy_lifecycle_generations(
     Ok((next, high))
 }
 
+/// Extract the active `__mesh_bpf_metrics` scrape exporter from a global
+/// plugin list. At most one enabled global instance is accepted — duplicates
+/// would double-emit series on `/metrics`.
+fn extract_mesh_bpf_metrics_exporter(
+    global_plugins: &[Arc<dyn Plugin>],
+) -> Result<Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter>, String> {
+    let mut found = None;
+    for plugin in global_plugins {
+        let Some(exporter) = plugin.mesh_bpf_metrics_exporter() else {
+            continue;
+        };
+        if found.is_some() {
+            return Err(
+                "at most one enabled global __mesh_bpf_metrics instance is permitted \
+                 (duplicate instances would double-emit Prometheus series)"
+                    .to_string(),
+            );
+        }
+        found = Some(exporter);
+    }
+    Ok(found)
+}
+
 impl PluginCacheInner {
     /// Admission-time ownership generation for `proxy_id`, or `None` when the
     /// proxy is absent from this published cache generation.
@@ -3117,6 +3151,9 @@ impl PluginCacheInner {
         tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
         proxy_lifecycle_generations: HashMap<String, u64>,
         proxy_lifecycle_generation_high_water: u64,
+        mesh_bpf_metrics_exporter: Option<
+            crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter,
+        >,
     ) -> Self {
         Self {
             proxy_plugins,
@@ -3135,6 +3172,7 @@ impl PluginCacheInner {
             tcp_connection_throttle_instances,
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
+            mesh_bpf_metrics_exporter,
         }
     }
 
@@ -3555,6 +3593,34 @@ fn validate_prometheus_metrics_ownership(config: &GatewayConfig) -> Result<(), S
     Ok(())
 }
 
+/// `__mesh_bpf_metrics` is a single scrape exporter per process. Require at
+/// most one enabled global instance so reload never registers duplicate
+/// collectors / double-emits series on authenticated `/metrics`.
+fn validate_mesh_bpf_metrics_ownership(config: &GatewayConfig) -> Result<(), String> {
+    let mut enabled = config.plugin_configs.iter().filter(|plugin| {
+        plugin.enabled && plugin.plugin_name == crate::plugins::mesh::bpf_metrics::PLUGIN_NAME
+    });
+    let Some(first) = enabled.next() else {
+        return Ok(());
+    };
+    if first.scope != PluginScope::Global {
+        return Err(format!(
+            "PluginConfig '{}' ({}) must have scope 'global'",
+            first.id,
+            crate::plugins::mesh::bpf_metrics::PLUGIN_NAME
+        ));
+    }
+    if let Some(second) = enabled.next() {
+        return Err(format!(
+            "{} permits at most one enabled global instance; found '{}' and '{}'",
+            crate::plugins::mesh::bpf_metrics::PLUGIN_NAME,
+            first.id,
+            second.id
+        ));
+    }
+    Ok(())
+}
+
 impl PluginCache {
     /// Build a new plugin cache from the given config with a default HTTP client.
     #[allow(dead_code)]
@@ -3615,6 +3681,7 @@ impl PluginCache {
         previous_lifecycle_generation_high_water: u64,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        validate_mesh_bpf_metrics_ownership(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -3643,6 +3710,7 @@ impl PluginCache {
                 previous_lifecycle_generation_high_water,
                 config,
             )?;
+        let mesh_bpf_metrics_exporter = extract_mesh_bpf_metrics_exporter(&globals)?;
 
         Ok(Arc::new(PluginCacheInner::new(
             proxy_map,
@@ -3661,6 +3729,7 @@ impl PluginCache {
             tcp_connection_throttle_instances,
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
+            mesh_bpf_metrics_exporter,
         )))
     }
 
@@ -3698,6 +3767,19 @@ impl PluginCache {
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
         self.inner.load_full()
+    }
+
+    /// Current-generation `__mesh_bpf_metrics` scrape exporter, if the plugin
+    /// is active in the published configuration.
+    ///
+    /// Lock-free: one `ArcSwap` load of the plugin-cache generation. Returns
+    /// a cheap clone of the precomputed exporter (prefix + shared state Arc)
+    /// so authenticated `/metrics` never scans plugins or retains a stale
+    /// removed/replaced instance across reload.
+    pub fn mesh_bpf_metrics_exporter(
+        &self,
+    ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
+        self.inner.load().mesh_bpf_metrics_exporter.clone()
     }
 
     pub(crate) fn retain_active_uris_for_inner(inner: &PluginCacheInner) {
@@ -3849,6 +3931,7 @@ impl PluginCache {
         country_mmdb_load_mode: CountryMmdbLoadMode,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        validate_mesh_bpf_metrics_ownership(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -3888,6 +3971,7 @@ impl PluginCache {
         force_node_local_refresh: bool,
     ) -> Result<Option<Arc<PluginCacheInner>>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        validate_mesh_bpf_metrics_ownership(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);
@@ -4562,6 +4646,24 @@ impl PluginCache {
             current.global_requires_ws_frame
         };
 
+        // Extract before commit_reload so a duplicate-exporter failure cannot
+        // leave the named-schema registry promoted against a rejected cache.
+        let mesh_bpf_metrics_exporter = match extract_mesh_bpf_metrics_exporter(&new_globals) {
+            Ok(exporter) => exporter,
+            Err(error) => {
+                if rebuild_globals {
+                    crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                        |registry_error| {
+                            format!(
+                                "Config reload rejected: {error}; registry abort also failed: {registry_error}"
+                            )
+                        },
+                    )?;
+                }
+                return Err(format!("Config reload rejected: {error}"));
+            }
+        };
+
         // Delta build succeeded. If a registry reload bracket was opened
         // above (rebuild_globals == true), promote the staged named
         // schemas now — pairs with the `begin_reload` at the top.
@@ -4599,6 +4701,7 @@ impl PluginCache {
             tcp_connection_throttle_instances,
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
+            mesh_bpf_metrics_exporter,
         )))
     }
 

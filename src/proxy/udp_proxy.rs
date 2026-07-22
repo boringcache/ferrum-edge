@@ -724,6 +724,10 @@ struct DtlsDisconnectContext<'a> {
     error_class: Option<crate::retry::ErrorClass>,
     disconnect_direction: Option<crate::plugins::Direction>,
     disconnect_cause: Option<crate::plugins::DisconnectCause>,
+    /// Frontend DTLS ClientHello SNI captured at accept and exposed on
+    /// `StreamConnectionContext` during `on_stream_connect`. Carried into the
+    /// disconnect summary so logging sinks keep connect/disconnect parity.
+    sni_hostname: Option<String>,
     metadata: &'a std::collections::HashMap<String, String>,
     correlation_ids: &'a CorrelationIdState,
 }
@@ -753,7 +757,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         disconnect_cause: context.disconnect_cause,
         timestamp_connected: context.connected_at.to_rfc3339(),
         timestamp_disconnected: context.disconnected_at.to_rfc3339(),
-        sni_hostname: None,
+        sni_hostname: context.sni_hostname,
         metadata,
     }
 }
@@ -2480,6 +2484,9 @@ async fn start_dtls_frontend_listener(
                 };
                 let handler_auth_method = stream_ctx.auth_method;
                 let handler_proxy_lifecycle_generation = stream_ctx.proxy_lifecycle_generation;
+                // Preserve the accepted connection's SNI across the per-session
+                // task so disconnect summaries match `on_stream_connect`.
+                let handler_sni_hostname = stream_ctx.sni_hostname.clone();
                 let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
                     stream_ctx.take_metadata_with_correlation_ids()
                 } else {
@@ -2583,6 +2590,7 @@ async fn start_dtls_frontend_listener(
                             error_class,
                             disconnect_direction,
                             disconnect_cause,
+                            sni_hostname: handler_sni_hostname.clone(),
                             metadata: &merged_metadata,
                             correlation_ids: &handler_correlation_ids,
                         });
@@ -4604,6 +4612,7 @@ backend_tls_verify_server_cert: false
             error_class: Some(crate::retry::ErrorClass::TlsError),
             disconnect_direction: None,
             disconnect_cause: Some(crate::plugins::DisconnectCause::RecvError),
+            sni_hostname: None,
             metadata: &metadata,
             correlation_ids: &correlation_ids,
         });
@@ -4623,6 +4632,7 @@ backend_tls_verify_server_cert: false
             summary.error_class,
             Some(crate::retry::ErrorClass::TlsError)
         );
+        assert_eq!(summary.sni_hostname, None);
         assert_eq!(
             summary
                 .metadata
@@ -4633,6 +4643,54 @@ backend_tls_verify_server_cert: false
         assert_eq!(summary.duration_ms, 750.0);
         assert_eq!(summary.timestamp_connected, connected_at.to_rfc3339());
         assert_eq!(summary.timestamp_disconnected, disconnected_at.to_rfc3339());
+    }
+
+    #[test]
+    fn test_build_dtls_stream_summary_preserves_terminating_sni() {
+        // Terminating DTLS extracts ClientHello SNI into the accepted connection
+        // and StreamConnectionContext; the disconnect summary must keep the same
+        // value for logging sinks (issue #2531).
+        let client_addr: SocketAddr = "127.0.0.1:54000".parse().unwrap();
+        let connected_at = chrono::Utc::now();
+        let disconnected_at = connected_at + chrono::TimeDelta::milliseconds(42);
+        let metadata = HashMap::new();
+        let correlation_ids = Default::default();
+        let sni = Some("device.example".to_string());
+
+        let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            namespace: "ferrum",
+            proxy_id: "dtls-proxy",
+            proxy_name: Some("DTLS Proxy"),
+            client_addr,
+            consumer_username: Some("alice".to_string()),
+            auth_method: Some("mtls_auth"),
+            backend_target: "10.0.0.60:7443",
+            backend_resolved_ip: Some("10.0.0.60"),
+            backend_scheme: BackendScheme::Dtls,
+            listen_port: 7443,
+            connected_at,
+            disconnected_at,
+            duration_ms: 42.0,
+            bytes_sent: 16,
+            bytes_received: 32,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
+            sni_hostname: sni.clone(),
+            metadata: &metadata,
+            correlation_ids: &correlation_ids,
+        });
+
+        assert_eq!(summary.sni_hostname.as_deref(), Some("device.example"));
+        assert_eq!(summary.consumer_username.as_deref(), Some("alice"));
+        assert_eq!(summary.auth_method, Some("mtls_auth"));
+        assert_eq!(
+            summary.sni_hostname, sni,
+            "disconnect SNI must match the connect-time value"
+        );
+        let json = serde_json::to_value(&summary).expect("stream summary serializes");
+        assert_eq!(json["sni_hostname"], "device.example");
     }
 
     struct CapturePlugin {
@@ -4710,6 +4768,38 @@ backend_tls_verify_server_cert: false
             summary.timestamp_disconnected,
             disconnected_wall_at.to_rfc3339()
         );
+        assert_eq!(summary.sni_hostname, None);
+    }
+
+    #[test]
+    fn test_build_udp_stream_summary_preserves_passthrough_sni() {
+        // UDP/DTLS passthrough peeks ClientHello SNI into UdpSession and must
+        // surface it on the disconnect summary (parity with terminating DTLS).
+        let client_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let mut session = make_udp_session();
+        session.sni_hostname = Some("passthrough.example".to_string());
+        let disconnected_wall_at =
+            chrono::DateTime::from_timestamp_millis(1_710_000_001_500).unwrap();
+
+        let summary = build_udp_stream_summary(UdpDisconnectContext {
+            namespace: "ferrum",
+            proxy_id: "udp-proxy",
+            proxy_name: Some("UDP Proxy"),
+            client_addr,
+            session: &session,
+            backend_scheme: BackendScheme::Udp,
+            listen_port: 5353,
+            disconnected_ms: 1_710_000_001_500,
+            disconnected_wall_at,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
+        });
+
+        assert_eq!(summary.sni_hostname.as_deref(), Some("passthrough.example"));
+        let json = serde_json::to_value(&summary).expect("udp summary serializes");
+        assert_eq!(json["sni_hostname"], "passthrough.example");
     }
 
     #[test]
@@ -4817,6 +4907,7 @@ backend_tls_verify_server_cert: false
             error_class: None,
             disconnect_direction: None,
             disconnect_cause: Some(crate::plugins::DisconnectCause::IdleTimeout),
+            sni_hostname: None,
             metadata: &metadata,
             correlation_ids: &correlation_ids,
         });
@@ -4864,6 +4955,7 @@ backend_tls_verify_server_cert: false
             error_class: None,
             disconnect_direction: None,
             disconnect_cause: Some(crate::plugins::DisconnectCause::IdleTimeout),
+            sni_hostname: None,
             metadata: &metadata,
             correlation_ids: &correlation_ids,
         });
@@ -4911,6 +5003,7 @@ backend_tls_verify_server_cert: false
             error_class: None,
             disconnect_direction: None,
             disconnect_cause: None,
+            sni_hostname: None,
             metadata: &metadata,
             correlation_ids: &correlation_ids,
         });
