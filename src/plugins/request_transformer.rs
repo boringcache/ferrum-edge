@@ -276,7 +276,7 @@ impl RequestTransformer {
                         ));
                     }
                 };
-                let value_present = r.contains_key("value");
+                let value_present = rule_obj.contains_key("value");
                 let value = match r.get("value") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
@@ -286,7 +286,7 @@ impl RequestTransformer {
                         ));
                     }
                 };
-                let new_key_present = r.contains_key("new_key");
+                let new_key_present = rule_obj.contains_key("new_key");
                 let raw_new_key = match r.get("new_key") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
