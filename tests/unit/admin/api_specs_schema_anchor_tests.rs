@@ -494,6 +494,55 @@ fn local_id_resource_scope_resolves_without_external_fetch() {
 }
 
 #[test]
+fn inline_schema_ref_uses_its_own_id_as_base() {
+    // `$id` changes the base URI for a sibling `$ref` in the same Schema
+    // Object. The target is declared in this document, so resolving it must
+    // not fall back to the synthetic OpenAPI document base or attempt a fetch.
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Inline Id Scope API", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "components": {{
+    "schemas": {{
+      "Target": {{
+        "$id": "https://example.com/scopes/target.json",
+        "$anchor": "Target",
+        "type": "object",
+        "required": ["scoped"],
+        "properties": {{"scoped": {{"type": "boolean"}}}}
+      }}
+    }}
+  }},
+  "paths": {{
+    "/scoped": {{
+      "post": {{
+        "requestBody": {{
+          "content": {{
+            "application/json": {{
+              "schema": {{
+                "$id": "https://example.com/scopes/wrapper.json",
+                "$ref": "target.json#Target"
+              }}
+            }}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+    let schema = first_request_schema(&spec);
+    assert_eq!(schema["$anchor"], "Target");
+    assert_eq!(schema["required"], json!(["scoped"]));
+    // `$ref` siblings are retained by the importer's existing merge contract.
+    assert_eq!(schema["$id"], "https://example.com/scopes/wrapper.json");
+}
+
+#[test]
 fn unknown_absolute_ref_remains_unsupported_external() {
     let spec = format!(
         r##"{{

@@ -1931,11 +1931,16 @@ fn resolve_refs(
     }
     match value {
         Value::Object(object) => {
+            // `$id` on this Schema Object establishes the base URI for every
+            // URI-reference keyword in the same object, including `$ref`.
+            // Compute it before resolving `$ref`; using the parent base here
+            // misclassifies valid same-document relative targets as external.
+            let child_base = resolver.child_base_for_object(object, current_base)?;
             if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
                 // Non-local absolute/relative refs without a matching in-document `$id`
                 // are rejected inside `resolve_reference` as UnsupportedExternalRef.
                 let (target, target_base) =
-                    resolver.resolve_reference(root, reference, current_base)?;
+                    resolver.resolve_reference(root, reference, &child_base)?;
                 let mut resolved =
                     resolve_refs(root, target, reference, depth - 1, &target_base, resolver)?;
                 if object.len() > 1
@@ -1950,7 +1955,7 @@ fn resolve_refs(
                                     child,
                                     location,
                                     depth - 1,
-                                    current_base,
+                                    &child_base,
                                     resolver,
                                 )?,
                             );
@@ -1959,7 +1964,6 @@ fn resolve_refs(
                 }
                 return Ok(resolved);
             }
-            let child_base = resolver.child_base_for_object(object, current_base)?;
             let mut resolved = Map::new();
             for (key, child) in object {
                 resolved.insert(
