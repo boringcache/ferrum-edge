@@ -9,7 +9,9 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
     serialize_json_each_row, write_private_file_atomically_for_tests,
 };
-use ferrum_edge::plugins::chargeback::pricing::ChargeComputation;
+use ferrum_edge::plugins::chargeback::pricing::{
+    ChargeComputation, MAX_UNIT_PRICE, PricingConfig,
+};
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
 use serde_json::{Value, json};
 use wiremock::matchers::method;
@@ -347,6 +349,143 @@ async fn config_validation_rejects_snapshot_without_spool() {
         Err(error) => error,
     };
     assert!(error.contains("snapshot mode requires spool.enabled=true"));
+}
+
+#[test]
+fn maximum_prices_remain_finite_in_per_event_and_snapshot_exports() {
+    let config = json!({
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": MAX_UNIT_PRICE}],
+        "bandwidth_pricing": {
+            "price_per_byte_sent": MAX_UNIT_PRICE,
+            "price_per_byte_received": MAX_UNIT_PRICE
+        },
+        "stream_connection_pricing": {"price_per_connection": MAX_UNIT_PRICE}
+    });
+    let pricing = PricingConfig::from_config(&config, "api_chargeback_sink").unwrap();
+
+    let http_charge = pricing
+        .compute_http(200, u64::MAX, u64::MAX)
+        .expect("maximum HTTP prices should produce a charge");
+    let stream_charge = pricing
+        .compute_stream(u64::MAX, u64::MAX)
+        .expect("maximum stream prices should produce a charge");
+    for charge in [http_charge, stream_charge] {
+        assert!(charge.charge_call.is_finite());
+        assert!(charge.charge_bytes_sent.is_finite());
+        assert!(charge.charge_bytes_received.is_finite());
+        assert!(charge.charge_total.is_finite());
+    }
+
+    let mut per_event = sample_event("maximum-price-per-event");
+    per_event.call_count = http_charge.call_count;
+    per_event.charge_call = http_charge.charge_call;
+    per_event.bytes_sent = http_charge.bytes_sent;
+    per_event.bytes_received = http_charge.bytes_received;
+    per_event.charge_bytes_sent = http_charge.charge_bytes_sent;
+    per_event.charge_bytes_received = http_charge.charge_bytes_received;
+    per_event.charge_total = http_charge.charge_total;
+    let per_event_json: Value = serde_json::from_str(
+        &serialize_json_each_row(std::slice::from_ref(&per_event)).unwrap(),
+    )
+    .unwrap();
+    for field in [
+        "charge_call",
+        "charge_bytes_sent",
+        "charge_bytes_received",
+        "charge_total",
+    ] {
+        assert!(
+            per_event_json[field]
+                .as_f64()
+                .is_some_and(|value| value.is_finite()),
+            "per-event {field} must serialize as a finite JSON number"
+        );
+    }
+
+    let mut snapshot_config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    snapshot_config.currency = "USD".to_string();
+    snapshot_config.pricing_version = "maximum-price".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        http_charge,
+    );
+    let events = accumulator.compute_deltas(
+        &snapshot_config,
+        "node-a",
+        1_774_000_000_000_000_000,
+        "maximum-price-snapshot",
+    );
+    assert_eq!(events.len(), 1);
+    let snapshot_json: Value =
+        serde_json::from_str(&serialize_json_each_row(&events).unwrap()).unwrap();
+    for field in [
+        "charge_call",
+        "charge_bytes_sent",
+        "charge_bytes_received",
+        "charge_total",
+    ] {
+        assert!(
+            snapshot_json[field]
+                .as_f64()
+                .is_some_and(|value| value.is_finite()),
+            "snapshot {field} must serialize as a finite JSON number"
+        );
+    }
+}
+
+#[test]
+fn sink_rejects_above_maximum_prices_in_both_export_modes() {
+    let temp = tempfile::tempdir().unwrap();
+    let above_maximum = f64::from_bits(MAX_UNIT_PRICE.to_bits() + 1);
+
+    for mode in ["per_event", "snapshot"] {
+        for field in [
+            "price_per_call",
+            "price_per_byte_sent",
+            "price_per_byte_received",
+            "price_per_connection",
+        ] {
+            let mut config = valid_config(temp.path());
+            config["mode"] = json!(mode);
+            match field {
+                "price_per_call" => {
+                    config["pricing_tiers"][0]["price_per_call"] = json!(above_maximum);
+                }
+                "price_per_byte_sent" => {
+                    config["bandwidth_pricing"]["price_per_byte_sent"] = json!(above_maximum);
+                }
+                "price_per_byte_received" => {
+                    config["bandwidth_pricing"]["price_per_byte_received"] = json!(above_maximum);
+                }
+                "price_per_connection" => {
+                    config["stream_connection_pricing"]["price_per_connection"] =
+                        json!(above_maximum);
+                }
+                _ => unreachable!(),
+            }
+
+            let error = ApiChargebackSink::new(
+                &config,
+                PluginHttpClient::default(),
+                "ferrum",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{mode} should reject {field} above MAX_UNIT_PRICE"));
+            assert!(
+                error.contains(field) && error.contains("no greater than"),
+                "unexpected {mode} rejection for {field}: {error}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
