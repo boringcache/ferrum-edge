@@ -421,6 +421,7 @@ See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per
 
 Notes:
 - `tcp_connection_throttle` is TCP/TCP+TLS-only. Explicit proxy/proxy-group attachment to any other protocol fails configuration admission and plugin-cache validation instead of silently claiming protection. A global policy with a nonempty effective target set must cover at least one TCP/TCP+TLS proxy; mixed global scope is applied only to its TCP-family listeners. In particular, it does not protect UDP/DTLS; use `udp_rate_limiting` for datagram/session admission. Its counters are process-local, so a replicated deployment's aggregate allowance can reach the configured limit per replica.
+- `udp_rate_limiting` runs on every UDP/DTLS datagram (`on_udp_datagram`) in both directions. Steady-path capacity admission uses an atomic resident-entry count coordinated with insert/remove — it does not call `DashMap::len()` or lock every state shard per packet (local and Redis-fallback). See [docs/plugins.md](plugins.md#udp_rate_limiting).
 - `access_control` applies to both TCP and UDP stream proxies. For TCP+TLS and UDP+DTLS, pair with `mtls_auth` for certificate-based consumer identification → ACL group/username authorization.
 - `mtls_auth` applies to both TCP+TLS and UDP+DTLS stream proxies. It only activates when the listener is configured with `frontend_tls: true` and a client certificate is presented during the TLS/DTLS handshake.
 

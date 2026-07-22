@@ -74,6 +74,18 @@ impl UdpRateLimiting {
         self.limiter.local_map_shard_amount()
     }
 
+    /// All-shard `DashMap::len()` observations on the local/fallback map.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn all_shard_len_calls_for_test(&self) -> usize {
+        self.limiter.all_shard_len_calls_for_test()
+    }
+
+    /// Exact DashMap length for reconciling the atomic entry count in tests.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn map_len_for_test(&self) -> usize {
+        self.limiter.map_len_for_test()
+    }
+
     /// Controllable-time seed for external cleanup tests. Not a production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_client_at_for_test(

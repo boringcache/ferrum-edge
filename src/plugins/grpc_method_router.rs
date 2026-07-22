@@ -211,9 +211,9 @@ impl GrpcMethodRouter {
     }
 
     fn evict_stale_entries_at(&self, now: Instant) {
-        // Sample every 1024 requests before any DashMap::len()
-        // (`tracked_keys_count`) so the hot path avoids all-shard locking on
-        // every request.
+        // Sample every 1024 requests before any tracked_keys_count /
+        // cleanup work so the hot path avoids capacity bookkeeping on every
+        // request. Entry counts are atomic (not DashMap::len()).
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
         if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
