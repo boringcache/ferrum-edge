@@ -27,6 +27,10 @@ fn make_ctx() -> RequestContext {
 }
 
 fn make_ctx_with_proxy() -> RequestContext {
+    make_ctx_with_proxy_timeout(30_000)
+}
+
+fn make_ctx_with_proxy_timeout(backend_read_timeout_ms: u64) -> RequestContext {
     let mut ctx = make_ctx();
     let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(json!({
         "id": "proxy-123",
@@ -35,7 +39,7 @@ fn make_ctx_with_proxy() -> RequestContext {
         "backend_host": "backend.local",
         "backend_port": 8080,
         "backend_scheme": "http",
-        "backend_read_timeout_ms": 30000
+        "backend_read_timeout_ms": backend_read_timeout_ms
     }))
     .unwrap();
     ctx.matched_proxy = Some(Arc::new(proxy));
@@ -107,6 +111,198 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
     assert!(!summaries[0].mirror);
     assert!(summaries[1].mirror);
     assert_eq!(summaries[1].response_status_code, 204);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mirror_results_before_at_and_after_five_seconds_remain_observable() {
+    let logger = Arc::new(CapturingMirrorLogger {
+        summaries: Mutex::new(Vec::new()),
+    });
+    let plugins: Vec<Arc<dyn Plugin>> = vec![logger.clone()];
+    let summary = TransactionSummary {
+        response_status_code: 200,
+        ..TransactionSummary::default()
+    };
+
+    let mut publishers = Vec::new();
+    for (delay_seconds, proxy_timeout_ms, status) in
+        [(4u64, 4_500u64, 204u16), (5, 5_500, 205), (6, 7_000, 206)]
+    {
+        let mut ctx = make_ctx_with_proxy_timeout(proxy_timeout_ms);
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        ctx.mirror_result_rx = Some(rx);
+        log_with_mirror(&plugins, &summary, &ctx).await;
+        publishers.push(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
+            tx.send(Some(MirrorResponseMeta {
+                mirror_target_url: format!("http://mirror.local/result-{status}"),
+                mirror_response_status_code: Some(status),
+                mirror_response_size_bytes: Some(0),
+                mirror_latency_ms: delay_seconds as f64 * 1000.0,
+                mirror_error: None,
+            }))
+            .expect("detached result collector must remain subscribed");
+        }));
+    }
+
+    let mirrored_statuses = || {
+        logger
+            .summaries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.mirror)
+            .map(|entry| entry.response_status_code)
+            .collect::<Vec<_>>()
+    };
+
+    // Let every publisher and detached result collector register its paused-
+    // clock wait before advancing virtual time. Otherwise the first task may
+    // not be polled until after the clock has already moved four seconds.
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    for _ in 0..100 {
+        if !mirrored_statuses().is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(mirrored_statuses(), vec![204]);
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    for _ in 0..100 {
+        if mirrored_statuses().len() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(mirrored_statuses(), vec![204, 205]);
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    for publisher in publishers {
+        publisher.await.expect("mirror result publisher");
+    }
+    for _ in 0..100 {
+        if mirrored_statuses().len() >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(mirrored_statuses(), vec![204, 205, 206]);
+}
+
+#[tokio::test]
+async fn max_in_flight_drop_emits_explicit_mirror_result() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let server_url = url::Url::parse(&server.uri()).unwrap();
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": server_url.host_str().unwrap(),
+            "mirror_port": server_url.port().unwrap(),
+            "percentage": 100,
+            "max_in_flight": 1,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first = make_ctx_with_proxy_timeout(30_000);
+    let mut first_headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut first, &mut first_headers).await);
+
+    let mut dropped = make_ctx_with_proxy_timeout(30_000);
+    let mut dropped_headers = HashMap::new();
+    plugin_utils::assert_continue(
+        plugin
+            .before_proxy(&mut dropped, &mut dropped_headers)
+            .await,
+    );
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        dropped.collect_mirror_result(),
+    )
+    .await
+    .expect("concurrency drop result must be immediately available")
+    .expect("selected mirror drop must emit metadata");
+    assert!(
+        meta.mirror_error
+            .as_deref()
+            .is_some_and(|error| error.contains("max_in_flight")),
+        "unexpected drop metadata: {meta:?}"
+    );
+}
+
+#[tokio::test]
+async fn closed_task_channel_returns_seeded_failure_result() {
+    let mut ctx = make_ctx_with_proxy();
+    let fallback = MirrorResponseMeta {
+        mirror_target_url: "http://mirror.local/cancelled".to_string(),
+        mirror_response_status_code: None,
+        mirror_response_size_bytes: None,
+        mirror_latency_ms: 0.0,
+        mirror_error: Some("mirror task ended before publishing a result".to_string()),
+    };
+    let (tx, rx) = tokio::sync::watch::channel(Some(fallback));
+    ctx.mirror_result_rx = Some(rx);
+    drop(tx);
+
+    let meta = ctx
+        .collect_mirror_result()
+        .await
+        .expect("seeded task failure must remain observable after sender closure");
+    assert!(
+        meta.mirror_error
+            .as_deref()
+            .is_some_and(|error| error.contains("ended before publishing"))
+    );
+}
+
+#[tokio::test]
+async fn backend_read_timeout_emits_explicit_mirror_error() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204).set_delay(std::time::Duration::from_secs(1)))
+        .mount(&server)
+        .await;
+    let server_url = url::Url::parse(&server.uri()).unwrap();
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": server_url.host_str().unwrap(),
+            "mirror_port": server_url.port().unwrap(),
+            "percentage": 100,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx_with_proxy_timeout(50);
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ctx.collect_mirror_result(),
+    )
+    .await
+    .expect("mirror request timeout outcome must be bounded")
+    .expect("timed-out mirror must emit metadata");
+    assert!(meta.mirror_response_status_code.is_none());
+    assert!(
+        meta.mirror_error.is_some(),
+        "timeout must be explicit: {meta:?}"
+    );
 }
 
 #[test]

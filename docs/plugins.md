@@ -3777,7 +3777,7 @@ Duplicates live proxy traffic to a secondary destination for shadow testing, val
 **Priority:** 3075
 **Protocols:** HTTP, gRPC
 
-Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger). The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
+Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger). Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the proxy's `backend_read_timeout_ms` is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream failure, and `max_in_flight` drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. The gateway runtime cancels outstanding detached mirror/logging tasks during shutdown; they never delay the client response or extend shutdown. The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
