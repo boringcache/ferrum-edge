@@ -247,6 +247,51 @@ async fn test_http_logging_rejects_invalid_config_shapes() {
 }
 
 #[tokio::test]
+async fn test_http_logging_rejects_malformed_and_out_of_range_batching() {
+    let endpoint = "http://127.0.0.1:1/logs";
+    for config in [
+        json!({"endpoint_url": endpoint, "batch_size": null}),
+        json!({"endpoint_url": endpoint, "batch_size": true}),
+        json!({"endpoint_url": endpoint, "batch_size": []}),
+        json!({"endpoint_url": endpoint, "batch_size": {}}),
+        json!({"endpoint_url": endpoint, "batch_size": 0}),
+        json!({"endpoint_url": endpoint, "batch_size": 10_001}),
+        json!({"endpoint_url": endpoint, "buffer_capacity": null}),
+        json!({"endpoint_url": endpoint, "buffer_capacity": 0}),
+        json!({"endpoint_url": endpoint, "buffer_capacity": 1_000_001}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": null}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": "100"}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": 99}),
+        json!({"endpoint_url": endpoint, "flush_interval_ms": 600_001}),
+        json!({"endpoint_url": endpoint, "max_retries": null}),
+        json!({"endpoint_url": endpoint, "max_retries": 11}),
+        json!({"endpoint_url": endpoint, "retry_delay_ms": null}),
+        json!({"endpoint_url": endpoint, "retry_delay_ms": 60_001}),
+    ] {
+        assert!(
+            HttpLogging::new(&config, default_client()).is_err(),
+            "expected batching rejection for {config}"
+        );
+    }
+
+    assert!(
+        HttpLogging::new(
+            &json!({
+                "endpoint_url": endpoint,
+                "batch_size": 1,
+                "buffer_capacity": 1,
+                "flush_interval_ms": 600_000,
+                "max_retries": 10,
+                "retry_delay_ms": 0
+            }),
+            default_client(),
+        )
+        .is_ok(),
+        "valid batching boundaries must be admitted"
+    );
+}
+
+#[tokio::test]
 async fn test_http_logging_rejects_invalid_header_name() {
     // Header names with spaces or non-ASCII characters are rejected at config load time
     let result = HttpLogging::new(
@@ -459,7 +504,7 @@ async fn test_http_logging_reuses_http11_connection_across_successful_batches() 
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "retry_delay_ms": 1,
         }),
@@ -486,7 +531,7 @@ async fn test_http_logging_reuses_http11_connection_across_retry() {
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 1,
             "retry_delay_ms": 1,
         }),
@@ -534,7 +579,7 @@ async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
         &json!({
             "endpoint_url": format!("http://{addr}/logs"),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
         }),
         default_client(),
@@ -582,7 +627,7 @@ async fn test_http_logging_delivers_stream_sni_hostname() {
         &json!({
             "endpoint_url": format!("http://{addr}/logs"),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
         }),
         default_client(),

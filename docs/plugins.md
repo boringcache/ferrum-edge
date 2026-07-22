@@ -179,11 +179,11 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 |---|---|---|---|
 | `endpoint_url` | String | `""` | URL to POST transaction logs to |
 | `custom_headers` | Object | *(none)* | Key-value pairs of custom HTTP headers to include on every batch request |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
-| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
-| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first.
 
@@ -414,11 +414,11 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
 | `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`). Sanitized for line-protocol safety; max 256 bytes after sanitization. |
 | `global_tags` | Object | *(none)* | Extra DogStatsD tags appended to every metric. Keys cannot override reserved runtime tags (`namespace`, `method`, `status`, `status_class`, `grpc_status`, `proxy`, `protocol`, `error`, `cause`, `direction`, `body_outcome`, `body_error`, `result`, `io_side`, `error_class`) or any effective key introduced by a schema rename. Encoded `global_tags` + authoritative `namespace` tag are capped at 400 bytes. |
-| `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-| `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing |
-| `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (shared batching logger) |
-| `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts |
+| `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (50–600000) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
+| `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing (1–10000) |
+| `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (0–10; shared batching logger) |
+| `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts (0–60000) |
 | `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
@@ -541,7 +541,7 @@ Sends transaction summaries as JSON to an external WebSocket endpoint. Like `htt
 |---|---|---|---|
 | `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname and must not include URL userinfo. Path/query may carry collector tokens when required; operational diagnostics always emit a structurally redacted form (`scheme://host[:port]/redacted`). Malformed or non-WebSocket schemes are rejected at config load time. |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
-| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (minimum 100) |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (1–60000) |
 | `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure (1–60000) |
@@ -590,11 +590,11 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 | `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
 | `tls` | Boolean | `false` | Enable TLS encryption for the connection |
 | `tls_server_name` | String | *(none)* | DNS or IP identity for TLS SNI/cert verification (defaults to `host`). Allowed only when `tls: true`. Must be a rustls-acceptable server name (no URL scheme, path, query, fragment, credentials, whitespace, or host:port); invalid values fail admission. |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
-| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
-| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (1–10000) |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
 | `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
 | `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
@@ -649,11 +649,11 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (requires `dtls: true`; must be paired with `dtls_cert_path`; ECDSA P-256/P-384 only) |
 | `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server (requires `dtls: true`; materialized on the consuming node when set, even if `dtls_no_verify` disables use of the resulting verifier) |
 | `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only; requires `dtls: true`) |
-| `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch |
-| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
-| `max_retries` | Integer | `1` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch (1–10000) |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (100–600000) |
+| `max_retries` | Integer | `1` | Retry attempts on failed batch delivery (0–10) |
+| `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts (0–60000) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 
@@ -1182,7 +1182,7 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
 | `gzip` | bool | `true` | Gzip-compress request bodies |
 | `batch_size` | integer | `100` | Max entries per batch (1–10,000) |
-| `flush_interval_ms` | integer | `1000` | Flush timer interval (minimum 100) |
+| `flush_interval_ms` | integer | `1000` | Flush timer interval (100–600000) |
 | `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
 | `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and worst-case dynamic label values must fit |
 | `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
@@ -2500,7 +2500,8 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 - Applicable methods with a declared body are buffered before `before_proxy`, even if the idempotency header is not present yet, so earlier header-transform plugins can add the key without making the body unavailable for fingerprinting
 - If a request declares a body but the body bytes are unavailable for fingerprinting, the request is rejected with 400 instead of being deduplicated unsafely
 - Streamed non-buffered responses, including `text/event-stream`, keep the in-flight marker while the stream is active. On a clean completion the marker is released without retaining a replayable response, so the next matching request re-executes normally. If the stream is interrupted — a client disconnect or mid-stream error — the marker is instead retained until `inflight_ttl_seconds`, so an immediate retry of the same idempotency key cannot re-run a side-effecting backend operation that has no replay/tombstone protection
-- Stale in-flight markers (request died after `before_proxy` but before buffered/committed response completion or a clean streamed completion — e.g., backend timeout, downstream plugin reject, process crash — plus interrupted streams that deliberately retain their marker) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
+- Stale in-flight markers (request died after `before_proxy` but before buffered/committed response completion or a clean streamed completion — e.g., backend timeout, non-2xx downstream plugin reject, process crash — plus interrupted streams that deliberately retain their marker) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests. Non-2xx plugin rejects and downstream rejection replacements are intentionally TTL-backed: they do not publish a replayable completion and do not clear the in-flight marker on the commit path, so an identical retry stays conflicted until `inflight_ttl_seconds` expires
+- Successful synthetic short-circuits from a later `before_proxy` plugin (for example `response_mock`, `fault_injection`, or `request_termination`) release token-matched local and Redis in-flight ownership once the shared H1/H2/H3 reject finalizer commits a final HTTP 2xx. That release is body-independent: empty 200 and 204/205 responses skip the synthetic response-body hook pipeline, but the finalizer still records a finalized-synthetic lifecycle signal that `on_response_committed` consumes. Non-2xx responses such as 304 remain TTL-backed. Ownership release always matches the exact local owner token and Redis lock token, so a late finalizer cannot clear a successor request's marker. Synthetic bodies are never stored under the idempotency key
 - Completed response storage is bounded by `max_entry_size_bytes` and `max_total_size_bytes`. Size-skipped responses still return to the original client, but no replayable response is retained. In local mode, ordinary skipped responses clear the in-flight marker so a later retry can execute normally. A terminate-mode `serverless_function` response, or a buffered backend fallback after that function may have executed, instead retains each owning in-flight marker until `inflight_ttl_seconds` whenever the settled response cannot be retained; an immediate retry cannot re-run an external side effect without a replay. The retention is scoped to outcomes where a side effect may have occurred: a serverless invocation that fails **proven pre-wire** (payload serialization, provider request signing, or a transport class that never reached the function — connect refused/timeout, DNS, TLS, pool/port exhaustion, or an egress-policy denial) releases the in-flight marker like any other pre-invocation rejection, because no function ran; only an ambiguous or post-wire failure (a timeout after send, a mid-response reset, an oversized/unreadable response) keeps the marker. In Redis mode, the same owned-response rule retains the distributed lock, while an ordinary local-total-cap skip keeps local and distributed locks only if Redis publication fails
 - A completed external operation performed by a synthetic short-circuit — for example an `ai_federation` provider call, which marks the request as having completed an external operation — retains the in-flight marker (and any distributed lock) until `inflight_ttl_seconds` instead of releasing it or caching the synthetic body. The first request receives its final guarded response, while an identical key/fingerprint retry cannot issue another billable provider call before the marker expires. Externally executed synthetic plugins that do not mark this provenance must define their own completion contract
 - LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. An externally executing terminal completion remains replayable while it is the only completed entry competing with active work. If later completed-entry pressure makes that replay impossible to retain and no distributed replay was confirmed, eviction replaces it with an in-flight tombstone until `inflight_ttl_seconds` instead of deleting all local safety state. As a result, `max_entries` can be temporarily exceeded by active work or security tombstones; correctness is preferred over the memory cap

@@ -950,6 +950,251 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
     assert!(request_identity(&plugin, &ctx2).is_some());
 }
 
+// Marker set by the shared H1/H2/H3 reject finalizer for every finalized
+// successful HTTP 2xx synthetic short-circuit (including empty 200 and 204), independent
+// of whether synthetic response-body hooks ran. Mirrors
+// `crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY`.
+const FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY: &str = "ferrum:finalized_synthetic_response";
+
+async fn finalize_empty_synthetic_and_assert_second_request_continues(
+    status_code: u16,
+    idempotency_key: &str,
+) {
+    let dedup = Arc::new(make_plugin(json!({})));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), idempotency_key.to_string());
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&dedup, &ctx).is_some());
+
+    let finalized = finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        PluginResult::Reject {
+            status_code,
+            body: String::new(),
+            headers: HashMap::new(),
+        },
+    )
+    .await;
+    match finalized {
+        PluginResult::RejectBinary {
+            status_code: final_status,
+            ..
+        } => assert_eq!(final_status, status_code),
+        other => panic!("expected finalized RejectBinary, got {other:?}"),
+    }
+    assert!(
+        !ctx.metadata
+            .contains_key(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY),
+        "internal finalized-synthetic signal must be consumed before transaction logging"
+    );
+    assert_eq!(
+        assert_completed_size_exact(&dedup),
+        0,
+        "empty/204 synthetic successes must not be stored as completed responses"
+    );
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert("idempotency-key".to_string(), idempotency_key.to_string());
+    let retry = dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await;
+    assert!(
+        matches!(retry, PluginResult::Continue),
+        "identical request after finalized empty/204 synthetic success must not see a stale 409; got {retry:?}"
+    );
+}
+
+#[tokio::test]
+async fn empty_synthetic_200_releases_dedup_inflight_via_finalized_signal() {
+    finalize_empty_synthetic_and_assert_second_request_continues(200, "empty-200-key").await;
+}
+
+#[tokio::test]
+async fn synthetic_204_releases_dedup_inflight_via_finalized_signal() {
+    finalize_empty_synthetic_and_assert_second_request_continues(204, "empty-204-key").await;
+}
+
+#[tokio::test]
+async fn non_2xx_plugin_reject_retains_dedup_inflight_until_ttl() {
+    let dedup = Arc::new(make_plugin(json!({
+        "inflight_ttl_seconds": 60,
+        "ttl_seconds": 60
+    })));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "non-2xx-retain-key".to_string(),
+    );
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let finalized = finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 503,
+            body: r#"{"error":"upstream unavailable"}"#.to_string(),
+            headers: HashMap::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        finalized,
+        PluginResult::RejectBinary {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert!(
+        !ctx.metadata
+            .contains_key(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY),
+        "non-2xx rejects must not set the finalized-synthetic success signal"
+    );
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "non-2xx-retain-key".to_string(),
+    );
+    assert!(
+        matches!(
+            dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "non-2xx downstream rejection must intentionally retain in-flight ownership until TTL"
+    );
+
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+    let mut after_ttl_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut after_ttl_headers = HashMap::new();
+    after_ttl_headers.insert(
+        "idempotency-key".to_string(),
+        "non-2xx-retain-key".to_string(),
+    );
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut after_ttl_ctx, &mut after_ttl_headers)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn late_finalized_synthetic_release_does_not_clear_successor_marker() {
+    let dedup = Arc::new(make_plugin(json!({
+        "inflight_ttl_seconds": 1,
+        "ttl_seconds": 60
+    })));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut first_headers = HashMap::new();
+    first_headers.insert(
+        "idempotency-key".to_string(),
+        "successor-safe-key".to_string(),
+    );
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+
+    // Simulate the original request dying without committing; TTL cleanup makes
+    // the key available for a successor with a new owner token.
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut successor_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut successor_headers = HashMap::new();
+    successor_headers.insert(
+        "idempotency-key".to_string(),
+        "successor-safe-key".to_string(),
+    );
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut successor_ctx, &mut successor_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // A late finalizer for the original request still carries that request's
+    // ownership state. Token matching must leave the successor's marker intact.
+    let _ = finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut first_ctx,
+        PluginResult::Reject {
+            status_code: 200,
+            body: String::new(),
+            headers: HashMap::new(),
+        },
+    )
+    .await;
+
+    let mut conflict_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut conflict_headers = HashMap::new();
+    conflict_headers.insert(
+        "idempotency-key".to_string(),
+        "successor-safe-key".to_string(),
+    );
+    assert!(
+        matches!(
+            dedup
+                .before_proxy(&mut conflict_ctx, &mut conflict_headers)
+                .await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "late finalized-synthetic release must not clear a successor's in-flight marker"
+    );
+}
+
 // A FRESH request marked in-flight by this plugin, then short-circuited by a
 // synthetic response AFTER a committed/ambiguous external operation (the
 // `ai_federation` provider-call lifecycle), must not release the in-flight

@@ -1793,6 +1793,119 @@ plugin_configs:
     println!("test_request_deduplication_redis_blocks_concurrent_cross_instance PASSED");
 }
 
+/// Empty/no-body successful synthetic responses must release the exact Redis
+/// in-flight lock even though the synthetic response-body hooks do not run.
+/// A repeated identical request must therefore reach the later response_mock
+/// again instead of receiving a stale request_deduplication 409.
+#[tokio::test]
+#[ignore]
+async fn test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks() {
+    if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!("Redis is required for the finalized synthetic deduplication CI gate");
+        }
+        return;
+    }
+
+    let namespace = format!("dedup-synthetic-{}", Uuid::new_v4().simple());
+    let default_prefix = format!("{namespace}:dedup");
+    delete_redis_keys_by_prefix(&default_prefix).await;
+
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "orders"
+    namespace: "{namespace}"
+    listen_path: "/orders"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: 1
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "dedup"
+      - plugin_config_id: "empty-successes"
+
+consumers: []
+
+plugin_configs:
+  - id: "dedup"
+    namespace: "{namespace}"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "orders"
+    enabled: true
+    config:
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      ttl_seconds: 60
+      inflight_ttl_seconds: 60
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+  - id: "empty-successes"
+    namespace: "{namespace}"
+    plugin_name: "response_mock"
+    scope: "proxy"
+    proxy_id: "orders"
+    enabled: true
+    config:
+      rules:
+        - method: POST
+          path: /empty-200
+          status_code: 200
+        - method: POST
+          path: /no-content
+          status_code: 204
+"#
+    );
+
+    let port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    };
+    let mut gateway = spawn_file_gateway(
+        config,
+        port,
+        vec![
+            ("RUST_LOG".to_string(), "ferrum_edge=debug".to_string()),
+            ("FERRUM_NAMESPACE".to_string(), namespace.clone()),
+        ],
+    )
+    .await;
+    sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    for (path, expected_status, key) in [
+        ("empty-200", 200, "redis-empty-200"),
+        ("no-content", 204, "redis-no-content"),
+    ] {
+        let url = format!("http://127.0.0.1:{port}/orders/{path}");
+        for attempt in 1..=2 {
+            let response = client
+                .post(&url)
+                .header("Host", "orders.example")
+                .header("Idempotency-Key", key)
+                .body("{}")
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{path} attempt {attempt} failed: {error}"));
+            assert_eq!(
+                response.status().as_u16(),
+                expected_status,
+                "{path} attempt {attempt} must not observe a stale Redis in-flight lock"
+            );
+        }
+    }
+
+    delete_redis_keys_by_prefix(&default_prefix).await;
+    gateway.shutdown();
+    println!(
+        "test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks PASSED"
+    );
+}
+
 /// Two `request_deduplication` configs on one proxy must not self-conflict under
 /// the shared default Redis prefix (`{FERRUM_NAMESPACE}:dedup`).
 ///
@@ -1958,7 +2071,6 @@ plugin_configs:
         "test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict PASSED"
     );
 }
-
 /// Namespace-based Redis key prefix isolation.
 ///
 /// Two gateways share the same Redis server with identical `rate_limiting`
