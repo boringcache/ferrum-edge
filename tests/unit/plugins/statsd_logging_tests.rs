@@ -698,14 +698,28 @@ fn test_statsd_terminal_grpc_status_across_buffered_streamed_h2_h3_and_rejection
     // rejection). StatsD consumes the authoritative summary value only.
     for (case, streamed, body_completed, status, rejection, expected) in [
         ("buffered_h2_ok", false, true, Some("0"), false, "0"),
-        ("buffered_h2_unavailable", false, true, Some("14"), false, "14"),
+        (
+            "buffered_h2_unavailable",
+            false,
+            true,
+            Some("14"),
+            false,
+            "14",
+        ),
         ("trailers_only_h2_ok", true, true, Some("0"), false, "0"),
         ("streamed_h2_error", true, true, Some("14"), false, "14"),
         ("native_h3_ok", true, true, Some("0"), false, "0"),
         ("native_h3_internal", true, true, Some("13"), false, "13"),
         ("gateway_rejection", false, true, Some("16"), true, "16"),
         ("missing_terminal_unknown", true, true, None, false, "2"),
-        ("malformed_terminal_other", true, true, Some("bad"), false, "OTHER"),
+        (
+            "malformed_terminal_other",
+            true,
+            true,
+            Some("bad"),
+            false,
+            "OTHER",
+        ),
     ] {
         let mut summary = create_test_transaction_summary();
         summary.http_method = "POST".to_string();
