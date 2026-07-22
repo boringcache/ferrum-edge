@@ -93,7 +93,7 @@ impl WsRateLimiting {
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_connection_at_for_test(&self, connection_id: u64, now: Instant) {
         let _ = self
             .limiter
@@ -101,7 +101,7 @@ impl WsRateLimiting {
     }
 
     /// Arm the sampled periodic gate without spinning 100k frames. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn arm_periodic_eviction_for_test(&self) {
         self.frame_counter
             .store(EVICTION_CHECK_INTERVAL, Ordering::Relaxed);
@@ -109,7 +109,7 @@ impl WsRateLimiting {
     }
 
     /// Block the below-cap cooldown so an armed sample does not scan. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn block_periodic_cooldown_at_for_test(&self, now: Instant) {
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         self.last_periodic_sweep_secs
@@ -117,13 +117,13 @@ impl WsRateLimiting {
     }
 
     /// Invoke the production sampled/cooldown eviction path at `now`. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn maybe_evict_at_for_test(&self, now: Instant) -> bool {
         self.maybe_evict_at(now)
     }
 
     /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn apply_cleanup_branch_for_test(
         &self,
         now: Instant,
@@ -133,7 +133,7 @@ impl WsRateLimiting {
         apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn contains_connection_for_test(&self, connection_id: u64) -> bool {
         self.limiter.contains_local_key(&connection_id)
     }

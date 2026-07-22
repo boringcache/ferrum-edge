@@ -474,7 +474,7 @@ where
     /// Seed or refresh a local/fallback key at a controllable instant.
     ///
     /// Test-support only: production admission always uses wall-clock `check`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn check_local_at(&self, key: K, op: &A::Op, now: Instant) -> RateLimitOutcome {
         match self {
             Self::Local(local) => local.check_at(key, op, now),

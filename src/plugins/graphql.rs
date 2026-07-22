@@ -233,7 +233,7 @@ impl GraphqlPlugin {
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_key_at_for_test(&self, key: String, now: Instant) {
         let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
             limit: 100,
@@ -243,7 +243,7 @@ impl GraphqlPlugin {
     }
 
     /// Arm the sampled below-cap gate without spinning 1024 requests. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn arm_periodic_eviction_for_test(&self) {
         self.request_counter
             .store(EVICTION_CHECK_INTERVAL_REQUESTS, Ordering::Relaxed);
@@ -251,13 +251,13 @@ impl GraphqlPlugin {
     }
 
     /// Invoke the production cleanup wrapper at `now`. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn evict_stale_entries_at_for_test(&self, now: Instant) {
         self.evict_stale_entries_at(now);
     }
 
     /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn apply_cleanup_branch_for_test(
         &self,
         now: Instant,
@@ -267,7 +267,7 @@ impl GraphqlPlugin {
         apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn contains_key_for_test(&self, key: &str) -> bool {
         self.limiter.contains_local_key(&key.to_string())
     }

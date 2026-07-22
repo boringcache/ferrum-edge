@@ -183,26 +183,28 @@ fn ws_sampled_cooldown_path_prunes_stale_preserves_active_below_cap() {
 
 #[test]
 fn rate_limit_backend_local_and_failover_expose_below_cap_prune() {
-    let local = RateLimitBackend::from_plugin_config(
-        "rate_limiting",
-        &json!({}),
-        &PluginHttpClient::default(),
-        DynamicHttpRateLimitAlgorithm::new(),
-    )
-    .expect("local backend");
+    let local: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({}),
+            &PluginHttpClient::default(),
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("local backend");
     assert!(matches!(local, RateLimitBackend::Local(_)));
 
-    let failover = RateLimitBackend::from_plugin_config(
-        "rate_limiting",
-        &json!({
-            "sync_mode": "redis",
-            "redis_url": "redis://127.0.0.1:9/0",
-            "redis_health_check_interval_seconds": 1
-        }),
-        &PluginHttpClient::default(),
-        DynamicHttpRateLimitAlgorithm::new(),
-    )
-    .expect("failover backend");
+    let failover: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:9/0",
+                "redis_health_check_interval_seconds": 1
+            }),
+            &PluginHttpClient::default(),
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("failover backend");
     assert!(matches!(failover, RateLimitBackend::Failover(_)));
 
     // Both backend variants accept prune_stale_at without requiring an

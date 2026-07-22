@@ -75,7 +75,7 @@ impl UdpRateLimiting {
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_client_at_for_test(
         &self,
         client_ip: Arc<str>,
@@ -88,7 +88,7 @@ impl UdpRateLimiting {
     }
 
     /// Arm the sampled periodic gate without spinning 100k hooks. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn arm_periodic_eviction_for_test(&self) {
         self.check_counter
             .store(EVICTION_CHECK_INTERVAL, Ordering::Relaxed);
@@ -96,20 +96,20 @@ impl UdpRateLimiting {
     }
 
     /// Force the cooldown clock so the next armed periodic sweep is blocked.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn block_eviction_cooldown_at_for_test(&self, now: Instant) {
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         self.last_eviction_secs.store(now_secs, Ordering::Relaxed);
     }
 
     /// Invoke the production sampled/cooldown eviction path at `now`. Test-only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn maybe_evict_at_for_test(&self, now: Instant) -> bool {
         self.maybe_evict_at(now)
     }
 
     /// Exercise the production sampled/cooldown path with a testable cap.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn maybe_evict_at_with_cap_for_test(
         &self,
         now: Instant,
@@ -118,12 +118,12 @@ impl UdpRateLimiting {
         self.maybe_evict_at_with_cap(now, max_entries)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn contains_client_for_test(&self, client_ip: &Arc<str>) -> bool {
         self.limiter.contains_local_key(client_ip)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn epoch_base_for_test(&self) -> Instant {
         self.epoch_base
     }
