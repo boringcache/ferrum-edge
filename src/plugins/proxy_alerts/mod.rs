@@ -993,7 +993,20 @@ mod tests {
             ..TransactionSummary::default()
         };
 
-        plugin.log(&summary).await;
+        let sample = SampleInput::Http(&summary);
+        let rule = &plugin.rules[0];
+        let first_resolve_ms = 5_002;
+        let observation = rule
+            .observe(sample, &plugin.windows, first_resolve_ms)
+            .expect("error-rate rule observes HTTP summaries");
+        plugin.process_observation(
+            rule,
+            &observation,
+            sample,
+            first_resolve_ms,
+            chrono::Utc::now(),
+            false,
+        );
         assert!(matches!(
             plugin
                 .recovery
@@ -1002,7 +1015,18 @@ mod tests {
         ));
 
         drop(held_permit);
-        plugin.log(&summary).await;
+        let second_resolve_ms = first_resolve_ms + 1;
+        let observation = rule
+            .observe(sample, &plugin.windows, second_resolve_ms)
+            .expect("error-rate rule observes HTTP summaries");
+        plugin.process_observation(
+            rule,
+            &observation,
+            sample,
+            second_resolve_ms,
+            chrono::Utc::now(),
+            false,
+        );
         assert_eq!(
             plugin
                 .recovery
