@@ -185,10 +185,9 @@ async fn test_statsd_logging_rejects_malformed_and_out_of_range_batching() {
         }),
         default_client(),
     );
-    assert!(
-        valid_bounds.is_ok(),
-        "valid batching boundaries must be admitted: {valid_bounds:?}"
-    );
+    if let Err(err) = valid_bounds {
+        panic!("valid batching boundaries must be admitted: {err}");
+    }
 }
 
 #[tokio::test]
