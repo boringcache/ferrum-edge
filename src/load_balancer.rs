@@ -199,6 +199,8 @@ fn membership_mask_for_indices(len: usize, indices: &[usize]) -> Vec<bool> {
     mask
 }
 
+use crossbeam_utils::CachePadded;
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
@@ -217,6 +219,16 @@ const WRR_MAX_SCHEDULE_LEN: usize = 8192;
 /// the rebuild path) under realistic shared-upstream traffic.
 const WRR_SCHEDULE_CACHE_SLOTS: usize = 8;
 
+/// Per-schedule selection-counter shards (power of two).
+///
+/// Small healthy sets make a single shared `AtomicU64` the throughput ceiling:
+/// concurrent workers bounce one cache line on every pick and can fall *below*
+/// single-thread throughput. Sharded, cache-line-padded counters keep each
+/// worker on its own line while every shard still walks the same precomputed
+/// smooth-WRR order (exact long-run ratios; workers no longer share one global
+/// interleaving).
+const WRR_COUNTER_SHARDS: usize = 16;
+
 /// Exact cache key for one healthy target set.
 #[derive(Debug)]
 enum WrrScheduleKey {
@@ -228,16 +240,15 @@ enum WrrScheduleKey {
 /// Precomputed smooth weighted round-robin order for one healthy fingerprint.
 ///
 /// Built on the cold path when a fingerprint misses the lane cache; steady-state
-/// selection only loads a matching slot via [`ArcSwap`] and advances an
-/// [`AtomicU64`].
+/// selection only loads a matching slot via [`ArcSwap`] and advances one
+/// sharded [`AtomicU64`].
 struct WrrSchedule {
     /// Exact healthy-set identity. The >128-target path retains its indices so
     /// a hash collision can never reuse a schedule for the wrong candidate set.
     key: WrrScheduleKey,
-    /// Each cached healthy set advances independently. A lane-global counter
-    /// would bias alternating fingerprints (for example, two length-2 orders
-    /// could each observe only one parity forever).
-    counter: AtomicU64,
+    /// Per-worker counter shards. Each cached healthy set keeps its own shard
+    /// set so alternating fingerprints cannot alias onto one counter parity.
+    counters: [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS],
     /// Target indices in NGINX smooth-WRR order for one (possibly truncated)
     /// weight period. Empty when the lane is inactive or all weights are 0.
     order: Box<[usize]>,
@@ -249,11 +260,45 @@ impl WrrSchedule {
     fn invalid() -> Self {
         Self {
             key: WrrScheduleKey::Invalid,
-            counter: AtomicU64::new(0),
+            counters: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
             order: Box::new([]),
             zero_weight: false,
         }
     }
+
+    fn with_seed(key: WrrScheduleKey, order: Box<[usize]>, zero_weight: bool, seed: u64) -> Self {
+        Self {
+            key,
+            // Distinct per-shard phases avoid lockstep bursts when many workers
+            // start together; ratios are unchanged because each shard is itself
+            // a full smooth-WRR walk of `order`.
+            counters: std::array::from_fn(|i| {
+                CachePadded::new(AtomicU64::new(
+                    seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15)),
+                ))
+            }),
+            order,
+            zero_weight,
+        }
+    }
+}
+
+/// Assign a stable counter shard for the current OS thread.
+#[inline]
+fn wrr_counter_shard() -> usize {
+    thread_local! {
+        static SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    SHARD.with(|cell| {
+        let current = cell.get();
+        if current < WRR_COUNTER_SHARDS {
+            return current;
+        }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let assigned = (NEXT.fetch_add(1, Ordering::Relaxed) as usize) & (WRR_COUNTER_SHARDS - 1);
+        cell.set(assigned);
+        assigned
+    })
 }
 
 /// Per-lane smooth-WRR state shared by parent, subset, and port selectors.
@@ -262,10 +307,12 @@ impl WrrSchedule {
 ///
 /// Steady-state selection is **wait-free**: each request scans the bounded
 /// [`ArcSwap`] schedule slots for the current healthy fingerprint, then does
-/// one per-schedule [`AtomicU64::fetch_add`] to pick the next index. Concurrent
-/// Tokio workers therefore share one smooth-WRR interleaving per healthy set
-/// (exact weighted ratios across workers) without taking a blocking mutex on
-/// the hot path — including when several recurring fingerprints alternate.
+/// one sharded per-schedule [`AtomicU64::fetch_add`] to pick the next index.
+/// Concurrent Tokio workers therefore scale across cores without taking a
+/// blocking mutex on the hot path — including when several recurring
+/// fingerprints alternate. Each worker shard walks the same precomputed
+/// smooth-WRR order, so long-run weighted ratios stay exact; workers do **not**
+/// share a single global interleaving (the intentional contention tradeoff).
 ///
 /// On a cache miss, builders use `Mutex::try_lock` so rebuilds stay
 /// contention-bounded: the lock holder publishes into a round-robin slot;
@@ -286,7 +333,7 @@ impl WrrSchedule {
 /// # Bounded state / wrap semantics
 ///
 /// At most [`WRR_SCHEDULE_CACHE_SLOTS`] schedules are retained (strict memory
-/// bound). The selection counter is `u64` and indexes with `% order.len()`.
+/// bound). Each shard counter is `u64` and indexes with `% order.len()`.
 /// Wrapping is well-defined and does not bias long-run ratios. Schedule length
 /// is capped at [`WRR_MAX_SCHEDULE_LEN`]; larger weight periods repeat the
 /// truncated prefix.
@@ -300,7 +347,9 @@ struct WrrLaneState {
     rebuild: std::sync::Mutex<()>,
     /// `0` means this lane does not run WRR (e.g. non-WRR port override).
     target_len: usize,
-    /// Steady-state cache hits (fingerprint matched a slot).
+    /// Steady-state cache hits (fingerprint matched a slot). Test builds only —
+    /// never updated on the release hot path (avoids a second shared RMW).
+    #[cfg(test)]
     cache_hits: AtomicU64,
     /// Successful schedule publishes into the bounded cache.
     rebuilds: AtomicU64,
@@ -325,12 +374,14 @@ impl std::fmt::Debug for WrrLaneState {
                 }
             })
             .collect();
-        f.debug_struct("WrrLaneState")
+        let mut debug = f.debug_struct("WrrLaneState");
+        debug
             .field("target_len", &self.target_len)
-            .field("cache_hits", &self.cache_hits.load(Ordering::Relaxed))
             .field("rebuilds", &self.rebuilds.load(Ordering::Relaxed))
-            .field("slot_keys", &keys)
-            .finish()
+            .field("slot_keys", &keys);
+        #[cfg(test)]
+        debug.field("cache_hits", &self.cache_hits.load(Ordering::Relaxed));
+        debug.finish()
     }
 }
 
@@ -348,6 +399,7 @@ impl WrrLaneState {
             publish_cursor: AtomicU64::new(0),
             rebuild: std::sync::Mutex::new(()),
             target_len: 0,
+            #[cfg(test)]
             cache_hits: AtomicU64::new(0),
             rebuilds: AtomicU64::new(0),
             schedule_seed: AtomicU64::new(0),
@@ -363,6 +415,7 @@ impl WrrLaneState {
             publish_cursor: AtomicU64::new(0),
             rebuild: std::sync::Mutex::new(()),
             target_len,
+            #[cfg(test)]
             cache_hits: AtomicU64::new(0),
             rebuilds: AtomicU64::new(0),
             schedule_seed: AtomicU64::new(0),
@@ -412,21 +465,23 @@ impl WrrLaneState {
         None
     }
 
-    /// Steady-state bitset hit: lookup + hit counter.
+    /// Steady-state bitset hit: lookup (+ test-only hit counter).
     #[inline]
     fn hit_bitset_schedule(&self, fingerprint: u128) -> Option<arc_swap::Guard<Arc<WrrSchedule>>> {
         let guard = self.lookup_bitset_schedule(fingerprint)?;
+        #[cfg(test)]
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
         Some(guard)
     }
 
-    /// Steady-state Vec hit: exact lookup + hit counter.
+    /// Steady-state Vec hit: exact lookup (+ test-only hit counter).
     #[inline]
     fn hit_vec_schedule(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
     ) -> Option<arc_swap::Guard<Arc<WrrSchedule>>> {
         let guard = self.lookup_vec_schedule(candidates)?;
+        #[cfg(test)]
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
         Some(guard)
     }
@@ -4320,8 +4375,8 @@ impl LoadBalancer {
     /// Smooth weighted round-robin (NGINX algorithm) using bitset.
     ///
     /// Steady-state path is wait-free: hit a precomputed order for the current
-    /// healthy fingerprint in the bounded slot cache and advance an atomic
-    /// counter. Schedule rebuild runs only on fingerprint misses — see
+    /// healthy fingerprint in the bounded slot cache and advance a sharded
+    /// atomic counter. Schedule rebuild runs only on fingerprint misses — see
     /// [`WrrLaneState`].
     fn select_wrr_bitset(
         &self,
@@ -4348,8 +4403,8 @@ impl LoadBalancer {
         schedule: &WrrSchedule,
     ) -> Option<Arc<UpstreamTarget>> {
         if schedule.zero_weight {
-            let idx = schedule.counter.fetch_add(1, Ordering::Relaxed) as usize;
-            let target_idx = healthy.nth_set_bit(idx);
+            let ticket = schedule.counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed);
+            let target_idx = healthy.nth_set_bit(ticket as usize);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
         Self::pick_from_wrr_schedule(schedule, |idx| {
@@ -4370,12 +4425,12 @@ impl LoadBalancer {
             weighted.push((idx, self.targets[idx].weight));
         });
         let (order, zero_weight) = build_smooth_wrr_order(&weighted);
-        Arc::new(WrrSchedule {
-            key: WrrScheduleKey::Bitset(fingerprint),
-            counter: AtomicU64::new(wrr_state.next_schedule_seed()),
+        Arc::new(WrrSchedule::with_seed(
+            WrrScheduleKey::Bitset(fingerprint),
             order,
             zero_weight,
-        })
+            wrr_state.next_schedule_seed(),
+        ))
     }
 
     fn rebuild_wrr_schedule_bitset(
@@ -4410,15 +4465,15 @@ impl LoadBalancer {
         if schedule.order.is_empty() {
             return None;
         }
-        let ticket = schedule.counter.fetch_add(1, Ordering::Relaxed);
+        let ticket = schedule.counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed);
         let idx = schedule.order[(ticket % schedule.order.len() as u64) as usize];
         resolve(idx)
     }
 
     /// Smooth weighted round-robin (NGINX algorithm) — Vec fallback for >128
-    /// targets. Same wait-free multi-fingerprint schedule + per-schedule atomic
-    /// counter model as the bitset path; cache identity compares the healthy
-    /// original indices exactly.
+    /// targets. Same wait-free multi-fingerprint schedule + sharded per-schedule
+    /// atomic counter model as the bitset path; cache identity compares the
+    /// healthy original indices exactly.
     fn select_wrr_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
@@ -4442,8 +4497,8 @@ impl LoadBalancer {
         schedule: &WrrSchedule,
     ) -> Option<Arc<UpstreamTarget>> {
         if schedule.zero_weight {
-            let idx = schedule.counter.fetch_add(1, Ordering::Relaxed) as usize;
-            return Some(Arc::clone(candidates[idx % candidates.len()].1));
+            let ticket = schedule.counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed);
+            return Some(Arc::clone(candidates[ticket as usize % candidates.len()].1));
         }
         Self::pick_from_wrr_schedule(schedule, |orig_idx| {
             candidates
@@ -4462,18 +4517,18 @@ impl LoadBalancer {
             .map(|&(idx, target)| (idx, target.weight))
             .collect();
         let (order, zero_weight) = build_smooth_wrr_order(&weighted);
-        Arc::new(WrrSchedule {
-            key: WrrScheduleKey::Indices(
+        Arc::new(WrrSchedule::with_seed(
+            WrrScheduleKey::Indices(
                 candidates
                     .iter()
                     .map(|(idx, _)| *idx)
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             ),
-            counter: AtomicU64::new(wrr_state.next_schedule_seed()),
             order,
             zero_weight,
-        })
+            wrr_state.next_schedule_seed(),
+        ))
     }
 
     fn rebuild_wrr_schedule_vec(

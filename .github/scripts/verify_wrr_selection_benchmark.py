@@ -6,6 +6,9 @@ Criterion fixture contract (see tests/performance/mesh/benches/wrr_selection.rs)
     worker thread (currently 50_000).
   - The 1-thread case therefore performs 50_000 selections per iteration.
   - The 4-thread case performs 4 * 50_000 selections per iteration.
+  - Multi-thread samples reuse a long-lived barrier-synchronized worker pool;
+    Criterion's mean is the max per-worker selection-loop wall time (batch wall),
+    not thread spawn/join overhead.
   - Criterion's mean point estimate is elapsed wall-clock nanoseconds for that
     whole custom iteration (not ns/selection).
 

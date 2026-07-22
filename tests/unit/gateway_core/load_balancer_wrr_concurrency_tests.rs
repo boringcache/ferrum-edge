@@ -70,6 +70,14 @@ fn wrr_source_no_longer_guards_lane_state_with_mutex_vec() {
         "steady-state WRR must retain a bounded multi-fingerprint schedule cache"
     );
     assert!(
+        source.contains("WRR_COUNTER_SHARDS"),
+        "steady-state WRR must shard selection counters to avoid single-line contention"
+    );
+    assert!(
+        source.contains("CachePadded"),
+        "WRR counter shards must be cache-line padded"
+    );
+    assert!(
         !source.contains("invalidate: AtomicBool"),
         "racy invalidate boolean must not return; schedules are fingerprint-pure"
     );
