@@ -598,7 +598,7 @@ fn deeply_nested_callback_schema_indexing_is_bounded() {
         "openapi": "3.1.0",
         "info": {"title": "Deep Callback API", "version": "1.0.0"},
         "x-ferrum-validate": true,
-        "x-ferrum-proxy": serde_json::from_str::<Value>(&proxy_block()).unwrap(),
+        "x-ferrum-proxy": serde_json::from_str::<Value>(proxy_block()).unwrap(),
         "paths": {"/start": path_item}
     });
     // YAML parsing accepts this deliberately deep literal tree so the resolver
