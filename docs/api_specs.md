@@ -168,7 +168,14 @@ The importer walks `paths.{path}.{method}`, resolves local `$ref`s, and extracts
 - Swagger 2.0 request schemas from `parameters[].in == "body"`.
 - Swagger 2.0 response schemas from `responses.{status}.schema`, using `consumes`/`produces` media types.
 
-External `$ref`s are rejected with HTTP 422 `UnsupportedExternalRef`, and deeply recursive refs are rejected with HTTP 422 `SchemaTooDeep`. Swagger 2.0 and OpenAPI 3.0 schemas are normalized for Draft 7 compatibility; OpenAPI 3.1+ schemas use Draft 2020-12.
+Supported local `$ref` forms (same document only; never fetched):
+
+- JSON Pointer fragments: `#`, `#/components/schemas/Order`, and percent-encoded pointer forms such as `#/components/schemas/Order%20Id`. Empty and `/`-prefixed fragments are pointers.
+- Draft 2020-12 plain-name anchors (OpenAPI 3.1+): `#Order` resolves to the schema object that declares `"$anchor": "Order"` in the current schema resource. Nested anchors are included. Duplicate anchors in one resource and missing anchors fail closed.
+- Draft 7 plain-name anchors (Swagger 2.0 / OpenAPI 3.0.x): `#Order` resolves via a fragment-only `"$id": "#Order"` (or Draft-4 `"id"`) in the current resource. The OpenAPI 3.1+ `$anchor` keyword is not consulted for 2.0 / 3.0.x documents.
+- Local `$id` resource scope: an absolute or relative `$ref` whose URI (without fragment) matches an `$id` declared in the same document resolves locally, including fragments such as `https://example.com/schemas/order.json#OrderBody`. URIs that are not declared in-document remain HTTP 422 `UnsupportedExternalRef`.
+
+URI fragments are percent-decoded deterministically before classification; malformed percent-escapes are rejected. External `$ref`s are rejected with HTTP 422 `UnsupportedExternalRef`, and deeply recursive refs are rejected with HTTP 422 `SchemaTooDeep`. Swagger 2.0 and OpenAPI 3.0 schemas are normalized for Draft 7 compatibility; OpenAPI 3.1+ schemas use Draft 2020-12.
 
 For Swagger 2.0 and OpenAPI 3.0.x, request and response schemas are normalized with an explicit direction so OpenAPI `readOnly` / `writeOnly` required semantics are preserved: required `readOnly` properties are enforced only on responses, and required `writeOnly` properties (OpenAPI 3.0 only) are enforced only on requests. The rewrite applies through nested objects, arrays, local `$ref` expansion, and `allOf` / `oneOf` / `anyOf` members. OpenAPI 3.1+ leaves `required` unchanged because those keywords are JSON Schema annotations there; see [openapi_validator.md](openapi_validator.md).
 
