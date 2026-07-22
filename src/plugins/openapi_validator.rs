@@ -2449,7 +2449,7 @@ fn merge_composition_object_fields(
                     // Use an order-insensitive union here; the original root
                     // schema remains authoritative for final validation.
                     let existing = entry.get().clone();
-                    entry.insert(json!({"anyOf": [existing, value.clone()]}));
+                    entry.insert(serde_json::json!({"anyOf": [existing, value.clone()]}));
                 }
             }
         }
