@@ -559,7 +559,8 @@ fn test_degraded_drop_warning_avoids_request_rate_log_and_atomic_write_amplifica
     let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
     assert!(
         source.contains("drop_warning_emitted.load(Ordering::Relaxed)")
-            && source.contains(".compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)"),
+            && source
+                .contains(".compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)"),
         "degraded audit drops must use a cheap steady-state load and a one-time transition"
     );
     assert!(
