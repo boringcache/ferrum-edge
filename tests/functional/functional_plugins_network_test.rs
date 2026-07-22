@@ -837,8 +837,9 @@ async fn assert_misbehaving_mirror_does_not_delay_primary(behavior: &'static str
     let logs = harness
         .wait_for_log_contains(
             |raw| {
-                raw.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).any(
-                    |entry| {
+                raw.lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|entry| {
                         entry.get("mirror").and_then(Value::as_bool) == Some(true)
                             && if behavior == "slow" {
                                 entry.get("response_status_code").and_then(Value::as_u64)
@@ -850,8 +851,7 @@ async fn assert_misbehaving_mirror_does_not_delay_primary(behavior: &'static str
                                     .and_then(Value::as_str)
                                     .is_some()
                             }
-                    },
-                )
+                    })
             },
             Duration::from_secs(10),
         )

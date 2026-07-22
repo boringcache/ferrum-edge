@@ -179,9 +179,7 @@ async fn max_in_flight_drop_emits_explicit_mirror_result() {
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(204).set_delay(std::time::Duration::from_secs(30)),
-        )
+        .respond_with(ResponseTemplate::new(204).set_delay(std::time::Duration::from_secs(30)))
         .mount(&server)
         .await;
     let server_url = url::Url::parse(&server.uri()).unwrap();
@@ -203,7 +201,11 @@ async fn max_in_flight_drop_emits_explicit_mirror_result() {
 
     let mut dropped = make_ctx_with_proxy_timeout(30_000);
     let mut dropped_headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut dropped, &mut dropped_headers).await);
+    plugin_utils::assert_continue(
+        plugin
+            .before_proxy(&mut dropped, &mut dropped_headers)
+            .await,
+    );
     let meta = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         dropped.collect_mirror_result(),
@@ -251,9 +253,7 @@ async fn backend_read_timeout_emits_explicit_mirror_error() {
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(204).set_delay(std::time::Duration::from_secs(1)),
-        )
+        .respond_with(ResponseTemplate::new(204).set_delay(std::time::Duration::from_secs(1)))
         .mount(&server)
         .await;
     let server_url = url::Url::parse(&server.uri()).unwrap();
@@ -271,12 +271,18 @@ async fn backend_read_timeout_emits_explicit_mirror_error() {
     let mut headers = HashMap::new();
     plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 
-    let meta = tokio::time::timeout(std::time::Duration::from_secs(1), ctx.collect_mirror_result())
-        .await
-        .expect("mirror request timeout outcome must be bounded")
-        .expect("timed-out mirror must emit metadata");
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ctx.collect_mirror_result(),
+    )
+    .await
+    .expect("mirror request timeout outcome must be bounded")
+    .expect("timed-out mirror must emit metadata");
     assert!(meta.mirror_response_status_code.is_none());
-    assert!(meta.mirror_error.is_some(), "timeout must be explicit: {meta:?}");
+    assert!(
+        meta.mirror_error.is_some(),
+        "timeout must be explicit: {meta:?}"
+    );
 }
 
 #[test]

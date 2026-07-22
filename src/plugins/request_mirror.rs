@@ -631,10 +631,8 @@ impl Plugin for RequestMirror {
         // collector waits for the task's update, but if the task is cancelled
         // or panics its sender closes and the fallback becomes the explicit
         // mirror outcome instead of disappearing from observability.
-        let task_fallback = mirror_failure_meta(
-            mirror_url_for_log.clone(),
-            MIRROR_TASK_INCOMPLETE_ERROR,
-        );
+        let task_fallback =
+            mirror_failure_meta(mirror_url_for_log.clone(), MIRROR_TASK_INCOMPLETE_ERROR);
         let (tx, rx) = tokio::sync::watch::channel(Some(task_fallback));
         ctx.mirror_result_rx = Some(rx);
 
@@ -711,10 +709,9 @@ impl Plugin for RequestMirror {
                                 );
                                 (Some(read_so_far as u64), None)
                             }
-                            Err(BoundedReadError::Stream(_)) => (
-                                None,
-                                Some("mirror response body stream failed".to_string()),
-                            ),
+                            Err(BoundedReadError::Stream(_)) => {
+                                (None, Some("mirror response body stream failed".to_string()))
+                            }
                         },
                     };
                     (Some(status), size, body_error)
