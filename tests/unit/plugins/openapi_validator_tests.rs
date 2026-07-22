@@ -1138,11 +1138,7 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
     let mut ctx = post_ctx("/items");
     assert_reject(
         plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &encoding_headers("gzip foo"),
-                plaintext,
-            )
+            .on_final_request_body_with_context(&mut ctx, &encoding_headers("gzip foo"), plaintext)
             .await,
         Some(400),
     );
@@ -1157,11 +1153,7 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
     let mut ctx = post_ctx("/items");
     assert_reject(
         plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &encoding_headers("deflate"),
-                plaintext,
-            )
+            .on_final_request_body_with_context(&mut ctx, &encoding_headers("deflate"), plaintext)
             .await,
         Some(400),
     );
@@ -1173,12 +1165,7 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
     let mut ctx = post_ctx("/items");
     assert_reject(
         plugin
-            .on_final_response_body(
-                &mut ctx,
-                200,
-                &encoding_headers("zstd"),
-                br#"{"ok":true}"#,
-            )
+            .on_final_response_body(&mut ctx, 200, &encoding_headers("zstd"), br#"{"ok":true}"#)
             .await,
         Some(502),
     );
@@ -1233,11 +1220,7 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
     let mut ctx = post_ctx("/items");
     assert_reject(
         plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &encoding_headers("gzip"),
-                b"not-gzip",
-            )
+            .on_final_request_body_with_context(&mut ctx, &encoding_headers("gzip"), b"not-gzip")
             .await,
         Some(400),
     );
@@ -1320,11 +1303,7 @@ async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
     let mut ctx = post_ctx("/items");
     assert_reject(
         plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &encoding_headers("gzip"),
-                &gzip_large,
-            )
+            .on_final_request_body_with_context(&mut ctx, &encoding_headers("gzip"), &gzip_large)
             .await,
         Some(400),
     );
@@ -1347,11 +1326,7 @@ async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
     let mut ctx = post_ctx("/items");
     assert_reject(
         plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &encoding_headers("gzip, br"),
-                &chained,
-            )
+            .on_final_request_body_with_context(&mut ctx, &encoding_headers("gzip, br"), &chained)
             .await,
         Some(400),
     );
@@ -1373,12 +1348,7 @@ async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
     let mut ctx = post_ctx("/items");
     assert_reject(
         plugin
-            .on_final_response_body(
-                &mut ctx,
-                200,
-                &encoding_headers("gzip"),
-                &response_gzip,
-            )
+            .on_final_response_body(&mut ctx, 200, &encoding_headers("gzip"), &response_gzip)
             .await,
         Some(502),
     );
