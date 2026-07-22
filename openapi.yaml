@@ -16549,7 +16549,11 @@ components:
           type: string
           enum: [auto, draft7, draft2020-12]
           default: auto
-          description: JSON Schema draft used when compiling generated schemas.
+          description: >
+            Sole authoritative JSON Schema draft selector used when compiling every
+            operation's request and response schemas. Per-operation draft fields are
+            not part of the published contract; the importer emits this field only at
+            the top-level config.
         operations:
           type: array
           minItems: 1
@@ -16609,6 +16613,14 @@ components:
           default: 1024
           description: Maximum validation-error characters written to metadata and problem bodies.
 
+    OpenapiValidatorJsonSchema:
+      type: [object, boolean]
+      description: >
+        JSON Schema value embedded in an openapi_validator operation. Accepts ordinary
+        object schemas and OpenAPI 3.1 boolean schemas (`true` / `false`). Dialect
+        selection is controlled by the top-level OpenapiValidatorConfig.schema_draft
+        field, not per operation.
+
     OpenapiValidatorOperation:
       type: object
       additionalProperties: false
@@ -16640,22 +16652,25 @@ components:
             content:
               type: object
               additionalProperties:
-                type: object
-              description: Media type to JSON Schema map.
+                $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+              description: Media type to JSON Schema map (object or boolean schemas).
             content_type:
               type: string
               description: Alternate single-schema form.
             schema:
-              type: object
-              description: Alternate single-schema form.
+              $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+              description: Alternate single-schema form (object or boolean schema).
           description: Request body schemas by media type.
         responses:
           type: object
           additionalProperties:
             type: object
             additionalProperties:
-              type: object
-          description: Status code to media type to JSON Schema map. Exact status codes are checked first, OpenAPI wildcard ranges such as `4XX` are checked next, and `default` is used as the final fallback.
+              $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+          description: >
+            Status code to media type to JSON Schema map (object or boolean schemas).
+            Exact status codes are checked first, OpenAPI wildcard ranges such as `4XX`
+            are checked next, and `default` is used as the final fallback.
 
     RequestTerminationConfig:
       type: object

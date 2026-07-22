@@ -147,8 +147,8 @@ The generated plugin config has this shape:
 | `fail_on_unknown_operation` | `true` | Reject requests that do not match any generated operation. |
 | `fail_on_missing_response_schema` | `false` | Reject responses whose status/content type has no schema and no `default` schema. |
 | `max_body_bytes` | `1048576` | Maximum raw or decompressed body size validated by the plugin. |
-| `schema_draft` | generated | `draft7`, `draft2020-12`, or `auto`. |
-| `operations` | required | Generated per-operation schema table. |
+| `schema_draft` | generated | Sole authoritative draft selector: `draft7`, `draft2020-12`, or `auto`. Emitted only at the top level; operations do not carry a draft field. |
+| `operations` | required | Generated per-operation schema table. Request and response media schemas are ordinary JSON Schema objects or OpenAPI 3.1 boolean schemas (`true` / `false`). |
 | `bypass.paths` | `[]` | Regexes that skip validation when the request path matches. |
 | `bypass.methods` | `[]` | HTTP methods that skip validation. |
 | `bypass.consumers` | `[]` | Authenticated identities or mapped consumer usernames that skip validation. |
