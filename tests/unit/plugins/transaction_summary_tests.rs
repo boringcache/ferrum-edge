@@ -485,6 +485,37 @@ fn test_stream_summary_omits_error_class_when_none() {
 }
 
 #[test]
+fn test_stream_summary_sni_serializes_for_tls_dtls_termination_and_passthrough() {
+    // Protocol-parity coverage for issue #2531: every stream path that captures
+    // frontend SNI (TCP TLS termination, DTLS termination, TLS/DTLS passthrough)
+    // must expose the same JSON field when logging sinks serialize the summary.
+    let cases = [
+        ("tcps", "tcp-term.example"),
+        ("tcp", "tcp-passthrough.example"),
+        ("dtls", "dtls-term.example"),
+        ("udp", "udp-passthrough.example"),
+    ];
+    for (protocol, sni) in cases {
+        let mut summary = make_stream_summary();
+        summary.protocol = protocol.to_string();
+        summary.sni_hostname = Some(sni.to_string());
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            json["sni_hostname"], sni,
+            "protocol {protocol} must serialize sni_hostname"
+        );
+        assert_eq!(json["protocol"], protocol);
+    }
+
+    let omitted = make_stream_summary();
+    let omitted_json = serde_json::to_string(&omitted).unwrap();
+    assert!(
+        !omitted_json.contains("sni_hostname"),
+        "null SNI must remain omitted from JSON"
+    );
+}
+
+#[test]
 fn test_stream_summary_contains_error_class_when_present() {
     use ferrum_edge::retry::ErrorClass;
 
