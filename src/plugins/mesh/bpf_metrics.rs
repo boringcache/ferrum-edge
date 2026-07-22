@@ -2,8 +2,8 @@
 //! metrics.
 //!
 //! GAP-SC3 introduces a `BPF_PROG_TYPE_SOCK_OPS` program that emits
-//! TCP-layer events (Connect, AcceptEstablished, RstSent/Received,
-//! FinSent/Received, SRTT samples, BPF drop-reason hits) to a userspace
+//! TCP-layer events (Connect, AcceptEstablished, Rst, FinSent/Received,
+//! SRTT samples) plus connect-hook drop-reason hits to a userspace
 //! ringbuf. The [`crate::ebpf::event_consumer::SockOpsConsumer`] drains
 //! that ringbuf and updates a shared [`BpfMetricsState`]. This plugin
 //! exposes that state in Prometheus exposition format via the
@@ -22,17 +22,20 @@
 //!
 //! - **`ferrum_mesh_bpf_tcp_events_total{event="connect"|"accept"|...}`**:
 //!   per-event TCP-lifecycle counts. Operators correlate `accept` vs
-//!   `connect` rates to spot stuck pods or pre-handshake drops.
+//!   `connect` rates to spot stuck pods or pre-handshake drops. RST is
+//!   a single non-directional `rst` label — SOCK_OPS cannot attribute
+//!   sent vs received.
 //! - **`ferrum_mesh_bpf_drops_total{reason="bypass_uid_hit"|...}`**:
-//!   how often each BPF drop reason fired. Previously invisible — the
-//!   GAP-SC3 plan calls out this win explicitly.
+//!   how often each BPF capture-bypass decision fired (produced by
+//!   connect4/connect6).
 //! - **`ferrum_mesh_bpf_ringbuf_overruns_total`**: ringbuf overruns. The
 //!   `_in_overrun_regime` companion gauge stays at 1 between the warn
 //!   and recovery transitions so dashboards can alert without scraping
 //!   logs.
-//! - **TCP-layer latency aggregates** (SRTT, syn→ack, accept→first-byte)
-//!   as `_sum`/`_count` so operators can derive averages. Histogram
-//!   buckets are deferred.
+//! - **TCP-layer latency aggregates** (SRTT, syn→ack) as `_sum`/`_count`
+//!   so operators can derive averages. Histogram buckets are deferred.
+//!   Accept-to-first-byte is omitted until a verifier-safe producer
+//!   exists (SOCK_OPS has no first-inbound-data-byte callback).
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -179,7 +182,9 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
     // TCP-layer event counters.
     let _ = writeln!(
         out,
-        "# HELP {p}_tcp_events_total TCP-layer events captured by the BPF SOCK_OPS program."
+        "# HELP {p}_tcp_events_total TCP-layer events captured by the BPF SOCK_OPS program. \
+            event=\"rst\" counts abnormal ESTABLISHED→CLOSE transitions without sent/received \
+            attribution (SOCK_OPS state callbacks cannot distinguish direction)."
     );
     let _ = writeln!(out, "# TYPE {p}_tcp_events_total counter");
     let _ = writeln!(
@@ -194,13 +199,8 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
     );
     let _ = writeln!(
         out,
-        "{p}_tcp_events_total{{event=\"rst_sent\"}} {}",
-        snap.rst_sent
-    );
-    let _ = writeln!(
-        out,
-        "{p}_tcp_events_total{{event=\"rst_received\"}} {}",
-        snap.rst_received
+        "{p}_tcp_events_total{{event=\"rst\"}} {}",
+        snap.rst
     );
     let _ = writeln!(
         out,
@@ -216,8 +216,8 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
     // Drop-reason counters.
     let _ = writeln!(
         out,
-        "# HELP {p}_drops_total Connection-bypass decisions by reason. \
-            These were previously invisible to operators."
+        "# HELP {p}_drops_total Connection-bypass decisions by reason, \
+            produced by the connect4/connect6 capture hooks."
     );
     let _ = writeln!(out, "# TYPE {p}_drops_total counter");
     for (reason, count) in snap.drop_reasons() {
@@ -269,22 +269,6 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
         snap.syn_to_ack_count
     );
 
-    let _ = writeln!(
-        out,
-        "# HELP {p}_accept_to_first_byte_microseconds Time between accept and first inbound data byte."
-    );
-    let _ = writeln!(out, "# TYPE {p}_accept_to_first_byte_microseconds summary");
-    let _ = writeln!(
-        out,
-        "{p}_accept_to_first_byte_microseconds_sum {}",
-        snap.accept_to_first_byte_us_sum
-    );
-    let _ = writeln!(
-        out,
-        "{p}_accept_to_first_byte_microseconds_count {}",
-        snap.accept_to_first_byte_count
-    );
-
     // Ringbuf health.
     let _ = writeln!(
         out,
@@ -298,7 +282,11 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
     );
     let _ = writeln!(
         out,
-        "# HELP {p}_ringbuf_overruns_total Ringbuf overrun count. Non-zero = userspace consumer fell behind and the kernel dropped events. Set FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES higher."
+        "# HELP {p}_ringbuf_overruns_total Ringbuf overrun episodes. Incremented when the \
+            kernel dropped-events counter advances between polls, and once when attaching \
+            (or re-attaching after pin rotation) to a map generation that already reports \
+            a nonzero dropped total. Non-zero = userspace fell behind and the kernel \
+            dropped events. Set FERRUM_BPF_SOCK_OPS_RINGBUF_BYTES higher."
     );
     let _ = writeln!(out, "# TYPE {p}_ringbuf_overruns_total counter");
     let _ = writeln!(out, "{p}_ringbuf_overruns_total {}", snap.ringbuf_overruns);

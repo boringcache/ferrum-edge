@@ -9,8 +9,12 @@
 //! | `PASSIVE_ESTABLISHED_CB`   | `AcceptEstablished`         |
 //! | `STATE_CB` (FIN_WAIT1)     | `Fin { Sent }`              |
 //! | `STATE_CB` (CLOSE_WAIT)    | `Fin { Received }`          |
-//! | `STATE_CB` (* → CLOSE)     | `Rst { Received }` (heuristic — see below) |
+//! | `STATE_CB` (* → CLOSE)     | `Rst` (direction unknown — see below) |
 //! | `RTT_CB`                   | `RttSample { srtt_us }`     |
+//!
+//! Capture-bypass decisions (`DropReason`) are emitted by `connect4` /
+//! `connect6` via the shared [`crate::sock_ops_emit`] helpers — not by this
+//! program — so the same ringbuf + dropped-counter contract covers both.
 //!
 //! Records are written to the `FERRUM_SOCK_OPS_EVENTS` ringbuf. When the
 //! ringbuf is full, `__sync_fetch_and_add` bumps
@@ -55,13 +59,22 @@
 //! already uses for the `bpf_sock_addr` v6 fields), so IPv6 node-waypoint cookie
 //! resolution now resolves on the same footing as IPv4.
 //!
-//! ## RST attribution caveat
+//! ## RST attribution
 //!
-//! `BPF_SOCK_OPS_STATE_CB` reports state transitions but does not directly
-//! distinguish RST-sent vs RST-received. For the first cut we treat every
-//! transition into `TCP_CLOSE` that did NOT go through the FIN_WAIT /
-//! LAST_ACK / CLOSING ladder as a received RST. Refining via
-//! `bpf_skc_to_tcp_sock(sk)->sk_err == ECONNRESET` is a future-work item.
+//! `BPF_SOCK_OPS_STATE_CB` reports state transitions but does not distinguish
+//! RST-sent vs RST-received. Every abnormal `ESTABLISHED → CLOSE` transition is
+//! therefore emitted as a non-directional `Rst` (`direction = 0`). Userspace
+//! exports a single `event="rst"` series — not `rst_sent` / `rst_received` —
+//! so operators are not told a directional story the kernel cannot support.
+//! Refining via `bpf_skc_to_tcp_sock(sk)->sk_err` remains future work if a
+//! verifier-safe attribution path lands.
+//!
+//! ## Accept-to-first-byte
+//!
+//! SOCK_OPS has no first-inbound-data-byte callback, so this program does **not**
+//! emit `SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY`. The discriminant remains
+//! reserved in the ABI; the public Prometheus surface omits that family until a
+//! verifier-safe producer exists.
 
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::sock_ops;
@@ -72,14 +85,14 @@ use ferrum_ebpf_common::{
     SockOpsRecord, SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT,
     SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN,
     SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE, SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY,
-    SOCK_OPS_STATS_EVENTS_DROPPED,
 };
 
 use crate::maps::{
     FERRUM_ACCEPT_COOKIE_BY_TUPLE4, FERRUM_ACCEPT_COOKIE_BY_TUPLE6, FERRUM_ORIG_DST4,
     FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_ORIG_DST_BY_TUPLE6,
-    FERRUM_SOCK_OPS_CONNECT_TS, FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS,
+    FERRUM_SOCK_OPS_CONNECT_TS,
 };
+use crate::sock_ops_emit::emit;
 
 // Address families from <bits/socket.h>; `bpf_sock_ops.family` carries the
 // value. The GAP-2M cookie bridge handles both: IPv4 reads the `local_ip4` /
@@ -241,15 +254,13 @@ fn emit_state_transition(old_state: u32, new_state: u32) {
             // (FIN_WAIT1, FIN_WAIT2, CLOSING, TIME_WAIT, LAST_ACK,
             // CLOSE_WAIT) always pass through ESTABLISHED first, then go
             // to a non-ESTABLISHED state before reaching CLOSE — so the
-            // ESTABLISHED check is sufficient. Without inspecting
-            // `tcp_sock->sk_err`, sent-vs-received is unknown; surface
-            // as Received per first-cut heuristic (refining via
-            // `bpf_skc_to_tcp_sock` is future work, called out in the
-            // module-level comment).
+            // ESTABLISHED check is sufficient. Direction is unknown without
+            // inspecting `tcp_sock->sk_err`; emit `direction = 0` so
+            // userspace surfaces a single non-directional `rst` series.
             if old_state == TCP_ESTABLISHED {
                 emit(SockOpsRecord {
                     event_type: SOCK_OPS_EVENT_RST,
-                    direction: SOCK_OPS_DIRECTION_RECEIVED,
+                    direction: 0,
                     drop_reason: 0,
                     _pad: 0,
                     value: 0,
@@ -612,29 +623,5 @@ fn drain_connect_ts(ctx: &SockOpsContext) -> Option<u64> {
         None
     } else {
         Some(delta_us)
-    }
-}
-
-#[inline(always)]
-fn emit(record: SockOpsRecord) {
-    match FERRUM_SOCK_OPS_EVENTS.reserve::<SockOpsRecord>(0) {
-        Some(mut entry) => {
-            entry.write(record);
-            entry.submit(0);
-        }
-        None => {
-            // Ringbuf full — bump the per-CPU kernel-side dropped counter
-            // so the userspace consumer can flip into the overrun regime.
-            // PerCpuArray slots are CPU-local, so a non-atomic increment
-            // is safe (no other CPU touches this slot until userspace
-            // reads). Userspace sums across CPUs when polling.
-            if let Some(slot) = FERRUM_SOCK_OPS_STATS.get_ptr_mut(SOCK_OPS_STATS_EVENTS_DROPPED) {
-                // Safety: `slot` points into a per-CPU array slot the
-                // verifier already proved valid for the current CPU.
-                unsafe {
-                    *slot = (*slot).wrapping_add(1);
-                }
-            }
-        }
     }
 }

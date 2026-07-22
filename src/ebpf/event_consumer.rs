@@ -1,10 +1,10 @@
 //! Userspace consumer for the SOCK_OPS ringbuf.
 //!
 //! The kernel-side `BPF_PROG_TYPE_SOCK_OPS` program emits one record per
-//! TCP-layer event (Connect, AcceptEstablished, RstSent/Received,
-//! FinSent/Received, RttSample) plus a record per BPF drop-reason hit.
-//! Userspace polls the ringbuf, decodes the records, and updates the
-//! shared [`BpfMetricsState`].
+//! TCP-layer event (Connect, AcceptEstablished, Rst, FinSent/Received,
+//! RttSample) and the connect4/connect6 hooks emit one record per BPF
+//! drop-reason hit. Userspace polls the ringbuf, decodes the records, and
+//! updates the shared [`BpfMetricsState`].
 //!
 //! ## Production wiring (GAP-3D)
 //!
@@ -36,8 +36,7 @@ use std::sync::Arc;
 use ferrum_ebpf_common::{
     SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_DROP_BYPASS_UID_HIT,
     SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
-    SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
-    SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, SOCK_OPS_EVENT_CONNECT,
+    SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, SOCK_OPS_EVENT_CONNECT,
     SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
     SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SockOpsRecord,
 };
@@ -63,11 +62,12 @@ pub const SOCK_OPS_RECOVERY_THRESHOLD: u32 = 3;
 pub enum SockOpsEvent {
     Connect,
     AcceptEstablished,
-    Rst { direction: TcpDirection },
+    /// Abnormal ESTABLISHED→CLOSE. Direction is not attributed (kernel
+    /// SOCK_OPS state callbacks cannot distinguish sent vs received RST).
+    Rst,
     Fin { direction: TcpDirection },
     RttSample { srtt_us: u64 },
     SynToAckLatency { us: u64 },
-    AcceptToFirstByteLatency { us: u64 },
     DropReason(BpfDropReason),
 }
 
@@ -91,9 +91,10 @@ impl SockOpsEvent {
         match record.event_type {
             SOCK_OPS_EVENT_CONNECT => Some(Self::Connect),
             SOCK_OPS_EVENT_ACCEPT_ESTABLISHED => Some(Self::AcceptEstablished),
-            SOCK_OPS_EVENT_RST => Some(Self::Rst {
-                direction: direction.unwrap_or(TcpDirection::Received),
-            }),
+            // Direction field is ignored for RST: the producer emits unknown
+            // (0). Older synthetic records with sent/received still decode
+            // to the same non-directional event.
+            SOCK_OPS_EVENT_RST => Some(Self::Rst),
             SOCK_OPS_EVENT_FIN => Some(Self::Fin {
                 direction: direction.unwrap_or(TcpDirection::Received),
             }),
@@ -101,9 +102,8 @@ impl SockOpsEvent {
                 srtt_us: record.value,
             }),
             SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY => Some(Self::SynToAckLatency { us: record.value }),
-            SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY => {
-                Some(Self::AcceptToFirstByteLatency { us: record.value })
-            }
+            // Accept-to-first-byte (discriminant 7) has no kernel producer;
+            // fall through to None so reserved records are ignored.
             SOCK_OPS_EVENT_DROP_REASON => Some(Self::DropReason(drop_reason?)),
             _ => None,
         }
@@ -162,13 +162,10 @@ impl SockOpsConsumer {
         match event {
             SockOpsEvent::Connect => self.metrics.record_connect(),
             SockOpsEvent::AcceptEstablished => self.metrics.record_accept_established(),
-            SockOpsEvent::Rst { direction } => self.metrics.record_rst(direction),
+            SockOpsEvent::Rst => self.metrics.record_rst(),
             SockOpsEvent::Fin { direction } => self.metrics.record_fin(direction),
             SockOpsEvent::RttSample { srtt_us } => self.metrics.record_srtt_sample(srtt_us),
             SockOpsEvent::SynToAckLatency { us } => self.metrics.record_syn_to_ack(us),
-            SockOpsEvent::AcceptToFirstByteLatency { us } => {
-                self.metrics.record_accept_to_first_byte(us)
-            }
             SockOpsEvent::DropReason(reason) => self.metrics.record_drop(reason),
         }
     }
@@ -236,6 +233,26 @@ impl SockOpsConsumer {
     }
 }
 
+/// Adopt a kernel dropped-events total as the comparison baseline.
+///
+/// Used on initial attach and after pin rotation reattachment. When the
+/// new map generation already reports a nonzero dropped total, seed one
+/// overrun episode ([`SockOpsConsumer::record_overrun`]) so the loss is
+/// operator-visible instead of being silently adopted as the baseline.
+/// Cumulative userspace counters on the shared [`BpfMetricsState`] are
+/// preserved — this only updates the kernel-map comparison baseline and,
+/// when needed, the overrun regime.
+///
+/// A pre-existing nonzero generation counts as **one** overrun episode
+/// (same contract as initial attach), regardless of the absolute dropped
+/// count on that generation.
+pub fn seed_dropped_baseline(consumer: &SockOpsConsumer, dropped_total: u64) -> u64 {
+    if dropped_total > 0 {
+        consumer.record_overrun();
+    }
+    dropped_total
+}
+
 /// Production async consumer that opens the pinned SOCK_OPS ringbuf and
 /// drives the [`SockOpsConsumer`] dispatch from kernel events.
 ///
@@ -255,7 +272,10 @@ pub mod production {
     use tokio::io::unix::AsyncFd;
     use tracing::{debug, info, warn};
 
-    use super::{PollOutcome, SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent};
+    use super::{
+        PollOutcome, SOCK_OPS_RECOVERY_THRESHOLD, SockOpsConsumer, SockOpsEvent,
+        seed_dropped_baseline,
+    };
     use crate::ebpf::{BPF_SOCK_OPS_EVENTS_PIN_PATH, BPF_SOCK_OPS_STATS_PIN_PATH};
 
     static MALFORMED_SOCK_OPS_RECORD_WARNED: AtomicBool = AtomicBool::new(false);
@@ -288,14 +308,9 @@ pub mod production {
         let mut async_fd = AsyncFd::with_interest(RingBufFd(raw_fd), Interest::READABLE)
             .map_err(|e| anyhow::anyhow!("Failed to wrap SOCK_OPS ringbuf fd in AsyncFd: {e}"))?;
 
-        let mut last_dropped_total: u64 = read_dropped_total(&stats);
+        let mut last_dropped_total: u64 =
+            seed_dropped_baseline(&consumer, read_dropped_total(&stats));
         let mut consecutive_drained: u32 = 0;
-        // Seed the regime as engaged when we observe pre-existing drops, so
-        // the operator dashboard immediately reflects the kernel state
-        // instead of waiting for the next drop to flip the regime.
-        if last_dropped_total > 0 {
-            consumer.record_overrun();
-        }
 
         // Track the inode of the events pin so we can detect node-agent
         // restarts. When the node-agent re-attaches it pins a new ringbuf
@@ -359,7 +374,10 @@ pub mod production {
                                 .map_err(|e| anyhow::anyhow!(
                                     "Failed to re-wrap SOCK_OPS ringbuf fd in AsyncFd: {e}"
                                 ))?;
-                                last_dropped_total = read_dropped_total(&stats);
+                                last_dropped_total = seed_dropped_baseline(
+                                    &consumer,
+                                    read_dropped_total(&stats),
+                                );
                                 consecutive_drained = 0;
                                 events_inode = pin_inode(BPF_SOCK_OPS_EVENTS_PIN_PATH);
                                 info!(
@@ -643,34 +661,27 @@ mod tests {
         consumer.handle_event(SockOpsEvent::Connect);
         consumer.handle_event(SockOpsEvent::AcceptEstablished);
         consumer.handle_event(SockOpsEvent::AcceptEstablished);
-        consumer.handle_event(SockOpsEvent::Rst {
-            direction: TcpDirection::Sent,
-        });
-        consumer.handle_event(SockOpsEvent::Rst {
-            direction: TcpDirection::Received,
-        });
+        consumer.handle_event(SockOpsEvent::Rst);
+        consumer.handle_event(SockOpsEvent::Rst);
         consumer.handle_event(SockOpsEvent::Fin {
             direction: TcpDirection::Received,
         });
         consumer.handle_event(SockOpsEvent::RttSample { srtt_us: 250 });
         consumer.handle_event(SockOpsEvent::SynToAckLatency { us: 60 });
-        consumer.handle_event(SockOpsEvent::AcceptToFirstByteLatency { us: 800 });
         consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::BypassUidHit));
 
         let s = snap(&consumer);
         assert_eq!(s.connect, 1);
         assert_eq!(s.accept_established, 2);
-        assert_eq!(s.rst_sent, 1);
-        assert_eq!(s.rst_received, 1);
+        assert_eq!(s.rst, 2);
         assert_eq!(s.fin_sent, 0);
         assert_eq!(s.fin_received, 1);
         assert_eq!(s.srtt_sample_us_sum, 250);
         assert_eq!(s.srtt_count, 1);
         assert_eq!(s.syn_to_ack_us_sum, 60);
-        assert_eq!(s.accept_to_first_byte_us_sum, 800);
         assert_eq!(s.drop_bypass_uid_hit, 1);
         // Every handled event also bumps the consumed-events counter.
-        assert_eq!(s.ringbuf_events_consumed, 10);
+        assert_eq!(s.ringbuf_events_consumed, 9);
     }
 
     #[test]
@@ -703,10 +714,13 @@ mod tests {
             Some(SockOpsEvent::AcceptEstablished)
         );
         assert_eq!(
+            SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_RST, 0, 0, 0)),
+            Some(SockOpsEvent::Rst)
+        );
+        // Legacy directional RST records still collapse to non-directional Rst.
+        assert_eq!(
             SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_RST, SOCK_OPS_DIRECTION_SENT, 0, 0)),
-            Some(SockOpsEvent::Rst {
-                direction: TcpDirection::Sent
-            })
+            Some(SockOpsEvent::Rst)
         );
         assert_eq!(
             SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_FIN, SOCK_OPS_DIRECTION_RECEIVED, 0, 0)),
@@ -722,10 +736,14 @@ mod tests {
             SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, 0, 0, 60)),
             Some(SockOpsEvent::SynToAckLatency { us: 60 })
         );
-        assert_eq!(
-            SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, 0, 0, 800)),
-            Some(SockOpsEvent::AcceptToFirstByteLatency { us: 800 })
-        );
+        // Reserved accept-to-first-byte discriminant has no producer — ignored.
+        assert!(SockOpsEvent::from_record(rec(
+            SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
+            0,
+            0,
+            800
+        ))
+        .is_none());
 
         for (raw, expected) in [
             (SOCK_OPS_DROP_BYPASS_UID_HIT, BpfDropReason::BypassUidHit),
@@ -848,5 +866,35 @@ mod tests {
             !in_regime,
             "three real drains in a row should clear the regime"
         );
+    }
+
+    #[test]
+    fn seed_dropped_baseline_zero_does_not_enter_overrun() {
+        let consumer = SockOpsConsumer::new(BpfMetricsState::new());
+        // Preserve unrelated cumulative state across a synthetic reattach.
+        consumer.handle_event(SockOpsEvent::Connect);
+        assert_eq!(seed_dropped_baseline(&consumer, 0), 0);
+        let s = snap(&consumer);
+        assert_eq!(s.connect, 1);
+        assert_eq!(s.ringbuf_overruns, 0);
+        assert!(!s.in_overrun_regime);
+    }
+
+    #[test]
+    fn seed_dropped_baseline_nonzero_enters_overrun_once() {
+        let consumer = SockOpsConsumer::new(BpfMetricsState::new());
+        consumer.handle_event(SockOpsEvent::Connect);
+        consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::ExcludePortHit));
+        assert_eq!(seed_dropped_baseline(&consumer, 42), 42);
+        let s = snap(&consumer);
+        assert_eq!(s.connect, 1, "cumulative userspace state must survive reattach");
+        assert_eq!(s.drop_exclude_port_hit, 1);
+        assert_eq!(s.ringbuf_overruns, 1);
+        assert!(s.in_overrun_regime);
+        // A second seed while already in-regime still increments the counter
+        // but does not re-enter (warn fires only once per regime).
+        assert_eq!(seed_dropped_baseline(&consumer, 99), 99);
+        assert_eq!(snap(&consumer).ringbuf_overruns, 2);
+        assert!(snap(&consumer).in_overrun_regime);
     }
 }
