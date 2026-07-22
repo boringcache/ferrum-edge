@@ -214,9 +214,16 @@ async fn test_ai_stream_router_normalizes_anthropic_sse_and_strips_accept_encodi
     assert!(body.trim_end().ends_with("data: [DONE]"));
     assert!(!body.contains("content_block_delta"));
 
-    let captured = capture.lock().unwrap().clone().expect("provider saw request");
+    let captured = capture
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("provider saw request");
     assert!(
-        !captured.raw.to_ascii_lowercase().contains("accept-encoding:"),
+        !captured
+            .raw
+            .to_ascii_lowercase()
+            .contains("accept-encoding:"),
         "provider must not receive Accept-Encoding: {}",
         captured.raw
     );

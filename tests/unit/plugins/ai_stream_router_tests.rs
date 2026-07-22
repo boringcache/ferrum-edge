@@ -1583,6 +1583,15 @@ async fn test_premature_anthropic_eof_is_upstream_error_not_success() {
 }
 
 #[tokio::test]
+async fn test_anthropic_message_stop_without_start_is_protocol_error() {
+    let (out, terminated) = run_sse("data: {\"type\":\"message_stop\"}\n\n").await;
+    assert!(terminated);
+    assert!(out.contains("before message_start"));
+    assert!(out.contains("upstream_error"));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
 async fn test_malformed_complete_sse_event_fails_closed() {
     let body = concat!(
         "event: message_start\n",
@@ -1670,7 +1679,9 @@ async fn test_normalized_claim_strips_accept_encoding() {
     headers.insert("accept-encoding".to_string(), "gzip, br".to_string());
     plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(
-        !headers.keys().any(|k| k.eq_ignore_ascii_case("accept-encoding")),
+        !headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("accept-encoding")),
         "normalized Anthropic claims must strip Accept-Encoding"
     );
 }
@@ -1678,7 +1689,8 @@ async fn test_normalized_claim_strips_accept_encoding() {
 #[tokio::test]
 async fn test_openai_passthrough_keeps_accept_encoding() {
     let plugin = build(openai_and_anthropic_config());
-    let body = json!({"model": "gpt-4o", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let body =
+        json!({"model": "gpt-4o", "stream": true, "messages": [{"role":"user","content":"hi"}]});
     let mut ctx = post_ctx(&body);
     let mut headers = json_headers();
     headers.insert("accept-encoding".to_string(), "gzip".to_string());
@@ -1722,10 +1734,7 @@ async fn test_gzip_encoded_streamed_anthropic_sse_is_normalized() {
     let after = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert!(matches!(after, PluginResult::Continue));
     assert!(!resp_headers.contains_key("content-encoding"));
-    assert_eq!(
-        resp_headers.get("vary").map(String::as_str),
-        Some("Origin")
-    );
+    assert_eq!(resp_headers.get("vary").map(String::as_str), Some("Origin"));
     assert_eq!(
         ctx.metadata
             .get("ai_stream_router.provider_content_encoding")
@@ -1743,6 +1752,35 @@ async fn test_gzip_encoded_streamed_anthropic_sse_is_normalized() {
     assert!(out.contains("\"content\":\"Hello\""));
     assert!(out.trim_end().ends_with("data: [DONE]"));
     assert!(!out.contains("upstream_error"));
+}
+
+#[tokio::test]
+async fn test_gzip_streaming_decode_rejects_expansion_over_limit() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("bounded decoding inspector");
+    let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+    let encoded = gzip_bytes(&oversized);
+    let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+    assert!(out.contains("upstream_error"));
+    assert!(out.contains("decoded content exceeds"));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
 }
 
 #[tokio::test]
@@ -1932,6 +1970,91 @@ async fn test_malformed_tool_history_rejects_with_400() {
     let mut headers2 = json_headers();
     assert_eq!(
         reject_status(&plugin.before_proxy(&mut ctx2, &mut headers2).await),
+        Some(400)
+    );
+
+    let missing_result = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"}
+                }]
+            },
+            {"role": "user", "content": "continue without a result"}
+        ]
+    });
+    let mut ctx3 = post_ctx(&missing_result);
+    let mut headers3 = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx3, &mut headers3).await),
+        Some(400)
+    );
+
+    let duplicate_result = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "first"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "duplicate"}
+        ]
+    });
+    let mut ctx4 = post_ctx(&duplicate_result);
+    let mut headers4 = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx4, &mut headers4).await),
+        Some(400)
+    );
+}
+
+#[tokio::test]
+async fn test_anthropic_late_translation_failure_is_rejected_before_dispatch() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                b"{",
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        reject_status(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, b"{")
+                .await
+        ),
         Some(400)
     );
 }

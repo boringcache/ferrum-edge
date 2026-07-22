@@ -53,7 +53,6 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use tracing::debug;
 use url::{Host, Url};
 
@@ -117,6 +116,7 @@ const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
 const META_FALLBACK_ATTEMPTS: &str = "ai_stream_router.fallback_attempts";
+const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
 /// Provider `Content-Encoding` that must be decoded before Anthropic SSE
 /// normalization. Stamped in `after_proxy` before representation headers are
 /// repaired so both streaming and buffered normalizers see the same coding.
@@ -809,9 +809,9 @@ fn parse_openai_tool_calls(
     let Some(tool_calls_value) = message.get("tool_calls") else {
         return Ok(Vec::new());
     };
-    let tool_calls = tool_calls_value.as_array().ok_or_else(|| {
-        format!("messages[{message_index}].tool_calls must be an array")
-    })?;
+    let tool_calls = tool_calls_value
+        .as_array()
+        .ok_or_else(|| format!("messages[{message_index}].tool_calls must be an array"))?;
     if tool_calls.is_empty() {
         return Err(format!(
             "messages[{message_index}].tool_calls must not be empty"
@@ -890,13 +890,13 @@ fn tool_result_text(content: &Value) -> Result<String, String> {
     let mut text = String::new();
     for (index, part) in parts.iter().enumerate() {
         if part.get("type").and_then(Value::as_str) != Some("text") {
-            return Err(format!(
-                "tool message content[{index}] must be a text part"
-            ));
+            return Err(format!("tool message content[{index}] must be a text part"));
         }
-        text.push_str(part.get("text").and_then(Value::as_str).ok_or_else(|| {
-            format!("tool message content[{index}] missing text")
-        })?);
+        text.push_str(
+            part.get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("tool message content[{index}] missing text"))?,
+        );
     }
     Ok(text)
 }
@@ -913,6 +913,7 @@ fn anthropic_text_content_blocks(text: &str) -> Vec<Value> {
 /// Fail closed on malformed tool calls/results rather than silently dropping them.
 fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
     let mut tool_call_ids = HashSet::new();
+    let mut pending_tool_results = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
         let message_object = message
             .as_object()
@@ -921,16 +922,16 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("messages[{index}] missing string role"))?;
-        if !matches!(
-            role,
-            "system" | "developer" | "user" | "assistant" | "tool"
-        ) {
-            return Err(format!(
-                "messages[{index}] has unsupported role '{role}'"
-            ));
+        if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+            return Err(format!("messages[{index}] has unsupported role '{role}'"));
         }
 
         let has_tool_calls = message_object.get("tool_calls").is_some();
+        if role != "tool" && !pending_tool_results.is_empty() {
+            return Err(format!(
+                "messages[{index}] appears before results for every preceding assistant tool call"
+            ));
+        }
         match message_object.get("content") {
             Some(Value::String(_)) | Some(Value::Array(_)) => {}
             Some(Value::Null) | None if role == "assistant" && has_tool_calls => {}
@@ -945,9 +946,10 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
 
         if role == "assistant" {
             for call in parse_openai_tool_calls(message, index)? {
-                if !tool_call_ids.insert(call.id) {
+                if !tool_call_ids.insert(call.id.clone()) {
                     return Err(format!("messages[{index}] repeats a tool-call id"));
                 }
+                pending_tool_results.insert(call.id);
             }
         } else if has_tool_calls {
             return Err(format!(
@@ -961,15 +963,17 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| format!("messages[{index}] tool message missing tool_call_id"))?;
-            if !tool_call_ids.contains(tool_call_id) {
+            if !pending_tool_results.remove(tool_call_id) {
                 return Err(format!(
-                    "messages[{index}] tool_call_id has no preceding assistant tool call"
+                    "messages[{index}] tool_call_id has no unmatched preceding assistant tool call"
                 ));
             }
-            tool_result_text(message_object.get("content").unwrap_or(&Value::Null)).map_err(
-                |error| format!("messages[{index}] {error}"),
-            )?;
+            tool_result_text(message_object.get("content").unwrap_or(&Value::Null))
+                .map_err(|error| format!("messages[{index}] {error}"))?;
         }
+    }
+    if !pending_tool_results.is_empty() {
+        return Err("assistant tool calls are missing one or more tool results".to_string());
     }
     Ok(())
 }
@@ -1485,10 +1489,10 @@ impl Plugin for AiStreamRouter {
         match provider.provider_type {
             ProviderType::Anthropic => {
                 let openai_body: Value = serde_json::from_slice(body).ok()?;
-                // Validation already ran in `before_proxy`; a late parse failure
-                // leaves the body untouched so the request cannot silently reach
-                // Anthropic with an OpenAI-shaped payload.
-                translate_to_anthropic(&openai_body, &model).ok()
+                let translated = translate_to_anthropic(&openai_body, &model).ok()?;
+                ctx.metadata
+                    .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
+                Some(translated)
             }
             ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
                 if self.inject_usage_options {
@@ -1500,6 +1504,31 @@ impl Plugin for AiStreamRouter {
             // Unreachable: google_gemini fails construction in this MVP.
             ProviderType::GoogleGemini => None,
         }
+    }
+
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        if ctx.metadata.get(META_CLAIMED).map(String::as_str) == Some("true")
+            && ctx.metadata.get(META_PROVIDER_TYPE).map(String::as_str) == Some("anthropic")
+            && ctx
+                .metadata
+                .get(META_REQUEST_TRANSLATED)
+                .map(String::as_str)
+                != Some("true")
+        {
+            return openai_error_response(
+                400,
+                "The Anthropic request body could not be translated safely",
+                "invalid_request_error",
+                Some("messages"),
+                Some("invalid_messages"),
+            );
+        }
+        PluginResult::Continue
     }
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
@@ -1535,10 +1564,7 @@ impl Plugin for AiStreamRouter {
             .get(META_MODEL)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        let encoding = ctx
-            .metadata
-            .get(META_PROVIDER_ENCODING)
-            .cloned();
+        let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
         Some(wrap_anthropic_normalizer(model, encoding.as_deref()))
     }
 
@@ -1589,9 +1615,7 @@ impl Plugin for AiStreamRouter {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled
-            || ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true")
-        {
+        if !self.enabled || ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
             return PluginResult::Continue;
         }
         if !(200..300).contains(&response_status) {
@@ -1612,9 +1636,7 @@ impl Plugin for AiStreamRouter {
             }
             ProviderContentEncoding::Unsupported(message) => openai_error_response(
                 502,
-                &format!(
-                    "Upstream Anthropic SSE used an unsupported Content-Encoding: {message}"
-                ),
+                &format!("Upstream Anthropic SSE used an unsupported Content-Encoding: {message}"),
                 "upstream_error",
                 None,
                 Some("unsupported_content_encoding"),
@@ -1899,6 +1921,7 @@ struct AnthropicSseNormalizer {
     model: String,
     stream_id: Option<String>,
     created: i64,
+    message_started: bool,
     role_emitted: bool,
     done_emitted: bool,
     terminal: Option<StreamTerminal>,
@@ -1916,6 +1939,7 @@ impl AnthropicSseNormalizer {
             model,
             stream_id: None,
             created: Utc::now().timestamp(),
+            message_started: false,
             role_emitted: false,
             done_emitted: false,
             terminal: None,
@@ -1987,6 +2011,15 @@ impl AnthropicSseNormalizer {
     fn transcode_event(&mut self, event: &Value, out: &mut String) -> bool {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
+                if self.message_started {
+                    self.emit_upstream_error(
+                        "upstream provider repeated Anthropic message_start",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+                self.message_started = true;
                 let message = &event["message"];
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
                     self.stream_id = Some(id.to_string());
@@ -2004,6 +2037,9 @@ impl AnthropicSseNormalizer {
                 false
             }
             Some("content_block_start") => {
+                if !self.require_message_start("content_block_start", out) {
+                    return true;
+                }
                 let index = event["index"].as_u64().unwrap_or(0);
                 let block = &event["content_block"];
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
@@ -2027,6 +2063,9 @@ impl AnthropicSseNormalizer {
                 false
             }
             Some("content_block_delta") => {
+                if !self.require_message_start("content_block_delta", out) {
+                    return true;
+                }
                 let index = event["index"].as_u64().unwrap_or(0);
                 let delta = &event["delta"];
                 match delta.get("type").and_then(Value::as_str) {
@@ -2057,6 +2096,9 @@ impl AnthropicSseNormalizer {
                 false
             }
             Some("message_delta") => {
+                if !self.require_message_start("message_delta", out) {
+                    return true;
+                }
                 if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
                     self.completion_tokens = Some(tokens);
                 }
@@ -2065,6 +2107,9 @@ impl AnthropicSseNormalizer {
                 false
             }
             Some("message_stop") => {
+                if !self.require_message_start("message_stop", out) {
+                    return true;
+                }
                 self.finish(StreamTerminal::MessageStop, out);
                 true
             }
@@ -2089,6 +2134,18 @@ impl AnthropicSseNormalizer {
             self.role_emitted = true;
             out.push_str(&self.chunk_line(json!({ "role": "assistant" }), None));
         }
+    }
+
+    fn require_message_start(&mut self, event_type: &str, out: &mut String) -> bool {
+        if self.message_started {
+            return true;
+        }
+        self.emit_upstream_error(
+            &format!("upstream provider sent Anthropic {event_type} before message_start"),
+            out,
+        );
+        self.finish(StreamTerminal::UpstreamFailure, out);
+        false
     }
 
     /// Emit the final usage chunk (when successful) and the OpenAI `[DONE]`
@@ -2216,78 +2273,37 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
 }
 
 /// Decode residual provider content coding, then feed plaintext SSE into the
-/// Anthropic→OpenAI normalizer.
+/// Anthropic→OpenAI normalizer. Because a compressed stream's checksum/trailer
+/// is not trustworthy until EOF, this rare fallback buffers the encoded body
+/// within a strict cap before decoding. Normal requests strip Accept-Encoding
+/// and retain fully progressive identity SSE normalization.
 struct ContentDecodingNormalizer {
-    decoder: StreamContentDecoder,
+    encoding: &'static str,
+    encoded: Vec<u8>,
     inner: AnthropicSseNormalizer,
-}
-
-enum StreamContentDecoder {
-    Gzip(flate2::write::GzDecoder<Vec<u8>>),
-    Brotli(brotli::DecompressorWriter<Vec<u8>>),
 }
 
 impl ContentDecodingNormalizer {
     fn gzip(inner: AnthropicSseNormalizer) -> Self {
         Self {
-            decoder: StreamContentDecoder::Gzip(flate2::write::GzDecoder::new(Vec::new())),
+            encoding: "gzip",
+            encoded: Vec::new(),
             inner,
         }
     }
 
     fn brotli(inner: AnthropicSseNormalizer) -> Self {
         Self {
-            decoder: StreamContentDecoder::Brotli(brotli::DecompressorWriter::new(Vec::new(), 4096)),
+            encoding: "br",
+            encoded: Vec::new(),
             inner,
-        }
-    }
-
-    fn take_decoded(&mut self) -> Result<Vec<u8>, String> {
-        match &mut self.decoder {
-            StreamContentDecoder::Gzip(decoder) => {
-                let buf = decoder.get_mut();
-                let out = std::mem::take(buf);
-                Ok(out)
-            }
-            StreamContentDecoder::Brotli(decoder) => {
-                let buf = decoder.get_mut();
-                let out = std::mem::take(buf);
-                Ok(out)
-            }
-        }
-    }
-
-    fn write_compressed(&mut self, chunk: &[u8]) -> Result<(), String> {
-        match &mut self.decoder {
-            StreamContentDecoder::Gzip(decoder) => decoder
-                .write_all(chunk)
-                .map_err(|error| format!("gzip decompression failed: {error}")),
-            StreamContentDecoder::Brotli(decoder) => decoder
-                .write_all(chunk)
-                .map_err(|error| format!("brotli decompression failed: {error}")),
-        }
-    }
-
-    fn finish_decoder(&mut self) -> Result<Vec<u8>, String> {
-        match std::mem::replace(
-            &mut self.decoder,
-            // Consumed below; placeholder keeps the enum inhabited.
-            StreamContentDecoder::Gzip(flate2::write::GzDecoder::new(Vec::new())),
-        ) {
-            StreamContentDecoder::Gzip(decoder) => decoder
-                .finish()
-                .map_err(|error| format!("gzip decompression failed: {error}")),
-            StreamContentDecoder::Brotli(decoder) => decoder
-                .into_inner()
-                .map_err(|_| "brotli decompression failed".to_string()),
         }
     }
 
     async fn fail_decode(&mut self, message: String) -> ResponseStreamAction {
         let mut out = String::new();
         self.inner.emit_upstream_error(&message, &mut out);
-        self.inner
-            .finish(StreamTerminal::UpstreamFailure, &mut out);
+        self.inner.finish(StreamTerminal::UpstreamFailure, &mut out);
         ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
     }
 }
@@ -2302,25 +2318,31 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         if self.inner.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        if let Err(message) = self.write_compressed(chunk) {
-            return self.fail_decode(message).await;
-        }
-        let decoded = match self.take_decoded() {
-            Ok(bytes) => bytes,
-            Err(message) => return self.fail_decode(message).await,
+        let Some(next_len) = self.encoded.len().checked_add(chunk.len()) else {
+            return self
+                .fail_decode("encoded Anthropic SSE size overflowed".to_string())
+                .await;
         };
-        if decoded.is_empty() {
-            return ResponseStreamAction::Forward(Bytes::new());
+        if next_len > NORMALIZE_DECODE_LIMITS.max_cumulative_bytes {
+            return self
+                .fail_decode(
+                    "encoded Anthropic SSE exceeds the streaming size limit".to_string(),
+                )
+                .await;
         }
-        self.inner.on_chunk(&decoded).await
+        self.encoded.extend_from_slice(chunk);
+        ResponseStreamAction::Forward(Bytes::new())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         if self.inner.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        let decoded = match self.finish_decoder() {
-            Ok(bytes) => bytes,
+        let decoded = match prepare_sse_bytes_for_normalization(
+            &self.encoded,
+            Some(self.encoding),
+        ) {
+            Ok(bytes) => bytes.into_owned(),
             Err(message) => return self.fail_decode(message).await,
         };
         let mut out = Vec::new();

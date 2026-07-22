@@ -30,9 +30,7 @@ fn plugin() -> AiStreamRouter {
     .expect("valid config")
 }
 
-async fn claim(
-    plugin: &AiStreamRouter,
-) -> (RequestContext, HashMap<String, String>) {
+async fn claim(plugin: &AiStreamRouter) -> (RequestContext, HashMap<String, String>) {
     let body = json!({
         "model": "claude-3-5-sonnet",
         "stream": true,
