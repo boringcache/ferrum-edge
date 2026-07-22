@@ -177,10 +177,7 @@ fn body_validator_gateway_builder(backend_port: u16) -> TestGatewayBuilder {
     TestGateway::builder()
         .mode_file(body_validator_config(backend_port))
         .log_level("warn")
-        .env(
-            "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
-            GLOBAL_LIMIT_BYTES,
-        )
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", GLOBAL_LIMIT_BYTES)
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
 }
 
