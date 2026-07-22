@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 
 from live_suite_path_filter import matched_files, self_test as live_suite_self_test
@@ -22,12 +23,13 @@ ACTION_EXPRESSION_ONLY = re.compile(
 ACTION_USES_VALUE = (
     r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\$\{\{[^\r\n]*\}\}|[^\s,#}]+)'
 )
+ACTION_USES_KEY = r'(?:uses|"uses"|\'uses\')'
 ACTION_USES_BLOCK = re.compile(
-    rf"^\s*(?:-\s*)?uses\s*:\s*(?P<ref>{ACTION_USES_VALUE})\s*(?:#.*)?$",
+    rf"^\s*(?:-\s*)?{ACTION_USES_KEY}\s*:\s*(?P<ref>{ACTION_USES_VALUE})\s*(?:#.*)?$",
     re.MULTILINE,
 )
 ACTION_USES_FLOW = re.compile(
-    rf"(?:^|[{{,])\s*uses\s*:\s*(?P<ref>{ACTION_USES_VALUE})"
+    rf"(?:^|[{{,])\s*{ACTION_USES_KEY}\s*:\s*(?P<ref>{ACTION_USES_VALUE})"
     r"(?=\s*(?:[,}]|#|$))",
     re.MULTILINE,
 )
@@ -126,8 +128,19 @@ def action_policy_yaml_files(repo_root: Path) -> tuple[list[Path], list[str]]:
     if not actions.is_dir():
         failures.append("missing .github/actions directory")
     files = [*workflows.glob("*.yml"), *workflows.glob("*.yaml")]
-    files.extend(actions.glob("*/action.yml"))
-    files.extend(actions.glob("*/action.yaml"))
+    # Local actions may be nested more than one directory below
+    # `.github/actions`; scan every manifest so nesting cannot bypass policy.
+    files.extend(actions.rglob("action.yml"))
+    files.extend(actions.rglob("action.yaml"))
+    for scan_root in (workflows, actions):
+        if not scan_root.is_dir():
+            continue
+        for path in scan_root.rglob("*"):
+            if path.is_symlink():
+                failures.append(
+                    f"{action_policy_relative_path(path, repo_root)}: "
+                    "workflow/action policy paths must not be symlinks"
+                )
     if not files:
         failures.append("no workflow or composite-action YAML found")
     return sorted(set(files)), failures
@@ -275,6 +288,8 @@ def action_pinning_self_test() -> list[str]:
         f"  - uses: actions/checkout@{sha} # pinned\n"
         "  - uses: '${{ matrix.action }}'\n"
         f"  - {{uses: owner/action@{sha}, name: inline}}\n"
+        f"  - \"uses\": owner/quoted-block@{sha}\n"
+        f"  - {{'uses': owner/quoted-flow@{sha}, name: quoted}}\n"
         "  # uses: owner/action@v7\n"
     )
     found = find_action_uses_refs(sample)
@@ -282,6 +297,8 @@ def action_pinning_self_test() -> list[str]:
         f"actions/checkout@{sha}",
         "${{ matrix.action }}",
         f"owner/action@{sha}",
+        f"owner/quoted-block@{sha}",
+        f"owner/quoted-flow@{sha}",
     ]
     if [ref for _, ref in found] != expected:
         failures.append(f"uses parser mismatch: {found!r}")
@@ -300,6 +317,23 @@ def action_pinning_self_test() -> list[str]:
         failures.append("continued pipe-to-shell self-test was not rejected")
     if not any("direct kind" in failure for failure in continued_failures):
         failures.append("continued direct-download self-test was not rejected")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / ".github" / "workflows").mkdir(parents=True)
+        nested = root / ".github" / "actions" / "nested" / "deeper"
+        nested.mkdir(parents=True)
+        (root / ".github" / "workflows" / "ci.yml").write_text(
+            "jobs: {}\n", encoding="utf-8"
+        )
+        nested_manifest = nested / "action.yml"
+        nested_manifest.write_text("runs: {using: composite, steps: []}\n", encoding="utf-8")
+        discovered, discovery_failures = action_policy_yaml_files(root)
+        if discovery_failures:
+            failures.append(
+                f"nested action discovery unexpectedly failed: {discovery_failures!r}"
+            )
+        if nested_manifest not in discovered:
+            failures.append("nested composite-action manifest was not scanned")
     return failures
 
 
