@@ -4698,6 +4698,53 @@ fn test_get_plugins_for_protocol_grpc_excludes_http_only() {
 }
 
 #[test]
+fn response_mock_excluded_from_native_grpc_protocol_view() {
+    // Issue #2442: H2 and H3 native gRPC both use ProxyProtocol::Grpc. The
+    // mock plugin must not appear in that view — Reject normalization would
+    // otherwise turn default status 200 into grpc-status 13 and drop the body.
+    let config = make_config(
+        vec![make_proxy("p1", "/grpc", vec!["mock", "limiter"])],
+        vec![
+            make_plugin_config_with_json(
+                "mock",
+                "response_mock",
+                json!({"rules": [{"path": "/helloworld.Greeter/SayHello", "body": "mocked-response"}]}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config(
+                "limiter",
+                "rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+
+    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_names: Vec<&str> = http_plugins.iter().map(|p| p.name()).collect();
+    assert!(http_names.contains(&"response_mock"));
+    assert!(http_names.contains(&"rate_limiting"));
+
+    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let ws_names: Vec<&str> = ws_plugins.iter().map(|p| p.name()).collect();
+    assert!(
+        ws_names.contains(&"response_mock"),
+        "WebSocket handshake view must retain response_mock"
+    );
+
+    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_names: Vec<&str> = grpc_plugins.iter().map(|p| p.name()).collect();
+    assert!(
+        !grpc_names.contains(&"response_mock"),
+        "native gRPC protocol view must exclude response_mock"
+    );
+    assert!(grpc_names.contains(&"rate_limiting"));
+}
+
+#[test]
 fn ai_prompt_shield_excluded_from_native_grpc_but_retained_on_grpc_web_view() {
     // GHSA-j7hv-p57w-p3vr / #2668: H2 and H3 native gRPC both use
     // ProxyProtocol::Grpc, so excluding the shield from that view covers both
