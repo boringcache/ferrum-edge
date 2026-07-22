@@ -159,7 +159,7 @@ The generated plugin config has this shape:
 | `response_content_types` | common JSON/XML/form/text/binary types | Response media types in scope. |
 | `fail_on_unknown_operation` | `true` | Reject requests that do not match any generated operation. |
 | `fail_on_missing_response_schema` | `false` | Reject responses whose status/content type has no schema and no `default` schema. |
-| `max_body_bytes` | `1048576` | Maximum raw or decompressed body size validated by the plugin. |
+| `max_body_bytes` | `1048576` | Maximum raw body size and per-layer decoded size while undoing `Content-Encoding` chains. |
 | `schema_draft` | generated | Sole authoritative draft selector: `draft7`, `draft2020-12`, or `auto`. Emitted only at the top level; operations do not carry a draft field. |
 | `operations` | required | Generated per-operation schema table. Request and response media schemas are ordinary JSON Schema objects or OpenAPI 3.1 boolean schemas (`true` / `false`). |
 | `bypass.paths` | `[]` | Regexes that skip validation when the request path matches. |
@@ -180,7 +180,7 @@ The generated plugin config has this shape:
 - `application/x-www-form-urlencoded` bodies are parsed into object fields and repeated fields become arrays when the schema property is an array.
 - `multipart/form-data` bodies are parsed into fields. File parts can validate as UTF-8 binary strings or as metadata objects with `filename`, `content_type`, `size`, and UTF-8 `content`; use the metadata-object shape for arbitrary non-UTF-8 file bytes.
 - `text/*` bodies validate as UTF-8 strings. UTF-8 binary bodies validate as strings, so `pattern` and `enum` can apply. Non-UTF-8 binary bodies enforce `minLength` and `maxLength` directly against byte length and skip string-only JSON Schema keywords.
-- gzip and brotli bodies are decompressed before validation and still respect `max_body_bytes`.
+- Request and response bodies may carry a complete HTTP `Content-Encoding` list (`gzip`, `br`, and `identity`). Supported coding chains such as `gzip, br` and `br, gzip` are decoded in reverse application order before schema validation. Empty, malformed, parameterized, or unsupported list members fail validation. `max_body_bytes` bounds the raw body and every decoded layer so chained expansion fails closed.
 - Response status lookup uses the exact status first, then OpenAPI wildcard ranges such as `4XX`, then the OpenAPI `default` response if present.
 - Path templates are generated as full-match regexes. Path parameter constraints are not interpreted; `{id}` becomes `[^/]+`.
 

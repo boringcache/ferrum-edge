@@ -9,6 +9,42 @@ use std::io::Write as _;
 
 use super::plugin_utils::{assert_continue, assert_reject};
 
+fn gzip_bytes(body: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn brotli_bytes(body: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    let mut input = body;
+    brotli::BrotliCompress(
+        &mut input,
+        &mut encoded,
+        &brotli::enc::BrotliEncoderParams::default(),
+    )
+    .unwrap();
+    encoded
+}
+
+fn encoding_headers(encoding: &str) -> HashMap<String, String> {
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), encoding.to_string());
+    headers
+}
+
+fn request_error(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("openapi_validator.request_error")
+        .map(String::as_str)
+}
+
+fn response_error(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("openapi_validator.response_error")
+        .map(String::as_str)
+}
+
 fn validator_config(mode: &str) -> serde_json::Value {
     json!({
         "enforcement_mode": mode,
@@ -194,12 +230,8 @@ async fn delete_request_with_schema_buffers_and_validates_body() {
 async fn valid_request_and_gzip_body_continue() {
     let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
     let mut ctx = post_ctx("/items");
-    let mut headers = json_headers();
-    headers.insert("content-encoding".to_string(), "gzip".to_string());
-
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(br#"{"name":"book"}"#).unwrap();
-    let body = encoder.finish().unwrap();
+    let headers = encoding_headers("gzip");
+    let body = gzip_bytes(br#"{"name":"book"}"#);
 
     assert_continue(
         plugin
@@ -963,5 +995,398 @@ async fn multipart_content_validation_preserved_when_schema_requires_it() {
             )
             .await,
         Some(400),
+    );
+}
+
+#[tokio::test]
+async fn content_encoding_identity_and_single_codings_validate() {
+    let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
+    let plaintext = br#"{"name":"book"}"#;
+    let response_plain = br#"{"ok":true}"#;
+
+    for encoding in ["identity", "Identity", " identity "] {
+        let mut ctx = post_ctx("/items");
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &encoding_headers(encoding),
+                    plaintext,
+                )
+                .await,
+        );
+        let mut ctx = post_ctx("/items");
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &encoding_headers(encoding), response_plain)
+                .await,
+        );
+    }
+
+    for (encoding, body) in [
+        ("gzip", gzip_bytes(plaintext)),
+        ("GZIP", gzip_bytes(plaintext)),
+        ("br", brotli_bytes(plaintext)),
+        ("BR", brotli_bytes(plaintext)),
+    ] {
+        let mut ctx = post_ctx("/items");
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &encoding_headers(encoding), &body)
+                .await,
+        );
+    }
+
+    for (encoding, body) in [
+        ("gzip", gzip_bytes(response_plain)),
+        ("br", brotli_bytes(response_plain)),
+    ] {
+        let mut ctx = post_ctx("/items");
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &encoding_headers(encoding), &body)
+                .await,
+        );
+    }
+}
+
+#[tokio::test]
+async fn content_encoding_chains_decode_in_reverse_application_order() {
+    let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
+    let plaintext = br#"{"name":"book"}"#;
+    let response_plain = br#"{"ok":true}"#;
+
+    // Application order for `gzip, br` is gzip then brotli; undo br first.
+    let gzip_then_br = brotli_bytes(&gzip_bytes(plaintext));
+    let br_then_gzip = gzip_bytes(&brotli_bytes(plaintext));
+    for (encoding, body) in [
+        ("gzip, br", gzip_then_br.clone()),
+        ("gzip,br", gzip_then_br.clone()),
+        (" GZIP , BR ", gzip_then_br.clone()),
+        ("br, gzip", br_then_gzip.clone()),
+        ("BR,GZIP", br_then_gzip.clone()),
+    ] {
+        let mut ctx = post_ctx("/items");
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &encoding_headers(encoding), &body)
+                .await,
+        );
+    }
+
+    let response_gzip_then_br = brotli_bytes(&gzip_bytes(response_plain));
+    let response_br_then_gzip = gzip_bytes(&brotli_bytes(response_plain));
+    for (encoding, body) in [
+        ("gzip, br", response_gzip_then_br.as_slice()),
+        ("br, gzip", response_br_then_gzip.as_slice()),
+    ] {
+        let mut ctx = post_ctx("/items");
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &encoding_headers(encoding), body)
+                .await,
+        );
+    }
+
+    // Wrong outer coding for the same bytes must fail closed (no partial decode).
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("br, gzip"),
+                &gzip_then_br,
+            )
+            .await,
+        Some(400),
+    );
+    let error = request_error(&ctx).unwrap_or_default();
+    assert!(
+        error.contains("decompression failed")
+            || error.contains("truncated")
+            || error.contains("trailing"),
+        "wrong chain order must surface a decode error, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
+    let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
+    let plaintext = br#"{"name":"book"}"#;
+
+    for encoding in [",", "gzip,", ",br", "gzip,,br", " , ", "gzip;q=1.0"] {
+        let mut ctx = post_ctx("/items");
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &encoding_headers(encoding),
+                    plaintext,
+                )
+                .await,
+            Some(400),
+        );
+        let error = request_error(&ctx).unwrap_or_default();
+        assert!(
+            error.contains("empty coding")
+                || error.contains("not a valid HTTP token")
+                || error.contains("unsupported parameters"),
+            "malformed `{encoding}` must be clear, got {error:?}"
+        );
+    }
+
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("gzip foo"),
+                plaintext,
+            )
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx)
+            .unwrap_or_default()
+            .contains("not a valid HTTP token"),
+        "non-token member must be rejected clearly, got {:?}",
+        request_error(&ctx)
+    );
+
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("deflate"),
+                plaintext,
+            )
+            .await,
+        Some(400),
+    );
+    assert_eq!(
+        request_error(&ctx),
+        Some("unsupported content-encoding 'deflate'")
+    );
+
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &encoding_headers("zstd"),
+                br#"{"ok":true}"#,
+            )
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        response_error(&ctx),
+        Some("unsupported content-encoding 'zstd'")
+    );
+
+    // Corrupt outer layer of a gzip,br chain.
+    let mut corrupt_outer = brotli_bytes(&gzip_bytes(plaintext));
+    if let Some(last) = corrupt_outer.last_mut() {
+        *last ^= 0xff;
+    }
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("gzip, br"),
+                &corrupt_outer,
+            )
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx).is_some_and(|error| error.contains("brotli")),
+        "corrupt outer brotli must fail, got {:?}",
+        request_error(&ctx)
+    );
+
+    // Corrupt inner gzip while outer brotli framing stays valid: encode garbage
+    // as brotli so the outer unwrap succeeds and the inner gzip fails.
+    let corrupt_inner = brotli_bytes(b"not-gzip-payload");
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("gzip, br"),
+                &corrupt_inner,
+            )
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx).is_some_and(|error| error.contains("gzip")),
+        "corrupt inner gzip must fail after outer decode, got {:?}",
+        request_error(&ctx)
+    );
+
+    // Corrupt single-layer bodies still fail closed on both sides.
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("gzip"),
+                b"not-gzip",
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &encoding_headers("br"), b"not-brotli")
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
+    let plugin = OpenapiValidator::new(&json!({
+        "enforcement_mode": "block",
+        "schema_draft": "draft7",
+        "max_body_bytes": 64,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string"}
+                        }
+                    }
+                }
+            },
+            "responses": {
+                "200": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let exact = br#"{"name":"abcdefghijkl"}"#;
+    assert!(exact.len() <= 64);
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), exact)
+            .await,
+    );
+
+    let oversized_raw = vec![b'a'; 65];
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &oversized_raw)
+            .await,
+        Some(400),
+    );
+    assert_eq!(
+        request_error(&ctx),
+        Some("Body exceeds max_body_bytes of 64 bytes")
+    );
+
+    // Highly compressible payload: wire size stays under the raw ceiling, but
+    // the identity representation exceeds max_body_bytes after decoding.
+    let large_json = format!(r#"{{"name":"{}"}}"#, "n".repeat(512));
+    assert!(large_json.len() > 64);
+    let gzip_large = gzip_bytes(large_json.as_bytes());
+    assert!(
+        gzip_large.len() <= 64,
+        "gzip fixture must fit under raw max, got {}",
+        gzip_large.len()
+    );
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("gzip"),
+                &gzip_large,
+            )
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx)
+            .unwrap_or_default()
+            .contains("exceeds 64 bytes"),
+        "single-layer expansion must honor max_body_bytes, got {:?}",
+        request_error(&ctx)
+    );
+
+    // Chained expansion: outer layer may be small, but an intermediate/final
+    // layer above max_body_bytes must still fail closed.
+    let chained = brotli_bytes(&gzip_bytes(large_json.as_bytes()));
+    assert!(
+        chained.len() <= 64,
+        "chained fixture must fit under raw max, got {}",
+        chained.len()
+    );
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("gzip, br"),
+                &chained,
+            )
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx)
+            .unwrap_or_default()
+            .contains("exceeds 64 bytes"),
+        "chained expansion must honor max_body_bytes per layer, got {:?}",
+        request_error(&ctx)
+    );
+
+    let response_large = format!(r#"{{"ok":true,"pad":"{}"}}"#, "p".repeat(512));
+    let response_gzip = gzip_bytes(response_large.as_bytes());
+    assert!(
+        response_gzip.len() <= 64,
+        "response gzip fixture must fit under raw max, got {}",
+        response_gzip.len()
+    );
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &encoding_headers("gzip"),
+                &response_gzip,
+            )
+            .await,
+        Some(502),
+    );
+    assert!(
+        response_error(&ctx)
+            .unwrap_or_default()
+            .contains("exceeds 64 bytes"),
+        "response expansion must honor max_body_bytes, got {:?}",
+        response_error(&ctx)
     );
 }

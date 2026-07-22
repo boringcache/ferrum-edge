@@ -8,7 +8,6 @@
 
 use ahash::AHashMap;
 use async_trait::async_trait;
-use flate2::read::GzDecoder;
 use regex::{Regex, RegexSet};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -18,11 +17,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 
+use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
+/// Upper bound on stacked `Content-Encoding` layers decoded for validation.
+/// Matches the shared content-coding decoder used elsewhere in the gateway.
+const MAX_CONTENT_CODINGS: usize = 4;
 /// Public, stable metadata key carrying the bypass/skip reason for loggers and
 /// observability. It is write-only output; control flow recomputes bypass
 /// decisions per instance so sibling instances cannot cross-apply a bypass
@@ -997,47 +1000,19 @@ fn decode_body<'a>(
             "Body exceeds max_body_bytes of {max_body_bytes} bytes"
         ));
     }
-    let Some(encoding) = header_value(headers, "content-encoding") else {
-        return Ok(Cow::Borrowed(body));
-    };
-    let encoding = encoding
-        .split(',')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    match encoding.as_str() {
-        "" | "identity" => Ok(Cow::Borrowed(body)),
-        "gzip" => read_bounded(GzDecoder::new(body), max_body_bytes)
-            .map(Cow::Owned)
-            .map_err(|error| format!("Failed to decompress gzip body: {error}")),
-        "br" => read_bounded(brotli::Decompressor::new(body, 4096), max_body_bytes)
-            .map(Cow::Owned)
-            .map_err(|error| format!("Failed to decompress brotli body: {error}")),
-        other => Err(format!("Unsupported content-encoding '{other}'")),
-    }
-}
-
-fn read_bounded<R: std::io::Read>(
-    mut reader: R,
-    max_body_bytes: usize,
-) -> Result<Vec<u8>, std::io::Error> {
-    let mut decoded = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        if decoded.len().saturating_add(n) > max_body_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("decompressed body exceeds max_body_bytes of {max_body_bytes} bytes"),
-            ));
-        }
-        decoded.extend_from_slice(&buf[..n]);
-    }
-    Ok(decoded)
+    // Enforce `max_body_bytes` on every decoded layer. Cumulative work is capped
+    // at layers × max so a stacked chain cannot bypass the per-layer ceiling
+    // while still failing closed on amplification across the full list.
+    let max_cumulative_bytes = max_body_bytes.saturating_mul(MAX_CONTENT_CODINGS);
+    decode_content_encoding(
+        header_value(headers, "content-encoding"),
+        body,
+        DecodeLimits {
+            max_decoded_bytes: max_body_bytes,
+            max_cumulative_bytes,
+            max_codings: MAX_CONTENT_CODINGS,
+        },
+    )
 }
 
 enum SchemaInstance {

@@ -3429,7 +3429,7 @@ Validates request and response bodies against operation schemas generated from a
 | `response_content_types` | String[] | common JSON/XML/form/text/binary types | Response media types to validate |
 | `fail_on_unknown_operation` | bool | `true` | Reject requests that do not match any generated operation |
 | `fail_on_missing_response_schema` | bool | `false` | Reject responses with no matching status/content-type schema |
-| `max_body_bytes` | integer | `1048576` | Maximum raw or decompressed body size validated |
+| `max_body_bytes` | integer | `1048576` | Maximum raw body size and per-layer decoded size while undoing `Content-Encoding` chains |
 | `schema_draft` | string | generated | `auto`, `draft7`, or `draft2020-12` |
 | `operations` | array | required | Generated operation schema table |
 | `bypass.paths` | String[] | `[]` | Regex paths that skip validation |
@@ -3437,7 +3437,7 @@ Validates request and response bodies against operation schemas generated from a
 | `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
 | `bypass.header_present` | object | `{}` | Header presence/value checks that skip validation |
 
-`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses, supports gzip and brotli decompression, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
+`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses, decodes complete `Content-Encoding` chains (`gzip` / `br`, including stacked lists such as `gzip, br`) in reverse application order under `max_body_bytes`, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
 
 See [openapi_validator.md](openapi_validator.md) for the full generated config shape, `x-ferrum-validate` options, and emergency override behavior.
 

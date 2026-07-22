@@ -18,14 +18,40 @@ pub struct DecodeLimits {
     pub max_codings: usize,
 }
 
+/// True when `value` is an HTTP `token` (RFC 9110 §5.6.2).
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 /// Decode a complete `Content-Encoding` chain for inspection.
 ///
-/// Codings are removed in reverse application order. `gzip`, `br`, and a lone
-/// `identity` are supported case-insensitively. Empty tokens, parameters,
-/// unsupported codings, mixed `identity`, too many layers, trailing data,
-/// concatenated streams, truncation, and limit overruns are rejected. Every
-/// decoded layer is capped by `max_decoded_bytes`, and the sum of all decoded
-/// layer sizes is capped by `max_cumulative_bytes`.
+/// Codings are parsed as an HTTP `#content-coding` list (RFC 9110 §8.4) and
+/// removed in reverse application order. `gzip`, `br`, and `identity`-only
+/// lists are supported case-insensitively. Empty tokens, non-token members,
+/// parameters, unsupported codings, mixed `identity`, too many layers, trailing
+/// data, concatenated streams, truncation, and limit overruns are rejected.
+/// Every decoded layer is capped by `max_decoded_bytes`, and the sum of all
+/// decoded layer sizes is capped by `max_cumulative_bytes`.
 pub fn decode_content_encoding<'a>(
     header: Option<&str>,
     body: &'a [u8],
@@ -46,8 +72,10 @@ pub fn decode_content_encoding<'a>(
                 "content-encoding coding '{coding}' contains unsupported parameters"
             ));
         }
-        if !coding.is_ascii() {
-            return Err("content-encoding must contain only ASCII".to_string());
+        if !coding.is_ascii() || !is_http_token(coding) {
+            return Err(format!(
+                "content-encoding coding '{coding}' is not a valid HTTP token"
+            ));
         }
         let coding = coding.to_ascii_lowercase();
         match coding.as_str() {
@@ -62,7 +90,7 @@ pub fn decode_content_encoding<'a>(
         }
     }
 
-    if codings.len() == 1 && codings[0] == "identity" {
+    if codings.iter().all(|coding| coding == "identity") {
         return Ok(Cow::Borrowed(body));
     }
     if codings.iter().any(|coding| coding == "identity") {
