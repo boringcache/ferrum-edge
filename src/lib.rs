@@ -151,6 +151,19 @@ pub mod _test_support {
         crate::PluginCache::with_http_client(config, http_client)
     }
 
+    /// Deterministic allocator helper for proxy lifecycle ownership generations.
+    pub fn build_proxy_lifecycle_generations_for_test(
+        previous: &HashMap<String, u64>,
+        previous_high_water: u64,
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(HashMap<String, u64>, u64), String> {
+        crate::plugin_cache::build_proxy_lifecycle_generations(
+            previous,
+            previous_high_water,
+            config,
+        )
+    }
+
     pub fn validate_plugin_composition_candidate_with_real_ip_header_for_test(
         config: &crate::config::types::GatewayConfig,
         real_ip_header: Option<&str>,

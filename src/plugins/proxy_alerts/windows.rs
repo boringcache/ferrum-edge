@@ -25,7 +25,7 @@
 //! Both are acceptable for alerting where threshold breaches sustain across
 //! many buckets and individual samples are not load-bearing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -308,11 +308,13 @@ pub struct RuleWindowSpec {
     pub kind: WindowKind,
 }
 
-/// `(rule_id → proxy_id → WindowState)` two-level map. The outer DashMap
-/// avoids needing to allocate a composite key on the hot path; the inner
-/// map can be looked up by `&str` thanks to `String: Borrow<str>`.
+/// `(rule_id → proxy_id → ownership_generation → WindowState)` map.
+///
+/// The outer/proxy DashMaps avoid composite string keys on the hot path:
+/// `proxy_id` uses `String: Borrow<str>`, and the generation dimension is a
+/// plain `u64` so admission-tagged writes need no per-sample formatting.
 pub struct WindowStore {
-    by_rule: DashMap<u32, Arc<DashMap<String, WindowState>>>,
+    by_rule: DashMap<u32, Arc<DashMap<String, Arc<DashMap<u64, WindowState>>>>>,
     rule_specs: HashMap<u32, RuleWindowSpec>,
     inner_shard_amount: usize,
 }
@@ -327,7 +329,10 @@ impl WindowStore {
         }
     }
 
-    fn inner_for(&self, rule_id: u32) -> Option<Arc<DashMap<String, WindowState>>> {
+    fn inner_for(
+        &self,
+        rule_id: u32,
+    ) -> Option<Arc<DashMap<String, Arc<DashMap<u64, WindowState>>>>> {
         if let Some(existing) = self.by_rule.get(&rule_id) {
             return Some(Arc::clone(existing.value()));
         }
@@ -339,21 +344,46 @@ impl WindowStore {
         Some(Arc::clone(entry.value()))
     }
 
-    pub fn record_count(&self, rule_id: u32, proxy_id: &str, matched: bool, now_ms: u64) {
+    fn generations_for(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+    ) -> Option<Arc<DashMap<u64, WindowState>>> {
+        let Some(inner) = self.inner_for(rule_id) else {
+            return None;
+        };
+        if let Some(existing) = inner.get(proxy_id) {
+            return Some(Arc::clone(existing.value()));
+        }
+        let shard_amount = self.inner_shard_amount;
+        let entry = inner
+            .entry(proxy_id.to_string())
+            .or_insert_with(|| Arc::new(DashMap::with_shard_amount(shard_amount)));
+        Some(Arc::clone(entry.value()))
+    }
+
+    pub fn record_count(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        matched: bool,
+        now_ms: u64,
+    ) {
         let Some(spec) = self.rule_specs.get(&rule_id).copied() else {
             return;
         };
-        let Some(inner) = self.inner_for(rule_id) else {
+        let Some(generations) = self.generations_for(rule_id, proxy_id) else {
             return;
         };
-        if let Some(state) = inner.get(proxy_id)
+        if let Some(state) = generations.get(&ownership_generation)
             && let WindowState::Counter(c) = state.value()
         {
             c.record(matched, now_ms);
             return;
         }
-        let entry = inner
-            .entry(proxy_id.to_string())
+        let entry = generations
+            .entry(ownership_generation)
             .or_insert_with(|| match spec.kind {
                 WindowKind::Counter => {
                     WindowState::Counter(BucketedCounter::new(spec.window_seconds))
@@ -367,21 +397,28 @@ impl WindowStore {
         }
     }
 
-    pub fn record_latency(&self, rule_id: u32, proxy_id: &str, latency_ms: f64, now_ms: u64) {
+    pub fn record_latency(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        latency_ms: f64,
+        now_ms: u64,
+    ) {
         let Some(spec) = self.rule_specs.get(&rule_id).copied() else {
             return;
         };
-        let Some(inner) = self.inner_for(rule_id) else {
+        let Some(generations) = self.generations_for(rule_id, proxy_id) else {
             return;
         };
-        if let Some(state) = inner.get(proxy_id)
+        if let Some(state) = generations.get(&ownership_generation)
             && let WindowState::Histogram(h) = state.value()
         {
             h.record(latency_ms, now_ms);
             return;
         }
-        let entry = inner
-            .entry(proxy_id.to_string())
+        let entry = generations
+            .entry(ownership_generation)
             .or_insert_with(|| match spec.kind {
                 WindowKind::Counter => {
                     WindowState::Counter(BucketedCounter::new(spec.window_seconds))
@@ -395,11 +432,20 @@ impl WindowStore {
         }
     }
 
-    pub fn snapshot_count(&self, rule_id: u32, proxy_id: &str, now_ms: u64) -> (u64, u64) {
+    pub fn snapshot_count(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        now_ms: u64,
+    ) -> (u64, u64) {
         let Some(inner) = self.by_rule.get(&rule_id) else {
             return (0, 0);
         };
-        let Some(state) = inner.get(proxy_id) else {
+        let Some(generations) = inner.get(proxy_id) else {
+            return (0, 0);
+        };
+        let Some(state) = generations.get(&ownership_generation) else {
             return (0, 0);
         };
         match state.value() {
@@ -412,13 +458,17 @@ impl WindowStore {
         &self,
         rule_id: u32,
         proxy_id: &str,
+        ownership_generation: u64,
         percentile: u8,
         now_ms: u64,
     ) -> (Option<f64>, u64) {
         let Some(inner) = self.by_rule.get(&rule_id) else {
             return (None, 0);
         };
-        let Some(state) = inner.get(proxy_id) else {
+        let Some(generations) = inner.get(proxy_id) else {
+            return (None, 0);
+        };
+        let Some(state) = generations.get(&ownership_generation) else {
             return (None, 0);
         };
         match state.value() {
@@ -432,30 +482,53 @@ impl WindowStore {
     pub fn evict_stale(&self, now_ms: u64, keep_ms: u64) {
         let cutoff = now_ms.saturating_sub(keep_ms);
         for outer in self.by_rule.iter() {
-            outer
-                .value()
-                .retain(|_, state| state.last_record_ms() >= cutoff);
+            outer.value().retain(|_, generations| {
+                generations.retain(|_, state| state.last_record_ms() >= cutoff);
+                !generations.is_empty()
+            });
         }
     }
 
-    /// Drop window rows for proxies absent from `active_proxy_ids`.
+    /// Drop window rows for proxies absent from `active_proxy_generations`
+    /// or whose stored generation does not match the published incarnation.
     ///
     /// Cold-path only: paired with cooldown/recovery retention so a delete
     /// and recreate of the same proxy ID cannot inherit prior samples.
-    pub fn retain_proxies(&self, active_proxy_ids: &HashSet<&str>) {
+    pub fn retain_proxies(&self, active_proxy_generations: &HashMap<&str, u64>) {
         for outer in self.by_rule.iter() {
-            outer
-                .value()
-                .retain(|proxy_id, _| active_proxy_ids.contains(proxy_id.as_str()));
+            outer.value().retain(|proxy_id, generations| {
+                match active_proxy_generations.get(proxy_id.as_str()).copied() {
+                    Some(active_gen) => {
+                        generations.retain(|&gen, _| gen == active_gen);
+                        !generations.is_empty()
+                    }
+                    None => false,
+                }
+            });
         }
     }
 
-    /// Whether any rule window currently holds a row for `proxy_id`.
+    /// Whether any rule window currently holds a row for `proxy_id` under any
+    /// ownership generation.
     #[allow(dead_code)] // Used by external test crate and admin/debug helpers.
     pub fn contains_proxy(&self, proxy_id: &str) -> bool {
-        self.by_rule
-            .iter()
-            .any(|entry| entry.value().contains_key(proxy_id))
+        self.by_rule.iter().any(|entry| {
+            entry
+                .value()
+                .get(proxy_id)
+                .is_some_and(|generations| !generations.is_empty())
+        })
+    }
+
+    /// Whether any rule window holds a row for `(proxy_id, generation)`.
+    #[allow(dead_code)] // Used by external test crate.
+    pub fn contains_proxy_generation(&self, proxy_id: &str, ownership_generation: u64) -> bool {
+        self.by_rule.iter().any(|entry| {
+            entry
+                .value()
+                .get(proxy_id)
+                .is_some_and(|generations| generations.contains_key(&ownership_generation))
+        })
     }
 }
 

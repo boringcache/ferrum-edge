@@ -3033,28 +3033,40 @@ pub(crate) struct PluginCacheInner {
     /// cannot share cooldown/recovery/window ownership with in-flight samples
     /// admitted under the prior incarnation.
     proxy_lifecycle_generations: HashMap<String, u64>,
+    /// Persistent monotonic high-water mark for lifecycle generation allocation.
+    /// Survives empty active maps so remove-to-empty then identical-ID recreate
+    /// cannot reuse a prior generation.
+    proxy_lifecycle_generation_high_water: u64,
 }
 
 /// Advance or assign per-proxy lifecycle ownership generations for `config`.
 ///
 /// Continuously present proxy IDs keep their previous generation. IDs absent
 /// from `previous` (new or recreated after removal) receive a fresh monotonic
-/// generation so an active-ID snapshot alone cannot confuse incarnations.
+/// generation allocated from `previous_high_water` so an empty active map
+/// cannot reset the allocator and reuse incarnations.
+///
+/// Integer exhaustion fails closed with `Err` rather than wrapping, saturating,
+/// or panicking.
 pub(crate) fn build_proxy_lifecycle_generations(
     previous: &HashMap<String, u64>,
+    previous_high_water: u64,
     config: &GatewayConfig,
-) -> HashMap<String, u64> {
+) -> Result<(HashMap<String, u64>, u64), String> {
     let mut next = HashMap::with_capacity(config.proxies.len());
-    let mut high = previous.values().copied().max().unwrap_or(0);
+    let previous_max = previous.values().copied().max().unwrap_or(0);
+    let mut high = previous_high_water.max(previous_max);
     for proxy in &config.proxies {
         if let Some(&gen) = previous.get(&proxy.id) {
             next.insert(proxy.id.clone(), gen);
         } else {
-            high = high.saturating_add(1);
+            high = high.checked_add(1).ok_or_else(|| {
+                "proxy lifecycle generation counter exhausted".to_string()
+            })?;
             next.insert(proxy.id.clone(), high);
         }
     }
-    next
+    Ok((next, high))
 }
 
 impl PluginCacheInner {
@@ -3081,6 +3093,7 @@ impl PluginCacheInner {
         country_mmdb_snapshot_bytes: u64,
         tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
         proxy_lifecycle_generations: HashMap<String, u64>,
+        proxy_lifecycle_generation_high_water: u64,
     ) -> Self {
         Self {
             proxy_plugins,
@@ -3098,6 +3111,7 @@ impl PluginCacheInner {
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
             proxy_lifecycle_generations,
+            proxy_lifecycle_generation_high_water,
         }
     }
 
@@ -3563,6 +3577,7 @@ impl PluginCache {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            0,
         )
     }
 
@@ -3572,6 +3587,7 @@ impl PluginCache {
         current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
         current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
         previous_lifecycle_generations: &HashMap<String, u64>,
+        previous_lifecycle_generation_high_water: u64,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
@@ -3596,8 +3612,12 @@ impl PluginCache {
             current_tcp_throttle_states,
         )?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
-        let proxy_lifecycle_generations =
-            build_proxy_lifecycle_generations(previous_lifecycle_generations, config);
+        let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
+            build_proxy_lifecycle_generations(
+                previous_lifecycle_generations,
+                previous_lifecycle_generation_high_water,
+                config,
+            )?;
 
         Ok(Arc::new(PluginCacheInner::new(
             proxy_map,
@@ -3615,6 +3635,7 @@ impl PluginCache {
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
             proxy_lifecycle_generations,
+            proxy_lifecycle_generation_high_water,
         )))
     }
 
@@ -3629,6 +3650,7 @@ impl PluginCache {
             &current.adaptive_concurrency_instances,
             &current.tcp_connection_throttle_instances,
             &current.proxy_lifecycle_generations,
+            current.proxy_lifecycle_generation_high_water,
         )
     }
 
@@ -4522,8 +4544,12 @@ impl PluginCache {
                 .map_err(|error| format!("Config reload rejected: {error}"))?;
         }
 
-        let proxy_lifecycle_generations =
-            build_proxy_lifecycle_generations(&current.proxy_lifecycle_generations, config);
+        let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
+            build_proxy_lifecycle_generations(
+                &current.proxy_lifecycle_generations,
+                current.proxy_lifecycle_generation_high_water,
+                config,
+            )?;
 
         Ok(Arc::new(PluginCacheInner::new(
             new_map,
@@ -4546,6 +4572,7 @@ impl PluginCache {
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
             proxy_lifecycle_generations,
+            proxy_lifecycle_generation_high_water,
         )))
     }
 

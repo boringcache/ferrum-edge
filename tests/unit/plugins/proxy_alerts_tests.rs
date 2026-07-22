@@ -1421,36 +1421,36 @@ fn latency_histogram_returns_none_when_empty() {
 #[test]
 fn cooldown_gate_first_acquire_succeeds() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
 }
 
 #[test]
 fn cooldown_gate_blocks_within_window() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
-    assert!(!gate.try_acquire(1, "p1", 10, 60_000, 100 + 30_000));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
+    assert!(!gate.try_acquire(1, "p1", 10, 60_000, 100 + 30_000, 0));
 }
 
 #[test]
 fn cooldown_gate_releases_after_window() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100 + 60_001));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100 + 60_001, 0));
 }
 
 #[test]
 fn cooldown_gate_per_channel_independent() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
     // Same rule, different channel: should not be blocked.
-    assert!(gate.try_acquire(1, "p1", 11, 60_000, 100 + 1));
+    assert!(gate.try_acquire(1, "p1", 11, 60_000, 100 + 1, 0));
 }
 
 #[test]
 fn cooldown_gate_per_proxy_independent() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
-    assert!(gate.try_acquire(1, "p2", 10, 60_000, 100 + 1));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
+    assert!(gate.try_acquire(1, "p2", 10, 60_000, 100 + 1, 0));
 }
 
 // -------------------------------------------------------------- RecoveryGate
@@ -1458,10 +1458,10 @@ fn cooldown_gate_per_proxy_independent() {
 #[test]
 fn recovery_healthy_to_active_emits_trigger() {
     let gate = RecoveryGate::new();
-    let outcome = gate.observe(1, "p", true, 60_000, 1_000);
+    let outcome = gate.observe(1, "p", true, 60_000, 1_000, 0);
     assert_eq!(outcome, LifecycleOutcome::Trigger);
     assert_eq!(
-        gate.current_state(1, "p"),
+        gate.current_state(1, "p", 0),
         Some(RuleState::Active { fired_at_ms: 1_000 })
     );
 }
@@ -1469,37 +1469,37 @@ fn recovery_healthy_to_active_emits_trigger() {
 #[test]
 fn recovery_active_to_active_returns_still_active() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 60_000, 1_000);
-    let outcome = gate.observe(1, "p", true, 60_000, 2_000);
+    gate.observe(1, "p", true, 60_000, 1_000, 0);
+    let outcome = gate.observe(1, "p", true, 60_000, 2_000, 0);
     assert_eq!(outcome, LifecycleOutcome::StillActive);
 }
 
 #[test]
 fn recovery_active_to_recovering_then_resolve() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 60_000, 1_000);
-    let entering = gate.observe(1, "p", false, 60_000, 2_000);
+    gate.observe(1, "p", true, 60_000, 1_000, 0);
+    let entering = gate.observe(1, "p", false, 60_000, 2_000, 0);
     assert_eq!(entering, LifecycleOutcome::EnteringRecovery);
     // Same call within recovery window: still quiet.
-    let quiet = gate.observe(1, "p", false, 60_000, 30_000);
+    let quiet = gate.observe(1, "p", false, 60_000, 30_000, 0);
     assert_eq!(quiet, LifecycleOutcome::Quiet);
     // After recovery window has elapsed (resolved_window_ms = 60_000 from
     // the EnteringRecovery timestamp 2_000): observe at 2_000 + 60_000 =
     // 62_000.
-    let resolve = gate.observe(1, "p", false, 60_000, 62_000);
+    let resolve = gate.observe(1, "p", false, 60_000, 62_000, 0);
     assert_eq!(resolve, LifecycleOutcome::Resolve);
-    assert_eq!(gate.current_state(1, "p"), Some(RuleState::Healthy));
+    assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
 }
 
 #[test]
 fn recovery_recovering_to_active_when_breach_returns_during_window() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 60_000, 1_000); // Active
-    gate.observe(1, "p", false, 60_000, 2_000); // Recovering
-    let reactivate = gate.observe(1, "p", true, 60_000, 3_000);
+    gate.observe(1, "p", true, 60_000, 1_000, 0); // Active
+    gate.observe(1, "p", false, 60_000, 2_000, 0); // Recovering
+    let reactivate = gate.observe(1, "p", true, 60_000, 3_000, 0);
     assert_eq!(reactivate, LifecycleOutcome::Reactivate);
     assert!(matches!(
-        gate.current_state(1, "p"),
+        gate.current_state(1, "p", 0),
         Some(RuleState::Active { .. })
     ));
 }
@@ -1507,11 +1507,11 @@ fn recovery_recovering_to_active_when_breach_returns_during_window() {
 #[test]
 fn recovery_disabled_when_recovery_ms_is_zero() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 0, 1_000);
-    let below = gate.observe(1, "p", false, 0, 2_000);
+    gate.observe(1, "p", true, 0, 1_000, 0);
+    let below = gate.observe(1, "p", false, 0, 2_000, 0);
     assert_eq!(below, LifecycleOutcome::Quiet);
-    assert_eq!(gate.current_state(1, "p"), Some(RuleState::Healthy));
-    let next_breach = gate.observe(1, "p", true, 0, 1_000_000);
+    assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
+    let next_breach = gate.observe(1, "p", true, 0, 1_000_000, 0);
     assert_eq!(next_breach, LifecycleOutcome::Trigger);
 }
 
@@ -1520,28 +1520,28 @@ fn recovery_disabled_when_recovery_ms_is_zero() {
 #[test]
 fn cooldown_retain_proxies_drops_removed_proxy_rows() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "gone", 10, 60_000, 100));
-    assert!(gate.try_acquire(1, "keep", 10, 60_000, 100));
-    gate.retain_proxies(&std::collections::HashSet::from(["keep"]));
+    assert!(gate.try_acquire(1, "gone", 10, 60_000, 100, 0));
+    assert!(gate.try_acquire(1, "keep", 10, 60_000, 100, 0));
+    gate.retain_proxies(&std::collections::HashMap::from([("keep", 0)]));
     assert!(!gate.contains_proxy("gone"));
     assert!(gate.contains_proxy("keep"));
     // Removed proxy must not inherit the old cooldown after ID reuse.
-    assert!(gate.try_acquire(1, "gone", 10, 60_000, 100 + 1));
+    assert!(gate.try_acquire(1, "gone", 10, 60_000, 100 + 1, 0));
 }
 
 #[test]
 fn recovery_retain_proxies_drops_removed_proxy_rows() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "gone", true, 60_000, 1_000);
-    gate.observe(1, "keep", true, 60_000, 1_000);
-    gate.retain_proxies(&std::collections::HashSet::from(["keep"]));
-    assert_eq!(gate.current_state(1, "gone"), None);
+    gate.observe(1, "gone", true, 60_000, 1_000, 0);
+    gate.observe(1, "keep", true, 60_000, 1_000, 0);
+    gate.retain_proxies(&std::collections::HashMap::from([("keep", 0)]));
+    assert_eq!(gate.current_state(1, "gone", 0), None);
     assert!(matches!(
-        gate.current_state(1, "keep"),
+        gate.current_state(1, "keep", 0),
         Some(RuleState::Active { .. })
     ));
     assert_eq!(
-        gate.observe(1, "gone", true, 60_000, 2_000),
+        gate.observe(1, "gone", true, 60_000, 2_000, 0),
         LifecycleOutcome::Trigger,
         "recreated proxy ID must start Healthy rather than inherit Active"
     );
@@ -1550,7 +1550,7 @@ fn recovery_retain_proxies_drops_removed_proxy_rows() {
 #[test]
 fn cooldown_evict_stale_drops_expired_timestamps() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
     gate.evict_stale(100 + 60_000, 60_000);
     assert!(!gate.contains_proxy("p1"));
 }
@@ -1558,17 +1558,17 @@ fn cooldown_evict_stale_drops_expired_timestamps() {
 #[test]
 fn recovery_evict_stale_drops_only_healthy_rows() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "active", true, 60_000, 1_000);
-    gate.observe(1, "resolved", true, 60_000, 1_000);
-    gate.observe(1, "resolved", false, 0, 2_000); // Active → Healthy when recovery_ms=0
+    gate.observe(1, "active", true, 60_000, 1_000, 0);
+    gate.observe(1, "resolved", true, 60_000, 1_000, 0);
+    gate.observe(1, "resolved", false, 0, 2_000, 0); // Active → Healthy when recovery_ms=0
     assert_eq!(
-        gate.current_state(1, "resolved"),
+        gate.current_state(1, "resolved", 0),
         Some(RuleState::Healthy)
     );
     gate.evict_stale(3_000, 60_000);
-    assert_eq!(gate.current_state(1, "resolved"), None);
+    assert_eq!(gate.current_state(1, "resolved", 0), None);
     assert!(matches!(
-        gate.current_state(1, "active"),
+        gate.current_state(1, "active", 0),
         Some(RuleState::Active { .. })
     ));
 }
@@ -1649,9 +1649,103 @@ async fn old_generation_sample_cannot_inherit_after_identical_id_recreate() {
     // A single sample may only touch windows; seed-equivalent cooldown needs
     // breach+dispatch. Window ownership alone proves the new generation can write.
     assert!(
-        plugin.has_lifecycle_state_for_test("p1"),
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
         "replacement generation must be able to record fresh lifecycle state"
     );
+}
+
+#[test]
+fn retain_proxies_drops_generation_mismatched_same_id_rows() {
+    let cooldown = CooldownGate::new();
+    assert!(cooldown.try_acquire(1, "p1", 10, 60_000, 100, 1));
+    cooldown.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert!(
+        !cooldown.contains_proxy_generation("p1", 1),
+        "same-ID generation advance must retire prior cooldown ownership"
+    );
+    assert!(!cooldown.contains_proxy("p1"));
+
+    let recovery = RecoveryGate::new();
+    recovery.observe(1, "p1", true, 60_000, 1_000, 1);
+    recovery.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert_eq!(recovery.current_state(1, "p1", 1), None);
+    assert!(!recovery.contains_proxy("p1"));
+
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.seed_lifecycle_state_for_test("p1", 1);
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "generation-mismatched retain must clear prior incarnation rows"
+    );
+    assert!(!plugin.has_lifecycle_state_for_test("p1"));
+}
+
+#[test]
+fn old_generation_direct_write_after_replacement_cannot_affect_new_generation() {
+    // Explicit interleaving without timing: seed gen1, publish gen2, then write
+    // under gen1 via the store API (bypassing the admission precheck) to prove
+    // generation-keyed isolation for the TOCTOU race.
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.seed_lifecycle_state_for_test("p1", 1);
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 1));
+
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "replacement publication must retire gen1 rows"
+    );
+    assert!(!plugin.has_lifecycle_state_for_generation_for_test("p1", 2));
+
+    plugin.write_lifecycle_state_for_test("p1", 1);
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "stale writer may create an isolated old-generation orphan"
+    );
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
+        "stale gen1 write must not populate replacement generation state"
+    );
+
+    // New generation begins clean and can write independently.
+    plugin.write_lifecycle_state_for_test("p1", 2);
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 2));
+
+    // Cooldown armed under gen1 must not suppress gen2.
+    let cooldown = CooldownGate::new();
+    assert!(cooldown.try_acquire(1, "p1", 10, 60_000, 100, 1));
+    assert!(
+        cooldown.try_acquire(1, "p1", 10, 60_000, 100 + 1, 2),
+        "new generation must not inherit prior cooldown"
+    );
+}
+
+#[test]
+fn generation_stable_reload_preserves_lifecycle_state() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 7), ("p2", 7)]));
+    plugin.seed_lifecycle_state_for_test("p1", 7);
+    plugin.seed_lifecycle_state_for_test("p2", 7);
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 7));
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p2", 7));
+
+    // Stable reload republishes the same ownership generations.
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 7), ("p2", 7)]));
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 7));
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p2", 7));
+}
+
+#[test]
+fn absent_id_cannot_repopulate_after_armed_retain() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("keep", 1)]));
+    plugin.write_lifecycle_state_for_test("gone", 1);
+    // Direct store write can create an orphan under an absent ID, but retain
+    // and the armed precheck must keep it out of the active ownership set.
+    plugin.retain_proxies(&std::collections::HashMap::from([("keep", 1)]));
+    assert!(!plugin.has_lifecycle_state_for_test("gone"));
 }
 
 #[test]

@@ -4107,6 +4107,262 @@ fn test_apply_delta_rebuild_globals_resets_proxy_alerts_lifecycle() {
 }
 
 #[test]
+fn test_proxy_lifecycle_generations_remove_to_empty_then_recreate_advances() {
+    let config1 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let (gens1, high1) = ferrum_edge::_test_support::build_proxy_lifecycle_generations_for_test(
+        &std::collections::HashMap::new(),
+        0,
+        &config1,
+    )
+    .expect("initial allocation");
+    assert_eq!(gens1.get("p1").copied(), Some(1));
+    assert_eq!(high1, 1);
+
+    let empty = make_config(vec![], vec![]);
+    let (gens_empty, high_empty) =
+        ferrum_edge::_test_support::build_proxy_lifecycle_generations_for_test(
+            &gens1, high1, &empty,
+        )
+        .expect("empty map must preserve high-water");
+    assert!(gens_empty.is_empty());
+    assert_eq!(high_empty, 1, "empty active map must not reset the allocator");
+
+    let config2 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let (gens2, high2) = ferrum_edge::_test_support::build_proxy_lifecycle_generations_for_test(
+        &gens_empty,
+        high_empty,
+        &config2,
+    )
+    .expect("recreate after empty");
+    assert_eq!(
+        gens2.get("p1").copied(),
+        Some(2),
+        "identical-ID recreate after empty map must not reuse generation 1"
+    );
+    assert_eq!(high2, 2);
+}
+
+#[test]
+fn test_proxy_lifecycle_generations_stable_presence_and_multi_id() {
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![],
+    );
+    let (gens1, high1) = ferrum_edge::_test_support::build_proxy_lifecycle_generations_for_test(
+        &std::collections::HashMap::new(),
+        0,
+        &config1,
+    )
+    .expect("initial multi-id allocation");
+    let p1 = *gens1.get("p1").expect("p1");
+    let p2 = *gens1.get("p2").expect("p2");
+    assert_ne!(p1, p2);
+    assert_eq!(high1, p1.max(p2));
+
+    let (gens2, high2) = ferrum_edge::_test_support::build_proxy_lifecycle_generations_for_test(
+        &gens1, high1, &config1,
+    )
+    .expect("stable presence");
+    assert_eq!(gens2.get("p1").copied(), Some(p1));
+    assert_eq!(gens2.get("p2").copied(), Some(p2));
+    assert_eq!(high2, high1);
+
+    let config_add = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/web", vec![]),
+            make_proxy("p3", "/ops", vec![]),
+        ],
+        vec![],
+    );
+    let (gens3, high3) = ferrum_edge::_test_support::build_proxy_lifecycle_generations_for_test(
+        &gens2, high2, &config_add,
+    )
+    .expect("new id advances high-water");
+    assert_eq!(gens3.get("p1").copied(), Some(p1));
+    assert_eq!(gens3.get("p2").copied(), Some(p2));
+    let p3 = *gens3.get("p3").expect("p3");
+    assert_eq!(p3, high2 + 1);
+    assert_eq!(high3, p3);
+}
+
+#[test]
+fn test_proxy_lifecycle_generations_exhaustion_fails_closed() {
+    let config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let err = ferrum_edge::_test_support::build_proxy_lifecycle_generations_for_test(
+        &std::collections::HashMap::new(),
+        u64::MAX,
+        &config,
+    )
+    .expect_err("exhausted counter must fail closed");
+    assert!(
+        err.contains("exhausted"),
+        "unexpected exhaustion error: {err}"
+    );
+}
+
+#[test]
+fn test_apply_delta_proxy_lifecycle_high_water_survives_empty_active_set() {
+    let config1 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let cache = PluginCache::new(&config1).unwrap();
+    let p1_gen = cache.proxy_lifecycle_generation("p1").expect("p1 generation");
+
+    let empty = make_config(vec![], vec![]);
+    cache
+        .apply_delta(&empty, &HashSet::new(), &["p1".to_string()], false)
+        .unwrap();
+    assert_eq!(cache.proxy_lifecycle_generation("p1"), None);
+
+    let config2 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let mut proxy_ids = HashSet::new();
+    proxy_ids.insert("p1".to_string());
+    cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
+    let p1_gen_after = cache
+        .proxy_lifecycle_generation("p1")
+        .expect("recreated p1 generation");
+    assert_ne!(
+        p1_gen, p1_gen_after,
+        "cache high-water must survive remove-to-empty so recreate advances"
+    );
+}
+
+#[test]
+fn test_apply_delta_global_proxy_alerts_generation_keyed_race_isolation() {
+    let alerts = make_plugin_config("g-alerts", "proxy_alerts", PluginScope::Global, None, true);
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![alerts.clone()],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let alerts_plugin = cache
+        .get_plugins("p1")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("global proxy_alerts")
+        .clone();
+    let p1_gen = cache.proxy_lifecycle_generation("p1").expect("p1 generation");
+    let p2_gen = cache.proxy_lifecycle_generation("p2").expect("p2 generation");
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("p1", p1_gen);
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("p2", p2_gen);
+
+    // Remove+recreate p1 while preserving the global instance.
+    let config2 = make_config(vec![make_proxy("p2", "/web", vec![])], vec![alerts.clone()]);
+    cache
+        .apply_delta(&config2, &HashSet::new(), &["p1".to_string()], false)
+        .unwrap();
+    let config3 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![alerts],
+    );
+    let mut proxy_ids = HashSet::new();
+    proxy_ids.insert("p1".to_string());
+    cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
+
+    let after = cache
+        .get_plugins("p1")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("preserved global proxy_alerts")
+        .clone();
+    let p1_gen_after = cache
+        .proxy_lifecycle_generation("p1")
+        .expect("recreated p1 generation");
+    assert_ne!(p1_gen, p1_gen_after);
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p2", p2_gen));
+    assert!(!after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen));
+    assert!(!after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after));
+
+    // Direct store write under the old generation after replacement publication.
+    after.write_proxy_lifecycle_state_for_test("p1", p1_gen);
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen));
+    assert!(
+        !after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after),
+        "old-generation write after retain must not populate the replacement"
+    );
+
+    after.write_proxy_lifecycle_state_for_test("p1", p1_gen_after);
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after));
+}
+
+#[test]
+fn test_apply_delta_proxy_group_proxy_alerts_generation_keyed_race_isolation() {
+    let group_alerts = make_plugin_config(
+        "group-alerts",
+        "proxy_alerts",
+        PluginScope::ProxyGroup,
+        None,
+        true,
+    );
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group-alerts"]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts.clone()],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let shared = cache
+        .get_plugins("p1")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("group proxy_alerts")
+        .clone();
+    let p1_gen = cache.proxy_lifecycle_generation("p1").expect("p1 generation");
+    let p2_gen = cache.proxy_lifecycle_generation("p2").expect("p2 generation");
+    shared.seed_proxy_lifecycle_state_for_test("p1", p1_gen);
+    shared.seed_proxy_lifecycle_state_for_test("p2", p2_gen);
+    let shared_ptr = Arc::as_ptr(&shared) as *const () as usize;
+
+    let config2 = make_config(
+        vec![make_proxy("p2", "/web", vec!["group-alerts"])],
+        vec![group_alerts.clone()],
+    );
+    cache
+        .apply_delta(&config2, &HashSet::new(), &["p1".to_string()], false)
+        .unwrap();
+    let config3 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group-alerts"]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts],
+    );
+    let mut proxy_ids = HashSet::new();
+    proxy_ids.insert("p1".to_string());
+    cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
+
+    let after = cache
+        .get_plugins("p2")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("preserved group proxy_alerts")
+        .clone();
+    assert_eq!(Arc::as_ptr(&after) as *const () as usize, shared_ptr);
+    let p1_gen_after = cache
+        .proxy_lifecycle_generation("p1")
+        .expect("recreated p1 generation");
+    assert_ne!(p1_gen, p1_gen_after);
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p2", p2_gen));
+
+    after.write_proxy_lifecycle_state_for_test("p1", p1_gen);
+    assert!(
+        !after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after),
+        "proxy-group stale generation write must stay isolated from replacement"
+    );
+    after.write_proxy_lifecycle_state_for_test("p1", p1_gen_after);
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after));
+}
+
+#[test]
 fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed() {
     let config1 = make_config(
         vec![make_proxy("p1", "/api", vec!["group1"])],

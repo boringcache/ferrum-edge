@@ -5293,6 +5293,22 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Test helper: whether this plugin holds lifecycle state for
+    /// `(proxy_id, generation)`.
+    #[doc(hidden)]
+    fn has_proxy_lifecycle_state_for_generation_for_test(
+        &self,
+        _proxy_id: &str,
+        _generation: u64,
+    ) -> bool {
+        false
+    }
+
+    /// Test helper: write lifecycle state under `generation`, bypassing the
+    /// admission precheck (race-contract tests).
+    #[doc(hidden)]
+    fn write_proxy_lifecycle_state_for_test(&self, _proxy_id: &str, _generation: u64) {}
+
     /// Return the node-local `.mmdb` path this instance was built from together
     /// with the validated snapshot it currently holds, or `None` when it holds
     /// no snapshot.

@@ -25,12 +25,14 @@
 //!   events still fire so operators don't miss recovery during off hours.
 //! - **Lifecycle retention**: preserved global/proxy-group instances publish
 //!   per-proxy ownership generations and retire cooldown/recovery/window rows
-//!   when proxies leave the instance's active set (incremental cache commit,
-//!   off the request path). Samples carry the admission-time generation so an
-//!   in-flight request from a removed incarnation cannot repopulate state after
-//!   delete→recreate of the same proxy ID. Expired cooldown timestamps and
-//!   terminal Healthy recovery rows are also swept by the background eviction
-//!   task.
+//!   when proxies leave the instance's active set or when an ID's generation
+//!   advances (incremental cache commit, off the request path). Lifecycle
+//!   rows themselves are keyed by admission ownership generation so a stale
+//!   write that races past retain cannot populate or poison the replacement
+//!   incarnation. Samples carry the admission-time generation captured from
+//!   the published RequestEpoch/plugin-cache snapshot. Expired cooldown
+//!   timestamps and terminal Healthy recovery rows are also swept by the
+//!   background eviction task.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -67,6 +69,11 @@ use windows::current_epoch_ms;
 /// Floor for background lifecycle retention, matching the historical window
 /// sweep cadence documented for inactive proxies.
 const LIFECYCLE_KEEP_FLOOR_MS: u64 = 3_600_000;
+
+/// Ownership generation used by offline / unarmed unit tests that intentionally
+/// omit an admission token. Armed production instances reject missing tokens
+/// before any lifecycle write.
+pub const UNARMED_PROXY_LIFECYCLE_GENERATION: u64 = 0;
 
 pub struct ProxyAlerts {
     rules: Arc<Vec<Rule>>,
@@ -138,7 +145,8 @@ impl ProxyAlerts {
     }
 
     /// Publish ownership generations and retire per-proxy window/cooldown/
-    /// recovery rows for proxies absent from that map.
+    /// recovery rows for proxies absent from that map or whose stored
+    /// generation does not match the published incarnation.
     ///
     /// Invoked from the plugin-cache commit path for preserved global and
     /// proxy-group instances. Must not run on the request hot path.
@@ -147,10 +155,9 @@ impl ProxyAlerts {
             .iter()
             .map(|(id, gen)| ((*id).to_string(), *gen))
             .collect();
-        let active_ids: HashSet<&str> = owned.keys().map(String::as_str).collect();
-        self.windows.retain_proxies(&active_ids);
-        self.cooldowns.retain_proxies(&active_ids);
-        self.recovery.retain_proxies(&active_ids);
+        self.windows.retain_proxies(active_proxy_generations);
+        self.cooldowns.retain_proxies(active_proxy_generations);
+        self.recovery.retain_proxies(active_proxy_generations);
         self.active_proxy_generations
             .store(Arc::new(Some(owned)));
     }
@@ -189,16 +196,55 @@ impl ProxyAlerts {
         map.insert(proxy_id.to_string(), generation);
         self.active_proxy_generations
             .store(Arc::new(Some(map)));
-        let _ = self.cooldowns.try_acquire(0, proxy_id, 0, 60_000, 1);
-        let _ = self.recovery.observe(0, proxy_id, true, 5_000, 1);
+        let _ = self
+            .cooldowns
+            .try_acquire(0, proxy_id, 0, 60_000, 1, generation);
+        let _ = self
+            .recovery
+            .observe(0, proxy_id, true, 5_000, 1, generation);
     }
 
-    /// Whether this instance currently holds lifecycle state for `proxy_id`.
+    /// Whether this instance currently holds lifecycle state for `proxy_id`
+    /// under any ownership generation.
     #[doc(hidden)]
     pub fn has_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
         self.cooldowns.contains_proxy(proxy_id)
             || self.recovery.contains_proxy(proxy_id)
             || self.windows.contains_proxy(proxy_id)
+    }
+
+    /// Whether this instance holds lifecycle state for `(proxy_id, generation)`.
+    #[doc(hidden)]
+    pub fn has_lifecycle_state_for_generation_for_test(
+        &self,
+        proxy_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.cooldowns
+            .contains_proxy_generation(proxy_id, generation)
+            || self
+                .recovery
+                .contains_proxy_generation(proxy_id, generation)
+            || self
+                .windows
+                .contains_proxy_generation(proxy_id, generation)
+    }
+
+    /// Direct store write that bypasses the admission precheck — used by
+    /// deterministic race-contract tests to prove generation-keyed isolation
+    /// even when a stale writer races past retain publication.
+    #[doc(hidden)]
+    pub fn write_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        if let Some(rule) = self.rules.first() {
+            self.windows
+                .record_count(rule.id(), proxy_id, generation, true, 1);
+        }
+        let _ = self
+            .cooldowns
+            .try_acquire(0, proxy_id, 0, 60_000, 1, generation);
+        let _ = self
+            .recovery
+            .observe(0, proxy_id, true, 5_000, 1, generation);
     }
 
     /// Whether an admitted sample may mutate lifecycle state for `proxy_id`.
@@ -247,7 +293,12 @@ impl ProxyAlerts {
         in_quiet: bool,
     ) {
         let proxy_id = sample.proxy_id().unwrap_or("");
-        let previous_state = self.recovery.current_state(rule.id(), proxy_id);
+        let ownership_generation = sample
+            .proxy_lifecycle_generation()
+            .unwrap_or(UNARMED_PROXY_LIFECYCLE_GENERATION);
+        let previous_state =
+            self.recovery
+                .current_state(rule.id(), proxy_id, ownership_generation);
         if observation.breach
             && in_quiet
             && matches!(previous_state, None | Some(RuleState::Healthy))
@@ -260,13 +311,24 @@ impl ProxyAlerts {
             .as_ref()
             .map(|r| r.resolved_window_ms)
             .unwrap_or(0);
-        let outcome =
-            self.recovery
-                .evaluate(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+        let outcome = self.recovery.evaluate(
+            rule.id(),
+            proxy_id,
+            observation.breach,
+            recovery_ms,
+            now_ms,
+            ownership_generation,
+        );
         let Some(event_action) = lifecycle_event_action(outcome) else {
             if non_event_outcome_needs_commit(outcome, previous_state, recovery_ms) {
-                self.recovery
-                    .observe(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+                self.recovery.observe(
+                    rule.id(),
+                    proxy_id,
+                    observation.breach,
+                    recovery_ms,
+                    now_ms,
+                    ownership_generation,
+                );
             }
             return;
         };
@@ -290,6 +352,7 @@ impl ProxyAlerts {
                     channel_id,
                     rule.common().cooldown_ms,
                     now_ms,
+                    ownership_generation,
                 ),
             };
             if !cooldown_ok {
@@ -302,14 +365,25 @@ impl ProxyAlerts {
         }
         let Some(dispatches) = dispatches else {
             if cooldown_suppressed && matches!(outcome, LifecycleOutcome::StillActive) {
-                self.recovery
-                    .observe(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+                self.recovery.observe(
+                    rule.id(),
+                    proxy_id,
+                    observation.breach,
+                    recovery_ms,
+                    now_ms,
+                    ownership_generation,
+                );
             }
             return;
         };
-        let committed_outcome =
-            self.recovery
-                .observe(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+        let committed_outcome = self.recovery.observe(
+            rule.id(),
+            proxy_id,
+            observation.breach,
+            recovery_ms,
+            now_ms,
+            ownership_generation,
+        );
         if lifecycle_event_action(committed_outcome) != Some(event_action) {
             return;
         }
@@ -455,6 +529,20 @@ impl Plugin for ProxyAlerts {
         self.has_lifecycle_state_for_test(proxy_id)
     }
 
+    #[doc(hidden)]
+    fn has_proxy_lifecycle_state_for_generation_for_test(
+        &self,
+        proxy_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.has_lifecycle_state_for_generation_for_test(proxy_id, generation)
+    }
+
+    #[doc(hidden)]
+    fn write_proxy_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        self.write_lifecycle_state_for_test(proxy_id, generation);
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         ALL_PROTOCOLS
     }
@@ -527,7 +615,12 @@ mod tests {
 
         plugin.log(&summary).await;
         assert_eq!(
-            plugin.windows.snapshot_count(0, "p1", current_epoch_ms()),
+            plugin.windows.snapshot_count(
+                0,
+                "p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION,
+                current_epoch_ms(),
+            ),
             (0, 0)
         );
 
@@ -535,7 +628,12 @@ mod tests {
         primary_summary.mirror = false;
         plugin.log(&primary_summary).await;
         assert_eq!(
-            plugin.windows.snapshot_count(0, "p1", current_epoch_ms()),
+            plugin.windows.snapshot_count(
+                0,
+                "p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION,
+                current_epoch_ms(),
+            ),
             (1, 1)
         );
     }
@@ -563,7 +661,12 @@ mod tests {
 
         plugin.log(&summary).await;
 
-        assert_eq!(plugin.recovery.current_state(0, "p1"), None);
+        assert_eq!(
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            None
+        );
     }
 
     #[tokio::test]
@@ -596,9 +699,14 @@ mod tests {
         plugin.log(&summary).await;
 
         assert!(
-            plugin
-                .cooldowns
-                .try_acquire(0, "p1", 0, 60_000, current_epoch_ms()),
+            plugin.cooldowns.try_acquire(
+                0,
+                "p1",
+                0,
+                60_000,
+                current_epoch_ms(),
+                UNARMED_PROXY_LIFECYCLE_GENERATION,
+            ),
             "a dropped dispatch must not arm the trigger cooldown"
         );
     }
@@ -668,12 +776,19 @@ mod tests {
         };
 
         plugin.log(&summary).await;
-        assert_eq!(plugin.recovery.current_state(0, "p1"), None);
+        assert_eq!(
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            None
+        );
 
         drop(held_permit);
         plugin.log(&summary).await;
         assert!(matches!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Active { .. })
         ));
     }
@@ -694,7 +809,14 @@ mod tests {
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
         let now_ms = current_epoch_ms();
-        assert!(plugin.cooldowns.try_acquire(0, "p1", 0, 60_000, now_ms));
+        assert!(plugin.cooldowns.try_acquire(
+            0,
+            "p1",
+            0,
+            60_000,
+            now_ms,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+        ));
         let summary = TransactionSummary {
             namespace: "ferrum".to_string(),
             proxy_id: Some("p1".to_string()),
@@ -706,7 +828,9 @@ mod tests {
         plugin.log(&summary).await;
 
         assert_eq!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             None,
             "a first trigger suppressed by cooldown must not create a resolvable incident"
         );
@@ -728,10 +852,26 @@ mod tests {
             ]
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
-        plugin.recovery.observe(0, "p1", true, 5_000, 1);
-        plugin.recovery.observe(0, "p1", false, 5_000, 2);
+        plugin.recovery.observe(
+            0,
+            "p1",
+            true,
+            5_000,
+            1,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+        );
+        plugin.recovery.observe(
+            0,
+            "p1",
+            false,
+            5_000,
+            2,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+        );
         assert!(matches!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Recovering { .. })
         ));
 
@@ -750,14 +890,18 @@ mod tests {
 
         plugin.log(&summary).await;
         assert!(matches!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Recovering { .. })
         ));
 
         drop(held_permit);
         plugin.log(&summary).await;
         assert_eq!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Healthy)
         );
     }
