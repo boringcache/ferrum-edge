@@ -273,6 +273,36 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
 }
 
 #[test]
+fn shared_reject_finalizer_records_finalized_synthetic_signal_for_2xx() {
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let finalizer = proxy_src
+        .split("pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(")
+        .nth(1)
+        .expect("shared reject finalizer must remain present")
+        .split("pub(crate) struct AfterProxyReject")
+        .next()
+        .expect("shared reject finalizer must remain bounded");
+    assert!(
+        finalizer.contains("FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY"),
+        "H1/H2/H3 shared reject finalizer must record the body-independent finalized-synthetic signal"
+    );
+    assert!(
+        finalizer.contains("(200..300).contains(status)"),
+        "finalized-synthetic signal must gate on final HTTP 2xx so non-2xx rejects stay TTL-backed"
+    );
+    assert!(
+        proxy_src.contains("pub(crate) const FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY"),
+        "finalized-synthetic lifecycle key must remain a shared proxy constant"
+    );
+
+    let dedup_src = include_str!("../../../src/plugins/request_deduplication.rs");
+    assert!(
+        dedup_src.contains("FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY"),
+        "request_deduplication must release ownership from the finalized-synthetic commit signal"
+    );
+}
+
+#[test]
 fn translated_h3_grpc_web_threads_preacquired_admission_into_grpc_dispatch() {
     let server = include_str!("../../../src/http3/server.rs");
     let bridge = server
