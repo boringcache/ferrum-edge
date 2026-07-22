@@ -1154,6 +1154,7 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
         .on_ws_disconnect(&WsDisconnectContext {
             namespace: "ferrum".to_string(),
             proxy_id: "ws-proxy".to_string(),
+            proxy_lifecycle_generation: None,
             proxy_name: Some("WS Proxy".to_string()),
             client_ip: "127.0.0.1".to_string(),
             backend_target: "http://127.0.0.1:9000/ws".to_string(),

@@ -1416,6 +1416,7 @@ pub(crate) async fn handle_h3_websocket(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         metadata: crate::proxy::clone_log_metadata(&ctx),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         session_start: Utc::now(),
         session_start_mono: std::time::Instant::now(),
     };

@@ -1240,6 +1240,7 @@ mod tests {
         let ctx = WsDisconnectContext {
             namespace: "ferrum".to_string(),
             proxy_id: "ws-1".to_string(),
+            proxy_lifecycle_generation: None,
             proxy_name: Some("WS".to_string()),
             client_ip: "127.0.0.1".to_string(),
             backend_target: "http://127.0.0.1:9000/".to_string(),

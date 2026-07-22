@@ -269,6 +269,7 @@ mod tests {
         StreamTransactionSummary {
             namespace: "ferrum".to_string(),
             proxy_id: "proxy-1".to_string(),
+            proxy_lifecycle_generation: None,
             proxy_name: None,
             client_ip: "127.0.0.1".to_string(),
             consumer_username: None,

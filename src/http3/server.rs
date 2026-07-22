@@ -1561,6 +1561,9 @@ async fn handle_h3_request(
     };
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
+    ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(proxy.id.as_str());
 
     // Keep recognized gRPC-Web on its ordinary HTTP protocol key. The request
     // view below composes only grpc_method_router and grpc_deadline into that
@@ -2858,6 +2861,9 @@ async fn handle_h3_request(
     // `src/proxy/mod.rs::handle_proxy_request_inner`.
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
+    ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(proxy.id.as_str());
 
     // Preserve the client's original request path for access logging — the
     // transaction summaries below source `request_path` from this, not the
@@ -2997,6 +3003,9 @@ async fn handle_h3_request(
     // dispatch-time concern and must not appear baked into the plugin-visible
     // proxy on H3 only.
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
+    ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(selected_base_proxy.id.as_str());
 
     let has_deferred_routing_header_hooks = backend_path_is_policy_bound
         && capabilities

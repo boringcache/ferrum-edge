@@ -701,6 +701,7 @@ fn minimum_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
         namespace: LOKI_MIN_PROXY_ID.to_string(),
         proxy_id: LOKI_MIN_PROXY_ID.to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: None,
         client_ip: "::".to_string(),
         consumer_username: None,

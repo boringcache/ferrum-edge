@@ -396,11 +396,12 @@ impl Plugin for PriorityOverridePlugin {
     ) -> Option<(&str, Arc<crate::config::types::CountryMmdbSnapshot>)> {
         self.inner.country_mmdb_retained_load()
     }
-    fn retain_active_proxy_state(&self, active_proxy_ids: &HashSet<&str>) {
-        self.inner.retain_active_proxy_state(active_proxy_ids);
+    fn retain_active_proxy_state(&self, active_proxy_generations: &HashMap<&str, u64>) {
+        self.inner.retain_active_proxy_state(active_proxy_generations);
     }
-    fn seed_proxy_lifecycle_state_for_test(&self, proxy_id: &str) {
-        self.inner.seed_proxy_lifecycle_state_for_test(proxy_id);
+    fn seed_proxy_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        self.inner
+            .seed_proxy_lifecycle_state_for_test(proxy_id, generation);
     }
     fn has_proxy_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
         self.inner.has_proxy_lifecycle_state_for_test(proxy_id)
@@ -3026,9 +3027,43 @@ pub(crate) struct PluginCacheInner {
     /// plugin config ID. Replacement plugin objects share these maps so live
     /// connection permits remain counted across cache generations.
     tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
+    /// Per-proxy lifecycle ownership generations published with this cache
+    /// generation. A proxy ID that remains continuously present keeps its
+    /// generation; leaving and later returning advances it so delete→recreate
+    /// cannot share cooldown/recovery/window ownership with in-flight samples
+    /// admitted under the prior incarnation.
+    proxy_lifecycle_generations: HashMap<String, u64>,
+}
+
+/// Advance or assign per-proxy lifecycle ownership generations for `config`.
+///
+/// Continuously present proxy IDs keep their previous generation. IDs absent
+/// from `previous` (new or recreated after removal) receive a fresh monotonic
+/// generation so an active-ID snapshot alone cannot confuse incarnations.
+pub(crate) fn build_proxy_lifecycle_generations(
+    previous: &HashMap<String, u64>,
+    config: &GatewayConfig,
+) -> HashMap<String, u64> {
+    let mut next = HashMap::with_capacity(config.proxies.len());
+    let mut high = previous.values().copied().max().unwrap_or(0);
+    for proxy in &config.proxies {
+        if let Some(&gen) = previous.get(&proxy.id) {
+            next.insert(proxy.id.clone(), gen);
+        } else {
+            high = high.saturating_add(1);
+            next.insert(proxy.id.clone(), high);
+        }
+    }
+    next
 }
 
 impl PluginCacheInner {
+    /// Admission-time ownership generation for `proxy_id`, or `None` when the
+    /// proxy is absent from this published cache generation.
+    pub(crate) fn proxy_lifecycle_generation(&self, proxy_id: &str) -> Option<u64> {
+        self.proxy_lifecycle_generations.get(proxy_id).copied()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         proxy_plugins: ProxyPluginMap,
@@ -3045,6 +3080,7 @@ impl PluginCacheInner {
         country_mmdb_instances: CountryMmdbPluginInstanceMap,
         country_mmdb_snapshot_bytes: u64,
         tcp_connection_throttle_instances: TcpConnectionThrottleInstanceMap,
+        proxy_lifecycle_generations: HashMap<String, u64>,
     ) -> Self {
         Self {
             proxy_plugins,
@@ -3061,6 +3097,7 @@ impl PluginCacheInner {
             country_mmdb_instances,
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
+            proxy_lifecycle_generations,
         }
     }
 
@@ -3498,6 +3535,11 @@ impl PluginCache {
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
         let inner = Self::build_inner(config, &http_client)?;
+        // Arm per-proxy ownership generations on the initial generation so
+        // admission tokens are enforced even before the first incremental
+        // update. No prior live instance exists yet, so this cannot mutate a
+        // still-served cache the way a pre-commit retain on a staged build would.
+        Self::retain_active_proxy_lifecycle_for_inner(&inner, config);
         Ok(Self {
             inner: ArcSwap::new(inner),
             http_client,
@@ -3515,7 +3557,13 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
     ) -> Result<Arc<PluginCacheInner>, String> {
-        Self::build_inner_with_prior_states(config, http_client, &HashMap::new(), &HashMap::new())
+        Self::build_inner_with_prior_states(
+            config,
+            http_client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
     }
 
     fn build_inner_with_prior_states(
@@ -3523,6 +3571,7 @@ impl PluginCache {
         http_client: &PluginHttpClient,
         current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
         current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
+        previous_lifecycle_generations: &HashMap<String, u64>,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
@@ -3547,6 +3596,8 @@ impl PluginCache {
             current_tcp_throttle_states,
         )?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
+        let proxy_lifecycle_generations =
+            build_proxy_lifecycle_generations(previous_lifecycle_generations, config);
 
         Ok(Arc::new(PluginCacheInner::new(
             proxy_map,
@@ -3563,6 +3614,7 @@ impl PluginCache {
             country_mmdb_instances,
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
+            proxy_lifecycle_generations,
         )))
     }
 
@@ -3576,6 +3628,7 @@ impl PluginCache {
             &self.http_client,
             &current.adaptive_concurrency_instances,
             &current.tcp_connection_throttle_instances,
+            &current.proxy_lifecycle_generations,
         )
     }
 
@@ -3610,19 +3663,34 @@ impl PluginCache {
     ///
     /// Must run only after commit: staging builds share Arcs with the live
     /// generation, so pruning before publication would mutate the still-served
-    /// instance if the staged build later fails validation.
+    /// instance if the staged build later fails validation. Passes the
+    /// published per-proxy ownership generations so preserved instances can
+    /// reject in-flight samples from a prior delete→recreate incarnation.
     pub(crate) fn retain_active_proxy_lifecycle_for_inner(
         inner: &PluginCacheInner,
         config: &GatewayConfig,
     ) {
-        let active_proxy_ids: HashSet<&str> =
-            config.proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+        let active_proxy_generations: HashMap<&str, u64> = inner
+            .proxy_lifecycle_generations
+            .iter()
+            .map(|(id, gen)| (id.as_str(), *gen))
+            .collect();
+        // `config` is the published generation that produced `inner`; keep the
+        // parameter so call sites stay explicitly paired with that commit.
+        debug_assert_eq!(
+            active_proxy_generations.len(),
+            config.proxies.len(),
+            "lifecycle generations must cover every published proxy"
+        );
         for plugin in inner.global_plugins.iter() {
-            plugin.retain_active_proxy_state(&active_proxy_ids);
+            plugin.retain_active_proxy_state(&active_proxy_generations);
         }
 
-        let mut group_members: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let mut group_members: HashMap<&str, HashMap<&str, u64>> = HashMap::new();
         for proxy in &config.proxies {
+            let Some(&generation) = inner.proxy_lifecycle_generations.get(&proxy.id) else {
+                continue;
+            };
             for assoc in &proxy.plugins {
                 if inner
                     .proxy_group_plugins
@@ -3631,7 +3699,7 @@ impl PluginCache {
                     group_members
                         .entry(assoc.plugin_config_id.as_str())
                         .or_default()
-                        .insert(proxy.id.as_str());
+                        .insert(proxy.id.as_str(), generation);
                 }
             }
         }
@@ -3642,6 +3710,17 @@ impl PluginCache {
                 .unwrap_or_default();
             instance.plugin.retain_active_proxy_state(&members);
         }
+    }
+
+    /// Admission-time ownership generation for `proxy_id` from the live cache.
+    ///
+    /// Returns `None` when the proxy is absent from the published generation.
+    pub fn proxy_lifecycle_generation(&self, proxy_id: &str) -> Option<u64> {
+        self.inner
+            .load()
+            .proxy_lifecycle_generations
+            .get(proxy_id)
+            .copied()
     }
 
     /// Build a request-scoped view of plugin-cache values for one proxy/protocol.
@@ -4443,6 +4522,9 @@ impl PluginCache {
                 .map_err(|error| format!("Config reload rejected: {error}"))?;
         }
 
+        let proxy_lifecycle_generations =
+            build_proxy_lifecycle_generations(&current.proxy_lifecycle_generations, config);
+
         Ok(Arc::new(PluginCacheInner::new(
             new_map,
             new_globals,
@@ -4463,6 +4545,7 @@ impl PluginCache {
             country_mmdb_instances,
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
+            proxy_lifecycle_generations,
         )))
     }
 

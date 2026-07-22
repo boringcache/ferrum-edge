@@ -448,6 +448,7 @@ fn stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("TCP Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),
@@ -477,6 +478,7 @@ fn websocket_summary() -> WsDisconnectContext {
     WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-proxy-1".to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("WebSocket Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://127.0.0.1:9001/chat".to_string(),

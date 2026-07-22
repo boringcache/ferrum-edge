@@ -1359,6 +1359,11 @@ pub struct WsDisconnectContext {
     pub auth_method: Option<&'static str>,
     /// Correlation ID / tracing metadata inherited from the upgrade request.
     pub metadata: HashMap<String, String>,
+    /// Ownership generation captured at WebSocket upgrade admission. Not
+    /// serialized; used by `proxy_alerts` to reject stale disconnect samples
+    /// after delete→recreate of the same proxy ID.
+    #[doc(hidden)]
+    pub proxy_lifecycle_generation: Option<u64>,
 }
 
 /// One-request/session cache for the authoritative, canonical client IP.
@@ -1587,6 +1592,12 @@ pub struct RequestContext {
     /// admission uses it to reject a retired service-discovery target view
     /// after a structural target-set publication.
     pub lb_generation: u64,
+    /// Per-proxy lifecycle ownership generation captured at routing/admission
+    /// from the published plugin-cache generation. Carried into transaction
+    /// summaries so `proxy_alerts` can reject samples from a prior
+    /// delete→recreate incarnation of the same proxy ID. `None` when no proxy
+    /// matched.
+    pub proxy_lifecycle_generation: Option<u64>,
     /// Raw HTTP headers from the request. Stored at init time and retained
     /// after `materialize_headers()` so security plugins can evaluate
     /// multi-value / non-UTF-8 field lines without the lossy folded map.
@@ -2154,6 +2165,7 @@ impl RequestContext {
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
+            proxy_lifecycle_generation: None,
             raw_headers: None,
             headers: HashMap::new(),
             headers_materialized: false,
@@ -2778,6 +2790,7 @@ impl RequestContext {
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
+            proxy_lifecycle_generation: self.proxy_lifecycle_generation,
             raw_headers: None,
             headers: self.headers.clone(),
             headers_materialized: true,
@@ -4396,6 +4409,11 @@ pub struct TransactionSummary {
     /// pipeline.
     #[doc(hidden)]
     pub ai_usage_export: Option<AiUsageExport>,
+    /// Ownership generation captured at HTTP/gRPC/WebSocket admission. Not
+    /// serialized; used by `proxy_alerts` to reject samples from a prior
+    /// delete→recreate incarnation of the same proxy ID.
+    #[doc(hidden)]
+    pub proxy_lifecycle_generation: Option<u64>,
 }
 
 impl Serialize for TransactionSummary {
@@ -4586,6 +4604,22 @@ pub async fn log_with_mirror(
     summary: &TransactionSummary,
     ctx: &RequestContext,
 ) {
+    // Stamp admission ownership when the caller left the field unset so every
+    // HTTP/gRPC path (including deferred streaming completion) carries the
+    // generation captured on RequestContext at routing time.
+    let stamped_storage;
+    let summary = if summary.proxy_lifecycle_generation.is_none()
+        && ctx.proxy_lifecycle_generation.is_some()
+    {
+        stamped_storage = {
+            let mut stamped = summary.clone();
+            stamped.proxy_lifecycle_generation = ctx.proxy_lifecycle_generation;
+            stamped
+        };
+        &stamped_storage
+    } else {
+        summary
+    };
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
@@ -4736,6 +4770,11 @@ pub struct StreamConnectionContext {
     correlation_ids: CorrelationIdState,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
+    /// Ownership generation captured at stream admission. Carried into
+    /// [`StreamTransactionSummary`] so `proxy_alerts` can reject disconnect
+    /// samples from a prior delete→recreate incarnation.
+    #[doc(hidden)]
+    pub proxy_lifecycle_generation: Option<u64>,
     pub listen_port: u16,
     /// Wire-level scheme the proxy uses to talk to its backend.
     /// Always one of the stream variants (`Tcp`, `Tcps`, `Udp`, `Dtls`) —
@@ -4820,6 +4859,7 @@ impl StreamConnectionContext {
             correlation_ids: CorrelationIdState::default(),
             proxy_id,
             proxy_name,
+            proxy_lifecycle_generation: None,
             listen_port,
             backend_scheme,
             consumer_index,
@@ -4976,6 +5016,12 @@ pub struct StreamTransactionSummary {
         serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
     )]
     pub metadata: HashMap<String, String>,
+    /// Ownership generation captured at stream admission. Not serialized;
+    /// used by `proxy_alerts` to reject samples from a prior delete→recreate
+    /// incarnation of the same proxy ID.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub proxy_lifecycle_generation: Option<u64>,
 }
 
 /// Plugin execution priority bands.
@@ -5223,19 +5269,22 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Cold-path: drop per-proxy mutable lifecycle state for proxies absent
-    /// from `active_proxy_ids`.
+    /// Cold-path: publish the active per-proxy ownership generations and drop
+    /// lifecycle rows for proxies absent from that map.
     ///
     /// Incremental plugin-cache commits call this on preserved global and
     /// proxy-group instances after the new generation is published so delete,
     /// rename, group-membership churn, and ID reuse cannot inherit prior
-    /// cooldown/recovery ownership. Must not run on the request hot path.
-    /// Ordinary plugins retain the no-op default.
-    fn retain_active_proxy_state(&self, _active_proxy_ids: &HashSet<&str>) {}
+    /// cooldown/recovery ownership. Values are ownership generations (not a
+    /// bare active-ID set) so an in-flight sample from a prior incarnation of
+    /// the same proxy ID cannot repopulate state after retain. Must not run on
+    /// the request hot path. Ordinary plugins retain the no-op default.
+    fn retain_active_proxy_state(&self, _active_proxy_generations: &HashMap<&str, u64>) {}
 
-    /// Test helper: seed per-proxy lifecycle state owned by this plugin.
+    /// Test helper: seed per-proxy lifecycle state owned by this plugin under
+    /// `generation`.
     #[doc(hidden)]
-    fn seed_proxy_lifecycle_state_for_test(&self, _proxy_id: &str) {}
+    fn seed_proxy_lifecycle_state_for_test(&self, _proxy_id: &str, _generation: u64) {}
 
     /// Test helper: whether this plugin currently holds lifecycle state for
     /// `proxy_id`.

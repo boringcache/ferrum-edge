@@ -743,6 +743,7 @@ pub mod _test_support {
         crate::plugins::StreamTransactionSummary {
             namespace: "ferrum".to_string(),
             proxy_id: "tcp-proxy".to_string(),
+            proxy_lifecycle_generation: None,
             proxy_name: Some("TCP Proxy".to_string()),
             client_ip: "10.0.0.1".to_string(),
             consumer_username: None,
@@ -2227,6 +2228,7 @@ pub mod _test_support {
             consumer_username,
             auth_method: None,
             metadata,
+            proxy_lifecycle_generation: None,
             session_start,
             // Duration is Instant-based; wall `session_start` is rendering-only.
             session_start_mono: std::time::Instant::now(),
@@ -2255,6 +2257,7 @@ pub mod _test_support {
             consumer_username,
             auth_method: None,
             metadata,
+            proxy_lifecycle_generation: None,
             session_start,
             session_start_mono,
         }

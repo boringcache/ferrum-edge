@@ -9926,6 +9926,7 @@ async fn handle_websocket_request_authenticated(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         metadata: clone_log_metadata(&ctx),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         session_start: chrono::Utc::now(),
         session_start_mono: Instant::now(),
     };
@@ -11229,6 +11230,8 @@ pub struct WsSessionMeta {
     pub consumer_username: Option<String>,
     pub auth_method: Option<&'static str>,
     pub metadata: HashMap<String, String>,
+    /// Ownership generation captured at WebSocket upgrade admission.
+    pub proxy_lifecycle_generation: Option<u64>,
     /// Civil/UTC connect time for human-readable `timestamp_connected` only.
     pub session_start: chrono::DateTime<chrono::Utc>,
     /// Process-monotonic connect instant used for `duration_ms`. Wall-clock
@@ -11270,6 +11273,7 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace.clone(),
         proxy_id: proxy_id.to_string(),
+        proxy_lifecycle_generation: session_meta.proxy_lifecycle_generation,
         proxy_name: session_meta.proxy_name.clone(),
         client_ip: session_meta.client_ip.clone(),
         backend_target: session_meta.backend_target.clone(),
@@ -11323,6 +11327,7 @@ pub async fn fire_ws_framed_disconnect_hooks(
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace,
         proxy_id: proxy_id.to_string(),
+        proxy_lifecycle_generation: session_meta.proxy_lifecycle_generation,
         proxy_name: session_meta.proxy_name,
         client_ip: session_meta.client_ip,
         backend_target: session_meta.backend_target,
@@ -18442,6 +18447,9 @@ async fn handle_proxy_request_inner(
     };
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
+    ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(proxy.id.as_str());
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
     // Preserve the path the client actually requested before any plugin can
@@ -19468,6 +19476,9 @@ async fn handle_proxy_request_inner(
     // destination (pool-poisoning invariant).
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
+    ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(proxy.id.as_str());
 
     // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
     // `ctx.route_override_path` for the matched route. Rebase the request path
@@ -19895,6 +19906,9 @@ async fn handle_proxy_request_inner(
     // clone) in the common case.
     let proxy = cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
+    ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(proxy.id.as_str());
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;

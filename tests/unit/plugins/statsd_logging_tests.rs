@@ -30,6 +30,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("TCP Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
@@ -674,6 +675,7 @@ async fn test_statsd_websocket_session_metrics_and_opt_in() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-proxy".to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("WS Proxy".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "http://127.0.0.1:9000/".to_string(),
@@ -925,6 +927,7 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-1".to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("WS".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "http://127.0.0.1:9/".to_string(),

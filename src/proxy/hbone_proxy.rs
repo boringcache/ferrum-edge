@@ -427,6 +427,9 @@ pub(super) async fn handle_hbone_request(
         .apply_route_overrides_with_upstreams(Arc::clone(proxy), epoch.load_balancer.upstreams());
     let proxy: &Arc<Proxy> = &proxy_arc;
     ctx.matched_proxy = Some(Arc::clone(proxy));
+    ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(proxy.id.as_str());
 
     // HBONE relay trust boundary. The relay byte-copies this CONNECT stream
     // straight to the backend as a transparent TCP tunnel, so it must only
@@ -885,6 +888,9 @@ pub(super) async fn handle_hbone_udp_request(
         .apply_route_overrides_with_upstreams(Arc::clone(proxy), epoch.load_balancer.upstreams());
     let proxy: &Arc<Proxy> = &proxy_arc;
     ctx.matched_proxy = Some(Arc::clone(proxy));
+    ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(proxy.id.as_str());
 
     // Same trust boundary as the byte-stream relay: only an authenticated,
     // trust-domain-verified mesh peer may open a datagram tunnel into a local

@@ -3755,8 +3755,10 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("global proxy_alerts");
-    alerts_plugin.seed_proxy_lifecycle_state_for_test("p1");
-    alerts_plugin.seed_proxy_lifecycle_state_for_test("p2");
+    let p1_gen = cache.proxy_lifecycle_generation("p1").expect("p1 generation");
+    let p2_gen = cache.proxy_lifecycle_generation("p2").expect("p2 generation");
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("p1", p1_gen);
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("p2", p2_gen);
     assert!(alerts_plugin.has_proxy_lifecycle_state_for_test("p1"));
     assert!(alerts_plugin.has_proxy_lifecycle_state_for_test("p2"));
 
@@ -3817,6 +3819,31 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
         !recreated.has_proxy_lifecycle_state_for_test("p1"),
         "recreated proxy ID must start without inherited lifecycle state"
     );
+    let p1_gen_after = cache
+        .proxy_lifecycle_generation("p1")
+        .expect("recreated p1 generation");
+    assert_ne!(
+        p1_gen, p1_gen_after,
+        "delete→recreate must advance ownership generation for the same proxy ID"
+    );
+
+    // Old in-flight sample admitted under the removed generation finishes after
+    // recreate; a current-active-ID gate would incorrectly accept it.
+    let stale = ferrum_edge::plugins::TransactionSummary {
+        proxy_id: Some("p1".to_string()),
+        proxy_lifecycle_generation: Some(p1_gen),
+        response_status_code: 500,
+        ..ferrum_edge::plugins::TransactionSummary::default()
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(ferrum_edge::plugins::Plugin::log(recreated.as_ref(), &stale));
+    assert!(
+        !recreated.has_proxy_lifecycle_state_for_test("p1"),
+        "stale generation must not repopulate lifecycle state after identical-ID recreate"
+    );
 }
 
 #[test]
@@ -3842,8 +3869,14 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("group proxy_alerts");
-    alerts_plugin.seed_proxy_lifecycle_state_for_test("p1");
-    alerts_plugin.seed_proxy_lifecycle_state_for_test("p2");
+    alerts_plugin.seed_proxy_lifecycle_state_for_test(
+        "p1",
+        cache.proxy_lifecycle_generation("p1").expect("p1 generation"),
+    );
+    alerts_plugin.seed_proxy_lifecycle_state_for_test(
+        "p2",
+        cache.proxy_lifecycle_generation("p2").expect("p2 generation"),
+    );
 
     // Rename p1 → p1b while keeping the group config unchanged so the shared
     // instance is preserved; only membership identities change.
@@ -3882,6 +3915,87 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
 }
 
 #[test]
+fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recreate() {
+    let group_alerts = make_plugin_config(
+        "group-alerts",
+        "proxy_alerts",
+        PluginScope::ProxyGroup,
+        None,
+        true,
+    );
+    let config1 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group-alerts"]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts.clone()],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let shared = cache
+        .get_plugins("p1")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("group proxy_alerts")
+        .clone();
+    let p1_gen = cache.proxy_lifecycle_generation("p1").expect("p1 generation");
+    shared.seed_proxy_lifecycle_state_for_test("p1", p1_gen);
+    shared.seed_proxy_lifecycle_state_for_test(
+        "p2",
+        cache.proxy_lifecycle_generation("p2").expect("p2 generation"),
+    );
+    let shared_ptr = Arc::as_ptr(&shared) as *const () as usize;
+
+    let config2 = make_config(
+        vec![make_proxy("p2", "/web", vec!["group-alerts"])],
+        vec![group_alerts.clone()],
+    );
+    cache
+        .apply_delta(&config2, &HashSet::new(), &["p1".to_string()], false)
+        .unwrap();
+
+    let config3 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group-alerts"]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts],
+    );
+    let mut proxy_ids = HashSet::new();
+    proxy_ids.insert("p1".to_string());
+    cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
+
+    let after = cache
+        .get_plugins("p2")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("preserved group proxy_alerts")
+        .clone();
+    assert_eq!(Arc::as_ptr(&after) as *const () as usize, shared_ptr);
+    let p1_gen_after = cache
+        .proxy_lifecycle_generation("p1")
+        .expect("recreated p1 generation");
+    assert_ne!(p1_gen, p1_gen_after);
+    assert!(!after.has_proxy_lifecycle_state_for_test("p1"));
+    assert!(after.has_proxy_lifecycle_state_for_test("p2"));
+
+    let stale = ferrum_edge::plugins::TransactionSummary {
+        proxy_id: Some("p1".to_string()),
+        proxy_lifecycle_generation: Some(p1_gen),
+        response_status_code: 500,
+        ..ferrum_edge::plugins::TransactionSummary::default()
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(ferrum_edge::plugins::Plugin::log(after.as_ref(), &stale));
+    assert!(
+        !after.has_proxy_lifecycle_state_for_test("p1"),
+        "preserved proxy-group instance must reject stale generation after ID recreate"
+    );
+}
+
+#[test]
 fn test_apply_delta_prunes_proxy_group_proxy_alerts_when_member_leaves_group() {
     let group_alerts = make_plugin_config(
         "group-alerts",
@@ -3904,8 +4018,14 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_when_member_leaves_group() {
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("group proxy_alerts")
         .clone();
-    shared.seed_proxy_lifecycle_state_for_test("p1");
-    shared.seed_proxy_lifecycle_state_for_test("p2");
+    shared.seed_proxy_lifecycle_state_for_test(
+        "p1",
+        cache.proxy_lifecycle_generation("p1").expect("p1 generation"),
+    );
+    shared.seed_proxy_lifecycle_state_for_test(
+        "p2",
+        cache.proxy_lifecycle_generation("p2").expect("p2 generation"),
+    );
     let shared_ptr = Arc::as_ptr(&shared) as *const () as usize;
 
     // p1 remains in the gateway but leaves the group; p2 keeps the shared
@@ -3944,7 +4064,10 @@ fn test_apply_delta_rebuild_globals_resets_proxy_alerts_lifecycle() {
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("global proxy_alerts");
-    alerts_before.seed_proxy_lifecycle_state_for_test("p1");
+    alerts_before.seed_proxy_lifecycle_state_for_test(
+        "p1",
+        cache.proxy_lifecycle_generation("p1").expect("p1 generation"),
+    );
     assert!(alerts_before.has_proxy_lifecycle_state_for_test("p1"));
     let ptr_before = plugin_ptr_by_name(&before, "proxy_alerts");
 

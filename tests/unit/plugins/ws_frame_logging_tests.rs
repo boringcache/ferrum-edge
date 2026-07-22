@@ -145,6 +145,7 @@ fn disconnect_context(metadata: HashMap<String, String>) -> WsDisconnectContext 
     WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-proxy".to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("websocket".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://127.0.0.1:9001/socket".to_string(),

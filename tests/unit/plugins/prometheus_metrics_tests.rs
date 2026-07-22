@@ -64,6 +64,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
     StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: proxy_id.to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("Stream Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
@@ -90,6 +91,7 @@ fn make_ws_summary(proxy_id: &str) -> WsDisconnectContext {
     WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: proxy_id.to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("WebSocket Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend.test/socket".to_string(),
@@ -1340,6 +1342,7 @@ async fn test_namespace_label_with_stream_metrics() {
 
     let summary = StreamTransactionSummary {
         proxy_id: "stream-ns".to_string(),
+            proxy_lifecycle_generation: None,
         proxy_name: Some("tcp-proxy".to_string()),
         namespace: "prod".to_string(),
         protocol: "tcp".to_string(),

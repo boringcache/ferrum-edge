@@ -171,6 +171,14 @@ impl<'a> SampleInput<'a> {
         }
     }
 
+    pub fn proxy_lifecycle_generation(&self) -> Option<u64> {
+        match self {
+            Self::Http(s) => s.proxy_lifecycle_generation,
+            Self::Stream(s) => s.proxy_lifecycle_generation,
+            Self::WebSocket(s) => s.proxy_lifecycle_generation,
+        }
+    }
+
     pub fn proxy_name(&self) -> Option<&str> {
         match self {
             Self::Http(s) => s.proxy_name.as_deref(),

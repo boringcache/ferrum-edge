@@ -23,16 +23,20 @@
 //! - **Quiet hours**: optional UTC time-of-day windows where `Trigger`
 //!   alerts are suppressed (without consuming the cooldown gate). `Resolve`
 //!   events still fire so operators don't miss recovery during off hours.
-//! - **Lifecycle retention**: preserved global/proxy-group instances retire
-//!   per-proxy cooldown, recovery, and window rows when proxies leave the
-//!   instance's active set (incremental cache commit, off the request path).
-//!   Expired cooldown timestamps and terminal Healthy recovery rows are also
-//!   swept by the background eviction task.
+//! - **Lifecycle retention**: preserved global/proxy-group instances publish
+//!   per-proxy ownership generations and retire cooldown/recovery/window rows
+//!   when proxies leave the instance's active set (incremental cache commit,
+//!   off the request path). Samples carry the admission-time generation so an
+//!   in-flight request from a removed incarnation cannot repopulate state after
+//!   delete→recreate of the same proxy ID. Expired cooldown timestamps and
+//!   terminal Healthy recovery rows are also swept by the background eviction
+//!   task.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
@@ -70,6 +74,11 @@ pub struct ProxyAlerts {
     windows: Arc<WindowStore>,
     cooldowns: Arc<CooldownGate>,
     recovery: Arc<RecoveryGate>,
+    /// Published ownership generations for proxies this instance may observe.
+    /// `None` until the first cold-path retain (unit tests that never retain
+    /// keep the historical ungated write path). After retain, writes require a
+    /// matching admitted generation.
+    active_proxy_generations: ArcSwap<Option<HashMap<String, u64>>>,
     dispatch_sem: Arc<Semaphore>,
     http_client: PluginHttpClient,
     enabled: AtomicBool,
@@ -119,6 +128,7 @@ impl ProxyAlerts {
             windows,
             cooldowns,
             recovery,
+            active_proxy_generations: ArcSwap::from_pointee(None),
             dispatch_sem,
             http_client,
             enabled: AtomicBool::new(parsed.enabled),
@@ -127,20 +137,58 @@ impl ProxyAlerts {
         })
     }
 
-    /// Retire per-proxy window/cooldown/recovery ownership for proxies that
-    /// are no longer in this instance's active set.
+    /// Publish ownership generations and retire per-proxy window/cooldown/
+    /// recovery rows for proxies absent from that map.
     ///
     /// Invoked from the plugin-cache commit path for preserved global and
     /// proxy-group instances. Must not run on the request hot path.
-    pub fn retain_proxies(&self, active_proxy_ids: &HashSet<&str>) {
-        self.windows.retain_proxies(active_proxy_ids);
-        self.cooldowns.retain_proxies(active_proxy_ids);
-        self.recovery.retain_proxies(active_proxy_ids);
+    pub fn retain_proxies(&self, active_proxy_generations: &HashMap<&str, u64>) {
+        let owned: HashMap<String, u64> = active_proxy_generations
+            .iter()
+            .map(|(id, gen)| ((*id).to_string(), *gen))
+            .collect();
+        let active_ids: HashSet<&str> = owned.keys().map(String::as_str).collect();
+        self.windows.retain_proxies(&active_ids);
+        self.cooldowns.retain_proxies(&active_ids);
+        self.recovery.retain_proxies(&active_ids);
+        self.active_proxy_generations
+            .store(Arc::new(Some(owned)));
+    }
+
+    /// Compatibility helper for tests that only have an active-ID set.
+    #[doc(hidden)]
+    pub fn retain_proxy_ids_for_test(&self, active_proxy_ids: &HashSet<&str>) {
+        let generations: HashMap<&str, u64> = active_proxy_ids
+            .iter()
+            .copied()
+            .map(|id| {
+                let gen = self
+                    .active_proxy_generations
+                    .load()
+                    .as_ref()
+                    .as_ref()
+                    .and_then(|map| map.get(id).copied())
+                    .unwrap_or(1);
+                (id, gen)
+            })
+            .collect();
+        self.retain_proxies(&generations);
     }
 
     /// Seed cooldown + Active recovery state for deterministic external tests.
     #[doc(hidden)]
-    pub fn seed_lifecycle_state_for_test(&self, proxy_id: &str) {
+    pub fn seed_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        // Ensure the seeded proxy is owned under `generation` so subsequent
+        // gated writes from the same incarnation succeed in tests.
+        let mut map = self
+            .active_proxy_generations
+            .load()
+            .as_ref()
+            .clone()
+            .unwrap_or_default();
+        map.insert(proxy_id.to_string(), generation);
+        self.active_proxy_generations
+            .store(Arc::new(Some(map)));
         let _ = self.cooldowns.try_acquire(0, proxy_id, 0, 60_000, 1);
         let _ = self.recovery.observe(0, proxy_id, true, 5_000, 1);
     }
@@ -153,8 +201,29 @@ impl ProxyAlerts {
             || self.windows.contains_proxy(proxy_id)
     }
 
+    /// Whether an admitted sample may mutate lifecycle state for `proxy_id`.
+    fn owns_proxy_generation(&self, proxy_id: &str, admitted_generation: Option<u64>) -> bool {
+        let guard = self.active_proxy_generations.load();
+        match guard.as_ref() {
+            // Retention not armed yet (offline unit tests / pre-retain).
+            None => true,
+            Some(active) => match (active.get(proxy_id), admitted_generation) {
+                (Some(&current), Some(admitted)) => current == admitted,
+                // Armed retention: missing proxy or missing admission token
+                // must not create ownership visible to a replacement generation.
+                _ => false,
+            },
+        }
+    }
+
     fn handle(&self, sample: SampleInput<'_>) {
         if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let proxy_id = sample.proxy_id().unwrap_or("");
+        if !proxy_id.is_empty()
+            && !self.owns_proxy_generation(proxy_id, sample.proxy_lifecycle_generation())
+        {
             return;
         }
         let now = Utc::now();
@@ -372,13 +441,13 @@ impl Plugin for ProxyAlerts {
         super::priority::PROXY_ALERTS
     }
 
-    fn retain_active_proxy_state(&self, active_proxy_ids: &HashSet<&str>) {
-        self.retain_proxies(active_proxy_ids);
+    fn retain_active_proxy_state(&self, active_proxy_generations: &HashMap<&str, u64>) {
+        self.retain_proxies(active_proxy_generations);
     }
 
     #[doc(hidden)]
-    fn seed_proxy_lifecycle_state_for_test(&self, proxy_id: &str) {
-        self.seed_lifecycle_state_for_test(proxy_id);
+    fn seed_proxy_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        self.seed_lifecycle_state_for_test(proxy_id, generation);
     }
 
     #[doc(hidden)]
