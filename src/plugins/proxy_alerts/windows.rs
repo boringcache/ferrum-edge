@@ -345,11 +345,7 @@ impl WindowStore {
         Some(Arc::clone(entry.value()))
     }
 
-    fn generations_for(
-        &self,
-        rule_id: u32,
-        proxy_id: &str,
-    ) -> Option<Arc<GenerationWindows>> {
+    fn generations_for(&self, rule_id: u32, proxy_id: &str) -> Option<Arc<GenerationWindows>> {
         let inner = self.inner_for(rule_id)?;
         if let Some(existing) = inner.get(proxy_id) {
             return Some(Arc::clone(existing.value()));
