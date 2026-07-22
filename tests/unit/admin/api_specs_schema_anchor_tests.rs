@@ -601,7 +601,11 @@ fn deeply_nested_callback_schema_indexing_is_bounded() {
         "x-ferrum-proxy": serde_json::from_str::<Value>(&proxy_block()).unwrap(),
         "paths": {"/start": path_item}
     });
-    let err = extract_err(&spec.to_string());
+    // YAML parsing accepts this deliberately deep literal tree so the resolver
+    // limit, rather than serde_json's own nesting limit, is what rejects it.
+    let yaml = serde_yaml::to_string(&spec).expect("deep callback fixture must serialize");
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod")
+        .expect_err("deep callback indexing must fail closed");
     assert!(
         matches!(err, ExtractError::SchemaTooDeep { .. }),
         "got: {err}"
