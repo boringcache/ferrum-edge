@@ -80,14 +80,6 @@ const SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "x-goog-api-key",
     "x-forwarded-authorization",
 ];
-const SYNTHETIC_FINGERPRINT_EXCLUSIONS: &[&str] = &[
-    "traceparent",
-    "tracestate",
-    "x-request-id",
-    "x-correlation-id",
-    "correlation-id",
-];
-
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
 /// the `Instant`-based entry expiry.
 fn monotonic_secs() -> u64 {
@@ -117,7 +109,7 @@ fn decrement_atomic(value: &AtomicUsize) -> usize {
 }
 
 use super::utils::body_transform::is_event_stream_content_type;
-use super::utils::cache_headers::sanitize_cached_headers;
+use super::utils::cache_headers::{is_per_request_trace_header, sanitize_cached_headers};
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
@@ -1532,9 +1524,7 @@ fn request_headers_for_fingerprint<'a>(
             || HOP_BY_HOP_FINGERPRINT_EXCLUSIONS
                 .iter()
                 .any(|excluded| normalized == *excluded)
-            || SYNTHETIC_FINGERPRINT_EXCLUSIONS
-                .iter()
-                .any(|excluded| normalized == *excluded)
+            || is_per_request_trace_header(&normalized)
             || (exclude_scoped_credentials
                 && SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS
                     .iter()

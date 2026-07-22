@@ -3537,6 +3537,20 @@ async fn test_reused_key_different_client_trace_headers_replays() {
         "00-11111111111111111111111111111111-2222222222222222-01".to_string(),
     );
     first_headers.insert("x-request-id".to_string(), "request-a".to_string());
+    first_headers.insert("tracestate".to_string(), "vendor=trace-a".to_string());
+    first_headers.insert("X-Correlation-ID".to_string(), "correlation-a".to_string());
+    first_headers.insert("correlation-id".to_string(), "legacy-a".to_string());
+    first_headers.insert("X-Trace-ID".to_string(), "generic-a".to_string());
+    first_headers.insert(
+        "X-Amzn-Trace-Id".to_string(),
+        "Root=1-11111111-111111111111111111111111".to_string(),
+    );
+    first_headers.insert(
+        "B3".to_string(),
+        "1111111111111111-2222222222222222-1".to_string(),
+    );
+    first_headers.insert("X-B3-TraceId".to_string(), "1111111111111111".to_string());
+    first_headers.insert("x-b3-spanid".to_string(), "2222222222222222".to_string());
     assert!(matches!(
         plugin
             .before_proxy(&mut first_ctx, &mut first_headers)
@@ -3552,6 +3566,20 @@ async fn test_reused_key_different_client_trace_headers_replays() {
         "00-33333333333333333333333333333333-4444444444444444-01".to_string(),
     );
     second_headers.insert("x-request-id".to_string(), "request-b".to_string());
+    second_headers.insert("TraceState".to_string(), "vendor=trace-b".to_string());
+    second_headers.insert("x-correlation-id".to_string(), "correlation-b".to_string());
+    second_headers.insert("Correlation-Id".to_string(), "legacy-b".to_string());
+    second_headers.insert("x-trace-id".to_string(), "generic-b".to_string());
+    second_headers.insert(
+        "x-amzn-trace-id".to_string(),
+        "Root=1-33333333-333333333333333333333333".to_string(),
+    );
+    second_headers.insert(
+        "b3".to_string(),
+        "3333333333333333-4444444444444444-0".to_string(),
+    );
+    second_headers.insert("x-b3-traceid".to_string(), "3333333333333333".to_string());
+    second_headers.insert("X-B3-SpanId".to_string(), "4444444444444444".to_string());
 
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
