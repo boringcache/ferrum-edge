@@ -384,16 +384,7 @@ async fn request_mirror_stall_scripted_backend_never_delays_primary() {
     })
     .await
     .expect("stalled mirror never received the copied request");
-    let primary_requests = primary.received_requests().await;
-    let expected_path = format!("/mirror-{behavior}");
-    assert_eq!(
-        primary_requests
-            .iter()
-            .filter(|request| request.path == expected_path)
-            .count(),
-        1,
-        "client request must reach the primary exactly once; requests={primary_requests:?}"
-    );
+    assert_eq!(primary.received_requests().await.len(), 1);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -841,7 +832,16 @@ async fn assert_misbehaving_mirror_does_not_delay_primary(behavior: &'static str
     })
     .await
     .unwrap_or_else(|_| panic!("{behavior} mirror never received the copied request"));
-    assert_eq!(primary.received_requests().await.len(), 1);
+    let primary_requests = primary.received_requests().await;
+    let expected_path = format!("/mirror-{behavior}");
+    assert_eq!(
+        primary_requests
+            .iter()
+            .filter(|request| request.path == expected_path)
+            .count(),
+        1,
+        "client request must reach the primary exactly once; requests={primary_requests:?}"
+    );
 
     let logs = harness
         .wait_for_log_contains(
