@@ -24,8 +24,6 @@ env:
   FERRUM_IMAGE_REPOSITORY: ferrum-edge
   FERRUM_IMAGE_TAG: mesh-e2e-sidecar
   CLUSTER: ferrum-sidecar-e2e
-  KIND_VERSION: v0.27.0
-  KUBECTL_VERSION: v1.32.3
 
 jobs:
   changes:
@@ -104,12 +102,7 @@ jobs:
           image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
 
       - name: Install Kubernetes tools
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo chmod +x /usr/local/bin/kind
-          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo chmod +x /usr/local/bin/kubectl
+        uses: ./.github/actions/setup-kubernetes-tools
 
       - name: Create kind cluster
         run: |

@@ -74,6 +74,35 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
 
+      - name: Validate GitHub Action pinning and Kubernetes tool installs
+        run: |
+          set -euo pipefail
+          # The preceding Cross-policy step fetches origin/${BASE_REF}; reuse that
+          # immutable ref rather than trusting a PR-controlled fetch here.
+          checker=.github/scripts/verify_action_pinning.py
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base_ref="origin/${BASE_REF}"
+            if git cat-file -e "${base_ref}:${checker}" 2>/dev/null; then
+              trusted_checker="$RUNNER_TEMP/verify-action-pinning.py"
+              git show "${base_ref}:${checker}" > "$trusted_checker"
+              checker="$trusted_checker"
+            else
+              # Bootstrap: base has no checker yet. Compile, then run this
+              # reviewed proposal. Later PRs take the trusted-base branch above.
+              PYTHONPYCACHEPREFIX="$RUNNER_TEMP/action-pinning-pyc" \
+                python3 -I -m py_compile "$checker"
+            fi
+          fi
+
+          python3 -I "$checker" \
+            --self-test \
+            --workflows-dir .github/workflows \
+            --actions-dir .github/actions
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+
       - name: Validate trusted PR CI planner examples
         run: |
           set -euo pipefail
@@ -1223,8 +1252,6 @@ jobs:
     timeout-minutes: 60
     env:
       FERRUM_IMAGE: ferrum-edge:multicluster-federation
-      KIND_VERSION: v0.27.0
-      KUBECTL_VERSION: v1.32.3
       FERRUM_MULTICLUSTER_DEPLOY_ONLY: "1"
       FERRUM_SKIP_IMAGE_BUILD: "1"
       FERRUM_IMAGE_REPOSITORY: ferrum-edge
@@ -1233,18 +1260,10 @@ jobs:
       # CI; acknowledge run.sh's preflight guard (the live workflow sets the same).
       FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE: "true"
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Kubernetes tools
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo chmod +x /usr/local/bin/kind
-          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo chmod +x /usr/local/bin/kubectl
-
-      - name: Install Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: ./.github/actions/setup-kubernetes-tools
 
       - name: Download prebuilt gateway binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1265,7 +1284,7 @@ jobs:
 
       - name: Upload mesh federation diagnostics
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ferrum-multicluster-federation
           path: ${{ runner.temp }}/ferrum-multicluster-federation
@@ -1279,8 +1298,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      KIND_VERSION: v0.27.0
-      KUBECTL_VERSION: v1.32.3
       # Deploy-only smoke: SPIRE + sidecar workloads roll out, no traffic
       # probes. The full datapath run rides the path-filtered
       # mesh-e2e-sidecar-live workflow.
@@ -1292,15 +1309,10 @@ jobs:
       # acknowledge run.sh's preflight guard (the live workflow sets the same).
       FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE: "true"
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Kubernetes tools
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo chmod +x /usr/local/bin/kind
-          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo chmod +x /usr/local/bin/kubectl
+        uses: ./.github/actions/setup-kubernetes-tools
 
       - name: Download prebuilt gateway binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1321,7 +1333,7 @@ jobs:
 
       - name: Upload mesh e2e sidecar diagnostics
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ferrum-mesh-e2e-sidecar
           path: ${{ runner.temp }}/ferrum-mesh-e2e-sidecar
@@ -1337,21 +1349,11 @@ jobs:
     timeout-minutes: 45
     env:
       FERRUM_IMAGE: ferrum-edge:helm-chart-ci
-      KIND_VERSION: v0.27.0
-      KUBECTL_VERSION: v1.32.3
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Kubernetes tools
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo chmod +x /usr/local/bin/kind
-          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo chmod +x /usr/local/bin/kubectl
-
-      - name: Install Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: ./.github/actions/setup-kubernetes-tools
 
       - name: Helm static validation
         run: |

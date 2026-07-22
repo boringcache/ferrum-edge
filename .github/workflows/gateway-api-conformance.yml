@@ -40,8 +40,6 @@ concurrency:
 
 env:
   FERRUM_IMAGE: ferrum-edge:gateway-api-conformance
-  KIND_VERSION: v0.27.0
-  KUBECTL_VERSION: v1.32.3
 
 jobs:
   changes:
@@ -153,15 +151,7 @@ jobs:
           cache: false
 
       - name: Install Kubernetes tools
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          sudo chmod +x /usr/local/bin/kind
-          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo chmod +x /usr/local/bin/kubectl
-
-      - name: Install Helm
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: ./.github/actions/setup-kubernetes-tools
 
       - name: Package Ferrum image
         uses: ./.github/actions/package-ferrum-runtime-image

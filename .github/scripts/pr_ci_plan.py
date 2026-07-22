@@ -88,7 +88,7 @@ EBPF_LIVE_PATTERNS = [
     re.compile(pattern)
     for pattern in (
         r"^\.github/workflows/(?:ci|node-waypoint-ebpf-live)\.yml$",
-        r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
+        r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker|setup-kubernetes-tools|package-ferrum-runtime-image)/",
         r"^Cargo\.(?:toml|lock)$",
         r"^\.cargo/",
         r"^rust-toolchain\.toml$",
@@ -131,6 +131,7 @@ GATE_CONTROLLER_PATHS = frozenset(
     {
         ".github/scripts/pr_ci_plan.py",
         ".github/scripts/live_suite_path_filter.py",
+        ".github/scripts/verify_action_pinning.py",
     }
 )
 
@@ -267,6 +268,16 @@ def self_test() -> int:
             "pull_request",
             [".github/scripts/live_suite_path_filter.py"],
             {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            [".github/scripts/verify_action_pinning.py"],
+            {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            [".github/actions/setup-kubernetes-tools/action.yml"],
+            {"run_ebpf_live": True, "run_helm": True},
         ),
         (
             "pull_request",

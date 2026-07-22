@@ -18,6 +18,15 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `docs/upstream-*-patches/` notes. The diff to `vendor/VENDOR_INTEGRITY.sha256`
   is the audit trail.
 
+## CI Actions and Kubernetes Tools
+
+- External GitHub Actions must be pinned to a full commit SHA (see
+  `docs/dependency-policy.md` → "CI Actions and Kubernetes tooling").
+- kind / kubectl / Helm install only via
+  `.github/actions/setup-kubernetes-tools` with repository-pinned checksums.
+- `ci-plan` runs `.github/scripts/verify_action_pinning.py` to reject mutable
+  action refs, pipe-to-shell installers, and unverified tool downloads.
+
 ## Drift Guard
 
 - `tests/integration/vendor_integrity_tests.rs` hashes every `vendor/` file
