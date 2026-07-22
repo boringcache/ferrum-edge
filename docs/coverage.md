@@ -160,7 +160,9 @@ regressions:
   invocations in one job reuses the compiled `unit_tests` binary.
 - `Plugin Hardening Redis Regression`: multi-instance Redis request
   deduplication with `FERRUM_REDIS_REQUIRED=1`, so Redis startup failures cannot
-  silently skip the regression.
+  silently skip the regression. Covers cross-gateway lock/completed-value
+  sharing for one `plugin_config_id` and same-proxy sibling instances under the
+  shared default `{FERRUM_NAMESPACE}:dedup` prefix.
 
 Latest opt-in functional benchmark: **81.68% line coverage**
 (`148,432/181,717` lines), captured locally on 2026-05-25 with

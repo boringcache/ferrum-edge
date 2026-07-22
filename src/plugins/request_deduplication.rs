@@ -288,6 +288,20 @@ pub(crate) fn set_request_state_for_test(
     );
 }
 
+/// Sorted logical keys acquired during `before_proxy` for external tests that
+/// construct plugins through `PluginCache` / the production factory (trait
+/// objects) rather than the concrete test helper.
+#[allow(dead_code)]
+pub(crate) fn logical_keys_from_request_context_for_test(ctx: &RequestContext) -> Vec<String> {
+    let mut keys: Vec<String> = ctx
+        .request_deduplication_states
+        .values()
+        .map(|state| state.key.clone())
+        .collect();
+    keys.sort();
+    keys
+}
+
 static NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct RequestDeduplication {
@@ -354,6 +368,19 @@ impl RequestDeduplication {
             return Err("request_deduplication: config must be an object".to_string());
         }
 
+        // Stable plugin-config identity partitions Redis ownership across
+        // sibling instances (global/proxy/proxy_group) that share a default or
+        // explicit prefix. Reject blank IDs fail-closed so two miswired
+        // constructors cannot collapse onto one distributed key space.
+        // Process-local `instance_id` is intentionally not used here: it would
+        // break intentional cross-gateway sharing for the same config.
+        if config_id.trim().is_empty() {
+            return Err(
+                "request_deduplication: plugin config id must be a non-empty stable identity"
+                    .to_string(),
+            );
+        }
+
         let header_name = parse_header_name(
             optional_string(config, "header_name")?.unwrap_or("Idempotency-Key"),
         )?;
@@ -393,7 +420,9 @@ impl RequestDeduplication {
 
         Ok(Self {
             instance_id: NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
-            config_id: config_id.to_string(),
+            // Preserve the configured resource identity byte-for-byte. Trimming
+            // here would collapse distinct nonblank IDs onto one Redis keyspace.
+            config_id: config_id.to_owned(),
             header_name,
             ttl,
             inflight_ttl,

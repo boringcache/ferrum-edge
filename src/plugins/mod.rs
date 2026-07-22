@@ -6549,6 +6549,11 @@ pub trait Plugin: Send + Sync {
 /// Uses a default `PluginHttpClient` for plugins that make outbound HTTP calls.
 /// Prefer [`create_plugin_with_http_client`] in production to share the gateway's
 /// pooled client across all plugins for connection reuse and keepalive.
+///
+/// Plugins that partition state by configured identity (notably
+/// `request_deduplication`) should be constructed through
+/// [`create_plugin_with_http_client_and_config_id`] with the stable plugin-config
+/// resource id. Direct construction here uses a validation-only default identity.
 #[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
     create_plugin_with_http_client(name, config, PluginHttpClient::default())
@@ -6567,10 +6572,31 @@ pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin
 /// - `Ok(Some(plugin))` — plugin created successfully
 /// - `Ok(None)` — unknown plugin name
 /// - `Err(msg)` — plugin config validation failed
+///
+/// For runtime construction of identity-partitioned plugins, prefer
+/// [`create_plugin_with_http_client_and_config_id`].
 pub fn create_plugin_with_http_client(
     name: &str,
     config: &Value,
     http_client: PluginHttpClient,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    create_plugin_with_http_client_and_config_id(name, config, http_client, None)
+}
+
+/// Create a plugin instance with a shared HTTP client and optional stable
+/// plugin-config resource id.
+///
+/// `plugin_config_id` is the configured plugin-config resource id (global /
+/// proxy / proxy_group). Production `PluginCache` passes `Some(&pc.id)` so
+/// Redis-backed `request_deduplication` instances partition logical keys by that
+/// identity. Pass `None` for config-validation and direct/test construction that
+/// does not need sibling isolation (uses the plugin's standalone default id).
+/// Blank ids fail closed when supplied.
+pub fn create_plugin_with_http_client_and_config_id(
+    name: &str,
+    config: &Value,
+    http_client: PluginHttpClient,
+    plugin_config_id: Option<&str>,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     // Fail CLOSED before constructing plugins with literal endpoints. LDAP uses
     // a dedicated fresh, policy-screened dial resolver; kafka_logging and
@@ -6710,9 +6736,21 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
-        "request_deduplication" => Ok(Some(Arc::new(
-            request_deduplication::RequestDeduplication::new(config, http_client.clone())?,
-        ))),
+        "request_deduplication" => {
+            let plugin = match plugin_config_id {
+                Some(config_id) => {
+                    request_deduplication::RequestDeduplication::new_with_instance_id(
+                        config,
+                        http_client.clone(),
+                        config_id,
+                    )?
+                }
+                None => {
+                    request_deduplication::RequestDeduplication::new(config, http_client.clone())?
+                }
+            };
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config)?,
         ))),

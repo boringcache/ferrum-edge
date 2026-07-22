@@ -3,7 +3,8 @@
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     incremental_plugin_rebuild_targets_for_test, plugin_cache_with_real_ip_header_for_test,
-    reconcile_fault_plugin_generations_for_test, run_after_proxy_hooks_for_test,
+    reconcile_fault_plugin_generations_for_test,
+    request_deduplication_logical_keys_from_context_for_test, run_after_proxy_hooks_for_test,
     set_grpc_deadline_budget_for_test, transform_buffered_response_body_with_deadline_for_test,
     validate_correlation_id_composition_with_real_ip_header_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
@@ -5636,6 +5637,90 @@ async fn test_priority_override_delegates_response_stream_termination_hook() {
     assert!(
         matches!(result, PluginResult::Continue),
         "stream-end cleanup should let the next keyed request execute, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn plugin_cache_wires_stable_plugin_config_id_into_dedup_logical_keys() {
+    // Production PluginCache must pass each plugin-config resource id through
+    // the factory so sibling Redis instances stay partitioned under a shared
+    // default prefix, while corresponding copies of one config share identity.
+    let first_gateway = make_config(
+        vec![make_proxy(
+            "orders",
+            "/orders",
+            vec!["dedup-short", "dedup-long"],
+        )],
+        vec![
+            make_plugin_config(
+                "dedup-short",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("orders"),
+                true,
+            ),
+            make_plugin_config(
+                "dedup-long",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("orders"),
+                true,
+            ),
+        ],
+    );
+    let second_gateway = make_config(
+        vec![make_proxy("orders", "/orders", vec!["dedup-short"])],
+        vec![make_plugin_config(
+            "dedup-short",
+            "request_deduplication",
+            PluginScope::Proxy,
+            Some("orders"),
+            true,
+        )],
+    );
+
+    let first_cache = PluginCache::new(&first_gateway).unwrap();
+    let second_cache = PluginCache::new(&second_gateway).unwrap();
+    let first_plugins = first_cache.get_plugins("orders");
+    let second_plugins = second_cache.get_plugins("orders");
+    assert_eq!(first_plugins.len(), 2);
+    assert_eq!(second_plugins.len(), 1);
+    assert!(
+        first_plugins
+            .iter()
+            .all(|plugin| plugin.name() == "request_deduplication")
+    );
+
+    async fn logical_key(plugin: &Arc<dyn Plugin>) -> String {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/orders".to_string(),
+        );
+        ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"{}"));
+        let mut headers = HashMap::new();
+        headers.insert("idempotency-key".to_string(), "order-1".to_string());
+        headers.insert("host".to_string(), "api.example".to_string());
+        headers.insert("content-length".to_string(), "2".to_string());
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let keys = request_deduplication_logical_keys_from_context_for_test(&ctx);
+        assert_eq!(keys.len(), 1);
+        keys.into_iter().next().unwrap()
+    }
+
+    let sibling_a = logical_key(&first_plugins[0]).await;
+    let sibling_b = logical_key(&first_plugins[1]).await;
+    let peer_key = logical_key(&second_plugins[0]).await;
+    assert_ne!(
+        sibling_a, sibling_b,
+        "PluginCache must partition sibling request_deduplication config ids"
+    );
+    assert!(
+        peer_key == sibling_a || peer_key == sibling_b,
+        "PluginCache must preserve cross-gateway identity for one plugin_config_id"
     );
 }
 
