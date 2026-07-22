@@ -304,9 +304,8 @@ pub async fn normalize_compressed_request_for_plugin_test(
         other => panic!("unsupported test encoding {other}"),
     };
 
-    let compression = Arc::new(
-        CompressionPlugin::new(&serde_json::json!({"decompress_request": true})).unwrap(),
-    );
+    let compression =
+        Arc::new(CompressionPlugin::new(&serde_json::json!({"decompress_request": true})).unwrap());
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
