@@ -23,13 +23,11 @@ fn first_request_schema(spec: &str) -> Value {
         .expect("spec extraction must succeed");
     assert_eq!(bundle.plugins.len(), 1);
     assert_eq!(bundle.plugins[0].plugin_name, "openapi_validator");
-    bundle.plugins[0].config["operations"][0]["request_body"]["content"]["application/json"]
-        .clone()
+    bundle.plugins[0].config["operations"][0]["request_body"]["content"]["application/json"].clone()
 }
 
 fn extract_err(spec: &str) -> ExtractError {
-    extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
-        .expect_err("spec extraction must fail")
+    extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").expect_err("spec extraction must fail")
 }
 
 #[test]
@@ -247,7 +245,12 @@ fn percent_encoded_pointer_and_anchor_fragments_resolve() {
     // Operation order follows HTTP_METHODS then path map iteration; assert by path.
     let by_path: std::collections::HashMap<_, _> = operations
         .iter()
-        .map(|op| (op["path_template"].as_str().unwrap().to_string(), op.clone()))
+        .map(|op| {
+            (
+                op["path_template"].as_str().unwrap().to_string(),
+                op.clone(),
+            )
+        })
         .collect();
     assert_eq!(
         by_path["/encoded-pointer"]["request_body"]["content"]["application/json"]["required"],
@@ -286,7 +289,13 @@ fn malformed_percent_encoding_is_rejected() {
     );
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "x-ferrum-validate", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                ..
+            }
+        ),
         "got: {err}"
     );
     assert!(
@@ -322,11 +331,18 @@ fn missing_anchor_is_rejected() {
     );
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "x-ferrum-validate", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                ..
+            }
+        ),
         "got: {err}"
     );
     assert!(
-        err.to_string().contains("unresolved internal $ref '#Missing'"),
+        err.to_string()
+            .contains("unresolved internal $ref '#Missing'"),
         "got: {err}"
     );
 }
@@ -364,7 +380,13 @@ fn duplicate_anchor_is_rejected() {
     );
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "x-ferrum-validate", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                ..
+            }
+        ),
         "got: {err}"
     );
     assert!(
@@ -526,7 +548,10 @@ fn openapi_30_pointer_and_draft7_id_anchor_remain_compatible() {
         proxy = proxy_block()
     );
     let pointer_schema = first_request_schema(&pointer_spec);
-    assert_eq!(pointer_schema["properties"]["id"]["type"], json!(["string", "null"]));
+    assert_eq!(
+        pointer_schema["properties"]["id"]["type"],
+        json!(["string", "null"])
+    );
 
     let id_anchor_spec = format!(
         r##"{{
@@ -603,7 +628,8 @@ fn openapi_30_ignores_dollar_anchor_keyword() {
     );
     let err = extract_err(&spec);
     assert!(
-        err.to_string().contains("unresolved internal $ref '#Order'"),
+        err.to_string()
+            .contains("unresolved internal $ref '#Order'"),
         "got: {err}"
     );
 }
@@ -775,7 +801,12 @@ fn schema_annotation_payloads_are_not_subschema_anchors() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|op| (op["path_template"].as_str().unwrap().to_string(), op.clone()))
+        .map(|op| {
+            (
+                op["path_template"].as_str().unwrap().to_string(),
+                op.clone(),
+            )
+        })
         .collect();
     assert_eq!(
         by_path["/orders"]["request_body"]["content"]["application/json"]["$anchor"],
@@ -912,7 +943,13 @@ fn duplicate_same_document_resource_id_is_rejected() {
     );
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "x-ferrum-validate", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                ..
+            }
+        ),
         "got: {err}"
     );
     assert!(

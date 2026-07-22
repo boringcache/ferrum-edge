@@ -1221,12 +1221,14 @@ impl LocalSchemaResolver {
             )?;
         }
         if let Some(headers) = components.get("headers").and_then(Value::as_object) {
-            self.index_header_map(headers, &append_json_pointer(pointer, "headers"), base, depth)?;
+            self.index_header_map(
+                headers,
+                &append_json_pointer(pointer, "headers"),
+                base,
+                depth,
+            )?;
         }
-        if let Some(request_bodies) = components
-            .get("requestBodies")
-            .and_then(Value::as_object)
-        {
+        if let Some(request_bodies) = components.get("requestBodies").and_then(Value::as_object) {
             for (name, body) in request_bodies {
                 let body_pointer =
                     append_json_pointer(&append_json_pointer(pointer, "requestBodies"), name);
@@ -1428,7 +1430,8 @@ impl LocalSchemaResolver {
             return Ok(());
         };
         for (media_type, media) in content {
-            let media_pointer = append_json_pointer(&append_json_pointer(pointer, "content"), media_type);
+            let media_pointer =
+                append_json_pointer(&append_json_pointer(pointer, "content"), media_type);
             if let Some(schema) = media.get("schema") {
                 self.index_schema(
                     schema,
@@ -1500,7 +1503,10 @@ impl LocalSchemaResolver {
                     self.index_schema(
                         child,
                         base,
-                        &append_json_pointer(&append_json_pointer(pointer, key), &index.to_string()),
+                        &append_json_pointer(
+                            &append_json_pointer(pointer, key),
+                            &index.to_string(),
+                        ),
                         depth,
                     )?;
                 }
@@ -1579,10 +1585,12 @@ impl LocalSchemaResolver {
             .and_then(Value::as_str);
 
         if let Some(id_value) = id_value {
-            let resolved = base.join(id_value).map_err(|_| ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                error: format!("invalid schema $id '{id_value}'"),
-            })?;
+            let resolved = base
+                .join(id_value)
+                .map_err(|_| ExtractError::MalformedExtension {
+                    which: "x-ferrum-validate",
+                    error: format!("invalid schema $id '{id_value}'"),
+                })?;
             let fragment = resolved.fragment().unwrap_or("");
             if !fragment.is_empty() {
                 if self.use_dollar_anchor {
@@ -1671,9 +1679,7 @@ impl LocalSchemaResolver {
             if root_pointer.is_empty() {
                 continue;
             }
-            if pointer == root_pointer
-                || pointer.starts_with(&format!("{root_pointer}/"))
-            {
+            if pointer == root_pointer || pointer.starts_with(&format!("{root_pointer}/")) {
                 return uri;
             }
         }
@@ -1704,12 +1710,13 @@ impl LocalSchemaResolver {
                 resource
             }
             Some(uri) => {
-                let joined = current_base.join(uri).map_err(|_| {
-                    ExtractError::MalformedExtension {
-                        which: "x-ferrum-validate",
-                        error: format!("invalid internal $ref '{reference}'"),
-                    }
-                })?;
+                let joined =
+                    current_base
+                        .join(uri)
+                        .map_err(|_| ExtractError::MalformedExtension {
+                            which: "x-ferrum-validate",
+                            error: format!("invalid internal $ref '{reference}'"),
+                        })?;
                 let mut resource = joined;
                 resource.set_fragment(None);
                 resource
@@ -1778,15 +1785,20 @@ impl LocalSchemaResolver {
         let target = if pointer.is_empty() {
             root
         } else {
-            root.pointer(pointer).ok_or_else(|| ExtractError::MalformedExtension {
-                which: "x-ferrum-validate",
-                error: format!("unresolved internal $ref '{reference}'"),
-            })?
+            root.pointer(pointer)
+                .ok_or_else(|| ExtractError::MalformedExtension {
+                    which: "x-ferrum-validate",
+                    error: format!("unresolved internal $ref '{reference}'"),
+                })?
         };
         Ok((target, target_resource))
     }
 
-    fn child_base_for_object(&self, object: &Map<String, Value>, base: &Url) -> Result<Url, ExtractError> {
+    fn child_base_for_object(
+        &self,
+        object: &Map<String, Value>,
+        base: &Url,
+    ) -> Result<Url, ExtractError> {
         let id_value = object
             .get("$id")
             .or_else(|| {
@@ -1800,10 +1812,12 @@ impl LocalSchemaResolver {
         let Some(id_value) = id_value else {
             return Ok(base.clone());
         };
-        let resolved = base.join(id_value).map_err(|_| ExtractError::MalformedExtension {
-            which: "x-ferrum-validate",
-            error: format!("invalid schema $id '{id_value}'"),
-        })?;
+        let resolved = base
+            .join(id_value)
+            .map_err(|_| ExtractError::MalformedExtension {
+                which: "x-ferrum-validate",
+                error: format!("invalid schema $id '{id_value}'"),
+            })?;
         let mut resource = resolved;
         resource.set_fragment(None);
         Ok(resource)
