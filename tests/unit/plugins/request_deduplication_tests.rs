@@ -312,10 +312,13 @@ fn production_factory_rejects_blank_plugin_config_id() {
 
 #[test]
 fn production_factory_without_config_id_keeps_direct_construction_coherent() {
-    let via_default_factory =
-        create_plugin_with_http_client("request_deduplication", &json!({}), PluginHttpClient::default())
-            .unwrap()
-            .unwrap();
+    let via_default_factory = create_plugin_with_http_client(
+        "request_deduplication",
+        &json!({}),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(via_default_factory.name(), "request_deduplication");
 }
 
