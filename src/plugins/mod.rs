@@ -6426,6 +6426,9 @@ pub trait Plugin: Send + Sync {
     /// observational hooks with that already-final Close so they can record
     /// the decision, while skipping later mutating plugins so they neither
     /// charge budget nor replace the Close code/reason.
+    /// The relay ignores the return value from an observational hook for every
+    /// frame, enforcing the observe-only contract even if an implementation
+    /// accidentally returns a replacement.
     fn observes_ws_frame_decisions(&self) -> bool {
         false
     }

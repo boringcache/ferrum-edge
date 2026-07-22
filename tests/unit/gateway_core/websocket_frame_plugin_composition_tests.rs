@@ -96,15 +96,13 @@ impl Plugin for CountingObserver {
         if matches!(message, Message::Close(_)) {
             self.seen_close.fetch_add(1, Ordering::SeqCst);
         }
-        // A buggy observational hook must not be allowed to replace the Close.
-        if matches!(message, Message::Close(_)) {
-            self.replacements.fetch_add(1, Ordering::SeqCst);
-            return Some(Message::Close(Some(CloseFrame {
-                code: CloseCode::Policy,
-                reason: "observer overwrite".into(),
-            })));
-        }
-        None
+        // A buggy observational hook must never be allowed to replace either
+        // an ordinary frame or an already-final Close.
+        self.replacements.fetch_add(1, Ordering::SeqCst);
+        Some(Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: "observer overwrite".into(),
+        })))
     }
 }
 
@@ -216,8 +214,9 @@ async fn earlier_size_close_is_preserved_over_rate_limiter_both_directions() {
             "rate limiter must not charge after an earlier terminal Close ({direction:?})"
         );
         assert_eq!(observer.seen_close.load(Ordering::SeqCst), 1);
-        // Observer attempted a replacement, but the applicator must ignore it.
-        assert_eq!(observer.replacements.load(Ordering::SeqCst), 1);
+        // Observer attempted replacements for both the admitted frame and the
+        // final Close, but the applicator must ignore both.
+        assert_eq!(observer.replacements.load(Ordering::SeqCst), 2);
     }
 }
 

@@ -11667,17 +11667,19 @@ pub(crate) async fn apply_ws_frame_plugins(
     let mut current = raw;
     let mut terminal_close = false;
     for plugin in plugins {
-        if terminal_close && !plugin.observes_ws_frame_decisions() {
+        let observes_decisions = plugin.observes_ws_frame_decisions();
+        if terminal_close && !observes_decisions {
             continue;
         }
-        if let Some(transformed) = plugin
+        let transformed = plugin
             .on_ws_frame(proxy_id, connection_id, direction, &current)
-            .await
-        {
-            if terminal_close {
-                // Observational hooks must not replace an already-final Close.
-                continue;
-            }
+            .await;
+        if observes_decisions {
+            // Enforce the observe-only capability instead of trusting a custom
+            // implementation not to return an accidental replacement.
+            continue;
+        }
+        if let Some(transformed) = transformed {
             if matches!(&transformed, Message::Close(_)) {
                 terminal_close = true;
             }
