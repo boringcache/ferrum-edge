@@ -5010,7 +5010,7 @@ async fn buffered_sse_without_content_type_is_governed() {
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
 
-    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut no_ct: HashMap<String, String> = HashMap::new();
     let mut ctx = create_test_context();
     assert_reject(
         plugin
@@ -5652,7 +5652,7 @@ async fn keepalive_prefixed_sse_body_is_governed() {
         "tools": { "report.read": { "action": "allow" } },
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
-    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut no_ct: HashMap<String, String> = HashMap::new();
 
     let denied = format!(": ping\n\n{SSE_DENIED_TOOL_BODY}");
     let mut ctx = create_test_context();
@@ -6258,7 +6258,7 @@ async fn ping_field_prefixed_unlabeled_buffered_sse_is_governed() {
         "tools": { "report.read": { "action": "allow" } },
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
-    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut no_ct: HashMap<String, String> = HashMap::new();
 
     let denied = format!("ping: 1\n\n{SSE_DENIED_TOOL_BODY}");
     let mut ctx = create_test_context();
@@ -6301,7 +6301,7 @@ async fn colonless_prefixed_unlabeled_buffered_sse_is_governed() {
     assert!(!terminated, "valid colonless-prefixed SSE must not be cut");
     assert_eq!(out, allowed.as_bytes());
 
-    for headers in [
+    for mut headers in [
         HashMap::new(),
         HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
     ] {
@@ -6420,7 +6420,7 @@ async fn ascii_keepalive_and_ping_prefixes_still_sse_after_high_bit_tightening()
         json!({ "report.read": { "action": "allow" } }),
         "deny",
     ));
-    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut no_ct: HashMap<String, String> = HashMap::new();
 
     for prelude in [": ka", "ping: 1"] {
         // Live inspector: an allowed call after the ASCII prelude passes through

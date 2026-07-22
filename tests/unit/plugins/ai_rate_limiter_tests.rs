@@ -111,7 +111,7 @@ async fn test_provider_is_case_insensitive() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -148,7 +148,7 @@ async fn test_token_accumulation_and_limit() {
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 
     // Record 150 tokens
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
     let body = openai_response(100, 50);
     plugin
         .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
@@ -195,7 +195,7 @@ async fn test_sliding_window_eviction() {
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
     let body = openai_response(80, 30); // 110 tokens
     plugin
         .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
@@ -231,7 +231,7 @@ async fn test_different_consumers_independent() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     // Consumer A uses 150 tokens
     let mut ctx_a = create_test_context();
@@ -274,7 +274,7 @@ async fn test_count_mode_prompt_tokens() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -304,7 +304,7 @@ async fn test_count_mode_completion_tokens() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -335,7 +335,7 @@ async fn test_anthropic_format() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -369,7 +369,7 @@ async fn test_google_format() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -437,7 +437,7 @@ async fn test_non_2xx_response_not_counted() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -466,7 +466,7 @@ async fn test_empty_body_not_counted() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -491,7 +491,7 @@ async fn test_zero_tokens_counted_but_no_usage() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -555,7 +555,7 @@ async fn test_expose_headers_on_rejection() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     // Record 100 tokens
     let mut ctx = create_test_context();
@@ -595,7 +595,7 @@ async fn test_consumer_fallback_to_ip() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     // No consumer set — should use IP as key
     let mut ctx = create_test_context();
@@ -636,7 +636,7 @@ async fn test_reads_tokens_from_ai_token_metrics_metadata() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let resp_headers = json_headers();
+    let mut resp_headers = json_headers();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();

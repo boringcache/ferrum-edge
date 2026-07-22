@@ -216,7 +216,7 @@ fn test_pre_header_decision_buffers_plain_json_requests() {
 async fn test_openai_format() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "model": "gpt-4o",
         "usage": {
@@ -245,7 +245,7 @@ async fn test_openai_format() {
 async fn test_anthropic_format() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "model": "claude-sonnet-4-20250514",
         "usage": {
@@ -276,7 +276,7 @@ async fn test_anthropic_format() {
 async fn test_google_format() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "modelVersion": "gemini-1.5-pro",
         "usageMetadata": {
@@ -305,7 +305,7 @@ async fn test_google_format() {
 async fn test_cohere_format() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "model": "command-r-plus",
         "meta": {
@@ -336,7 +336,7 @@ async fn test_cohere_v2_buffered_format() {
     // OpenAI / Bedrock which also key off `usage.*`.
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "id": "abc-123",
         "finish_reason": "COMPLETE",
@@ -392,7 +392,7 @@ async fn test_cohere_v2_streaming_format() {
 async fn test_bedrock_format() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {
             "inputTokens": 150,
@@ -419,7 +419,7 @@ async fn test_bedrock_format() {
 async fn test_explicit_provider_openai() {
     let plugin = AiTokenMetrics::new(&json!({"provider": "openai"})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "model": "gpt-4",
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
@@ -447,7 +447,7 @@ fn explicit_provider_requires_the_documented_lowercase_enum_spelling() {
 async fn test_explicit_provider_mistral() {
     let plugin = AiTokenMetrics::new(&json!({"provider": "mistral"})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "model": "mistral-large",
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
@@ -466,7 +466,7 @@ async fn test_explicit_provider_mistral() {
 async fn test_custom_prefix() {
     let plugin = AiTokenMetrics::new(&json!({"metadata_prefix": "llm"})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     }))
@@ -490,7 +490,7 @@ async fn test_cost_calculation() {
     }))
     .unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500}
     }))
@@ -511,7 +511,7 @@ async fn test_cost_calculation_prompt_only() {
     }))
     .unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 1000, "total_tokens": 1000}
     }))
@@ -528,7 +528,7 @@ async fn test_cost_calculation_prompt_only() {
 async fn test_cost_not_calculated_when_no_rates() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500}
     }))
@@ -546,7 +546,7 @@ async fn test_cost_not_calculated_when_no_rates() {
 async fn test_include_model_false() {
     let plugin = AiTokenMetrics::new(&json!({"include_model": false})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "model": "gpt-4",
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
@@ -566,7 +566,7 @@ async fn test_include_model_false() {
 async fn test_include_token_details_false() {
     let plugin = AiTokenMetrics::new(&json!({"include_token_details": false})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     }))
@@ -600,7 +600,7 @@ async fn test_non_json_content_type() {
 async fn test_empty_body() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
 
     let result = plugin
         .on_response_body(&mut ctx, 200, &mut headers, b"")
@@ -613,7 +613,7 @@ async fn test_empty_body() {
 async fn test_malformed_json() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
 
     let result = plugin
         .on_response_body(&mut ctx, 200, &mut headers, b"not valid json")
@@ -626,7 +626,7 @@ async fn test_malformed_json() {
 async fn test_missing_usage_fields() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({"id": "chatcmpl-123"})).unwrap();
 
     let result = plugin
@@ -641,7 +641,7 @@ async fn test_missing_usage_fields() {
 async fn test_zero_tokens() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     }))
@@ -668,7 +668,7 @@ async fn test_bedrock_computed_total() {
     // Bedrock without explicit totalTokens — should compute from input + output
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"inputTokens": 100, "outputTokens": 50}
     }))
@@ -688,7 +688,7 @@ async fn test_skips_4xx_responses() {
     // not be parsed for token counts or pollute observability metrics.
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
     }))
@@ -707,7 +707,7 @@ async fn test_skips_4xx_responses() {
 async fn test_skips_5xx_responses() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
     }))
@@ -728,7 +728,7 @@ async fn test_processes_2xx_responses() {
     // 2xx responses.
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
     }))
@@ -856,7 +856,7 @@ async fn synthetic_short_circuit_body_is_not_token_accounted() {
         SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
         "true".to_string(),
     );
-    let headers = json_headers();
+    let mut headers = json_headers();
     // A canned OpenAI-shaped body that WOULD otherwise be accounted.
     let body = serde_json::to_vec(&json!({
         "model": "gpt-4o",
@@ -891,7 +891,7 @@ async fn synthetic_short_circuit_body_is_not_token_accounted() {
 async fn genuine_response_is_token_accounted_without_synthetic_marker() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let body = serde_json::to_vec(&json!({
         "model": "gpt-4o",
         "usage": {
@@ -920,7 +920,7 @@ async fn anthropic_sse_merges_cumulative_terminal_usage_without_double_counting(
     }))
     .unwrap();
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = concat!(
         "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n",
@@ -958,7 +958,7 @@ async fn anthropic_sse_merges_cumulative_terminal_usage_without_double_counting(
 async fn anthropic_sse_without_message_start_keeps_explicit_partial_usage() {
     let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
 
     plugin
@@ -981,7 +981,7 @@ async fn partial_sse_component_update_retains_earlier_authoritative_total() {
     }))
     .unwrap();
     let mut ctx = create_test_context();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = concat!(
         "data: {\"usage\":{\"total_tokens\":100}}\n\n",
         "data: {\"usage\":{\"completion_tokens\":7}}\n\n",
@@ -1061,7 +1061,7 @@ async fn openai_responses_buffered_and_completed_sse_are_supported() {
 
     let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
     let mut ctx = create_test_context();
-    let headers = HashMap::from([(
+    let mut headers = HashMap::from([(
         "content-type".to_string(),
         "text/event-stream; charset=utf-8".to_string(),
     )]);
@@ -1089,7 +1089,7 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
         "cost_per_prompt_token": 1.0
     }))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     for event_type in ["response.incomplete", "response.failed"] {
         let mut ctx = create_test_context();
         let event = format!(
@@ -1117,7 +1117,7 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
 
 #[tokio::test]
 async fn google_sse_merges_repeated_partial_usage_for_auto_and_fixed_provider() {
-    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = concat!(
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"modelVersion\":\"gemini-test\"}\n\n",
         "data: {\"usageMetadata\":{\"promptTokenCount\":11}}\n\n",
@@ -1228,7 +1228,7 @@ async fn encoded_json_supports_gzip_brotli_and_coding_chains_without_mutation() 
 
     for (encoding, encoded) in cases {
         let original = encoded.clone();
-        let headers = HashMap::from([
+        let mut headers = HashMap::from([
             (
                 "Content-Type".to_string(),
                 "application/json; charset=utf-8".to_string(),
@@ -1267,7 +1267,7 @@ async fn encoded_json_supports_gzip_brotli_and_coding_chains_without_mutation() 
 async fn encoded_sse_is_inspected_only_when_stream_buffering_is_enabled() {
     let event = b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}\n\ndata: [DONE]\n\n";
     let encoded = gzip(event);
-    let headers = HashMap::from([
+    let mut headers = HashMap::from([
         ("content-type".to_string(), "text/event-stream".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
@@ -1300,7 +1300,7 @@ async fn encoded_json_rejects_malformed_unsupported_concatenated_and_oversized_c
         ("gzip", oversized),
     ];
     for (encoding, body) in cases {
-        let headers = HashMap::from([
+        let mut headers = HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
             ("content-encoding".to_string(), encoding.to_string()),
         ]);

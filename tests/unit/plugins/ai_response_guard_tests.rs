@@ -848,7 +848,7 @@ async fn test_event_stream_fails_closed_before_ai_guard_delivery() {
 
 #[tokio::test]
 async fn test_json_event_stream_profile_stays_on_json_guard_path() {
-    let headers = HashMap::from([(
+    let mut headers = HashMap::from([(
         "content-type".to_string(),
         "application/json; profile=event-stream".to_string(),
     )]);
@@ -2326,7 +2326,7 @@ async fn test_max_completion_length_applies_in_scan_all_json() {
         "choices": [{"message": {"content": "12345"}}]
     }))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let mut ctx = ctx_with_content_type("POST", "application/json");
 
     assert!(matches!(
@@ -2383,7 +2383,7 @@ async fn test_blocked_phrase_value_is_not_exposed_by_any_action() {
         "choices": [{"message": {"content": format!("prefix {secret_phrase} suffix")}}]
     }))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     for action in ["reject", "warn"] {
         let plugin = make_plugin(json!({
@@ -2440,7 +2440,7 @@ async fn test_max_scan_boundary_and_oversize_dispositions() {
         "choices": [{"message": {"content": "contact boundary@example.com"}}]
     }))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     let at_limit = make_plugin(json!({
         "pii_patterns": ["email"],
@@ -2515,7 +2515,7 @@ async fn test_max_scan_boundary_and_oversize_dispositions() {
 #[tokio::test]
 async fn test_oversized_non_json_error_body_is_bounded_for_every_action() {
     let body = format!("{} oversized-error@example.com", "x".repeat(128)).into_bytes();
-    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
 
     for action in ["reject", "redact", "warn"] {
         let plugin = make_plugin(json!({
@@ -2559,7 +2559,7 @@ async fn test_oversized_non_json_error_body_is_bounded_for_every_action() {
 #[tokio::test]
 async fn test_require_json_checks_actual_representation() {
     let plugin = make_plugin(json!({"require_json": true}));
-    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
 
     let mut valid_ctx = ctx_with_content_type("GET", "text/plain");
     let valid = plugin
@@ -2580,7 +2580,7 @@ async fn test_require_json_checks_actual_representation() {
 
 #[tokio::test]
 async fn test_non_json_scan_all_is_governed_and_redactable() {
-    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
     let body = b"contact raw@example.com";
 
     let reject = make_plugin(json!({
@@ -2623,7 +2623,7 @@ async fn redaction_findings_on_range_and_delta_responses_fail_closed() {
         "pii_patterns": ["email"],
         "action": "redact"
     }));
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let governed = serde_json::to_vec(&json!({
         "choices": [{"message": {"content": "contact secret@example.com"}}]
     }))
@@ -2673,7 +2673,7 @@ async fn redaction_findings_on_range_and_delta_responses_fail_closed() {
 async fn test_uninspectable_sse_fails_closed_except_warn_mode() {
     let malformed = b"data: {\"choices\":[\n\n";
     let non_utf8 = b"data: \xff\xfe\n\n";
-    let headers = sse_headers();
+    let mut headers = sse_headers();
 
     for body in [malformed.as_slice(), non_utf8.as_slice()] {
         for action in ["reject", "redact"] {
@@ -2764,7 +2764,7 @@ async fn test_common_buffered_output_shapes_are_detected_and_redacted() {
         json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": secret}]}]}),
         json!({"output": [{"type": "function_call", "name": "lookup", "arguments": secret}]}),
     ];
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     for (index, value) in shapes.into_iter().enumerate() {
         let body = serde_json::to_vec(&value).unwrap();
@@ -2821,7 +2821,7 @@ async fn test_tool_arguments_participate_in_completion_length_enforcement() {
         }]
     }))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
         plugin
@@ -3016,7 +3016,7 @@ async fn test_cross_part_content_matches_are_joined_and_fail_closed() {
             {"text": "example.com"}
         ]}}]}),
     ];
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     for (index, value) in shapes.into_iter().enumerate() {
         let body = serde_json::to_vec(&value).unwrap();
@@ -3071,7 +3071,7 @@ async fn test_non_adjacent_text_parts_are_not_joined() {
         {"type": "text", "text": "example.com"}
     ]}}]}))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let plugin = make_plugin(json!({"pii_patterns": ["email"], "action": "reject"}));
     let mut ctx = ctx_with_content_type("POST", "application/json");
     assert!(matches!(
@@ -3089,7 +3089,7 @@ async fn test_completion_length_enforced_across_adjacent_parts() {
         {"type": "text", "text": "67890"}
     ]}}]}))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     let reject = make_plugin(json!({"max_completion_length": 8, "action": "reject"}));
     let mut ctx = ctx_with_content_type("POST", "application/json");
@@ -3130,7 +3130,7 @@ async fn test_refusal_content_is_scanned_and_redacted() {
         json!({"choices": [{"message": {"refusal": format!("cannot help {secret}")}}]}),
         json!({"choices": [{"delta": {"refusal": format!("cannot help {secret}")}}]}),
     ];
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     for (index, value) in shapes.into_iter().enumerate() {
         let body = serde_json::to_vec(&value).unwrap();
@@ -3180,7 +3180,7 @@ async fn test_escaped_tool_arguments_are_decoded_before_scanning() {
         json!({"choices": [{"message": {"function_call": {"name": "send", "arguments": escaped_args}}}]}),
         json!({"output": [{"type": "function_call", "name": "send", "arguments": escaped_args}]}),
     ];
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     for (index, value) in shapes.into_iter().enumerate() {
         let body = serde_json::to_vec(&value).unwrap();
@@ -3248,7 +3248,7 @@ async fn test_unrewritable_escaped_argument_key_fails_closed_in_redact_mode() {
         {"function": {"name": "send", "arguments": escaped_key_args}}
     ]}}]}))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     for scan_fields in ["content", "all"] {
         let redact = make_plugin(json!({
@@ -3272,7 +3272,7 @@ async fn test_unrewritable_escaped_argument_key_fails_closed_in_redact_mode() {
 
 #[tokio::test]
 async fn test_unrewritable_argument_keys_and_numeric_scalars_fail_closed() {
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let cases = [
         ("email", r#"{"user@example.com":true}"#),
         ("ssn", "123456789"),
@@ -3322,7 +3322,7 @@ async fn test_nested_argument_string_values_redact_with_valid_json_semantics() {
         {"function": {"name": "send", "arguments": arguments}}
     ]}}]}))
     .unwrap();
-    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
     for scan_fields in ["content", "all"] {
         let redact = make_plugin(json!({
