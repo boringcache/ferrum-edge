@@ -161,8 +161,9 @@ x-ferrum-validate:
 - `false` or `null` — do not generate the plugin.
 - object — generate the plugin and apply the listed settings.
 
-The importer walks `paths.{path}.{method}`, resolves local `$ref`s, and extracts:
+The importer walks `paths.{path}`, resolves local Path Item `$ref`s first, then enumerates HTTP methods and resolves local schema `$ref`s inside request/response content:
 
+- **Path Item Objects** — local `$ref` targets such as `#/components/pathItems/Pets` (OpenAPI 3.1+) or `#/paths/~1shared` (Swagger 2.0 / OpenAPI 3.x) are expanded before method keys are read, so referenced operations enter the generated `openapi_validator` table.
 - OpenAPI 3.x request schemas from `requestBody.content.{mediaType}.schema`.
 - OpenAPI 3.x response schemas from `responses.{status}.content.{mediaType}.schema`.
 - Swagger 2.0 request schemas from `parameters[].in == "body"`.
@@ -170,12 +171,13 @@ The importer walks `paths.{path}.{method}`, resolves local `$ref`s, and extracts
 
 Supported local `$ref` forms (same document only; never fetched):
 
-- JSON Pointer fragments: `#/components/schemas/Order`, and percent-encoded pointer forms such as `#/components/schemas/Order%20Id`. Empty and `/`-prefixed fragments are pointers. An empty fragment (`#` or `https://example.com/schemas/order.json#`) resolves to the **schema resource root** — a Schema Object whose `$id` matches the reference URI. The OpenAPI document root is not a JSON Schema root, so bare `#` against the document (no matching Schema Object `$id` as the current resource) fails closed.
+- **Path Item `$ref`**: JSON Pointer fragments to Path Item Objects in the same document. OpenAPI leaves conflicts between `$ref` and adjacent Path Item fields undefined; Ferrum applies a deterministic sibling overlay — sibling fields override fields from the referenced Path Item after resolution.
+- JSON Pointer fragments for schemas: `#/components/schemas/Order`, and percent-encoded pointer forms such as `#/components/schemas/Order%20Id`. Empty and `/`-prefixed fragments are pointers. An empty fragment (`#` or `https://example.com/schemas/order.json#`) resolves to the **schema resource root** — a Schema Object whose `$id` matches the reference URI. The OpenAPI document root is not a JSON Schema root, so bare `#` against the document (no matching Schema Object `$id` as the current resource) fails closed.
 - Draft 2020-12 plain-name anchors (OpenAPI 3.1+): `#Order` resolves to the schema object that declares `"$anchor": "Order"` in the current schema resource. Nested anchors inside applicator / `$defs` subschemas and schemas under `components.pathItems` are included. `$anchor` / `$id` / `id` / `$ref` fields in non-schema OpenAPI data (for example `x-ferrum-plugins` config) or in schema annotation payloads (`default` / `examples` / `const` / `enum`) are not interpreted during schema indexing or expansion. Duplicate anchors in one resource and missing anchors fail closed.
 - Draft 7 plain-name anchors (Swagger 2.0 / OpenAPI 3.0.x): `#Order` resolves via a fragment-only `"$id": "#Order"` (or Draft-4 `"id"`) in the current resource. Draft 7 names begin with a letter and may contain letters, digits, `-`, `_`, `.`, or `:`. The OpenAPI 3.1+ `$anchor` keyword is not consulted for 2.0 / 3.0.x documents.
 - Local `$id` resource scope: an absolute or relative `$ref` whose URI (without fragment) matches an `$id` declared on a Schema Object in the same document resolves locally, including fragments such as `https://example.com/schemas/order.json#OrderBody`. Duplicate same-document resource `$id` URIs fail closed. URIs that are not declared in-document remain HTTP 422 `UnsupportedExternalRef`.
 
-URI fragments are percent-decoded deterministically before classification; percent-escape hex case is canonicalized for resource identity, and malformed percent-escapes are rejected. Malformed, duplicated, or unresolved local references return HTTP 422 `SchemaReference`; external `$ref`s return HTTP 422 `UnsupportedExternalRef`, and deeply recursive refs return HTTP 422 `SchemaTooDeep`. Swagger 2.0 and OpenAPI 3.0 schemas are normalized for Draft 7 compatibility; OpenAPI 3.1+ schemas use Draft 2020-12.
+URI fragments are percent-decoded deterministically before classification; percent-escape hex case is canonicalized for resource identity, and malformed percent-escapes are rejected. Malformed, duplicated, or unresolved local references (including Path Item refs) return HTTP 422 `SchemaReference`; external `$ref`s (including external Path Item refs) return HTTP 422 `UnsupportedExternalRef`, and deeply recursive or cyclic refs return HTTP 422 `SchemaTooDeep`. Swagger 2.0 and OpenAPI 3.0 schemas are normalized for Draft 7 compatibility; OpenAPI 3.1+ schemas use Draft 2020-12.
 
 For Swagger 2.0 and OpenAPI 3.0.x, request and response schemas are normalized with an explicit direction so OpenAPI `readOnly` / `writeOnly` required semantics are preserved: required `readOnly` properties are enforced only on responses, and required `writeOnly` properties (OpenAPI 3.0 only) are enforced only on requests. The rewrite applies through nested objects, arrays, local `$ref` expansion, and `allOf` / `oneOf` / `anyOf` members. OpenAPI 3.1+ leaves `required` unchanged because those keywords are JSON Schema annotations there; see [openapi_validator.md](openapi_validator.md).
 
@@ -193,7 +195,7 @@ The following are rejected at parse time with a 400 error:
 - **Plugin `scope: global` or `scope: proxy_group`** — only proxy-scoped plugins are allowed. A single shared plugin instance across multiple proxies cannot be expressed via a single-proxy spec bundle.
 - **Plugin `proxy_id` mismatch** — if `proxy_id` is set on a plugin, it must match the spec's proxy ID.
 - **Forbidden keys in plugin `config`** — the plugin `config` object is walked recursively. Any of the following keys at any nesting depth triggers a 400 `PluginContainsCredentials` error: `credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`.
-- **External `$ref`s in `x-ferrum-validate` schemas** — only local document refs are resolved into generated plugin config.
+- **External `$ref`s in `x-ferrum-validate`** — only local document refs are resolved into generated plugin config. This covers Path Item `$ref`s as well as schema `$ref`s.
 
   Note the distinction: a `plugin_name: "jwt"` plugin is fine — the check walks the plugin's `config` *value*, not the plugin metadata fields. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
 
