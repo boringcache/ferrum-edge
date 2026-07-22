@@ -59,15 +59,9 @@ fn measure_parallel_batches(
     threads: usize,
     batches: u64,
 ) -> Duration {
-    use std::sync::atomic::AtomicU64;
-
     let start_line = Arc::new(Barrier::new(threads + 1));
     let end_line = Arc::new(Barrier::new(threads + 1));
     let stop = Arc::new(AtomicBool::new(false));
-    // Max per-worker selection-loop elapsed for the current batch. Workers start
-    // together at `start_line`, so max elapsed ≈ batch wall time without
-    // including barrier/mutex harness overhead in the sample.
-    let batch_ns = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
@@ -75,7 +69,6 @@ fn measure_parallel_batches(
         let start_line = Arc::clone(&start_line);
         let end_line = Arc::clone(&end_line);
         let stop = Arc::clone(&stop);
-        let batch_ns = Arc::clone(&batch_ns);
         handles.push(thread::spawn(move || {
             loop {
                 start_line.wait();
@@ -83,26 +76,25 @@ fn measure_parallel_batches(
                     end_line.wait();
                     break;
                 }
-                let started = Instant::now();
                 run_selections(&lb, ITERATIONS_PER_THREAD);
-                let elapsed_ns = started.elapsed().as_nanos() as u64;
-                batch_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
                 end_line.wait();
             }
         }));
     }
 
     // Untimed prime so the first measured sample is not cold-scheduled.
-    batch_ns.store(0, Ordering::Relaxed);
     start_line.wait();
     end_line.wait();
 
     let mut total = Duration::ZERO;
     for _ in 0..batches {
-        batch_ns.store(0, Ordering::Relaxed);
         start_line.wait();
+        // Measure the real concurrent batch wall time. Starting immediately
+        // after barrier release excludes worker creation while retaining any
+        // scheduler delay or contention that production requests experience.
+        let started = Instant::now();
         end_line.wait();
-        total += Duration::from_nanos(batch_ns.load(Ordering::Relaxed));
+        total += started.elapsed();
     }
 
     stop.store(true, Ordering::Release);
