@@ -6,9 +6,7 @@
 
 use ferrum_edge::_test_support::RateLimitCleanupHarness;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
-use ferrum_edge::plugins::utils::rate_limit::{
-    DynamicHttpRateLimitAlgorithm, RateLimitBackend,
-};
+use ferrum_edge::plugins::utils::rate_limit::{DynamicHttpRateLimitAlgorithm, RateLimitBackend};
 use serde_json::json;
 use std::time::{Duration, Instant};
 

@@ -1209,8 +1209,7 @@ pub mod _test_support {
             now: std::time::Instant,
             max_entries: usize,
         ) -> bool {
-            self.udp
-                .maybe_evict_at_with_cap_for_test(now, max_entries)
+            self.udp.maybe_evict_at_with_cap_for_test(now, max_entries)
         }
 
         pub fn seed_rate_limiting(&self, key: &str, now: std::time::Instant) {
@@ -1223,8 +1222,7 @@ pub mod _test_support {
         }
 
         pub fn block_rate_limiting_cooldown_at(&self, now: std::time::Instant) {
-            self.rate_limiting
-                .block_periodic_cooldown_at_for_test(now);
+            self.rate_limiting.block_periodic_cooldown_at_for_test(now);
         }
 
         pub fn maybe_evict_rate_limiting_at(&self, now: std::time::Instant) {

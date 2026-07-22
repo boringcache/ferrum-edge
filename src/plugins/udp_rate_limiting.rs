@@ -82,11 +82,9 @@ impl UdpRateLimiting {
         datagram_size: u64,
         now: Instant,
     ) {
-        let _ = self.limiter.check_local_at(
-            client_ip,
-            &UdpRateLimitOp { datagram_size },
-            now,
-        );
+        let _ = self
+            .limiter
+            .check_local_at(client_ip, &UdpRateLimitOp { datagram_size }, now);
     }
 
     /// Arm the sampled periodic gate without spinning 100k hooks. Test-only.
@@ -174,12 +172,7 @@ impl UdpRateLimiting {
                 // the map at `MAX_STATE_ENTRIES + 1` and leave the
                 // `over_capacity && !contains_local_key` guard dropping
                 // every new client IP indefinitely.
-                apply_rate_limit_cleanup(
-                    &self.limiter,
-                    max_entries,
-                    now,
-                    false,
-                );
+                apply_rate_limit_cleanup(&self.limiter, max_entries, now, false);
             }
         }
 

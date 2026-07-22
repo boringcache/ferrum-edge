@@ -275,11 +275,9 @@ impl AiRateLimiter {
     /// Controllable-time seed for external cleanup tests. Not a production API.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn seed_key_at_for_test(&self, key: String, now: Instant) {
-        let _ = self.limiter.check_local_at(
-            key,
-            &AiRateLimitOp::Reserve { tokens: 1 },
-            now,
-        );
+        let _ = self
+            .limiter
+            .check_local_at(key, &AiRateLimitOp::Reserve { tokens: 1 }, now);
     }
 
     /// Arm the sampled below-cap gate without spinning 1024 requests. Test-only.
