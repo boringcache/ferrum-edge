@@ -155,10 +155,16 @@ impl ProxyAlerts {
             .iter()
             .map(|(id, generation)| ((*id).to_string(), *generation))
             .collect();
+        // Publish ownership first. The request epoch has already committed, so
+        // newly admitted samples must not be rejected while the cold-path
+        // retains walk potentially large historical maps. New-generation rows
+        // written concurrently are preserved by the generation-aware retains;
+        // old-generation writers remain isolated even if they raced past the
+        // admission check before this publication.
+        self.active_proxy_generations.store(Arc::new(Some(owned)));
         self.windows.retain_proxies(active_proxy_generations);
         self.cooldowns.retain_proxies(active_proxy_generations);
         self.recovery.retain_proxies(active_proxy_generations);
-        self.active_proxy_generations.store(Arc::new(Some(owned)));
     }
 
     /// Compatibility helper for tests that only have an active-ID set.

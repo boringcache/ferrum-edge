@@ -148,7 +148,7 @@ impl CooldownGate {
             per_proxy.retain(|_, generations| {
                 generations.retain(|_, atomic| {
                     let ts = atomic.load(Ordering::Acquire);
-                    ts == 0 || ts >= cutoff
+                    ts == 0 || ts > cutoff
                 });
                 !generations.is_empty()
             });
