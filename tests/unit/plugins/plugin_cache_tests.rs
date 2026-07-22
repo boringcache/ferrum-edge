@@ -4110,10 +4110,7 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         .enable_all()
         .build()
         .expect("test runtime");
-    rt.block_on(ferrum_edge::plugins::Plugin::log(
-        rejoined.as_ref(),
-        &stale,
-    ));
+    rt.block_on(ferrum_edge::plugins::Plugin::log(rejoined.as_ref(), &stale));
     assert!(
         !rejoined.has_proxy_lifecycle_state_for_test("p1"),
         "pre-leave in-flight sample must not repopulate a rejoined membership"
@@ -4123,10 +4120,7 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         &current,
     ));
     assert!(
-        rejoined.has_proxy_lifecycle_state_for_generation_for_test(
-            "p1",
-            p1_rejoined_generation,
-        ),
+        rejoined.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_rejoined_generation,),
         "rejoined membership must accept its current ownership generation"
     );
 }

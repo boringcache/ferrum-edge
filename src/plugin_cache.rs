@@ -3122,10 +3122,7 @@ fn build_proxy_lifecycle_generations_with_advances(
 /// Whether the effective set of `proxy_alerts` instances changed for one
 /// continuously present proxy. This catches proxy-group leave/rejoin without
 /// resetting alert ownership for unrelated edits to the same proxy.
-fn proxy_alerts_instances_changed(
-    previous: &[Arc<dyn Plugin>],
-    next: &[Arc<dyn Plugin>],
-) -> bool {
+fn proxy_alerts_instances_changed(previous: &[Arc<dyn Plugin>], next: &[Arc<dyn Plugin>]) -> bool {
     let instance_ids = |plugins: &[Arc<dyn Plugin>]| -> HashSet<usize> {
         plugins
             .iter()
