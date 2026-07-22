@@ -202,6 +202,197 @@ fn membership_mask_for_indices(len: usize, indices: &[usize]) -> Vec<bool> {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
+/// Cap on a precomputed smooth-WRR schedule length.
+///
+/// Normal weights produce `sum(weight)/gcd` entries (often tens). Pathological
+/// huge weights are truncated and the truncated order repeats; long-run ratios
+/// stay close to configured weights while rebuild stays bounded.
+const WRR_MAX_SCHEDULE_LEN: usize = 8192;
+
+/// Precomputed smooth weighted round-robin order for one healthy fingerprint.
+///
+/// Built on the cold path when healthy membership changes; steady-state
+/// selection only loads this via [`ArcSwap`] and advances an [`AtomicU64`].
+struct WrrSchedule {
+    /// Healthy-set fingerprint this order was built for.
+    /// Bitset path: `HealthBitset.bits`. Vec path: FNV-style mix of indices.
+    fingerprint: u128,
+    /// Target indices in NGINX smooth-WRR order for one (possibly truncated)
+    /// weight period. Empty when the lane is inactive or all weights are 0.
+    order: Box<[usize]>,
+    /// When true, selection must fall back to the lane's round-robin counter.
+    zero_weight: bool,
+}
+
+impl WrrSchedule {
+    fn invalid() -> Self {
+        Self {
+            // `u128::MAX` never equals a real bitset fingerprint used with an
+            // empty order on first select; rebuild always runs once.
+            fingerprint: u128::MAX,
+            order: Box::new([]),
+            zero_weight: false,
+        }
+    }
+}
+
+/// Per-lane smooth-WRR state shared by parent, subset, and port selectors.
+///
+/// # Concurrency / distribution tradeoff
+///
+/// Steady-state selection is **wait-free**: each request does one
+/// [`ArcSwap::load`] of a precomputed order plus one [`AtomicU64::fetch_add`]
+/// to pick the next index. Concurrent Tokio workers therefore share one global
+/// smooth-WRR interleaving for the lane (exact weighted ratios across workers)
+/// without taking a blocking mutex on the hot path.
+///
+/// When the healthy fingerprint changes (or recovery forces invalidation), a
+/// short `std::sync::Mutex<()>` serializes **schedule rebuild only**. That lock
+/// is never held across `.await`, and rebuilds are amortized to healthy-set
+/// transitions rather than every request. Contended rebuilders double-check
+/// after acquiring the gate and reuse a schedule another worker just published.
+///
+/// # Bounded state / wrap semantics
+///
+/// The selection counter is `u64` and indexes with `% order.len()`. Wrapping
+/// is well-defined and does not bias long-run ratios. Schedule length is capped
+/// at [`WRR_MAX_SCHEDULE_LEN`]; larger weight periods repeat the truncated
+/// prefix.
+///
+/// # Target-set generation safety
+///
+/// WRR state is owned by a `LoadBalancer` instance. Config reload swaps the
+/// balancer `Arc` through [`LoadBalancerCache`]'s `ArcSwap`, so a schedule
+/// built for one target generation cannot be consulted after the balancer
+/// (and its target vector) is replaced.
+struct WrrLaneState {
+    counter: AtomicU64,
+    schedule: ArcSwap<WrrSchedule>,
+    /// Cold-path rebuild gate only — not acquired on the steady-state path.
+    rebuild: std::sync::Mutex<()>,
+    /// Set on target recovery so the next selection rebuilds even if the
+    /// healthy fingerprint happens to match a previously cached schedule.
+    invalidate: AtomicBool,
+    /// `0` means this lane does not run WRR (e.g. non-WRR port override).
+    target_len: usize,
+}
+
+impl std::fmt::Debug for WrrLaneState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrrLaneState")
+            .field("counter", &self.counter.load(Ordering::Relaxed))
+            .field("invalidate", &self.invalidate.load(Ordering::Relaxed))
+            .field("target_len", &self.target_len)
+            .field("schedule_fingerprint", &self.schedule.load().fingerprint)
+            .field("schedule_len", &self.schedule.load().order.len())
+            .finish()
+    }
+}
+
+impl WrrLaneState {
+    fn inactive() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+            schedule: ArcSwap::from_pointee(WrrSchedule::invalid()),
+            rebuild: std::sync::Mutex::new(()),
+            invalidate: AtomicBool::new(false),
+            target_len: 0,
+        }
+    }
+
+    fn new(target_len: usize) -> Self {
+        if target_len == 0 {
+            return Self::inactive();
+        }
+        Self {
+            counter: AtomicU64::new(0),
+            schedule: ArcSwap::from_pointee(WrrSchedule::invalid()),
+            rebuild: std::sync::Mutex::new(()),
+            invalidate: AtomicBool::new(false),
+            target_len,
+        }
+    }
+
+    #[inline]
+    fn is_active(&self) -> bool {
+        self.target_len > 0
+    }
+
+    #[inline]
+    fn mark_invalid(&self) {
+        self.invalidate.store(true, Ordering::Release);
+    }
+}
+
+/// Greatest common divisor for shrinking WRR schedule length.
+#[inline]
+fn wrr_gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Build a smooth-WRR order for `(target_index, weight)` pairs with weight > 0.
+fn build_smooth_wrr_order(weighted: &[(usize, u32)]) -> (Box<[usize]>, bool) {
+    let mut gcd = 0u32;
+    for &(_, weight) in weighted {
+        if weight == 0 {
+            continue;
+        }
+        gcd = if gcd == 0 {
+            weight
+        } else {
+            wrr_gcd(gcd, weight)
+        };
+    }
+    if gcd == 0 {
+        return (Box::new([]), true);
+    }
+
+    let normalized: Vec<(usize, i64)> = weighted
+        .iter()
+        .filter(|(_, weight)| *weight > 0)
+        .map(|&(idx, weight)| (idx, (weight / gcd) as i64))
+        .collect();
+    let total_weight: i64 = normalized.iter().map(|(_, weight)| *weight).sum();
+    if total_weight <= 0 {
+        return (Box::new([]), true);
+    }
+
+    let steps = (total_weight as usize).min(WRR_MAX_SCHEDULE_LEN);
+    let mut current = vec![0i64; normalized.len()];
+    let mut order = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        let mut best_slot = 0usize;
+        let mut best_current = i64::MIN;
+        for (slot, &(_, weight)) in normalized.iter().enumerate() {
+            current[slot] += weight;
+            if current[slot] > best_current {
+                best_current = current[slot];
+                best_slot = slot;
+            }
+        }
+        current[best_slot] -= total_weight;
+        order.push(normalized[best_slot].0);
+    }
+    (order.into_boxed_slice(), false)
+}
+
+/// Fingerprint healthy original indices for the >128-target WRR path.
+#[inline]
+fn wrr_vec_fingerprint(candidates: &[(usize, &Arc<UpstreamTarget>)]) -> u128 {
+    let mut hash: u128 = 0xcbf2_9ce4_8422_2325;
+    for &(idx, _) in candidates {
+        hash ^= idx as u128;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash ^= (candidates.len() as u128).wrapping_shl(64);
+    hash
+}
+
 /// Health context passed to target selection, bundling both active (shared
 /// per-upstream) and passive (per-proxy) unhealthy target state.
 ///
@@ -435,7 +626,7 @@ impl LoadBalancerCacheInner {
 /// incremental updates can clone the HashMap cheaply (just Arc pointer
 /// copies) and only allocate new `LoadBalancer` instances for changed
 /// upstreams. Unchanged upstreams keep their exact same instance --
-/// round-robin counters, WRR weights, active connection counts, latency
+/// round-robin counters, WRR schedules, active connection counts, latency
 /// EWMAs, and consistent hash rings are all preserved.
 pub struct LoadBalancerCache {
     inner: ArcSwap<LoadBalancerCacheInner>,
@@ -503,7 +694,7 @@ impl LoadBalancerCache {
     /// - Removes deleted upstreams
     /// - Creates fresh `LoadBalancer` instances only for added/modified upstreams
     /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
-    ///   round-robin counters, WRR weights, active connection counts, latency
+    ///   round-robin counters, WRR schedules, active connection counts, latency
     ///   EWMAs, and hash rings
     pub(crate) fn build_delta_inner(
         current: &LoadBalancerCacheInner,
@@ -1436,13 +1627,9 @@ pub struct LoadBalancer {
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin counter.
     rr_counter: AtomicU64,
-    /// Weighted round-robin state (smooth weighted round-robin).
-    /// Protected by a mutex to prevent weight drift under concurrency.
-    /// The critical section is sub-microsecond (weight arithmetic only).
-    wrr_state: std::sync::Mutex<Vec<i64>>,
-    /// Set on target recovery so WRR pays the stale-weight scan only on the
-    /// first post-recovery selection instead of every steady-state request.
-    wrr_needs_stale_check: AtomicBool,
+    /// Weighted round-robin lane state (smooth weighted round-robin).
+    /// See [`WrrLaneState`] for the wait-free hot path and rebuild tradeoff.
+    wrr_state: WrrLaneState,
     /// Active connections per target (for least-connections).
     pub active_connections: DashMap<String, AtomicI64>,
     /// Consistent hash ring (sorted hash values -> target index).
@@ -1472,12 +1659,8 @@ pub struct LoadBalancer {
     /// algorithm is consistent hashing; non-hash subset lanes store `Ip`.
     subset_hash_on_strategies: HashMap<String, HashOnStrategy>,
     /// Smooth-WRR state isolated per subset so weighted routing in one subset
-    /// cannot perturb the current weights of another subset.
-    subset_wrr_state: HashMap<String, std::sync::Mutex<Vec<i64>>>,
-    /// Stale-weight scan flags isolated per WRR subset. The parent WRR state
-    /// and each subset WRR state can be selected independently after a recovery
-    /// event, so one state consuming its scan flag must not clear another's.
-    subset_wrr_needs_stale_check: HashMap<String, AtomicBool>,
+    /// cannot perturb the schedule of another subset.
+    subset_wrr_state: HashMap<String, WrrLaneState>,
     /// Per-subset consistent-hash rings. These avoid walking the full upstream
     /// ring when a small subset uses consistent hashing.
     subset_hash_rings: HashMap<String, Vec<(u64, usize)>>,
@@ -1570,8 +1753,7 @@ struct PortLbState {
     algorithm: LoadBalancerAlgorithm,
     algorithm_overridden: bool,
     rr_counter: AtomicU64,
-    wrr_state: std::sync::Mutex<Vec<i64>>,
-    wrr_needs_stale_check: AtomicBool,
+    wrr_state: WrrLaneState,
     hash_ring: Vec<(u64, usize)>,
     hash_on_strategy: HashOnStrategy,
     hash_on_override_strategy: Option<HashOnStrategy>,
@@ -1630,7 +1812,7 @@ impl LoadBalancer {
         locality_lb_setting: Option<&UpstreamLocalityLbSetting>,
         locality_lb_strict: bool,
     ) -> Self {
-        let wrr_weights: Vec<i64> = vec![0; targets.len()];
+        let wrr_weights_len = targets.len();
         // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
         let host_port_keys: Vec<String> = targets.iter().map(target_host_port_key).collect();
         // Pre-compute upstream-scoped keys for health check filtering (matches HealthChecker key format)
@@ -1749,15 +1931,10 @@ impl LoadBalancer {
             };
 
         let mut subset_wrr_state = HashMap::new();
-        let mut subset_wrr_needs_stale_check = HashMap::new();
         let mut subset_hash_rings = HashMap::new();
         for (subset_name, subset_algorithm) in &subset_algorithms {
             if *subset_algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
-                subset_wrr_state.insert(
-                    subset_name.clone(),
-                    std::sync::Mutex::new(vec![0; targets.len()]),
-                );
-                subset_wrr_needs_stale_check.insert(subset_name.clone(), AtomicBool::new(false));
+                subset_wrr_state.insert(subset_name.clone(), WrrLaneState::new(targets.len()));
             }
             if *subset_algorithm == LoadBalancerAlgorithm::ConsistentHashing
                 && let Some(indices) = subset_indices.get(subset_name)
@@ -1800,9 +1977,9 @@ impl LoadBalancer {
                     // vector, even when only a subset serves this port, so
                     // bitset, subset, and Vec fallback paths can share the
                     // same target-index bookkeeping.
-                    vec![0; targets.len()]
+                    WrrLaneState::new(targets.len())
                 } else {
-                    Vec::new()
+                    WrrLaneState::inactive()
                 };
                 // Per-port locality LB falls back to the upstream-level setting
                 // when the operator did not override it at this port. The
@@ -1821,8 +1998,7 @@ impl LoadBalancer {
                         algorithm: effective_algorithm,
                         algorithm_overridden: override_config.algorithm.is_some(),
                         rr_counter: AtomicU64::new(0),
-                        wrr_state: std::sync::Mutex::new(wrr_state),
-                        wrr_needs_stale_check: AtomicBool::new(false),
+                        wrr_state,
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
                         hash_on_override_strategy: override_config
@@ -1885,8 +2061,7 @@ impl LoadBalancer {
             target_index,
             algorithm,
             rr_counter: AtomicU64::new(0),
-            wrr_state: std::sync::Mutex::new(wrr_weights),
-            wrr_needs_stale_check: AtomicBool::new(false),
+            wrr_state: WrrLaneState::new(wrr_weights_len),
             active_connections: DashMap::new(),
             hash_ring,
             latency_ewma,
@@ -1896,7 +2071,6 @@ impl LoadBalancer {
             subset_algorithms,
             subset_hash_on_strategies,
             subset_wrr_state,
-            subset_wrr_needs_stale_check,
             subset_hash_rings,
             port_overrides: port_states,
             initial_dispatch_port_override,
@@ -2012,12 +2186,12 @@ impl LoadBalancer {
             Some(k) => k,
             None => return,
         };
-        self.wrr_needs_stale_check.store(true, Ordering::Release);
-        for flag in self.subset_wrr_needs_stale_check.values() {
-            flag.store(true, Ordering::Release);
+        self.wrr_state.mark_invalid();
+        for state in self.subset_wrr_state.values() {
+            state.mark_invalid();
         }
         for state in self.port_overrides.values() {
-            state.wrr_needs_stale_check.store(true, Ordering::Release);
+            state.wrr_state.mark_invalid();
         }
 
         // Find minimum EWMA among all targets (excluding unset)
@@ -3263,7 +3437,7 @@ impl LoadBalancer {
         &'a self,
         port_state: &'a PortLbState,
         subset_name: &str,
-    ) -> &'a std::sync::Mutex<Vec<i64>> {
+    ) -> &'a WrrLaneState {
         if port_state.algorithm_overridden {
             &port_state.wrr_state
         } else {
@@ -3285,36 +3459,10 @@ impl LoadBalancer {
     }
 
     #[inline]
-    fn subset_wrr_state(&self, subset_name: &str) -> &std::sync::Mutex<Vec<i64>> {
+    fn subset_wrr_state(&self, subset_name: &str) -> &WrrLaneState {
         self.subset_wrr_state
             .get(subset_name)
             .unwrap_or(&self.wrr_state)
-    }
-
-    fn stale_check_flag_for_wrr_state(
-        &self,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
-    ) -> &AtomicBool {
-        if std::ptr::eq(wrr_state, &self.wrr_state) {
-            return &self.wrr_needs_stale_check;
-        }
-
-        self.subset_wrr_state
-            .iter()
-            .find_map(|(subset_name, subset_state)| {
-                if std::ptr::eq(wrr_state, subset_state) {
-                    self.subset_wrr_needs_stale_check.get(subset_name)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                self.port_overrides.values().find_map(|port_state| {
-                    std::ptr::eq(wrr_state, &port_state.wrr_state)
-                        .then_some(&port_state.wrr_needs_stale_check)
-                })
-            })
-            .unwrap_or(&self.wrr_needs_stale_check)
     }
 
     #[inline]
@@ -3363,7 +3511,7 @@ impl LoadBalancer {
         healthy: &HealthBitset,
         algorithm: LoadBalancerAlgorithm,
         rr_counter: &AtomicU64,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
+        wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -3469,7 +3617,7 @@ impl LoadBalancer {
         candidates: &[(usize, &Arc<UpstreamTarget>)],
         algorithm: LoadBalancerAlgorithm,
         rr_counter: &AtomicU64,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
+        wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -4053,65 +4201,194 @@ impl LoadBalancer {
     // ─── Bitset-based algorithm implementations (zero-alloc hot path) ────────
 
     /// Smooth weighted round-robin (NGINX algorithm) using bitset.
-    /// No Vec allocation — iterates targets directly, skipping unset bits.
     ///
-    /// Stale-weight guard: when a target transitions from unhealthy back to
-    /// healthy, its accumulated `weights[i]` may hold a stale value from
-    /// before it went down. The recovery hook sets `wrr_needs_stale_check`,
-    /// so this scan runs only once per recovery event, not on every request.
+    /// Steady-state path is wait-free: load a precomputed order for the current
+    /// healthy fingerprint and advance an atomic counter. Schedule rebuild runs
+    /// only when the fingerprint changes or recovery invalidated the lane —
+    /// see [`WrrLaneState`].
     fn select_wrr_bitset(
         &self,
         healthy: &HealthBitset,
         rr_counter: &AtomicU64,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
+        wrr_state: &WrrLaneState,
     ) -> Option<Arc<UpstreamTarget>> {
-        let total_weight: i64 = self
-            .targets
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| healthy.contains(*i))
-            .map(|(_, t)| t.weight as i64)
-            .sum();
+        if !wrr_state.is_active() || healthy.is_empty() {
+            return None;
+        }
 
-        if total_weight == 0 {
+        let fingerprint = healthy.bits;
+        let schedule = wrr_state.schedule.load();
+        if !wrr_state.invalidate.load(Ordering::Acquire)
+            && schedule.fingerprint == fingerprint
+        {
+            if schedule.zero_weight {
+                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let target_idx = healthy.nth_set_bit(idx);
+                return Some(Arc::clone(&self.targets[target_idx]));
+            }
+            if let Some(target) = Self::pick_from_wrr_schedule(&schedule, wrr_state, |idx| {
+                healthy.contains(idx).then(|| Arc::clone(&self.targets[idx]))
+            }) {
+                return Some(target);
+            }
+        }
+
+        self.rebuild_wrr_schedule_bitset(healthy, rr_counter, wrr_state, fingerprint)
+    }
+
+    fn rebuild_wrr_schedule_bitset(
+        &self,
+        healthy: &HealthBitset,
+        rr_counter: &AtomicU64,
+        wrr_state: &WrrLaneState,
+        fingerprint: u128,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let _guard = wrr_state
+            .rebuild
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let schedule = wrr_state.schedule.load();
+        if !wrr_state.invalidate.load(Ordering::Acquire) && schedule.fingerprint == fingerprint {
+            if schedule.zero_weight {
+                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let target_idx = healthy.nth_set_bit(idx);
+                return Some(Arc::clone(&self.targets[target_idx]));
+            }
+            if let Some(target) = Self::pick_from_wrr_schedule(&schedule, wrr_state, |idx| {
+                healthy.contains(idx).then(|| Arc::clone(&self.targets[idx]))
+            }) {
+                return Some(target);
+            }
+        }
+
+        let mut weighted = Vec::with_capacity(healthy.count());
+        healthy.for_each_set_bit(|idx| {
+            weighted.push((idx, self.targets[idx].weight));
+        });
+        let (order, zero_weight) = build_smooth_wrr_order(&weighted);
+        let new_schedule = Arc::new(WrrSchedule {
+            fingerprint,
+            order,
+            zero_weight,
+        });
+        wrr_state.schedule.store(Arc::clone(&new_schedule));
+        wrr_state.invalidate.store(false, Ordering::Release);
+
+        if new_schedule.zero_weight {
             let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
+        Self::pick_from_wrr_schedule(&new_schedule, wrr_state, |idx| {
+            healthy.contains(idx).then(|| Arc::clone(&self.targets[idx]))
+        })
+    }
 
-        let mut weights = wrr_state.lock().unwrap_or_else(|e| e.into_inner());
+    #[inline]
+    fn pick_from_wrr_schedule(
+        schedule: &WrrSchedule,
+        wrr_state: &WrrLaneState,
+        resolve: impl Fn(usize) -> Option<Arc<UpstreamTarget>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if schedule.order.is_empty() {
+            return None;
+        }
+        let ticket = wrr_state.counter.fetch_add(1, Ordering::Relaxed);
+        let idx = schedule.order[(ticket % schedule.order.len() as u64) as usize];
+        resolve(idx)
+    }
 
-        if self
-            .stale_check_flag_for_wrr_state(wrr_state)
-            .swap(false, Ordering::AcqRel)
+    /// Smooth weighted round-robin (NGINX algorithm) — Vec fallback for >128
+    /// targets. Same wait-free schedule + atomic counter model as the bitset
+    /// path; fingerprint is a mix of healthy original indices.
+    fn select_wrr_vec(
+        &self,
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        rr_counter: &AtomicU64,
+        wrr_state: &WrrLaneState,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if candidates.is_empty() || !wrr_state.is_active() {
+            return None;
+        }
+
+        let fingerprint = wrr_vec_fingerprint(candidates);
+        let schedule = wrr_state.schedule.load();
+        if !wrr_state.invalidate.load(Ordering::Acquire)
+            && schedule.fingerprint == fingerprint
         {
-            // Reset stale weights for targets that just re-entered the healthy set.
-            // Use a deliberately loose cap so heterogeneous high-weight targets
-            // are not reset during normal smooth-WRR oscillation.
-            let drift_cap = total_weight.saturating_mul(4).max(1);
-            for i in 0..self.targets.len() {
-                if healthy.contains(i) && weights[i].abs() > drift_cap {
-                    weights[i] = 0;
-                }
+            if schedule.zero_weight {
+                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                return Some(Arc::clone(candidates[idx % candidates.len()].1));
+            }
+            if let Some(target) =
+                Self::pick_from_wrr_schedule(&schedule, wrr_state, |orig_idx| {
+                    candidates
+                        .iter()
+                        .find(|(idx, _)| *idx == orig_idx)
+                        .map(|(_, target)| Arc::clone(target))
+                })
+            {
+                return Some(target);
             }
         }
 
-        let mut best_idx = 0;
-        let mut best_current = i64::MIN;
+        self.rebuild_wrr_schedule_vec(candidates, rr_counter, wrr_state, fingerprint)
+    }
 
-        for (i, target) in self.targets.iter().enumerate() {
-            if !healthy.contains(i) {
-                continue;
+    fn rebuild_wrr_schedule_vec(
+        &self,
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        rr_counter: &AtomicU64,
+        wrr_state: &WrrLaneState,
+        fingerprint: u128,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let _guard = wrr_state
+            .rebuild
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let schedule = wrr_state.schedule.load();
+        if !wrr_state.invalidate.load(Ordering::Acquire) && schedule.fingerprint == fingerprint {
+            if schedule.zero_weight {
+                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                return Some(Arc::clone(candidates[idx % candidates.len()].1));
             }
-            weights[i] += target.weight as i64;
-            if weights[i] > best_current {
-                best_current = weights[i];
-                best_idx = i;
+            if let Some(target) =
+                Self::pick_from_wrr_schedule(&schedule, wrr_state, |orig_idx| {
+                    candidates
+                        .iter()
+                        .find(|(idx, _)| *idx == orig_idx)
+                        .map(|(_, target)| Arc::clone(target))
+                })
+            {
+                return Some(target);
             }
         }
 
-        weights[best_idx] -= total_weight;
-        Some(Arc::clone(&self.targets[best_idx]))
+        let weighted: Vec<(usize, u32)> = candidates
+            .iter()
+            .map(|&(idx, target)| (idx, target.weight))
+            .collect();
+        let (order, zero_weight) = build_smooth_wrr_order(&weighted);
+        let new_schedule = Arc::new(WrrSchedule {
+            fingerprint,
+            order,
+            zero_weight,
+        });
+        wrr_state.schedule.store(Arc::clone(&new_schedule));
+        wrr_state.invalidate.store(false, Ordering::Release);
+
+        if new_schedule.zero_weight {
+            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            return Some(Arc::clone(candidates[idx % candidates.len()].1));
+        }
+        Self::pick_from_wrr_schedule(&new_schedule, wrr_state, |orig_idx| {
+            candidates
+                .iter()
+                .find(|(idx, _)| *idx == orig_idx)
+                .map(|(_, target)| Arc::clone(target))
+        })
     }
 
     /// Select target with least active connections using bitset.
@@ -4297,58 +4574,6 @@ impl LoadBalancer {
     }
 
     // ─── Vec-based algorithm implementations (fallback for >128 targets) ─────
-
-    /// Smooth weighted round-robin (NGINX algorithm) — Vec fallback.
-    ///
-    /// Applies the same stale-weight guard as `select_wrr_bitset` — see its
-    /// doc comment for rationale.
-    fn select_wrr_vec(
-        &self,
-        candidates: &[(usize, &Arc<UpstreamTarget>)],
-        rr_counter: &AtomicU64,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let total_weight: i64 = candidates.iter().map(|(_, t)| t.weight as i64).sum();
-        if total_weight == 0 {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            return Some(Arc::clone(candidates[idx % candidates.len()].1));
-        }
-
-        let mut weights = wrr_state.lock().unwrap_or_else(|e| e.into_inner());
-
-        if self
-            .stale_check_flag_for_wrr_state(wrr_state)
-            .swap(false, Ordering::AcqRel)
-        {
-            // Reset stale weights for candidates that drifted while unhealthy.
-            let drift_cap = total_weight.saturating_mul(4).max(1);
-            for &(orig_idx, _) in candidates {
-                if weights[orig_idx].abs() > drift_cap {
-                    weights[orig_idx] = 0;
-                }
-            }
-        }
-
-        let mut best_idx = 0;
-        let mut best_current = i64::MIN;
-
-        for (i, (orig_idx, target)) in candidates.iter().enumerate() {
-            weights[*orig_idx] += target.weight as i64;
-            let current = weights[*orig_idx];
-            if current > best_current {
-                best_current = current;
-                best_idx = i;
-            }
-        }
-
-        let (orig_idx, _) = candidates[best_idx];
-        weights[orig_idx] -= total_weight;
-        Some(Arc::clone(candidates[best_idx].1))
-    }
 
     /// Select target with least active connections — Vec fallback.
     fn select_least_connections_vec(
@@ -4801,26 +5026,17 @@ mod tests {
 
         let random_state = lb.port_overrides.get(&8080).expect("random override");
         assert!(
-            random_state
-                .wrr_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
+            !random_state.wrr_state.is_active(),
+            "non-WRR port override must leave WRR lane inactive"
         );
 
         let wrr_state = lb.port_overrides.get(&9090).expect("wrr override");
-        assert_eq!(
-            wrr_state
-                .wrr_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
-            targets.len()
-        );
+        assert!(wrr_state.wrr_state.is_active());
+        assert_eq!(wrr_state.wrr_state.target_len, targets.len());
     }
 
     #[test]
-    fn recovered_target_marks_parent_and_subset_wrr_stale_flags_independently() {
+    fn recovered_target_marks_parent_and_subset_wrr_invalidate_independently() {
         let mut v1 = make_target("10.0.0.1", 8080);
         v1.tags = HashMap::from([("version".to_string(), "v1".to_string())]);
         let mut v2 = make_target("10.0.0.2", 8080);
@@ -4846,24 +5062,26 @@ mod tests {
         );
 
         lb.reset_recovered_target_latency(&targets[1]);
-        assert!(lb.wrr_needs_stale_check.load(Ordering::Acquire));
+        assert!(lb.wrr_state.invalidate.load(Ordering::Acquire));
         assert!(
-            lb.subset_wrr_needs_stale_check
+            lb.subset_wrr_state
                 .get("canary")
-                .expect("subset stale flag")
+                .expect("subset WRR state")
+                .invalidate
                 .load(Ordering::Acquire)
         );
 
         let healthy = HealthBitset::all(targets.len());
         let _ = lb.select_wrr_bitset(&healthy, &lb.rr_counter, &lb.wrr_state);
 
-        assert!(!lb.wrr_needs_stale_check.load(Ordering::Acquire));
+        assert!(!lb.wrr_state.invalidate.load(Ordering::Acquire));
         assert!(
-            lb.subset_wrr_needs_stale_check
+            lb.subset_wrr_state
                 .get("canary")
-                .expect("subset stale flag")
+                .expect("subset WRR state")
+                .invalidate
                 .load(Ordering::Acquire),
-            "parent WRR selection must not clear the subset WRR stale flag"
+            "parent WRR selection must not clear the subset WRR invalidate flag"
         );
     }
 

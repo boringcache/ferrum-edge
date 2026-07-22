@@ -3185,6 +3185,7 @@ jobs:
 
           run_benchmark=true
           run_ip_restriction_benchmark=false
+          run_wrr_benchmark=false
           reason="Performance regression checks always run for ${EVENT_NAME} events."
           changed_files=""
 
@@ -3239,6 +3240,10 @@ jobs:
             run_ip_restriction_benchmark=true
           fi
 
+          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/wrr_selection\.rs)|\.github/scripts/verify_wrr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+            run_wrr_benchmark=true
+          fi
+
           if [ -n "${changed_files}" ]; then
             printf '%s\n' "${changed_files}" > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
           else
@@ -3248,11 +3253,12 @@ jobs:
           {
             echo "run=${run_benchmark}"
             echo "run_ip_restriction_benchmark=${run_ip_restriction_benchmark}"
+            echo "run_wrr_benchmark=${run_wrr_benchmark}"
             echo "reason=${reason}"
           } >> "${GITHUB_OUTPUT}"
 
       - uses: ./.github/actions/setup-rust-ci
-        if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true'
+        if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true'
         with:
           shared-key: "ci-perf"
 
@@ -3264,6 +3270,14 @@ jobs:
             --criterion-root tests/performance/mesh/target/criterion \
             --max-scaling-ratio 8 \
             --max-ns-per-instance 10000
+
+      - name: Run WRR selection contention microbenchmark
+        if: steps.perf_changes.outputs.run_wrr_benchmark == 'true'
+        run: |
+          cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench wrr_selection
+          python3 .github/scripts/verify_wrr_selection_benchmark.py \
+            --criterion-root tests/performance/mesh/target/criterion \
+            --min-parallel-speedup 1.25
 
       - name: Build release binaries
         if: steps.perf_changes.outputs.run == 'true'
@@ -3339,13 +3353,14 @@ jobs:
           kill "${GATEWAY_PID:-}" 2>/dev/null || true
 
       - name: Upload performance results
-        if: always() && (steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true')
+        if: always() && (steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: performance-results
           path: |
             tests/performance/ci_results/
             tests/performance/mesh/target/criterion/ip_restriction_lookup/
+            tests/performance/mesh/target/criterion/wrr_selection/
           retention-days: 30
 
       - name: Post performance summary
@@ -3353,6 +3368,7 @@ jobs:
         env:
           RUN: ${{ steps.perf_changes.outputs.run }}
           RUN_IP_RESTRICTION: ${{ steps.perf_changes.outputs.run_ip_restriction_benchmark }}
+          RUN_WRR: ${{ steps.perf_changes.outputs.run_wrr_benchmark }}
           REASON: ${{ steps.perf_changes.outputs.reason }}
         run: |
           {
@@ -3362,6 +3378,12 @@ jobs:
           if [ "${RUN_IP_RESTRICTION}" = "true" ]; then
             {
               echo "IP restriction lookup guard executed: 10,000/100-rule mean ratio <= 8x and 10,000-rule mean <= 10 microseconds per plugin instance."
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${RUN_WRR}" = "true" ]; then
+            {
+              echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.25x across 4/32/129-target fixtures."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi

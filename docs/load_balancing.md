@@ -220,6 +220,10 @@ With weights 5:1 and 60 requests, `large-server` receives 50 requests and `small
 
 The smooth WRR algorithm ensures the distribution is interleaved. For example, with weights 5:1, the sequence is approximately: `L, L, L, L, S, L, L, L, L, L, S, L, ...` rather than `L, L, L, L, L, S, L, L, L, L, L, S, ...`.
 
+**Concurrency model:** Each WRR lane (parent upstream, subset, or port override) keeps a precomputed smooth-WRR order for the current healthy-target fingerprint behind `ArcSwap`, plus an `AtomicU64` selection counter. Steady-state picks are wait-free across Tokio workers and share one global interleaving for that lane, so long-run ratios match configured weights without a per-request blocking mutex. When healthy membership changes (or a recovered target forces invalidation), one thread rebuilds the order under a short rebuild-only lock that is never held across `.await`; other workers reuse the published schedule after a double-check. The counter wraps with `% order.len()` and does not bias ratios. Schedule length is capped (8192) so pathological huge weights truncate and repeat a bounded prefix rather than allocating an unbounded period. WRR state lives on the `LoadBalancer` instance swapped atomically on config reload, so schedules cannot bleed across target-set generations.
+
+Subset and port WRR lanes remain isolated from each other and from the parent lane.
+
 **Best for:** Backends with unequal capacity (e.g., different hardware, different resources).
 
 ### Least Connections
