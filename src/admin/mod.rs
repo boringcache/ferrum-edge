@@ -1558,28 +1558,49 @@ pub async fn handle_admin_request(
         let registry = crate::plugins::api_chargeback::global_registry();
         match parse_chargeback_format(req.uri().query()) {
             Ok(ChargebackFormat::Json) => {
-                let json_output = registry.render_json();
-                let resp = Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "application/json")
-                    .header("X-Content-Type-Options", "nosniff")
-                    .header("Cache-Control", "no-store")
-                    .body(Full::new(Bytes::from(json_output)))
-                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
-                return Ok(resp);
+                match registry.render_json() {
+                    Ok(json_output) => {
+                        let resp = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "application/json")
+                            .header("X-Content-Type-Options", "nosniff")
+                            .header("Cache-Control", "no-store")
+                            .body(Full::new(Bytes::from(json_output)))
+                            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+                        return Ok(resp);
+                    }
+                    Err(err) => {
+                        // Fail closed: never serialize non-finite monetary values as
+                        // JSON null (serde_json's default for Inf/NaN).
+                        return Ok(json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &json!({"error": err}),
+                        ));
+                    }
+                }
             }
             Ok(ChargebackFormat::Prometheus) => {
-                let prom_output = registry.render_prometheus();
-                let resp = Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                    .header("X-Content-Type-Options", "nosniff")
-                    .header("Cache-Control", "no-store")
-                    .body(Full::new(Bytes::from(prom_output)))
-                    .unwrap_or_else(|_| {
-                        Response::new(Full::new(Bytes::from("# error rendering charges\n")))
-                    });
-                return Ok(resp);
+                match registry.render_prometheus() {
+                    Ok(prom_output) => {
+                        let resp = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                            .header("X-Content-Type-Options", "nosniff")
+                            .header("Cache-Control", "no-store")
+                            .body(Full::new(Bytes::from(prom_output)))
+                            .unwrap_or_else(|_| {
+                                Response::new(Full::new(Bytes::from("# error rendering charges\n")))
+                            });
+                        return Ok(resp);
+                    }
+                    Err(err) => {
+                        // Fail closed: never publish non-finite Prometheus samples.
+                        return Ok(json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &json!({"error": err}),
+                        ));
+                    }
+                }
             }
             Err(resp) => return Ok(*resp),
         }

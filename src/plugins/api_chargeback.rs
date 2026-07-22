@@ -39,7 +39,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
-use crate::plugins::chargeback::pricing::PricingConfig;
+use crate::plugins::chargeback::pricing::{
+    PricingConfig, checked_add_charge, checked_mul_quantity, require_finite_charge,
+};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Closed top-level config key set for `api_chargeback` admission.
@@ -289,19 +291,27 @@ impl ChargebackEntry {
     }
 
     /// Total per-call (or per-connection) charge, computed once from exact
-    /// inputs: `call_count * call_price`.
-    pub fn call_charge(&self) -> f64 {
-        self.call_count.load(Ordering::Relaxed) as f64 * self.call_price
+    /// inputs: `call_count * call_price`. Returns an error when the product is
+    /// non-finite so exporters can fail closed instead of emitting JSON null /
+    /// Prometheus `inf`.
+    pub fn call_charge(&self) -> Result<f64, String> {
+        checked_mul_quantity(self.call_count.load(Ordering::Relaxed), self.call_price)
     }
 
     /// Bandwidth charge for client→backend bytes: `bytes_sent_total * price`.
-    pub fn bandwidth_charge_sent(&self) -> f64 {
-        self.bytes_sent_total.load(Ordering::Relaxed) as f64 * self.bw_price_sent
+    pub fn bandwidth_charge_sent(&self) -> Result<f64, String> {
+        checked_mul_quantity(
+            self.bytes_sent_total.load(Ordering::Relaxed),
+            self.bw_price_sent,
+        )
     }
 
     /// Bandwidth charge for backend→client bytes: `bytes_received_total * price`.
-    pub fn bandwidth_charge_received(&self) -> f64 {
-        self.bytes_received_total.load(Ordering::Relaxed) as f64 * self.bw_price_received
+    pub fn bandwidth_charge_received(&self) -> Result<f64, String> {
+        checked_mul_quantity(
+            self.bytes_received_total.load(Ordering::Relaxed),
+            self.bw_price_received,
+        )
     }
 
     fn nanos_since_update(&self, epoch: Instant) -> u64 {
@@ -662,25 +672,28 @@ impl ChargebackRegistry {
     }
 
     /// Render in Prometheus exposition format with caching.
-    pub fn render_prometheus(&self) -> String {
+    ///
+    /// Returns `Err` when any monetary sample would be non-finite; callers must
+    /// surface that as an explicit export failure rather than emitting `inf`.
+    pub fn render_prometheus(&self) -> Result<String, String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
         let cached = self.prometheus_cache.load();
         if let Some((generated_at, ref output)) = **cached
             && generated_at.elapsed().as_secs() < ttl_secs
         {
-            return output.clone();
+            return Ok(output.clone());
         }
 
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
-        let output = self.render_prometheus_uncached();
+        let output = self.render_prometheus_uncached()?;
         self.prometheus_cache
             .store(Arc::new(Some((Instant::now(), output.clone()))));
-        output
+        Ok(output)
     }
 
-    pub fn render_prometheus_uncached(&self) -> String {
+    pub fn render_prometheus_uncached(&self) -> Result<String, String> {
         // Multiple counter families × ~200 bytes per entry
         let estimated_cap = 1024 + self.entries.len() * 600;
         let mut output = String::with_capacity(estimated_cap);
@@ -722,7 +735,7 @@ impl ChargebackRegistry {
                             charges: 0.0,
                         });
                     agg.count += v.call_count.load(Ordering::Relaxed);
-                    agg.charges += v.call_charge();
+                    agg.charges = checked_add_charge(agg.charges, v.call_charge()?)?;
                 }
                 ProtocolFamily::Stream => {
                     let agg = stream_aggregates
@@ -740,7 +753,7 @@ impl ChargebackRegistry {
                             charges: 0.0,
                         });
                     agg.count += v.call_count.load(Ordering::Relaxed);
-                    agg.charges += v.call_charge();
+                    agg.charges = checked_add_charge(agg.charges, v.call_charge()?)?;
                 }
             }
         }
@@ -767,6 +780,7 @@ impl ChargebackRegistry {
         );
         output.push_str("# TYPE ferrum_api_charges_total counter\n");
         for ((consumer, proxy_id, status_code, _, _), agg) in &http_aggregates {
+            let charges = require_finite_charge(agg.charges, "ferrum_api_charges_total")?;
             output.push_str(&format!(
                 "ferrum_api_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\",currency=\"{}\"{}}} {:.10}\n",
                 escape_label_value(consumer),
@@ -775,7 +789,7 @@ impl ChargebackRegistry {
                 status_code,
                 escape_label_value(&agg.currency),
                 agg.namespace_label,
-                agg.charges
+                charges
             ));
         }
 
@@ -802,6 +816,8 @@ impl ChargebackRegistry {
         );
         output.push_str("# TYPE ferrum_api_stream_connection_charges_total counter\n");
         for ((consumer, proxy_id, _, _), agg) in &stream_aggregates {
+            let charges =
+                require_finite_charge(agg.charges, "ferrum_api_stream_connection_charges_total")?;
             output.push_str(&format!(
                 "ferrum_api_stream_connection_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",currency=\"{}\"{}}} {:.10}\n",
                 escape_label_value(consumer),
@@ -809,7 +825,7 @@ impl ChargebackRegistry {
                 escape_label_value(&agg.proxy_name),
                 escape_label_value(&agg.currency),
                 agg.namespace_label,
-                agg.charges
+                charges
             ));
         }
 
@@ -850,8 +866,9 @@ impl ChargebackRegistry {
                 });
             agg.bytes_sent += v.bytes_sent_total.load(Ordering::Relaxed);
             agg.bytes_received += v.bytes_received_total.load(Ordering::Relaxed);
-            agg.charge_sent += v.bandwidth_charge_sent();
-            agg.charge_received += v.bandwidth_charge_received();
+            agg.charge_sent = checked_add_charge(agg.charge_sent, v.bandwidth_charge_sent()?)?;
+            agg.charge_received =
+                checked_add_charge(agg.charge_received, v.bandwidth_charge_received()?)?;
         }
 
         output.push_str(
@@ -893,6 +910,10 @@ impl ChargebackRegistry {
         );
         output.push_str("# TYPE ferrum_api_bandwidth_charges_total counter\n");
         for ((consumer, proxy_id, family, _, _), agg) in &bw_aggregates {
+            let charge_sent =
+                require_finite_charge(agg.charge_sent, "ferrum_api_bandwidth_charges_total")?;
+            let charge_received =
+                require_finite_charge(agg.charge_received, "ferrum_api_bandwidth_charges_total")?;
             output.push_str(&format!(
                 "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",direction=\"sent\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
                 escape_label_value(consumer),
@@ -901,7 +922,7 @@ impl ChargebackRegistry {
                 escape_label_value(&agg.currency),
                 family.label(),
                 agg.namespace_label,
-                agg.charge_sent
+                charge_sent
             ));
             output.push_str(&format!(
                 "ferrum_api_bandwidth_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",direction=\"received\",currency=\"{}\",protocol_family=\"{}\"{}}} {:.10}\n",
@@ -911,33 +932,36 @@ impl ChargebackRegistry {
                 escape_label_value(&agg.currency),
                 family.label(),
                 agg.namespace_label,
-                agg.charge_received
+                charge_received
             ));
         }
 
-        output
+        Ok(output)
     }
 
     /// Render as JSON with caching.
-    pub fn render_json(&self) -> String {
+    ///
+    /// Returns `Err` when any monetary field would be non-finite; callers must
+    /// return an explicit error response rather than serializing JSON `null`.
+    pub fn render_json(&self) -> Result<String, String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
         let cached = self.json_cache.load();
         if let Some((generated_at, ref output)) = **cached
             && generated_at.elapsed().as_secs() < ttl_secs
         {
-            return output.clone();
+            return Ok(output.clone());
         }
 
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
-        let output = self.render_json_uncached();
+        let output = self.render_json_uncached()?;
         self.json_cache
             .store(Arc::new(Some((Instant::now(), output.clone()))));
-        output
+        Ok(output)
     }
 
-    pub fn render_json_uncached(&self) -> String {
+    pub fn render_json_uncached(&self) -> Result<String, String> {
         // Nested structure: consumer -> proxy -> {protocol, by_status, stream, bandwidth}.
         //
         // Currency is carried per proxy (it is a property of the recording
@@ -972,11 +996,11 @@ impl ChargebackRegistry {
         for entry in self.entries.iter() {
             let v = entry.value();
             let calls = v.call_count.load(Ordering::Relaxed);
-            let call_charge = v.call_charge();
+            let call_charge = v.call_charge()?;
             let bytes_sent = v.bytes_sent_total.load(Ordering::Relaxed);
             let bytes_received = v.bytes_received_total.load(Ordering::Relaxed);
-            let bw_sent = v.bandwidth_charge_sent();
-            let bw_received = v.bandwidth_charge_received();
+            let bw_sent = v.bandwidth_charge_sent()?;
+            let bw_received = v.bandwidth_charge_received()?;
 
             if !currency_mixed {
                 match overall_currency.as_ref() {
@@ -1010,8 +1034,10 @@ impl ChargebackRegistry {
                 });
             proxy_entry.bytes_sent += bytes_sent;
             proxy_entry.bytes_received += bytes_received;
-            proxy_entry.bandwidth_charge_sent += bw_sent;
-            proxy_entry.bandwidth_charge_received += bw_received;
+            proxy_entry.bandwidth_charge_sent =
+                checked_add_charge(proxy_entry.bandwidth_charge_sent, bw_sent)?;
+            proxy_entry.bandwidth_charge_received =
+                checked_add_charge(proxy_entry.bandwidth_charge_received, bw_received)?;
 
             match v.protocol_family {
                 ProtocolFamily::Http => {
@@ -1021,12 +1047,13 @@ impl ChargebackRegistry {
                         .entry(v.status_code)
                         .or_insert((0, 0.0));
                     status_entry.0 += calls;
-                    status_entry.1 += call_charge;
+                    status_entry.1 = checked_add_charge(status_entry.1, call_charge)?;
                 }
                 ProtocolFamily::Stream => {
                     proxy_entry.has_stream = true;
                     proxy_entry.stream_connections += calls;
-                    proxy_entry.stream_charges += call_charge;
+                    proxy_entry.stream_charges =
+                        checked_add_charge(proxy_entry.stream_charges, call_charge)?;
                 }
             }
         }
@@ -1042,18 +1069,19 @@ impl ChargebackRegistry {
         }
 
         impl CurrencyTotals {
-            fn total_charges(&self) -> f64 {
-                self.per_call_charges + self.stream_connection_charges + self.bandwidth_charges
+            fn total_charges(&self) -> Result<f64, String> {
+                checked_add_charge(self.per_call_charges, self.stream_connection_charges)
+                    .and_then(|partial| checked_add_charge(partial, self.bandwidth_charges))
             }
 
-            fn to_json(&self) -> serde_json::Value {
-                serde_json::json!({
+            fn to_json(&self) -> Result<serde_json::Value, String> {
+                Ok(serde_json::json!({
                     "total_calls": self.total_calls,
-                    "total_charges": self.total_charges(),
+                    "total_charges": self.total_charges()?,
                     "per_call_charges": self.per_call_charges,
                     "stream_connection_charges": self.stream_connection_charges,
                     "bandwidth_charges": self.bandwidth_charges,
-                })
+                }))
             }
         }
 
@@ -1074,7 +1102,8 @@ impl ChargebackRegistry {
                 let mut status_objects = serde_json::Map::new();
 
                 for (status_code, (calls, charge)) in &agg.by_status {
-                    proxy_per_call_charges += charge;
+                    let charge = require_finite_charge(*charge, "by_status.charges")?;
+                    proxy_per_call_charges = checked_add_charge(proxy_per_call_charges, charge)?;
                     proxy_calls += calls;
                     status_objects.insert(
                         status_code.to_string(),
@@ -1085,21 +1114,35 @@ impl ChargebackRegistry {
                     );
                 }
 
+                let stream_charges =
+                    require_finite_charge(agg.stream_charges, "stream.connection_charges")?;
+                let bw_sent =
+                    require_finite_charge(agg.bandwidth_charge_sent, "bandwidth.charge_sent")?;
+                let bw_received = require_finite_charge(
+                    agg.bandwidth_charge_received,
+                    "bandwidth.charge_received",
+                )?;
+
                 // Stream connections also count toward total_calls for headline numbers.
                 let proxy_total_calls = proxy_calls + agg.stream_connections;
-                let proxy_bandwidth_charges =
-                    agg.bandwidth_charge_sent + agg.bandwidth_charge_received;
                 let proxy_total_charges =
-                    proxy_per_call_charges + agg.stream_charges + proxy_bandwidth_charges;
+                    checked_add_charge(proxy_per_call_charges, stream_charges)
+                        .and_then(|partial| checked_add_charge(partial, bw_sent))
+                        .and_then(|partial| checked_add_charge(partial, bw_received))?;
+                require_finite_charge(proxy_total_charges, "proxy.total_charges")?;
 
                 total_calls += proxy_total_calls;
+                let proxy_bandwidth_charges = checked_add_charge(bw_sent, bw_received)?;
                 let currency_totals = by_currency
                     .entry(agg.currency.as_ref().to_string())
                     .or_default();
                 currency_totals.total_calls += proxy_total_calls;
-                currency_totals.per_call_charges += proxy_per_call_charges;
-                currency_totals.stream_connection_charges += agg.stream_charges;
-                currency_totals.bandwidth_charges += proxy_bandwidth_charges;
+                currency_totals.per_call_charges =
+                    checked_add_charge(currency_totals.per_call_charges, proxy_per_call_charges)?;
+                currency_totals.stream_connection_charges =
+                    checked_add_charge(currency_totals.stream_connection_charges, stream_charges)?;
+                currency_totals.bandwidth_charges =
+                    checked_add_charge(currency_totals.bandwidth_charges, proxy_bandwidth_charges)?;
 
                 // Deterministic protocol_family label: "mixed" when a proxy
                 // carries both HTTP and stream activity, otherwise the single
@@ -1121,8 +1164,8 @@ impl ChargebackRegistry {
                     "bandwidth": {
                         "bytes_sent": agg.bytes_sent,
                         "bytes_received": agg.bytes_received,
-                        "charge_sent": agg.bandwidth_charge_sent,
-                        "charge_received": agg.bandwidth_charge_received,
+                        "charge_sent": bw_sent,
+                        "charge_received": bw_received,
                     },
                 });
                 // Always emit the stream sub-object when stream activity exists,
@@ -1131,7 +1174,7 @@ impl ChargebackRegistry {
                 if agg.has_stream {
                     proxy_obj["stream"] = serde_json::json!({
                         "connections": agg.stream_connections,
-                        "connection_charges": agg.stream_charges,
+                        "connection_charges": stream_charges,
                     });
                 }
 
@@ -1167,7 +1210,7 @@ impl ChargebackRegistry {
                 let totals = by_currency.values().next().cloned().unwrap_or_default();
                 consumer_obj.insert(
                     "total_charges".to_string(),
-                    serde_json::json!(totals.total_charges()),
+                    serde_json::json!(totals.total_charges()?),
                 );
                 consumer_obj.insert(
                     "per_call_charges".to_string(),
@@ -1194,7 +1237,7 @@ impl ChargebackRegistry {
                 currency_entries.sort_by(|a, b| a.0.cmp(&b.0));
                 let mut currency_objects = serde_json::Map::new();
                 for (currency, totals) in currency_entries {
-                    currency_objects.insert(currency, totals.to_json());
+                    currency_objects.insert(currency, totals.to_json()?);
                 }
                 consumer_obj.insert(
                     "charges_by_currency".to_string(),
@@ -1221,7 +1264,8 @@ impl ChargebackRegistry {
             "consumers": serde_json::Value::Object(consumer_objects),
         });
 
-        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        serde_json::to_string_pretty(&result)
+            .map_err(|err| format!("api_chargeback: failed to serialize charges JSON: {err}"))
     }
 }
 

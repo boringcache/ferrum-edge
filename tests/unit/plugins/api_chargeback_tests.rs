@@ -5,6 +5,9 @@ use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::plugins::api_chargeback::{
     ApiChargeback, ChargebackRegistry, InstanceScope, ProtocolFamily, global_registry,
 };
+use ferrum_edge::plugins::chargeback::pricing::{
+    MAX_UNIT_PRICE, checked_add_charge, checked_mul_quantity,
+};
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, StreamTransactionSummary, TransactionSummary,
 };
@@ -350,8 +353,8 @@ async fn test_bandwidth_only_config_records_bytes() {
             0.0000002,
         ))
         .expect("bandwidth-only entry recorded");
-    assert!((entry.bandwidth_charge_sent() - 0.1).abs() < 1e-10);
-    assert!((entry.bandwidth_charge_received() - 0.4).abs() < 1e-10);
+    assert!((entry.bandwidth_charge_sent().unwrap() - 0.1).abs() < 1e-10);
+    assert!((entry.bandwidth_charge_received().unwrap() - 0.4).abs() < 1e-10);
 }
 
 #[tokio::test]
@@ -382,7 +385,7 @@ async fn test_stream_only_config_charges_connection() {
         ))
         .expect("stream-only entry recorded");
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
-    assert!((entry.call_charge() - 0.0005).abs() < 1e-12);
+    assert!((entry.call_charge().unwrap() - 0.0005).abs() < 1e-12);
 }
 
 #[test]
@@ -584,9 +587,9 @@ async fn test_combined_pricing_applies_both_call_and_bandwidth_charges() {
             0.000002,
         ))
         .expect("combined entry recorded");
-    let call_charge = entry.call_charge();
-    let bw_sent = entry.bandwidth_charge_sent();
-    let bw_recv = entry.bandwidth_charge_received();
+    let call_charge = entry.call_charge().unwrap();
+    let bw_sent = entry.bandwidth_charge_sent().unwrap();
+    let bw_recv = entry.bandwidth_charge_received().unwrap();
     assert!((call_charge - 0.001).abs() < 1e-12);
     assert!((bw_sent - 0.001).abs() < 1e-12); // 1_000 * 0.000001
     assert!((bw_recv - 0.004).abs() < 1e-12); // 2_000 * 0.000002
@@ -613,7 +616,7 @@ fn test_registry_records_charge() {
     let key = make_key_with_prices("user-1", "proxy-a", 200, 0.00001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
-    assert!((entry.call_charge() - 0.00001).abs() < 1e-15);
+    assert!((entry.call_charge().unwrap() - 0.00001).abs() < 1e-15);
     // Verify render metadata is stored correctly
     assert_eq!(&*entry.consumer, "user-1");
     assert_eq!(&*entry.proxy_id, "proxy-a");
@@ -643,7 +646,7 @@ fn test_registry_accumulates_charges() {
     let key = make_key_with_prices("user-1", "proxy-a", 200, 0.00001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1000);
-    assert!((entry.call_charge() - 0.01).abs() < 1e-10);
+    assert!((entry.call_charge().unwrap() - 0.01).abs() < 1e-10);
 }
 
 #[test]
@@ -799,8 +802,8 @@ fn test_registry_records_bandwidth_for_http() {
         entry.bytes_received_total.load(Ordering::Relaxed),
         2_000_000
     );
-    assert!((entry.bandwidth_charge_sent() - 0.1).abs() < 1e-10);
-    assert!((entry.bandwidth_charge_received() - 0.4).abs() < 1e-10);
+    assert!((entry.bandwidth_charge_sent().unwrap() - 0.1).abs() < 1e-10);
+    assert!((entry.bandwidth_charge_received().unwrap() - 0.4).abs() < 1e-10);
 }
 
 #[test]
@@ -823,7 +826,7 @@ fn test_registry_records_stream_session() {
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert_eq!(entry.status_code, 0);
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
-    assert!((entry.call_charge() - 0.0005).abs() < 1e-12);
+    assert!((entry.call_charge().unwrap() - 0.0005).abs() < 1e-12);
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 500_000);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 750_000);
 }
@@ -851,8 +854,8 @@ fn test_registry_does_not_charge_bandwidth_when_price_zero() {
         .unwrap();
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_000);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 2_000);
-    assert_eq!(entry.bandwidth_charge_sent(), 0.0);
-    assert_eq!(entry.bandwidth_charge_received(), 0.0);
+    assert_eq!(entry.bandwidth_charge_sent().unwrap(), 0.0);
+    assert_eq!(entry.bandwidth_charge_received().unwrap(), 0.0);
 }
 
 // --- Prometheus render tests ---
@@ -860,7 +863,7 @@ fn test_registry_does_not_charge_bandwidth_when_price_zero() {
 #[test]
 fn test_prometheus_render_empty() {
     let registry = ChargebackRegistry::new();
-    let output = registry.render_prometheus_uncached();
+    let output = registry.render_prometheus_uncached().unwrap();
     assert!(output.contains("ferrum_api_chargeable_calls_total"));
     assert!(output.contains("ferrum_api_charges_total"));
     assert!(output.contains("ferrum_api_stream_connections_total"));
@@ -899,7 +902,7 @@ fn test_prometheus_render_with_data() {
         0.0,
     );
 
-    let output = registry.render_prometheus_uncached();
+    let output = registry.render_prometheus_uncached().unwrap();
     assert!(output.contains("consumer=\"alice\""));
     assert!(output.contains("proxy_id=\"proxy-1\""));
     assert!(output.contains("proxy_name=\"Payments API\""));
@@ -926,7 +929,7 @@ fn test_prometheus_render_emits_stream_metrics() {
         0.000002,
     );
 
-    let output = registry.render_prometheus_uncached();
+    let output = registry.render_prometheus_uncached().unwrap();
     assert!(output.contains("ferrum_api_stream_connections_total{consumer=\"bob\""));
     assert!(output.contains("protocol_family=\"stream\""));
     // Stream entry must NOT emit ferrum_api_chargeable_calls_total rows (those are HTTP-only).
@@ -945,7 +948,7 @@ fn test_prometheus_render_bandwidth_aggregates_across_status_codes() {
         &s, "charlie", "proxy-x", "API", 500, 0.0, 500, 5_000, 0.0000001, 0.0000002,
     );
 
-    let output = registry.render_prometheus_uncached();
+    let output = registry.render_prometheus_uncached().unwrap();
     // One bytes_sent line per (consumer, proxy, family) — aggregated to 1500.
     let sent_count = output
         .lines()
@@ -963,7 +966,7 @@ fn test_prometheus_render_bandwidth_aggregates_across_status_codes() {
 #[test]
 fn test_json_render_empty() {
     let registry = ChargebackRegistry::new();
-    let output = registry.render_json_uncached();
+    let output = registry.render_json_uncached().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert!(parsed["consumers"].as_object().unwrap().is_empty());
     assert_eq!(parsed["currency"], "USD");
@@ -1002,7 +1005,7 @@ fn test_json_render_with_data() {
         0.0,
     );
 
-    let output = registry.render_json_uncached();
+    let output = registry.render_json_uncached().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
 
     assert_eq!(parsed["currency"], "EUR");
@@ -1038,7 +1041,7 @@ fn test_json_render_includes_bandwidth() {
         0.0000002,
     );
 
-    let output = registry.render_json_uncached();
+    let output = registry.render_json_uncached().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
     let bandwidth = &parsed["consumers"]["alice"]["proxies"]["proxy-1"]["bandwidth"];
     assert_eq!(bandwidth["bytes_sent"], 1_000);
@@ -1061,7 +1064,7 @@ fn test_json_render_includes_stream_section() {
         0.0000002,
     );
 
-    let output = registry.render_json_uncached();
+    let output = registry.render_json_uncached().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
     let proxy = &parsed["consumers"]["alice"]["proxies"]["tcp-1"];
     assert_eq!(proxy["protocol_family"], "stream");
@@ -1152,7 +1155,7 @@ async fn test_log_prices_final_grpc_status_as_effective_http_status() {
             .unwrap_or_else(|| panic!("missing effective gRPC billing entry {key}"));
         assert_eq!(entry.status_code, effective_status);
         assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
-        assert!((entry.call_charge() - price).abs() < 1e-12);
+        assert!((entry.call_charge().unwrap() - price).abs() < 1e-12);
         drop(entry);
         assert!(
             effective_status == 200
@@ -1227,7 +1230,7 @@ async fn test_log_records_bandwidth_even_when_status_is_uncharged() {
         .get(&key)
         .expect("bandwidth entry recorded");
     // 404 has no per-call price, so the per-call charge stays at zero.
-    assert!(entry.call_charge().abs() < 1e-15);
+    assert!(entry.call_charge().unwrap().abs() < 1e-15);
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_024);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 4_096);
 }
@@ -1265,7 +1268,7 @@ async fn test_on_stream_disconnect_records_bandwidth() {
     let entry = registry.entries.get(&key).expect("stream entry recorded");
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
-    assert!((entry.call_charge() - 0.001).abs() < 1e-12);
+    assert!((entry.call_charge().unwrap() - 0.001).abs() < 1e-12);
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 10_000);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 20_000);
 }
@@ -1343,7 +1346,7 @@ fn test_prometheus_render_namespace_present_for_default() {
         0.0,
     );
 
-    let output = registry.render_prometheus_uncached();
+    let output = registry.render_prometheus_uncached().unwrap();
     assert!(output.contains(r#"namespace="ferrum""#));
     assert!(output.contains("consumer=\"alice\""));
 }
@@ -1365,7 +1368,7 @@ fn test_prometheus_render_namespace_present_for_non_default() {
         0.0,
     );
 
-    let output = registry.render_prometheus_uncached();
+    let output = registry.render_prometheus_uncached().unwrap();
     assert!(output.contains(r#"namespace="staging""#));
     assert!(output.contains("consumer=\"bob\""));
 }
@@ -1397,7 +1400,7 @@ fn test_per_instance_currency_and_namespace_not_last_writer_wins() {
     );
 
     // Prometheus: each proxy keeps its own currency + namespace label.
-    let prom = registry.render_prometheus_uncached();
+    let prom = registry.render_prometheus_uncached().unwrap();
     assert!(
         prom.lines().any(|l| l.contains("proxy_id=\"proxy-a\"")
             && l.contains("currency=\"USD\"")
@@ -1421,7 +1424,8 @@ fn test_per_instance_currency_and_namespace_not_last_writer_wins() {
 
     // JSON: per-proxy currency, top-level currency signals "mixed", and
     // consumer monetary totals are partitioned (never USD+EUR=2).
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     assert_eq!(json["currency"], "mixed");
     assert_eq!(
         json["consumers"]["alice"]["proxies"]["proxy-a"]["currency"],
@@ -1475,7 +1479,7 @@ fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
 
     assert_eq!(registry.entries.len(), 2);
 
-    let prom = registry.render_prometheus_uncached();
+    let prom = registry.render_prometheus_uncached().unwrap();
     assert!(
         prom.lines()
             .any(|line| line.contains("proxy_id=\"shared-proxy\"")
@@ -1493,7 +1497,8 @@ fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
         "EUR/team-b call row missing\n{prom}"
     );
 
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     let proxies = json["consumers"]["alice"]["proxies"].as_object().unwrap();
     assert_eq!(proxies.len(), 2);
     assert!(proxies.values().any(|proxy| {
@@ -1520,7 +1525,8 @@ fn test_json_top_level_currency_single_when_uniform() {
     registry.record_http(&s, "alice", "proxy-a", "API", 200, 1.0, 0, 0, 0.0, 0.0);
     registry.record_http(&s, "bob", "proxy-b", "API", 200, 1.0, 0, 0, 0.0, 0.0);
 
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     assert_eq!(json["currency"], "GBP");
 }
 
@@ -1550,7 +1556,7 @@ fn test_http_and_stream_share_proxy_id_render_is_deterministic() {
     let mut http_sent_seen = false;
     let mut stream_sent_seen = false;
     for _ in 0..8 {
-        let prom = registry.render_prometheus_uncached();
+        let prom = registry.render_prometheus_uncached().unwrap();
         let http_sent = prom.lines().any(|l| {
             l.starts_with("ferrum_api_bytes_sent_total{")
                 && l.contains("proxy_id=\"proxy-1\"")
@@ -1589,7 +1595,8 @@ fn test_http_and_stream_share_proxy_id_render_is_deterministic() {
     assert!(http_sent_seen && stream_sent_seen);
 
     // --- JSON: stream sub-object always present, label "mixed", totals reconcile. ---
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     let proxy = &json["consumers"]["alice"]["proxies"]["proxy-1"];
     assert_eq!(proxy["protocol_family"], "mixed");
     // The stream sub-object must be present regardless of iteration order.
@@ -1637,7 +1644,7 @@ fn test_high_volume_charge_has_no_accumulation_drift() {
         .unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), n);
     // Exact: equals n * price computed once, bit-for-bit.
-    assert_eq!(entry.call_charge(), n as f64 * price);
+    assert_eq!(entry.call_charge().unwrap(), n as f64 * price);
 }
 
 /// Bandwidth charge is computed from the exact accumulated byte count, so many
@@ -1666,9 +1673,308 @@ fn test_bandwidth_charge_is_exact_from_byte_totals() {
     // Charge derives from the (exact) total byte count, so it equals the bulk
     // computation exactly — no per-add drift.
     assert_eq!(
-        many_entry.bandwidth_charge_sent(),
+        many_entry.bandwidth_charge_sent().unwrap(),
         (7 * chunks) as f64 * price
     );
+}
+
+// --- Issue #2574: finite arithmetic bounds for pricing and exports ---
+
+#[test]
+fn test_price_at_max_unit_price_is_accepted() {
+    let config = json!({
+        "pricing_tiers": [{
+            "status_codes": [200],
+            "price_per_call": MAX_UNIT_PRICE
+        }]
+    });
+    ApiChargeback::new(&config, "ferrum").expect("MAX_UNIT_PRICE must be accepted");
+}
+
+#[test]
+fn test_price_above_max_unit_price_is_rejected() {
+    let just_above = f64::from_bits(MAX_UNIT_PRICE.to_bits() + 1);
+    let config = json!({
+        "pricing_tiers": [{
+            "status_codes": [200],
+            "price_per_call": just_above
+        }]
+    });
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
+    assert!(
+        err.contains("1e288")
+            || err.contains(&MAX_UNIT_PRICE.to_string())
+            || err.contains("no greater than"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_bandwidth_and_stream_prices_above_max_are_rejected() {
+    let bw = json!({
+        "bandwidth_pricing": { "price_per_byte_sent": 1e308 }
+    });
+    let bw_err = ApiChargeback::new(&bw, "ferrum").err().unwrap();
+    assert!(bw_err.contains("no greater than"), "{bw_err}");
+
+    let stream = json!({
+        "stream_connection_pricing": { "price_per_connection": 1e308 }
+    });
+    let stream_err = ApiChargeback::new(&stream, "ferrum").err().unwrap();
+    assert!(stream_err.contains("no greater than"), "{stream_err}");
+}
+
+#[test]
+fn test_non_finite_configured_prices_are_rejected() {
+    for price in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let config = serde_json::json!({
+            "pricing_tiers": [{
+                "status_codes": [200],
+                "price_per_call": price
+            }]
+        });
+        // serde_json encodes non-finite f64 as null, which fails "must be a number".
+        let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
+        assert!(
+            err.contains("must be a number") || err.contains("finite"),
+            "price={price:?} err={err}"
+        );
+    }
+}
+
+#[test]
+fn test_checked_mul_quantity_rejects_overflow() {
+    let ok = checked_mul_quantity(2, MAX_UNIT_PRICE).unwrap();
+    assert!(ok.is_finite());
+
+    let overflow = checked_mul_quantity(u64::MAX, 1e308).unwrap_err();
+    assert!(overflow.contains("overflowed") || overflow.contains("non-finite"));
+}
+
+#[test]
+fn test_checked_add_charge_rejects_aggregate_overflow() {
+    let near_max = f64::MAX / 2.0;
+    assert!(checked_add_charge(near_max, near_max).is_ok());
+    let err = checked_add_charge(f64::MAX, f64::MAX).unwrap_err();
+    assert!(
+        err.contains("overflowed") || err.contains("non-finite"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_max_price_times_max_counter_stays_finite_for_exports() {
+    let registry = ChargebackRegistry::new();
+    let s = scope();
+    registry.record_http(
+        &s,
+        "alice",
+        "proxy-max",
+        "API",
+        200,
+        MAX_UNIT_PRICE,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    let entry = registry
+        .entries
+        .get(&make_key_with_prices(
+            "alice",
+            "proxy-max",
+            200,
+            MAX_UNIT_PRICE,
+            0.0,
+            0.0,
+        ))
+        .unwrap();
+    entry.call_count.store(u64::MAX, Ordering::Relaxed);
+
+    let charge = entry
+        .call_charge()
+        .expect("max price × u64::MAX must be finite");
+    assert!(charge.is_finite());
+
+    let prom = registry
+        .render_prometheus_uncached()
+        .expect("prometheus export must succeed for bounded prices");
+    assert!(prom.contains("ferrum_api_charges_total"));
+    assert!(!prom.to_lowercase().contains("inf"));
+
+    let json_text = registry
+        .render_json_uncached()
+        .expect("json export must succeed for bounded prices");
+    let parsed: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+    let charges =
+        &parsed["consumers"]["alice"]["proxies"]["proxy-max"]["by_status"]["200"]["charges"];
+    assert!(
+        charges.is_number(),
+        "charges must remain a JSON number, got {charges}"
+    );
+    assert!(!charges.is_null());
+}
+
+#[test]
+fn test_bandwidth_max_price_times_max_bytes_stays_finite() {
+    let registry = ChargebackRegistry::new();
+    let s = scope();
+    registry.record_http(
+        &s,
+        "alice",
+        "proxy-bw-max",
+        "API",
+        404,
+        0.0,
+        0,
+        0,
+        MAX_UNIT_PRICE,
+        MAX_UNIT_PRICE,
+    );
+    let entry = registry
+        .entries
+        .get(&make_key_with_prices(
+            "alice",
+            "proxy-bw-max",
+            404,
+            0.0,
+            MAX_UNIT_PRICE,
+            MAX_UNIT_PRICE,
+        ))
+        .unwrap();
+    entry.bytes_sent_total.store(u64::MAX, Ordering::Relaxed);
+    entry
+        .bytes_received_total
+        .store(u64::MAX, Ordering::Relaxed);
+
+    assert!(entry.bandwidth_charge_sent().unwrap().is_finite());
+    assert!(entry.bandwidth_charge_received().unwrap().is_finite());
+    registry
+        .render_json_uncached()
+        .expect("bandwidth export at bound must succeed");
+}
+
+#[test]
+fn test_render_fails_closed_on_quantity_price_overflow() {
+    // Bypass admission (record_* accepts raw f64) to simulate historical /
+    // poisoned registry state that config bounds alone cannot remove.
+    let registry = ChargebackRegistry::new();
+    let s = scope();
+    let poison = 1e308;
+    registry.record_http(
+        &s,
+        "alice",
+        "proxy-poison",
+        "API",
+        200,
+        poison,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    let entry = registry
+        .entries
+        .get(&make_key_with_prices(
+            "alice",
+            "proxy-poison",
+            200,
+            poison,
+            0.0,
+            0.0,
+        ))
+        .unwrap();
+    entry.call_count.store(2, Ordering::Relaxed);
+
+    assert!(entry.call_charge().is_err());
+
+    let prom_err = registry.render_prometheus_uncached().unwrap_err();
+    assert!(
+        prom_err.contains("overflow") || prom_err.contains("non-finite"),
+        "{prom_err}"
+    );
+
+    let json_err = registry.render_json_uncached().unwrap_err();
+    assert!(
+        json_err.contains("overflow") || json_err.contains("non-finite"),
+        "{json_err}"
+    );
+}
+
+#[test]
+fn test_render_fails_closed_on_aggregate_addition_overflow() {
+    let registry = ChargebackRegistry::new();
+    let s = scope();
+    // Two series that each contribute a near-max finite charge; summing them
+    // overflows aggregation even though each product is finite.
+    let price = f64::MAX * 0.75;
+    for (proxy, status) in [("p-a", 200u16), ("p-b", 200u16)] {
+        registry.record_http(&s, "alice", proxy, "API", status, price, 0, 0, 0.0, 0.0);
+        let entry = registry
+            .entries
+            .get(&make_key_with_prices(
+                "alice", proxy, status, price, 0.0, 0.0,
+            ))
+            .unwrap();
+        entry.call_count.store(1, Ordering::Relaxed);
+        assert!(entry.call_charge().unwrap().is_finite());
+    }
+
+    // JSON sums consumer totals across proxies — that addition overflows.
+    let err = registry.render_json_uncached().unwrap_err();
+    assert!(
+        err.contains("overflow") || err.contains("non-finite"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_mixed_currency_export_still_succeeds_with_finite_prices() {
+    // Preserve finding #24 mixed-currency labeling while exercising the new
+    // fail-closed export path on healthy finite arithmetic.
+    let registry = ChargebackRegistry::new();
+    registry.record_http(
+        &scope_for("USD", "ns-a"),
+        "alice",
+        "proxy-a",
+        "A",
+        200,
+        0.001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    registry.record_http(
+        &scope_for("EUR", "ns-b"),
+        "alice",
+        "proxy-b",
+        "B",
+        200,
+        0.002,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    assert_eq!(json["currency"], "mixed");
+    assert!(json["consumers"]["alice"]["total_charges"].is_null());
+    assert_eq!(
+        json["consumers"]["alice"]["charges_by_currency"]["USD"]["total_charges"],
+        0.001
+    );
+    assert_eq!(
+        json["consumers"]["alice"]["charges_by_currency"]["EUR"]["total_charges"],
+        0.002
+    );
+
+    let prom = registry.render_prometheus_uncached().unwrap();
+    assert!(prom.contains("currency=\"USD\""));
+    assert!(prom.contains("currency=\"EUR\""));
+    assert!(!prom.to_lowercase().contains("inf"));
 }
 
 // --- Issue #2569: never sum monetary totals across currencies ---
@@ -1736,7 +2042,8 @@ fn test_json_mixed_currency_consumer_totals_partitioned_not_summed() {
         0.0,
     );
 
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     assert_eq!(json["currency"], "mixed");
 
     let alice = &json["consumers"]["alice"];
@@ -1798,7 +2105,8 @@ fn test_json_single_currency_consumer_keeps_flat_totals() {
     registry.record_http(&usd, "alice", "proxy-a", "A", 200, 1.0, 10, 0, 0.1, 0.0);
     registry.record_stream(&usd, "alice", "proxy-b", "B", 0.25, 0, 0, 0.0, 0.0);
 
-    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     let alice = &json["consumers"]["alice"];
     assert_eq!(json["currency"], "USD");
     assert!(alice["charges_by_currency"].is_null());
@@ -1947,7 +2255,7 @@ async fn test_effective_plugin_chain_partitions_multi_instance_currency_totals()
     eur_stream_plugin.on_stream_disconnect(&eur_stream).await;
 
     let rendered: serde_json::Value =
-        serde_json::from_str(&global_registry().render_json_uncached()).unwrap();
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
     let consumer = &rendered["consumers"][CONSUMER];
     assert!(consumer["total_charges"].is_null());
     assert_eq!(consumer["total_calls"], 3);
