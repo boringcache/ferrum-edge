@@ -307,9 +307,9 @@ fn production_factory_rejects_blank_plugin_config_id() {
         );
         let err = match result {
             Err(err) => err,
-            Ok(_) => panic!(
-                "blank plugin config id must fail closed through the production factory"
-            ),
+            Ok(_) => {
+                panic!("blank plugin config id must fail closed through the production factory")
+            }
         };
         assert!(
             err.contains("plugin config id must be a non-empty stable identity"),
