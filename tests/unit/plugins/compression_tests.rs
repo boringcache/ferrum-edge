@@ -222,6 +222,23 @@ fn test_invalid_levels_rejected() {
 }
 
 #[test]
+fn test_gzip_level_boundary_values() {
+    // 0, 1, and 9 are the inclusive boundary values accepted by the runtime.
+    for level in [0u64, 1, 9] {
+        let plugin = CompressionPlugin::new(&json!({"gzip_level": level}))
+            .unwrap_or_else(|e| panic!("gzip_level {level} must be accepted: {e}"));
+        assert!(plugin.requires_response_body_buffering());
+    }
+
+    // 10 is the first rejected value (just above the maximum of 9).
+    let err = CompressionPlugin::new(&json!({"gzip_level": 10}))
+        .err()
+        .expect("gzip_level 10 must be rejected");
+    assert!(err.contains("gzip_level"), "got: {}", err);
+    assert!(err.contains("0 and 9"), "got: {}", err);
+}
+
+#[test]
 fn test_unknown_algorithm_rejected() {
     let err = CompressionPlugin::new(&json!({"algorithms": ["lz4"]}))
         .err()
