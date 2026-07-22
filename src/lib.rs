@@ -943,6 +943,18 @@ pub mod _test_support {
         crate::proxy::publish_ws_policy_close(policy_close, cancel, close)
     }
 
+    /// Exercise the shared H1/H2/H3 WebSocket frame-plugin composition path.
+    pub async fn apply_ws_frame_plugins_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        raw: Message,
+    ) -> Message {
+        crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw)
+            .await
+    }
+
     /// Report the production parser-policy and post-reassembly hook lists.
     pub fn websocket_relay_plugin_names_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],

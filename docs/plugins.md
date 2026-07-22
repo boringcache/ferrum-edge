@@ -5020,7 +5020,10 @@ WebSocket plugins share the bidirectional H1 Upgrade, H2 Extended CONNECT, and
 H3 Extended CONNECT relay. Ordinary `on_ws_frame` hooks receive complete
 tungstenite messages (with continuation frames already reassembled), in both
 directions. Parser-level policies such as `ws_message_size_limiting` run before
-that hook so they can enforce actual wire-frame boundaries safely.
+that hook so they can enforce actual wire-frame boundaries safely. Within the
+post-reassembly chain, the first terminal Close from a priority-ordered
+admission/mutating hook is preserved: later mutating plugins are skipped for
+that frame, while observational hooks still see the final Close.
 
 ### `ws_message_size_limiting`
 
@@ -5065,7 +5068,7 @@ parsers receive the effective limits before their first frame read.
 
 ### `ws_rate_limiting`
 
-Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket.
+Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected.
 
 **Priority:** 2910
 
@@ -5104,7 +5107,7 @@ config:
 
 ### `ws_frame_logging`
 
-Logs metadata for every WebSocket frame passing through the proxy. Provides frame-level observability without requiring packet captures. This plugin never transforms or drops frames — it is purely observational.
+Logs metadata for every WebSocket frame passing through the proxy. Provides frame-level observability without requiring packet captures. This plugin never transforms or drops frames — it is purely observational (`observes_ws_frame_decisions()`), so after an earlier admission plugin synthesizes a terminal Close the shared relay still invokes this hook with that final decision.
 
 **Priority:** 9050
 

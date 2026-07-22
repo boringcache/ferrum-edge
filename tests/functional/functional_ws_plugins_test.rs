@@ -1010,3 +1010,188 @@ async fn test_ws_combined_plugins_e2e() {
     echo_handle.abort();
     println!("test_ws_combined_plugins_e2e PASSED");
 }
+
+/// Exhaust the rate bucket, then violate the size limit. The parser-level 1009
+/// Close must win; the later rate limiter must not rewrite it to 1008.
+#[ignore]
+#[tokio::test]
+async fn test_ws_size_rejection_preserved_over_exhausted_rate_limiter_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
+    let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
+        backend_listener,
+        backend_close_tx,
+    ));
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config_with_plugins(
+        &config_path,
+        backend_port,
+        r#"  - id: "ws-size"
+    plugin_name: "ws_message_size_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      max_frame_bytes: 16
+      close_reason: "message too large"
+  - id: "ws-rate"
+    plugin_name: "ws_rate_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      frames_per_second: 1
+      burst_size: 1
+      close_reason: "frame rate exceeded""#,
+        r#"      - plugin_config_id: "ws-size"
+      - plugin_config_id: "ws-rate""#,
+    );
+
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect WebSocket");
+
+    // Consume the sole rate token with a small frame that is forwarded.
+    ws.send(Message::Text("ok".into()))
+        .await
+        .expect("send small frame");
+    let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("echo timed out")
+        .expect("stream ended before echo")
+        .expect("echo read failed");
+    assert_eq!(reply, Message::Text("Echo: ok".into()));
+
+    // Oversized frame: parser-level size policy closes with 1009 before any
+    // post-reassembly rate accounting can rewrite the terminal Close.
+    ws.send(Message::Text("this payload exceeds sixteen".into()))
+        .await
+        .expect("send oversized frame");
+
+    let client_close = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(close @ Message::Close(_))) => break close,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                other => panic!("unexpected reply before size close: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("client close timed out");
+    let Message::Close(Some(client_close)) = client_close else {
+        panic!("client did not receive detailed size close");
+    };
+    assert_eq!(
+        client_close.code,
+        CloseCode::Size,
+        "1009 size rejection must not become 1008"
+    );
+    assert_eq!(client_close.reason.as_str(), "message too large");
+
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("backend close timed out")
+            .expect("backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Size);
+    assert_eq!(backend_reason, "message too large");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_ws_size_rejection_preserved_over_exhausted_rate_limiter_e2e PASSED");
+}
+
+/// Backend-originated oversized frames with an exhausted rate bucket still
+/// close both peers with 1009 through the shared relay.
+#[ignore]
+#[tokio::test]
+async fn test_ws_size_rejection_preserved_over_rate_limiter_backend_direction_e2e() {
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let (backend_close_tx, mut backend_close_rx) = mpsc::unbounded_channel();
+    let echo_handle = tokio::spawn(start_ws_echo_server_recording_close(
+        backend_listener,
+        backend_close_tx,
+    ));
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config_with_plugins(
+        &config_path,
+        backend_port,
+        r#"  - id: "ws-size"
+    plugin_name: "ws_message_size_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      max_frame_bytes: 16
+      close_reason: "message too large"
+  - id: "ws-rate"
+    plugin_name: "ws_rate_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      frames_per_second: 1
+      burst_size: 1
+      close_reason: "frame rate exceeded""#,
+        r#"      - plugin_config_id: "ws-size"
+      - plugin_config_id: "ws-rate""#,
+    );
+
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect WebSocket");
+
+    ws.send(Message::Text("ok".into()))
+        .await
+        .expect("send small frame");
+    let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("echo timed out")
+        .expect("stream ended before echo")
+        .expect("echo read failed");
+    assert_eq!(reply, Message::Text("Echo: ok".into()));
+
+    ws.send(Message::Text("__backend_oversized_frame__".into()))
+        .await
+        .expect("request oversized backend frame");
+
+    let client_close = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(close @ Message::Close(_))) => break close,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                Some(Ok(Message::Text(_))) => continue,
+                other => panic!("unexpected reply before size close: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("client close timed out");
+    let Message::Close(Some(client_close)) = client_close else {
+        panic!("client did not receive detailed size close");
+    };
+    assert_eq!(client_close.code, CloseCode::Size);
+    assert_eq!(client_close.reason.as_str(), "message too large");
+
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("backend close timed out")
+            .expect("backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Size);
+    assert_eq!(backend_reason, "message too large");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}

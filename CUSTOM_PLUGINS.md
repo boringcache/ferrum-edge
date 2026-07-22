@@ -296,7 +296,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `log(&summary)` | Logging | No | Hand transaction data to a bounded sink; timing depends on response ownership |
 | `on_ws_frame(proxy_id, connection_id, direction, &message)` | WebSocket frame | Close* | Inspect/transform per-frame WebSocket traffic |
 
-\*`on_ws_frame` cannot return `PluginResult::Reject`. Instead, return `Some(Message::Close(...))` to close the connection in both directions. Return `None` for passthrough, or `Some(transformed_message)` to replace the frame.
+\*`on_ws_frame` cannot return `PluginResult::Reject`. Instead, return `Some(Message::Close(...))` to close the connection in both directions. Return `None` for passthrough, or `Some(transformed_message)` to replace the frame. The first terminal Close from a priority-ordered admission/mutating hook is preserved: later mutating plugins are skipped for that frame (so they cannot charge budget or overwrite the Close), while observational hooks that return `true` from `observes_ws_frame_decisions()` still see the final Close.
 
 **Streaming inspectors:** A `ResponseStreamInspector` runs after response headers have been committed. It can forward, hold, or terminate the remaining body, but it cannot change the response status or retract bytes already sent.
 
@@ -385,6 +385,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn correlation_id_header_name(&self) -> Option<&str>` | `None` | Return the non-empty correlation header owned by this instance, or `None` when it owns no correlation header. Empty or whitespace-only claims fail admission with a capability-specific error. Core candidate admission and runtime cache construction defensively trim and compare valid claims ASCII-case-insensitively, rejecting the effective deployment-specific `FERRUM_REAL_IP_HEADER` and duplicate effective headers or priorities on one plugin chain, including custom-only chains. CP/DP deployments require every DP to advertise the same effective real-IP header as the CP before config distribution. Custom plugins must still trim, validate, and normalize the header names used by their own runtime writes. |
 | `fn applies_after_proxy_on_reject(&self) -> bool` | `false` | Set to `true` if your plugin's `after_proxy` should also run on gateway-generated rejection responses (e.g., CORS headers on error responses). |
 | `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()`. Pre-computed per proxy for zero overhead when unused. |
+| `fn observes_ws_frame_decisions(&self) -> bool` | `false` | Set to `true` for observe-only frame hooks. After an earlier admission plugin returns a terminal Close, the shared relay still invokes observational hooks with that Close while skipping later mutating plugins. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming at startup). |
 | `fn tracked_keys_count(&self) -> Option<usize>` | `None` | Number of tracked rate-limit keys (for admin API diagnostics). |
 
@@ -1536,6 +1537,7 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] Streaming response plugins declare `requires_response_stream_hooks()` and return a bounded, state-owning `ResponseStreamInspector`
 - [ ] A plugin that relabels response `Content-Type` declares `may_modify_response_content_type()` with the same conditions as `after_proxy()`
 - [ ] `requires_ws_frame_hooks()` returns `true` if it implements `on_ws_frame()`
+- [ ] Mutating `on_ws_frame` hooks treat an inbound `Message::Close` as already-final (no budget charge / no replacement) unless they intentionally observe-only via `observes_ws_frame_decisions()`
 - [ ] `warmup_hostnames()` returns external hosts if applicable
 - [ ] Slow `log()` I/O uses a bounded, lifecycle-owned handoff with explicit overflow and shutdown behavior
 - [ ] If using database tables: `plugin_migrations()` exported with versioned migrations

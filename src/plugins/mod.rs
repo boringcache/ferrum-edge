@@ -6418,6 +6418,18 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin only observes WebSocket frame decisions
+    /// and never mutates or rejects them.
+    ///
+    /// After an earlier admission/mutating `on_ws_frame` hook returns a
+    /// terminal `Message::Close`, the shared H1/H2/H3 relay keeps invoking
+    /// observational hooks with that already-final Close so they can record
+    /// the decision, while skipping later mutating plugins so they neither
+    /// charge budget nor replace the Close code/reason.
+    fn observes_ws_frame_decisions(&self) -> bool {
+        false
+    }
+
     /// Optional parser-level WebSocket size policy.
     ///
     /// Implementations must return immutable construction-time values. The
@@ -6446,6 +6458,11 @@ pub trait Plugin: Send + Sync {
     ///
     /// Return `Some(message)` to replace the frame, `None` to pass through unchanged.
     /// Returning `Some(Message::Close(...))` will close the WebSocket in both directions.
+    ///
+    /// The first terminal Close from a priority-ordered admission/mutating hook
+    /// is preserved for the rest of the chain: later mutating plugins are not
+    /// invoked for that frame, and observational hooks
+    /// ([`Plugin::observes_ws_frame_decisions`]) may still see the final Close.
     async fn on_ws_frame(
         &self,
         _proxy_id: &str,

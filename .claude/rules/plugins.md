@@ -52,6 +52,9 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 10. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
 11. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
 12. `on_ws_frame`: WS size, rate, and frame logging
+    - First terminal Close from an admission/mutating hook wins; later mutating
+      plugins are skipped for that frame while observational hooks
+      (`observes_ws_frame_decisions`) may still record the final decision.
 13. `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
 14. `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`
 

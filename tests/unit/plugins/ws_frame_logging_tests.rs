@@ -233,6 +233,7 @@ fn test_creation_defaults() {
     assert_eq!(plugin.configured_log_level(), "info");
     assert_eq!(plugin.payload_preview_bytes(), 128);
     assert!(plugin.requires_ws_frame_hooks());
+    assert!(plugin.observes_ws_frame_decisions());
     assert_eq!(
         plugin_failure_policy("ws_frame_logging"),
         Some(PluginFailurePolicy::OptionalFailOpen)
@@ -356,6 +357,12 @@ fn test_supported_protocols_websocket_only() {
 fn test_requires_ws_frame_hooks() {
     let plugin = WsFrameLogging::new(&json!({})).unwrap();
     assert!(plugin.requires_ws_frame_hooks());
+}
+
+#[test]
+fn test_observes_ws_frame_decisions() {
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+    assert!(plugin.observes_ws_frame_decisions());
 }
 
 #[tokio::test]

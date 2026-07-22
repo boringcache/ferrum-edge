@@ -251,8 +251,15 @@ impl Plugin for WsRateLimiting {
         proxy_id: &str,
         connection_id: u64,
         direction: WebSocketFrameDirection,
-        _message: &Message,
+        message: &Message,
     ) -> Option<Message> {
+        // An earlier admission/mutating frame plugin may already have synthesized
+        // a terminal Close. Do not charge local/Redis budget, run eviction
+        // sampling, or replace that Close with a 1008 Policy Violation.
+        if matches!(message, Message::Close(_)) {
+            return None;
+        }
+
         let over_capacity = self.maybe_evict();
         if over_capacity && !self.limiter.contains_local_key(&connection_id) {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
