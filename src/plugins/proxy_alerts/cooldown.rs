@@ -96,8 +96,8 @@ impl CooldownGate {
             )
         };
         // Brief map lock for lookup/insert only; CAS below is lock-free.
-        let atomic = per_generation
-            .get_or_insert_with(ownership_generation, || Arc::new(AtomicU64::new(0)));
+        let atomic =
+            per_generation.get_or_insert_with(ownership_generation, || Arc::new(AtomicU64::new(0)));
         let mut prev = atomic.load(Ordering::Acquire);
         loop {
             if prev != 0 && now_ms.saturating_sub(prev) < cooldown_ms {
@@ -279,9 +279,9 @@ impl RecoveryGate {
             .state
             .get(&rule_id)
             .and_then(|per_rule| {
-                per_rule.get(proxy_id).and_then(|generations| {
-                    generations.get_copied(&ownership_generation)
-                })
+                per_rule
+                    .get(proxy_id)
+                    .and_then(|generations| generations.get_copied(&ownership_generation))
             })
             .unwrap_or(RuleState::Healthy);
         let mut state = state;

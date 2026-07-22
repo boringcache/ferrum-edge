@@ -307,7 +307,10 @@ impl ProxyAlerts {
     /// the commit/sweep serialization contract.
     #[doc(hidden)]
     #[allow(dead_code)]
-    pub fn publish_proxy_generations_for_test(&self, active_proxy_generations: &HashMap<&str, u64>) {
+    pub fn publish_proxy_generations_for_test(
+        &self,
+        active_proxy_generations: &HashMap<&str, u64>,
+    ) {
         let owned: HashMap<String, u64> = active_proxy_generations
             .iter()
             .map(|(id, generation)| ((*id).to_string(), *generation))
