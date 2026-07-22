@@ -62,8 +62,8 @@ fn wrr_source_no_longer_guards_lane_state_with_mutex_vec() {
         "expected contention-bounded WrrLaneState"
     );
     assert!(
-        !source.contains("wrr_state: std::sync::Mutex<Vec<i64>>"),
-        "reintroduction of per-selection Mutex<Vec<i64>> would serialize the WRR hot path"
+        source.contains("struct WrrSchedule"),
+        "steady-state WRR must use precomputed WrrSchedule values"
     );
     assert!(
         source.contains("WRR_SCHEDULE_CACHE_SLOTS"),
@@ -72,6 +72,10 @@ fn wrr_source_no_longer_guards_lane_state_with_mutex_vec() {
     assert!(
         source.contains("WRR_COUNTER_SHARDS"),
         "steady-state WRR must shard selection counters to avoid single-line contention"
+    );
+    assert!(
+        source.contains("WRR_SMOOTH_BUILD_MAX_WORK"),
+        "smooth-WRR construction must declare an explicit work budget"
     );
     assert!(
         source.contains("CachePadded"),
@@ -93,6 +97,15 @@ fn wrr_source_no_longer_guards_lane_state_with_mutex_vec() {
         source.contains("pick_wrr_miss_fallback_bitset")
             && source.contains("pick_wrr_miss_fallback_vec"),
         "cache misses must have an allocation-free candidate-scan fallback"
+    );
+    assert!(
+        source.contains("is_lottery_only") || source.contains("LotteryOnly"),
+        "oversized smooth builds must publish a lottery-only sentinel"
+    );
+    assert!(
+        source.contains("resolve_wrr_vec_candidate")
+            && source.contains("binary_search_by_key"),
+        "Vec schedule hits must resolve original indices with binary search"
     );
     assert!(
         !source.contains("build a local schedule")
@@ -510,4 +523,92 @@ fn wrr_vec_path_fingerprint_churn_beyond_cache_capacity_amortizes_publishes() {
         "vec publishes={publishes} exceeded amortized bound {max_publishes} for {selections} selections"
     );
     assert!(publishes * 10 < selections);
+}
+
+#[test]
+fn wrr_oversized_schedule_caches_lottery_sentinel_without_rebuild_churn() {
+    // 200 candidates × 8192 capped steps exceeds WRR_SMOOTH_BUILD_MAX_WORK
+    // (8192 × 128). The publisher must store an exact-key lottery-only sentinel
+    // so repeated selections do not re-attempt the quadratic smooth build.
+    let n = 200usize;
+    let weights: Vec<u32> = (0..n)
+        .map(|i| if i == 0 { 65_535 } else { 1 })
+        .collect();
+    let targets = weighted_targets(&weights);
+    let lb = LoadBalancer::new(
+        UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    );
+
+    let mut heavy = 0u64;
+    let samples = 400usize;
+    for _ in 0..samples {
+        let sel = lb
+            .select("", None)
+            .expect("lottery-sentinel WRR selection");
+        assert!(sel.target.weight > 0);
+        if sel.target.host == "host0" {
+            heavy += 1;
+        }
+    }
+
+    let (publishes, _fallbacks) = lb.wrr_parent_schedule_counters();
+    assert_eq!(
+        publishes, 1,
+        "exact-key lottery sentinel must publish once, not on every selection"
+    );
+    // Lottery is not exact smooth-WRR, but the heavy target must remain reachable
+    // and dominate zero-weight exclusion (all weights here are positive).
+    assert!(
+        heavy > 0,
+        "heavy positive-weight target must remain selectable under lottery sentinel"
+    );
+}
+
+#[test]
+fn wrr_all_zero_weights_round_robin_under_concurrency() {
+    let targets = weighted_targets(&[0, 0, 0, 0]);
+    let lb = Arc::new(LoadBalancer::new(
+        UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    ));
+    let counts = Arc::new([
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ]);
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let lb = Arc::clone(&lb);
+        let counts = Arc::clone(&counts);
+        handles.push(thread::spawn(move || {
+            for _ in 0..500 {
+                let sel = lb.select("", None).expect("zero-weight RR");
+                let idx: usize = sel
+                    .target
+                    .host
+                    .trim_start_matches("host")
+                    .parse()
+                    .expect("host index");
+                counts[idx].fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("worker");
+    }
+    let total: u64 = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    assert_eq!(total, 8 * 500);
+    for (i, c) in counts.iter().enumerate() {
+        let share = c.load(Ordering::Relaxed) as f64 / total as f64;
+        assert!(
+            (share - 0.25).abs() < 0.08,
+            "zero-weight host{i} share {share} outside fairness band"
+        );
+    }
 }
