@@ -28,8 +28,6 @@ jobs:
     name: CI Plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
       run_helm: ${{ steps.plan.outputs.run_helm }}
