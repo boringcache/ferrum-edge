@@ -2877,8 +2877,7 @@ fn test_response_content_type_refinement_releases_irrelevant_media_types() {
     )]);
     let json_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-    let xml_headers =
-        HashMap::from([("content-type".to_string(), "application/xml".to_string())]);
+    let xml_headers = HashMap::from([("content-type".to_string(), "application/xml".to_string())]);
 
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
@@ -2912,12 +2911,7 @@ fn test_response_content_type_refinement_releases_irrelevant_media_types() {
         200,
         &xml_headers,
     ));
-    assert!(plugin.should_buffer_response_body_for_content_type(
-        &ctx,
-        None,
-        200,
-        &HashMap::new(),
-    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new(),));
 
     // Retry-aware release must stream irrelevant types once headers are known.
     assert!(plugin.may_release_response_body_under_retries(&ctx));
@@ -2925,11 +2919,9 @@ fn test_response_content_type_refinement_releases_irrelevant_media_types() {
     assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &octet_headers));
     assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_headers));
     // Content-Type rewrite safety: only SSE uses the pre-rewrite release hook.
-    assert!(!plugin.should_release_response_body_before_content_type_rewrite(
-        &ctx,
-        200,
-        &png_headers,
-    ));
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &png_headers,)
+    );
 }
 
 #[test]
@@ -3019,8 +3011,10 @@ fn test_protobuf_response_refinement_retains_applicable_grpc_and_releases_others
         200,
         &grpc_headers,
     ));
-    ctx.metadata
-        .insert("grpc_full_method".to_string(), "test.Greeter/SayHello".to_string());
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
     assert!(method_plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("application/grpc"),

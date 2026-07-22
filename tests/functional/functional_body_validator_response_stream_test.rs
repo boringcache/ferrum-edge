@@ -230,7 +230,11 @@ async fn spawn_typed_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
                 if req.contains("GET /download.png") {
                     ("200 OK", "image/png", vec![0x89u8; OVERSIZED_LEN])
                 } else if req.contains("GET /missing.json") {
-                    ("200 OK", "application/json", br#"{"name":"no-id"}"#.to_vec())
+                    (
+                        "200 OK",
+                        "application/json",
+                        br#"{"name":"no-id"}"#.to_vec(),
+                    )
                 } else if req.contains("GET /item.json") {
                     ("200 OK", "application/json", br#"{"id":"ok"}"#.to_vec())
                 } else {

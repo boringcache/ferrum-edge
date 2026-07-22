@@ -38614,8 +38614,7 @@ mod tests {
             .unwrap(),
         )];
 
-        let png_headers =
-            HashMap::from([("content-type".to_string(), "image/png".to_string())]);
+        let png_headers = HashMap::from([("content-type".to_string(), "image/png".to_string())]);
         let json_headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
