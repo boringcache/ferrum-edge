@@ -7788,8 +7788,8 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
         .build(&schema)
         .expect("AiRateLimiterConfig schema compiles");
 
-    let provider_schema = spec["components"]["schemas"]["AiRateLimiterConfig"]["properties"]["provider"]
-        .clone();
+    let provider_schema =
+        spec["components"]["schemas"]["AiRateLimiterConfig"]["properties"]["provider"].clone();
     let enum_values: Vec<String> = provider_schema["enum"]
         .as_array()
         .expect("provider enum must be present")
@@ -7798,7 +7798,15 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
         .collect();
     assert_eq!(
         enum_values,
-        vec!["auto", "openai", "anthropic", "google", "cohere", "mistral", "bedrock"],
+        vec![
+            "auto",
+            "openai",
+            "anthropic",
+            "google",
+            "cohere",
+            "mistral",
+            "bedrock"
+        ],
         "provider enum must match the runtime accepted set"
     );
 

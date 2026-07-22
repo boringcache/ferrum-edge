@@ -18461,7 +18461,10 @@ components:
           type: string
           enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
           default: auto
-          description: LLM provider format for token extraction. Accepted values: auto, openai, anthropic, google, cohere, mistral, bedrock. Gemini/Vertex payloads use `google`.
+          description: >-
+            LLM provider format for token extraction. Accepted values: auto,
+            openai, anthropic, google, cohere, mistral, bedrock. Gemini/Vertex
+            payloads use `google`.
         on_unmetered_response:
           type: string
           enum: [reject, charge_estimate, warn]
