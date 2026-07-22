@@ -3683,3 +3683,242 @@ mod x509_roundtrip {
         assert!(err.contains("failed to load trusted cert"), "got: {err}");
     }
 }
+
+// ── #2329: compressed SOAP + compression decompress_request interoperability ─
+
+fn gzip_compress(plaintext: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(plaintext).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn brotli_compress(plaintext: &[u8]) -> Vec<u8> {
+    let params = brotli::enc::BrotliEncoderParams::default();
+    let mut compressed = Vec::new();
+    brotli::BrotliCompress(&mut &plaintext[..], &mut compressed, &params).unwrap();
+    compressed
+}
+
+async fn run_compressed_soap_lifecycle(
+    encoding: &str,
+    compressed: Vec<u8>,
+    plaintext: &str,
+    max_decompressed_request_size: Option<usize>,
+) -> (PluginResult, Vec<u8>, HashMap<String, String>, RequestContext) {
+    use ferrum_edge::_test_support::apply_buffered_request_body_normalization_before_before_proxy_for_test;
+    use ferrum_edge::plugins::compression::CompressionPlugin;
+    use std::sync::Arc;
+
+    let mut compression_cfg = json!({ "decompress_request": true });
+    if let Some(limit) = max_decompressed_request_size {
+        compression_cfg["max_decompressed_request_size"] = json!(limit);
+    }
+    let compression = Arc::new(CompressionPlugin::new(&compression_cfg).unwrap());
+    let soap = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/ws".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "text/xml".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), encoding.to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(&compressed));
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/xml".to_string());
+    headers.insert("content-encoding".to_string(), encoding.to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+
+    let mut body = compressed;
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&compression) as Arc<dyn Plugin>];
+    let normalize =
+        apply_buffered_request_body_normalization_before_before_proxy_for_test(
+            &plugins, &mut ctx, &mut headers, &mut body,
+        )
+        .await;
+    if !matches!(normalize, PluginResult::Continue) {
+        return (normalize, body, headers, ctx);
+    }
+
+    // SOAP runs at priority 1500, before compression's before_proxy (4050).
+    // After shared normalization it must see plaintext XML.
+    assert_eq!(
+        ctx.request_body_bytes.as_deref(),
+        Some(plaintext.as_bytes()),
+        "normalization must expose plaintext to soap_ws_security"
+    );
+    let soap_result = soap.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(soap_result, PluginResult::Continue),
+        "soap_ws_security must accept decompressed SOAP, got {soap_result:?}"
+    );
+
+    assert!(matches!(
+        compression.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let transformed = compression
+        .transform_request_body_with_context(&mut ctx, &body, Some("text/xml"), &headers)
+        .await;
+    assert!(
+        transformed.is_none(),
+        "already-normalized plaintext must not be decoded again"
+    );
+    assert_eq!(body.as_slice(), plaintext.as_bytes());
+    assert!(!headers.contains_key("content-encoding"));
+    assert!(!headers.contains_key("content-length"));
+
+    (PluginResult::Continue, body, headers, ctx)
+}
+
+#[tokio::test]
+async fn compressed_gzip_soap_is_visible_to_ws_security_before_validation() {
+    let plaintext = wrap_soap(&fresh_timestamp());
+    let compressed = gzip_compress(plaintext.as_bytes());
+    let (result, body, headers, _) =
+        run_compressed_soap_lifecycle("gzip", compressed, &plaintext, None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body.as_slice(), plaintext.as_bytes());
+    assert!(!headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn compressed_brotli_soap_is_visible_to_ws_security_before_validation() {
+    let plaintext = wrap_soap(&fresh_timestamp());
+    let compressed = brotli_compress(plaintext.as_bytes());
+    let (result, body, headers, _) =
+        run_compressed_soap_lifecycle("br", compressed, &plaintext, None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body.as_slice(), plaintext.as_bytes());
+    assert!(!headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn malformed_gzip_soap_is_rejected_before_ws_security() {
+    use ferrum_edge::_test_support::apply_buffered_request_body_normalization_before_before_proxy_for_test;
+    use ferrum_edge::plugins::compression::CompressionPlugin;
+    use std::sync::Arc;
+
+    let compression = Arc::new(
+        CompressionPlugin::new(&json!({ "decompress_request": true })).unwrap(),
+    );
+    let soap = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let corrupt = vec![0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00];
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/ws".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "text/xml".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(&corrupt));
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/xml".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), corrupt.len().to_string());
+
+    let mut body = corrupt.clone();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![compression as Arc<dyn Plugin>];
+    let normalize =
+        apply_buffered_request_body_normalization_before_before_proxy_for_test(
+            &plugins, &mut ctx, &mut headers, &mut body,
+        )
+        .await;
+    match normalize {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for malformed gzip, got {other:?}"),
+    }
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "headers must stay intact on failed decode"
+    );
+    assert!(headers.contains_key("content-length"));
+
+    // SOAP must not run after a failed normalize in production ordering; pin that
+    // the still-compressed bytes would not validate as SOAP XML.
+    let soap_on_compressed = soap.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        is_reject(&soap_on_compressed),
+        "compressed bytes must not satisfy SOAP validation"
+    );
+}
+
+#[tokio::test]
+async fn over_limit_gzip_soap_is_rejected_before_ws_security() {
+    use ferrum_edge::_test_support::apply_buffered_request_body_normalization_before_before_proxy_for_test;
+    use ferrum_edge::plugins::compression::CompressionPlugin;
+    use std::sync::Arc;
+
+    let compression = Arc::new(
+        CompressionPlugin::new(&json!({
+            "decompress_request": true,
+            "max_decompressed_request_size": 64,
+        }))
+        .unwrap(),
+    );
+    let big = "A".repeat(500);
+    let compressed = gzip_compress(big.as_bytes());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/ws".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "text/xml".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(&compressed));
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/xml".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+
+    let mut body = compressed;
+    let plugins: Vec<Arc<dyn Plugin>> = vec![compression as Arc<dyn Plugin>];
+    let normalize =
+        apply_buffered_request_body_normalization_before_before_proxy_for_test(
+            &plugins, &mut ctx, &mut headers, &mut body,
+        )
+        .await;
+    match normalize {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected Reject for over-limit gzip, got {other:?}"),
+    }
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+}
+
+#[tokio::test]
+async fn compressed_soap_without_early_normalization_is_rejected_by_ws_security() {
+    // Documents the pre-fix failure mode: soap_ws_security at 1500 sees gzip
+    // bytes before compression's later hooks can decode them.
+    let plaintext = wrap_soap(&fresh_timestamp());
+    let compressed = gzip_compress(plaintext.as_bytes());
+    let mut ctx = make_ctx_with_soap_bytes(compressed, "text/xml");
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    let mut headers = soap_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let soap = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let result = soap.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        is_reject(&result),
+        "gzip bytes without early normalization must fail SOAP validation"
+    );
+}

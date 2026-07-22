@@ -38,25 +38,26 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 1. `on_request_received`: tracing/CORS/termination/IP+geo/bot/spec_expose/spiffe/SSE/gRPC-Web/size+rate/tx_debug
 2. `authenticate`: mTLS, JWKS, JWT, keyauth, LDAP, basicauth, HMAC
 3. `authorize`: ACL, mesh_authz, rate limiting
-4. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, serverless, mock, gRPC deadline, mirror, load, cache, compression
-5. `on_final_request_body`: body validator and gRPC-Web validation
-6. `after_proxy`: response-side counterpart to before_proxy
+4. `normalize_buffered_request_body_before_before_proxy`: configured request decompression (and any future early body normalizers) after the pre-`before_proxy` buffer is stored
+5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, serverless, mock, gRPC deadline, mirror, load, cache, compression
+6. `on_final_request_body`: body validator and gRPC-Web validation
+7. `after_proxy`: response-side counterpart to before_proxy
    - Successful H1/H2/H3 WebSocket handshakes bypass general `after_proxy` and
      instead run the synchronous, non-rejecting
      `apply_websocket_handshake_response_headers` boundary in configured order.
      Transport-owned handshake/framing fields are stripped afterward and
      restored only by proxy core.
-7. `normalize_response_body`: provider/protocol adapters produce the client-visible buffered representation
-8. `on_response_body`: AI response guard and token metrics inspect the normalized body
-9. `transform_response_body`: ordinary client-facing body rewrites
-10. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
-11. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
-12. `on_ws_frame`: WS size, rate, and frame logging
+8. `normalize_response_body`: provider/protocol adapters produce the client-visible buffered representation
+9. `on_response_body`: AI response guard and token metrics inspect the normalized body
+10. `transform_response_body`: ordinary client-facing body rewrites
+11. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
+12. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
+13. `on_ws_frame`: WS size, rate, and frame logging
     - First terminal Close from an admission/mutating hook wins; later mutating
       plugins are skipped for that frame while observational hooks
       (`observes_ws_frame_decisions`) may still record the final decision.
-13. `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
-14. `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`
+14. `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
+15. `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`
 
 Streaming response inspectors are staged: `Normalize` runs before `Inspect`,
 with configured plugin order preserved within each stage. Do not hard-code

@@ -2,8 +2,11 @@
 //!
 //! Supports gzip and brotli algorithms. Response compression is negotiated via
 //! the client's `Accept-Encoding` header (RFC 9110 §12.5.3). Request
-//! decompression is opt-in and decompresses `Content-Encoding: gzip|br` request
-//! bodies before other plugins inspect them.
+//! decompression is opt-in: when enabled, supported `Content-Encoding: gzip|br`
+//! request bodies are decoded in the shared pre-`before_proxy` normalization
+//! phase so earlier body consumers (for example `soap_ws_security`) inspect
+//! validated plaintext. The same plaintext is forwarded to the backend after
+//! encoding/length headers are stripped only on successful decode.
 //!
 //! Multiple effective instances compose with first-wins ownership: one instance
 //! owns request decode and one owns response encode per request so Content-
@@ -115,6 +118,11 @@ static NEXT_COMPRESSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// the hook), so a strip here is visible to every later phase, and only this
 /// snapshot still describes what the client actually negotiated.
 pub(crate) const REQUEST_ACCEPT_ENCODING_METADATA_KEY: &str = "compression:accept_encoding";
+
+/// Set when configured request decompression replaced the buffered body with
+/// validated plaintext before `before_proxy`. Later transforms must not decode
+/// again; the backend already receives the normalized bytes.
+pub(crate) const REQUEST_DECODED_METADATA_KEY: &str = "compression:request_decoded";
 
 struct CompressionConfig {
     /// Enabled algorithms in server-preference order (used to break q-value ties).
@@ -265,6 +273,110 @@ impl CompressionPlugin {
 
     fn is_response_encode_owner(&self, ctx: &RequestContext) -> bool {
         ctx.owns_compression_response_encode(self.instance_id)
+    }
+
+    /// Validate/decode a supported request coding, claim ownership, and strip
+    /// public encoding metadata only after success.
+    ///
+    /// When `body` is provided (pre-`before_proxy` normalization), successful
+    /// decode replaces it with plaintext so later `before_proxy` consumers see
+    /// the same bytes the backend will receive. When `body` is `None`, this
+    /// only validates `ctx.request_body_bytes` (legacy buffered `before_proxy`
+    /// path / rare unbuffered fallback) and leaves the transform stage to emit
+    /// plaintext.
+    fn try_claim_and_decode_request(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: Option<&mut Vec<u8>>,
+    ) -> PluginResult {
+        if !self.config.decompress_request || ctx.has_compression_request_decode_owner() {
+            return PluginResult::Continue;
+        }
+        let Some(ce) = headers.get("content-encoding") else {
+            return PluginResult::Continue;
+        };
+        let Some(encoding) = supported_request_encoding(ce) else {
+            return PluginResult::Continue;
+        };
+
+        let decode_source: &[u8] = if let Some(body) = body.as_deref() {
+            body
+        } else if let Some(bytes) = ctx.request_body_bytes.as_ref() {
+            bytes.as_ref()
+        } else {
+            // Unbuffered path (e.g. HBONE CONNECT): claim/strip for the later
+            // transform fallback without a rejectable body view.
+            let claimed = ctx.claim_compression_request_decode(self.instance_id);
+            debug_assert!(
+                claimed,
+                "request decode owner changed within a sequential hook chain"
+            );
+            ctx.metadata.insert(
+                "compression:request_encoding".to_string(),
+                encoding.to_string(),
+            );
+            headers.remove("content-encoding");
+            headers.insert(
+                "x-ferrum-original-content-encoding".to_string(),
+                encoding.to_string(),
+            );
+            headers.remove("content-length");
+            return PluginResult::Continue;
+        };
+
+        let decode_result = if decode_source.is_empty() {
+            Err("empty compressed request body".to_string())
+        } else {
+            self.decompress(
+                encoding,
+                decode_source,
+                self.config.max_decompressed_request_size,
+            )
+        };
+        let decompressed = match decode_result {
+            Ok(plain) => plain,
+            Err(e) => {
+                warn!("compression: rejecting request with undecodable {encoding} body: {e}");
+                return PluginResult::Reject {
+                    status_code: 400,
+                    body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
+                    headers: HashMap::new(),
+                };
+            }
+        };
+
+        let claimed = ctx.claim_compression_request_decode(self.instance_id);
+        debug_assert!(
+            claimed,
+            "request decode owner changed within a sequential hook chain"
+        );
+        ctx.metadata.insert(
+            "compression:request_encoding".to_string(),
+            encoding.to_string(),
+        );
+        headers.remove("content-encoding");
+        headers.insert(
+            "x-ferrum-original-content-encoding".to_string(),
+            encoding.to_string(),
+        );
+        headers.remove("content-length");
+
+        if let Some(body) = body {
+            debug!(
+                "compression: normalized request body from {} to {} bytes ({})",
+                body.len(),
+                decompressed.len(),
+                encoding
+            );
+            *body = decompressed;
+            ctx.metadata.insert(
+                REQUEST_DECODED_METADATA_KEY.to_string(),
+                encoding.to_string(),
+            );
+        }
+
+        PluginResult::Continue
     }
 
     /// Parse `Accept-Encoding` and negotiate the representation coding among
@@ -937,20 +1049,39 @@ impl Plugin for CompressionPlugin {
     }
 
     /// Buffer the request body before `before_proxy` runs so the decompression
-    /// can be validated (and a malformed body cleanly rejected) before the
-    /// Content-Encoding/Content-Length headers are stripped. Without this the
-    /// body would only become available in `transform_request_body`, which
-    /// cannot reject. This stays gated by `should_buffer_request_body`, so only
-    /// requests that carry a decodable `Content-Encoding` header buffer early.
+    /// can be validated (and a malformed body cleanly rejected) in the shared
+    /// pre-`before_proxy` normalization phase before Content-Encoding /
+    /// Content-Length headers are stripped. This stays gated by
+    /// `should_buffer_request_body`, so only requests that carry a decodable
+    /// `Content-Encoding` header buffer early.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.config.decompress_request
     }
 
-    /// The validation in `before_proxy` decompresses arbitrary (possibly
-    /// non-UTF-8) bytes, so it reads `ctx.request_body_bytes` rather than the
-    /// UTF-8 `ctx.metadata["request_body"]` view.
+    fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        self.config.decompress_request
+    }
+
+    /// The validation in `before_proxy` / early normalization decompresses
+    /// arbitrary (possibly non-UTF-8) bytes, so it reads
+    /// `ctx.request_body_bytes` rather than the UTF-8
+    /// `ctx.metadata["request_body"]` view.
     fn needs_request_body_bytes(&self) -> bool {
         self.config.decompress_request
+    }
+
+    async fn normalize_buffered_request_body_before_before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: &mut Vec<u8>,
+    ) -> PluginResult {
+        // Strip client-spoofed values of the gateway-internal marker only
+        // before any compression instance has claimed request-decode ownership.
+        if !ctx.has_compression_request_decode_owner() {
+            headers.remove("x-ferrum-original-content-encoding");
+        }
+        self.try_claim_and_decode_request(ctx, headers, Some(body))
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -1129,75 +1260,17 @@ impl Plugin for CompressionPlugin {
             }
         }
 
-        // For request decompression: save the Content-Encoding value before
-        // removing it, so transform_request_body can find it. The private header
-        // x-ferrum-original-content-encoding is used because transform_request_body
-        // receives the same headers map (with content-encoding already removed).
-        // Only the first claiming instance may strip public encoding metadata —
-        // stripping without a guaranteed owner transform would forward encoded
-        // bytes without Content-Encoding.
-        if self.config.decompress_request
-            && !ctx.has_compression_request_decode_owner()
-            && let Some(ce) = headers.get("content-encoding")
-            && let Some(encoding) = supported_request_encoding(ce)
-        {
-            // Validate that the body actually decompresses BEFORE stripping the
-            // Content-Encoding/Content-Length headers. Stripping is gated on
-            // successful decompression so we never forward a body whose headers
-            // and contents disagree (RFC 9110 §8.4): if we removed
-            // Content-Encoding but left the body compressed (because decode
-            // later failed in transform_request_body, which has no way to
-            // reject), the backend would receive a gzip/brotli blob mislabeled
-            // as plaintext and emit confusing 400s / mis-parsed data instead of
-            // a clean gateway rejection.
-            //
-            // The body is buffered before before_proxy (see
-            // `requires_request_body_before_before_proxy`) and exposed binary
-            // safe via `ctx.request_body_bytes`. We only have it on the buffered
-            // request path; if it is absent (e.g. an HBONE CONNECT tunnel where
-            // pre-before_proxy buffering is skipped) we fall back to the prior
-            // best-effort behaviour and let transform_request_body handle it.
-            if let Some(body) = ctx.request_body_bytes.as_ref() {
-                let decode_result = if body.is_empty() {
-                    Err("empty compressed request body".to_string())
-                } else {
-                    self.decompress(encoding, body, self.config.max_decompressed_request_size)
-                        .map(|_| ())
-                };
-                if let Err(e) = decode_result {
-                    // Reject with a protocol-appropriate gateway error. The proxy
-                    // normalizes this to a trailers-only gRPC error for
-                    // application/grpc and a plain 400 otherwise. The detailed
-                    // cause is logged, not leaked to the client.
-                    warn!("compression: rejecting request with undecodable {encoding} body: {e}");
-                    return PluginResult::Reject {
-                        status_code: 400,
-                        body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-            }
-
-            let claimed = ctx.claim_compression_request_decode(self.instance_id);
-            debug_assert!(
-                claimed,
-                "request decode owner changed within a sequential hook chain"
-            );
-            ctx.metadata.insert(
-                "compression:request_encoding".to_string(),
-                encoding.to_string(),
-            );
-            headers.remove("content-encoding");
-            headers.insert(
-                "x-ferrum-original-content-encoding".to_string(),
-                encoding.to_string(),
-            );
-            // Content-Length will be wrong after decompression; remove it
-            // so the backend uses chunked transfer or recalculates.
-            headers.remove("content-length");
+        // For request decompression: when the shared pre-`before_proxy`
+        // normalization phase already claimed/decoded, skip. Otherwise validate
+        // (and claim/strip) here so malformed bodies still fail closed on the
+        // rare path where early normalization did not run with a body view.
+        //
+        // Stripping is gated on successful decompression so we never forward a
+        // body whose headers and contents disagree (RFC 9110 §8.4).
+        match self.try_claim_and_decode_request(ctx, headers, None) {
+            PluginResult::Continue => PluginResult::Continue,
+            reject @ (PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }) => reject,
         }
-
-        PluginResult::Continue
     }
 
     async fn after_proxy(
@@ -1359,9 +1432,14 @@ impl Plugin for CompressionPlugin {
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Production H1/H2/H3 loops call this context-aware path. Only the
-        // instance that claimed decode ownership in `before_proxy` may rewrite
-        // the body — siblings return None so the bytes are decoded exactly once.
+        // instance that claimed decode ownership may rewrite the body —
+        // siblings return None so the bytes are decoded exactly once.
         if !self.is_request_decode_owner(ctx) {
+            return None;
+        }
+        // Early normalization already replaced the buffered body with validated
+        // plaintext; re-decoding would corrupt the backend-visible bytes.
+        if ctx.metadata.contains_key(REQUEST_DECODED_METADATA_KEY) {
             return None;
         }
         self.transform_request_body(body, content_type, request_headers)

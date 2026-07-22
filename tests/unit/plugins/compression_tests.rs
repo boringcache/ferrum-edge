@@ -3071,6 +3071,52 @@ async fn test_custom_content_types() {
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
 }
 
+/// #2329: early normalization replaces the buffered body with plaintext and
+/// strips encoding headers only after successful decode.
+#[tokio::test]
+async fn test_normalize_buffered_request_body_decodes_before_before_proxy() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"early normalize plaintext";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+    let mut body = compressed.clone();
+
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body.as_slice(), original.as_slice());
+    assert!(!headers.contains_key("content-encoding"));
+    assert!(!headers.contains_key("content-length"));
+    assert_eq!(
+        ctx.metadata
+            .get("compression:request_decoded")
+            .map(String::as_str),
+        Some("gzip")
+    );
+
+    // before_proxy must not re-claim; transform must not decode again.
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_request_body_with_context(&mut ctx, &body, None, &headers)
+            .await
+            .is_none()
+    );
+}
+
 // ────────────────────── before_proxy: request decompression header cleanup ─
 
 #[tokio::test]
@@ -4828,13 +4874,19 @@ fn test_h1_h2_h3_paths_share_multi_instance_body_transform_loops() {
         h1_h2.contains("apply_request_body_plugins_with_context(")
             && h1_h2.contains("transform_request_body_with_context(")
             && h1_h2.contains("transform_buffered_response_body_with_deadline(")
-            && h1_h2.contains("transform_response_body_with_context("),
-        "H1/H2 must use the shared request/response body transform loops"
+            && h1_h2.contains("transform_response_body_with_context(")
+            && h1_h2.contains(
+                "apply_buffered_request_body_normalization_before_before_proxy("
+            ),
+        "H1/H2 must use the shared request/response body transform loops and pre-before_proxy normalization"
     );
     assert!(
         h3.contains("apply_request_body_plugins_with_context(")
-            && h3.contains("transform_buffered_response_body_with_deadline("),
-        "native H3 must use the shared body transform helpers"
+            && h3.contains("transform_buffered_response_body_with_deadline(")
+            && h3.contains(
+                "apply_buffered_request_body_normalization_before_before_proxy("
+            ),
+        "native H3 must use the shared body transform helpers and pre-before_proxy normalization"
     );
     assert!(
         h3_cross.contains("apply_request_body_plugins_with_context("),
