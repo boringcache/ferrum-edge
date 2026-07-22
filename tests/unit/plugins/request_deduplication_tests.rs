@@ -349,6 +349,14 @@ async fn production_factory_partitions_logical_keys_by_plugin_config_id() {
     )
     .unwrap()
     .unwrap();
+    let whitespace_distinct = create_plugin_with_http_client_and_config_id(
+        "request_deduplication",
+        &config,
+        PluginHttpClient::default(),
+        Some(" dedup-short "),
+    )
+    .unwrap()
+    .unwrap();
 
     async fn logical_key(plugin: &Arc<dyn Plugin>) -> String {
         let mut ctx = body_ctx("POST", "/api/orders", b"{}");
@@ -365,6 +373,7 @@ async fn production_factory_partitions_logical_keys_by_plugin_config_id() {
     let first_key = logical_key(&first).await;
     let sibling_key = logical_key(&sibling).await;
     let peer_key = logical_key(&same_config_peer).await;
+    let whitespace_distinct_key = logical_key(&whitespace_distinct).await;
     assert_ne!(
         first_key, sibling_key,
         "production factory must partition sibling plugin_config_id values"
@@ -372,6 +381,10 @@ async fn production_factory_partitions_logical_keys_by_plugin_config_id() {
     assert_eq!(
         first_key, peer_key,
         "corresponding copies of one plugin_config_id must share Redis identity"
+    );
+    assert_ne!(
+        first_key, whitespace_distinct_key,
+        "distinct nonblank plugin_config_id bytes must not collapse after validation"
     );
 }
 

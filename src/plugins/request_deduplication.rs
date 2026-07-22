@@ -374,8 +374,7 @@ impl RequestDeduplication {
         // constructors cannot collapse onto one distributed key space.
         // Process-local `instance_id` is intentionally not used here: it would
         // break intentional cross-gateway sharing for the same config.
-        let config_id = config_id.trim();
-        if config_id.is_empty() {
+        if config_id.trim().is_empty() {
             return Err(
                 "request_deduplication: plugin config id must be a non-empty stable identity"
                     .to_string(),
@@ -421,6 +420,8 @@ impl RequestDeduplication {
 
         Ok(Self {
             instance_id: NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            // Preserve the configured resource identity byte-for-byte. Trimming
+            // here would collapse distinct nonblank IDs onto one Redis keyspace.
             config_id: config_id.to_owned(),
             header_name,
             ttl,
