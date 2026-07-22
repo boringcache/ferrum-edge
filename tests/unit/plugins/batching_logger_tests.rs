@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, DeferredBatchingLogger, LoggerHooks,
-    MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config,
-    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
-    wait_until_committed,
+    MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
+    MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config, handle_http_batch_response,
+    parse_custom_headers, parse_http_endpoint, validate_batch_config, wait_until_committed,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
@@ -73,6 +73,7 @@ fn batch_defaults() -> BatchConfigDefaults {
         buffer_capacity: 10_000,
         max_retries: 3,
         retry_delay_ms: 1000,
+        min_retry_delay_ms: 0,
     }
 }
 
@@ -83,35 +84,38 @@ async fn wait_for_flush(notify: &Notify) {
 }
 
 #[test]
-fn build_batch_config_caps_unbounded_values() {
-    let cfg = build_batch_config(
-        &json!({
-            "batch_size": u64::MAX,
-            "buffer_capacity": u64::MAX,
-            "max_retries": u64::MAX
-        }),
-        "batching_logger_bounds",
-        batch_defaults(),
-    );
-
-    assert_eq!(cfg.batch_size, MAX_BATCH_SIZE);
-    assert_eq!(cfg.buffer_capacity, MAX_BUFFER_CAPACITY);
-    assert_eq!(cfg.retry.max_attempts, u32::MAX);
+fn build_batch_config_rejects_out_of_range_values() {
+    for config in [
+        json!({"batch_size": 0}),
+        json!({"batch_size": MAX_BATCH_SIZE as u64 + 1}),
+        json!({"buffer_capacity": 0}),
+        json!({"buffer_capacity": MAX_BUFFER_CAPACITY as u64 + 1}),
+        json!({"flush_interval_ms": 1}),
+        json!({"flush_interval_ms": MAX_BATCH_FLUSH_INTERVAL_MS + 1}),
+        json!({"max_retries": MAX_BATCH_RETRIES + 1}),
+        json!({"retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS + 1}),
+    ] {
+        assert!(
+            build_batch_config(&config, "batching_logger_bounds", batch_defaults()).is_err(),
+            "expected out-of-range config to be rejected: {config}"
+        );
+    }
 }
 
 #[test]
-fn build_batch_config_applies_defaults_and_lower_bounds() {
+fn build_batch_config_applies_defaults_and_valid_boundaries() {
     let cfg = build_batch_config(
         &json!({
-            "batch_size": 0,
-            "buffer_capacity": 0,
-            "flush_interval_ms": 1,
+            "batch_size": 1,
+            "buffer_capacity": 1,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "retry_delay_ms": 0
         }),
         "batching_logger_bounds",
         batch_defaults(),
-    );
+    )
+    .expect("valid lower boundaries");
 
     assert_eq!(cfg.batch_size, 1);
     assert_eq!(cfg.buffer_capacity, 1);
@@ -120,7 +124,32 @@ fn build_batch_config_applies_defaults_and_lower_bounds() {
     assert_eq!(cfg.retry.delay, Duration::from_millis(0));
     assert_eq!(cfg.plugin_name, "batching_logger_bounds");
 
-    let default_cfg = build_batch_config(&json!({}), "batching_logger_defaults", batch_defaults());
+    let upper = build_batch_config(
+        &json!({
+            "batch_size": MAX_BATCH_SIZE,
+            "buffer_capacity": MAX_BUFFER_CAPACITY,
+            "flush_interval_ms": MAX_BATCH_FLUSH_INTERVAL_MS,
+            "max_retries": MAX_BATCH_RETRIES,
+            "retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS
+        }),
+        "batching_logger_bounds",
+        batch_defaults(),
+    )
+    .expect("valid upper boundaries");
+    assert_eq!(upper.batch_size, MAX_BATCH_SIZE);
+    assert_eq!(upper.buffer_capacity, MAX_BUFFER_CAPACITY);
+    assert_eq!(
+        upper.flush_interval,
+        Duration::from_millis(MAX_BATCH_FLUSH_INTERVAL_MS)
+    );
+    assert_eq!(upper.retry.max_attempts, (MAX_BATCH_RETRIES + 1) as u32);
+    assert_eq!(
+        upper.retry.delay,
+        Duration::from_millis(MAX_BATCH_RETRY_DELAY_MS)
+    );
+
+    let default_cfg = build_batch_config(&json!({}), "batching_logger_defaults", batch_defaults())
+        .expect("defaults");
     assert_eq!(default_cfg.batch_size, 50);
     assert_eq!(default_cfg.buffer_capacity, 10_000);
     assert_eq!(default_cfg.flush_interval, Duration::from_millis(1000));
@@ -129,19 +158,97 @@ fn build_batch_config_applies_defaults_and_lower_bounds() {
 }
 
 #[test]
-fn validate_batch_config_rejects_malformed_numeric_values() {
-    for config in [
-        json!({"batch_size": "many"}),
-        json!({"flush_interval_ms": false}),
-        json!({"buffer_capacity": -1}),
-        json!({"max_retries": {}}),
-        json!({"retry_delay_ms": []}),
+fn validate_batch_config_rejects_malformed_and_out_of_range_values() {
+    let defaults = batch_defaults();
+    let fields = [
+        "batch_size",
+        "flush_interval_ms",
+        "buffer_capacity",
+        "max_retries",
+        "retry_delay_ms",
+    ];
+    let malformed = [
+        json!(null),
+        json!("bad"),
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(-1),
+    ];
+
+    for field in fields {
+        for bad in &malformed {
+            let mut config = json!({});
+            config[field] = bad.clone();
+            let err = validate_batch_config(&config, "batching_logger_bounds", defaults)
+                .expect_err(&format!("expected rejection for {field}={bad}"));
+            assert!(
+                err.contains(field),
+                "error for {field}={bad} must name the field; got {err}"
+            );
+        }
+    }
+
+    for (config, field) in [
+        (json!({"batch_size": 0}), "batch_size"),
+        (
+            json!({"batch_size": MAX_BATCH_SIZE as u64 + 1}),
+            "batch_size",
+        ),
+        (json!({"buffer_capacity": 0}), "buffer_capacity"),
+        (
+            json!({"buffer_capacity": MAX_BUFFER_CAPACITY as u64 + 1}),
+            "buffer_capacity",
+        ),
+        (json!({"flush_interval_ms": 99}), "flush_interval_ms"),
+        (
+            json!({"flush_interval_ms": MAX_BATCH_FLUSH_INTERVAL_MS + 1}),
+            "flush_interval_ms",
+        ),
+        (json!({"max_retries": MAX_BATCH_RETRIES + 1}), "max_retries"),
+        (
+            json!({"retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS + 1}),
+            "retry_delay_ms",
+        ),
     ] {
+        let err = validate_batch_config(&config, "batching_logger_bounds", defaults)
+            .expect_err(&format!("expected out-of-range rejection for {config}"));
         assert!(
-            validate_batch_config(&config, "batching_logger_bounds", batch_defaults()).is_err(),
-            "expected invalid config to be rejected: {config}"
+            err.contains(field),
+            "out-of-range error for {config} must name {field}; got {err}"
         );
     }
+
+    assert!(
+        validate_batch_config(
+            &json!({
+                "batch_size": 1,
+                "buffer_capacity": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 0,
+                "retry_delay_ms": 0
+            }),
+            "batching_logger_bounds",
+            defaults
+        )
+        .is_ok(),
+        "valid lower boundaries must be admitted"
+    );
+    assert!(
+        validate_batch_config(
+            &json!({
+                "batch_size": MAX_BATCH_SIZE,
+                "buffer_capacity": MAX_BUFFER_CAPACITY,
+                "flush_interval_ms": MAX_BATCH_FLUSH_INTERVAL_MS,
+                "max_retries": MAX_BATCH_RETRIES,
+                "retry_delay_ms": MAX_BATCH_RETRY_DELAY_MS
+            }),
+            "batching_logger_bounds",
+            defaults
+        )
+        .is_ok(),
+        "valid upper boundaries must be admitted"
+    );
 }
 
 #[test]

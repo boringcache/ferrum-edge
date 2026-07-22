@@ -44,7 +44,8 @@ Admin, file-mode, and CP-DP admission share the OpenAPI
 `config`, `clickhouse.url`, at least one valid pricing dimension, snapshot
 mode with `spool.enabled=true`, and compatible `password_ref`/TLS settings.
 Constructor validation additionally enforces relationships OpenAPI 3.1 cannot
-express safely (notably `retry.max_delay_ms >= retry.initial_delay_ms`),
+express safely (notably `retry.max_delay_ms >= retry.initial_delay_ms` and the
+600000 ms worst-case cumulative inter-attempt delay budget),
 spool directory privacy, ClickHouse egress screening, and that a nonempty
 `password_ref` names a set `FERRUM_*` environment variable.
 
@@ -121,15 +122,22 @@ must name a `FERRUM_*` variable.
 
 ## Retry
 
-A failed ClickHouse export is retried up to `retry.max_attempts` times. The
-inter-attempt delay uses **bounded exponential backoff**: it starts at
-`retry.initial_delay_ms` and doubles each attempt, capped at `retry.max_delay_ms`
-(which must be `>= retry.initial_delay_ms`). When `retry.jitter` is `true`
-(default), each delay is replaced with a uniformly random value in
-`[0, computed_delay]` (full jitter) so a fleet of nodes does not synchronize a
-retry storm against a struggling ClickHouse. After the attempt budget is
-exhausted the batch is handed to the spool (when enabled) instead of being
-dropped.
+A failed ClickHouse export uses `retry.max_attempts` total attempts (including
+the initial try; valid range **1–32**). `0` is rejected rather than silently
+rewritten. Batch `size` is capped at **10000** and `flush_interval_ms` at
+**600000** to match the shared `BatchingLogger` admission limits. Each of
+`retry.initial_delay_ms` and
+`retry.max_delay_ms` is capped at **60000** ms. The inter-attempt delay uses
+**bounded exponential backoff**: it starts at `retry.initial_delay_ms` and
+doubles each attempt, capped at `retry.max_delay_ms` (which must be
+`>= retry.initial_delay_ms`). The worst-case cumulative inter-attempt delay
+(same exponential/capped schedule, excluding the initial try and ignoring
+jitter reduction) must stay within **600000** ms (ten minutes); over-budget
+configurations are rejected. When `retry.jitter` is `true` (default), each
+delay is replaced with a uniformly random value in `[0, computed_delay]` (full
+jitter) so a fleet of nodes does not synchronize a retry storm against a
+struggling ClickHouse. After the attempt budget is exhausted the batch is
+handed to the spool (when enabled) instead of being dropped.
 
 ## Spool And Replay
 
@@ -216,8 +224,12 @@ node and time window.
 
 ## Status And Metrics
 
-`GET /charges/sink/status` is JWT-authenticated and returns queue depth, spool
-size, replay timestamps, and export counters. `/metrics` includes:
+`GET /charges/sink/status` is JWT-authenticated and returns the effective batch
+size, flush interval, and retry settings (`max_attempts`, `initial_delay_ms`,
+`max_delay_ms`, `jitter`), queue depth, spool size, replay timestamps, and
+export counters. While the sink is disabled the response keeps the same object
+shape with zeroed batch/retry numerics and `retry.jitter: false`. `/metrics`
+includes:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`

@@ -155,6 +155,7 @@ impl TcpLogging {
             buffer_capacity: 10000,
             max_retries: 3,
             retry_delay_ms: 1000,
+            min_retry_delay_ms: 0,
         };
         validate_batch_config(config, "tcp_logging", batch_defaults)?;
 
@@ -193,7 +194,7 @@ impl TcpLogging {
         };
 
         Ok(Self {
-            batch_config: build_batch_config(config, "tcp_logging", batch_defaults),
+            batch_config: build_batch_config(config, "tcp_logging", batch_defaults)?,
             flush_config,
             writer: Arc::new(Mutex::new(None)),
             logger: DeferredBatchingLogger::new(),

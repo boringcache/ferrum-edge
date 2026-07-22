@@ -358,6 +358,7 @@ impl ExampleAuditPlugin {
             buffer_capacity: queue_capacity,
             max_retries: 3,
             retry_delay_ms: 1000,
+            min_retry_delay_ms: 0,
         };
         // validate_batch_config expects buffer_capacity on the config object;
         // synthesize a view that includes the resolved queue capacity.
@@ -366,7 +367,7 @@ impl ExampleAuditPlugin {
             obj.insert("buffer_capacity".to_string(), Value::from(queue_capacity));
         }
         validate_batch_config(&batch_cfg_value, PLUGIN_NAME, batch_defaults)?;
-        let batch_config = build_batch_config(&batch_cfg_value, PLUGIN_NAME, batch_defaults);
+        let batch_config = build_batch_config(&batch_cfg_value, PLUGIN_NAME, batch_defaults)?;
 
         Ok(Self {
             log_request_headers,

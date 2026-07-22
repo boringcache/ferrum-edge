@@ -45,7 +45,8 @@ pub mod udp_endpoint;
 
 pub use batching_logger::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, BatchingLoggerPermit,
-    DeferredBatchingLogger, LoggerHooks, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
+    DeferredBatchingLogger, LoggerHooks, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES,
+    MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
     wait_until_committed,
 };
 pub use http_client::PluginHttpClient;
