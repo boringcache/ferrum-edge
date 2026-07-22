@@ -1,13 +1,13 @@
 //! Tests for api_chargeback plugin
 
+use ferrum_edge::PluginCache;
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::plugins::api_chargeback::{
     ApiChargeback, ChargebackRegistry, InstanceScope, ProtocolFamily, global_registry,
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, StreamTransactionSummary, TransactionSummary,
 };
-use ferrum_edge::PluginCache;
-use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -1685,19 +1685,56 @@ fn test_json_mixed_currency_consumer_totals_partitioned_not_summed() {
 
     // USD HTTP: per-call 1.0 + bandwidth 100*0.01 + 50*0.02 = 1.0 + 1.0 + 1.0 = 3.0
     registry.record_http(
-        &usd, "alice", "proxy-usd", "USD API", 200, 1.0, 100, 50, 0.01, 0.02,
+        &usd,
+        "alice",
+        "proxy-usd",
+        "USD API",
+        200,
+        1.0,
+        100,
+        50,
+        0.01,
+        0.02,
     );
     // EUR stream: connection 0.5 + bandwidth 10*0.1 + 20*0.05 = 0.5 + 1.0 + 1.0 = 2.5
     registry.record_stream(
-        &eur, "alice", "proxy-eur-stream", "EUR Stream", 0.5, 10, 20, 0.1, 0.05,
+        &eur,
+        "alice",
+        "proxy-eur-stream",
+        "EUR Stream",
+        0.5,
+        10,
+        20,
+        0.1,
+        0.05,
     );
     // EUR HTTP per-call only: 1.0
     registry.record_http(
-        &eur, "alice", "proxy-eur-http", "EUR HTTP", 200, 1.0, 0, 0, 0.0, 0.0,
+        &eur,
+        "alice",
+        "proxy-eur-http",
+        "EUR HTTP",
+        200,
+        1.0,
+        0,
+        0,
+        0.0,
+        0.0,
     );
     // A second consumer billed only in USD keeps numeric flat totals even when
     // the response-level currency is "mixed".
-    registry.record_http(&usd, "bob", "proxy-usd", "USD API", 200, 2.0, 0, 0, 0.0, 0.0);
+    registry.record_http(
+        &usd,
+        "bob",
+        "proxy-usd",
+        "USD API",
+        200,
+        2.0,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
 
     let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
     assert_eq!(json["currency"], "mixed");
@@ -1758,9 +1795,7 @@ fn test_json_mixed_currency_consumer_totals_partitioned_not_summed() {
 fn test_json_single_currency_consumer_keeps_flat_totals() {
     let registry = ChargebackRegistry::new();
     let usd = scope_for("USD", "ferrum");
-    registry.record_http(
-        &usd, "alice", "proxy-a", "A", 200, 1.0, 10, 0, 0.1, 0.0,
-    );
+    registry.record_http(&usd, "alice", "proxy-a", "A", 200, 1.0, 10, 0, 0.1, 0.0);
     registry.record_stream(&usd, "alice", "proxy-b", "B", 0.25, 0, 0, 0.0, 0.0);
 
     let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
@@ -1808,10 +1843,7 @@ fn chargeback_chain_plugin(
     currency: &str,
     pricing: serde_json::Value,
 ) -> PluginConfig {
-    let mut config = pricing
-        .as_object()
-        .cloned()
-        .expect("pricing config object");
+    let mut config = pricing.as_object().cloned().expect("pricing config object");
     config.insert("currency".to_string(), json!(currency));
     config.insert("cleanup_interval_seconds".to_string(), json!(0));
     serde_json::from_value(json!({
@@ -1873,11 +1905,7 @@ async fn test_effective_plugin_chain_partitions_multi_instance_currency_totals()
     let config = GatewayConfig {
         proxies: vec![
             chargeback_chain_proxy(USD_PROXY, "/issue-2569-usd", "charge-usd"),
-            chargeback_chain_proxy(
-                EUR_HTTP_PROXY,
-                "/issue-2569-eur-http",
-                "charge-eur-http",
-            ),
+            chargeback_chain_proxy(EUR_HTTP_PROXY, "/issue-2569-eur-http", "charge-eur-http"),
             chargeback_chain_stream_proxy(EUR_STREAM_PROXY, "charge-eur-stream"),
         ],
         plugin_configs,
