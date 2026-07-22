@@ -185,7 +185,10 @@ fn validate_batch_config_rejects_malformed_and_out_of_range_values() {
 
     for (config, field) in [
         (json!({"batch_size": 0}), "batch_size"),
-        (json!({"batch_size": MAX_BATCH_SIZE as u64 + 1}), "batch_size"),
+        (
+            json!({"batch_size": MAX_BATCH_SIZE as u64 + 1}),
+            "batch_size",
+        ),
         (json!({"buffer_capacity": 0}), "buffer_capacity"),
         (
             json!({"buffer_capacity": MAX_BUFFER_CAPACITY as u64 + 1}),
