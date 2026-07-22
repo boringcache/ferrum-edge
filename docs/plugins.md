@@ -2975,6 +2975,7 @@ Modifies response headers and JSON body fields before sending to the client. Whe
 config:
   rules:
     - operation: add
+      target: header             # required: header or body
       key: "X-Powered-By"
       value: "Ferrum-Gateway"
     - operation: rename
@@ -2984,15 +2985,19 @@ config:
     - operation: remove
       target: body
       key: "items.0"              # numeric segment removes an array element
+    - operation: add
+      target: body
+      key: "enabled"
+      value: true                 # native JSON types / null are valid for body
 ```
 
-Header rules default to `target: header` (no `target` field required). Body rules require explicit `target: body`.
+`target` is required on every rule — there is no default. Header rules must set `target: header`; body rules must set `target: body`.
 
 **Valid targets for `response_transformer` are `header` and `body` ONLY** — unlike `request_transformer`, there is no `query` target (query parameters are part of the request, not the response). Configs specifying `target: query` are rejected at plugin load time.
 
-**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected (no silent coercion).
+**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
 
-Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
+Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
 ### `security_headers`
 
@@ -3086,6 +3091,8 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB) |
 
 **Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
+
+**Content-type matching:** The whitelist is matched as an exact media-type token: the response `Content-Type` is split on the first semicolon, the token is trimmed, and compared ASCII case-insensitively against each configured entry. Parameters (e.g. `; charset=utf-8`) are ignored, so `application/json; charset=utf-8` matches `application/json`. Substring matching is intentionally avoided, so lexical near-misses such as `application/jsonp` or `application/json-patch-binary` do **not** match `application/json`, and parameter-only occurrences such as `application/octet-stream; profile="application/json"` do **not** match `application/json`. An empty or malformed media-type token fails closed (no match).
 
 **Response compression skip conditions** (checked in order):
 1. Response status is 204 or 304
@@ -3571,7 +3578,20 @@ Supports both encoding modes:
 - **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
 - **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
 
-On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. On the response path, `grpc_web` embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, binary `*-bin` metadata, and valid ASCII custom trailing metadata such as `request-id` — as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and initial response headers are not copied into the trailer block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name.
+Message-format suffixes (`+proto`, `+json`, `+thrift`, or another valid custom `+subtype`) are preserved on the negotiated response `Content-Type`.
+
+On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. Request-body decoding mode follows request `Content-Type` only.
+
+On the response path, `grpc_web` embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, binary `*-bin` metadata, and valid ASCII custom trailing metadata such as `request-id` — as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` to the **negotiated** gRPC-Web variant. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and initial response headers are not copied into the trailer block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name.
+
+**Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
+
+- Absent or empty `Accept` defaults to the request `Content-Type`'s mode and message-format suffix.
+- Lists, parameters, quality values (`q=`), and wildcards (`*/*`, `application/*`) are honored; more specific entries override wildcards, and an explicit `q=0` refusal is not revived by `*`.
+- `Accept` selects binary versus text encoding but does not transcode message payloads. An exact media range with a different `+proto` / `+json` / `+thrift` / custom suffix is ineligible; the negotiated response preserves the request's effective message format (a missing suffix means `+proto`).
+- A present `Accept` that is structurally malformed, or that refuses every gRPC-Web representation the gateway can produce, fails closed with HTTP `406 Not Acceptable`.
+- Translated responses and gateway-generated gRPC-Web errors emit `Vary: Accept` (merged with any existing `Vary` value) so shared caches cannot mix binary, text, or message-format variants.
+- When `Accept` selects text while `Content-Type` is binary (or the reverse), request decoding and response encoding stay independent.
 
 **Malformed / non-gRPC backend responses:** When the backend or an intermediary returns a response without a present, numeric `grpc-status` (empty or non-numeric values count as absent), `grpc_web` synthesizes the trailer `grpc-status` from the official HTTP-to-gRPC client mapping ([http-grpc-status-mapping.md](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md)): `400→INTERNAL(13)`, `401→UNAUTHENTICATED(16)`, `403→PERMISSION_DENIED(7)`, `404→UNIMPLEMENTED(12)`, `429/502/503/504→UNAVAILABLE(14)`, and every other HTTP status (including `200`) → `UNKNOWN(2)`. A valid supplied `grpc-status` remains authoritative and is never overridden by the HTTP status. Existing `grpc-message` / `grpc-status-details-bin` metadata is preserved when present; synthesis does not invent a message. The client-visible HTTP status is left unchanged on this path (Ferrum does not force HTTP `200` for translated gRPC-Web backend responses), so wire observers still see the backend/intermediary HTTP failure while gRPC-Web clients read the mapped code from the body trailer frame.
 

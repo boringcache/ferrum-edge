@@ -4008,8 +4008,11 @@ pub async fn normalize_response_body_for_inspection(
         {
             Ok(body) => body,
             Err(()) => {
+                let owned_grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx)
+                        .map(str::to_owned);
                 let grpc_web_response_content_type =
-                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                    owned_grpc_web_response_content_type.as_deref();
                 crate::proxy::replace_buffered_grpc_response_with_deadline(
                     ctx,
                     grpc_web_response_content_type,
@@ -6303,13 +6306,27 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Starts runtime-owned background work after the complete plugin-cache
+    /// Stages runtime-owned background work after the complete plugin-cache
     /// generation has validated and before it is published. Constructors must
     /// remain pure because offline validation invokes them without a runtime.
-    /// Implementations must be idempotent and stop owned work when dropped.
+    ///
+    /// Fallible producer/client construction, secret resolution, and channel
+    /// construction belong here. Workers capable of externally visible writes,
+    /// exports, replay, or live-state mutation must stay dormant — gated on
+    /// [`Self::commit_background_tasks`] — so a generation that later fails
+    /// registry/cache commit has no such side effects. Read-only discovery or
+    /// refresh workers may stage earlier when their implementation documents
+    /// that lifecycle. Implementations must be idempotent; dropping an
+    /// uncommitted instance must cancel every staged worker it owns.
     fn start_background_tasks(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Releases staged workers and publishes process-global runtime state after
+    /// the complete plugin-cache generation has been atomically installed.
+    /// Implementations must be infallible and idempotent: all fallible setup
+    /// belongs in [`Self::start_background_tasks`].
+    fn commit_background_tasks(&self) {}
 
     /// Returns `true` if this plugin participates in the authorization phase.
     ///

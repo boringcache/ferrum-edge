@@ -1043,18 +1043,28 @@ async fn handle_h3_request(
     // Besides selecting the WebSocket plugin chain below, suppress gRPC-Web
     // rejection shaping so a spoofed header cannot turn a WS policy reject
     // into a gRPC-Web response.
-    let grpc_web_response_content_type = if detected_http_flavor == HttpFlavor::WebSocket {
+    let grpc_web_response_content_type_owned = if detected_http_flavor == HttpFlavor::WebSocket {
         None
     } else {
         req.headers()
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|content_type| {
-                crate::plugins::grpc_web::is_grpc_web_content_type(content_type).then(|| {
-                    crate::plugins::grpc_web::response_content_type(content_type).to_string()
-                })
+                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                    return None;
+                }
+                let negotiated =
+                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                        content_type,
+                        req.headers(),
+                        state.max_header_size_bytes,
+                    );
+                Some(negotiated.unwrap_or_else(|_| {
+                    crate::plugins::grpc_web::response_content_type(content_type)
+                }))
             })
     };
+    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
     // gRPC-Web remains Plain in the shared wire classifier so the grpc_web
     // plugin retains ownership of body translation. Once its content type is
     // recognized here, however, every request-side decision must treat it as
@@ -1062,8 +1072,8 @@ async fn handle_h3_request(
     // fail-closed method policy all need the same answer. Backend transport is
     // selected separately after request hooks, once the translator's trusted
     // marker is known. The separate response content type above preserves
-    // binary/text + proto encoding for client-facing rejection and response
-    // shaping.
+    // binary/text + format-suffix encoding for client-facing rejection and
+    // response shaping after Accept negotiation.
     let http_flavor = if grpc_web_response_content_type.is_some() {
         HttpFlavor::Grpc
     } else {
@@ -1080,7 +1090,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             http::StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":"Service overloaded"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
@@ -1106,8 +1116,8 @@ async fn handle_h3_request(
     ctx.request_is_secure = true;
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
-    if let Some(content_type) = grpc_web_response_content_type.as_deref() {
-        crate::plugins::grpc_web::retain_client_content_type_for_errors(&mut ctx, content_type);
+    if let Some(content_type) = grpc_web_response_content_type {
+        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
     }
     // Use the actual UDP listener port so port-scoped plugins such as mesh
     // outbound registry and mesh authz see the same frontend port that accepted
@@ -1135,7 +1145,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
                 &body,
                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1151,7 +1161,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             r#"{"error":"Total request headers exceed maximum size"}"#,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1170,7 +1180,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             &body,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1201,7 +1211,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 StatusCode::URI_TOO_LONG,
                 &body,
                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1226,7 +1236,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 StatusCode::BAD_REQUEST,
                 &body,
                 crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1249,7 +1259,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::BAD_REQUEST,
             error_body,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1268,7 +1278,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::BAD_REQUEST,
             error_body,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1285,7 +1295,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"TRACE method is not allowed"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
@@ -1307,7 +1317,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"CONNECT method is not allowed"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
@@ -1329,7 +1339,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::TOO_EARLY,
             r#"{"error":"Method not allowed in 0-RTT early data"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
@@ -1413,7 +1423,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 http::StatusCode::TOO_MANY_REQUESTS,
                 r#"{"error":"Too many concurrent requests from this IP"}"#,
                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1448,7 +1458,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware(
                     &mut stream,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::BAD_REQUEST,
                     r#"{"error":"Request contains malformed Host or authority"}"#,
                     crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1549,7 +1559,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 StatusCode::NOT_FOUND,
                 r#"{"error":"Not Found"}"#,
                 crate::proxy::grpc_proxy::grpc_status::NOT_FOUND,
@@ -1605,7 +1615,7 @@ async fn handle_h3_request(
         // Empty plugin list on the response path: do not run after_proxy /
         // request hooks merely to shape the 405. Logging uses a separate
         // immutable cache view below.
-        if let Some(content_type) = grpc_web_response_content_type.as_deref() {
+        if let Some(content_type) = grpc_web_response_content_type {
             send_h3_grpc_web_reject(
                 &mut stream,
                 &[],
@@ -1653,7 +1663,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::BAD_REQUEST,
             r#"{"error":"gRPC requires POST method"}"#,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1699,7 +1709,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     b"Internal Server Error",
                     &HashMap::new(),
@@ -1718,7 +1728,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     b"Internal Server Error",
                     &HashMap::new(),
@@ -1745,7 +1755,7 @@ async fn handle_h3_request(
                 &plugins,
                 &mut ctx,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 http_status,
                 &reject_body,
                 &headers,
@@ -1755,7 +1765,7 @@ async fn handle_h3_request(
             if deadline_replaced {
                 http_status = replace_buffered_h3_response_with_grpc_deadline(
                     &mut ctx,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     &mut headers,
                     &mut reject_body,
                     initial_response_header_policy_plugins.as_ref(),
@@ -1796,7 +1806,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     http_status,
                     &reject_body,
                     &headers,
@@ -1835,7 +1845,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         b"Internal Server Error",
                         &HashMap::new(),
@@ -1854,7 +1864,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         b"Internal Server Error",
                         &HashMap::new(),
@@ -1889,7 +1899,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     http_status,
                     &reject_body,
                     &headers,
@@ -1921,7 +1931,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     http_status,
                     &reject_body,
                     &headers,
@@ -1995,7 +2005,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -2016,7 +2026,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     start_time,
                     "grpc_deadline_upload_before_authenticate",
                     plugin_execution_ns,
@@ -2037,7 +2047,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy_and_recv_halt(
                     &mut stream,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::REQUEST_TIMEOUT,
                     error_body,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -2101,7 +2111,7 @@ async fn handle_h3_request(
             &plugins,
             &mut ctx,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             http_status,
             &reject_body,
             &headers,
@@ -2134,7 +2144,7 @@ async fn handle_h3_request(
             &plugins,
             &mut ctx,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             http_status,
             &reject_body,
             &headers,
@@ -2178,7 +2188,7 @@ async fn handle_h3_request(
                     send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                         crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -2199,7 +2209,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         start_time,
                         "grpc_deadline_upload_before_authorize",
                         plugin_execution_ns,
@@ -2220,7 +2230,7 @@ async fn handle_h3_request(
                     send_h3_error_flavor_aware_with_policy_and_recv_halt(
                         &mut stream,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::REQUEST_TIMEOUT,
                         error_body,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -2241,7 +2251,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -2284,7 +2294,7 @@ async fn handle_h3_request(
                             &plugins,
                             &mut ctx,
                             http_flavor,
-                            grpc_web_response_content_type.as_deref(),
+                            grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -2303,7 +2313,7 @@ async fn handle_h3_request(
                             &plugins,
                             &mut ctx,
                             http_flavor,
-                            grpc_web_response_content_type.as_deref(),
+                            grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -2336,7 +2346,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         http_status,
                         &reject_body,
                         &headers,
@@ -2367,7 +2377,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         http_status,
                         &reject_body,
                         &headers,
@@ -2433,7 +2443,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -2454,7 +2464,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     start_time,
                     "grpc_deadline_upload_before_before_proxy",
                     plugin_execution_ns,
@@ -2475,7 +2485,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy_and_recv_halt(
                     &mut stream,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::REQUEST_TIMEOUT,
                     error_body,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -2497,7 +2507,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware_with_policy(
                 &mut stream,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 r#"{"error":"Request body exceeds maximum size"}"#,
                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -2547,7 +2557,7 @@ async fn handle_h3_request(
                             &plugins,
                             &mut ctx,
                             http_flavor,
-                            grpc_web_response_content_type.as_deref(),
+                            grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -2566,7 +2576,7 @@ async fn handle_h3_request(
                             &plugins,
                             &mut ctx,
                             http_flavor,
-                            grpc_web_response_content_type.as_deref(),
+                            grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -2599,7 +2609,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         http_status,
                         &reject_body,
                         &headers,
@@ -2630,7 +2640,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         http_status,
                         &reject_body,
                         &headers,
@@ -2671,7 +2681,7 @@ async fn handle_h3_request(
                             &plugins,
                             &mut ctx,
                             http_flavor,
-                            grpc_web_response_content_type.as_deref(),
+                            grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -2690,7 +2700,7 @@ async fn handle_h3_request(
                             &plugins,
                             &mut ctx,
                             http_flavor,
-                            grpc_web_response_content_type.as_deref(),
+                            grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -2724,7 +2734,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         http_status,
                         &reject_body,
                         &headers,
@@ -2755,7 +2765,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         http_status,
                         &reject_body,
                         &headers,
@@ -2900,7 +2910,7 @@ async fn handle_h3_request(
                 &plugins,
                 &mut ctx,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 br#"{"error":"Request body exceeds maximum size"}"#,
                 start_time,
@@ -2913,7 +2923,7 @@ async fn handle_h3_request(
                 &plugins,
                 &mut ctx,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 rejection.http_status,
                 &rejection.body,
                 &rejection.headers,
@@ -2924,7 +2934,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware_with_policy(
                 &mut stream,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 r#"{"error":"Request body exceeds maximum size"}"#,
                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -3033,7 +3043,7 @@ async fn handle_h3_request(
             &state,
             start_time,
             &mut plugin_execution_ns,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
         )
         .await?
         {
@@ -3100,7 +3110,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         b"Internal Server Error",
                         &HashMap::new(),
@@ -3119,7 +3129,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         b"Internal Server Error",
                         &HashMap::new(),
@@ -3146,7 +3156,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     http_status,
                     &reject_body,
                     &headers,
@@ -3175,7 +3185,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     http_status,
                     &reject_body,
                     &headers,
@@ -3208,7 +3218,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         br#"{"error":"Request body exceeds maximum size"}"#,
                         start_time,
@@ -3221,7 +3231,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         rejection.http_status,
                         &rejection.body,
                         &rejection.headers,
@@ -3237,7 +3247,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         status,
                         br#"{"error":"Client disconnected"}"#,
                         start_time,
@@ -3253,7 +3263,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::REQUEST_TIMEOUT,
                         br#"{"error":"Request body read timed out"}"#,
                         start_time,
@@ -3266,7 +3276,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         rejection.http_status,
                         &rejection.body,
                         &rejection.headers,
@@ -3286,7 +3296,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         start_time,
                         "grpc_deadline_terminal_h3_upload",
                         plugin_execution_ns,
@@ -3371,7 +3381,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     http_status,
                     &reject.body,
                     &headers,
@@ -3445,7 +3455,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     reject_status,
                     &reject_body,
                     &rej_headers,
@@ -3455,7 +3465,7 @@ async fn handle_h3_request(
                 if deadline_replaced {
                     reject_status = replace_buffered_h3_response_with_grpc_deadline(
                         &mut ctx,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         &mut rej_headers,
                         &mut reject_body,
                         initial_response_header_policy_plugins.as_ref(),
@@ -3497,7 +3507,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         reject_status,
                         &reject_body,
                         &rej_headers,
@@ -3548,7 +3558,7 @@ async fn handle_h3_request(
                 &proxy,
                 upstream_target.as_deref(),
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 initial_response_header_policy_plugins.as_ref(),
                 &mut stream,
                 &state,
@@ -3595,7 +3605,7 @@ async fn handle_h3_request(
                     send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                         crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -3629,7 +3639,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         start_time,
                         "grpc_deadline_upload_before_dispatch",
                         plugin_execution_ns,
@@ -3659,7 +3669,7 @@ async fn handle_h3_request(
                     send_h3_error_flavor_aware_with_policy_and_recv_halt(
                         &mut stream,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::REQUEST_TIMEOUT,
                         error_body,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -3715,7 +3725,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         b"Internal Server Error",
                         &HashMap::new(),
@@ -3734,7 +3744,7 @@ async fn handle_h3_request(
                         &plugins,
                         &mut ctx,
                         http_flavor,
-                        grpc_web_response_content_type.as_deref(),
+                        grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         b"Internal Server Error",
                         &HashMap::new(),
@@ -3759,7 +3769,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     http_status,
                     &reject.body,
                     &headers,
@@ -3788,7 +3798,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     http_status,
                     &reject.body,
                     &headers,
@@ -3895,7 +3905,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::BAD_GATEWAY,
             r#"{"error":"backend address blocked by egress policy"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
@@ -3985,7 +3995,7 @@ async fn handle_h3_request(
             &plugins,
             &mut ctx,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::BAD_GATEWAY,
             br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
             &reason_headers,
@@ -4004,7 +4014,7 @@ async fn handle_h3_request(
             &plugins,
             &mut ctx,
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             StatusCode::BAD_GATEWAY,
             br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
             &reason_headers,
@@ -4238,7 +4248,7 @@ async fn handle_h3_request(
                             send_h3_error_flavor_aware_with_policy(
                                 &mut stream,
                                 http_flavor,
-                                grpc_web_response_content_type.as_deref(),
+                                grpc_web_response_content_type,
                                 StatusCode::PAYLOAD_TOO_LARGE,
                                 r#"{"error":"Request body exceeds maximum size"}"#,
                                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -4289,7 +4299,7 @@ async fn handle_h3_request(
                                 &plugins,
                                 &mut ctx,
                                 http_flavor,
-                                grpc_web_response_content_type.as_deref(),
+                                grpc_web_response_content_type,
                                 start_time,
                                 "grpc_deadline_upload_before_cross_protocol_dispatch",
                                 plugin_execution_ns,
@@ -4325,7 +4335,7 @@ async fn handle_h3_request(
                             send_h3_error_flavor_aware_with_policy_and_recv_halt(
                                 &mut stream,
                                 http_flavor,
-                                grpc_web_response_content_type.as_deref(),
+                                grpc_web_response_content_type,
                                 StatusCode::REQUEST_TIMEOUT,
                                 error_body,
                                 crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -4486,7 +4496,7 @@ async fn handle_h3_request(
             &proxy,
             upstream_target.as_deref(),
             http_flavor,
-            grpc_web_response_content_type.as_deref(),
+            grpc_web_response_content_type,
             initial_response_header_policy_plugins.as_ref(),
             &mut stream,
             &state,
@@ -5445,7 +5455,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -5478,7 +5488,7 @@ async fn handle_h3_request(
                     &plugins,
                     &mut ctx,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     start_time,
                     "grpc_deadline_buffered_h3_upload",
                     plugin_execution_ns,
@@ -5505,7 +5515,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy_and_recv_halt(
                     &mut stream,
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     StatusCode::REQUEST_TIMEOUT,
                     error_body,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -5639,7 +5649,7 @@ async fn handle_h3_request(
                 &plugins,
                 &mut ctx,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 http_status,
                 &reject.body,
                 &headers,
@@ -5667,7 +5677,7 @@ async fn handle_h3_request(
                 &plugins,
                 &mut ctx,
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 http_status,
                 &reject.body,
                 &headers,
@@ -5689,7 +5699,7 @@ async fn handle_h3_request(
                 &proxy,
                 upstream_target.as_deref(),
                 http_flavor,
-                grpc_web_response_content_type.as_deref(),
+                grpc_web_response_content_type,
                 initial_response_header_policy_plugins.as_ref(),
                 &mut stream,
                 &state,
@@ -6199,7 +6209,7 @@ async fn handle_h3_request(
                     &proxy,
                     current_target.as_deref(),
                     http_flavor,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     initial_response_header_policy_plugins.as_ref(),
                     &mut stream,
                     &state,
@@ -6475,7 +6485,7 @@ async fn handle_h3_request(
                     &mut response_status,
                     &mut response_headers,
                     &mut response_body,
-                    grpc_web_response_content_type.as_deref(),
+                    grpc_web_response_content_type,
                     initial_response_header_policy_plugins.as_ref(),
                 )
                 .await;
@@ -10583,6 +10593,21 @@ async fn send_h3_grpc_web_reject_with_recv_halt(
     headers: &HashMap<String, String>,
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
+    // Accept negotiation failures must stay HTTP 406 JSON on H3, matching
+    // H1/H2 `normalize_reject_response`. Do not rewrite them into a gRPC-Web
+    // trailer-frame response with HTTP 200.
+    if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
+        let normalized = crate::proxy::normalize_reject_response(http_status, body, headers, true);
+        return send_h3_finalized_reject_response_with_recv_halt(
+            stream,
+            normalized.http_status,
+            &normalized.body,
+            &normalized.headers,
+            halt_recv,
+        )
+        .await;
+    }
+
     let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
     let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
         response_content_type,
@@ -10681,26 +10706,37 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
     // `adopt_gateway_rejection` rather than restarting provenance.
     ctx.begin_rejection_deadline_response_header_provenance(headers);
 
-    let (committed_status, committed_headers, committed_body) = if let Some(content_type) =
-        grpc_web_response_content_type
-    {
-        let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
-        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
-            content_type,
-            grpc_status,
-            grpc_message.as_ref(),
-        );
-        crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, &[], Some(headers));
-        (StatusCode::OK, translated.headers, translated.body)
-    } else {
-        let normalized = crate::proxy::normalize_reject_response(
-            http_status,
-            body,
-            headers,
-            matches!(flavor, HttpFlavor::Grpc),
-        );
-        (normalized.http_status, normalized.headers, normalized.body)
-    };
+    let (committed_status, committed_headers, committed_body) =
+        if let Some(content_type) = grpc_web_response_content_type {
+            // Keep Accept negotiation 406s on the HTTP/JSON wire contract for
+            // committed observers (chargeback, exporters), matching the sender.
+            if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
+                let normalized =
+                    crate::proxy::normalize_reject_response(http_status, body, headers, true);
+                (normalized.http_status, normalized.headers, normalized.body)
+            } else {
+                let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
+                let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+                    content_type,
+                    grpc_status,
+                    grpc_message.as_ref(),
+                );
+                crate::proxy::finalize_grpc_web_error_response_headers(
+                    &mut translated,
+                    &[],
+                    Some(headers),
+                );
+                (StatusCode::OK, translated.headers, translated.body)
+            }
+        } else {
+            let normalized = crate::proxy::normalize_reject_response(
+                http_status,
+                body,
+                headers,
+                matches!(flavor, HttpFlavor::Grpc),
+            );
+            (normalized.http_status, normalized.headers, normalized.body)
+        };
 
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
@@ -11477,6 +11513,12 @@ fn h3_reject_log_status_and_metadata(
             GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
         );
         return StatusCode::OK.as_u16();
+    }
+
+    // Accept negotiation failures remain HTTP 406 on the wire; do not collapse
+    // their logged/runtime status into the trailers-only HTTP 200 shape.
+    if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
+        return http_status.as_u16();
     }
 
     if !matches!(flavor, HttpFlavor::Grpc) {

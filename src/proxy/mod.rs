@@ -14855,8 +14855,9 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // serverless terminate, dedup replay), so there is no upstream snapshot and
     // no hidden origin coding — the live headers are the only description of
     // these bytes, and `GatewayGenerated` reads them directly.
-    let grpc_web_response_content_type =
-        crate::plugins::grpc_web::retained_response_content_type(ctx);
+    let owned_grpc_web_response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+    let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
     // `false`: the reject `after_proxy` hooks are deliberately deferred on this
     // path and applied exactly once by
     // `apply_reject_after_proxy_and_synthetic_body_hooks` over the final
@@ -15425,8 +15426,14 @@ pub(crate) fn normalize_reject_response(
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
-    if !is_grpc_request {
-        let mut normalized_headers = headers.clone();
+    let grpc_web_accept_rejected =
+        crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers);
+    if !is_grpc_request || grpc_web_accept_rejected {
+        let mut normalized_headers = headers
+            .iter()
+            .filter(|(name, _)| !crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<HashMap<_, _>>();
         normalized_headers
             .entry("content-type".to_string())
             .or_insert_with(|| "application/json".to_string());
@@ -16375,17 +16382,20 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             continue;
         };
 
-        let grpc_web_response_content_type =
-            crate::plugins::grpc_web::retained_response_content_type(ctx).or_else(|| {
-                response_headers
-                    .get("content-type")
-                    .filter(|content_type| {
-                        crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
-                    })
-                    .map(|content_type| {
-                        crate::plugins::grpc_web::response_content_type(content_type)
-                    })
-            });
+        let owned_grpc_web_response_content_type =
+            crate::plugins::grpc_web::retained_response_content_type(ctx)
+                .map(str::to_owned)
+                .or_else(|| {
+                    response_headers
+                        .get("content-type")
+                        .filter(|content_type| {
+                            crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                        })
+                        .map(|content_type| {
+                            crate::plugins::grpc_web::response_content_type(content_type)
+                        })
+                });
+        let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
         *response_status = replace_buffered_grpc_response_with_deadline(
             ctx,
             grpc_web_response_content_type,
@@ -18062,18 +18072,29 @@ async fn handle_proxy_request_inner(
     // hostile Content-Type, matching backend dispatch and the H3 frontend.
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
     let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
-    let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket {
+    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
         None
     } else {
         req.headers()
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|content_type| {
-                crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
-                    .then(|| crate::plugins::grpc_web::response_content_type(content_type))
+                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                    return None;
+                }
+                let negotiated =
+                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                        content_type,
+                        req.headers(),
+                        state.max_header_size_bytes,
+                    );
+                Some(negotiated.unwrap_or_else(|_| {
+                    crate::plugins::grpc_web::response_content_type(content_type)
+                }))
             })
     };
-    let grpc_web_request = grpc_web_response_content_type.is_some();
+    let grpc_web_request = grpc_web_response_content_type_owned.is_some();
+    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
     // Retain the representation just classified, exactly as the H3 frontend does
     // right after it builds its context. Without this the marker existed only
     // when the `grpc_web` plugin was configured, so an H1/H2 PASS-THROUGH
@@ -18086,7 +18107,7 @@ async fn handle_proxy_request_inner(
     // immutable inbound content-type before any hook runs, so it records the
     // client's own representation and never a rewritten one.
     if let Some(content_type) = grpc_web_response_content_type {
-        crate::plugins::grpc_web::retain_client_content_type_for_errors(&mut ctx, content_type);
+        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
     }
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
@@ -28953,8 +28974,12 @@ pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
     else {
         return client_grpc_deadline_exceeded_response(resolved_ip);
     };
+    let response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(request_ctx)
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::plugins::grpc_web::response_content_type(content_type));
     let translated = crate::plugins::grpc_web::error_response_for_content_type(
-        crate::plugins::grpc_web::response_content_type(content_type),
+        &response_content_type,
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
         GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
     );

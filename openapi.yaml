@@ -1511,6 +1511,12 @@ paths:
         object states that its configured concurrent-connection limit is
         process-local and independently enforced per replica.
 
+        Served in every mode that constructs an AdminState:
+        `database`, `file`, `cp`, `dp`, `mesh`, and `node_agent`. Modes without
+        proxy state (`cp`, `node_agent`) return zeroed runtime counters. JWT
+        authentication is required; this endpoint never returns unauthenticated
+        detail.
+
         The response is cached for 5 seconds to avoid performance impact from
         frequent polling. The `X-Cache` response header indicates `hit` or `miss`.
 
@@ -10546,8 +10552,9 @@ components:
           items:
             $ref: "#/components/schemas/AdminMetricsCircuitBreaker"
           description: |
-            Per-proxy circuit breaker states. Only proxies with circuit breaker
-            config that have been accessed appear here.
+            Circuit breaker states for direct-backend proxies (no `target`) and
+            per-upstream-target breakers (`target` = `host:port`). Only proxies
+            with circuit breaker config that have been accessed appear here.
         health_check:
           $ref: "#/components/schemas/AdminMetricsHealthCheck"
         load_balancers:
@@ -10582,8 +10589,11 @@ components:
       properties:
         mode:
           type: string
-          enum: [database, file, cp, dp]
-          description: Operating mode (set by FERRUM_MODE)
+          enum: [database, file, cp, dp, mesh, node_agent]
+          description: |
+            Operating mode that constructed this AdminState (set by FERRUM_MODE).
+            Every mode that serves authenticated `GET /admin/metrics` is listed:
+            `database`, `file`, `cp`, `dp`, `mesh`, and `node_agent`.
         ferrum_version:
           type: string
           description: Ferrum Edge binary version
@@ -10699,15 +10709,26 @@ components:
     AdminMetricsCircuitBreaker:
       type: object
       description: |
-        Circuit breaker state for a single proxy. Three states:
+        Circuit breaker state for a single proxy or upstream target. Three states:
         - **closed**: Normal operation, requests pass through
         - **open**: Failures exceeded threshold, requests rejected with 503
         - **half_open**: Timeout elapsed, limited probe requests allowed to test recovery
+
+        Direct-backend proxies (no upstream) emit one per-proxy entry without
+        `target`. Proxies with upstream targets emit one independent breaker per
+        target and include `target` as `host:port`.
       required: [proxy_id, state, failure_count, success_count]
       properties:
         proxy_id:
           type: string
           description: ID of the proxy this circuit breaker protects
+        target:
+          type: string
+          description: |
+            Upstream target `host:port` this breaker is scoped to. Present for
+            per-target (upstream) breakers; omitted for direct-backend
+            (per-proxy) breakers.
+          example: "10.0.2.1:8080"
         state:
           type: string
           enum: [closed, open, half_open]
@@ -10722,6 +10743,50 @@ components:
             Consecutive successes during half_open state. When this reaches the
             configured success_threshold, the circuit closes (recovers).
 
+    AdminMetricsUnhealthyTarget:
+      type: object
+      description: |
+        One unhealthy target excluded from load balancing. Active health checks
+        are upstream-scoped (`type=active`, no `proxy_id`). Passive health checks
+        are proxy-scoped (`type=passive` and always include `proxy_id`).
+      required: [target, type, since_epoch_ms]
+      properties:
+        proxy_id:
+          type: string
+          description: |
+            Proxy that owns this passive health entry. Required when
+            `type` is `passive`; omitted when `type` is `active`.
+        target:
+          type: string
+          description: "Target in host:port format"
+          example: "10.0.3.12:8080"
+        type:
+          type: string
+          enum: [active, passive]
+          description: |
+            `active` for periodic probe failures; `passive` for failures
+            observed on proxied requests.
+        since_epoch_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the target was marked unhealthy
+      allOf:
+        - if:
+            properties:
+              type:
+                const: passive
+            required: [type]
+          then:
+            required: [proxy_id]
+        - if:
+            properties:
+              type:
+                const: active
+            required: [type]
+          then:
+            not:
+              required: [proxy_id]
+
     AdminMetricsHealthCheck:
       type: object
       description: |
@@ -10735,17 +10800,7 @@ components:
         unhealthy_targets:
           type: array
           items:
-            type: object
-            required: [target, since_epoch_ms]
-            properties:
-              target:
-                type: string
-                description: "Target in host:port format"
-                example: "10.0.3.12:8080"
-              since_epoch_ms:
-                type: integer
-                format: int64
-                description: Unix epoch milliseconds when the target was marked unhealthy
+            $ref: "#/components/schemas/AdminMetricsUnhealthyTarget"
 
     AdminMetricsLoadBalancers:
       type: object
@@ -15558,7 +15613,10 @@ components:
         Plugin: response_transformer — Modifies response headers and JSON
         body. Same validation rules as request_transformer (unknown
         operations / targets, missing value / new_key, and CR/LF in header
-        values are rejected at plugin load time).
+        values are rejected at plugin load time). Every rule must set an
+        explicit `target` (`header` or `body`); there is no default. Valid
+        targets are `header` and `body` only — unlike request_transformer,
+        there is no `query` target.
 
         When `apply_route_overrides: true`, the plugin consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -15569,30 +15627,14 @@ components:
         rules:
           type: array
           items:
-            type: object
-            required: [operation, key]
-            properties:
-              operation:
-                type: string
-                enum: [add, remove, update, rename]
-              target:
-                type: string
-                enum: [header, body]
-                default: header
-              key:
-                type: string
-                description: |
-                  Header name or dot-notation body path. Body paths support
-                  nested objects, array indexing ('items.0'), and
-                  backslash-escaped literal dots.
-              value:
-                type: string
-                description: |
-                  Required for add/update. Header values must not contain CR
-                  or LF.
-              new_key:
-                type: string
-                description: Required for rename operations.
+            oneOf:
+              - $ref: "#/components/schemas/ResponseTransformerHeaderRule"
+              - $ref: "#/components/schemas/ResponseTransformerBodyRule"
+            discriminator:
+              propertyName: target
+              mapping:
+                header: "#/components/schemas/ResponseTransformerHeaderRule"
+                body: "#/components/schemas/ResponseTransformerBodyRule"
         apply_route_overrides:
           type: boolean
           default: false
@@ -15612,6 +15654,64 @@ components:
           description: >-
             Fallback when `runtime_overlay_scope` is configured but the RTDS
             overlay has no boolean value for that key.
+
+    ResponseTransformerHeaderRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write the header value.
+            remove: delete the header.
+            rename: move old → new header name.
+        target:
+          type: string
+          const: header
+        key:
+          type: string
+          description: HTTP header name.
+        value:
+          type: string
+          description: |
+            Required for add/update. Must be a string and must not contain
+            CR or LF.
+        new_key:
+          type: string
+          description: Required for rename operations.
+
+    ResponseTransformerBodyRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write, creating intermediate objects as needed.
+            remove: delete the field.
+            rename: move old → new, with rollback if the destination is unreachable.
+        target:
+          type: string
+          const: body
+        key:
+          type: string
+          description: |
+            Dot-notation body path. Supports nested objects, array indexing
+            ('items.0'), and backslash-escaped literal dots.
+        value:
+          description: |
+            Required for add/update. Accepts any JSON value — strings,
+            numbers, booleans, objects, arrays, and explicit null.
+            Strings that parse as JSON (e.g., "42", "true", '{"a":1}')
+            are inserted as the parsed type at runtime; otherwise kept
+            as a JSON string.
+        new_key:
+          type: string
+          description: Required for rename operations.
 
     SecurityHeadersConfig:
       type: object
@@ -15716,7 +15816,7 @@ components:
           type: array
           items:
             type: string
-          description: "Content-type whitelist. Defaults to 10 common text/application types"
+          description: "Content-type whitelist. Defaults to 10 common text/application types. Matched as an exact media-type token (before the first semicolon, ASCII case-insensitive); parameters like ; charset=utf-8 are ignored. Substring matching is not used, so application/jsonp does not match application/json."
         remove_accept_encoding:
           type: boolean
           default: true
@@ -17680,7 +17780,16 @@ components:
       description: >-
         Plugin: grpc_web — Translates between gRPC-Web (browser-compatible)
         and native gRPC (HTTP/2) wire formats. Supports binary
-        (application/grpc-web) and text (application/grpc-web-text) encoding.
+        (application/grpc-web) and text (application/grpc-web-text) encoding,
+        including message-format suffixes such as +proto, +json, +thrift, and
+        other valid +subtype values. Request-body decoding follows request
+        Content-Type; response encoding and Content-Type follow Accept
+        negotiation (absent Accept defaults to the request Content-Type mode
+        and suffix; lists, q-values, and */* / application/* wildcards are
+        honored; Accept can select binary versus text but cannot transcode to a
+        different message-format suffix; malformed or fully refused Accept
+        fails closed with HTTP 406;
+        translated responses merge Vary: Accept so caches separate variants).
         Config must be a JSON object (not null); `{}` and objects that only set
         `expose_headers` are accepted. Unknown keys are rejected. When a backend
         or intermediary response omits a valid numeric grpc-status, the response
