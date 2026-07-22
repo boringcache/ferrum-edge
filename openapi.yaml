@@ -17071,9 +17071,11 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties: true
           description: >
-            Additional multipart part headers to require/validate. Only valid for
-            multipart/form-data. Must not redefine Content-Type,
-            Content-Disposition, or Content-Transfer-Encoding.
+            Additional multipart part Header Objects. Present values are validated
+            against their schemas; an absent header fails only when its Header Object
+            sets required=true (the OpenAPI default is false). Only valid for
+            multipart/form-data. Must not redefine Content-Type, Content-Disposition,
+            or Content-Transfer-Encoding.
 
     RequestTerminationConfig:
       type: object
