@@ -247,9 +247,21 @@ impl AdminMetricsUnhealthyTarget {
     }
 }
 
+/// Derive `gateway.config_source_status` from a lock-free `db_available`
+/// snapshot. `None` means the mode has no DB-backed config source (`n/a`);
+/// `Some(true)` / `Some(false)` map to `online` / `offline`.
+pub fn config_source_status(db_available: Option<bool>) -> &'static str {
+    match db_available {
+        Some(true) => "online",
+        Some(false) => "offline",
+        None => "n/a",
+    }
+}
+
 /// Skeleton response used when `AdminState.proxy_state` is absent (CP and
 /// node_agent). Runtime counters are zeroed; pool/cache objects serialize as
-/// empty maps.
+/// empty maps. `config_source_status` defaults to `n/a`; callers that hold a
+/// `db_available` flag (CP) overwrite it via [`build_admin_metrics`].
 pub fn empty_proxy_metrics(mode: &str) -> AdminMetrics {
     AdminMetrics {
         gateway: AdminMetricsGateway {
@@ -294,14 +306,22 @@ pub fn empty_proxy_metrics(mode: &str) -> AdminMetrics {
 }
 
 /// Build the typed metrics snapshot from live admin/proxy state.
+///
+/// `db_available` is a lock-free snapshot of [`crate::admin::AdminState::db_available`]:
+/// `None` → `"n/a"`, `Some(true)` → `"online"`, `Some(false)` → `"offline"`.
+/// Callers must not probe the database for this field.
 pub fn build_admin_metrics(
     mode: &str,
-    db_configured: bool,
+    db_available: Option<bool>,
     proxy_state: Option<&ProxyState>,
     database_polling: Option<DatabaseDeltaPollMetricsSnapshot>,
 ) -> AdminMetrics {
+    let source_status = config_source_status(db_available).to_string();
+
     let Some(ps) = proxy_state else {
-        return empty_proxy_metrics(mode);
+        let mut metrics = empty_proxy_metrics(mode);
+        metrics.gateway.config_source_status = source_status;
+        return metrics;
     };
 
     let config = ps.current_config();
@@ -370,8 +390,6 @@ pub fn build_admin_metrics(
         );
     }
 
-    let config_source_status = if db_configured { "online" } else { "n/a" };
-
     AdminMetrics {
         gateway: AdminMetricsGateway {
             mode: mode.to_string(),
@@ -386,7 +404,7 @@ pub fn build_admin_metrics(
             status_codes_per_second,
             metrics_window_seconds: ps.windowed_metrics.window_seconds,
             config_last_updated_at: Some(config.loaded_at.to_rfc3339()),
-            config_source_status: config_source_status.to_string(),
+            config_source_status: source_status,
             proxy_count: config.proxies.len(),
             consumer_count: config.consumers.len(),
             upstream_count: config.upstreams.len(),
@@ -467,6 +485,11 @@ pub fn contract_fixtures() -> Vec<AdminMetrics> {
         if *mode == "database" {
             base.database_polling = Some(sample_database_polling());
         }
+        // CP holds a live database without proxy_state; healthy fixtures report
+        // online so OpenAPI/docs cover the no-proxy DB-backed path.
+        if *mode == "cp" {
+            base.gateway.config_source_status = "online".to_string();
+        }
         fixtures.push(base);
     }
 
@@ -501,6 +524,16 @@ pub fn contract_fixtures() -> Vec<AdminMetrics> {
         ],
     };
     fixtures.push(breakers_and_health);
+
+    // Offline enum coverage for DB-backed modes (database + CP).
+    let mut database_offline = proxy_serving_fixture("database");
+    database_offline.gateway.config_source_status = "offline".to_string();
+    database_offline.database_polling = Some(sample_database_polling());
+    fixtures.push(database_offline);
+
+    let mut cp_offline = empty_proxy_metrics("cp");
+    cp_offline.gateway.config_source_status = "offline".to_string();
+    fixtures.push(cp_offline);
 
     fixtures
 }

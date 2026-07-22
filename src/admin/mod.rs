@@ -5198,15 +5198,23 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
     Ok(resp)
 }
 
-fn build_metrics(state: &AdminState) -> metrics::AdminMetrics {
+/// Build the typed `/admin/metrics` payload from live admin state.
+///
+/// `gateway.config_source_status` is derived from a lock-free
+/// [`AdminState::db_available`] snapshot — never from a per-request DB probe.
+pub fn build_metrics(state: &AdminState) -> metrics::AdminMetrics {
     let database_polling = if state.mode == "database" {
         crate::plugins::prometheus_metrics::global_registry().database_delta_poll_metrics_snapshot()
     } else {
         None
     };
+    let db_available = state
+        .db_available
+        .as_ref()
+        .map(|flag| flag.load(Ordering::Relaxed));
     metrics::build_admin_metrics(
         &state.mode,
-        state.db.is_some(),
+        db_available,
         state.proxy_state.as_ref(),
         database_polling,
     )

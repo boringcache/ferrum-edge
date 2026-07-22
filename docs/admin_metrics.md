@@ -245,7 +245,7 @@ Top-level gateway info and throughput counters.
 | `status_codes_per_second` | object | Average per-second rate of each HTTP status code over the last metrics window |
 | `metrics_window_seconds` | integer | Window size in seconds used for per-second rate calculations (configurable via `FERRUM_STATUS_METRICS_WINDOW_SECONDS`, default 30) |
 | `config_last_updated_at` | string (RFC 3339) | Timestamp of the last successful config load/reload. `null` in CP mode without proxy state |
-| `config_source_status` | string | `"online"` when a database is configured and reachable, `"n/a"` for file mode or when no database is used |
+| `config_source_status` | string | Lock-free snapshot of the DB config source: `"online"` when a DB-backed mode reports `db_available=true` (configured and dynamically reachable), `"offline"` when a configured DB is unavailable (`db_available=false`), and `"n/a"` when the mode has no DB-backed config source (`file`, `dp`, `mesh`, `node_agent`). Control-plane (`cp`) reports `online`/`offline` even though `proxy_state` is absent. Never derived from a per-request database probe. |
 | `proxy_count` | integer | Number of proxy routes in the active config |
 | `consumer_count` | integer | Number of consumers in the active config |
 | `upstream_count` | integer | Number of upstreams (load-balanced target groups) |
