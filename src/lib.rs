@@ -951,8 +951,7 @@ pub mod _test_support {
         direction: crate::plugins::WebSocketFrameDirection,
         raw: Message,
     ) -> Message {
-        crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw)
-            .await
+        crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw).await
     }
 
     /// Report the production parser-policy and post-reassembly hook lists.

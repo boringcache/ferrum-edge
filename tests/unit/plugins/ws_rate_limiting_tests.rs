@@ -768,9 +768,7 @@ async fn test_transformed_close_does_not_consume_budget_or_create_state() {
         WebSocketFrameDirection::ClientToBackend,
         WebSocketFrameDirection::BackendToClient,
     ] {
-        let result = plugin
-            .on_ws_frame("test-proxy", 7, direction, &close)
-            .await;
+        let result = plugin.on_ws_frame("test-proxy", 7, direction, &close).await;
         assert!(
             result.is_none(),
             "Close must pass through without replacement ({direction:?})"
