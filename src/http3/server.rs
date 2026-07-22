@@ -3342,7 +3342,7 @@ async fn handle_h3_request(
                         &mut headers,
                         body.len(),
                     ) {
-                        body.clear();
+                        body = Vec::new();
                     }
                     send_h3_reject_flavor_aware(
                         &mut stream,
@@ -5608,7 +5608,7 @@ async fn handle_h3_request(
                     &mut headers,
                     body.len(),
                 ) {
-                    body.clear();
+                    body = Vec::new();
                 }
                 send_h3_reject_response(
                     &mut stream,
@@ -7559,7 +7559,7 @@ async fn run_h3_streaming_after_proxy_hooks(
             reject.body.len(),
         )
     {
-        reject.body.clear();
+        reject.body = Vec::new();
     }
     *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     reject
