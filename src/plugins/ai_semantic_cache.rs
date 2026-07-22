@@ -1980,9 +1980,7 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
         if !is_json_content_type(content_type) {
-            debug!(
-                "ai_semantic_cache: skipping response without a JSON-compatible content type"
-            );
+            debug!("ai_semantic_cache: skipping response without a JSON-compatible content type");
             return PluginResult::Continue;
         }
         // Size checks

@@ -2286,7 +2286,13 @@ async fn test_same_request_different_consumer_no_cache_hit_with_default_config()
     let alice = make_consumer("alice");
     let bob = make_consumer("bob");
 
-    store_response(&plugin, &body_str, Some(alice.clone()), br#""alice-only-data""#).await;
+    store_response(
+        &plugin,
+        &body_str,
+        Some(alice.clone()),
+        br#""alice-only-data""#,
+    )
+    .await;
 
     let hit = run_before_proxy_get_status(&plugin, &body_str, Some(bob.clone())).await;
     assert!(
@@ -2320,7 +2326,13 @@ async fn test_same_request_same_consumer_same_params_cache_hit_positive() {
     });
     let body_str = serde_json::to_string(&body).unwrap();
 
-    store_response(&plugin, &body_str, Some(consumer.clone()), br#""hello-back""#).await;
+    store_response(
+        &plugin,
+        &body_str,
+        Some(consumer.clone()),
+        br#""hello-back""#,
+    )
+    .await;
 
     let hit = run_before_proxy_get_status(&plugin, &body_str, Some(consumer)).await;
     assert!(
