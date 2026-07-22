@@ -3610,7 +3610,10 @@ async fn test_request_no_transform_metadata_does_not_skip_context_aware_decode()
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    assert!(ctx.metadata.contains_key("compression:request_decode_owner"));
+    assert!(
+        ctx.metadata
+            .contains_key("compression:request_decode_owner")
+    );
 
     let transformed = plugin
         .transform_request_body_with_context(
@@ -4322,8 +4325,6 @@ async fn test_trailer_integrity_digests_retired_after_compression_rewrite() {
     );
     assert_integrity_digests_absent(&headers);
 }
-
-
 // ────────────────────── Multi-instance ownership (#2353) ──────────────────────
 
 fn gzip_bytes(plaintext: &[u8]) -> Vec<u8> {
@@ -4364,7 +4365,10 @@ async fn run_after_proxy_chain(
     response_headers: &mut HashMap<String, String>,
 ) -> PluginResult {
     for plugin in plugins {
-        match plugin.after_proxy(ctx, response_status, response_headers).await {
+        match plugin
+            .after_proxy(ctx, response_status, response_headers)
+            .await
+        {
             PluginResult::Continue => {}
             reject => return reject,
         }
@@ -4437,7 +4441,10 @@ async fn test_multi_instance_response_single_coding_layer() {
         Some("gzip"),
         "first committing instance wins; later configs must not stack encodings"
     );
-    assert!(ctx.metadata.contains_key("compression:response_encode_owner"));
+    assert!(
+        ctx.metadata
+            .contains_key("compression:response_encode_owner")
+    );
     assert_eq!(
         ctx.metadata
             .get("compression:algorithm")
@@ -4600,7 +4607,10 @@ async fn test_multi_instance_request_decode_exactly_once() {
         Some("gzip"),
         "siblings must not delete the owner's internal marker"
     );
-    assert!(ctx.metadata.contains_key("compression:request_decode_owner"));
+    assert!(
+        ctx.metadata
+            .contains_key("compression:request_decode_owner")
+    );
 
     let decoded = run_request_body_transform_loop(&plugins, &mut ctx, &headers, compressed).await;
     assert_eq!(decoded, original);
@@ -4651,7 +4661,10 @@ async fn test_multi_instance_malformed_upload_rejects_without_stripping() {
         Some("gzip"),
         "failed claim must not strip encoding metadata"
     );
-    assert!(!ctx.metadata.contains_key("compression:request_decode_owner"));
+    assert!(
+        !ctx.metadata
+            .contains_key("compression:request_decode_owner")
+    );
 }
 
 #[tokio::test]
