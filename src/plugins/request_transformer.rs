@@ -188,9 +188,7 @@ fn validate_configured_header_value(value: &str, idx: usize) -> Result<(), Strin
         ));
     }
     HeaderValue::from_str(value).map_err(|_| {
-        format!(
-            "request_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue"
-        )
+        format!("request_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue")
     })?;
     Ok(())
 }

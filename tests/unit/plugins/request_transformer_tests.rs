@@ -1664,10 +1664,7 @@ async fn test_request_transformer_rejects_forbidden_header_control_bytes() {
         }))
         .err()
         .unwrap_or_else(|| panic!("expected HeaderValue rejection for {label}"));
-        assert!(
-            err.contains("valid HTTP HeaderValue"),
-            "{label}: got {err}"
-        );
+        assert!(err.contains("valid HTTP HeaderValue"), "{label}: got {err}");
     }
 }
 
@@ -1767,5 +1764,8 @@ async fn test_request_transformer_route_level_accepted_value_applies() {
     ctx.route_override_request_transform = Some(route_rules);
     let mut headers: HashMap<String, String> = HashMap::new();
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_eq!(headers.get("x-route").map(String::as_str), Some("tab\there"));
+    assert_eq!(
+        headers.get("x-route").map(String::as_str),
+        Some("tab\there")
+    );
 }

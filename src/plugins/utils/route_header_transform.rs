@@ -359,10 +359,7 @@ mod tests {
                 }]))
                 .unwrap();
             let err = parse_route_header_transforms(&raw, "ctx").unwrap_err();
-            assert!(
-                err.contains("valid HTTP HeaderValue"),
-                "{label}: got {err}"
-            );
+            assert!(err.contains("valid HTTP HeaderValue"), "{label}: got {err}");
         }
     }
 
