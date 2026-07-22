@@ -398,6 +398,65 @@ async fn start_blocking_counting_backend_on(
     Ok(handle)
 }
 
+async fn start_counting_backend_on(
+    listener: tokio::net::TcpListener,
+    hits: Arc<AtomicUsize>,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let hits = Arc::clone(&hits);
+            tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut buf_reader = tokio::io::BufReader::new(reader);
+                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+                let mut request_line = String::new();
+                if buf_reader.read_line(&mut request_line).await.is_err()
+                    || !request_line.starts_with("POST ")
+                {
+                    return;
+                }
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    let _ = buf_reader.read_line(&mut line).await;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = trimmed.split_once(':')
+                        && key.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body_buf = vec![0u8; content_length];
+                    let _ = buf_reader.read_exact(&mut body_buf).await;
+                }
+
+                hits.fetch_add(1, Ordering::SeqCst);
+
+                let body = json!({
+                    "request_line": request_line.trim(),
+                    "backend_hits": hits.load(Ordering::SeqCst),
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = writer.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Ok(handle)
+}
+
 async fn start_counting_large_function_on(
     listener: tokio::net::TcpListener,
     hits: Arc<AtomicUsize>,
@@ -1424,6 +1483,10 @@ plugin_configs:
 /// Request deduplication must use Redis for in-flight exclusion, not only for
 /// completed response replay. Two gateway instances sharing Redis should not
 /// both execute the same idempotent POST concurrently.
+///
+/// Companion to `test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict`
+/// (#2379): corresponding copies of one `plugin_config_id` must still share
+/// locks and completed values across gateways.
 #[tokio::test]
 #[ignore]
 async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
@@ -1728,6 +1791,172 @@ plugin_configs:
     gw1.shutdown();
     gw2.shutdown();
     println!("test_request_deduplication_redis_blocks_concurrent_cross_instance PASSED");
+}
+
+/// Two `request_deduplication` configs on one proxy must not self-conflict under
+/// the shared default Redis prefix (`{FERRUM_NAMESPACE}:dedup`).
+///
+/// Before #2379, sibling instances hashed the same logical key (proxy +
+/// identity + idempotency value only). The first acquired
+/// `{prefix}:inflight:<digest>` and the second treated that lock as a peer
+/// request, returning 409 before the backend ran. Stable `plugin_config_id`
+/// partitioning keeps each instance's Redis ownership isolated while the
+/// companion cross-gateway test still proves corresponding copies share state.
+#[tokio::test]
+#[ignore]
+async fn test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict() {
+    if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!("Redis is required for the request deduplication same-proxy sibling CI gate");
+        }
+        return;
+    }
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let _backend = start_counting_backend_on(backend_listener, Arc::clone(&backend_hits))
+        .await
+        .unwrap();
+
+    // Unique namespace per run so both sibling instances share the default
+    // `{namespace}:dedup` prefix without colliding with other Redis tests.
+    let namespace = format!("dedup-sibling-{}", Uuid::new_v4().simple());
+    let default_prefix = format!("{namespace}:dedup");
+    delete_redis_keys_by_prefix(&default_prefix).await;
+
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "orders"
+    namespace: "{namespace}"
+    listen_path: "/orders"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "dedup-short"
+      - plugin_config_id: "dedup-long"
+
+consumers: []
+
+plugin_configs:
+  - id: "dedup-short"
+    namespace: "{namespace}"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "orders"
+    enabled: true
+    config:
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      ttl_seconds: 60
+      inflight_ttl_seconds: 10
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+  - id: "dedup-long"
+    namespace: "{namespace}"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "orders"
+    enabled: true
+    config:
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      ttl_seconds: 600
+      inflight_ttl_seconds: 10
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+"#
+    );
+
+    let port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let mut gw = spawn_file_gateway(
+        config,
+        port,
+        vec![
+            ("RUST_LOG".to_string(), "ferrum_edge=debug".to_string()),
+            ("FERRUM_NAMESPACE".to_string(), namespace.clone()),
+        ],
+    )
+    .await;
+
+    sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let body = r#"{"order":1}"#;
+    let idempotency_key = "order-1";
+    let authority = "orders.example";
+    let url = format!("http://127.0.0.1:{port}/orders");
+
+    let response = client
+        .post(&url)
+        .header("Idempotency-Key", idempotency_key)
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("sibling-instance request failed");
+    let status = response.status().as_u16();
+    let response_body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "two same-proxy Redis dedup instances must not 409 their own first request under the shared default prefix; body={response_body}"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "fresh request through sibling dedup instances must reach the backend exactly once"
+    );
+
+    // Corresponding completed values remain per-instance; a retry must still
+    // replay without a second backend execution (either instance may replay).
+    let replay = client
+        .post(&url)
+        .header("Idempotency-Key", idempotency_key)
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("sibling-instance replay failed");
+    assert_eq!(replay.status().as_u16(), 200);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "completed Redis values from sibling instances must still replay"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "replay through sibling dedup instances must not re-execute the backend"
+    );
+
+    // Both instances should have published independent completed keys under the
+    // shared default prefix (partitioned by plugin_config_id in the digest).
+    let completed_keys = redis_key_count_by_prefix(&format!("{default_prefix}:v3:")).await;
+    assert!(
+        completed_keys >= 2,
+        "expected at least two completed Redis keys under the shared default prefix, got {completed_keys}"
+    );
+
+    delete_redis_keys_by_prefix(&default_prefix).await;
+    gw.shutdown();
+    println!(
+        "test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict PASSED"
+    );
 }
 
 /// Namespace-based Redis key prefix isolation.

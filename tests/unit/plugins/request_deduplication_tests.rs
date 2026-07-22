@@ -4,6 +4,7 @@ use ferrum_edge::_test_support::{
     finalize_plugin_rejection_for_test, request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_inflight_entries_for_test,
+    request_deduplication_logical_keys_from_context_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test, request_deduplication_request_identity_for_test,
     request_deduplication_set_request_state_for_test,
@@ -15,7 +16,8 @@ use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
+    create_plugin_with_http_client, create_plugin_with_http_client_and_config_id, priority,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::json;
@@ -273,6 +275,125 @@ fn test_new_rejects_non_object_config() {
     let result = RequestDeduplication::new(&json!("bad"), PluginHttpClient::default());
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[test]
+fn new_with_instance_id_rejects_blank_stable_identity() {
+    for blank in ["", "   ", "\t\n"] {
+        let result = request_deduplication_with_instance_id_for_test(
+            &json!({}),
+            PluginHttpClient::default(),
+            blank,
+        );
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("blank plugin config id must fail closed"),
+        };
+        assert!(
+            err.contains("plugin config id must be a non-empty stable identity"),
+            "unexpected error for {blank:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn production_factory_rejects_blank_plugin_config_id() {
+    for blank in ["", "   ", "\t\n"] {
+        let result = create_plugin_with_http_client_and_config_id(
+            "request_deduplication",
+            &json!({}),
+            PluginHttpClient::default(),
+            Some(blank),
+        );
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => {
+                panic!("blank plugin config id must fail closed through the production factory")
+            }
+        };
+        assert!(
+            err.contains("plugin config id must be a non-empty stable identity"),
+            "unexpected error for {blank:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn production_factory_without_config_id_keeps_direct_construction_coherent() {
+    let via_default_factory = create_plugin_with_http_client(
+        "request_deduplication",
+        &json!({}),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(via_default_factory.name(), "request_deduplication");
+}
+
+#[tokio::test]
+async fn production_factory_partitions_logical_keys_by_plugin_config_id() {
+    let config = json!({});
+    let first = create_plugin_with_http_client_and_config_id(
+        "request_deduplication",
+        &config,
+        PluginHttpClient::default(),
+        Some("dedup-short"),
+    )
+    .unwrap()
+    .unwrap();
+    let sibling = create_plugin_with_http_client_and_config_id(
+        "request_deduplication",
+        &config,
+        PluginHttpClient::default(),
+        Some("dedup-long"),
+    )
+    .unwrap()
+    .unwrap();
+    let same_config_peer = create_plugin_with_http_client_and_config_id(
+        "request_deduplication",
+        &config,
+        PluginHttpClient::default(),
+        Some("dedup-short"),
+    )
+    .unwrap()
+    .unwrap();
+    let whitespace_distinct = create_plugin_with_http_client_and_config_id(
+        "request_deduplication",
+        &config,
+        PluginHttpClient::default(),
+        Some(" dedup-short "),
+    )
+    .unwrap()
+    .unwrap();
+
+    async fn logical_key(plugin: &Arc<dyn Plugin>) -> String {
+        let mut ctx = body_ctx("POST", "/api/orders", b"{}");
+        let mut headers = keyed_headers("shared-key", "api.example", 2);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let keys = request_deduplication_logical_keys_from_context_for_test(&ctx);
+        assert_eq!(keys.len(), 1, "expected one acquired logical key");
+        keys.into_iter().next().unwrap()
+    }
+
+    let first_key = logical_key(&first).await;
+    let sibling_key = logical_key(&sibling).await;
+    let peer_key = logical_key(&same_config_peer).await;
+    let whitespace_distinct_key = logical_key(&whitespace_distinct).await;
+    assert_ne!(
+        first_key, sibling_key,
+        "production factory must partition sibling plugin_config_id values"
+    );
+    assert_eq!(
+        first_key, peer_key,
+        "corresponding copies of one plugin_config_id must share Redis identity"
+    );
+    assert_ne!(
+        first_key, whitespace_distinct_key,
+        "distinct nonblank plugin_config_id bytes must not collapse after validation"
+    );
 }
 
 #[test]
@@ -3663,6 +3784,9 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
 #[tokio::test]
 async fn stable_plugin_config_identity_partitions_distributed_logical_keys() {
     let config = json!({});
+    // Same stable plugin-config id on two gateways must share Redis identity
+    // (cross-gateway companion contract). Distinct ids — including across
+    // scopes that happen to share a proxy association — must stay partitioned.
     let first_gateway = request_deduplication_with_instance_id_for_test(
         &config,
         PluginHttpClient::default(),
@@ -3681,9 +3805,27 @@ async fn stable_plugin_config_identity_partitions_distributed_logical_keys() {
         "dedup-secondary",
     )
     .unwrap();
+    let proxy_group_sibling = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-proxy-group",
+    )
+    .unwrap();
+    let global_sibling = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-global",
+    )
+    .unwrap();
 
     let mut identities = Vec::new();
-    for plugin in [&first_gateway, &second_gateway, &sibling_instance] {
+    for plugin in [
+        &first_gateway,
+        &second_gateway,
+        &sibling_instance,
+        &proxy_group_sibling,
+        &global_sibling,
+    ] {
         let mut ctx = body_ctx("POST", "/api/orders", b"{}");
         let mut headers = keyed_headers("shared-key", "api.example", 2);
         assert!(matches!(
@@ -3700,6 +3842,14 @@ async fn stable_plugin_config_identity_partitions_distributed_logical_keys() {
     assert_ne!(
         identities[0].0, identities[2].0,
         "sibling plugin instances must not share completed or in-flight Redis keys"
+    );
+    assert_ne!(
+        identities[0].0, identities[3].0,
+        "proxy_group-scoped config identity must remain isolated from peer instances"
+    );
+    assert_ne!(
+        identities[0].0, identities[4].0,
+        "global-scoped config identity must remain isolated from peer instances"
     );
     assert_eq!(
         identities[0].1, identities[2].1,
