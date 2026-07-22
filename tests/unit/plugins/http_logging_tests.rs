@@ -503,7 +503,7 @@ async fn test_http_logging_reuses_http11_connection_across_successful_batches() 
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "retry_delay_ms": 1,
         }),
@@ -530,7 +530,7 @@ async fn test_http_logging_reuses_http11_connection_across_retry() {
         &json!({
             "endpoint_url": endpoint,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 1,
             "retry_delay_ms": 1,
         }),
@@ -578,7 +578,7 @@ async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
         &json!({
             "endpoint_url": format!("http://{addr}/logs"),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
         }),
         default_client(),

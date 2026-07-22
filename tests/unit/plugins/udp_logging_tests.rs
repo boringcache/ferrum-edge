@@ -1096,7 +1096,7 @@ async fn test_udp_logging_plain_udp_dns_address_change_rebuilds_sender() {
             "host": "127.0.0.1",
             "port": addr_a.port(),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "buffer_capacity": 16
         }),
@@ -1143,7 +1143,7 @@ async fn test_udp_logging_dtls_dns_address_change_rebuilds_association() {
             "dtls": true,
             "dtls_no_verify": true,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "buffer_capacity": 16
         }),
@@ -1198,7 +1198,7 @@ async fn test_udp_logging_dtls_retains_association_when_replacement_handshake_fa
             "dtls": true,
             "dtls_no_verify": true,
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "buffer_capacity": 16
         }),
