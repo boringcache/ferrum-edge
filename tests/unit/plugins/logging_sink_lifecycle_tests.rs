@@ -65,6 +65,27 @@ fn kafka_sink_config() -> Value {
     })
 }
 
+const KAFKA_VALIDATION_PROBE_MAX_ENTRY_BYTES: u64 = 12_347;
+const KAFKA_VALIDATION_PROBE_BUFFER_MAX_BYTES: u64 = 7_654_321;
+
+fn kafka_validation_probe_config() -> Value {
+    json!({
+        "broker_list": "127.0.0.1:9092",
+        "topic": "ferrum-validation-probe",
+        "max_entry_bytes": KAFKA_VALIDATION_PROBE_MAX_ENTRY_BYTES,
+        "buffer_max_bytes": KAFKA_VALIDATION_PROBE_BUFFER_MAX_BYTES
+    })
+}
+
+fn kafka_validation_probe_is_registered() -> bool {
+    ferrum_edge::plugins::kafka_logging::snapshots()
+        .iter()
+        .any(|snapshot| {
+            snapshot.max_entry_bytes == KAFKA_VALIDATION_PROBE_MAX_ENTRY_BYTES
+                && snapshot.buffer_max_bytes == KAFKA_VALIDATION_PROBE_BUFFER_MAX_BYTES
+        })
+}
+
 fn chargeback_sink_config(tmp: &tempfile::TempDir) -> Value {
     json!({
         "mode": "per_event",
@@ -109,7 +130,7 @@ fn all_sink_cases(tmp: &tempfile::TempDir) -> Vec<(&'static str, Value)> {
         ("statsd_logging", statsd_sink_config()),
         ("loki_logging", loki_sink_config()),
         ("ws_logging", ws_sink_config()),
-        ("kafka_logging", kafka_sink_config()),
+        ("kafka_logging", kafka_validation_probe_config()),
         ("api_chargeback_sink", chargeback_sink_config(tmp)),
         ("ai_transcript_audit", transcript_sink_config()),
     ]
@@ -205,8 +226,6 @@ fn load_file_mode_spec(
 fn file_mode_validate_pipeline_accepts_each_worker_backed_sink() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool = tmp.path().join("spool");
-    let kafka_before = ferrum_edge::plugins::kafka_logging::snapshots().len();
-
     for (name, config) in all_sink_cases(&tmp) {
         let spec_path = tmp.path().join(format!("{name}-ok.json"));
         write_file_mode_spec(&spec_path, name, &config);
@@ -218,9 +237,8 @@ fn file_mode_validate_pipeline_accepts_each_worker_backed_sink() {
         !spool.exists(),
         "api_chargeback_sink file-mode validation must not create spool directories"
     );
-    assert_eq!(
-        ferrum_edge::plugins::kafka_logging::snapshots().len(),
-        kafka_before,
+    assert!(
+        !kafka_validation_probe_is_registered(),
         "file-mode validation must not register a Kafka generation"
     );
 }
@@ -326,16 +344,15 @@ fn logging_sink_pure_constructors_leave_workers_unstarted() {
 
 #[test]
 fn kafka_validation_construction_does_not_register_generations() {
-    let registered_before = ferrum_edge::plugins::kafka_logging::snapshots().len();
     for _ in 0..8 {
-        let plugin = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
+        let plugin = KafkaLogging::new(&kafka_validation_probe_config(), &client())
+            .expect("kafka validation probe");
         assert_eq!(plugin.snapshot().generation_id, 0);
         assert!(!plugin.snapshot().accepting);
         drop(plugin);
     }
-    assert_eq!(
-        ferrum_edge::plugins::kafka_logging::snapshots().len(),
-        registered_before,
+    assert!(
+        !kafka_validation_probe_is_registered(),
         "validation-only kafka construction must not register generations"
     );
 }
