@@ -223,8 +223,7 @@ const WRR_MAX_SCHEDULE_LEN: usize = 8192;
 /// schedule (`!zero_weight`) so the same fingerprint does not repeatedly retry
 /// the expensive construction; steady hits then use the allocation-free
 /// weighted-lottery / all-zero round-robin path.
-const WRR_SMOOTH_BUILD_MAX_WORK: u64 =
-    (WRR_MAX_SCHEDULE_LEN as u64) * (MAX_BITSET_TARGETS as u64);
+const WRR_SMOOTH_BUILD_MAX_WORK: u64 = (WRR_MAX_SCHEDULE_LEN as u64) * (MAX_BITSET_TARGETS as u64);
 
 /// Bound on concurrently cached healthy-set schedules per WRR lane.
 ///
@@ -5356,8 +5355,7 @@ mod tests {
         let t1 = Arc::new(make_target("h1", 8080));
         let t2 = Arc::new(make_target("h2", 8080));
         // Ascending original indices with a gap (as after an exclusion).
-        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> =
-            vec![(0, &t0), (5, &t1), (12, &t2)];
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = vec![(0, &t0), (5, &t1), (12, &t2)];
 
         assert!(Arc::ptr_eq(
             resolve_wrr_vec_candidate(&candidates, 0).expect("first"),

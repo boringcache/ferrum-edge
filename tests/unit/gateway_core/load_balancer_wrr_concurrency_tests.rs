@@ -103,8 +103,7 @@ fn wrr_source_no_longer_guards_lane_state_with_mutex_vec() {
         "oversized smooth builds must publish a lottery-only sentinel"
     );
     assert!(
-        source.contains("resolve_wrr_vec_candidate")
-            && source.contains("binary_search_by_key"),
+        source.contains("resolve_wrr_vec_candidate") && source.contains("binary_search_by_key"),
         "Vec schedule hits must resolve original indices with binary search"
     );
     assert!(
@@ -531,9 +530,7 @@ fn wrr_oversized_schedule_caches_lottery_sentinel_without_rebuild_churn() {
     // (8192 × 128). The publisher must store an exact-key lottery-only sentinel
     // so repeated selections do not re-attempt the quadratic smooth build.
     let n = 200usize;
-    let weights: Vec<u32> = (0..n)
-        .map(|i| if i == 0 { 65_535 } else { 1 })
-        .collect();
+    let weights: Vec<u32> = (0..n).map(|i| if i == 0 { 65_535 } else { 1 }).collect();
     let targets = weighted_targets(&weights);
     let lb = LoadBalancer::new(
         UPSTREAM,
@@ -545,9 +542,7 @@ fn wrr_oversized_schedule_caches_lottery_sentinel_without_rebuild_churn() {
     let mut heavy = 0u64;
     let samples = 400usize;
     for _ in 0..samples {
-        let sel = lb
-            .select("", None)
-            .expect("lottery-sentinel WRR selection");
+        let sel = lb.select("", None).expect("lottery-sentinel WRR selection");
         assert!(sel.target.weight > 0);
         if sel.target.host == "host0" {
             heavy += 1;
