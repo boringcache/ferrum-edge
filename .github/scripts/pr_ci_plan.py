@@ -17,9 +17,6 @@ from live_suite_path_filter import matched_files, self_test as live_suite_self_t
 # scanner it is evaluated by, and avoids adding a new executable surface to the
 # Cross-protected CI workflow.
 ACTION_SHA40 = re.compile(r"^[0-9a-f]{40}$")
-ACTION_EXPRESSION_ONLY = re.compile(
-    r"^\$\{\{\s*matrix(?:\.[A-Za-z_][A-Za-z0-9_-]*)+\s*\}\}$"
-)
 ACTION_USES_VALUE = (
     r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\$\{\{[^\r\n]*\}\}|[^\s,#}]+)'
 )
@@ -66,8 +63,6 @@ def action_pin_status(raw: str) -> tuple[bool, str]:
     ref = normalize_action_uses_ref(raw)
     if not ref:
         return False, "empty uses reference"
-    if ACTION_EXPRESSION_ONLY.fullmatch(ref):
-        return True, "expression-only generated matrix ref"
     if "${{" in ref:
         return False, f"dynamic or partially interpolated uses ref: {ref}"
     if ref.startswith("./"):
@@ -270,7 +265,7 @@ def action_pinning_self_test() -> list[str]:
     sha = "a" * 40
     expect_ok(f"actions/checkout@{sha}")
     expect_ok("./.github/actions/setup-kubernetes-tools")
-    expect_ok("${{ matrix.action }}")
+    expect_bad("${{ matrix.action }}", "dynamic or partially interpolated")
     expect_bad("actions/checkout@v7", "mutable action ref")
     expect_bad("actions/checkout@abcd123", "mutable action ref")
     expect_bad("actions/checkout", "missing action pin")

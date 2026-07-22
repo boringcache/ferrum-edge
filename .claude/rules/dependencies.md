@@ -24,8 +24,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `docs/dependency-policy.md` → "CI Actions and Kubernetes tooling").
 - kind / kubectl / Helm install only via
   `.github/actions/setup-kubernetes-tools` with repository-pinned checksums.
-- The trusted-base `pr_ci_plan.py --self-test` rejects mutable action refs,
-  pipe-to-shell installers, and unverified tool downloads.
+- The trusted-base `pr_ci_plan.py --self-test` rejects mutable or dynamic
+  action refs, pipe-to-shell installers, and unverified tool downloads.
 
 ## Drift Guard
 

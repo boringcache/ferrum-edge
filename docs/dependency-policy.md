@@ -268,8 +268,10 @@ jobs are a separate supply-chain surface from Rust crates. Policy:
    `.github/scripts/pr_ci_plan.py --self-test` on every CI run (including
    lightweight documentation PRs). Its checker rejects mutable action refs,
    pipe-to-shell installers, mutable-branch install scripts, and direct
-   kind/kubectl/Helm downloads outside the composite action. Local actions and
-   expression-only generated matrix refs are not false positives.
+   kind/kubectl/Helm downloads outside the composite action. Repository-local
+   actions are allowed, but dynamic or matrix-generated `uses` references are
+   rejected because the checker cannot prove that every generated value is a
+   full immutable SHA.
 
 ### Refreshing GitHub Actions (Dependabot)
 
