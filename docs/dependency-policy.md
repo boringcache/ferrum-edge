@@ -274,10 +274,10 @@ jobs are a separate supply-chain surface from Rust crates. Policy:
    kind/kubectl/Helm downloads outside the composite action. Repository-local
    actions are allowed, but dynamic or matrix-generated `uses` references are
    rejected because the checker cannot prove that every generated value is a
-   full immutable SHA. A separate read-only job executes a pull request's
-   proposed planner self-tests without using its output for scheduling, so new
-   policy code is exercised before merge while the base branch remains the
-   authority for job gates.
+   full immutable SHA. The head-executed required-CI verifier also runs a pull
+   request's proposed planner self-tests without consuming planner outputs, so
+   new policy code is exercised before merge while the base branch remains the
+   sole authority for job gates.
 
    This is deliberately static enforcement, not a shell interpreter. It catches
    known direct URLs and folded/continued installer commands, but cannot prove
@@ -297,13 +297,14 @@ When reviewing an actions Dependabot PR:
    to.
 3. Do not accept a PR that reintroduces a mutable tag ref.
 
-The ARM64 Cross build and publication contracts are deliberately frozen
-byte-for-byte by the trusted `pull_request_target` verifier. Six checkout uses
-inside those protected job blocks still carry the historical `# v6` annotation,
-although their pinned `3d3c42e5...` SHA resolves to v7.0.1. An ordinary pull
-request cannot alter those comments without failing the trust gate; correct them
-only as part of an authorized, coordinated rotation of the protected verifier
-and workflow hashes. Do not copy the legacy annotation to unprotected jobs.
+The ARM64 Cross build and publication contracts are deliberately frozen by the
+trusted `pull_request_target` verifier. Existing checkout uses on the guarded
+workflow surfaces still carry the historical `# v6` annotation, although their
+pinned `3d3c42e5...` SHA resolves to v7.0.1. The verifier treats an adjacent
+annotation change as a change to that executable surface, so an ordinary pull
+request cannot normalize those comments. Correct them only as part of an
+authorized, coordinated rotation of the trusted policy; do not copy the legacy
+annotation onto new uses.
 
 ### Refreshing kind / kubectl / Helm versions and checksums
 
