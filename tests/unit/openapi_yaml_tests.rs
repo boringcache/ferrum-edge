@@ -7238,9 +7238,7 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         &json!(["database", "file", "cp", "dp", "mesh", "node_agent"])
     );
     let config_source_status_enum = spec
-        .pointer(
-            "/components/schemas/AdminMetricsGateway/properties/config_source_status/enum",
-        )
+        .pointer("/components/schemas/AdminMetricsGateway/properties/config_source_status/enum")
         .expect("AdminMetricsGateway.config_source_status enum");
     assert_eq!(
         config_source_status_enum,
