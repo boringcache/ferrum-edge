@@ -1503,11 +1503,7 @@ async fn urlencoded_allow_reserved_controls_literal_reserved_bytes() {
     for (allow_reserved, body, expected_status) in [
         (true, "url=https://example.test/a?x=1", None),
         (false, "url=https://example.test/a?x=1", Some(400)),
-        (
-            false,
-            "url=https%3A%2F%2Fexample.test%2Fa%3Fx%3D1",
-            None,
-        ),
+        (false, "url=https%3A%2F%2Fexample.test%2Fa%3Fx%3D1", None),
     ] {
         let plugin = OpenapiValidator::new(&json!({
             "operations": [{
@@ -2252,7 +2248,9 @@ async fn multipart_preserves_non_utf8_file_bytes_for_metadata_validation() {
         }]
     }))
     .unwrap();
-    let mut body = b"--abc\r\nContent-Disposition: form-data; name=\"file\"; filename=\"raw.bin\"\r\n\r\n".to_vec();
+    let mut body =
+        b"--abc\r\nContent-Disposition: form-data; name=\"file\"; filename=\"raw.bin\"\r\n\r\n"
+            .to_vec();
     body.extend_from_slice(&[0, 0xff, 1]);
     body.extend_from_slice(b"\r\n--abc--\r\n");
     let headers = content_type_headers("multipart/form-data; boundary=abc");

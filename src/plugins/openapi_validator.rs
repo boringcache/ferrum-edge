@@ -899,7 +899,10 @@ fn parse_request_validators(
         .and_then(Value::as_object)
         .unwrap_or(object);
     for (content_type, media_value) in content {
-        if matches!(content_type.as_str(), "content_type" | "schema" | "encoding") {
+        if matches!(
+            content_type.as_str(),
+            "content_type" | "schema" | "encoding"
+        ) {
             continue;
         }
         let media_type = normalize_media_type(content_type);
@@ -1060,8 +1063,7 @@ fn split_media_type_value(value: &Value) -> Result<(&Value, Option<&Value>), Str
         .all(|key| matches!(key.as_str(), "schema" | "encoding"));
     if !only_media_type_fields {
         return Err(
-            "media type object with encoding may contain only 'schema' and 'encoding'"
-                .to_string(),
+            "media type object with encoding may contain only 'schema' and 'encoding'".to_string(),
         );
     }
     let schema = object
@@ -1083,8 +1085,8 @@ fn parse_encoding_map(
         .as_object()
         .ok_or_else(|| "encoding must be an object".to_string())?;
     let normalized = media_type.to_ascii_lowercase();
-    let supports_style = normalized == "application/x-www-form-urlencoded"
-        || normalized == "multipart/form-data";
+    let supports_style =
+        normalized == "application/x-www-form-urlencoded" || normalized == "multipart/form-data";
     if !supports_style {
         return Err(format!(
             "encoding is only supported for application/x-www-form-urlencoded and multipart/form-data (got {media_type})"
@@ -1092,8 +1094,7 @@ fn parse_encoding_map(
     }
     let mut out = AHashMap::new();
     for (property, value) in object {
-        let parsed =
-            parse_property_encoding(property, value, &normalized, schema, schema_draft)?;
+        let parsed = parse_property_encoding(property, value, &normalized, schema, schema_draft)?;
         out.insert(property.clone(), parsed);
     }
     Ok(out)
@@ -1109,9 +1110,9 @@ fn parse_property_encoding(
     let property_schema = property_schema_from_object(schema, property).ok_or_else(|| {
         format!("encoding['{property}'] does not name a request-body schema property")
     })?;
-    let object = value.as_object().ok_or_else(|| {
-        format!("encoding['{property}'] must be an object")
-    })?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("encoding['{property}'] must be an object"))?;
     for key in object.keys() {
         if !matches!(
             key.as_str(),
@@ -1215,9 +1216,9 @@ fn parse_property_encoding(
                 "encoding['{property}'].headers is only valid for multipart/form-data"
             ));
         }
-        let headers_object = headers_value.as_object().ok_or_else(|| {
-            format!("encoding['{property}'].headers must be an object")
-        })?;
+        let headers_object = headers_value
+            .as_object()
+            .ok_or_else(|| format!("encoding['{property}'].headers must be an object"))?;
         if headers_object.len() > 32 {
             return Err(format!(
                 "encoding['{property}'].headers must not exceed 32 entries"
@@ -1576,8 +1577,7 @@ fn validate_form_serialization(
         });
         if !allow_reserved
             && raw_value.bytes().any(|byte| {
-                is_unescaped_form_reserved_byte(byte)
-                    && !(comma_is_style_delimiter && byte == b',')
+                is_unescaped_form_reserved_byte(byte) && !(comma_is_style_delimiter && byte == b',')
             })
         {
             return Err(format!(
@@ -1612,8 +1612,21 @@ fn is_unescaped_form_reserved_byte(byte: u8) -> bool {
     // `&` is already the field delimiter and `+` is the form-space encoding.
     matches!(
         byte,
-        b':' | b'/' | b'?' | b'#' | b'[' | b']' | b'@' | b'!' | b'$' | b'\'' | b'(' | b')'
-            | b'*' | b',' | b';' | b'='
+        b':' | b'/'
+            | b'?'
+            | b'#'
+            | b'['
+            | b']'
+            | b'@'
+            | b'!'
+            | b'$'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b','
+            | b';'
+            | b'='
     )
 }
 
@@ -1844,8 +1857,7 @@ fn fields_to_schema_object(
     label: &'static str,
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema);
-    if !(schema_accepts_object(object_schema.as_ref())
-        || object_schema.get("properties").is_some())
+    if !(schema_accepts_object(object_schema.as_ref()) || object_schema.get("properties").is_some())
     {
         let Some(values) = fields.values().next() else {
             return Ok(Value::Null);
@@ -1889,7 +1901,10 @@ fn fields_to_schema_object(
             // consumed. Remaining unmatched deep-object keys fall through.
             let _ = child;
         }
-        out.insert(key.clone(), values_to_schema_value(values, &Value::Null, None)?);
+        out.insert(
+            key.clone(),
+            values_to_schema_value(values, &Value::Null, None)?,
+        );
     }
     if out.is_empty() && schema_has_required(object_schema.as_ref()) {
         return Err(format!("{label} body did not contain any schema fields"));
@@ -1957,8 +1972,7 @@ fn multipart_parts_to_schema_object(
     encoding: &AHashMap<String, PropertyEncoding>,
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema);
-    if !(schema_accepts_object(object_schema.as_ref())
-        || object_schema.get("properties").is_some())
+    if !(schema_accepts_object(object_schema.as_ref()) || object_schema.get("properties").is_some())
     {
         let Some(values) = parts.values().next() else {
             return Ok(Value::Null);
@@ -2061,12 +2075,15 @@ fn multipart_part_to_schema_value(
                 ));
             };
             let converted = scalar_to_schema_value(header_value, &header_validator.schema)?;
-            header_validator.validator.validate(&converted).map_err(|error| {
-                format!(
-                    "Multipart field '{}' header '{header_name}' failed validation: {error}",
-                    part.name
-                )
-            })?;
+            header_validator
+                .validator
+                .validate(&converted)
+                .map_err(|error| {
+                    format!(
+                        "Multipart field '{}' header '{header_name}' failed validation: {error}",
+                        part.name
+                    )
+                })?;
         }
     }
 
@@ -2145,9 +2162,7 @@ fn values_to_schema_value(
                 EncodingStyle::SpaceDelimited => ' ',
                 EncodingStyle::PipeDelimited => '|',
                 EncodingStyle::DeepObject => {
-                    return Err(
-                        "deepObject style is not valid for array properties".to_string(),
-                    );
+                    return Err("deepObject style is not valid for array properties".to_string());
                 }
             };
             values
@@ -2375,8 +2390,7 @@ fn schema_is_composed(schema: &Value) -> bool {
 }
 
 fn schema_accepts_object(schema: &Value) -> bool {
-    collect_scalar_types(schema).contains(&ScalarType::Object)
-        || schema.get("properties").is_some()
+    collect_scalar_types(schema).contains(&ScalarType::Object) || schema.get("properties").is_some()
 }
 
 fn schema_accepts_array(schema: &Value) -> bool {

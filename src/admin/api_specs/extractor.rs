@@ -1361,9 +1361,7 @@ fn extract_openapi_request_body(
             let encoding = match media_object.get("encoding") {
                 None | Some(Value::Null) => None,
                 Some(encoding) => Some(normalize_request_body_encoding(
-                    media_type,
-                    encoding,
-                    &schema,
+                    media_type, encoding, &schema,
                 )?),
             };
             let media_value = match encoding {
@@ -1398,10 +1396,12 @@ fn normalize_request_body_encoding(
         .unwrap_or(media_type)
         .trim()
         .to_ascii_lowercase();
-    let object = encoding.as_object().ok_or_else(|| ExtractError::MalformedExtension {
-        which: "requestBody.content.encoding",
-        error: format!("encoding for media type '{media_type}' must be an object"),
-    })?;
+    let object = encoding
+        .as_object()
+        .ok_or_else(|| ExtractError::MalformedExtension {
+            which: "requestBody.content.encoding",
+            error: format!("encoding for media type '{media_type}' must be an object"),
+        })?;
     if base != "application/x-www-form-urlencoded" && base != "multipart/form-data" {
         return Err(ExtractError::MalformedExtension {
             which: "requestBody.content.encoding",
@@ -1438,9 +1438,7 @@ fn normalize_request_body_encoding(
             ) {
                 return Err(ExtractError::MalformedExtension {
                     which: "requestBody.content.encoding",
-                    error: format!(
-                        "encoding['{property}'] contains unsupported field '{key}'"
-                    ),
+                    error: format!("encoding['{property}'] contains unsupported field '{key}'"),
                 });
             }
         }

@@ -248,8 +248,8 @@ fn importer_preserves_form_encoding_objects_in_generated_config() {
 }"##;
 
     let config = extract_validator_config(spec);
-    let media = &config["operations"][0]["request_body"]["content"]
-        ["application/x-www-form-urlencoded"];
+    let media =
+        &config["operations"][0]["request_body"]["content"]["application/x-www-form-urlencoded"];
     assert_eq!(media["encoding"]["tags"]["style"], "form");
     assert_eq!(media["encoding"]["tags"]["explode"], false);
     assert!(media["schema"]["properties"]["tags"].is_object());
