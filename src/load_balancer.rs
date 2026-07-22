@@ -199,8 +199,584 @@ fn membership_mask_for_indices(len: usize, indices: &[usize]) -> Vec<bool> {
     mask
 }
 
+use crossbeam_utils::CachePadded;
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+
+/// Cap on a precomputed smooth-WRR schedule length.
+///
+/// Normal weights produce `sum(weight)/gcd` entries (often tens). Pathological
+/// huge periods are proportionally apportioned into this many entries while
+/// retaining at least one entry for every positive-weight target.
+const WRR_MAX_SCHEDULE_LEN: usize = 8192;
+
+/// Maximum smooth-WRR construction work (`schedule_steps × positive_candidates`)
+/// before publishing a lottery-only sentinel instead of running the quadratic
+/// NGINX loop on a Tokio worker.
+///
+/// Ordinary sets (small candidate counts and uncapped or modest periods) stay
+/// well under this budget and retain exact smooth-WRR sequences. The bound is
+/// `WRR_MAX_SCHEDULE_LEN × MAX_BITSET_TARGETS` (8192 × 128): a full bitset-path
+/// capped period is still buildable, while pathologically large candidate ×
+/// period products fall back. Oversized builds publish an exact-key empty-order
+/// schedule (`!zero_weight`) so the same fingerprint does not repeatedly retry
+/// the expensive construction; steady hits then use the allocation-free
+/// weighted-lottery / all-zero round-robin path.
+const WRR_SMOOTH_BUILD_MAX_WORK: u64 = (WRR_MAX_SCHEDULE_LEN as u64) * (MAX_BITSET_TARGETS as u64);
+
+/// Bound on concurrently cached healthy-set schedules per WRR lane.
+///
+/// One [`LoadBalancer`] is shared for an upstream, but per-proxy passive health,
+/// retry exclusions, and locality candidate sets produce distinct fingerprints.
+/// Caching several recurring fingerprints avoids thrashing a single slot (and
+/// the rebuild path) under realistic shared-upstream traffic.
+const WRR_SCHEDULE_CACHE_SLOTS: usize = 8;
+
+/// After the fingerprint cache is full, attempt a schedule publish at most once
+/// per this many locked miss decisions.
+///
+/// Cold-start fills of empty slots are uncapped. Sustained churn beyond
+/// [`WRR_SCHEDULE_CACHE_SLOTS`] therefore cannot rebuild/allocate a smooth
+/// schedule on every request; unsampled misses use the allocation-free
+/// candidate scan instead.
+const WRR_MISS_PUBLISH_SAMPLE: u64 = 64;
+
+/// Per-schedule selection-counter shards (power of two).
+///
+/// Small healthy sets make a single shared `AtomicU64` the throughput ceiling:
+/// concurrent workers bounce one cache line on every pick and can fall *below*
+/// single-thread throughput. Sharded, cache-line-padded counters keep each
+/// worker on its own line while every shard still walks the same precomputed
+/// smooth-WRR order (the schedule-defined long-run ratios are preserved;
+/// workers no longer share one global interleaving).
+const WRR_COUNTER_SHARDS: usize = 16;
+
+/// Exact cache key for one healthy target set.
+#[derive(Debug)]
+enum WrrScheduleKey {
+    Invalid,
+    Bitset(u128),
+    Indices(Box<[usize]>),
+}
+
+/// Precomputed smooth weighted round-robin order for one healthy fingerprint.
+///
+/// Built on the cold path when a fingerprint miss is allowed to publish into
+/// the lane cache (empty-slot fill or rate-sampled replacement); steady-state
+/// selection only loads a matching slot via [`ArcSwap`] and advances one
+/// sharded [`AtomicU64`]. Unsampled / contended misses never construct this
+/// value — they use the allocation-free candidate scan instead.
+///
+/// # Order / flag contract
+///
+/// - Non-empty `order`, `zero_weight == false`: exact or weight-bounded smooth
+///   WRR walk.
+/// - Empty `order`, `zero_weight == true`: all-zero weights — round-robin over
+///   the current healthy set via shard counters.
+/// - Empty `order`, `zero_weight == false`, non-[`Invalid`] key: **lottery-only
+///   sentinel** published when smooth construction would exceed
+///   [`WRR_SMOOTH_BUILD_MAX_WORK`]. Hits use the allocation-free weighted
+///   lottery (or all-zero RR if weights are later all zero) and never retry the
+///   quadratic build for this exact key.
+struct WrrSchedule {
+    /// Exact healthy-set identity. The >128-target path retains its indices so
+    /// a hash collision can never reuse a schedule for the wrong candidate set.
+    key: WrrScheduleKey,
+    /// Per-worker counter shards. Each cached healthy set keeps its own shard
+    /// set so alternating fingerprints cannot alias onto one counter parity.
+    counters: [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS],
+    /// Target indices in NGINX smooth-WRR order for one exact or proportionally
+    /// bounded weight period. Empty for inactive/invalid, all-zero, or
+    /// lottery-only sentinel schedules (see struct docs).
+    order: Box<[usize]>,
+    /// When true, selection uses this schedule's counter over healthy targets
+    /// (all-zero weight round-robin). When false with an empty `order` and a
+    /// real key, the schedule is a lottery-only sentinel.
+    zero_weight: bool,
+}
+
+impl WrrSchedule {
+    fn invalid() -> Self {
+        Self {
+            key: WrrScheduleKey::Invalid,
+            counters: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
+            order: Box::new([]),
+            zero_weight: false,
+        }
+    }
+
+    /// `healthy_count` is used only for all-zero schedules (`zero_weight`): it
+    /// spreads shard phases across the healthy candidate count so independent
+    /// shards do not start lockstep on the same RR offset. Pass `0` when
+    /// unused (smooth or lottery-only).
+    fn with_seed(
+        key: WrrScheduleKey,
+        order: Box<[usize]>,
+        zero_weight: bool,
+        seed: u64,
+        healthy_count: usize,
+    ) -> Self {
+        // Deterministic stride across the healthy set: shard_i starts at
+        // seed + i × max(1, healthy_count / WRR_COUNTER_SHARDS).
+        let zero_phase_stride = (healthy_count / WRR_COUNTER_SHARDS).max(1) as u64;
+        Self {
+            key,
+            // Distinct per-shard phases avoid lockstep bursts when many workers
+            // start together; ratios are unchanged because each shard is itself
+            // a full smooth-WRR walk of `order` (or RR/lottery over the set).
+            counters: std::array::from_fn(|i| {
+                let initial = if zero_weight {
+                    seed.wrapping_add((i as u64).wrapping_mul(zero_phase_stride))
+                } else {
+                    seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15))
+                };
+                CachePadded::new(AtomicU64::new(initial))
+            }),
+            order,
+            zero_weight,
+        }
+    }
+
+    /// True when this cached schedule is a work-budget lottery-only sentinel.
+    #[inline]
+    fn is_lottery_only(&self) -> bool {
+        self.order.is_empty() && !self.zero_weight && !matches!(self.key, WrrScheduleKey::Invalid)
+    }
+}
+
+/// Assign a stable counter shard for the current OS thread.
+#[inline]
+fn wrr_counter_shard() -> usize {
+    thread_local! {
+        static SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    SHARD.with(|cell| {
+        let current = cell.get();
+        if current < WRR_COUNTER_SHARDS {
+            return current;
+        }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let assigned = (NEXT.fetch_add(1, Ordering::Relaxed) as usize) & (WRR_COUNTER_SHARDS - 1);
+        cell.set(assigned);
+        assigned
+    })
+}
+
+/// Per-lane smooth-WRR state shared by parent, subset, and port selectors.
+///
+/// # Concurrency / distribution tradeoff
+///
+/// Steady-state selection is **wait-free**: each request scans the bounded
+/// [`ArcSwap`] schedule slots for the current healthy fingerprint, then does
+/// one sharded per-schedule [`AtomicU64::fetch_add`] to pick the next index.
+/// Concurrent Tokio workers therefore scale across cores without taking a
+/// blocking mutex on the hot path — including when several recurring
+/// fingerprints alternate. Each worker shard walks the same precomputed
+/// smooth-WRR order, so uncapped cached periods retain exact configured ratios;
+/// workers do **not** share a single global interleaving (the intentional
+/// contention tradeoff).
+///
+/// On a cache miss, publishers use `Mutex::try_lock` so rebuilds stay
+/// contention-bounded and never block the hot path. Empty cache slots fill
+/// immediately; once the cache is full, further publishes are rate-sampled
+/// ([`WRR_MISS_PUBLISH_SAMPLE`]). Contending missers and unsampled misses
+/// **never** build an ephemeral smooth schedule — they take an allocation-free
+/// O(candidate) weighted lottery (or all-zero round-robin) over eligible
+/// positive-weight targets. That fallback preserves reachability and safety
+/// but does **not** claim exact smooth-WRR interleaving. The lock is never
+/// held across `.await`.
+///
+/// # Why there is no invalidate flag
+///
+/// A schedule is a pure function of `(fingerprint, immutable target weights)`
+/// for a given [`LoadBalancer`] generation. Config reload swaps the balancer
+/// `Arc` through [`LoadBalancerCache`]'s `ArcSwap`, so schedules cannot bleed
+/// across target-set generations. Recovering a target either changes the
+/// fingerprint (miss → rebuild) or restores a previously cached fingerprint
+/// whose order is still correct — a boolean `invalidate` is unnecessary and
+/// would race with concurrent publishers (`store(true)` lost to a late
+/// `store(false)`). See `wrr_recovery_reuses_cached_fingerprint_schedule`.
+///
+/// # Bounded state / wrap semantics
+///
+/// At most [`WRR_SCHEDULE_CACHE_SLOTS`] schedules are retained (strict memory
+/// bound). Each shard counter is `u64` and indexes with `% order.len()`.
+/// Wrapping is well-defined and does not bias the schedule's long-run ratios.
+/// Config-valid schedules are capped at [`WRR_MAX_SCHEDULE_LEN`]; larger exact
+/// periods are deterministically apportioned while preserving every positive-
+/// weight target, then smoothed over the complete bounded period. Those capped
+/// 8192-entry schedules are bounded approximations of the exact period — they
+/// retain every positive-weight target but do not claim exact configured ratios
+/// for pathological weight products that exceed the cap.
+///
+/// Smooth construction itself is additionally bounded by
+/// [`WRR_SMOOTH_BUILD_MAX_WORK`] (`schedule_steps × positive_candidates`). When
+/// that work budget would be exceeded, the publisher stores an exact-key
+/// lottery-only sentinel (empty order, `!zero_weight`) so the fingerprint does
+/// not repeatedly attempt the quadratic build; hits then use the same
+/// allocation-free lottery / all-zero RR as the miss path.
+struct WrrLaneState {
+    /// Bounded fingerprint → schedule cache. Steady hits load matching slots
+    /// with no lock and no per-selection allocation.
+    slots: Box<[ArcSwap<WrrSchedule>]>,
+    /// Round-robin index of the next slot to overwrite on publish.
+    publish_cursor: AtomicU64,
+    /// Cold-path publish gate — `try_lock` only; never blocks the hot path.
+    rebuild: std::sync::Mutex<()>,
+    /// `0` means this lane does not run WRR (e.g. non-WRR port override).
+    target_len: usize,
+    /// Steady-state cache hits (fingerprint matched a slot). Test builds only —
+    /// never updated on the release hot path (avoids a second shared RMW).
+    #[cfg(test)]
+    cache_hits: AtomicU64,
+    /// Successful schedule publishes into the bounded cache.
+    rebuilds: AtomicU64,
+    /// Allocation-free miss-fallback selections (miss path only; not the
+    /// steady-state hit path).
+    miss_fallbacks: CachePadded<AtomicU64>,
+    /// Rate-sample counter for full-cache replacement publishes.
+    miss_publish_tickets: AtomicU64,
+    /// Seed source for newly published schedules. Distinct seeds avoid a herd
+    /// of concurrent first-fill publishes all choosing entry zero.
+    schedule_seed: AtomicU64,
+}
+
+impl std::fmt::Debug for WrrLaneState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<String> = self
+            .slots
+            .iter()
+            .map(|slot| {
+                let guard = slot.load();
+                match &guard.key {
+                    WrrScheduleKey::Invalid => "invalid".to_string(),
+                    WrrScheduleKey::Bitset(bits) => format!("bitset:{bits:032x}"),
+                    WrrScheduleKey::Indices(indices) => {
+                        format!("indices(len={})", indices.len())
+                    }
+                }
+            })
+            .collect();
+        let mut debug = f.debug_struct("WrrLaneState");
+        debug
+            .field("target_len", &self.target_len)
+            .field("rebuilds", &self.rebuilds.load(Ordering::Relaxed))
+            .field(
+                "miss_fallbacks",
+                &self.miss_fallbacks.load(Ordering::Relaxed),
+            )
+            .field("slot_keys", &keys);
+        #[cfg(test)]
+        debug.field("cache_hits", &self.cache_hits.load(Ordering::Relaxed));
+        debug.finish()
+    }
+}
+
+impl WrrLaneState {
+    fn empty_slots() -> Box<[ArcSwap<WrrSchedule>]> {
+        (0..WRR_SCHEDULE_CACHE_SLOTS)
+            .map(|_| ArcSwap::from_pointee(WrrSchedule::invalid()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    fn inactive() -> Self {
+        Self {
+            slots: Vec::new().into_boxed_slice(),
+            publish_cursor: AtomicU64::new(0),
+            rebuild: std::sync::Mutex::new(()),
+            target_len: 0,
+            #[cfg(test)]
+            cache_hits: AtomicU64::new(0),
+            rebuilds: AtomicU64::new(0),
+            miss_fallbacks: CachePadded::new(AtomicU64::new(0)),
+            miss_publish_tickets: AtomicU64::new(0),
+            schedule_seed: AtomicU64::new(0),
+        }
+    }
+
+    fn new(target_len: usize) -> Self {
+        if target_len == 0 {
+            return Self::inactive();
+        }
+        Self {
+            slots: Self::empty_slots(),
+            publish_cursor: AtomicU64::new(0),
+            rebuild: std::sync::Mutex::new(()),
+            target_len,
+            #[cfg(test)]
+            cache_hits: AtomicU64::new(0),
+            rebuilds: AtomicU64::new(0),
+            miss_fallbacks: CachePadded::new(AtomicU64::new(0)),
+            miss_publish_tickets: AtomicU64::new(0),
+            schedule_seed: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn is_active(&self) -> bool {
+        self.target_len > 0
+    }
+
+    /// Load a cached bitset schedule without recording a hit.
+    #[inline]
+    fn lookup_bitset_schedule(
+        &self,
+        fingerprint: u128,
+    ) -> Option<arc_swap::Guard<Arc<WrrSchedule>>> {
+        for slot in self.slots.iter() {
+            let guard = slot.load();
+            if matches!(&guard.key, WrrScheduleKey::Bitset(value) if *value == fingerprint) {
+                return Some(guard);
+            }
+        }
+        None
+    }
+
+    /// Load a cached >128-target schedule by exact ordered membership.
+    #[inline]
+    fn lookup_vec_schedule(
+        &self,
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+    ) -> Option<arc_swap::Guard<Arc<WrrSchedule>>> {
+        for slot in self.slots.iter() {
+            let guard = slot.load();
+            let WrrScheduleKey::Indices(indices) = &guard.key else {
+                continue;
+            };
+            if indices.len() == candidates.len()
+                && indices
+                    .iter()
+                    .copied()
+                    .eq(candidates.iter().map(|(idx, _)| *idx))
+            {
+                return Some(guard);
+            }
+        }
+        None
+    }
+
+    /// Steady-state bitset hit: lookup (+ test-only hit counter).
+    #[inline]
+    fn hit_bitset_schedule(&self, fingerprint: u128) -> Option<arc_swap::Guard<Arc<WrrSchedule>>> {
+        let guard = self.lookup_bitset_schedule(fingerprint)?;
+        #[cfg(test)]
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        Some(guard)
+    }
+
+    /// Steady-state Vec hit: exact lookup (+ test-only hit counter).
+    #[inline]
+    fn hit_vec_schedule(
+        &self,
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+    ) -> Option<arc_swap::Guard<Arc<WrrSchedule>>> {
+        let guard = self.lookup_vec_schedule(candidates)?;
+        #[cfg(test)]
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        Some(guard)
+    }
+
+    #[inline]
+    fn next_schedule_seed(&self) -> u64 {
+        self.schedule_seed.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn next_miss_fallback(&self) -> u64 {
+        self.miss_fallbacks.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// True when at least one cache slot has never been published.
+    #[inline]
+    fn has_free_slot(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| matches!(&slot.load().key, WrrScheduleKey::Invalid))
+    }
+
+    /// Whether a locked miss may build+publish a schedule.
+    ///
+    /// Empty slots always fill. Full-cache replacement is rate-sampled so
+    /// sustained fingerprint churn cannot allocate on every request.
+    #[inline]
+    fn should_publish_on_miss(&self) -> bool {
+        if self.has_free_slot() {
+            return true;
+        }
+        let ticket = self.miss_publish_tickets.fetch_add(1, Ordering::Relaxed);
+        ticket.is_multiple_of(WRR_MISS_PUBLISH_SAMPLE)
+    }
+
+    /// Publish `schedule` into the next round-robin slot (caller holds try-lock).
+    fn publish_schedule(&self, schedule: Arc<WrrSchedule>) {
+        let slot_count = self.slots.len();
+        if slot_count == 0 {
+            return;
+        }
+        let idx = (self.publish_cursor.fetch_add(1, Ordering::Relaxed) as usize) % slot_count;
+        self.slots[idx].store(schedule);
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn cache_stats(&self) -> (u64, u64) {
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.rebuilds.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(schedule_publishes, allocation_free_miss_fallbacks)` for diagnostics/tests.
+    #[inline]
+    fn schedule_counters(&self) -> (u64, u64) {
+        (
+            self.rebuilds.load(Ordering::Relaxed),
+            self.miss_fallbacks.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Greatest common divisor for shrinking WRR schedule length.
+#[inline]
+fn wrr_gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Result of building a smooth-WRR order for one healthy weight set.
+#[derive(Debug)]
+enum WrrOrderBuild {
+    /// Exact or weight-bounded NGINX smooth-WRR sequence.
+    Smooth(Box<[usize]>),
+    /// Every weight was zero — callers publish an all-zero RR schedule.
+    ZeroWeight,
+    /// Construction work would exceed [`WRR_SMOOTH_BUILD_MAX_WORK`]. Callers
+    /// publish a lottery-only sentinel for the exact healthy-set key.
+    LotteryOnly,
+}
+
+/// Bound a normalized WRR period without starving positive-weight targets.
+///
+/// Each target first receives one slot. Remaining slots are apportioned by the
+/// largest-remainder method in original target order for deterministic ties.
+/// Config validation limits upstreams to fewer targets than the normal cap;
+/// `max` also keeps direct internal construction safe if that invariant changes.
+fn bound_wrr_weights(normalized: &[(usize, u64)], total_weight: u64) -> Vec<(usize, i64)> {
+    let schedule_len = WRR_MAX_SCHEDULE_LEN.max(normalized.len());
+    if total_weight <= schedule_len as u64 {
+        return normalized
+            .iter()
+            .map(|&(idx, weight)| (idx, weight as i64))
+            .collect();
+    }
+
+    let remaining = schedule_len.saturating_sub(normalized.len());
+    let denominator = u128::from(total_weight).max(1);
+    let mut apportioned = Vec::with_capacity(normalized.len());
+    let mut remainders = Vec::with_capacity(normalized.len());
+    let mut assigned = normalized.len();
+
+    for (slot, &(idx, weight)) in normalized.iter().enumerate() {
+        let numerator = u128::from(weight).saturating_mul(remaining as u128);
+        let extra = usize::try_from(numerator / denominator).unwrap_or(usize::MAX);
+        let slots = (extra as u64).saturating_add(1);
+        apportioned.push((idx, slots.min(i64::MAX as u64) as i64));
+        remainders.push((slot, numerator % denominator));
+        assigned = assigned.saturating_add(extra);
+    }
+
+    remainders.sort_unstable_by(|(slot_a, remainder_a), (slot_b, remainder_b)| {
+        remainder_b
+            .cmp(remainder_a)
+            .then_with(|| slot_a.cmp(slot_b))
+    });
+    let leftover = schedule_len.saturating_sub(assigned);
+    for &(slot, _) in remainders.iter().take(leftover) {
+        apportioned[slot].1 = apportioned[slot].1.saturating_add(1);
+    }
+    apportioned
+}
+
+/// Build a smooth-WRR order for `(target_index, weight)` pairs with weight > 0.
+///
+/// Returns [`WrrOrderBuild::LotteryOnly`] when the quadratic NGINX loop would
+/// exceed [`WRR_SMOOTH_BUILD_MAX_WORK`], so callers can publish an exact-key
+/// sentinel instead of blocking a Tokio worker on a pathological build.
+fn build_smooth_wrr_order(weighted: &[(usize, u32)]) -> WrrOrderBuild {
+    let mut gcd = 0u32;
+    for &(_, weight) in weighted {
+        if weight == 0 {
+            continue;
+        }
+        gcd = if gcd == 0 {
+            weight
+        } else {
+            wrr_gcd(gcd, weight)
+        };
+    }
+    if gcd == 0 {
+        return WrrOrderBuild::ZeroWeight;
+    }
+
+    let normalized: Vec<(usize, u64)> = weighted
+        .iter()
+        .filter(|(_, weight)| *weight > 0)
+        .map(|&(idx, weight)| (idx, u64::from(weight / gcd)))
+        .collect();
+    let total_weight: u64 = normalized.iter().map(|(_, weight)| *weight).sum();
+    let bounded = bound_wrr_weights(&normalized, total_weight);
+    let bounded_total: i64 = bounded.iter().map(|(_, weight)| *weight).sum();
+    if bounded_total <= 0 {
+        return WrrOrderBuild::ZeroWeight;
+    }
+
+    let steps = bounded_total as usize;
+    let positive_candidates = bounded.len();
+    match (steps as u64).checked_mul(positive_candidates as u64) {
+        Some(work) if work <= WRR_SMOOTH_BUILD_MAX_WORK => {}
+        _ => return WrrOrderBuild::LotteryOnly,
+    }
+
+    let mut current = vec![0i64; positive_candidates];
+    let mut order = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        let mut best_slot = 0usize;
+        let mut best_current = i64::MIN;
+        for (slot, &(_, weight)) in bounded.iter().enumerate() {
+            current[slot] = current[slot].saturating_add(weight);
+            if current[slot] > best_current {
+                best_current = current[slot];
+                best_slot = slot;
+            }
+        }
+        current[best_slot] = current[best_slot].saturating_sub(bounded_total);
+        order.push(bounded[best_slot].0);
+    }
+    WrrOrderBuild::Smooth(order.into_boxed_slice())
+}
+
+/// Resolve a schedule original-index into a >128-target candidate slice.
+///
+/// All Vec candidate construction paths retain ascending original-index order
+/// (enumerate / filter / locality masks, with passive readmits re-sorted), so
+/// steady-state hits use `binary_search_by_key` — O(log n), allocation-free.
+#[inline]
+fn resolve_wrr_vec_candidate<'a>(
+    candidates: &[(usize, &'a Arc<UpstreamTarget>)],
+    orig_idx: usize,
+) -> Option<&'a Arc<UpstreamTarget>> {
+    match candidates.binary_search_by_key(&orig_idx, |(idx, _)| *idx) {
+        Ok(pos) => Some(candidates[pos].1),
+        Err(_) => None,
+    }
+}
 
 /// Health context passed to target selection, bundling both active (shared
 /// per-upstream) and passive (per-proxy) unhealthy target state.
@@ -435,7 +1011,7 @@ impl LoadBalancerCacheInner {
 /// incremental updates can clone the HashMap cheaply (just Arc pointer
 /// copies) and only allocate new `LoadBalancer` instances for changed
 /// upstreams. Unchanged upstreams keep their exact same instance --
-/// round-robin counters, WRR weights, active connection counts, latency
+/// round-robin counters, WRR schedules, active connection counts, latency
 /// EWMAs, and consistent hash rings are all preserved.
 pub struct LoadBalancerCache {
     inner: ArcSwap<LoadBalancerCacheInner>,
@@ -503,7 +1079,7 @@ impl LoadBalancerCache {
     /// - Removes deleted upstreams
     /// - Creates fresh `LoadBalancer` instances only for added/modified upstreams
     /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
-    ///   round-robin counters, WRR weights, active connection counts, latency
+    ///   round-robin counters, WRR schedules, active connection counts, latency
     ///   EWMAs, and hash rings
     pub(crate) fn build_delta_inner(
         current: &LoadBalancerCacheInner,
@@ -1436,13 +2012,9 @@ pub struct LoadBalancer {
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin counter.
     rr_counter: AtomicU64,
-    /// Weighted round-robin state (smooth weighted round-robin).
-    /// Protected by a mutex to prevent weight drift under concurrency.
-    /// The critical section is sub-microsecond (weight arithmetic only).
-    wrr_state: std::sync::Mutex<Vec<i64>>,
-    /// Set on target recovery so WRR pays the stale-weight scan only on the
-    /// first post-recovery selection instead of every steady-state request.
-    wrr_needs_stale_check: AtomicBool,
+    /// Weighted round-robin lane state (smooth weighted round-robin).
+    /// See [`WrrLaneState`] for the wait-free hot path and rebuild tradeoff.
+    wrr_state: WrrLaneState,
     /// Active connections per target (for least-connections).
     pub active_connections: DashMap<String, AtomicI64>,
     /// Consistent hash ring (sorted hash values -> target index).
@@ -1472,12 +2044,8 @@ pub struct LoadBalancer {
     /// algorithm is consistent hashing; non-hash subset lanes store `Ip`.
     subset_hash_on_strategies: HashMap<String, HashOnStrategy>,
     /// Smooth-WRR state isolated per subset so weighted routing in one subset
-    /// cannot perturb the current weights of another subset.
-    subset_wrr_state: HashMap<String, std::sync::Mutex<Vec<i64>>>,
-    /// Stale-weight scan flags isolated per WRR subset. The parent WRR state
-    /// and each subset WRR state can be selected independently after a recovery
-    /// event, so one state consuming its scan flag must not clear another's.
-    subset_wrr_needs_stale_check: HashMap<String, AtomicBool>,
+    /// cannot perturb the schedule of another subset.
+    subset_wrr_state: HashMap<String, WrrLaneState>,
     /// Per-subset consistent-hash rings. These avoid walking the full upstream
     /// ring when a small subset uses consistent hashing.
     subset_hash_rings: HashMap<String, Vec<(u64, usize)>>,
@@ -1570,8 +2138,7 @@ struct PortLbState {
     algorithm: LoadBalancerAlgorithm,
     algorithm_overridden: bool,
     rr_counter: AtomicU64,
-    wrr_state: std::sync::Mutex<Vec<i64>>,
-    wrr_needs_stale_check: AtomicBool,
+    wrr_state: WrrLaneState,
     hash_ring: Vec<(u64, usize)>,
     hash_on_strategy: HashOnStrategy,
     hash_on_override_strategy: Option<HashOnStrategy>,
@@ -1630,7 +2197,6 @@ impl LoadBalancer {
         locality_lb_setting: Option<&UpstreamLocalityLbSetting>,
         locality_lb_strict: bool,
     ) -> Self {
-        let wrr_weights: Vec<i64> = vec![0; targets.len()];
         // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
         let host_port_keys: Vec<String> = targets.iter().map(target_host_port_key).collect();
         // Pre-compute upstream-scoped keys for health check filtering (matches HealthChecker key format)
@@ -1749,15 +2315,10 @@ impl LoadBalancer {
             };
 
         let mut subset_wrr_state = HashMap::new();
-        let mut subset_wrr_needs_stale_check = HashMap::new();
         let mut subset_hash_rings = HashMap::new();
         for (subset_name, subset_algorithm) in &subset_algorithms {
             if *subset_algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
-                subset_wrr_state.insert(
-                    subset_name.clone(),
-                    std::sync::Mutex::new(vec![0; targets.len()]),
-                );
-                subset_wrr_needs_stale_check.insert(subset_name.clone(), AtomicBool::new(false));
+                subset_wrr_state.insert(subset_name.clone(), WrrLaneState::new(targets.len()));
             }
             if *subset_algorithm == LoadBalancerAlgorithm::ConsistentHashing
                 && let Some(indices) = subset_indices.get(subset_name)
@@ -1800,9 +2361,9 @@ impl LoadBalancer {
                     // vector, even when only a subset serves this port, so
                     // bitset, subset, and Vec fallback paths can share the
                     // same target-index bookkeeping.
-                    vec![0; targets.len()]
+                    WrrLaneState::new(targets.len())
                 } else {
-                    Vec::new()
+                    WrrLaneState::inactive()
                 };
                 // Per-port locality LB falls back to the upstream-level setting
                 // when the operator did not override it at this port. The
@@ -1821,8 +2382,7 @@ impl LoadBalancer {
                         algorithm: effective_algorithm,
                         algorithm_overridden: override_config.algorithm.is_some(),
                         rr_counter: AtomicU64::new(0),
-                        wrr_state: std::sync::Mutex::new(wrr_state),
-                        wrr_needs_stale_check: AtomicBool::new(false),
+                        wrr_state,
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
                         hash_on_override_strategy: override_config
@@ -1885,8 +2445,11 @@ impl LoadBalancer {
             target_index,
             algorithm,
             rr_counter: AtomicU64::new(0),
-            wrr_state: std::sync::Mutex::new(wrr_weights),
-            wrr_needs_stale_check: AtomicBool::new(false),
+            wrr_state: if algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
+                WrrLaneState::new(targets.len())
+            } else {
+                WrrLaneState::inactive()
+            },
             active_connections: DashMap::new(),
             hash_ring,
             latency_ewma,
@@ -1896,7 +2459,6 @@ impl LoadBalancer {
             subset_algorithms,
             subset_hash_on_strategies,
             subset_wrr_state,
-            subset_wrr_needs_stale_check,
             subset_hash_rings,
             port_overrides: port_states,
             initial_dispatch_port_override,
@@ -2012,13 +2574,10 @@ impl LoadBalancer {
             Some(k) => k,
             None => return,
         };
-        self.wrr_needs_stale_check.store(true, Ordering::Release);
-        for flag in self.subset_wrr_needs_stale_check.values() {
-            flag.store(true, Ordering::Release);
-        }
-        for state in self.port_overrides.values() {
-            state.wrr_needs_stale_check.store(true, Ordering::Release);
-        }
+        // WRR schedules are pure functions of healthy-set fingerprint + immutable
+        // weights on this balancer generation. Recovery either changes the
+        // fingerprint (cold miss) or restores a still-valid cached schedule —
+        // no invalidate flag is required (and a boolean would race publishers).
 
         // Find minimum EWMA among all targets (excluding unset)
         let min_ewma = self
@@ -2041,6 +2600,14 @@ impl LoadBalancer {
                 .value()
                 .store(LATENCY_WARMUP_THRESHOLD, Ordering::Relaxed);
         }
+    }
+
+    /// Parent WRR lane counters: `(schedule_publishes, allocation_free_miss_fallbacks)`.
+    ///
+    /// Intended for diagnostics and deterministic unit coverage of cache-miss
+    /// amortization. Neither counter is touched on the steady-state cache-hit path.
+    pub fn wrr_parent_schedule_counters(&self) -> (u64, u64) {
+        self.wrr_state.schedule_counters()
     }
 
     /// Find the pre-computed host:port key for a target via O(1) HashMap lookup.
@@ -2232,6 +2799,10 @@ impl LoadBalancer {
 
     /// Collect healthy targets into a Vec — fallback for upstreams with >128
     /// targets that cannot use the bitset fast path.
+    ///
+    /// Returned pairs are always ascending by original target index so WRR
+    /// schedule keys stay membership-stable and hit resolution can
+    /// `binary_search_by_key`.
     fn healthy_targets_vec(
         &self,
         health: Option<&HealthContext<'_>>,
@@ -2259,14 +2830,23 @@ impl LoadBalancer {
 
         let to_readmit =
             passive_ejections_to_readmit(&mut passive_ejected, n, h.max_ejection_percent);
-        for &(idx, _) in passive_ejected.iter().take(to_readmit) {
-            healthy.push((idx, &self.targets[idx]));
+        if to_readmit > 0 {
+            for &(idx, _) in passive_ejected.iter().take(to_readmit) {
+                healthy.push((idx, &self.targets[idx]));
+            }
+            // Readmits were appended out of enumeration order; restore the
+            // ascending original-index invariant used by WRR Vec cache keys.
+            healthy.sort_unstable_by_key(|(idx, _)| *idx);
         }
 
         healthy
     }
 
     /// Vec fallback equivalent of `compute_health_bitset_for_indices`.
+    ///
+    /// Like [`Self::healthy_targets_vec`], results are ascending by original
+    /// index (input `indices` are already ascending from subset/port
+    /// construction; readmits are re-sorted).
     fn healthy_targets_vec_for_indices(
         &self,
         health: Option<&HealthContext<'_>>,
@@ -2304,8 +2884,11 @@ impl LoadBalancer {
             indices.len(),
             h.max_ejection_percent,
         );
-        for &(idx, _) in passive_ejected.iter().take(to_readmit) {
-            healthy.push((idx, &self.targets[idx]));
+        if to_readmit > 0 {
+            for &(idx, _) in passive_ejected.iter().take(to_readmit) {
+                healthy.push((idx, &self.targets[idx]));
+            }
+            healthy.sort_unstable_by_key(|(idx, _)| *idx);
         }
 
         healthy
@@ -3263,7 +3846,7 @@ impl LoadBalancer {
         &'a self,
         port_state: &'a PortLbState,
         subset_name: &str,
-    ) -> &'a std::sync::Mutex<Vec<i64>> {
+    ) -> &'a WrrLaneState {
         if port_state.algorithm_overridden {
             &port_state.wrr_state
         } else {
@@ -3285,36 +3868,10 @@ impl LoadBalancer {
     }
 
     #[inline]
-    fn subset_wrr_state(&self, subset_name: &str) -> &std::sync::Mutex<Vec<i64>> {
+    fn subset_wrr_state(&self, subset_name: &str) -> &WrrLaneState {
         self.subset_wrr_state
             .get(subset_name)
             .unwrap_or(&self.wrr_state)
-    }
-
-    fn stale_check_flag_for_wrr_state(
-        &self,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
-    ) -> &AtomicBool {
-        if std::ptr::eq(wrr_state, &self.wrr_state) {
-            return &self.wrr_needs_stale_check;
-        }
-
-        self.subset_wrr_state
-            .iter()
-            .find_map(|(subset_name, subset_state)| {
-                if std::ptr::eq(wrr_state, subset_state) {
-                    self.subset_wrr_needs_stale_check.get(subset_name)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                self.port_overrides.values().find_map(|port_state| {
-                    std::ptr::eq(wrr_state, &port_state.wrr_state)
-                        .then_some(&port_state.wrr_needs_stale_check)
-                })
-            })
-            .unwrap_or(&self.wrr_needs_stale_check)
     }
 
     #[inline]
@@ -3363,7 +3920,7 @@ impl LoadBalancer {
         healthy: &HealthBitset,
         algorithm: LoadBalancerAlgorithm,
         rr_counter: &AtomicU64,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
+        wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -3402,9 +3959,7 @@ impl LoadBalancer {
                 };
                 Some(Arc::clone(&self.targets[target_idx]))
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => {
-                self.select_wrr_bitset(healthy, rr_counter, wrr_state)
-            }
+            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr_bitset(healthy, wrr_state),
             LoadBalancerAlgorithm::LeastConnections => {
                 self.select_least_connections_bitset(healthy)
             }
@@ -3469,7 +4024,7 @@ impl LoadBalancer {
         candidates: &[(usize, &Arc<UpstreamTarget>)],
         algorithm: LoadBalancerAlgorithm,
         rr_counter: &AtomicU64,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
+        wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -3497,9 +4052,7 @@ impl LoadBalancer {
                 let hash = golden_ratio_hash(idx) as usize;
                 Some(Arc::clone(candidates[hash % candidates.len()].1))
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => {
-                self.select_wrr_vec(candidates, rr_counter, wrr_state)
-            }
+            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr_vec(candidates, wrr_state),
             LoadBalancerAlgorithm::LeastConnections => {
                 self.select_least_connections_vec(candidates)
             }
@@ -4053,65 +4606,310 @@ impl LoadBalancer {
     // ─── Bitset-based algorithm implementations (zero-alloc hot path) ────────
 
     /// Smooth weighted round-robin (NGINX algorithm) using bitset.
-    /// No Vec allocation — iterates targets directly, skipping unset bits.
     ///
-    /// Stale-weight guard: when a target transitions from unhealthy back to
-    /// healthy, its accumulated `weights[i]` may hold a stale value from
-    /// before it went down. The recovery hook sets `wrr_needs_stale_check`,
-    /// so this scan runs only once per recovery event, not on every request.
+    /// Steady-state path is wait-free: hit a precomputed order for the current
+    /// healthy fingerprint in the bounded slot cache and advance a sharded
+    /// atomic counter. Schedule rebuild runs only on rate-sampled / cold-fill
+    /// fingerprint misses — see [`WrrLaneState`].
     fn select_wrr_bitset(
         &self,
         healthy: &HealthBitset,
-        rr_counter: &AtomicU64,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
+        wrr_state: &WrrLaneState,
     ) -> Option<Arc<UpstreamTarget>> {
-        let total_weight: i64 = self
-            .targets
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| healthy.contains(*i))
-            .map(|(_, t)| t.weight as i64)
-            .sum();
+        if !wrr_state.is_active() || healthy.is_empty() {
+            return None;
+        }
+
+        let fingerprint = healthy.bits;
+        if let Some(schedule) = wrr_state.hit_bitset_schedule(fingerprint)
+            && let Some(target) = self.pick_wrr_bitset_schedule(healthy, &schedule)
+        {
+            return Some(target);
+        }
+
+        self.rebuild_wrr_schedule_bitset(healthy, wrr_state, fingerprint)
+    }
+
+    fn pick_wrr_bitset_schedule(
+        &self,
+        healthy: &HealthBitset,
+        schedule: &WrrSchedule,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if schedule.zero_weight {
+            let ticket = schedule.counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed);
+            let target_idx = healthy.nth_set_bit(ticket as usize);
+            return Some(Arc::clone(&self.targets[target_idx]));
+        }
+        if schedule.is_lottery_only() {
+            let ticket = schedule.counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed);
+            return self.pick_wrr_lottery_bitset(healthy, ticket);
+        }
+        Self::pick_from_wrr_schedule(schedule, |idx| {
+            healthy
+                .contains(idx)
+                .then(|| Arc::clone(&self.targets[idx]))
+        })
+    }
+
+    /// Allocation-free weighted lottery / all-zero RR over a bitset healthy set.
+    ///
+    /// Shared by the miss path and by lottery-only schedule hits (work-budget
+    /// sentinel). `ticket` is the selection entropy (miss counter or shard).
+    fn pick_wrr_lottery_bitset(
+        &self,
+        healthy: &HealthBitset,
+        ticket: u64,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let healthy_count = healthy.count();
+        if healthy_count == 0 {
+            return None;
+        }
+
+        let mut total_weight = 0u64;
+        healthy.for_each_set_bit(|idx| {
+            total_weight = total_weight.saturating_add(u64::from(self.targets[idx].weight));
+        });
 
         if total_weight == 0 {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            let target_idx = healthy.nth_set_bit(idx);
+            let target_idx = healthy.nth_set_bit((ticket % healthy_count as u64) as usize);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
 
-        let mut weights = wrr_state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cursor = golden_ratio_hash(ticket) % total_weight;
+        let mut chosen = None;
+        healthy.for_each_set_bit(|idx| {
+            if chosen.is_some() {
+                return;
+            }
+            let weight = u64::from(self.targets[idx].weight);
+            if weight == 0 {
+                return;
+            }
+            if cursor < weight {
+                chosen = Some(idx);
+            } else {
+                cursor = cursor.saturating_sub(weight);
+            }
+        });
+        chosen.map(|idx| Arc::clone(&self.targets[idx]))
+    }
 
-        if self
-            .stale_check_flag_for_wrr_state(wrr_state)
-            .swap(false, Ordering::AcqRel)
-        {
-            // Reset stale weights for targets that just re-entered the healthy set.
-            // Use a deliberately loose cap so heterogeneous high-weight targets
-            // are not reset during normal smooth-WRR oscillation.
-            let drift_cap = total_weight.saturating_mul(4).max(1);
-            for i in 0..self.targets.len() {
-                if healthy.contains(i) && weights[i].abs() > drift_cap {
-                    weights[i] = 0;
-                }
+    /// Allocation-free miss path: O(healthy) scan, no smooth-schedule build.
+    ///
+    /// Positive-weight targets use a weighted lottery over current weights;
+    /// all-zero sets keep the historical round-robin fallback. This is the
+    /// contention / churn tradeoff vs exact smooth-WRR interleaving.
+    fn pick_wrr_miss_fallback_bitset(
+        &self,
+        healthy: &HealthBitset,
+        wrr_state: &WrrLaneState,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let ticket = wrr_state.next_miss_fallback();
+        self.pick_wrr_lottery_bitset(healthy, ticket)
+    }
+
+    fn build_wrr_schedule_bitset(
+        &self,
+        healthy: &HealthBitset,
+        wrr_state: &WrrLaneState,
+        fingerprint: u128,
+    ) -> Arc<WrrSchedule> {
+        let mut weighted = Vec::with_capacity(healthy.count());
+        healthy.for_each_set_bit(|idx| {
+            weighted.push((idx, self.targets[idx].weight));
+        });
+        let seed = wrr_state.next_schedule_seed();
+        let key = WrrScheduleKey::Bitset(fingerprint);
+        match build_smooth_wrr_order(&weighted) {
+            WrrOrderBuild::Smooth(order) => {
+                Arc::new(WrrSchedule::with_seed(key, order, false, seed, 0))
+            }
+            WrrOrderBuild::ZeroWeight => Arc::new(WrrSchedule::with_seed(
+                key,
+                Box::new([]),
+                true,
+                seed,
+                healthy.count(),
+            )),
+            WrrOrderBuild::LotteryOnly => {
+                // Exact-key sentinel: subsequent hits skip the quadratic build.
+                Arc::new(WrrSchedule::with_seed(key, Box::new([]), false, seed, 0))
             }
         }
+    }
 
-        let mut best_idx = 0;
-        let mut best_current = i64::MIN;
+    fn rebuild_wrr_schedule_bitset(
+        &self,
+        healthy: &HealthBitset,
+        wrr_state: &WrrLaneState,
+        fingerprint: u128,
+    ) -> Option<Arc<UpstreamTarget>> {
+        // Contention-bounded: try_lock only. Contending / unsampled misses never
+        // build an ephemeral schedule — they use the allocation-free scan.
+        if let Ok(_guard) = wrr_state.rebuild.try_lock() {
+            if let Some(schedule) = wrr_state.lookup_bitset_schedule(fingerprint) {
+                return self.pick_wrr_bitset_schedule(healthy, &schedule);
+            }
+            if wrr_state.should_publish_on_miss() {
+                let new_schedule = self.build_wrr_schedule_bitset(healthy, wrr_state, fingerprint);
+                wrr_state.publish_schedule(Arc::clone(&new_schedule));
+                return self.pick_wrr_bitset_schedule(healthy, &new_schedule);
+            }
+        } else if let Some(schedule) = wrr_state.lookup_bitset_schedule(fingerprint) {
+            return self.pick_wrr_bitset_schedule(healthy, &schedule);
+        }
 
-        for (i, target) in self.targets.iter().enumerate() {
-            if !healthy.contains(i) {
+        self.pick_wrr_miss_fallback_bitset(healthy, wrr_state)
+    }
+
+    #[inline]
+    fn pick_from_wrr_schedule(
+        schedule: &WrrSchedule,
+        resolve: impl Fn(usize) -> Option<Arc<UpstreamTarget>>,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if schedule.order.is_empty() {
+            return None;
+        }
+        let ticket = schedule.counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed);
+        let idx = schedule.order[(ticket % schedule.order.len() as u64) as usize];
+        resolve(idx)
+    }
+
+    /// Smooth weighted round-robin (NGINX algorithm) — Vec fallback for >128
+    /// targets. Same wait-free multi-fingerprint schedule + sharded per-schedule
+    /// atomic counter model as the bitset path; cache identity compares the
+    /// healthy original indices exactly.
+    fn select_wrr_vec(
+        &self,
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        wrr_state: &WrrLaneState,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if candidates.is_empty() || !wrr_state.is_active() {
+            return None;
+        }
+
+        if let Some(schedule) = wrr_state.hit_vec_schedule(candidates)
+            && let Some(target) = Self::pick_wrr_vec_schedule(candidates, &schedule)
+        {
+            return Some(target);
+        }
+
+        self.rebuild_wrr_schedule_vec(candidates, wrr_state)
+    }
+
+    fn pick_wrr_vec_schedule(
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        schedule: &WrrSchedule,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if schedule.zero_weight {
+            let ticket = schedule.counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed);
+            return Some(Arc::clone(candidates[ticket as usize % candidates.len()].1));
+        }
+        if schedule.is_lottery_only() {
+            let ticket = schedule.counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed);
+            return Self::pick_wrr_lottery_vec(candidates, ticket);
+        }
+        Self::pick_from_wrr_schedule(schedule, |orig_idx| {
+            resolve_wrr_vec_candidate(candidates, orig_idx).map(Arc::clone)
+        })
+    }
+
+    /// Allocation-free weighted lottery / all-zero RR over a Vec candidate slice.
+    fn pick_wrr_lottery_vec(
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        ticket: u64,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut total_weight = 0u64;
+        for (_, target) in candidates {
+            total_weight = total_weight.saturating_add(u64::from(target.weight));
+        }
+
+        if total_weight == 0 {
+            return Some(Arc::clone(
+                candidates[(ticket as usize) % candidates.len()].1,
+            ));
+        }
+
+        let mut cursor = golden_ratio_hash(ticket) % total_weight;
+        for (_, target) in candidates {
+            let weight = u64::from(target.weight);
+            if weight == 0 {
                 continue;
             }
-            weights[i] += target.weight as i64;
-            if weights[i] > best_current {
-                best_current = weights[i];
-                best_idx = i;
+            if cursor < weight {
+                return Some(Arc::clone(target));
+            }
+            cursor = cursor.saturating_sub(weight);
+        }
+        None
+    }
+
+    /// Allocation-free Vec miss path — same lottery / all-zero RR contract as
+    /// the bitset fallback, scanning only the current candidate slice.
+    fn pick_wrr_miss_fallback_vec(
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        wrr_state: &WrrLaneState,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let ticket = wrr_state.next_miss_fallback();
+        Self::pick_wrr_lottery_vec(candidates, ticket)
+    }
+
+    fn build_wrr_schedule_vec(
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        wrr_state: &WrrLaneState,
+    ) -> Arc<WrrSchedule> {
+        let weighted: Vec<(usize, u32)> = candidates
+            .iter()
+            .map(|&(idx, target)| (idx, target.weight))
+            .collect();
+        let seed = wrr_state.next_schedule_seed();
+        let key = WrrScheduleKey::Indices(
+            candidates
+                .iter()
+                .map(|(idx, _)| *idx)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        match build_smooth_wrr_order(&weighted) {
+            WrrOrderBuild::Smooth(order) => {
+                Arc::new(WrrSchedule::with_seed(key, order, false, seed, 0))
+            }
+            WrrOrderBuild::ZeroWeight => Arc::new(WrrSchedule::with_seed(
+                key,
+                Box::new([]),
+                true,
+                seed,
+                candidates.len(),
+            )),
+            WrrOrderBuild::LotteryOnly => {
+                Arc::new(WrrSchedule::with_seed(key, Box::new([]), false, seed, 0))
             }
         }
+    }
 
-        weights[best_idx] -= total_weight;
-        Some(Arc::clone(&self.targets[best_idx]))
+    fn rebuild_wrr_schedule_vec(
+        &self,
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        wrr_state: &WrrLaneState,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if let Ok(_guard) = wrr_state.rebuild.try_lock() {
+            if let Some(schedule) = wrr_state.lookup_vec_schedule(candidates) {
+                return Self::pick_wrr_vec_schedule(candidates, &schedule);
+            }
+            if wrr_state.should_publish_on_miss() {
+                let new_schedule = Self::build_wrr_schedule_vec(candidates, wrr_state);
+                wrr_state.publish_schedule(Arc::clone(&new_schedule));
+                return Self::pick_wrr_vec_schedule(candidates, &new_schedule);
+            }
+        } else if let Some(schedule) = wrr_state.lookup_vec_schedule(candidates) {
+            return Self::pick_wrr_vec_schedule(candidates, &schedule);
+        }
+
+        Self::pick_wrr_miss_fallback_vec(candidates, wrr_state)
     }
 
     /// Select target with least active connections using bitset.
@@ -4298,58 +5096,6 @@ impl LoadBalancer {
 
     // ─── Vec-based algorithm implementations (fallback for >128 targets) ─────
 
-    /// Smooth weighted round-robin (NGINX algorithm) — Vec fallback.
-    ///
-    /// Applies the same stale-weight guard as `select_wrr_bitset` — see its
-    /// doc comment for rationale.
-    fn select_wrr_vec(
-        &self,
-        candidates: &[(usize, &Arc<UpstreamTarget>)],
-        rr_counter: &AtomicU64,
-        wrr_state: &std::sync::Mutex<Vec<i64>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let total_weight: i64 = candidates.iter().map(|(_, t)| t.weight as i64).sum();
-        if total_weight == 0 {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            return Some(Arc::clone(candidates[idx % candidates.len()].1));
-        }
-
-        let mut weights = wrr_state.lock().unwrap_or_else(|e| e.into_inner());
-
-        if self
-            .stale_check_flag_for_wrr_state(wrr_state)
-            .swap(false, Ordering::AcqRel)
-        {
-            // Reset stale weights for candidates that drifted while unhealthy.
-            let drift_cap = total_weight.saturating_mul(4).max(1);
-            for &(orig_idx, _) in candidates {
-                if weights[orig_idx].abs() > drift_cap {
-                    weights[orig_idx] = 0;
-                }
-            }
-        }
-
-        let mut best_idx = 0;
-        let mut best_current = i64::MIN;
-
-        for (i, (orig_idx, target)) in candidates.iter().enumerate() {
-            weights[*orig_idx] += target.weight as i64;
-            let current = weights[*orig_idx];
-            if current > best_current {
-                best_current = current;
-                best_idx = i;
-            }
-        }
-
-        let (orig_idx, _) = candidates[best_idx];
-        weights[orig_idx] -= total_weight;
-        Some(Arc::clone(candidates[best_idx].1))
-    }
-
     /// Select target with least active connections — Vec fallback.
     fn select_least_connections_vec(
         &self,
@@ -4520,6 +5266,112 @@ impl LoadBalancer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_smooth_wrr_order_matches_nginx_sequence() {
+        // Classic NGINX smooth WRR for weights 5:1:2 over indices 0,1,2.
+        match build_smooth_wrr_order(&[(0, 5), (1, 1), (2, 2)]) {
+            WrrOrderBuild::Smooth(order) => {
+                assert_eq!(&order[..], &[0, 2, 0, 0, 1, 0, 2, 0]);
+            }
+            other => panic!("ordinary weights must build exact smooth order, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_wrr_period_does_not_starve_extreme_low_weight_target() {
+        // Two candidates × 8192 steps = 16384 work units ≪ budget → exact SWRR.
+        match build_smooth_wrr_order(&[(7, 65_535), (9, 1)]) {
+            WrrOrderBuild::Smooth(order) => {
+                assert_eq!(order.len(), WRR_MAX_SCHEDULE_LEN);
+                assert_eq!(order.iter().filter(|&&idx| idx == 7).count(), 8_191);
+                assert_eq!(order.iter().filter(|&&idx| idx == 9).count(), 1);
+            }
+            other => panic!("two-target capped period must stay exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_smooth_wrr_build_returns_lottery_only_sentinel() {
+        // 1000 positive candidates × 8192 capped steps exceeds
+        // WRR_SMOOTH_BUILD_MAX_WORK (8192 × 128); construction must refuse the
+        // quadratic loop so callers can publish a lottery-only key sentinel.
+        let weighted: Vec<(usize, u32)> = (0..1_000)
+            .map(|idx| (idx, if idx == 0 { 65_535 } else { 1 }))
+            .collect();
+        assert!(
+            matches!(
+                build_smooth_wrr_order(&weighted),
+                WrrOrderBuild::LotteryOnly
+            ),
+            "pathological candidate×period work must be lottery-only"
+        );
+        // Work estimate uses checked mul; prove the threshold itself.
+        let work = (WRR_MAX_SCHEDULE_LEN as u64).saturating_mul(1_000);
+        assert!(work > WRR_SMOOTH_BUILD_MAX_WORK);
+    }
+
+    #[test]
+    fn zero_weight_build_is_explicit() {
+        assert!(matches!(
+            build_smooth_wrr_order(&[(0, 0), (1, 0)]),
+            WrrOrderBuild::ZeroWeight
+        ));
+    }
+
+    #[test]
+    fn zero_weight_shard_phases_are_offset_across_healthy_count() {
+        let healthy_count = 32usize;
+        let seed = 7u64;
+        let schedule = WrrSchedule::with_seed(
+            WrrScheduleKey::Bitset(0xabc),
+            Box::new([]),
+            true,
+            seed,
+            healthy_count,
+        );
+        let stride = (healthy_count / WRR_COUNTER_SHARDS).max(1) as u64;
+        for (i, counter) in schedule.counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                seed.wrapping_add((i as u64).wrapping_mul(stride)),
+                "shard {i} phase"
+            );
+        }
+        // Distinct shards must not all share the same starting phase.
+        let first = schedule.counters[0].load(Ordering::Relaxed);
+        assert!(
+            schedule
+                .counters
+                .iter()
+                .any(|c| c.load(Ordering::Relaxed) != first),
+            "zero-weight shards must be phase-distributed"
+        );
+    }
+
+    #[test]
+    fn resolve_wrr_vec_candidate_first_middle_last_and_absent() {
+        let t0 = Arc::new(make_target("h0", 8080));
+        let t1 = Arc::new(make_target("h1", 8080));
+        let t2 = Arc::new(make_target("h2", 8080));
+        // Ascending original indices with a gap (as after an exclusion).
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = vec![(0, &t0), (5, &t1), (12, &t2)];
+
+        assert!(Arc::ptr_eq(
+            resolve_wrr_vec_candidate(&candidates, 0).expect("first"),
+            &t0
+        ));
+        assert!(Arc::ptr_eq(
+            resolve_wrr_vec_candidate(&candidates, 5).expect("middle"),
+            &t1
+        ));
+        assert!(Arc::ptr_eq(
+            resolve_wrr_vec_candidate(&candidates, 12).expect("last"),
+            &t2
+        ));
+        assert!(resolve_wrr_vec_candidate(&candidates, 3).is_none());
+        assert!(resolve_wrr_vec_candidate(&candidates, 99).is_none());
+    }
 
     // ── HealthBitset tests ──────────────────────────────────────────────
 
@@ -4801,70 +5653,56 @@ mod tests {
 
         let random_state = lb.port_overrides.get(&8080).expect("random override");
         assert!(
-            random_state
-                .wrr_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
+            !random_state.wrr_state.is_active(),
+            "non-WRR port override must leave WRR lane inactive"
         );
 
         let wrr_state = lb.port_overrides.get(&9090).expect("wrr override");
-        assert_eq!(
-            wrr_state
-                .wrr_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
-            targets.len()
-        );
+        assert!(wrr_state.wrr_state.is_active());
+        assert_eq!(wrr_state.wrr_state.target_len, targets.len());
     }
 
     #[test]
-    fn recovered_target_marks_parent_and_subset_wrr_stale_flags_independently() {
-        let mut v1 = make_target("10.0.0.1", 8080);
-        v1.tags = HashMap::from([("version".to_string(), "v1".to_string())]);
-        let mut v2 = make_target("10.0.0.2", 8080);
-        v2.tags = HashMap::from([("version".to_string(), "v2".to_string())]);
-        let targets = vec![v1, v2];
-        let subsets = vec![SubsetDefinition {
-            name: "canary".to_string(),
-            labels: HashMap::from([("version".to_string(), "v2".to_string())]),
-            traffic_policy: Some(crate::config::types::SubsetTrafficPolicy {
-                load_balancer_algorithm: Some(LoadBalancerAlgorithm::WeightedRoundRobin),
-                hash_on: None,
-                tls: None,
-                connect_timeout_ms: None,
-                passive_health_check: None,
-            }),
-        }];
-        let lb = LoadBalancer::with_subsets(
-            "upstream-wrr",
+    fn recovered_target_does_not_require_wrr_invalidate_flag() {
+        // Schedules are fingerprint-pure for a LoadBalancer generation. Recovery
+        // must not depend on a racy invalidate boolean; restoring a previously
+        // seen healthy set must reuse the cached schedule (hit, not rebuild).
+        let targets = vec![
+            make_target("10.0.0.1", 8080),
+            make_target("10.0.0.2", 8080),
+            make_target("10.0.0.3", 8080),
+        ];
+        let lb = LoadBalancer::new(
+            "upstream-wrr-recovery",
             LoadBalancerAlgorithm::WeightedRoundRobin,
             &targets,
             None,
-            Some(&subsets),
         );
 
-        lb.reset_recovered_target_latency(&targets[1]);
-        assert!(lb.wrr_needs_stale_check.load(Ordering::Acquire));
+        let all = HealthBitset::all(targets.len());
+        let _ = lb.select_wrr_bitset(&all, &lb.wrr_state);
+        let (_, rebuilds_after_full) = lb.wrr_state.cache_stats();
+        assert!(rebuilds_after_full >= 1);
+
+        let mut without_first = HealthBitset::all(targets.len());
+        without_first.clear(0);
+        let _ = lb.select_wrr_bitset(&without_first, &lb.wrr_state);
+        let (hits_before, rebuilds_before) = lb.wrr_state.cache_stats();
+
+        // Recovery restores the full healthy set — must hit the cached schedule.
+        let _ = lb.select_wrr_bitset(&all, &lb.wrr_state);
+        let (hits_after, rebuilds_after) = lb.wrr_state.cache_stats();
+        assert_eq!(
+            rebuilds_after, rebuilds_before,
+            "restoring a cached fingerprint must not publish a new schedule"
+        );
         assert!(
-            lb.subset_wrr_needs_stale_check
-                .get("canary")
-                .expect("subset stale flag")
-                .load(Ordering::Acquire)
+            hits_after > hits_before,
+            "restored full healthy set must be a steady cache hit"
         );
 
-        let healthy = HealthBitset::all(targets.len());
-        let _ = lb.select_wrr_bitset(&healthy, &lb.rr_counter, &lb.wrr_state);
-
-        assert!(!lb.wrr_needs_stale_check.load(Ordering::Acquire));
-        assert!(
-            lb.subset_wrr_needs_stale_check
-                .get("canary")
-                .expect("subset stale flag")
-                .load(Ordering::Acquire),
-            "parent WRR selection must not clear the subset WRR stale flag"
-        );
+        // Latency reset remains independent of WRR cache state.
+        lb.reset_recovered_target_latency(&targets[0]);
     }
 
     /// Consistent hash with targets produces a non-empty ring and selects
