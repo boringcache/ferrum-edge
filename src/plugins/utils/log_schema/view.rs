@@ -740,6 +740,7 @@ mod tests {
         StreamTransactionSummary {
             namespace: "ferrum".into(),
             proxy_id: "tcp-p1".into(),
+            proxy_lifecycle_generation: None,
             proxy_name: Some("postgres-front".into()),
             client_ip: "10.0.0.2".into(),
             consumer_username: None,

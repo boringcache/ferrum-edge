@@ -57,6 +57,7 @@ fn make_summary(
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn make_stream_summary(
     StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: proxy_id.to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some(proxy_name.to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: consumer.map(|c| c.to_string()),

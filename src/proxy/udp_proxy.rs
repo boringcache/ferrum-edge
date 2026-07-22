@@ -143,6 +143,8 @@ struct UdpSession {
     datagram_payload_kind: StreamBytesKind,
     proxy_id: String,
     proxy_name: Option<String>,
+    /// Ownership generation captured at UDP/DTLS session admission.
+    proxy_lifecycle_generation: Option<u64>,
     proxy_namespace: String,
     backend_scheme: BackendScheme,
     listen_port: u16,
@@ -657,6 +659,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
+        proxy_lifecycle_generation: context.session.proxy_lifecycle_generation,
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: context.client_addr.ip().to_canonical().to_string(),
         consumer_username: context.session.consumer_username.clone(),
@@ -701,6 +704,7 @@ struct DtlsDisconnectContext<'a> {
     namespace: &'a str,
     proxy_id: &'a str,
     proxy_name: Option<&'a str>,
+    proxy_lifecycle_generation: Option<u64>,
     client_addr: SocketAddr,
     consumer_username: Option<String>,
     auth_method: Option<&'static str>,
@@ -735,6 +739,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
     StreamTransactionSummary {
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
+        proxy_lifecycle_generation: context.proxy_lifecycle_generation,
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: context.client_addr.ip().to_canonical().to_string(),
         consumer_username: context.consumer_username,
@@ -2399,6 +2404,9 @@ async fn start_dtls_frontend_listener(
                     backend_scheme,
                     consumer_index,
                 );
+                stream_ctx.proxy_lifecycle_generation = epoch
+                    .plugin_cache
+                    .proxy_lifecycle_generation(proxy.id.as_str());
                 stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
                 stream_ctx.tls_client_cert_chain_der =
                     client_conn.tls_client_cert_chain_der.clone();
@@ -2475,6 +2483,7 @@ async fn start_dtls_frontend_listener(
                     None
                 };
                 let handler_auth_method = stream_ctx.auth_method;
+                let handler_proxy_lifecycle_generation = stream_ctx.proxy_lifecycle_generation;
                 // Preserve the accepted connection's SNI across the per-session
                 // task so disconnect summaries match `on_stream_connect`.
                 let handler_sni_hostname = stream_ctx.sni_hostname.clone();
@@ -2564,6 +2573,7 @@ async fn start_dtls_frontend_listener(
                             namespace: &handler_proxy_namespace,
                             proxy_id: &handler_proxy_id,
                             proxy_name: handler_proxy_name.as_deref(),
+                            proxy_lifecycle_generation: handler_proxy_lifecycle_generation,
                             client_addr,
                             consumer_username: handler_consumer_username.clone(),
                             auth_method: handler_auth_method,
@@ -3311,6 +3321,7 @@ async fn create_session(
         backend_scheme,
         consumer_index,
     );
+    stream_ctx.proxy_lifecycle_generation = epoch.plugin_cache.proxy_lifecycle_generation(proxy_id);
     stream_ctx.sni_hostname = sni_hostname;
     // The constructor intentionally leaves node-waypoint per-pod policy scope
     // absent: plain UDP cannot wire it without a new capture path. Identity is
@@ -3569,6 +3580,7 @@ async fn create_session(
         },
         proxy_id: proxy_id.to_string(),
         proxy_name: proxy_name.clone(),
+        proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
         proxy_namespace: proxy_namespace.clone(),
         backend_scheme,
         listen_port,
@@ -4442,6 +4454,7 @@ mod tests {
             datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             proxy_id: "udp-proxy".to_string(),
             proxy_name: Some("UDP Proxy".to_string()),
+            proxy_lifecycle_generation: None,
             proxy_namespace: "ferrum".to_string(),
             backend_scheme: BackendScheme::Udp,
             listen_port: 5300,
@@ -4582,6 +4595,7 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
+            proxy_lifecycle_generation: None,
             client_addr,
             consumer_username: Some("alice".to_string()),
             auth_method: None,
@@ -4647,6 +4661,7 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
+            proxy_lifecycle_generation: None,
             client_addr,
             consumer_username: Some("alice".to_string()),
             auth_method: Some("mtls_auth"),
@@ -4876,6 +4891,7 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: None,
+            proxy_lifecycle_generation: None,
             client_addr: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
             auth_method: None,
@@ -4923,6 +4939,7 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Frontend"),
+            proxy_lifecycle_generation: None,
             client_addr: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
             auth_method: None,
@@ -4970,6 +4987,7 @@ backend_tls_verify_server_cert: false
             namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: None,
+            proxy_lifecycle_generation: None,
             client_addr: "127.0.0.1:54000".parse().unwrap(),
             consumer_username: None,
             auth_method: None,
@@ -5386,6 +5404,7 @@ backend_tls_verify_server_cert: false
             datagram_payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             proxy_id: "udp-proxy".to_string(),
             proxy_name: Some("UDP Proxy".to_string()),
+            proxy_lifecycle_generation: None,
             proxy_namespace: "ferrum".to_string(),
             backend_scheme: BackendScheme::Udp,
             listen_port: 5300,

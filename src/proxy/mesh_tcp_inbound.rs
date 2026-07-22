@@ -173,6 +173,9 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         proxy.effective_scheme(),
         consumer_index,
     );
+    stream_ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(proxy.id.as_str());
     // Populated above for opaque-TLS captures; `None` for raw-TCP streams.
     stream_ctx.sni_hostname = sni_hostname;
     // Captured plaintext Sidecar inbound is, by direction, inbound mesh
@@ -507,6 +510,7 @@ async fn emit_disconnect(
     let summary = StreamTransactionSummary {
         namespace: proxy.namespace.clone(),
         proxy_id: proxy.id.clone(),
+        proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
         proxy_name: proxy.name.clone(),
         client_ip: client_ip.to_string(),
         consumer_username: stream_ctx.effective_identity().map(str::to_owned),

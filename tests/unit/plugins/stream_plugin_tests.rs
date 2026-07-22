@@ -320,6 +320,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "test-proxy".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("Test Proxy".to_string()),
         client_ip: "10.1.2.3".to_string(),
         consumer_username: None,

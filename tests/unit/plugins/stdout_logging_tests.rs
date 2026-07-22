@@ -224,6 +224,7 @@ async fn test_stdout_logging_stream_disconnect() {
     let summary = StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("TCP Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,

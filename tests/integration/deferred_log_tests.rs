@@ -185,6 +185,7 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 

@@ -66,6 +66,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         mirror: false,
         metadata,
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 
@@ -94,6 +95,7 @@ fn make_stream_summary(metadata: HashMap<String, String>) -> StreamTransactionSu
     StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("postgres".to_string()),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),
@@ -198,6 +200,7 @@ fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         mirror: false,
         metadata,
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 
@@ -1648,6 +1651,7 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("chat".to_string()),
         client_ip: "10.0.0.1".to_string(),
         backend_target: "http://backend:8080/ws".to_string(),
@@ -1730,6 +1734,7 @@ async fn test_otel_tracing_ws_disconnect_distinguishes_client_and_backend_failur
         let ctx = WsDisconnectContext {
             namespace: "ferrum".to_string(),
             proxy_id: "ws-1".to_string(),
+            proxy_lifecycle_generation: None,
             proxy_name: Some("chat".to_string()),
             client_ip: "10.0.0.1".to_string(),
             backend_target: "http://backend:8080/ws".to_string(),

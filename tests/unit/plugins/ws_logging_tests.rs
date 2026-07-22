@@ -69,6 +69,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
     WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "proxy-ws".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("websocket-proxy".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend.local/chat".to_string(),

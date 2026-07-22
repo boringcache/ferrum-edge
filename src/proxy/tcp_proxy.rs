@@ -1396,6 +1396,9 @@ async fn run_tcp_accept_loop(
                             .unwrap_or(BackendScheme::Tcp),
                         consumer_index,
                     );
+                    stream_ctx.proxy_lifecycle_generation = epoch
+                        .plugin_cache
+                        .proxy_lifecycle_generation(proxy_id.as_ref());
                     // Populated above from the node-waypoint resolver in
                     // NodeWaypoint topology so `mesh_authz` enforces
                     // namespace/selector-scoped policies per source pod
@@ -1569,6 +1572,7 @@ async fn run_tcp_accept_loop(
                         let summary = StreamTransactionSummary {
                             namespace: proxy_namespace,
                             proxy_id: final_proxy_id,
+                            proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
                             proxy_name,
                             client_ip,
                             consumer_username,

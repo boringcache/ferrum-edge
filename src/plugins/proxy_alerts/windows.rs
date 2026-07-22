@@ -28,10 +28,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use dashmap::DashMap;
 
+use super::generation_map::GenerationMap;
 use crate::util::sharding::pool_shard_amount;
 
 const N_BUCKETS: usize = 10;
@@ -309,11 +309,19 @@ pub struct RuleWindowSpec {
     pub kind: WindowKind,
 }
 
-/// `(rule_id → proxy_id → WindowState)` two-level map. The outer DashMap
-/// avoids needing to allocate a composite key on the hot path; the inner
-/// map can be looked up by `&str` thanks to `String: Borrow<str>`.
+/// `(rule_id → proxy_id → ownership_generation → WindowState)` map.
+///
+/// Outer rule/proxy DashMaps use `pool_shard_amount` and avoid composite string
+/// keys on the hot path (`proxy_id` uses `String: Borrow<str>`). The generation
+/// dimension is a compact [`GenerationMap`] of `Arc<WindowState>` so typically
+/// one live incarnation does not pay for a fully pool-sharded DashMap, while
+/// record/snapshot still run lock-free on the window atomics after lookup.
+type GenerationWindows = GenerationMap<Arc<WindowState>>;
+type ProxyWindows = DashMap<String, Arc<GenerationWindows>>;
+type RuleWindows = DashMap<u32, Arc<ProxyWindows>>;
+
 pub struct WindowStore {
-    by_rule: DashMap<u32, Arc<DashMap<String, WindowState>>>,
+    by_rule: RuleWindows,
     rule_specs: HashMap<u32, RuleWindowSpec>,
     inner_shard_amount: usize,
 }
@@ -328,7 +336,7 @@ impl WindowStore {
         }
     }
 
-    fn inner_for(&self, rule_id: u32) -> Option<Arc<DashMap<String, WindowState>>> {
+    fn inner_for(&self, rule_id: u32) -> Option<Arc<ProxyWindows>> {
         if let Some(existing) = self.by_rule.get(&rule_id) {
             return Some(Arc::clone(existing.value()));
         }
@@ -340,70 +348,91 @@ impl WindowStore {
         Some(Arc::clone(entry.value()))
     }
 
-    pub fn record_count(&self, rule_id: u32, proxy_id: &str, matched: bool, now_ms: u64) {
-        let Some(spec) = self.rule_specs.get(&rule_id).copied() else {
-            return;
-        };
-        let Some(inner) = self.inner_for(rule_id) else {
-            return;
-        };
-        if let Some(state) = inner.get(proxy_id)
-            && let WindowState::Counter(c) = state.value()
-        {
-            c.record(matched, now_ms);
-            return;
+    fn generations_for(&self, rule_id: u32, proxy_id: &str) -> Option<Arc<GenerationWindows>> {
+        let inner = self.inner_for(rule_id)?;
+        if let Some(existing) = inner.get(proxy_id) {
+            return Some(Arc::clone(existing.value()));
         }
         let entry = inner
             .entry(proxy_id.to_string())
-            .or_insert_with(|| match spec.kind {
+            .or_insert_with(|| Arc::new(GenerationMap::new()));
+        Some(Arc::clone(entry.value()))
+    }
+
+    fn window_for_generation(
+        generations: &GenerationWindows,
+        ownership_generation: u64,
+        spec: RuleWindowSpec,
+    ) -> Arc<WindowState> {
+        generations.get_or_insert_with(ownership_generation, || {
+            Arc::new(match spec.kind {
                 WindowKind::Counter => {
                     WindowState::Counter(BucketedCounter::new(spec.window_seconds))
                 }
                 WindowKind::Histogram => {
                     WindowState::Histogram(BucketedLatencyHistogram::new(spec.window_seconds))
                 }
-            });
-        if let WindowState::Counter(c) = entry.value() {
+            })
+        })
+    }
+
+    pub fn record_count(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        matched: bool,
+        now_ms: u64,
+    ) {
+        let Some(spec) = self.rule_specs.get(&rule_id).copied() else {
+            return;
+        };
+        let Some(generations) = self.generations_for(rule_id, proxy_id) else {
+            return;
+        };
+        let state = Self::window_for_generation(&generations, ownership_generation, spec);
+        if let WindowState::Counter(c) = state.as_ref() {
             c.record(matched, now_ms);
         }
     }
 
-    pub fn record_latency(&self, rule_id: u32, proxy_id: &str, latency_ms: f64, now_ms: u64) {
+    pub fn record_latency(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        latency_ms: f64,
+        now_ms: u64,
+    ) {
         let Some(spec) = self.rule_specs.get(&rule_id).copied() else {
             return;
         };
-        let Some(inner) = self.inner_for(rule_id) else {
+        let Some(generations) = self.generations_for(rule_id, proxy_id) else {
             return;
         };
-        if let Some(state) = inner.get(proxy_id)
-            && let WindowState::Histogram(h) = state.value()
-        {
-            h.record(latency_ms, now_ms);
-            return;
-        }
-        let entry = inner
-            .entry(proxy_id.to_string())
-            .or_insert_with(|| match spec.kind {
-                WindowKind::Counter => {
-                    WindowState::Counter(BucketedCounter::new(spec.window_seconds))
-                }
-                WindowKind::Histogram => {
-                    WindowState::Histogram(BucketedLatencyHistogram::new(spec.window_seconds))
-                }
-            });
-        if let WindowState::Histogram(h) = entry.value() {
+        let state = Self::window_for_generation(&generations, ownership_generation, spec);
+        if let WindowState::Histogram(h) = state.as_ref() {
             h.record(latency_ms, now_ms);
         }
     }
 
-    pub fn snapshot_count(&self, rule_id: u32, proxy_id: &str, now_ms: u64) -> (u64, u64) {
+    pub fn snapshot_count(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        now_ms: u64,
+    ) -> (u64, u64) {
         let Some(inner) = self.by_rule.get(&rule_id) else {
             return (0, 0);
         };
-        let Some(state) = inner.get(proxy_id) else {
+        let Some(generations) = inner.get(proxy_id) else {
             return (0, 0);
         };
-        match state.value() {
+        let Some(state) = generations.get_cloned(&ownership_generation) else {
+            return (0, 0);
+        };
+        match state.as_ref() {
             WindowState::Counter(c) => c.snapshot(now_ms),
             WindowState::Histogram(_) => (0, 0),
         }
@@ -413,16 +442,20 @@ impl WindowStore {
         &self,
         rule_id: u32,
         proxy_id: &str,
+        ownership_generation: u64,
         percentile: u8,
         now_ms: u64,
     ) -> (Option<f64>, u64) {
         let Some(inner) = self.by_rule.get(&rule_id) else {
             return (None, 0);
         };
-        let Some(state) = inner.get(proxy_id) else {
+        let Some(generations) = inner.get(proxy_id) else {
             return (None, 0);
         };
-        match state.value() {
+        let Some(state) = generations.get_cloned(&ownership_generation) else {
+            return (None, 0);
+        };
+        match state.as_ref() {
             WindowState::Histogram(h) => h.percentile(percentile, now_ms),
             WindowState::Counter(_) => (None, 0),
         }
@@ -433,39 +466,53 @@ impl WindowStore {
     pub fn evict_stale(&self, now_ms: u64, keep_ms: u64) {
         let cutoff = now_ms.saturating_sub(keep_ms);
         for outer in self.by_rule.iter() {
-            outer
-                .value()
-                .retain(|_, state| state.last_record_ms() >= cutoff);
+            outer.value().retain(|_, generations| {
+                generations.retain(|_, state| state.last_record_ms() >= cutoff);
+                !generations.is_empty()
+            });
         }
     }
-}
 
-impl WindowStore {
-    /// Spawn a background task that periodically evicts stale entries when
-    /// called from inside a Tokio runtime.
+    /// Drop window rows for proxies absent from `active_proxy_generations`
+    /// or whose stored generation does not match the published incarnation.
     ///
-    /// Validation paths can instantiate plugins outside a runtime, so this is
-    /// deliberately best-effort. Runtime plugin instances keep the returned
-    /// handle and abort it on drop.
-    pub fn start_eviction_task(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return None;
-        };
-        let store = Arc::clone(self);
-        Some(handle.spawn(async move {
-            // Eviction cadence chosen to be coarse — staleness is determined
-            // by per-rule window length, and inactive proxies just take a
-            // bit longer to free up.
-            let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                ticker.tick().await;
-                let now_ms = current_epoch_ms();
-                // Keep entries that recorded within the last hour OR the
-                // largest window (whichever is greater). 1h is a generous
-                // floor that covers all reasonable rule windows.
-                store.evict_stale(now_ms, 3_600_000);
-            }
-        }))
+    /// Cold-path only: paired with cooldown/recovery retention so a delete
+    /// and recreate of the same proxy ID cannot inherit prior samples.
+    pub fn retain_proxies(&self, active_proxy_generations: &HashMap<&str, u64>) {
+        for outer in self.by_rule.iter() {
+            outer.value().retain(|proxy_id, generations| {
+                match active_proxy_generations.get(proxy_id.as_str()).copied() {
+                    Some(active_gen) => {
+                        generations.retain(|&generation, _| generation == active_gen);
+                        !generations.is_empty()
+                    }
+                    None => false,
+                }
+            });
+        }
+    }
+
+    /// Whether any rule window currently holds a row for `proxy_id` under any
+    /// ownership generation.
+    #[allow(dead_code)] // Used by external test crate and admin/debug helpers.
+    pub fn contains_proxy(&self, proxy_id: &str) -> bool {
+        self.by_rule.iter().any(|entry| {
+            entry
+                .value()
+                .get(proxy_id)
+                .is_some_and(|generations| !generations.is_empty())
+        })
+    }
+
+    /// Whether any rule window holds a row for `(proxy_id, generation)`.
+    #[allow(dead_code)] // Used by external test crate.
+    pub fn contains_proxy_generation(&self, proxy_id: &str, ownership_generation: u64) -> bool {
+        self.by_rule.iter().any(|entry| {
+            entry
+                .value()
+                .get(proxy_id)
+                .is_some_and(|generations| generations.contains_key(&ownership_generation))
+        })
     }
 }
 

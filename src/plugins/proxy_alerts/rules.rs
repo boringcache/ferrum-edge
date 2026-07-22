@@ -171,6 +171,14 @@ impl<'a> SampleInput<'a> {
         }
     }
 
+    pub fn proxy_lifecycle_generation(&self) -> Option<u64> {
+        match self {
+            Self::Http(s) => s.proxy_lifecycle_generation,
+            Self::Stream(s) => s.proxy_lifecycle_generation,
+            Self::WebSocket(s) => s.proxy_lifecycle_generation,
+        }
+    }
+
     pub fn proxy_name(&self) -> Option<&str> {
         match self {
             Self::Http(s) => s.proxy_name.as_deref(),
@@ -329,17 +337,26 @@ impl Rule {
         now_ms: u64,
     ) -> Option<RuleObservation> {
         let proxy_id = sample.proxy_id()?;
+        // Offline / unarmed unit tests omit an admission token; production
+        // armed paths fail closed before observe when the token is missing.
+        let ownership_generation = sample
+            .proxy_lifecycle_generation()
+            .unwrap_or(super::UNARMED_PROXY_LIFECYCLE_GENERATION);
         match self {
-            Rule::ErrorRate(r) => observe_error_rate(r, sample, proxy_id, store, now_ms),
+            Rule::ErrorRate(r) => {
+                observe_error_rate(r, sample, proxy_id, ownership_generation, store, now_ms)
+            }
             Rule::StatusCodeCount(r) => {
-                observe_status_code_count(r, sample, proxy_id, store, now_ms)
+                observe_status_code_count(r, sample, proxy_id, ownership_generation, store, now_ms)
             }
             Rule::LatencyPercentile(r) => {
-                observe_latency_percentile(r, sample, proxy_id, store, now_ms)
+                observe_latency_percentile(r, sample, proxy_id, ownership_generation, store, now_ms)
             }
-            Rule::ErrorClass(r) => observe_error_class(r, sample, proxy_id, store, now_ms),
+            Rule::ErrorClass(r) => {
+                observe_error_class(r, sample, proxy_id, ownership_generation, store, now_ms)
+            }
             Rule::StreamDisconnectCause(r) => {
-                observe_stream_disconnect(r, sample, proxy_id, store, now_ms)
+                observe_stream_disconnect(r, sample, proxy_id, ownership_generation, store, now_ms)
             }
         }
     }
@@ -349,6 +366,7 @@ fn observe_error_rate(
     rule: &ErrorRateRule,
     sample: SampleInput<'_>,
     proxy_id: &str,
+    ownership_generation: u64,
     store: &WindowStore,
     now_ms: u64,
 ) -> Option<RuleObservation> {
@@ -356,8 +374,15 @@ fn observe_error_rate(
         return None;
     };
     let matched = rule.status_codes.contains(&s.response_status_code);
-    store.record_count(rule.common.id, proxy_id, matched, now_ms);
-    let (matched_total, total) = store.snapshot_count(rule.common.id, proxy_id, now_ms);
+    store.record_count(
+        rule.common.id,
+        proxy_id,
+        ownership_generation,
+        matched,
+        now_ms,
+    );
+    let (matched_total, total) =
+        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
     let percent = if total == 0 {
         0.0
     } else {
@@ -379,6 +404,7 @@ fn observe_status_code_count(
     rule: &StatusCodeCountRule,
     sample: SampleInput<'_>,
     proxy_id: &str,
+    ownership_generation: u64,
     store: &WindowStore,
     now_ms: u64,
 ) -> Option<RuleObservation> {
@@ -386,8 +412,15 @@ fn observe_status_code_count(
         return None;
     };
     let matched = rule.status_codes.contains(&s.response_status_code);
-    store.record_count(rule.common.id, proxy_id, matched, now_ms);
-    let (matched_total, _) = store.snapshot_count(rule.common.id, proxy_id, now_ms);
+    store.record_count(
+        rule.common.id,
+        proxy_id,
+        ownership_generation,
+        matched,
+        now_ms,
+    );
+    let (matched_total, _) =
+        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
     let breach = matched_total >= rule.threshold_count;
     Some(RuleObservation {
         breach,
@@ -400,6 +433,7 @@ fn observe_latency_percentile(
     rule: &LatencyPercentileRule,
     sample: SampleInput<'_>,
     proxy_id: &str,
+    ownership_generation: u64,
     store: &WindowStore,
     now_ms: u64,
 ) -> Option<RuleObservation> {
@@ -415,8 +449,13 @@ fn observe_latency_percentile(
         // Sentinel value (-1.0) or NaN — skip recording but still return
         // a snapshot-based observation. Sentinel samples must not clear an
         // already-breached latency window.
-        let (estimate, total) =
-            store.snapshot_percentile(rule.common.id, proxy_id, rule.percentile, now_ms);
+        let (estimate, total) = store.snapshot_percentile(
+            rule.common.id,
+            proxy_id,
+            ownership_generation,
+            rule.percentile,
+            now_ms,
+        );
         let breach = latency_estimate_breaches(estimate, total, rule);
         return Some(RuleObservation {
             breach,
@@ -426,9 +465,20 @@ fn observe_latency_percentile(
             },
         });
     }
-    store.record_latency(rule.common.id, proxy_id, latency, now_ms);
-    let (estimate, total) =
-        store.snapshot_percentile(rule.common.id, proxy_id, rule.percentile, now_ms);
+    store.record_latency(
+        rule.common.id,
+        proxy_id,
+        ownership_generation,
+        latency,
+        now_ms,
+    );
+    let (estimate, total) = store.snapshot_percentile(
+        rule.common.id,
+        proxy_id,
+        ownership_generation,
+        rule.percentile,
+        now_ms,
+    );
     let breach = latency_estimate_breaches(estimate, total, rule);
     Some(RuleObservation {
         breach,
@@ -458,6 +508,7 @@ fn observe_error_class(
     rule: &ErrorClassRule,
     sample: SampleInput<'_>,
     proxy_id: &str,
+    ownership_generation: u64,
     store: &WindowStore,
     now_ms: u64,
 ) -> Option<RuleObservation> {
@@ -470,8 +521,15 @@ fn observe_error_class(
         SampleInput::Stream(s) => s.error_class.is_some_and(|c| rule.classes.contains(&c)),
         SampleInput::WebSocket(s) => s.error_class.is_some_and(|c| rule.classes.contains(&c)),
     };
-    store.record_count(rule.common.id, proxy_id, matched, now_ms);
-    let (matched_total, _) = store.snapshot_count(rule.common.id, proxy_id, now_ms);
+    store.record_count(
+        rule.common.id,
+        proxy_id,
+        ownership_generation,
+        matched,
+        now_ms,
+    );
+    let (matched_total, _) =
+        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
     let breach = matched_total >= rule.threshold_count;
     Some(RuleObservation {
         breach,
@@ -484,6 +542,7 @@ fn observe_stream_disconnect(
     rule: &StreamDisconnectCauseRule,
     sample: SampleInput<'_>,
     proxy_id: &str,
+    ownership_generation: u64,
     store: &WindowStore,
     now_ms: u64,
 ) -> Option<RuleObservation> {
@@ -496,8 +555,15 @@ fn observe_stream_disconnect(
         Some(c) => rule.causes.contains(&c),
         None => false,
     };
-    store.record_count(rule.common.id, proxy_id, matched, now_ms);
-    let (matched_total, _) = store.snapshot_count(rule.common.id, proxy_id, now_ms);
+    store.record_count(
+        rule.common.id,
+        proxy_id,
+        ownership_generation,
+        matched,
+        now_ms,
+    );
+    let (matched_total, _) =
+        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
     let breach = matched_total >= rule.threshold_count;
     Some(RuleObservation {
         breach,

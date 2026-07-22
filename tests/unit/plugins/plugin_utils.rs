@@ -238,6 +238,7 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 
@@ -247,6 +248,7 @@ pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamT
     ferrum_edge::plugins::StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "test-stream-proxy".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("Test Stream Proxy".to_string()),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("testuser".to_string()),

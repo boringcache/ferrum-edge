@@ -38,6 +38,7 @@ fn make_full_summary() -> TransactionSummary {
         mirror: false,
         metadata: HashMap::new(),
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 
@@ -450,6 +451,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("TCP Backend".to_string()),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,

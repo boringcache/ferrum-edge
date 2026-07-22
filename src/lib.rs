@@ -151,6 +151,19 @@ pub mod _test_support {
         crate::PluginCache::with_http_client(config, http_client)
     }
 
+    /// Deterministic allocator helper for proxy lifecycle ownership generations.
+    pub fn build_proxy_lifecycle_generations_for_test(
+        previous: &HashMap<String, u64>,
+        previous_high_water: u64,
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(HashMap<String, u64>, u64), String> {
+        crate::plugin_cache::build_proxy_lifecycle_generations(
+            previous,
+            previous_high_water,
+            config,
+        )
+    }
+
     pub fn validate_plugin_composition_candidate_with_real_ip_header_for_test(
         config: &crate::config::types::GatewayConfig,
         real_ip_header: Option<&str>,
@@ -782,6 +795,7 @@ pub mod _test_support {
         crate::plugins::StreamTransactionSummary {
             namespace: "ferrum".to_string(),
             proxy_id: "tcp-proxy".to_string(),
+            proxy_lifecycle_generation: None,
             proxy_name: Some("TCP Proxy".to_string()),
             client_ip: "10.0.0.1".to_string(),
             consumer_username: None,
@@ -2556,6 +2570,7 @@ pub mod _test_support {
             consumer_username,
             auth_method: None,
             metadata,
+            proxy_lifecycle_generation: None,
             session_start,
             // Duration is Instant-based; wall `session_start` is rendering-only.
             session_start_mono: std::time::Instant::now(),
@@ -2585,6 +2600,7 @@ pub mod _test_support {
             consumer_username,
             auth_method: None,
             metadata,
+            proxy_lifecycle_generation: None,
             session_start,
             session_start_mono,
         }

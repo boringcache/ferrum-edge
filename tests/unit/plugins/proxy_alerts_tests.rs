@@ -8,6 +8,8 @@
 //! - Cooldown gate per `(rule_id, proxy_id, channel_id)`.
 //! - Recovery state machine transitions (Healthy → Active → Recovering →
 //!   Healthy / Recovering → Active flap).
+//! - Lifecycle retention: prune removed proxies, expire cooldown rows, drop
+//!   terminal Healthy recovery state, and clear inherited ID-reuse state.
 //! - Plugin construction wires everything end-to-end.
 
 use chrono::{TimeZone, Utc};
@@ -1090,6 +1092,7 @@ fn websocket_disconnect_context_feeds_stream_rules() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1139,6 +1142,7 @@ fn websocket_disconnect_cause_distinguishes_client_write_failures() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1227,6 +1231,7 @@ fn latency_sentinel_sample_keeps_existing_breach() {
     let mut ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1281,6 +1286,7 @@ fn latency_boundary_threshold_does_not_fire_previous_bucket() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1332,6 +1338,7 @@ fn latency_non_boundary_threshold_fires_within_estimated_bucket() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1383,6 +1390,7 @@ fn latency_overflow_bucket_reports_configured_max_bound() {
     let ctx = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "p1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("api".to_string()),
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://backend".to_string(),
@@ -1478,36 +1486,36 @@ fn latency_histogram_returns_none_when_empty() {
 #[test]
 fn cooldown_gate_first_acquire_succeeds() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
 }
 
 #[test]
 fn cooldown_gate_blocks_within_window() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
-    assert!(!gate.try_acquire(1, "p1", 10, 60_000, 100 + 30_000));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
+    assert!(!gate.try_acquire(1, "p1", 10, 60_000, 100 + 30_000, 0));
 }
 
 #[test]
 fn cooldown_gate_releases_after_window() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100 + 60_001));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100 + 60_001, 0));
 }
 
 #[test]
 fn cooldown_gate_per_channel_independent() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
     // Same rule, different channel: should not be blocked.
-    assert!(gate.try_acquire(1, "p1", 11, 60_000, 100 + 1));
+    assert!(gate.try_acquire(1, "p1", 11, 60_000, 100 + 1, 0));
 }
 
 #[test]
 fn cooldown_gate_per_proxy_independent() {
     let gate = CooldownGate::new();
-    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100));
-    assert!(gate.try_acquire(1, "p2", 10, 60_000, 100 + 1));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
+    assert!(gate.try_acquire(1, "p2", 10, 60_000, 100 + 1, 0));
 }
 
 // -------------------------------------------------------------- RecoveryGate
@@ -1515,10 +1523,10 @@ fn cooldown_gate_per_proxy_independent() {
 #[test]
 fn recovery_healthy_to_active_emits_trigger() {
     let gate = RecoveryGate::new();
-    let outcome = gate.observe(1, "p", true, 60_000, 1_000);
+    let outcome = gate.observe(1, "p", true, 60_000, 1_000, 0);
     assert_eq!(outcome, LifecycleOutcome::Trigger);
     assert_eq!(
-        gate.current_state(1, "p"),
+        gate.current_state(1, "p", 0),
         Some(RuleState::Active { fired_at_ms: 1_000 })
     );
 }
@@ -1526,37 +1534,37 @@ fn recovery_healthy_to_active_emits_trigger() {
 #[test]
 fn recovery_active_to_active_returns_still_active() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 60_000, 1_000);
-    let outcome = gate.observe(1, "p", true, 60_000, 2_000);
+    gate.observe(1, "p", true, 60_000, 1_000, 0);
+    let outcome = gate.observe(1, "p", true, 60_000, 2_000, 0);
     assert_eq!(outcome, LifecycleOutcome::StillActive);
 }
 
 #[test]
 fn recovery_active_to_recovering_then_resolve() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 60_000, 1_000);
-    let entering = gate.observe(1, "p", false, 60_000, 2_000);
+    gate.observe(1, "p", true, 60_000, 1_000, 0);
+    let entering = gate.observe(1, "p", false, 60_000, 2_000, 0);
     assert_eq!(entering, LifecycleOutcome::EnteringRecovery);
     // Same call within recovery window: still quiet.
-    let quiet = gate.observe(1, "p", false, 60_000, 30_000);
+    let quiet = gate.observe(1, "p", false, 60_000, 30_000, 0);
     assert_eq!(quiet, LifecycleOutcome::Quiet);
     // After recovery window has elapsed (resolved_window_ms = 60_000 from
     // the EnteringRecovery timestamp 2_000): observe at 2_000 + 60_000 =
     // 62_000.
-    let resolve = gate.observe(1, "p", false, 60_000, 62_000);
+    let resolve = gate.observe(1, "p", false, 60_000, 62_000, 0);
     assert_eq!(resolve, LifecycleOutcome::Resolve);
-    assert_eq!(gate.current_state(1, "p"), Some(RuleState::Healthy));
+    assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
 }
 
 #[test]
 fn recovery_recovering_to_active_when_breach_returns_during_window() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 60_000, 1_000); // Active
-    gate.observe(1, "p", false, 60_000, 2_000); // Recovering
-    let reactivate = gate.observe(1, "p", true, 60_000, 3_000);
+    gate.observe(1, "p", true, 60_000, 1_000, 0); // Active
+    gate.observe(1, "p", false, 60_000, 2_000, 0); // Recovering
+    let reactivate = gate.observe(1, "p", true, 60_000, 3_000, 0);
     assert_eq!(reactivate, LifecycleOutcome::Reactivate);
     assert!(matches!(
-        gate.current_state(1, "p"),
+        gate.current_state(1, "p", 0),
         Some(RuleState::Active { .. })
     ));
 }
@@ -1564,12 +1572,368 @@ fn recovery_recovering_to_active_when_breach_returns_during_window() {
 #[test]
 fn recovery_disabled_when_recovery_ms_is_zero() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 0, 1_000);
-    let below = gate.observe(1, "p", false, 0, 2_000);
+    gate.observe(1, "p", true, 0, 1_000, 0);
+    let below = gate.observe(1, "p", false, 0, 2_000, 0);
     assert_eq!(below, LifecycleOutcome::Quiet);
-    assert_eq!(gate.current_state(1, "p"), Some(RuleState::Healthy));
-    let next_breach = gate.observe(1, "p", true, 0, 1_000_000);
+    assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
+    let next_breach = gate.observe(1, "p", true, 0, 1_000_000, 0);
     assert_eq!(next_breach, LifecycleOutcome::Trigger);
+}
+
+// ----------------------------------------- Lifecycle retain / bounded history
+
+#[test]
+fn cooldown_retain_proxies_drops_removed_proxy_rows() {
+    let gate = CooldownGate::new();
+    assert!(gate.try_acquire(1, "gone", 10, 60_000, 100, 0));
+    assert!(gate.try_acquire(1, "keep", 10, 60_000, 100, 0));
+    gate.retain_proxies(&std::collections::HashMap::from([("keep", 0)]));
+    assert!(!gate.contains_proxy("gone"));
+    assert!(gate.contains_proxy("keep"));
+    // Removed proxy must not inherit the old cooldown after ID reuse.
+    assert!(gate.try_acquire(1, "gone", 10, 60_000, 100 + 1, 0));
+}
+
+#[test]
+fn recovery_retain_proxies_drops_removed_proxy_rows() {
+    let gate = RecoveryGate::new();
+    gate.observe(1, "gone", true, 60_000, 1_000, 0);
+    gate.observe(1, "keep", true, 60_000, 1_000, 0);
+    gate.retain_proxies(&std::collections::HashMap::from([("keep", 0)]));
+    assert_eq!(gate.current_state(1, "gone", 0), None);
+    assert!(matches!(
+        gate.current_state(1, "keep", 0),
+        Some(RuleState::Active { .. })
+    ));
+    assert_eq!(
+        gate.observe(1, "gone", true, 60_000, 2_000, 0),
+        LifecycleOutcome::Trigger,
+        "recreated proxy ID must start Healthy rather than inherit Active"
+    );
+}
+
+#[test]
+fn cooldown_evict_stale_drops_expired_timestamps() {
+    let gate = CooldownGate::new();
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
+    gate.evict_stale(100 + 60_000, 60_000);
+    assert!(!gate.contains_proxy("p1"));
+}
+
+#[test]
+fn recovery_evict_resolved_drops_only_healthy_rows() {
+    let gate = RecoveryGate::new();
+    gate.observe(1, "active", true, 60_000, 1_000, 0);
+    gate.observe(1, "resolved", true, 60_000, 1_000, 0);
+    gate.observe(1, "resolved", false, 0, 2_000, 0); // Active → Healthy when recovery_ms=0
+    assert_eq!(
+        gate.current_state(1, "resolved", 0),
+        Some(RuleState::Healthy)
+    );
+    gate.evict_resolved();
+    assert_eq!(gate.current_state(1, "resolved", 0), None);
+    assert!(matches!(
+        gate.current_state(1, "active", 0),
+        Some(RuleState::Active { .. })
+    ));
+}
+
+#[test]
+fn proxy_alerts_retain_proxies_clears_all_lifecycle_stores() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.seed_lifecycle_state_for_test("gone", 1);
+    plugin.seed_lifecycle_state_for_test("keep", 1);
+    assert!(plugin.has_lifecycle_state_for_test("gone"));
+    assert!(plugin.has_lifecycle_state_for_test("keep"));
+
+    plugin.retain_proxies(&std::collections::HashMap::from([("keep", 1)]));
+
+    assert!(!plugin.has_lifecycle_state_for_test("gone"));
+    assert!(plugin.has_lifecycle_state_for_test("keep"));
+}
+
+#[tokio::test]
+async fn old_generation_sample_cannot_repopulate_after_removal() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1), ("p2", 1)]));
+    plugin.seed_lifecycle_state_for_test("p1", 1);
+    assert!(plugin.has_lifecycle_state_for_test("p1"));
+
+    // Removal publish retires p1 rows and disarms generation 1.
+    plugin.retain_proxies(&std::collections::HashMap::from([("p2", 1)]));
+    assert!(!plugin.has_lifecycle_state_for_test("p1"));
+
+    // Old in-flight sample admitted under generation 1 finishes after retain.
+    let summary = TransactionSummary {
+        proxy_id: Some("p1".to_string()),
+        proxy_lifecycle_generation: Some(1),
+        response_status_code: 500,
+        ..TransactionSummary::default()
+    };
+    Plugin::log(&plugin, &summary).await;
+    assert!(
+        !plugin.has_lifecycle_state_for_test("p1"),
+        "old-generation completion after removal must not recreate lifecycle rows"
+    );
+}
+
+#[tokio::test]
+async fn old_generation_sample_cannot_inherit_after_identical_id_recreate() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.seed_lifecycle_state_for_test("p1", 1);
+    assert!(plugin.has_lifecycle_state_for_test("p1"));
+
+    // Delete then recreate the same proxy ID with a new ownership generation.
+    plugin.retain_proxies(&std::collections::HashMap::new());
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert!(
+        !plugin.has_lifecycle_state_for_test("p1"),
+        "recreate must not keep prior rows"
+    );
+
+    let stale = TransactionSummary {
+        proxy_id: Some("p1".to_string()),
+        proxy_lifecycle_generation: Some(1),
+        response_status_code: 500,
+        ..TransactionSummary::default()
+    };
+    Plugin::log(&plugin, &stale).await;
+    assert!(
+        !plugin.has_lifecycle_state_for_test("p1"),
+        "stale generation must not write into the replacement incarnation"
+    );
+
+    let fresh = TransactionSummary {
+        proxy_id: Some("p1".to_string()),
+        proxy_lifecycle_generation: Some(2),
+        response_status_code: 500,
+        ..TransactionSummary::default()
+    };
+    Plugin::log(&plugin, &fresh).await;
+    // A single sample may only touch windows; seed-equivalent cooldown needs
+    // breach+dispatch. Window ownership alone proves the new generation can write.
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
+        "replacement generation must be able to record fresh lifecycle state"
+    );
+}
+
+#[test]
+fn retain_proxies_drops_generation_mismatched_same_id_rows() {
+    let cooldown = CooldownGate::new();
+    assert!(cooldown.try_acquire(1, "p1", 10, 60_000, 100, 1));
+    cooldown.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert!(
+        !cooldown.contains_proxy_generation("p1", 1),
+        "same-ID generation advance must retire prior cooldown ownership"
+    );
+    assert!(!cooldown.contains_proxy("p1"));
+
+    let recovery = RecoveryGate::new();
+    recovery.observe(1, "p1", true, 60_000, 1_000, 1);
+    recovery.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert_eq!(recovery.current_state(1, "p1", 1), None);
+    assert!(!recovery.contains_proxy("p1"));
+
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.seed_lifecycle_state_for_test("p1", 1);
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "generation-mismatched retain must clear prior incarnation rows"
+    );
+    assert!(!plugin.has_lifecycle_state_for_test("p1"));
+}
+
+#[test]
+fn old_generation_direct_write_after_replacement_cannot_affect_new_generation() {
+    // Explicit interleaving without timing: seed gen1, publish gen2, then write
+    // under gen1 via the store API (bypassing the admission precheck) to prove
+    // generation-keyed isolation for the TOCTOU race.
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.seed_lifecycle_state_for_test("p1", 1);
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 1));
+
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "replacement publication must retire gen1 rows"
+    );
+    assert!(!plugin.has_lifecycle_state_for_generation_for_test("p1", 2));
+
+    plugin.write_lifecycle_state_for_test("p1", 1);
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "stale writer may create an isolated old-generation orphan"
+    );
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
+        "stale gen1 write must not populate replacement generation state"
+    );
+
+    // New generation begins clean and can write independently.
+    plugin.write_lifecycle_state_for_test("p1", 2);
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 2));
+
+    // The periodic ownership sweep must bound the isolated orphan created by
+    // the stale writer without expiring the replacement's live incident.
+    plugin.sweep_lifecycle_ownership_for_test();
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "background ownership retention must prune a late old-generation write"
+    );
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
+        "background ownership retention must preserve current-generation state"
+    );
+
+    // Cooldown armed under gen1 must not suppress gen2.
+    let cooldown = CooldownGate::new();
+    assert!(cooldown.try_acquire(1, "p1", 10, 60_000, 100, 1));
+    assert!(
+        cooldown.try_acquire(1, "p1", 10, 60_000, 100 + 1, 2),
+        "new generation must not inherit prior cooldown"
+    );
+}
+
+#[test]
+fn generation_stable_reload_preserves_lifecycle_state() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 7), ("p2", 7)]));
+    plugin.seed_lifecycle_state_for_test("p1", 7);
+    plugin.seed_lifecycle_state_for_test("p2", 7);
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 7));
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p2", 7));
+
+    // Stable reload republishes the same ownership generations.
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 7), ("p2", 7)]));
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 7));
+    assert!(plugin.has_lifecycle_state_for_generation_for_test("p2", 7));
+}
+
+#[test]
+fn absent_id_cannot_repopulate_after_armed_retain() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    plugin.retain_proxies(&std::collections::HashMap::from([("keep", 1)]));
+    plugin.write_lifecycle_state_for_test("gone", 1);
+    // Direct store write can create an orphan under an absent ID, but retain
+    // and the armed precheck must keep it out of the active ownership set.
+    plugin.retain_proxies(&std::collections::HashMap::from([("keep", 1)]));
+    assert!(!plugin.has_lifecycle_state_for_test("gone"));
+}
+
+#[test]
+fn retention_serialization_keeps_latest_rows_across_stale_sweep() {
+    // Deterministic serialization contract without sleeps:
+    // 1. Hold the cold-path retention lock (as a commit retain would).
+    // 2. Publish a newer ownership map and write current-generation rows.
+    // 3. Spawn a sweep that must block until the lock is released.
+    // 4. After release, the sweep loads the latest map and must preserve
+    //    current-generation rows (the old race deleted them).
+    let plugin = std::sync::Arc::new(ProxyAlerts::new(&minimal_config(), http_client()).unwrap());
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.seed_lifecycle_state_for_test("p1", 1);
+
+    let (sweep_started_tx, sweep_started_rx) = std::sync::mpsc::channel::<()>();
+    let (lock_held_tx, lock_held_rx) = std::sync::mpsc::channel::<()>();
+    let plugin_sweep = std::sync::Arc::clone(&plugin);
+    let sweep = std::thread::spawn(move || {
+        sweep_started_tx.send(()).unwrap();
+        lock_held_rx.recv().unwrap();
+        plugin_sweep.sweep_lifecycle_ownership_for_test();
+    });
+
+    sweep_started_rx.recv().unwrap();
+    plugin.with_retention_lock_for_test(|| {
+        plugin.publish_proxy_generations_for_test(&std::collections::HashMap::from([("p1", 2)]));
+        plugin.write_lifecycle_state_for_test("p1", 2);
+        assert!(plugin.has_lifecycle_state_for_generation_for_test("p1", 2));
+        // Sweep is waiting to enter retain; it must not be able to take the lock.
+        assert!(
+            !plugin.try_retention_lock_for_test(),
+            "commit retention guard must serialize the background ownership sweep"
+        );
+        lock_held_tx.send(()).unwrap();
+        // Hold the lock until the sweep is observably blocked on it. The
+        // try_lock check above already proved mutual exclusion; releasing
+        // after the signal lets the sweep proceed against the latest map.
+    });
+    sweep.join().expect("ownership sweep thread");
+
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
+        "serialized sweep must retain against the latest published map"
+    );
+    assert!(
+        !plugin.has_lifecycle_state_for_generation_for_test("p1", 1),
+        "serialized sweep may still prune the retired generation"
+    );
+}
+
+#[test]
+fn concurrent_commit_retain_and_sweep_preserve_final_generation() {
+    let plugin = std::sync::Arc::new(ProxyAlerts::new(&minimal_config(), http_client()).unwrap());
+    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
+    plugin.write_lifecycle_state_for_test("p1", 1);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let commit_plugin = std::sync::Arc::clone(&plugin);
+    let commit_barrier = std::sync::Arc::clone(&barrier);
+    let commit = std::thread::spawn(move || {
+        commit_barrier.wait();
+        for generation in 2u64..=32 {
+            commit_plugin.retain_proxies(&std::collections::HashMap::from([("p1", generation)]));
+            commit_plugin.write_lifecycle_state_for_test("p1", generation);
+        }
+    });
+    let sweep_plugin = std::sync::Arc::clone(&plugin);
+    let sweep_barrier = std::sync::Arc::clone(&barrier);
+    let sweep = std::thread::spawn(move || {
+        sweep_barrier.wait();
+        for _ in 0..64 {
+            sweep_plugin.sweep_lifecycle_ownership_for_test();
+        }
+    });
+    barrier.wait();
+    commit.join().expect("commit retain thread");
+    sweep.join().expect("sweep thread");
+
+    plugin.sweep_lifecycle_ownership_for_test();
+    assert!(
+        plugin.has_lifecycle_state_for_generation_for_test("p1", 32),
+        "latest published generation rows must survive interleaved retain/sweep"
+    );
+    assert!(!plugin.has_lifecycle_state_for_generation_for_test("p1", 1));
+}
+
+#[test]
+fn generation_map_shares_cooldown_atomic_across_concurrent_acquires() {
+    // Compact generation storage must keep concurrent same-generation writers
+    // on one AtomicU64 (no lost inserts / duplicate rows).
+    let gate = std::sync::Arc::new(CooldownGate::new());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let gate = std::sync::Arc::clone(&gate);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            gate.try_acquire(1, "p1", 10, 60_000, 100, 7)
+        }));
+    }
+    let successes: usize = handles
+        .into_iter()
+        .map(|handle| usize::from(handle.join().expect("cooldown acquire thread")))
+        .sum();
+    assert_eq!(
+        successes, 1,
+        "one shared cooldown atomic must admit exactly one acquire at now_ms=100"
+    );
+    assert!(gate.contains_proxy_generation("p1", 7));
+    assert!(!gate.try_acquire(1, "p1", 10, 60_000, 100 + 1, 7));
 }
 
 #[test]
@@ -1600,6 +1964,7 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
     let summary = StreamTransactionSummary {
         namespace: "ferrum".to_string(),
         proxy_id: "udp-1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("udp".to_string()),
         client_ip: "10.0.0.9".to_string(),
         consumer_username: None,
@@ -1634,6 +1999,7 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
     let ws = WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-1".to_string(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("ws".to_string()),
         client_ip: "10.0.0.8".to_string(),
         backend_target: "ws://backend".to_string(),

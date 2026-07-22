@@ -1421,6 +1421,7 @@ pub(crate) async fn handle_h3_websocket(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         metadata: crate::proxy::clone_log_metadata(&ctx),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         session_start: Utc::now(),
         session_start_mono: std::time::Instant::now(),
     };
@@ -1582,6 +1583,7 @@ async fn emit_successful_upgrade_summary(
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         metadata: crate::proxy::clone_log_metadata(ctx),
         ai_usage_export: ctx.ai_usage_export.clone(),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -1665,6 +1667,7 @@ async fn emit_failed_upgrade_summary(
         error_class: Some(error_class),
         metadata,
         ai_usage_export: ctx.ai_usage_export.clone(),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         ..TransactionSummary::default()
     };
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;

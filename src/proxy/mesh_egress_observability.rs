@@ -73,6 +73,9 @@ impl CapturedMeshEgressLifecycle {
             proxy.effective_scheme(),
             Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index))),
         );
+        stream_ctx.proxy_lifecycle_generation = epoch
+            .plugin_cache
+            .proxy_lifecycle_generation(proxy.id.as_str());
         // NodeWaypoint TCP and Ambient UDP capture already verified the
         // originating pod's identity before handing the flow here; carry
         // it so workload_metrics attributes CLIENT spans/labels to the
@@ -252,6 +255,7 @@ impl CapturedMeshEgressLifecycle {
         Some(StreamTransactionSummary {
             namespace: self.namespace.clone(),
             proxy_id: self.proxy_id.clone(),
+            proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
             proxy_name: self.proxy_name.clone(),
             client_ip: self.client_ip.clone(),
             consumer_username: stream_ctx.effective_identity().map(str::to_owned),

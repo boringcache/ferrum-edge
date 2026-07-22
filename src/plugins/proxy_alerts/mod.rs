@@ -23,11 +23,25 @@
 //! - **Quiet hours**: optional UTC time-of-day windows where `Trigger`
 //!   alerts are suppressed (without consuming the cooldown gate). `Resolve`
 //!   events still fire so operators don't miss recovery during off hours.
+//! - **Lifecycle retention**: preserved global/proxy-group instances publish
+//!   per-proxy ownership generations and retire cooldown/recovery/window rows
+//!   when proxies leave the instance's active set or when an ID's generation
+//!   advances (incremental cache commit, off the request path). Lifecycle
+//!   rows themselves are keyed by admission ownership generation so a stale
+//!   write that races past retain cannot populate or poison the replacement
+//!   incarnation. Samples carry the admission-time generation captured from
+//!   the published RequestEpoch/plugin-cache snapshot. Full retention passes
+//!   (commit-path retain and the background ownership sweep) share a
+//!   poison-recovering cold-path mutex so a stale sweep cannot delete rows
+//!   for the latest published map. Expired cooldown timestamps and terminal
+//!   Healthy recovery rows are also swept by the background eviction task.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
@@ -44,6 +58,7 @@ use super::{
 
 pub mod config;
 pub mod cooldown;
+mod generation_map;
 pub mod render;
 pub mod rules;
 pub mod windows;
@@ -55,12 +70,30 @@ use windows::WindowStore;
 #[cfg(test)]
 use windows::current_epoch_ms;
 
+/// Floor for background lifecycle retention, matching the historical window
+/// sweep cadence documented for inactive proxies.
+const LIFECYCLE_KEEP_FLOOR_MS: u64 = 3_600_000;
+
+/// Ownership generation used by offline / unarmed unit tests that intentionally
+/// omit an admission token. Armed production instances reject missing tokens
+/// before any lifecycle write.
+pub const UNARMED_PROXY_LIFECYCLE_GENERATION: u64 = 0;
+
 pub struct ProxyAlerts {
     rules: Arc<Vec<Rule>>,
     channel_by_id: Arc<HashMap<u32, Arc<NotificationChannel>>>,
     windows: Arc<WindowStore>,
     cooldowns: Arc<CooldownGate>,
     recovery: Arc<RecoveryGate>,
+    /// Published ownership generations for proxies this instance may observe.
+    /// `None` until the first cold-path retain (unit tests that never retain
+    /// keep the historical ungated write path). After retain, writes require a
+    /// matching admitted generation.
+    active_proxy_generations: Arc<ArcSwap<Option<HashMap<String, u64>>>>,
+    /// Serializes full ownership retention passes (commit-path retain and the
+    /// background ownership sweep). Request observation only loads the
+    /// ArcSwap snapshot and never takes this lock.
+    retention_lock: Arc<Mutex<()>>,
     dispatch_sem: Arc<Semaphore>,
     http_client: PluginHttpClient,
     enabled: AtomicBool,
@@ -92,7 +125,19 @@ impl ProxyAlerts {
             .map(|r| (r.id(), r.window_spec()))
             .collect();
         let windows = Arc::new(WindowStore::new(rule_specs));
-        let eviction_handle = windows.start_eviction_task();
+        let cooldowns = Arc::new(CooldownGate::new());
+        let recovery = Arc::new(RecoveryGate::new());
+        let lifecycle_keep_ms = lifecycle_keep_ms(parsed.rules.as_ref());
+        let active_proxy_generations = Arc::new(ArcSwap::from_pointee(None));
+        let retention_lock = Arc::new(Mutex::new(()));
+        let eviction_handle = start_lifecycle_eviction_task(
+            Arc::clone(&windows),
+            Arc::clone(&cooldowns),
+            Arc::clone(&recovery),
+            Arc::clone(&active_proxy_generations),
+            Arc::clone(&retention_lock),
+            lifecycle_keep_ms,
+        );
 
         let dispatch_sem = Arc::new(Semaphore::new(parsed.max_concurrent_dispatches));
 
@@ -100,8 +145,10 @@ impl ProxyAlerts {
             rules: parsed.rules,
             channel_by_id: parsed.channel_by_id,
             windows,
-            cooldowns: Arc::new(CooldownGate::new()),
-            recovery: Arc::new(RecoveryGate::new()),
+            cooldowns,
+            recovery,
+            active_proxy_generations,
+            retention_lock,
             dispatch_sem,
             http_client,
             enabled: AtomicBool::new(parsed.enabled),
@@ -110,8 +157,190 @@ impl ProxyAlerts {
         })
     }
 
+    fn retention_guard(&self) -> MutexGuard<'_, ()> {
+        self.retention_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Publish ownership generations and retire per-proxy window/cooldown/
+    /// recovery rows for proxies absent from that map or whose stored
+    /// generation does not match the published incarnation.
+    ///
+    /// Invoked from the plugin-cache commit path for preserved global and
+    /// proxy-group instances. Must not run on the request hot path.
+    pub fn retain_proxies(&self, active_proxy_generations: &HashMap<&str, u64>) {
+        let owned: HashMap<String, u64> = active_proxy_generations
+            .iter()
+            .map(|(id, generation)| ((*id).to_string(), *generation))
+            .collect();
+        // Serialize against the background ownership sweep. Publish under the
+        // same guard before the retain walks so admission sees the new map
+        // immediately while a concurrent sweep cannot still be retaining an
+        // older snapshot (which would delete current-generation rows).
+        let _guard = self.retention_guard();
+        self.active_proxy_generations
+            .store(Arc::new(Some(owned.clone())));
+        let borrowed: HashMap<&str, u64> = owned
+            .iter()
+            .map(|(proxy_id, generation)| (proxy_id.as_str(), *generation))
+            .collect();
+        self.windows.retain_proxies(&borrowed);
+        self.cooldowns.retain_proxies(&borrowed);
+        self.recovery.retain_proxies(&borrowed);
+    }
+
+    /// Compatibility helper for tests that only have an active-ID set.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn retain_proxy_ids_for_test(&self, active_proxy_ids: &HashSet<&str>) {
+        let generations: HashMap<&str, u64> = active_proxy_ids
+            .iter()
+            .copied()
+            .map(|id| {
+                let generation = self
+                    .active_proxy_generations
+                    .load()
+                    .as_ref()
+                    .as_ref()
+                    .and_then(|map| map.get(id).copied())
+                    .unwrap_or(1);
+                (id, generation)
+            })
+            .collect();
+        self.retain_proxies(&generations);
+    }
+
+    /// Seed cooldown + Active recovery state for deterministic external tests.
+    #[doc(hidden)]
+    pub fn seed_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        // Ensure the seeded proxy is owned under `generation` so subsequent
+        // gated writes from the same incarnation succeed in tests.
+        let mut map = self
+            .active_proxy_generations
+            .load()
+            .as_ref()
+            .clone()
+            .unwrap_or_default();
+        map.insert(proxy_id.to_string(), generation);
+        self.active_proxy_generations.store(Arc::new(Some(map)));
+        let _ = self
+            .cooldowns
+            .try_acquire(0, proxy_id, 0, 60_000, 1, generation);
+        let _ = self
+            .recovery
+            .observe(0, proxy_id, true, 5_000, 1, generation);
+    }
+
+    /// Whether this instance currently holds lifecycle state for `proxy_id`
+    /// under any ownership generation.
+    #[doc(hidden)]
+    pub fn has_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
+        self.cooldowns.contains_proxy(proxy_id)
+            || self.recovery.contains_proxy(proxy_id)
+            || self.windows.contains_proxy(proxy_id)
+    }
+
+    /// Whether this instance holds lifecycle state for `(proxy_id, generation)`.
+    #[doc(hidden)]
+    pub fn has_lifecycle_state_for_generation_for_test(
+        &self,
+        proxy_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.cooldowns
+            .contains_proxy_generation(proxy_id, generation)
+            || self
+                .recovery
+                .contains_proxy_generation(proxy_id, generation)
+            || self.windows.contains_proxy_generation(proxy_id, generation)
+    }
+
+    /// Direct store write that bypasses the admission precheck — used by
+    /// deterministic race-contract tests to prove generation-keyed isolation
+    /// even when a stale writer races past retain publication.
+    #[doc(hidden)]
+    pub fn write_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        if let Some(rule) = self.rules.first() {
+            self.windows
+                .record_count(rule.id(), proxy_id, generation, true, 1);
+        }
+        let _ = self
+            .cooldowns
+            .try_acquire(0, proxy_id, 0, 60_000, 1, generation);
+        let _ = self
+            .recovery
+            .observe(0, proxy_id, true, 5_000, 1, generation);
+    }
+
+    /// Run the ownership portion of the background lifecycle sweep without
+    /// waiting for its one-minute cadence.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn sweep_lifecycle_ownership_for_test(&self) {
+        retain_published_proxy_generations(
+            &self.windows,
+            &self.cooldowns,
+            &self.recovery,
+            &self.active_proxy_generations,
+            &self.retention_lock,
+        );
+    }
+
+    /// Hold the cold-path retention lock for deterministic serialization tests.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn with_retention_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.retention_guard();
+        f()
+    }
+
+    /// Whether the retention lock is free (`true`) or held (`false`).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn try_retention_lock_for_test(&self) -> bool {
+        self.retention_lock.try_lock().is_ok()
+    }
+
+    /// Publish ownership generations without retaining (test-only). Callers
+    /// must already hold [`Self::with_retention_lock_for_test`] when proving
+    /// the commit/sweep serialization contract.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn publish_proxy_generations_for_test(
+        &self,
+        active_proxy_generations: &HashMap<&str, u64>,
+    ) {
+        let owned: HashMap<String, u64> = active_proxy_generations
+            .iter()
+            .map(|(id, generation)| ((*id).to_string(), *generation))
+            .collect();
+        self.active_proxy_generations.store(Arc::new(Some(owned)));
+    }
+
+    /// Whether an admitted sample may mutate lifecycle state for `proxy_id`.
+    fn owns_proxy_generation(&self, proxy_id: &str, admitted_generation: Option<u64>) -> bool {
+        let guard = self.active_proxy_generations.load();
+        match guard.as_ref() {
+            // Retention not armed yet (offline unit tests / pre-retain).
+            None => true,
+            Some(active) => match (active.get(proxy_id), admitted_generation) {
+                (Some(&current), Some(admitted)) => current == admitted,
+                // Armed retention: missing proxy or missing admission token
+                // must not create ownership visible to a replacement generation.
+                _ => false,
+            },
+        }
+    }
+
     fn handle(&self, sample: SampleInput<'_>) {
         if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let proxy_id = sample.proxy_id().unwrap_or("");
+        if !proxy_id.is_empty()
+            && !self.owns_proxy_generation(proxy_id, sample.proxy_lifecycle_generation())
+        {
             return;
         }
         let now = Utc::now();
@@ -135,7 +364,12 @@ impl ProxyAlerts {
         in_quiet: bool,
     ) {
         let proxy_id = sample.proxy_id().unwrap_or("");
-        let previous_state = self.recovery.current_state(rule.id(), proxy_id);
+        let ownership_generation = sample
+            .proxy_lifecycle_generation()
+            .unwrap_or(UNARMED_PROXY_LIFECYCLE_GENERATION);
+        let previous_state = self
+            .recovery
+            .current_state(rule.id(), proxy_id, ownership_generation);
         if observation.breach
             && in_quiet
             && matches!(previous_state, None | Some(RuleState::Healthy))
@@ -148,13 +382,24 @@ impl ProxyAlerts {
             .as_ref()
             .map(|r| r.resolved_window_ms)
             .unwrap_or(0);
-        let outcome =
-            self.recovery
-                .evaluate(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+        let outcome = self.recovery.evaluate(
+            rule.id(),
+            proxy_id,
+            observation.breach,
+            recovery_ms,
+            now_ms,
+            ownership_generation,
+        );
         let Some(event_action) = lifecycle_event_action(outcome) else {
             if non_event_outcome_needs_commit(outcome, previous_state, recovery_ms) {
-                self.recovery
-                    .observe(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+                self.recovery.observe(
+                    rule.id(),
+                    proxy_id,
+                    observation.breach,
+                    recovery_ms,
+                    now_ms,
+                    ownership_generation,
+                );
             }
             return;
         };
@@ -178,6 +423,7 @@ impl ProxyAlerts {
                     channel_id,
                     rule.common().cooldown_ms,
                     now_ms,
+                    ownership_generation,
                 ),
             };
             if !cooldown_ok {
@@ -190,14 +436,25 @@ impl ProxyAlerts {
         }
         let Some(dispatches) = dispatches else {
             if cooldown_suppressed && matches!(outcome, LifecycleOutcome::StillActive) {
-                self.recovery
-                    .observe(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+                self.recovery.observe(
+                    rule.id(),
+                    proxy_id,
+                    observation.breach,
+                    recovery_ms,
+                    now_ms,
+                    ownership_generation,
+                );
             }
             return;
         };
-        let committed_outcome =
-            self.recovery
-                .observe(rule.id(), proxy_id, observation.breach, recovery_ms, now_ms);
+        let committed_outcome = self.recovery.observe(
+            rule.id(),
+            proxy_id,
+            observation.breach,
+            recovery_ms,
+            now_ms,
+            ownership_generation,
+        );
         if lifecycle_event_action(committed_outcome) != Some(event_action) {
             return;
         }
@@ -262,6 +519,83 @@ impl Drop for ProxyAlerts {
     }
 }
 
+fn lifecycle_keep_ms(rules: &[Rule]) -> u64 {
+    let mut keep = LIFECYCLE_KEEP_FLOOR_MS;
+    for rule in rules {
+        let common = rule.common();
+        keep = keep.max(common.cooldown_ms);
+        keep = keep.max(u64::from(common.window_seconds) * 1000);
+        if let Some(recovery) = common.recovery.as_ref() {
+            keep = keep.max(recovery.resolved_window_ms);
+        }
+    }
+    keep
+}
+
+fn start_lifecycle_eviction_task(
+    windows: Arc<WindowStore>,
+    cooldowns: Arc<CooldownGate>,
+    recovery: Arc<RecoveryGate>,
+    active_proxy_generations: Arc<ArcSwap<Option<HashMap<String, u64>>>>,
+    retention_lock: Arc<Mutex<()>>,
+    keep_ms: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return None;
+    };
+    Some(handle.spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            let now_ms = windows::current_epoch_ms();
+            // A sample can pass the admission-generation check immediately
+            // before a cache commit and finish its write immediately after the
+            // commit-time retain. Generation-keying isolates that row from the
+            // replacement; periodically reapplying the published ownership map
+            // also bounds the orphan rather than leaving an old-generation
+            // Active/Recovering recovery row resident indefinitely. The
+            // retention lock ensures this sweep loads the latest published map
+            // and cannot interleave with a commit-path retain pass.
+            retain_published_proxy_generations(
+                &windows,
+                &cooldowns,
+                &recovery,
+                &active_proxy_generations,
+                &retention_lock,
+            );
+            windows.evict_stale(now_ms, keep_ms);
+            cooldowns.evict_stale(now_ms, keep_ms);
+            recovery.evict_resolved();
+        }
+    }))
+}
+
+fn retain_published_proxy_generations(
+    windows: &WindowStore,
+    cooldowns: &CooldownGate,
+    recovery: &RecoveryGate,
+    active_proxy_generations: &ArcSwap<Option<HashMap<String, u64>>>,
+    retention_lock: &Mutex<()>,
+) {
+    let _guard = retention_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Load only after acquiring the serialization guard so a concurrent
+    // commit cannot publish a newer map and finish retaining before this
+    // pass still deletes against a stale snapshot.
+    let active = active_proxy_generations.load();
+    let Some(active) = active.as_ref() else {
+        return;
+    };
+    let borrowed: HashMap<&str, u64> = active
+        .iter()
+        .map(|(proxy_id, generation)| (proxy_id.as_str(), *generation))
+        .collect();
+    windows.retain_proxies(&borrowed);
+    cooldowns.retain_proxies(&borrowed);
+    recovery.retain_proxies(&borrowed);
+}
+
 fn lifecycle_event_action(outcome: LifecycleOutcome) -> Option<EventAction> {
     match outcome {
         LifecycleOutcome::Trigger | LifecycleOutcome::StillActive => Some(EventAction::Trigger),
@@ -293,6 +627,34 @@ impl Plugin for ProxyAlerts {
 
     fn priority(&self) -> u16 {
         super::priority::PROXY_ALERTS
+    }
+
+    fn retain_active_proxy_state(&self, active_proxy_generations: &HashMap<&str, u64>) {
+        self.retain_proxies(active_proxy_generations);
+    }
+
+    #[doc(hidden)]
+    fn seed_proxy_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        self.seed_lifecycle_state_for_test(proxy_id, generation);
+    }
+
+    #[doc(hidden)]
+    fn has_proxy_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
+        self.has_lifecycle_state_for_test(proxy_id)
+    }
+
+    #[doc(hidden)]
+    fn has_proxy_lifecycle_state_for_generation_for_test(
+        &self,
+        proxy_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.has_lifecycle_state_for_generation_for_test(proxy_id, generation)
+    }
+
+    #[doc(hidden)]
+    fn write_proxy_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
+        self.write_lifecycle_state_for_test(proxy_id, generation);
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
@@ -367,7 +729,12 @@ mod tests {
 
         plugin.log(&summary).await;
         assert_eq!(
-            plugin.windows.snapshot_count(0, "p1", current_epoch_ms()),
+            plugin.windows.snapshot_count(
+                0,
+                "p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION,
+                current_epoch_ms(),
+            ),
             (0, 0)
         );
 
@@ -375,7 +742,12 @@ mod tests {
         primary_summary.mirror = false;
         plugin.log(&primary_summary).await;
         assert_eq!(
-            plugin.windows.snapshot_count(0, "p1", current_epoch_ms()),
+            plugin.windows.snapshot_count(
+                0,
+                "p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION,
+                current_epoch_ms(),
+            ),
             (1, 1)
         );
     }
@@ -403,7 +775,12 @@ mod tests {
 
         plugin.log(&summary).await;
 
-        assert_eq!(plugin.recovery.current_state(0, "p1"), None);
+        assert_eq!(
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            None
+        );
     }
 
     #[tokio::test]
@@ -436,9 +813,14 @@ mod tests {
         plugin.log(&summary).await;
 
         assert!(
-            plugin
-                .cooldowns
-                .try_acquire(0, "p1", 0, 60_000, current_epoch_ms()),
+            plugin.cooldowns.try_acquire(
+                0,
+                "p1",
+                0,
+                60_000,
+                current_epoch_ms(),
+                UNARMED_PROXY_LIFECYCLE_GENERATION,
+            ),
             "a dropped dispatch must not arm the trigger cooldown"
         );
     }
@@ -508,12 +890,19 @@ mod tests {
         };
 
         plugin.log(&summary).await;
-        assert_eq!(plugin.recovery.current_state(0, "p1"), None);
+        assert_eq!(
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            None
+        );
 
         drop(held_permit);
         plugin.log(&summary).await;
         assert!(matches!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Active { .. })
         ));
     }
@@ -534,7 +923,14 @@ mod tests {
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
         let now_ms = current_epoch_ms();
-        assert!(plugin.cooldowns.try_acquire(0, "p1", 0, 60_000, now_ms));
+        assert!(plugin.cooldowns.try_acquire(
+            0,
+            "p1",
+            0,
+            60_000,
+            now_ms,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+        ));
         let summary = TransactionSummary {
             namespace: "ferrum".to_string(),
             proxy_id: Some("p1".to_string()),
@@ -546,7 +942,9 @@ mod tests {
         plugin.log(&summary).await;
 
         assert_eq!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             None,
             "a first trigger suppressed by cooldown must not create a resolvable incident"
         );
@@ -568,10 +966,16 @@ mod tests {
             ]
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
-        plugin.recovery.observe(0, "p1", true, 5_000, 1);
-        plugin.recovery.observe(0, "p1", false, 5_000, 2);
+        plugin
+            .recovery
+            .observe(0, "p1", true, 5_000, 1, UNARMED_PROXY_LIFECYCLE_GENERATION);
+        plugin
+            .recovery
+            .observe(0, "p1", false, 5_000, 2, UNARMED_PROXY_LIFECYCLE_GENERATION);
         assert!(matches!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Recovering { .. })
         ));
 
@@ -590,14 +994,18 @@ mod tests {
 
         plugin.log(&summary).await;
         assert!(matches!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Recovering { .. })
         ));
 
         drop(held_permit);
         plugin.log(&summary).await;
         assert_eq!(
-            plugin.recovery.current_state(0, "p1"),
+            plugin
+                .recovery
+                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Healthy)
         );
     }

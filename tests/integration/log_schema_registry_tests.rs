@@ -57,6 +57,7 @@ fn fully_populated_http() -> TransactionSummary {
             ("grpc_status".to_string(), "14".to_string()),
         ]),
         ai_usage_export: None,
+        proxy_lifecycle_generation: None,
     }
 }
 
@@ -64,6 +65,7 @@ fn fully_populated_stream() -> StreamTransactionSummary {
     StreamTransactionSummary {
         namespace: "ferrum".into(),
         proxy_id: "p2".into(),
+        proxy_lifecycle_generation: None,
         proxy_name: Some("db-front".into()),
         client_ip: "10.0.0.2".into(),
         consumer_username: Some("svc-account".into()),
