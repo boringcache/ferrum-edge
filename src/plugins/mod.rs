@@ -1323,6 +1323,17 @@ pub struct WsDisconnectContext {
     pub backend_target: String,
     /// Listener port on the gateway that accepted the upgrade.
     pub listen_port: u16,
+    /// Process-local accepted WebSocket session ID allocated at upgrade
+    /// admission (`ProxyState.ws_connection_counter`).
+    ///
+    /// Identical to the `connection_id` passed to every `on_ws_frame` call for
+    /// this session, including H1/H2/H3 relay teardown, peer close/error,
+    /// plugin cancellation, idle/drain timeout, and H1/H2 upgrade-handoff
+    /// failure. The value is **not** globally unique across gateway processes;
+    /// operators aggregating logs from multiple instances must join on
+    /// `(gateway_instance_id, proxy_id, connection_id)` (or an equivalent
+    /// host/process identity + `proxy_id` + `connection_id` tuple).
+    pub connection_id: u64,
     /// Total session lifetime in milliseconds (upgrade → close).
     pub duration_ms: f64,
     /// Number of frames proxied from client toward backend.
@@ -6236,13 +6247,27 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Starts runtime-owned background work after the complete plugin-cache
+    /// Stages runtime-owned background work after the complete plugin-cache
     /// generation has validated and before it is published. Constructors must
     /// remain pure because offline validation invokes them without a runtime.
-    /// Implementations must be idempotent and stop owned work when dropped.
+    ///
+    /// Fallible producer/client construction, secret resolution, and channel
+    /// construction belong here. Workers capable of externally visible writes,
+    /// exports, replay, or live-state mutation must stay dormant — gated on
+    /// [`Self::commit_background_tasks`] — so a generation that later fails
+    /// registry/cache commit has no such side effects. Read-only discovery or
+    /// refresh workers may stage earlier when their implementation documents
+    /// that lifecycle. Implementations must be idempotent; dropping an
+    /// uncommitted instance must cancel every staged worker it owns.
     fn start_background_tasks(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Releases staged workers and publishes process-global runtime state after
+    /// the complete plugin-cache generation has been atomically installed.
+    /// Implementations must be infallible and idempotent: all fallible setup
+    /// belongs in [`Self::start_background_tasks`].
+    fn commit_background_tasks(&self) {}
 
     /// Returns `true` if this plugin participates in the authorization phase.
     ///
