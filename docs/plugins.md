@@ -3438,9 +3438,10 @@ configured JSON/XML `response_content_types` (and gRPC responses without
 applicable protobuf response validation) are released to the streaming path so
 large irrelevant downloads are not collected against the response-body limit.
 Matching JSON/XML types and applicable gRPC protobuf responses remain buffered.
-Missing, ambiguous, or later-relabeled content types stay on the ordinary
-validation path; the shared refinement also refuses release when another active
-plugin may rewrite `Content-Type`.
+A missing content type stays on the conservative buffered path. Malformed or
+ambiguous values cannot match a configured JSON/XML rule and are released;
+the shared refinement still refuses release when another active plugin may
+rewrite `Content-Type`.
 
 **Supported JSON Schema `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
 

@@ -739,8 +739,9 @@ impl BodyValidator {
     ///
     /// Used by the post-header buffering refinement so irrelevant downloads
     /// (and other non-matching types) can stream instead of being collected
-    /// only to be skipped. Missing/ambiguous types stay buffered
-    /// conservatively; genuine `text/event-stream` is released so
+    /// only to be skipped. A missing type stays buffered conservatively;
+    /// malformed or ambiguous values cannot match a configured JSON/XML rule
+    /// and are released. Genuine `text/event-stream` is released so
     /// `after_proxy` can fail closed before header commit.
     fn response_body_requires_buffering_for_media_type(
         &self,
