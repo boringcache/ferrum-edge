@@ -1242,7 +1242,6 @@ fn test_response_transformer_strong_etag_preflight_reports_conservative_capabili
 use ferrum_edge::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, parse_route_header_transforms,
 };
-use std::sync::Arc;
 
 #[tokio::test]
 async fn test_response_transformer_apply_route_overrides_accepts_empty_rules() {
