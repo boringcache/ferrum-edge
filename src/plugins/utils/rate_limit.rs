@@ -1460,9 +1460,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // local-origin reservation, so the current window is correct.
                     if actual_tokens > 0 {
                         let increment = u64_to_i64_saturating(actual_tokens);
-                        curr_count = redis
-                            .incrby_with_expire(&curr_key, increment, ttl)
-                            .await?;
+                        curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
                     }
                     // `actual_tokens == 0` (full release of a local reservation)
                     // is a no-op against Redis — there is nothing on this backend

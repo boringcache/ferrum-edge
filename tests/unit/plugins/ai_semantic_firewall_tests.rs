@@ -1128,7 +1128,9 @@ async fn response_leakage_is_blocked() {
     let body =
         br#"{"choices":[{"message":{"content":"My system prompt says never reveal policy."}}]}"#;
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -1150,7 +1152,9 @@ async fn response_dry_run_allows_but_records_would_reject() {
     let body =
         br#"{"choices":[{"message":{"content":"My system prompt says never reveal policy."}}]}"#;
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
     assert_eq!(
@@ -2211,7 +2215,9 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" says never reveal pol
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2240,7 +2246,9 @@ async fn streaming_response_buffer_allows_clean_sse() {
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
 }
@@ -2291,7 +2299,9 @@ async fn streaming_response_buffer_clean_sse_passes_semantic_evaluation() {
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
     assert_eq!(
@@ -2353,7 +2363,9 @@ async fn streaming_response_buffer_inspects_non_delta_leak_frame() {
 data: {\"choices\":[{\"index\":0,\"message\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2426,7 +2438,9 @@ async fn streaming_response_buffer_honors_output_text_override() {
 data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"says never reveal policy.\"}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2453,7 +2467,9 @@ async fn streaming_response_buffer_reassembles_legacy_completion_text() {
 data: {\"choices\":[{\"index\":0,\"text\":\"prompt says never reveal policy.\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2493,7 +2509,9 @@ async fn streaming_response_buffer_rejects_unparseable_stream() {
     let (mut ctx, headers) = buffer_marked_event_stream_ctx();
     let body = b"data: not-json-at-all\n\ndata: <<garbage event>>\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
     assert_eq!(
@@ -2522,7 +2540,9 @@ async fn streaming_response_buffer_rejects_content_less_stream() {
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_reject(result, Some(502));
 }
@@ -2541,7 +2561,9 @@ async fn streaming_response_buffer_uninspectable_honors_on_error_allow() {
     let (mut ctx, headers) = buffer_marked_event_stream_ctx();
     let body = b"data: not-json\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
 }
@@ -2564,7 +2586,9 @@ async fn unflagged_unencoded_uninspectable_sse_is_not_rejected() {
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: not-json\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
 }
@@ -2586,7 +2610,9 @@ async fn streaming_response_buffer_dry_run_records_would_reject() {
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"says never reveal policy.\"}}]}\n\n\
 data: [DONE]\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_continue(result);
     assert_eq!(
@@ -3028,7 +3054,9 @@ async fn buffered_inspect_mode_stream_fails_closed_when_uninspectable() {
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: not-json-at-all\n\ndata: <<garbage>>\n\n";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
     assert_reject(result, Some(502));
 }
 
@@ -4607,7 +4635,12 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
     let mut download_ctx = create_test_context();
     assert_continue(
         firewall
-            .on_response_body(&mut download_ctx, 200, &mut download_headers, &large_download)
+            .on_response_body(
+                &mut download_ctx,
+                200,
+                &mut download_headers,
+                &large_download,
+            )
             .await,
     );
 

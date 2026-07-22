@@ -376,7 +376,9 @@ async fn test_cohere_v2_streaming_format() {
     )
     .as_bytes();
 
-    plugin.on_response_body(&mut ctx, 200, &mut headers, sse).await;
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, sse)
+        .await;
 
     assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "cohere");
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "64");
@@ -600,7 +602,9 @@ async fn test_empty_body() {
     let mut ctx = create_test_context();
     let headers = json_headers();
 
-    let result = plugin.on_response_body(&mut ctx, 200, &mut headers, b"").await;
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, b"")
+        .await;
     assert_continue(result);
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
 }
@@ -957,7 +961,9 @@ async fn anthropic_sse_without_message_start_keeps_explicit_partial_usage() {
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
 
-    plugin.on_response_body(&mut ctx, 200, &mut headers, body).await;
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
 
     assert_eq!(
         ctx.metadata.get("ai_completion_tokens").map(String::as_str),

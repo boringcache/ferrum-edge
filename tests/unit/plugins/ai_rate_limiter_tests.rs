@@ -3922,7 +3922,9 @@ async fn run_expose_header_lifecycle(
     );
     let reserved_str = reserved.to_string();
     assert_eq!(
-        response_headers.get("x-ai-ratelimit-usage").map(String::as_str),
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
         Some(reserved_str.as_str()),
         "after_proxy must initially expose the admission estimate"
     );
@@ -3933,7 +3935,9 @@ async fn run_expose_header_lifecycle(
         Some(ctx.metadata.get("ai_ratelimit_remaining").unwrap().as_str())
     );
     assert_eq!(
-        response_headers.get("x-ai-ratelimit-limit").map(String::as_str),
+        response_headers
+            .get("x-ai-ratelimit-limit")
+            .map(String::as_str),
         Some("1000")
     );
     assert_eq!(
@@ -3980,7 +3984,9 @@ async fn expose_headers_lifecycle_reflects_reconciled_usage_local() {
     let actual_str = actual.to_string();
     let remaining_str = (1000 - actual).to_string();
     assert_eq!(
-        response_headers.get("x-ai-ratelimit-usage").map(String::as_str),
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
         Some(actual_str.as_str()),
         "final headers must expose reconciled usage, not the admission estimate"
     );
@@ -3992,7 +3998,9 @@ async fn expose_headers_lifecycle_reflects_reconciled_usage_local() {
         "final remaining must match the post-reconcile bucket"
     );
     assert_eq!(
-        response_headers.get("x-ai-ratelimit-limit").map(String::as_str),
+        response_headers
+            .get("x-ai-ratelimit-limit")
+            .map(String::as_str),
         Some("1000"),
         "limit stays coherent across reconcile"
     );
@@ -4043,7 +4051,9 @@ async fn expose_headers_lifecycle_reflects_reconciled_usage_redis_fallback() {
     let actual_str = actual.to_string();
     let remaining_str = (1000 - actual).to_string();
     assert_eq!(
-        response_headers.get("x-ai-ratelimit-usage").map(String::as_str),
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
         Some(actual_str.as_str()),
         "Redis-fallback lifecycle must expose reconciled usage on the final headers"
     );
@@ -4077,7 +4087,9 @@ async fn expose_headers_lifecycle_positive_delta_charges_extra() {
         run_expose_header_lifecycle(&plugin, 50, "short", 10, 80).await;
     assert_eq!(reserved_tokens(&ctx), 50);
     assert_eq!(
-        response_headers.get("x-ai-ratelimit-usage").map(String::as_str),
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
         Some("80")
     );
     assert_eq!(
@@ -4119,7 +4131,9 @@ async fn expose_headers_non_2xx_release_refreshes_remaining() {
             .await,
     );
     assert_eq!(
-        response_headers.get("x-ai-ratelimit-usage").map(String::as_str),
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
         Some(reserved_str.as_str())
     );
 
@@ -4134,7 +4148,9 @@ async fn expose_headers_non_2xx_release_refreshes_remaining() {
             .await,
     );
     assert_eq!(
-        response_headers.get("x-ai-ratelimit-usage").map(String::as_str),
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
         Some("0"),
         "non-2xx release must refresh usage to the post-release bucket"
     );

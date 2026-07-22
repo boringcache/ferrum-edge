@@ -2762,7 +2762,12 @@ where
                 let mut response_body_rejected = false;
                 for plugin in plugins {
                     let result = plugin
-                        .on_response_body(ctx, response_status, &mut response_headers, &response_body)
+                        .on_response_body(
+                            ctx,
+                            response_status,
+                            &mut response_headers,
+                            &response_body,
+                        )
                         .await;
                     match result {
                         PluginResult::Continue => {

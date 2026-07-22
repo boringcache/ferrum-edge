@@ -877,7 +877,9 @@ async fn non_json_and_non_2xx_are_ignored() {
     // intact Chat Completions JSON underneath.
     let mut ctx = create_test_context();
     assert_reject(
-        plugin.on_response_body(&mut ctx, 200, &mut html, &body).await,
+        plugin
+            .on_response_body(&mut ctx, 200, &mut html, &body)
+            .await,
         Some(403),
     );
 }
@@ -1080,7 +1082,11 @@ async fn relabeled_json_shaped_response_is_still_redacted_by_transform() {
 
     // The relabeled body is still governed via the JSON-shaped fallback and
     // records the redact decision.
-    assert_continue(plugin.on_response_body(&mut ctx, 200, &mut html, &body).await);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut html, &body)
+            .await,
+    );
     assert_eq!(
         ctx.metadata
             .get("ai_tool_governor.redacted_tools")
@@ -5928,7 +5934,12 @@ async fn buffered_multi_batch_sse_governs_second_batch_under_true_name() {
     let mut ctx = create_test_context();
     assert_continue(
         strict
-            .on_response_body(&mut ctx, 200, &mut sse_headers(), allowed_batches.as_bytes())
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut sse_headers(),
+                allowed_batches.as_bytes(),
+            )
             .await,
     );
 
@@ -8851,7 +8862,12 @@ async fn stream_late_id_introduction_fails_closed_but_missing_continuation_id_is
     let mut buffered_ctx = create_test_context();
     assert_reject(
         buffered
-            .on_response_body(&mut buffered_ctx, 200, &mut sse_headers(), ambiguous.as_bytes())
+            .on_response_body(
+                &mut buffered_ctx,
+                200,
+                &mut sse_headers(),
+                ambiguous.as_bytes(),
+            )
             .await,
         Some(502),
     );
@@ -8948,7 +8964,12 @@ async fn stream_null_call_id_is_omission_but_empty_string_fails_closed() {
     let mut buffered_ctx = create_test_context();
     assert_continue(
         buffered
-            .on_response_body(&mut buffered_ctx, 200, &mut sse_headers(), null_id.as_bytes())
+            .on_response_body(
+                &mut buffered_ctx,
+                200,
+                &mut sse_headers(),
+                null_id.as_bytes(),
+            )
             .await,
     );
 
@@ -8968,7 +8989,12 @@ async fn stream_null_call_id_is_omission_but_empty_string_fails_closed() {
     let mut buffered_ctx = create_test_context();
     assert_reject(
         buffered
-            .on_response_body(&mut buffered_ctx, 200, &mut sse_headers(), empty_id.as_bytes())
+            .on_response_body(
+                &mut buffered_ctx,
+                200,
+                &mut sse_headers(),
+                empty_id.as_bytes(),
+            )
             .await,
         Some(502),
     );
