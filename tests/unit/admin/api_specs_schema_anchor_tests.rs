@@ -525,6 +525,90 @@ fn inline_schema_ref_uses_its_own_id_as_base() {
 }
 
 #[test]
+fn referenced_relative_directory_id_is_applied_once() {
+    // A referenced resource root receives the base that was in force before
+    // its own `$id`. Applying the relative directory `$id` twice would make
+    // the nested `leaf.json` reference resolve under a duplicated path.
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Relative Resource API", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "components": {{
+    "schemas": {{
+      "Target": {{
+        "$id": "schemas/target/",
+        "$anchor": "Target",
+        "type": "object",
+        "required": ["leaf"],
+        "properties": {{
+          "leaf": {{"$ref": "leaf.json#Leaf"}}
+        }},
+        "$defs": {{
+          "Leaf": {{
+            "$id": "leaf.json",
+            "$anchor": "Leaf",
+            "type": "string",
+            "minLength": 1
+          }}
+        }}
+      }}
+    }}
+  }},
+  "paths": {{
+    "/relative": {{
+      "post": {{
+        "requestBody": {{
+          "content": {{
+            "application/json": {{
+              "schema": {{"$ref": "schemas/target/#Target"}}
+            }}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+    let schema = first_request_schema(&spec);
+    assert_eq!(schema["$id"], "schemas/target/");
+    assert_eq!(schema["properties"]["leaf"]["$anchor"], "Leaf");
+    assert_eq!(schema["properties"]["leaf"]["minLength"], 1);
+}
+
+#[test]
+fn deeply_nested_callback_schema_indexing_is_bounded() {
+    let mut path_item = json!({
+        "post": {
+            "responses": {"204": {"description": "ok"}}
+        }
+    });
+    for _ in 0..65 {
+        path_item = json!({
+            "post": {
+                "callbacks": {"next": {"/callback": path_item}},
+                "responses": {"204": {"description": "ok"}}
+            }
+        });
+    }
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Deep Callback API", "version": "1.0.0"},
+        "x-ferrum-validate": true,
+        "x-ferrum-proxy": serde_json::from_str::<Value>(&proxy_block()).unwrap(),
+        "paths": {"/start": path_item}
+    });
+    let err = extract_err(&spec.to_string());
+    assert!(
+        matches!(err, ExtractError::SchemaTooDeep { .. }),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn unknown_absolute_ref_remains_unsupported_external() {
     let spec = format!(
         r##"{{

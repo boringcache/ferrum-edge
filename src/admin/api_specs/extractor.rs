@@ -1287,6 +1287,11 @@ impl LocalSchemaResolver {
         base: &Url,
         depth: usize,
     ) -> Result<(), ExtractError> {
+        if depth == 0 {
+            return Err(ExtractError::SchemaTooDeep {
+                location: pointer.to_string(),
+            });
+        }
         for (name, item) in items {
             let item_pointer = append_json_pointer(pointer, name);
             let Some(item_object) = item.as_object() else {
@@ -1336,7 +1341,7 @@ impl LocalSchemaResolver {
                             cb_name,
                         );
                         if let Some(path_items) = callback.as_object() {
-                            self.index_path_item_map(path_items, &cb_pointer, base, depth)?;
+                            self.index_path_item_map(path_items, &cb_pointer, base, depth - 1)?;
                         }
                     }
                 }
@@ -1700,15 +1705,17 @@ impl LocalSchemaResolver {
         Ok(())
     }
 
-    fn resource_for_pointer(&self, pointer: &str) -> &Url {
+    /// Return the base in force immediately before the schema at `pointer`
+    /// applies its own `$id`. An exact resource-root match must therefore be
+    /// excluded: `resolve_refs` will process that target object's `$id` once.
+    fn parent_resource_for_pointer(&self, pointer: &str) -> &Url {
         for root in &self.resource_roots {
             if root.pointer.is_empty() {
                 continue;
             }
-            if pointer == root.pointer.as_str()
-                || pointer
-                    .strip_prefix(&root.pointer)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
+            if pointer
+                .strip_prefix(&root.pointer)
+                .is_some_and(|suffix| suffix.starts_with('/'))
             {
                 return &root.base;
             }
@@ -1787,7 +1794,10 @@ impl LocalSchemaResolver {
             } else {
                 format!("{resource_root_pointer}{decoded_fragment}")
             };
-            return Ok((target, self.resource_for_pointer(&absolute_pointer).clone()));
+            return Ok((
+                target,
+                self.parent_resource_for_pointer(&absolute_pointer).clone(),
+            ));
         }
 
         if !self.valid_anchor_name(&decoded_fragment) {
@@ -1810,7 +1820,7 @@ impl LocalSchemaResolver {
                 schema_reference_error(format!("unresolved internal $ref '{reference}'"))
             })?
         };
-        Ok((target, target_resource))
+        Ok((target, self.parent_resource_for_pointer(pointer).clone()))
     }
 
     fn valid_anchor_name(&self, name: &str) -> bool {
