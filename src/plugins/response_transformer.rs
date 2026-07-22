@@ -387,6 +387,7 @@ impl ResponseTransformer {
                         )
                     })?
                     .to_string();
+                let value_present = rule_obj.contains_key("value");
                 let value = match r.get("value") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
@@ -396,6 +397,7 @@ impl ResponseTransformer {
                         ));
                     }
                 };
+                let new_key_present = rule_obj.contains_key("new_key");
                 let raw_new_key = match r.get("new_key") {
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(Value::Null) | None => None,
@@ -428,14 +430,14 @@ impl ResponseTransformer {
                                 "response_transformer: rule[{idx}]: '{op_str}' operation requires a 'value'"
                             ));
                         }
-                        if raw_new_key.is_some() {
+                        if new_key_present {
                             return Err(format!(
                                 "response_transformer: rule[{idx}]: 'new_key' must not be set for header '{op_str}' operation"
                             ));
                         }
                     }
                     HeaderOp::Rename => {
-                        if value.is_some() {
+                        if value_present {
                             return Err(format!(
                                 "response_transformer: rule[{idx}]: 'value' must not be set for header 'rename' operation"
                             ));
@@ -447,12 +449,12 @@ impl ResponseTransformer {
                         }
                     }
                     HeaderOp::Remove => {
-                        if value.is_some() {
+                        if value_present {
                             return Err(format!(
                                 "response_transformer: rule[{idx}]: 'value' must not be set for header 'remove' operation"
                             ));
                         }
-                        if raw_new_key.is_some() {
+                        if new_key_present {
                             return Err(format!(
                                 "response_transformer: rule[{idx}]: 'new_key' must not be set for header 'remove' operation"
                             ));

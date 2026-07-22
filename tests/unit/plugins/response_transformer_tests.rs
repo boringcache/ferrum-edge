@@ -624,11 +624,31 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
         ),
         (
             json!({
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue",
+                "new_key": null
+            }),
+            "'new_key' must not be set for header 'add'",
+        ),
+        (
+            json!({
                 "operation": "rename",
                 "target": "header",
                 "key": "X-Old",
                 "new_key": "X-New",
                 "value": "ignored"
+            }),
+            "'value' must not be set for header 'rename'",
+        ),
+        (
+            json!({
+                "operation": "rename",
+                "target": "header",
+                "key": "X-Old",
+                "new_key": "X-New",
+                "value": null
             }),
             "'value' must not be set for header 'rename'",
         ),
@@ -647,6 +667,24 @@ async fn test_response_transformer_rejects_incompatible_header_fields() {
                 "target": "header",
                 "key": "X-Color",
                 "new_key": "X-Ignored"
+            }),
+            "'new_key' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "value": null
+            }),
+            "'value' must not be set for header 'remove'",
+        ),
+        (
+            json!({
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Color",
+                "new_key": null
             }),
             "'new_key' must not be set for header 'remove'",
         ),
