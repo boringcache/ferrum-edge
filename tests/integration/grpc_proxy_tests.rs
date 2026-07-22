@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use base64::Engine as _;
 use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::{BodyExt, Full};
@@ -21,11 +22,13 @@ use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, BackoffStrategy, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
-    PluginConfig, PluginScope, Proxy, ResponseBodyMode, RetryConfig, Upstream, UpstreamTarget,
+    AuthMode, BackendScheme, BackoffStrategy, Consumer, DispatchKind, GatewayConfig,
+    LoadBalancerAlgorithm, PluginConfig, PluginScope, Proxy, ResponseBodyMode, RetryConfig,
+    Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
@@ -226,6 +229,20 @@ fn create_test_proxy_state_with_plugins_and_upstreams(
     plugin_configs: Vec<PluginConfig>,
     upstreams: Vec<Upstream>,
 ) -> ProxyState {
+    create_test_proxy_state_with_plugins_upstreams_and_consumers(
+        proxies,
+        plugin_configs,
+        upstreams,
+        Vec::new(),
+    )
+}
+
+fn create_test_proxy_state_with_plugins_upstreams_and_consumers(
+    proxies: Vec<Proxy>,
+    plugin_configs: Vec<PluginConfig>,
+    upstreams: Vec<Upstream>,
+    consumers: Vec<Consumer>,
+) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: HashMap::new(),
         resolver_addresses: None,
@@ -250,7 +267,7 @@ fn create_test_proxy_state_with_plugins_and_upstreams(
     let config = GatewayConfig {
         version: "1".to_string(),
         proxies,
-        consumers: vec![],
+        consumers,
         plugin_configs,
         upstreams,
         loaded_at: Utc::now(),
@@ -474,6 +491,55 @@ async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) 
     (addr, handle)
 }
 
+/// Start an h2c gRPC echo backend and expose the number of requests that
+/// reached its service. Prebuffer cancellation tests use the counter to prove
+/// an incomplete frontend upload never dispatches a partial primary request.
+async fn start_counting_grpc_echo_backend()
+-> (
+    SocketAddr,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let service_requests = Arc::clone(&requests);
+
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let connection_requests = Arc::clone(&service_requests);
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let request_count = Arc::clone(&connection_requests);
+                    async move {
+                        request_count.fetch_add(1, Ordering::SeqCst);
+                        let body = req
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(|collected| collected.to_bytes())
+                            .unwrap_or_default();
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .header("grpc-status", "0")
+                                .body(Full::new(body))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = Http2ServerBuilder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, requests, handle)
+}
+
 async fn start_connection_counting_backend()
 -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -585,6 +651,56 @@ async fn send_grpc_request(
         .unwrap_or_default();
 
     Ok((status, headers, body_bytes))
+}
+
+/// Send a native gRPC request with an explicit HTTP/2 authority. HMAC binds
+/// that authority, so a relative URI (used by most transport-only tests) is
+/// intentionally insufficient for the signed-request regression.
+async fn send_grpc_request_with_authority(
+    gateway_addr: SocketAddr,
+    path: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    use hyper::client::conn::http2;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await?;
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("Client connection error: {}", e);
+        }
+    });
+
+    let mut req_builder = Request::builder()
+        .method("POST")
+        .uri(format!("http://{gateway_addr}{path}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+
+    for (key, value) in extra_headers {
+        req_builder = req_builder.header(*key, *value);
+    }
+
+    let response = sender
+        .send_request(req_builder.body(Full::new(Bytes::copy_from_slice(body)))?)
+        .await?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (key.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let body = response.into_body().collect().await?.to_bytes().to_vec();
+    Ok((status, headers, body))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1516,6 +1632,254 @@ async fn test_grpc_body_forwarding() {
     assert_eq!(
         body, grpc_message,
         "Backend should echo the gRPC message body"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
+    let (backend_addr, _backend_handle) = start_mock_grpc_backend().await;
+    let mut proxy = create_grpc_proxy("grpc-hmac", "/grpc-hmac", backend_addr.port());
+    attach_test_plugin(&mut proxy, "grpc-hmac-auth");
+
+    let secret = "0123456789abcdef0123456789abcdef";
+    let consumer = Consumer {
+        id: "grpc-hmac-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: "grpc-hmac-user".to_string(),
+        custom_id: None,
+        credentials: HashMap::from([(
+            "hmac_auth".to_string(),
+            serde_json::json!([{ "secret": secret }]),
+        )]),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let plugin = test_plugin_config(
+        "grpc-hmac-auth",
+        "hmac_auth",
+        "grpc-hmac",
+        serde_json::json!({}),
+    );
+    let state = create_test_proxy_state_with_plugins_upstreams_and_consumers(
+        vec![proxy],
+        vec![plugin],
+        Vec::new(),
+        vec![consumer],
+    );
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let path = "/grpc-hmac/my.Service/Echo";
+    let grpc_message = b"\x00\x00\x00\x00\x0bsigned body";
+    let date = Utc::now().to_rfc2822();
+    let digest = format!(
+        "sha-256={}",
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(grpc_message))
+    );
+    let signature = crate::common::generate_hmac_signature_with_digest(
+        "POST",
+        path,
+        &date,
+        "grpc-hmac-user",
+        &gateway_addr.to_string(),
+        secret,
+        &digest,
+    );
+    let authorization = format!(
+        "hmac username=\"grpc-hmac-user\", algorithm=\"hmac-sha256\", signature=\"{signature}\""
+    );
+
+    let (status, headers, body) = send_grpc_request_with_authority(
+        gateway_addr,
+        path,
+        grpc_message,
+        &[
+            ("date", date.as_str()),
+            ("digest", digest.as_str()),
+            ("authorization", authorization.as_str()),
+        ],
+    )
+    .await
+    .expect("signed native gRPC request should reach the primary backend");
+
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("0"));
+    assert_eq!(body, grpc_message);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_mirror_failure_does_not_block_prebuffered_native_grpc_primary() {
+    let (backend_addr, _backend_handle) = start_mock_grpc_backend().await;
+    let mut proxy = create_grpc_proxy("grpc-mirror", "/grpc-mirror", backend_addr.port());
+    attach_test_plugin(&mut proxy, "grpc-request-mirror");
+    let plugin = test_plugin_config(
+        "grpc-request-mirror",
+        "request_mirror",
+        "grpc-mirror",
+        serde_json::json!({
+            "mirror_host": "127.0.0.1",
+            "mirror_port": 9,
+            "mirror_protocol": "http",
+            "percentage": 100.0,
+            "mirror_request_body": true
+        }),
+    );
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+    let grpc_message = b"\x00\x00\x00\x00\x0bmirror body";
+
+    let (status, headers, body) = send_grpc_request(
+        gateway_addr,
+        "/grpc-mirror/my.Service/Echo",
+        grpc_message,
+        &[],
+    )
+    .await
+    .expect("a detached mirror failure must not affect native gRPC primary dispatch");
+
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("0"));
+    assert_eq!(body, grpc_message);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_mirror_prebuffer_enforces_native_grpc_receive_ceiling() {
+    let (backend_addr, backend_requests, _backend_handle) =
+        start_counting_grpc_echo_backend().await;
+    let mut proxy = create_grpc_proxy("grpc-mirror-limit", "/grpc-limit", backend_addr.port());
+    attach_test_plugin(&mut proxy, "grpc-request-mirror-limit");
+    let plugin = test_plugin_config(
+        "grpc-request-mirror-limit",
+        "request_mirror",
+        "grpc-mirror-limit",
+        serde_json::json!({
+            "mirror_host": "127.0.0.1",
+            "mirror_port": 9,
+            "mirror_protocol": "http",
+            "percentage": 100.0,
+            "mirror_request_body": true
+        }),
+    );
+    let mut state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    state.max_request_body_size_bytes = 1024;
+    state.max_grpc_recv_size_bytes = 8;
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let (status, headers, body) = send_grpc_request(
+        gateway_addr,
+        "/grpc-limit/my.Service/Echo",
+        b"\x00\x00\x00\x00\x06abcdef",
+        &[],
+    )
+    .await
+    .expect("oversized native gRPC prebuffer should receive a protocol error");
+
+    assert_eq!(status, 200, "native gRPC errors remain trailers-only");
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("8"));
+    assert!(body.is_empty());
+    assert_eq!(backend_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_mirror_prebuffer_handles_client_stream_and_cancellation_without_partial_dispatch() {
+    use std::convert::Infallible;
+
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+    use hyper::client::conn::http2;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (backend_addr, backend_requests, _backend_handle) =
+        start_counting_grpc_echo_backend().await;
+    let mut proxy = create_grpc_proxy(
+        "grpc-mirror-stream",
+        "/grpc-mirror-stream",
+        backend_addr.port(),
+    );
+    attach_test_plugin(&mut proxy, "grpc-request-mirror-stream");
+    let plugin = test_plugin_config(
+        "grpc-request-mirror-stream",
+        "request_mirror",
+        "grpc-mirror-stream",
+        serde_json::json!({
+            "mirror_host": "127.0.0.1",
+            "mirror_port": 9,
+            "mirror_protocol": "http",
+            "percentage": 100.0,
+            "mirror_request_body": true
+        }),
+    );
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/grpc-mirror-stream/my.Service/ClientStream")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(StreamBody::new(ReceiverStream::new(body_rx)))
+        .unwrap();
+    let response_task = tokio::spawn(async move {
+        let response = sender.send_request(request).await.map_err(|e| e.to_string())?;
+        response
+            .into_body()
+            .collect()
+            .await
+            .map(|collected| collected.to_bytes().to_vec())
+            .map_err(|e| e.to_string())
+    });
+    let first = Bytes::from_static(b"\x00\x00\x00\x00\x03one");
+    let second = Bytes::from_static(b"\x00\x00\x00\x00\x03two");
+    body_tx.send(Ok(Frame::data(first.clone()))).await.unwrap();
+    body_tx.send(Ok(Frame::data(second.clone()))).await.unwrap();
+    drop(body_tx);
+    let echoed = response_task
+        .await
+        .expect("client-stream response task")
+        .expect("client-stream response");
+    assert_eq!(echoed, [first.as_ref(), second.as_ref()].concat());
+    assert_eq!(backend_requests.load(Ordering::SeqCst), 1);
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(1);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/grpc-mirror-stream/my.Service/ClientStream")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(StreamBody::new(ReceiverStream::new(body_rx)))
+        .unwrap();
+    let response_task = tokio::spawn(async move { sender.send_request(request).await });
+    body_tx
+        .send(Ok(Frame::data(Bytes::from_static(
+            b"\x00\x00\x00\x00\x03one",
+        ))))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    response_task.abort();
+    connection_task.abort();
+    drop(body_tx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        backend_requests.load(Ordering::SeqCst),
+        1,
+        "a cancelled prebuffer must not dispatch a partial primary request"
     );
 }
 
