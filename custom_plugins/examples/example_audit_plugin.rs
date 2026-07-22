@@ -389,7 +389,12 @@ impl ExampleAuditPlugin {
                 }
             }
             None => {
-                if !self.drop_warning_emitted.swap(true, Ordering::Relaxed) {
+                if !self.drop_warning_emitted.load(Ordering::Relaxed)
+                    && self
+                        .drop_warning_emitted
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
                     warn!(
                         plugin = PLUGIN_NAME,
                         "example_audit_plugin: dropping audit records because the \
