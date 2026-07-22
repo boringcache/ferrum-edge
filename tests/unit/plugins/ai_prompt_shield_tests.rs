@@ -7,7 +7,10 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 
-use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
+use super::plugin_utils::{
+    assert_continue, assert_reject, create_test_context,
+    normalize_compressed_request_for_plugin_test,
+};
 
 fn make_post_ctx(body: &serde_json::Value) -> ferrum_edge::plugins::RequestContext {
     let mut ctx = create_test_context();
@@ -177,6 +180,27 @@ async fn test_email_detected() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn configured_decompression_exposes_plaintext_before_prompt_policy() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "reject",
+        "patterns": ["email"]
+    }))
+    .unwrap();
+    let plaintext = serde_json::to_vec(&ai_request("Contact private@example.com")).unwrap();
+
+    for encoding in ["gzip", "br"] {
+        let (mut ctx, mut headers, _) = normalize_compressed_request_for_plugin_test(
+            "application/json",
+            "/v1/chat/completions",
+            encoding,
+            &plaintext,
+        )
+        .await;
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
 }
 
 // ─── AWS key detection ──────────────────────────────────────────────────

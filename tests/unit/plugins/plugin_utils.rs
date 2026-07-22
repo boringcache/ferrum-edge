@@ -4,10 +4,11 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, Proxy, default_namespace,
 };
-use ferrum_edge::plugins::{PluginResult, RequestContext};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use hmac::{KeyInit, Mac};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
@@ -269,6 +270,75 @@ pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamT
         sni_hostname: None,
         metadata: HashMap::new(),
     }
+}
+
+/// Apply the production pre-`before_proxy` request-normalization phase to a
+/// gzip- or Brotli-encoded body and return the plaintext request views.
+///
+/// This is shared by composition tests for body-aware plugins that run before
+/// the configured `compression` plugin in ordinary hook priority order.
+pub async fn normalize_compressed_request_for_plugin_test(
+    content_type: &str,
+    path: &str,
+    encoding: &str,
+    plaintext: &[u8],
+) -> (RequestContext, HashMap<String, String>, Vec<u8>) {
+    use ferrum_edge::_test_support::apply_buffered_request_body_normalization_before_before_proxy_for_test;
+    use ferrum_edge::plugins::compression::CompressionPlugin;
+
+    let mut body = match encoding {
+        "gzip" => {
+            use flate2::write::GzEncoder;
+            use std::io::Write;
+
+            let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(plaintext).unwrap();
+            encoder.finish().unwrap()
+        }
+        "br" => {
+            let params = brotli::enc::BrotliEncoderParams::default();
+            let mut compressed = Vec::new();
+            brotli::BrotliCompress(&mut &plaintext[..], &mut compressed, &params).unwrap();
+            compressed
+        }
+        other => panic!("unsupported test encoding {other}"),
+    };
+
+    let compression = Arc::new(
+        CompressionPlugin::new(&serde_json::json!({"decompress_request": true})).unwrap(),
+    );
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        path.to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), content_type.to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), encoding.to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(&body));
+    let mut headers = ctx.headers.clone();
+    headers.insert("content-length".to_string(), body.len().to_string());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![compression];
+
+    let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body, plaintext);
+    assert_eq!(ctx.request_body_bytes.as_deref(), Some(plaintext));
+    assert_eq!(
+        ctx.metadata.get("request_body").map(String::as_bytes),
+        Some(plaintext)
+    );
+    assert!(!headers.contains_key("content-encoding"));
+    assert!(!headers.contains_key("content-length"));
+    ctx.headers = headers.clone();
+    (ctx, headers, body)
 }
 
 /// Assert that a plugin result is Continue

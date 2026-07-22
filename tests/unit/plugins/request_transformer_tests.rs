@@ -6,6 +6,8 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 
+use super::plugin_utils::normalize_compressed_request_for_plugin_test;
+
 fn make_ctx() -> RequestContext {
     RequestContext::new(
         "127.0.0.1".to_string(),
@@ -501,6 +503,43 @@ async fn test_request_transformer_body_add_field() {
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["name"], "Alice");
     assert_eq!(transformed["version"], "v2");
+}
+
+#[tokio::test]
+async fn configured_decompression_exposes_plaintext_before_request_transforms() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "remove",
+                "target": "body",
+                "key": "credentials.api_key"
+            }
+        ]
+    }))
+    .unwrap();
+    let plaintext = br#"{"credentials":{"api_key":"secret","region":"us"}}"#;
+
+    for encoding in ["gzip", "br"] {
+        let (mut ctx, headers, body) = normalize_compressed_request_for_plugin_test(
+            "application/json",
+            "/transform",
+            encoding,
+            plaintext,
+        )
+        .await;
+        let transformed = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .expect("decoded JSON rule must transform the request body");
+        let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+        assert!(transformed["credentials"].get("api_key").is_none());
+        assert_eq!(transformed["credentials"]["region"], "us");
+    }
 }
 
 #[tokio::test]
