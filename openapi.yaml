@@ -17233,7 +17233,16 @@ components:
           minimum: 0.0
           maximum: 100.0
           default: 100.0
-          description: "Percentage of requests to mirror. Granularity is 0.1% (deterministic counter-based sampling, no RNG)."
+          description: >
+            Percentage of requests to mirror (0.0–100.0). Quantized to 0.1%
+            steps as round(percentage × 10) in 0..=1000. Sampling is
+            deterministic and evenly spaced (Bresenham phase accumulator over
+            a 1,000-request cycle): 0% never selects, 100% always selects, and
+            other thresholds mirror exactly that many requests per cycle with
+            gaps of floor(1000/threshold) or ceil(1000/threshold). No RNG.
+            Construction/reload resets the phase to 0 so the first selection
+            is deferred (no mirrored prefix burst). The phase stays bounded in
+            0..1000 via lock-free atomic updates on the request hot path.
         mirror_request_body:
           type: boolean
           default: true

@@ -674,33 +674,296 @@ async fn test_before_proxy_without_matched_proxy_uses_default_timeout() {
 }
 
 // ---------------------------------------------------------------------------
-// Percentage sampling
+// Percentage sampling (issue #2466)
 // ---------------------------------------------------------------------------
+//
+// Selection is a deterministic Bresenham phase accumulator at 0.1% granularity.
+// Tests below observe actual selection decisions via `should_mirror()` and via
+// `ctx.mirror_result_rx` (dispatch), never merely `PluginResult::Continue`.
 
-#[tokio::test]
-async fn test_percentage_50_mirrors_roughly_half() {
-    let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "percentage": 50.0 }),
+const SAMPLE_PERIOD: u64 = 1000;
+
+fn mirror_plugin(percentage: f64) -> RequestMirror {
+    RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "percentage": percentage,
+            "mirror_request_body": false,
+            // Keep saturation from masking selection observations if a test
+            // path does dispatch mirrors.
+            "max_in_flight": 10_000u64,
+        }),
         PluginHttpClient::default(),
     )
-    .unwrap();
+    .unwrap_or_else(|e| panic!("valid request_mirror config: {e}"))
+}
 
-    // The counter-based approach mirrors requests where (counter % 1000) < 500.
-    // Over 1000 requests, exactly 500 should be mirrored.
-    let mut mirrored = 0u32;
-    for _ in 0..1000 {
+fn collect_selections(plugin: &RequestMirror, n: usize) -> Vec<bool> {
+    (0..n).map(|_| plugin.should_mirror()).collect()
+}
+
+fn selection_count(selections: &[bool]) -> usize {
+    selections.iter().filter(|selected| **selected).count()
+}
+
+fn selection_gaps(selections: &[bool]) -> Vec<usize> {
+    let indices: Vec<usize> = selections
+        .iter()
+        .enumerate()
+        .filter_map(|(i, selected)| selected.then_some(i))
+        .collect();
+    if indices.len() < 2 {
+        return Vec::new();
+    }
+    indices.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+fn assert_exact_cycle_count(percentage: f64, expected_threshold: u64) {
+    let plugin = mirror_plugin(percentage);
+    assert_eq!(plugin.sample_threshold(), expected_threshold);
+    assert_eq!(plugin.sample_phase(), 0, "construction must start at phase 0");
+    let selections = collect_selections(&plugin, SAMPLE_PERIOD as usize);
+    assert_eq!(
+        selection_count(&selections) as u64,
+        expected_threshold,
+        "percentage {percentage}: expected exactly {expected_threshold} selections per {SAMPLE_PERIOD}-request cycle"
+    );
+    // A second cycle must match exactly as well (phase remains bounded).
+    let selections2 = collect_selections(&plugin, SAMPLE_PERIOD as usize);
+    assert_eq!(selection_count(&selections2) as u64, expected_threshold);
+}
+
+fn assert_gap_bounds(percentage: f64, expected_threshold: u64) {
+    let plugin = mirror_plugin(percentage);
+    // Two cycles so thresholds like 0.1% (one hit/cycle) still yield measurable gaps.
+    let selections = collect_selections(&plugin, (SAMPLE_PERIOD * 2) as usize);
+    assert_eq!(
+        selection_count(&selections) as u64,
+        expected_threshold * 2,
+        "percentage {percentage}: expected exact long-run count over two cycles"
+    );
+    if expected_threshold == 0 || expected_threshold >= SAMPLE_PERIOD {
+        return;
+    }
+    let gaps = selection_gaps(&selections);
+    assert!(
+        !gaps.is_empty(),
+        "percentage {percentage}: need at least two selections to measure gaps"
+    );
+    let min_gap = (SAMPLE_PERIOD / expected_threshold) as usize;
+    let max_gap = ((SAMPLE_PERIOD + expected_threshold - 1) / expected_threshold) as usize;
+    for gap in &gaps {
+        assert!(
+            *gap >= min_gap && *gap <= max_gap,
+            "percentage {percentage}: gap {gap} outside [{min_gap}, {max_gap}]"
+        );
+    }
+    // Must not be a contiguous prefix: the first selection is deferred until
+    // the accumulator crosses SAMPLE_PERIOD (phase starts at 0).
+    assert!(
+        !selections[0],
+        "percentage {percentage}: construction must not mirror the first request (no mirrored prefix)"
+    );
+}
+
+#[test]
+fn test_sampling_exact_counts_for_required_percentages() {
+    assert_exact_cycle_count(0.0, 0);
+    assert_exact_cycle_count(0.1, 1);
+    assert_exact_cycle_count(1.0, 10);
+    assert_exact_cycle_count(33.3, 333);
+    assert_exact_cycle_count(50.0, 500);
+    assert_exact_cycle_count(99.9, 999);
+    assert_exact_cycle_count(100.0, 1000);
+}
+
+#[test]
+fn test_sampling_gap_bounds_for_required_percentages() {
+    for (percentage, threshold) in [
+        (0.1, 1u64),
+        (1.0, 10),
+        (33.3, 333),
+        (50.0, 500),
+        (99.9, 999),
+    ] {
+        assert_gap_bounds(percentage, threshold);
+    }
+}
+
+#[test]
+fn test_sampling_zero_percent_never_selects() {
+    let plugin = mirror_plugin(0.0);
+    assert_eq!(plugin.sample_threshold(), 0);
+    for _ in 0..(SAMPLE_PERIOD * 3) {
+        assert!(!plugin.should_mirror());
+    }
+    assert_eq!(
+        plugin.sample_phase(),
+        0,
+        "0% must not advance the phase accumulator"
+    );
+}
+
+#[test]
+fn test_sampling_hundred_percent_always_selects() {
+    let plugin = mirror_plugin(100.0);
+    assert_eq!(plugin.sample_threshold(), SAMPLE_PERIOD);
+    for _ in 0..(SAMPLE_PERIOD * 3) {
+        assert!(plugin.should_mirror());
+    }
+    assert_eq!(
+        plugin.sample_phase(),
+        0,
+        "100% must not advance the phase accumulator"
+    );
+}
+
+#[test]
+fn test_sampling_is_evenly_spaced_not_contiguous_prefix() {
+    // Regression for #2466: the old `(counter % 1000) < threshold` predicate
+    // mirrored a contiguous prefix (e.g. first 10 of every 1000 at 1%).
+    let plugin = mirror_plugin(1.0);
+    let selections = collect_selections(&plugin, SAMPLE_PERIOD as usize);
+    assert_eq!(selection_count(&selections), 10);
+    let prefix_mirrors = selections[..10].iter().filter(|s| **s).count();
+    assert!(
+        prefix_mirrors < 10,
+        "1% must not mirror a contiguous 10-request prefix; got {prefix_mirrors} mirrors in the first 10"
+    );
+    // Even spacing: every selection gap is exactly 100 for threshold 10.
+    let gaps = selection_gaps(&selections);
+    assert!(gaps.iter().all(|g| *g == 100), "1% gaps must be exactly 100, got {gaps:?}");
+}
+
+#[test]
+fn test_sampling_construction_and_reload_reset_phase_without_prefix_burst() {
+    let first = mirror_plugin(50.0);
+    assert_eq!(first.sample_phase(), 0);
+    let first_cycle = collect_selections(&first, SAMPLE_PERIOD as usize);
+    assert!(!first_cycle[0], "fresh instance must not open with a mirror");
+    assert_eq!(selection_count(&first_cycle), 500);
+
+    // Simulate config reload: a new instance resets phase independently.
+    let reloaded = mirror_plugin(50.0);
+    assert_eq!(reloaded.sample_phase(), 0);
+    let reload_cycle = collect_selections(&reloaded, SAMPLE_PERIOD as usize);
+    assert_eq!(
+        first_cycle, reload_cycle,
+        "reload must reproduce the same evenly spaced sequence from phase 0"
+    );
+    assert!(
+        !reload_cycle[0],
+        "reload must not reopen with a mirrored prefix burst"
+    );
+    // Old contiguous-prefix behavior mirrored the first 500 requests at 50%.
+    let prefix = reload_cycle[..500].iter().filter(|s| **s).count();
+    assert!(
+        prefix < 500,
+        "reload must not mirror a contiguous 50% prefix; got {prefix}/500"
+    );
+}
+
+#[test]
+fn test_sampling_phase_stays_bounded_across_many_cycles() {
+    let plugin = mirror_plugin(33.3);
+    for _ in 0..(SAMPLE_PERIOD * 5) {
+        let _ = plugin.should_mirror();
+        let phase = plugin.sample_phase();
+        assert!(
+            phase < SAMPLE_PERIOD,
+            "phase must remain in 0..{SAMPLE_PERIOD}, got {phase}"
+        );
+    }
+}
+
+#[test]
+fn test_sampling_concurrent_calls_preserve_exact_cycle_count() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    let plugin = std::sync::Arc::new(mirror_plugin(50.0));
+    let selected = std::sync::Arc::new(AtomicUsize::new(0));
+    let total = SAMPLE_PERIOD as usize * 4;
+    let threads = 8usize;
+    assert_eq!(total % threads, 0);
+    let per_thread = total / threads;
+
+    let mut handles = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let plugin = plugin.clone();
+        let selected = selected.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..per_thread {
+                if plugin.should_mirror() {
+                    selected.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("sampler thread");
+    }
+
+    assert_eq!(
+        selected.load(Ordering::Relaxed) as u64,
+        (total as u64 / SAMPLE_PERIOD) * plugin.sample_threshold(),
+        "concurrent selection must preserve exact long-run counts"
+    );
+    assert!(plugin.sample_phase() < SAMPLE_PERIOD);
+}
+
+#[tokio::test]
+async fn test_sampling_dispatch_observes_selection_not_just_continue() {
+    // 0%: before_proxy always Continues and must NOT arm mirror_result_rx.
+    let zero = mirror_plugin(0.0);
+    for _ in 0..32 {
         let mut ctx = make_ctx();
         let mut headers = HashMap::new();
-        // We can't directly observe mirroring since it's fire-and-forget via tokio::spawn,
-        // but we can verify the plugin always returns Continue.
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-        match result {
-            PluginResult::Continue => {}
-            _ => panic!("Expected Continue"),
-        }
-        mirrored += 1;
+        plugin_utils::assert_continue(zero.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            ctx.mirror_result_rx.is_none(),
+            "0% must not dispatch a mirror"
+        );
     }
-    assert_eq!(mirrored, 1000); // All return Continue regardless of mirror decision
+
+    // 100%: every Continuance must arm the dispatch channel.
+    let full = mirror_plugin(100.0);
+    for _ in 0..8 {
+        let mut ctx = make_ctx();
+        let mut headers = HashMap::new();
+        plugin_utils::assert_continue(full.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            ctx.mirror_result_rx.is_some(),
+            "100% must dispatch a mirror"
+        );
+    }
+
+    // Sequence agreement: before_proxy dispatch must match should_mirror() for
+    // the same fresh phase, observed via mirror_result_rx (not merely Continue).
+    // Use 1% over one cycle (10 dispatches) so the test stays light.
+    let expected = collect_selections(&mirror_plugin(1.0), SAMPLE_PERIOD as usize);
+    assert_eq!(selection_count(&expected), 10);
+    assert!(
+        expected[..10].iter().filter(|s| **s).count() < 10,
+        "expected sequence must not be a contiguous prefix"
+    );
+
+    let plugin = mirror_plugin(1.0);
+    let mut dispatched = 0usize;
+    for (i, expect) in expected.iter().enumerate() {
+        let mut ctx = make_ctx();
+        let mut headers = HashMap::new();
+        plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let did_dispatch = ctx.mirror_result_rx.is_some();
+        assert_eq!(
+            did_dispatch, *expect,
+            "before_proxy dispatch diverged from should_mirror at index {i}"
+        );
+        if did_dispatch {
+            dispatched += 1;
+        }
+    }
+    assert_eq!(dispatched, 10, "dispatch path must preserve the exact 1% cycle count");
 }
 
 // ---------------------------------------------------------------------------

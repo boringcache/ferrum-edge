@@ -59,10 +59,38 @@
 //! | `mirror_port` | u16 | 80 (http) / 443 (https) | Port of the mirror target |
 //! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"` |
 //! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, the backend-effective authorized path is used if backend-path policy is active; otherwise the original request path is used |
-//! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0) |
+//! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0). Deterministic evenly spaced sampling at 0.1% granularity (see sampling notes below) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes read from a mirror response when sizing it (only consulted when the response has no `content-length`). Streaming aborts as soon as the limit is crossed; mirror task discards the bytes after sizing. |
 //! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. |
+//!
+//! ## Percentage sampling
+//!
+//! Sampling is **deterministic and evenly spaced** (Bresenham / dithered
+//! accumulator), not randomized and not a contiguous prefix of each 1,000-request
+//! window. Configuration is quantized to tenths of a percent: the effective
+//! threshold is `round(percentage × 10)` clamped to `0..=1000`.
+//!
+//! - `0%` (threshold 0) never selects; the phase accumulator is not advanced.
+//! - `100%` (threshold 1000) always selects; the phase accumulator is not advanced.
+//! - Otherwise each eligible request adds `threshold` to a phase in `0..1000`.
+//!   When the sum reaches or exceeds `1000`, that request is mirrored and the
+//!   phase wraps by subtracting `1000`. Every complete 1,000-request cycle
+//!   therefore mirrors exactly `threshold` requests, spaced with gaps of
+//!   `floor(1000/threshold)` or `ceil(1000/threshold)`.
+//!
+//! **Construction / reload:** each plugin instance starts with phase `0`. The
+//! first selection is deferred until the accumulator crosses `1000`, so reload
+//! does not reopen with a mirrored burst/prefix. Recreating the plugin (config
+//! reload) resets the phase to `0`.
+//!
+//! **Concurrency:** selection uses a single `AtomicU64` phase with a lock-free
+//! compare-exchange update (relaxed ordering). No per-request allocation, RNG,
+//! formatting, or mutex. Contended CAS retries remain O(1) amortized.
+//!
+//! **Wrap / exhaustion:** the phase is bounded to `0..1000` at every successful
+//! update, so integer wraparound of an unbounded counter cannot occur, cannot
+//! panic, and cannot bias a complete sampling cycle.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -93,8 +121,27 @@ use crate::proxy::headers::{
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
 
+/// Sampling period for percentage decisions: threshold is tenths of a percent
+/// in `0..=SAMPLE_PERIOD`, so each complete cycle of `SAMPLE_PERIOD` requests
+/// mirrors exactly `threshold` of them when `0 < threshold < SAMPLE_PERIOD`.
+const SAMPLE_PERIOD: u64 = 1000;
+
 fn strip_query_params(url: &str) -> &str {
     url.split_once('?').map_or(url, |(base, _)| base)
+}
+
+/// Quantize a configured percentage to the integer tenth-percent threshold
+/// used by the deterministic sampler (`0..=1000`).
+fn sample_threshold_from_percentage(percentage: f64) -> u64 {
+    // `percentage` is already validated to `[0.0, 100.0]` at construction.
+    let rounded = (percentage * 10.0).round();
+    if rounded <= 0.0 {
+        0
+    } else if rounded >= 1000.0 {
+        SAMPLE_PERIOD
+    } else {
+        rounded as u64
+    }
 }
 
 pub struct RequestMirror {
@@ -103,7 +150,10 @@ pub struct RequestMirror {
     mirror_port: u16,
     mirror_protocol: String,
     mirror_path: Option<String>,
+    /// Configured percentage (0.0–100.0) before tenth-percent quantization.
     percentage: f64,
+    /// `round(percentage × 10)` clamped to `0..=1000` (0.1% granularity).
+    sample_threshold: u64,
     mirror_request_body: bool,
     /// Maximum number of bytes to read from the mirror response when deriving
     /// `mirror_response_size_bytes`. The body is discarded after measurement,
@@ -112,9 +162,9 @@ pub struct RequestMirror {
     /// `content-length` header (the CL fast path doesn't read the body).
     max_response_body_bytes: usize,
     mirror_hostname: Option<String>,
-    /// Monotonic counter for deterministic percentage sampling without rand.
-    /// Every Nth request is mirrored based on the percentage threshold.
-    request_counter: AtomicU64,
+    /// Bresenham phase accumulator in `0..SAMPLE_PERIOD` for evenly spaced
+    /// deterministic percentage sampling. Reset to `0` on construction/reload.
+    sample_phase: AtomicU64,
     /// Bounds concurrent mirror tasks to prevent unbounded background work.
     mirror_in_flight: Arc<tokio::sync::Semaphore>,
 }
@@ -178,6 +228,7 @@ impl RequestMirror {
                 percentage
             ));
         }
+        let sample_threshold = sample_threshold_from_percentage(percentage);
 
         let mirror_request_body = optional_bool(config, "mirror_request_body")?.unwrap_or(true);
 
@@ -208,12 +259,30 @@ impl RequestMirror {
             mirror_protocol,
             mirror_path,
             percentage,
+            sample_threshold,
             mirror_request_body,
             max_response_body_bytes,
             mirror_hostname,
-            request_counter: AtomicU64::new(0),
+            // Phase 0 defers the first selection until the accumulator crosses
+            // SAMPLE_PERIOD — construction/reload never opens with a mirrored prefix.
+            sample_phase: AtomicU64::new(0),
             mirror_in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
         })
+    }
+
+    /// Configured mirror percentage before quantization (`0.0..=100.0`).
+    pub fn percentage(&self) -> f64 {
+        self.percentage
+    }
+
+    /// Effective sampling threshold in tenths of a percent (`0..=1000`).
+    pub fn sample_threshold(&self) -> u64 {
+        self.sample_threshold
+    }
+
+    /// Current Bresenham phase in `0..SAMPLE_PERIOD`.
+    pub fn sample_phase(&self) -> u64 {
+        self.sample_phase.load(Ordering::Relaxed)
     }
 
     /// Build the full mirror URL from the configured or gateway-selected path.
@@ -260,21 +329,42 @@ impl RequestMirror {
         url
     }
 
-    /// Should this request be mirrored (percentage sampling)?
+    /// Should this request be mirrored (deterministic evenly spaced sampling)?
     ///
-    /// Uses a monotonic counter for deterministic sampling without external RNG.
-    /// For a percentage of N%, every request where `(counter % 1000) < (N * 10)`
-    /// is mirrored. This gives 0.1% granularity and even distribution.
-    fn should_mirror(&self) -> bool {
-        if self.percentage >= 100.0 {
-            return true;
-        }
-        if self.percentage <= 0.0 {
+    /// See the module-level "Percentage sampling" section for phase/reset,
+    /// concurrency, and wrap semantics. Exposed as `pub` so unit tests can
+    /// observe selection decisions without spawning detached mirror tasks.
+    pub fn should_mirror(&self) -> bool {
+        let threshold = self.sample_threshold;
+        if threshold == 0 {
             return false;
         }
-        let count = self.request_counter.fetch_add(1, Ordering::Relaxed);
-        let threshold = (self.percentage * 10.0) as u64; // 0.1% granularity
-        (count % 1000) < threshold
+        if threshold >= SAMPLE_PERIOD {
+            return true;
+        }
+
+        // Lock-free Bresenham: keep phase in [0, SAMPLE_PERIOD). Successful
+        // updates always store `next < SAMPLE_PERIOD`, and `threshold` is at
+        // most 999, so `current + threshold` stays far below u64::MAX and
+        // cannot overflow or panic.
+        let mut current = self.sample_phase.load(Ordering::Relaxed);
+        loop {
+            let sum = current + threshold;
+            let (selected, next) = if sum >= SAMPLE_PERIOD {
+                (true, sum - SAMPLE_PERIOD)
+            } else {
+                (false, sum)
+            };
+            match self.sample_phase.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return selected,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
