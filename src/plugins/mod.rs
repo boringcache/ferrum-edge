@@ -2507,6 +2507,7 @@ impl RequestContext {
         self.compression_response_encode_owner == Some(owner)
     }
 
+    #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
     pub(crate) fn compression_ownership_for_test(&self) -> (Option<u64>, Option<u64>) {
         (
             self.compression_request_decode_owner,
