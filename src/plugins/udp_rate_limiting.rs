@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::warn;
 
-use super::utils::rate_limit::{RateLimitBackend, UdpRateLimitAlgorithm, UdpRateLimitOp};
+use super::utils::rate_limit::{
+    RateLimitBackend, UdpRateLimitAlgorithm, UdpRateLimitOp, apply_rate_limit_cleanup,
+};
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
     UdpDatagramVerdict,
@@ -72,6 +74,60 @@ impl UdpRateLimiting {
         self.limiter.local_map_shard_amount()
     }
 
+    /// Controllable-time seed for external cleanup tests. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn seed_client_at_for_test(
+        &self,
+        client_ip: Arc<str>,
+        datagram_size: u64,
+        now: Instant,
+    ) {
+        let _ = self
+            .limiter
+            .check_local_at(client_ip, &UdpRateLimitOp { datagram_size }, now);
+    }
+
+    /// Arm the sampled periodic gate without spinning 100k hooks. Test-only.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn arm_periodic_eviction_for_test(&self) {
+        self.check_counter
+            .store(EVICTION_CHECK_INTERVAL, Ordering::Relaxed);
+        self.last_eviction_secs.store(0, Ordering::Relaxed);
+    }
+
+    /// Force the cooldown clock so the next armed periodic sweep is blocked.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn block_eviction_cooldown_at_for_test(&self, now: Instant) {
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+        self.last_eviction_secs.store(now_secs, Ordering::Relaxed);
+    }
+
+    /// Invoke the production sampled/cooldown eviction path at `now`. Test-only.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn maybe_evict_at_for_test(&self, now: Instant) -> bool {
+        self.maybe_evict_at(now)
+    }
+
+    /// Exercise the production sampled/cooldown path with a testable cap.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn maybe_evict_at_with_cap_for_test(
+        &self,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        self.maybe_evict_at_with_cap(now, max_entries)
+    }
+
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn contains_client_for_test(&self, client_ip: &Arc<str>) -> bool {
+        self.limiter.contains_local_key(client_ip)
+    }
+
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn epoch_base_for_test(&self) -> Instant {
+        self.epoch_base
+    }
+
     fn redis_ip_key(client_ip: &str) -> String {
         let mut key = String::with_capacity(3 + client_ip.len());
         key.push_str("ip:");
@@ -79,18 +135,29 @@ impl UdpRateLimiting {
         key
     }
 
-    fn secs_since_base(&self) -> u64 {
-        Instant::now().duration_since(self.epoch_base).as_secs()
+    fn maybe_evict(&self) -> bool {
+        self.maybe_evict_at(Instant::now())
     }
 
-    fn maybe_evict(&self) -> bool {
+    fn maybe_evict_at(&self, now: Instant) -> bool {
+        self.maybe_evict_at_with_cap(now, MAX_STATE_ENTRIES)
+    }
+
+    fn maybe_evict_at_with_cap(&self, now: Instant, max_entries: usize) -> bool {
         let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
         let len = self.limiter.tracked_keys_count();
-        let over_capacity = len > MAX_STATE_ENTRIES;
+        let over_capacity = len > max_entries;
         let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        if over_capacity || periodic {
-            let now_secs = self.secs_since_base();
+        // Keep strict admission active for every over-cap observation, even
+        // when this call wins cleanup and brings the map back to the cap. That
+        // prevents a spoofed new-IP stream from defeating the caller's O(1)
+        // rejection guard by alternating insertion with full-map eviction.
+        // Reuse the periodic timestamp as a once-per-second single-flight gate
+        // so attacker-controlled datagrams cannot trigger retain/eviction on
+        // every packet.
+        if over_capacity {
             let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
             if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
                 && self
@@ -98,22 +165,28 @@ impl UdpRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                // `enforce_capacity` runs `retain_active_at` first and
-                // then force-evicts down to the cap when active-only
-                // pruning isn't enough. Under sustained per-IP UDP
-                // traffic every window state keeps reporting active, so
-                // plain `retain_active_at` would leave the map pinned
-                // at `MAX_STATE_ENTRIES + 1` and the
-                // `over_capacity && !contains_local_key` guard in
-                // `on_udp_datagram` would drop every new client IP
-                // indefinitely. Mirrors `ai_rate_limiter.rs` and
-                // `rate_limiting.rs`.
-                self.limiter
-                    .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
+                apply_rate_limit_cleanup(&self.limiter, max_entries, now, true);
+            }
+            return true;
+        }
+
+        if periodic {
+            let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
+            if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
+                && self
+                    .last_eviction_secs
+                    .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                // Periodic sweeps prune idle keys even while the map is
+                // below the hard cap. A later over-cap observation keeps the
+                // strict new-IP guard active and force-evicts at most once per
+                // second after pruning.
+                apply_rate_limit_cleanup(&self.limiter, max_entries, now, false);
             }
         }
 
-        self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES
+        self.limiter.tracked_keys_count() > max_entries
     }
 }
 

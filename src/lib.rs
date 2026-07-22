@@ -1143,6 +1143,280 @@ pub mod _test_support {
         });
     }
 
+    // ── plugins/rate-limit cleanup wrappers (#2316) ──────────────────────────
+    /// Controllable-time harness for consumer cleanup wrappers. External tests
+    /// exercise sampled/cooldown routing through these hooks rather than calling
+    /// `LocalLimiter::prune_stale_at` directly.
+    pub struct RateLimitCleanupHarness {
+        udp: crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        rate_limiting: crate::plugins::rate_limiting::RateLimiting,
+        ai: crate::plugins::ai_rate_limiter::AiRateLimiter,
+        graphql: crate::plugins::graphql::GraphqlPlugin,
+        grpc: crate::plugins::grpc_method_router::GrpcMethodRouter,
+        ws: crate::plugins::ws_rate_limiting::WsRateLimiting,
+    }
+
+    impl Default for RateLimitCleanupHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl RateLimitCleanupHarness {
+        pub fn new() -> Self {
+            use crate::plugins::PluginHttpClient;
+            use serde_json::json;
+
+            let http = PluginHttpClient::default();
+            Self {
+                udp: crate::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+                    &json!({"datagrams_per_second": 1_000, "window_seconds": 1}),
+                    http.clone(),
+                )
+                .expect("udp_rate_limiting"),
+                rate_limiting: crate::plugins::rate_limiting::RateLimiting::new(
+                    &json!({
+                        "limits": [{"scope": "default", "requests_per_second": 100}]
+                    }),
+                    http.clone(),
+                )
+                .expect("rate_limiting"),
+                ai: crate::plugins::ai_rate_limiter::AiRateLimiter::new(
+                    &json!({"token_limit": 1_000, "window_seconds": 1}),
+                    http.clone(),
+                )
+                .expect("ai_rate_limiter"),
+                graphql: crate::plugins::graphql::GraphqlPlugin::new(
+                    &json!({
+                        "type_rate_limits": {
+                            "query": {"max_requests": 100, "window_seconds": 1}
+                        }
+                    }),
+                    http.clone(),
+                )
+                .expect("graphql"),
+                grpc: crate::plugins::grpc_method_router::GrpcMethodRouter::new(
+                    &json!({
+                        "method_rate_limits": {
+                            "/pkg.Svc/Method": {"max_requests": 100, "window_seconds": 1}
+                        }
+                    }),
+                    http.clone(),
+                )
+                .expect("grpc_method_router"),
+                ws: crate::plugins::ws_rate_limiting::WsRateLimiting::new(
+                    &json!({"frames_per_second": 100, "burst_size": 100}),
+                    http,
+                )
+                .expect("ws_rate_limiting"),
+            }
+        }
+
+        pub fn udp_epoch_base(&self) -> std::time::Instant {
+            self.udp.epoch_base_for_test()
+        }
+
+        pub fn seed_udp(&self, ip: &str, now: std::time::Instant) {
+            self.udp
+                .seed_client_at_for_test(std::sync::Arc::<str>::from(ip), 1, now);
+        }
+
+        pub fn arm_udp_periodic(&self) {
+            self.udp.arm_periodic_eviction_for_test();
+        }
+
+        pub fn block_udp_cooldown_at(&self, now: std::time::Instant) {
+            self.udp.block_eviction_cooldown_at_for_test(now);
+        }
+
+        pub fn maybe_evict_udp_at(&self, now: std::time::Instant) -> bool {
+            self.udp.maybe_evict_at_for_test(now)
+        }
+
+        pub fn udp_contains(&self, ip: &str) -> bool {
+            self.udp
+                .contains_client_for_test(&std::sync::Arc::<str>::from(ip))
+        }
+
+        pub fn udp_tracked(&self) -> Option<usize> {
+            use crate::plugins::Plugin;
+            self.udp.tracked_keys_count()
+        }
+
+        pub fn maybe_evict_udp_at_with_cap(
+            &self,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.udp.maybe_evict_at_with_cap_for_test(now, max_entries)
+        }
+
+        pub fn seed_rate_limiting(&self, key: &str, now: std::time::Instant) {
+            self.rate_limiting
+                .seed_key_at_for_test(key.to_string(), now);
+        }
+
+        pub fn arm_rate_limiting_periodic(&self) {
+            self.rate_limiting.arm_periodic_eviction_for_test();
+        }
+
+        pub fn block_rate_limiting_cooldown_at(&self, now: std::time::Instant) {
+            self.rate_limiting.block_periodic_cooldown_at_for_test(now);
+        }
+
+        pub fn maybe_evict_rate_limiting_at(&self, now: std::time::Instant) {
+            self.rate_limiting
+                .maybe_evict_stale_entries_at_for_test(now);
+        }
+
+        pub fn rate_limiting_contains(&self, key: &str) -> bool {
+            self.rate_limiting.contains_key_for_test(key)
+        }
+
+        pub fn rate_limiting_tracked(&self) -> Option<usize> {
+            use crate::plugins::Plugin;
+            self.rate_limiting.tracked_keys_count()
+        }
+
+        pub fn rate_limiting_apply_branch(
+            &self,
+            now: std::time::Instant,
+            over_capacity: bool,
+            max_entries: usize,
+        ) {
+            self.rate_limiting
+                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        }
+
+        pub fn seed_ai(&self, key: &str, now: std::time::Instant) {
+            self.ai.seed_key_at_for_test(key.to_string(), now);
+        }
+
+        pub fn arm_ai_periodic(&self) {
+            self.ai.arm_periodic_eviction_for_test();
+        }
+
+        pub fn maybe_evict_ai_at(&self, now: std::time::Instant) {
+            self.ai.evict_stale_entries_at_for_test(now);
+        }
+
+        pub fn ai_contains(&self, key: &str) -> bool {
+            self.ai.contains_key_for_test(key)
+        }
+
+        pub fn ai_tracked(&self) -> Option<usize> {
+            use crate::plugins::Plugin;
+            self.ai.tracked_keys_count()
+        }
+
+        pub fn ai_apply_branch(
+            &self,
+            now: std::time::Instant,
+            over_capacity: bool,
+            max_entries: usize,
+        ) {
+            self.ai
+                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        }
+
+        pub fn seed_graphql(&self, key: &str, now: std::time::Instant) {
+            self.graphql.seed_key_at_for_test(key.to_string(), now);
+        }
+
+        pub fn arm_graphql_periodic(&self) {
+            self.graphql.arm_periodic_eviction_for_test();
+        }
+
+        pub fn maybe_evict_graphql_at(&self, now: std::time::Instant) {
+            self.graphql.evict_stale_entries_at_for_test(now);
+        }
+
+        pub fn graphql_contains(&self, key: &str) -> bool {
+            self.graphql.contains_key_for_test(key)
+        }
+
+        pub fn graphql_tracked(&self) -> Option<usize> {
+            use crate::plugins::Plugin;
+            self.graphql.tracked_keys_count()
+        }
+
+        pub fn graphql_apply_branch(
+            &self,
+            now: std::time::Instant,
+            over_capacity: bool,
+            max_entries: usize,
+        ) {
+            self.graphql
+                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        }
+
+        pub fn seed_grpc(&self, key: &str, now: std::time::Instant) {
+            self.grpc.seed_key_at_for_test(key.to_string(), now);
+        }
+
+        pub fn arm_grpc_periodic(&self) {
+            self.grpc.arm_periodic_eviction_for_test();
+        }
+
+        pub fn maybe_evict_grpc_at(&self, now: std::time::Instant) {
+            self.grpc.evict_stale_entries_at_for_test(now);
+        }
+
+        pub fn grpc_contains(&self, key: &str) -> bool {
+            self.grpc.contains_key_for_test(key)
+        }
+
+        pub fn grpc_tracked(&self) -> Option<usize> {
+            use crate::plugins::Plugin;
+            self.grpc.tracked_keys_count()
+        }
+
+        pub fn grpc_apply_branch(
+            &self,
+            now: std::time::Instant,
+            over_capacity: bool,
+            max_entries: usize,
+        ) {
+            self.grpc
+                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        }
+
+        pub fn seed_ws(&self, connection_id: u64, now: std::time::Instant) {
+            self.ws.seed_connection_at_for_test(connection_id, now);
+        }
+
+        pub fn arm_ws_periodic(&self) {
+            self.ws.arm_periodic_eviction_for_test();
+        }
+
+        pub fn block_ws_cooldown_at(&self, now: std::time::Instant) {
+            self.ws.block_periodic_cooldown_at_for_test(now);
+        }
+
+        pub fn maybe_evict_ws_at(&self, now: std::time::Instant) -> bool {
+            self.ws.maybe_evict_at_for_test(now)
+        }
+
+        pub fn ws_contains(&self, connection_id: u64) -> bool {
+            self.ws.contains_connection_for_test(connection_id)
+        }
+
+        pub fn ws_tracked(&self) -> Option<usize> {
+            use crate::plugins::Plugin;
+            self.ws.tracked_keys_count()
+        }
+
+        pub fn ws_apply_branch(
+            &self,
+            now: std::time::Instant,
+            over_capacity: bool,
+            max_entries: usize,
+        ) {
+            self.ws
+                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        }
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two

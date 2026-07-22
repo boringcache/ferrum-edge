@@ -11,17 +11,24 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::utils::rate_limit::{RateLimitBackend, WsFrameRateAlgorithm, WsRateLimitOp};
+use super::utils::rate_limit::{
+    RateLimitBackend, WsFrameRateAlgorithm, WsRateLimitOp, apply_rate_limit_cleanup,
+};
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 
 const MAX_STATE_ENTRIES: usize = 50_000;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
+/// Bounds below-cap full-map scans under high frame rates. Over-cap enforcement
+/// is not cooldown-gated so admission pressure still reclaims space immediately.
+const EVICTION_COOLDOWN_SECS: u64 = 1;
 
 pub struct WsRateLimiting {
     close_reason: String,
     frame_counter: AtomicU64,
     redis_instance_id: String,
     limiter: RateLimitBackend<u64, WsFrameRateAlgorithm>,
+    epoch_base: Instant,
+    last_periodic_sweep_secs: AtomicU64,
 }
 
 impl WsRateLimiting {
@@ -74,6 +81,8 @@ impl WsRateLimiting {
                 &http_client,
                 WsFrameRateAlgorithm::new(frames_per_second, burst_size),
             )?,
+            epoch_base: Instant::now(),
+            last_periodic_sweep_secs: AtomicU64::new(0),
         })
     }
 
@@ -81,6 +90,52 @@ impl WsRateLimiting {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Controllable-time seed for external cleanup tests. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn seed_connection_at_for_test(&self, connection_id: u64, now: Instant) {
+        let _ = self
+            .limiter
+            .check_local_at(connection_id, &WsRateLimitOp, now);
+    }
+
+    /// Arm the sampled periodic gate without spinning 100k frames. Test-only.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn arm_periodic_eviction_for_test(&self) {
+        self.frame_counter
+            .store(EVICTION_CHECK_INTERVAL, Ordering::Relaxed);
+        self.last_periodic_sweep_secs.store(0, Ordering::Relaxed);
+    }
+
+    /// Block the below-cap cooldown so an armed sample does not scan. Test-only.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn block_periodic_cooldown_at_for_test(&self, now: Instant) {
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+        self.last_periodic_sweep_secs
+            .store(now_secs, Ordering::Relaxed);
+    }
+
+    /// Invoke the production sampled/cooldown eviction path at `now`. Test-only.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn maybe_evict_at_for_test(&self, now: Instant) -> bool {
+        self.maybe_evict_at(now)
+    }
+
+    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn apply_cleanup_branch_for_test(
+        &self,
+        now: Instant,
+        over_capacity: bool,
+        max_entries: usize,
+    ) {
+        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    }
+
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn contains_connection_for_test(&self, connection_id: u64) -> bool {
+        self.limiter.contains_local_key(&connection_id)
     }
 
     pub(crate) fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
@@ -102,26 +157,36 @@ impl WsRateLimiting {
     }
 
     fn maybe_evict(&self) -> bool {
+        self.maybe_evict_at(Instant::now())
+    }
+
+    fn maybe_evict_at(&self, now: Instant) -> bool {
         let count = self.frame_counter.fetch_add(1, Ordering::Relaxed);
         let tracked_keys = self.limiter.tracked_keys_count();
         let over_capacity = tracked_keys > MAX_STATE_ENTRIES;
+
+        // Over-cap pressure force-evicts immediately (no sample/cooldown gate)
+        // so sustained traffic cannot pin the map at MAX+1 and leave the
+        // `over_capacity && !contains_local_key` branch rejecting every new
+        // connection indefinitely.
+        if over_capacity {
+            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+            return self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
+        }
+
         let periodic =
             count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && tracked_keys > 0;
-
-        if over_capacity || periodic {
-            // `enforce_capacity` first calls `retain_active_at` to drop
-            // inactive entries, then — if the map is still over the cap —
-            // force-evicts remaining keys until it holds. Plain
-            // `retain_active_at` isn't enough under sustained traffic:
-            // every tracked connection's TokenBucket keeps reporting
-            // active, so nothing gets evicted and the map stays pinned at
-            // `MAX_STATE_ENTRIES + 1`. The `over_capacity &&
-            // !contains_local_key` branch in `on_ws_frame` would then
-            // reject every new WebSocket connection indefinitely — a
-            // service-degradation bug. Mirrors `ai_rate_limiter.rs` and
-            // `rate_limiting.rs`.
-            self.limiter
-                .enforce_capacity(MAX_STATE_ENTRIES, Instant::now());
+        if periodic {
+            let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+            let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
+            if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
+                && self
+                    .last_periodic_sweep_secs
+                    .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, false);
+            }
         }
 
         self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES

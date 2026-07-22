@@ -156,17 +156,24 @@ where
         self.state.len()
     }
 
-    pub fn retain_active_at(&self, now: Instant) {
+    /// Drop idle entries according to the algorithm's activity predicate.
+    ///
+    /// This is the below-cap periodic cleanup path: it never force-evicts
+    /// still-active keys and is safe to invoke on a sampled schedule even when
+    /// the map sits under the hard capacity ceiling.
+    pub fn prune_stale_at(&self, now: Instant) {
         self.state
             .retain(|_, state| self.algorithm.is_state_active(state, now));
     }
 
+    /// Enforce the hard entry cap after first pruning idle state.
+    ///
+    /// Idle entries are always evaluated — even when the map is already at or
+    /// below `max_entries` — so callers that route both periodic sweeps and
+    /// over-cap pressure through this helper reclaim stale keys. Only when
+    /// active state still exceeds the cap are live keys force-evicted.
     pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
-        if self.state.len() <= max_entries {
-            return;
-        }
-
-        self.retain_active_at(now);
+        self.prune_stale_at(now);
 
         let len = self.state.len();
         if len <= max_entries {
@@ -175,8 +182,8 @@ where
 
         let remove_count = len.saturating_sub(max_entries);
         // DashMap iteration order is intentionally arbitrary here. Rate-limit
-        // state is already window-bounded, so after stale entries are retained
-        // away any remaining key can be evicted to enforce the hard cap.
+        // state is already window-bounded, so after stale entries are pruned
+        // any remaining key can be evicted to enforce the hard cap.
         let keys: Vec<K> = self
             .state
             .iter()
@@ -325,6 +332,10 @@ where
         self.fallback.tracked_keys_count()
     }
 
+    pub fn prune_local_stale_at(&self, now: Instant) {
+        self.fallback.prune_stale_at(now);
+    }
+
     pub fn enforce_local_capacity(&self, max_entries: usize, now: Instant) {
         self.fallback.enforce_capacity(max_entries, now);
     }
@@ -446,10 +457,28 @@ where
         }
     }
 
+    pub fn prune_stale_at(&self, now: Instant) {
+        match self {
+            Self::Local(local) => local.prune_stale_at(now),
+            Self::Failover(failover) => failover.prune_local_stale_at(now),
+        }
+    }
+
     pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
         match self {
             Self::Local(local) => local.enforce_capacity(max_entries, now),
             Self::Failover(failover) => failover.enforce_local_capacity(max_entries, now),
+        }
+    }
+
+    /// Seed or refresh a local/fallback key at a controllable instant.
+    ///
+    /// Test-support only: production admission always uses wall-clock `check`.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn check_local_at(&self, key: K, op: &A::Op, now: Instant) -> RateLimitOutcome {
+        match self {
+            Self::Local(local) => local.check_at(key, op, now),
+            Self::Failover(failover) => failover.fallback.check_at(key, op, now),
         }
     }
 
@@ -465,6 +494,28 @@ where
             Self::Local(_) => None,
             Self::Failover(failover) => failover.warmup_hostname(),
         }
+    }
+}
+
+/// Shared consumer cleanup branch: below-cap prune vs over-cap force eviction.
+///
+/// Every rate-limit consumer wrapper routes through this helper so omitted or
+/// reversed `prune_stale_at` / `enforce_capacity` wiring is a single shared
+/// failure mode rather than six divergent copies.
+#[inline]
+pub fn apply_rate_limit_cleanup<K, A>(
+    limiter: &RateLimitBackend<K, A>,
+    max_entries: usize,
+    now: Instant,
+    over_capacity: bool,
+) where
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    A: RateLimitAlgorithm + Clone,
+{
+    if over_capacity {
+        limiter.enforce_capacity(max_entries, now);
+    } else {
+        limiter.prune_stale_at(now);
     }
 }
 
@@ -2480,6 +2531,108 @@ mod tests {
 
         limiter.enforce_capacity(3, Instant::now());
         assert!(limiter.tracked_keys_count() <= 3);
+    }
+
+    #[test]
+    fn local_limiter_prune_stale_below_cap_preserves_active_keys() {
+        let limiter = LocalLimiter::new(
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+            crate::util::sharding::pool_shard_amount(0),
+        );
+        let op = TestOp;
+        let t0 = Instant::now();
+
+        assert!(limiter.check_at("stale-a".to_string(), &op, t0).allowed);
+        assert!(limiter.check_at("stale-b".to_string(), &op, t0).allowed);
+        let t_active = t0 + Duration::from_secs(20);
+        assert!(
+            limiter
+                .check_at("active".to_string(), &op, t_active)
+                .allowed
+        );
+        assert_eq!(limiter.tracked_keys_count(), 3);
+
+        // TestAlgorithm treats entries idle for >= 10s as inactive.
+        limiter.prune_stale_at(t_active);
+        assert_eq!(limiter.tracked_keys_count(), 1);
+        assert!(limiter.contains_key(&"active".to_string()));
+        assert!(!limiter.contains_key(&"stale-a".to_string()));
+        assert!(!limiter.contains_key(&"stale-b".to_string()));
+    }
+
+    #[test]
+    fn local_limiter_enforce_capacity_prunes_stale_below_cap() {
+        let limiter = LocalLimiter::new(
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+            crate::util::sharding::pool_shard_amount(0),
+        );
+        let op = TestOp;
+        let t0 = Instant::now();
+
+        for idx in 0..4 {
+            assert!(limiter.check_at(format!("stale:{idx}"), &op, t0).allowed);
+        }
+        let t_active = t0 + Duration::from_secs(20);
+        assert!(
+            limiter
+                .check_at("active".to_string(), &op, t_active)
+                .allowed
+        );
+        assert_eq!(limiter.tracked_keys_count(), 5);
+
+        // Cap is above current length; stale pruning must still run.
+        limiter.enforce_capacity(100, t_active);
+        assert_eq!(limiter.tracked_keys_count(), 1);
+        assert!(limiter.contains_key(&"active".to_string()));
+    }
+
+    #[tokio::test]
+    async fn failover_limiter_prunes_stale_local_fallback_below_cap() {
+        let http_client = namespaced_http_client("tenant-a");
+        let redis_ok = Arc::new(AtomicBool::new(false));
+        let algorithm = TestAlgorithm {
+            redis_ok: Arc::clone(&redis_ok),
+        };
+        let local = LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
+        let redis = test_redis_limiter(&http_client, algorithm);
+        let limiter = FailoverLimiter::new("rate_limiting", redis, local);
+        let op = TestOp;
+        let t0 = Instant::now();
+
+        // Redis algorithm reports unavailable, so checks land in the local
+        // fallback map (the Redis-fallback consumer path).
+        assert!(
+            limiter
+                .check("stale".to_string(), "redis:stale", &op)
+                .await
+                .allowed
+        );
+        assert!(
+            limiter
+                .check("active".to_string(), "redis:active", &op)
+                .await
+                .allowed
+        );
+        assert_eq!(limiter.tracked_keys_count(), 2);
+
+        // Controllable-time refresh of only the active key, then prune past
+        // TestAlgorithm's 10s idle threshold.
+        let t_active = t0 + Duration::from_secs(20);
+        let _ = limiter
+            .fallback
+            .check_at("active".to_string(), &op, t_active);
+        // Ensure the stale key's last_seen is pinned at t0 even if the async
+        // check path observed a slightly later Instant::now().
+        let _ = limiter.fallback.check_at("stale".to_string(), &op, t0);
+        limiter.prune_local_stale_at(t_active);
+
+        assert_eq!(limiter.tracked_keys_count(), 1);
+        assert!(limiter.contains_local_key(&"active".to_string()));
+        assert!(!limiter.contains_local_key(&"stale".to_string()));
     }
 
     #[test]

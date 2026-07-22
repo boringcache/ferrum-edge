@@ -541,10 +541,11 @@ fn test_invalid_close_reason_type_returns_error() {
 // === Eviction logic ===
 
 #[tokio::test]
-async fn test_stale_entries_evicted_on_capacity_trigger() {
-    // Test that when we exceed MAX_STATE_ENTRIES, stale entries get evicted.
-    // We can't create 50K entries in a unit test, but we can verify the is_active()
-    // logic by checking that entries persist when active and accumulate when stale.
+async fn test_stale_entries_persist_until_sampled_sweep() {
+    // Below-cap stale pruning runs on the sampled periodic interval (every
+    // 100_000 frames), not on every frame. A handful of frames therefore keeps
+    // idle keys until that sampled sweep; controllable-time coverage for the
+    // prune itself lives in rate_limit_cleanup_tests.
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 1000}),
         PluginHttpClient::default(),
@@ -568,7 +569,7 @@ async fn test_stale_entries_evicted_on_capacity_trigger() {
     // Wait for buckets to become stale (2x window for FPS=1000, burst=1000 → 2s)
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
 
-    // Add a 4th connection — stale entries still present (under eviction threshold)
+    // Add a 4th connection — still far below the sampled sweep interval.
     plugin
         .on_ws_frame(
             "test-proxy",
@@ -580,7 +581,7 @@ async fn test_stale_entries_evicted_on_capacity_trigger() {
     assert_eq!(
         plugin.tracked_keys_count(),
         Some(4),
-        "Stale entries persist under eviction threshold"
+        "Stale entries persist until the sampled periodic sweep"
     );
 
     // Verify active connection is still functional
