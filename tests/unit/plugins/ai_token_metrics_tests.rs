@@ -920,7 +920,8 @@ async fn anthropic_sse_merges_cumulative_terminal_usage_without_double_counting(
     }))
     .unwrap();
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = concat!(
         "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n",
@@ -958,7 +959,8 @@ async fn anthropic_sse_merges_cumulative_terminal_usage_without_double_counting(
 async fn anthropic_sse_without_message_start_keeps_explicit_partial_usage() {
     let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
 
     plugin
@@ -981,7 +983,8 @@ async fn partial_sse_component_update_retains_earlier_authoritative_total() {
     }))
     .unwrap();
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = concat!(
         "data: {\"usage\":{\"total_tokens\":100}}\n\n",
         "data: {\"usage\":{\"completion_tokens\":7}}\n\n",
@@ -1089,7 +1092,8 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
         "cost_per_prompt_token": 1.0
     }))
     .unwrap();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     for event_type in ["response.incomplete", "response.failed"] {
         let mut ctx = create_test_context();
         let event = format!(
@@ -1117,7 +1121,8 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
 
 #[tokio::test]
 async fn google_sse_merges_repeated_partial_usage_for_auto_and_fixed_provider() {
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = concat!(
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"modelVersion\":\"gemini-test\"}\n\n",
         "data: {\"usageMetadata\":{\"promptTokenCount\":11}}\n\n",

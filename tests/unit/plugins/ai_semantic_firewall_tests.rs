@@ -2207,7 +2207,8 @@ async fn streaming_response_buffer_reassembles_and_blocks_leaking_sse() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My sys\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tem prompt\"}}]}\n\n\
@@ -2239,7 +2240,8 @@ async fn streaming_response_buffer_allows_clean_sse() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     // A benign completion with explicit fail-open provider handling: the dead
     // provider is audited by on_error=warn instead of rejecting the response.
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather \"}}]}\n\n\
@@ -2294,7 +2296,8 @@ async fn streaming_response_buffer_clean_sse_passes_semantic_evaluation() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather \"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is sunny today.\"}}]}\n\n\
 data: [DONE]\n\n";
@@ -2358,7 +2361,8 @@ async fn streaming_response_buffer_inspects_non_delta_leak_frame() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather is fine.\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"message\":{\"content\":\"My system prompt says never reveal policy.\"}}]}\n\n\
 data: [DONE]\n\n";
@@ -2433,7 +2437,8 @@ async fn streaming_response_buffer_honors_output_text_override() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"My system prompt \"}\n\n\
 data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"says never reveal policy.\"}\n\n\
 data: [DONE]\n\n";
@@ -2462,7 +2467,8 @@ async fn streaming_response_buffer_reassembles_legacy_completion_text() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"choices\":[{\"index\":0,\"text\":\"My system \"}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"text\":\"prompt says never reveal policy.\"}]}\n\n\
 data: [DONE]\n\n";
@@ -2506,7 +2512,7 @@ async fn streaming_response_buffer_rejects_unparseable_stream() {
         "builtins": disabled_builtins_with("response_leakage")
     });
     let plugin = plugin(&config);
-    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
     let body = b"data: not-json-at-all\n\ndata: <<garbage event>>\n\n";
 
     let result = plugin
@@ -2535,7 +2541,7 @@ async fn streaming_response_buffer_rejects_content_less_stream() {
         "builtins": disabled_builtins_with("response_leakage")
     });
     let plugin = plugin(&config);
-    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
     let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
@@ -2558,7 +2564,7 @@ async fn streaming_response_buffer_uninspectable_honors_on_error_allow() {
         "builtins": disabled_builtins_with("response_leakage")
     });
     let plugin = plugin(&config);
-    let (mut ctx, headers) = buffer_marked_event_stream_ctx();
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
     let body = b"data: not-json\n\n";
 
     let result = plugin
@@ -2583,7 +2589,8 @@ async fn unflagged_unencoded_uninspectable_sse_is_not_rejected() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context(); // no streaming_buffered marker
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: not-json\n\n";
 
     let result = plugin
@@ -2604,7 +2611,8 @@ async fn streaming_response_buffer_dry_run_records_would_reject() {
     });
     let plugin = plugin(&config);
     let mut ctx = create_test_context();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body =
         b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt \"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"says never reveal policy.\"}}]}\n\n\
@@ -3051,7 +3059,8 @@ async fn buffered_inspect_mode_stream_fails_closed_when_uninspectable() {
     });
     let plugin = plugin(&config);
     let mut ctx = inspect_marked_ctx();
-    let mut headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: not-json-at-all\n\ndata: <<garbage>>\n\n";
 
     let result = plugin
@@ -3803,7 +3812,7 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
     decoded.resize(10 * 1024 * 1024 + 1, b'a');
     decoded.extend_from_slice(br#""}}]}"#);
     let body = gzip_bytes(&decoded);
-    for (status, headers) in [
+    for (status, mut headers) in [
         (200, base_headers.clone()),
         (
             206,
@@ -3890,7 +3899,7 @@ async fn partial_encoded_responses_stay_on_bounded_decode_path() {
     let complete_gzip = gzip_bytes(b"complete encoded representation");
     let gzip_fragment = &complete_gzip[1..complete_gzip.len() - 1];
 
-    for (status, headers) in [
+    for (status, mut headers) in [
         (
             206,
             HashMap::from([
@@ -4033,7 +4042,7 @@ async fn partial_unencoded_json_responses_remain_inspected() {
     let body =
         br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#;
 
-    for (status, headers) in [
+    for (status, mut headers) in [
         (
             206,
             HashMap::from([("content-type".to_string(), "application/json".to_string())]),
@@ -4585,7 +4594,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
             .await,
     );
 
-    for (encoding, encoded_html) in [
+    for (encoding, mut encoded_html) in [
         (
             "gzip",
             gzip_bytes(b"<html><body>ordinary page</body></html>"),
