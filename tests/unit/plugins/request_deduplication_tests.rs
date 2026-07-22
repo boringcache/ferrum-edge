@@ -276,6 +276,22 @@ fn test_new_rejects_non_object_config() {
 }
 
 #[test]
+fn new_with_instance_id_rejects_blank_stable_identity() {
+    for blank in ["", "   ", "\t\n"] {
+        let err = request_deduplication_with_instance_id_for_test(
+            &json!({}),
+            PluginHttpClient::default(),
+            blank,
+        )
+        .expect_err("blank plugin config id must fail closed");
+        assert!(
+            err.contains("plugin config id must be a non-empty stable identity"),
+            "unexpected error for {blank:?}: {err}"
+        );
+    }
+}
+
+#[test]
 fn test_new_rejects_invalid_header_name() {
     let config = json!({
         "header_name": "not a header"
@@ -3663,6 +3679,9 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
 #[tokio::test]
 async fn stable_plugin_config_identity_partitions_distributed_logical_keys() {
     let config = json!({});
+    // Same stable plugin-config id on two gateways must share Redis identity
+    // (cross-gateway companion contract). Distinct ids — including across
+    // scopes that happen to share a proxy association — must stay partitioned.
     let first_gateway = request_deduplication_with_instance_id_for_test(
         &config,
         PluginHttpClient::default(),
@@ -3681,9 +3700,27 @@ async fn stable_plugin_config_identity_partitions_distributed_logical_keys() {
         "dedup-secondary",
     )
     .unwrap();
+    let proxy_group_sibling = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-proxy-group",
+    )
+    .unwrap();
+    let global_sibling = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-global",
+    )
+    .unwrap();
 
     let mut identities = Vec::new();
-    for plugin in [&first_gateway, &second_gateway, &sibling_instance] {
+    for plugin in [
+        &first_gateway,
+        &second_gateway,
+        &sibling_instance,
+        &proxy_group_sibling,
+        &global_sibling,
+    ] {
         let mut ctx = body_ctx("POST", "/api/orders", b"{}");
         let mut headers = keyed_headers("shared-key", "api.example", 2);
         assert!(matches!(
@@ -3700,6 +3737,14 @@ async fn stable_plugin_config_identity_partitions_distributed_logical_keys() {
     assert_ne!(
         identities[0].0, identities[2].0,
         "sibling plugin instances must not share completed or in-flight Redis keys"
+    );
+    assert_ne!(
+        identities[0].0, identities[3].0,
+        "proxy_group-scoped config identity must remain isolated from peer instances"
+    );
+    assert_ne!(
+        identities[0].0, identities[4].0,
+        "global-scoped config identity must remain isolated from peer instances"
     );
     assert_eq!(
         identities[0].1, identities[2].1,

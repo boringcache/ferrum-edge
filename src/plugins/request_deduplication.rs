@@ -354,6 +354,20 @@ impl RequestDeduplication {
             return Err("request_deduplication: config must be an object".to_string());
         }
 
+        // Stable plugin-config identity partitions Redis ownership across
+        // sibling instances (global/proxy/proxy_group) that share a default or
+        // explicit prefix. Reject blank IDs fail-closed so two miswired
+        // constructors cannot collapse onto one distributed key space.
+        // Process-local `instance_id` is intentionally not used here: it would
+        // break intentional cross-gateway sharing for the same config.
+        let config_id = config_id.trim();
+        if config_id.is_empty() {
+            return Err(
+                "request_deduplication: plugin config id must be a non-empty stable identity"
+                    .to_string(),
+            );
+        }
+
         let header_name = parse_header_name(
             optional_string(config, "header_name")?.unwrap_or("Idempotency-Key"),
         )?;
@@ -393,7 +407,7 @@ impl RequestDeduplication {
 
         Ok(Self {
             instance_id: NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
-            config_id: config_id.to_string(),
+            config_id: config_id.to_owned(),
             header_name,
             ttl,
             inflight_ttl,
