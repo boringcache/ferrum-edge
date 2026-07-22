@@ -3816,7 +3816,9 @@ async fn test_options_does_not_invalidate_cached_get() {
     // Sanity: the entry is served from cache.
     let mut ctx = make_ctx("GET", "/api/items");
     let mut headers = HashMap::new();
-    assert!(is_reject(plugin.before_proxy(&mut ctx, &mut headers).await));
+    assert!(is_reject(
+        &plugin.before_proxy(&mut ctx, &mut headers).await
+    ));
 
     let mut ctx = make_ctx("OPTIONS", "/api/items");
     let mut headers = HashMap::new();
@@ -3830,7 +3832,7 @@ async fn test_options_does_not_invalidate_cached_get() {
     let mut ctx = make_ctx("GET", "/api/items");
     let mut headers = HashMap::new();
     assert!(
-        is_reject(plugin.before_proxy(&mut ctx, &mut headers).await),
+        is_reject(&plugin.before_proxy(&mut ctx, &mut headers).await),
         "OPTIONS must not invalidate cached GET entries"
     );
 }
@@ -3856,7 +3858,7 @@ async fn test_non_cacheable_head_does_not_invalidate_cached_get() {
     let mut ctx = make_ctx("GET", "/api/items");
     let mut headers = HashMap::new();
     assert!(
-        is_reject(plugin.before_proxy(&mut ctx, &mut headers).await),
+        is_reject(&plugin.before_proxy(&mut ctx, &mut headers).await),
         "non-cacheable HEAD must not invalidate cached GET entries"
     );
 }
@@ -3958,7 +3960,7 @@ async fn test_byte_cap_admission_reclaims_expired_entries() {
     let mut ctx = make_ctx("GET", "/d");
     let mut headers = HashMap::new();
     assert!(
-        is_reject(plugin.before_proxy(&mut ctx, &mut headers).await),
+        is_reject(&plugin.before_proxy(&mut ctx, &mut headers).await),
         "new entry must be admitted after expired entries are reclaimed"
     );
 
