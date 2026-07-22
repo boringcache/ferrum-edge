@@ -14,7 +14,7 @@ from live_suite_path_filter import (
     SUITE_PATTERNS,
     exact_path_patterns,
 )
-from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS
+from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS, self_test as planner_self_test
 
 
 REQUIRED_JOBS = {
@@ -440,6 +440,12 @@ def main() -> int:
         planner_errors.append(
             "jobs.ci-plan must run the integration shard-coverage gate"
         )
+    # The scheduling decision above intentionally executes the trusted-base
+    # planner on pull requests. Exercise the proposed planner here as data-plane
+    # validation only: this verifier publishes no planner outputs and cannot
+    # influence which jobs the trusted scheduler selected.
+    if planner_self_test() != 0:
+        planner_errors.append("proposed PR CI planner self-test failed")
     try:
         run_self_test()
     except AssertionError as error:

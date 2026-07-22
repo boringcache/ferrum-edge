@@ -243,6 +243,97 @@ reqwest/h3/tungstenite lineage needs an explicit path:
 6. Never silence an advisory without an expiry and a rationale — the expiry
    check will fail the weekly run otherwise (by design).
 
+## CI Actions and Kubernetes tooling
+
+GitHub Actions and the kind / kubectl / Helm binaries used by live Kubernetes
+jobs are a separate supply-chain surface from Rust crates. Policy:
+
+1. **Pin every external action** to a full 40-character commit SHA, with an
+   accurate version comment (for example
+   `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`).
+   Mutable tags (`@v7`, `@v7.0.1`), branches (`@main`), and short SHAs are
+   forbidden. `docker://` action references require an explicit
+   `@sha256:<64-hex>` image digest. Local composite actions under
+   `./.github/actions/...` and reusable workflows directly under
+   `./.github/workflows/` are allowed without a SHA pin; local Docker actions
+   must also digest-pin every non-`scratch` `FROM` image.
+2. **Install kind, kubectl, and Helm only through**
+   [`.github/actions/setup-kubernetes-tools`](../.github/actions/setup-kubernetes-tools/action.yml).
+   That composite action downloads from official versioned release URLs, verifies
+   each artifact against repository-pinned SHA-256 digests **and** the matching
+   official published checksum file for that exact version, then installs into
+   the runner PATH. It never pipes remote content to a shell and fails closed on
+   download or verification errors.
+3. **Do not** use `azure/setup-helm`, `curl … | bash` installers, or
+   `raw.githubusercontent.com/helm/helm/main` (or any other mutable-branch
+   install script).
+4. **Static enforcement.** The `ci-plan` job runs the trusted base branch's
+   `.github/scripts/pr_ci_plan.py --self-test` on every CI run (including
+   lightweight documentation PRs). Its checker rejects mutable action refs,
+   pipe-to-shell installers, mutable-branch install scripts, and direct
+   kind/kubectl/Helm downloads outside the composite action. Repository-local
+   actions are allowed, but dynamic or matrix-generated `uses` references are
+   rejected because the checker cannot prove that every generated value is a
+   full immutable SHA. The head-executed required-CI verifier also runs a pull
+   request's proposed planner self-tests without consuming planner outputs, so
+   new policy code is exercised before merge while the base branch remains the
+   sole authority for job gates.
+
+   This is deliberately static enforcement, not a shell interpreter. It catches
+   known direct URLs and folded/continued installer commands, but cannot prove
+   the destination of a URL assembled indirectly from shell variables or other
+   obfuscation. Reviewers must treat such construction as unverified and require
+   a literal, versioned URL plus repository-pinned checksum (or the centralized
+   installer) before approving it.
+
+### Refreshing GitHub Actions (Dependabot)
+
+`.github/dependabot.yml` already schedules weekly `github-actions` updates.
+When reviewing an actions Dependabot PR:
+
+1. Confirm the PR pins a full commit SHA (Dependabot for GitHub Actions should
+   produce SHA pins when the repo already uses them).
+2. Keep the trailing version comment accurate for the tag the SHA corresponds
+   to.
+3. Do not accept a PR that reintroduces a mutable tag ref.
+
+The ARM64 Cross build and publication contracts are deliberately frozen by the
+trusted `pull_request_target` verifier. Existing checkout uses on the guarded
+workflow surfaces still carry the historical `# v6` annotation, although their
+pinned `3d3c42e5...` SHA resolves to v7.0.1. The verifier treats an adjacent
+annotation change as a change to that executable surface, so an ordinary pull
+request cannot normalize those comments. Correct them only as part of an
+authorized, coordinated rotation of the trusted policy; do not copy the legacy
+annotation onto new uses.
+
+### Refreshing kind / kubectl / Helm versions and checksums
+
+Versions and digests live as defaults on the
+`setup-kubernetes-tools` composite action inputs. To bump a tool:
+
+1. Choose the new official release tag (kind GitHub release, Kubernetes
+   `dl.k8s.io` release, or Helm release on `get.helm.sh`).
+2. Fetch the **official** published checksum for that exact version and
+   architecture (`linux/amd64`):
+   - kind:
+     `https://github.com/kubernetes-sigs/kind/releases/download/<tag>/kind-linux-amd64.sha256sum`
+   - kubectl:
+     `https://dl.k8s.io/release/<tag>/bin/linux/amd64/kubectl.sha256`
+   - Helm:
+     `https://get.helm.sh/helm-<tag>-linux-amd64.tar.gz.sha256sum`
+     (optionally cross-check the detached signature assets on the Helm GitHub
+     release before trusting a new digest).
+3. Update the matching `*-version` and `*-sha256` defaults in
+   `.github/actions/setup-kubernetes-tools/action.yml`.
+4. Leave workflow jobs calling `uses: ./.github/actions/setup-kubernetes-tools`
+   unchanged unless a job must pin an override input for a temporary skew.
+5. Land the change via PR; the trusted CI planner policy and the live suites that
+   path-filter on the composite action will exercise the new pins.
+
+Never refresh a checksum by copying a digest from an unpinned adjacent path
+without official release provenance, and never pipe a remote install script to
+a shell as a shortcut.
+
 ## See also
 
 - `deny.toml` — the gate configuration and current exceptions.

@@ -1,0 +1,204 @@
+name: Setup Kubernetes tools
+description: >-
+  Install kind, kubectl, and Helm from official versioned release URLs after
+  verifying each download against repository-pinned SHA-256 digests and the
+  matching official published checksum files. Fail closed on download or
+  verification errors. Never pipes remote content to a shell.
+
+inputs:
+  kind-version:
+    description: kind release tag (for example v0.27.0)
+    required: false
+    default: "v0.27.0"
+  kubectl-version:
+    description: kubectl release tag (for example v1.32.3)
+    required: false
+    default: "v1.32.3"
+  helm-version:
+    description: Helm release tag (for example v3.17.3)
+    required: false
+    default: "v3.17.3"
+  kind-sha256:
+    description: >-
+      Expected SHA-256 of kind-linux-amd64 from the kind GitHub release
+      checksum file for kind-version.
+    required: false
+    default: "a6875aaea358acf0ac07786b1a6755d08fd640f4c79b7a2e46681cc13f49a04b"
+  kubectl-sha256:
+    description: >-
+      Expected SHA-256 of the linux/amd64 kubectl binary from
+      dl.k8s.io for kubectl-version.
+    required: false
+    default: "ab209d0c5134b61486a0486585604a616a5bb2fc07df46d304b3c95817b2d79f"
+  helm-sha256:
+    description: >-
+      Expected SHA-256 of helm-<version>-linux-amd64.tar.gz from get.helm.sh
+      for helm-version.
+    required: false
+    default: "ee88b3c851ae6466a3de507f7be73fe94d54cbf2987cbaa3d1a3832ea331f2cd"
+  install-kind:
+    description: Install kind when true
+    required: false
+    default: "true"
+  install-kubectl:
+    description: Install kubectl when true
+    required: false
+    default: "true"
+  install-helm:
+    description: Install Helm when true
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Install kind, kubectl, and Helm with pinned checksums
+      shell: bash
+      env:
+        KIND_VERSION: ${{ inputs.kind-version }}
+        KUBECTL_VERSION: ${{ inputs.kubectl-version }}
+        HELM_VERSION: ${{ inputs.helm-version }}
+        KIND_SHA256: ${{ inputs.kind-sha256 }}
+        KUBECTL_SHA256: ${{ inputs.kubectl-sha256 }}
+        HELM_SHA256: ${{ inputs.helm-sha256 }}
+        INSTALL_KIND: ${{ inputs.install-kind }}
+        INSTALL_KUBECTL: ${{ inputs.install-kubectl }}
+        INSTALL_HELM: ${{ inputs.install-helm }}
+      run: |
+        set -euo pipefail
+
+        # Linux/amd64 GitHub-hosted runners only. Refuse other platforms instead
+        # of silently installing binaries for the wrong OS or architecture.
+        os="$(uname -s)"
+        arch="$(uname -m)"
+        if [ "$os" != "Linux" ] || { [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; }; then
+          echo "::error::setup-kubernetes-tools supports linux/amd64 only (got ${os}/${arch})"
+          exit 1
+        fi
+
+        require_sha256() {
+          local value="$1"
+          local label="$2"
+          if ! [[ "$value" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::${label} must be a 64-character lowercase hex SHA-256"
+            exit 1
+          fi
+        }
+
+        download() {
+          local url="$1"
+          local dest="$2"
+          if ! curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 30 --max-time 300 \
+            -o "$dest" "$url"; then
+            echo "::error::download failed: ${url}"
+            exit 1
+          fi
+          if [ ! -s "$dest" ]; then
+            echo "::error::download produced an empty file: ${url}"
+            exit 1
+          fi
+        }
+
+        file_sha256() {
+          # Prefer sha256sum (Linux runners); fall back to shasum (macOS).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$1" | awk '{print $1}'
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$1" | awk '{print $1}'
+          else
+            echo "::error::neither sha256sum nor shasum is available"
+            exit 1
+          fi
+        }
+
+        verify_pinned_sha256() {
+          local path="$1"
+          local expected="$2"
+          local label="$3"
+          local actual
+          actual="$(file_sha256 "$path")"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::${label} checksum mismatch: got ${actual}, want ${expected}"
+            exit 1
+          fi
+        }
+
+        # Cross-check the repository pin against the official published
+        # checksum for this exact version. Reject if either the download or the
+        # pin disagrees with official provenance.
+        assert_official_checksum_matches_pin() {
+          local official_url="$1"
+          local pinned="$2"
+          local label="$3"
+          local checksum_path official
+          checksum_path="$(mktemp)"
+          download "$official_url" "$checksum_path"
+          official="$(awk '{print $1; exit}' "$checksum_path" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          rm -f "$checksum_path"
+          if ! [[ "$official" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::${label}: official checksum file did not contain a SHA-256 digest (${official_url})"
+            exit 1
+          fi
+          if [ "$official" != "$pinned" ]; then
+            echo "::error::${label}: repository pin ${pinned} does not match official checksum ${official} from ${official_url}"
+            exit 1
+          fi
+        }
+
+        install_dir="${RUNNER_TEMP}/ferrum-k8s-tools/bin"
+        work_dir="${RUNNER_TEMP}/ferrum-k8s-tools/work"
+        mkdir -p "$install_dir" "$work_dir"
+        echo "$install_dir" >> "$GITHUB_PATH"
+
+        if [ "$INSTALL_KIND" = "true" ]; then
+          require_sha256 "$KIND_SHA256" "kind-sha256"
+          kind_bin="${work_dir}/kind-linux-amd64"
+          # GitHub release assets are the authoritative kind provenance.
+          download \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \
+            "$kind_bin"
+          assert_official_checksum_matches_pin \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64.sha256sum" \
+            "$KIND_SHA256" \
+            "kind ${KIND_VERSION}"
+          verify_pinned_sha256 "$kind_bin" "$KIND_SHA256" "kind ${KIND_VERSION}"
+          install -m 0755 "$kind_bin" "${install_dir}/kind"
+          "${install_dir}/kind" version
+        fi
+
+        if [ "$INSTALL_KUBECTL" = "true" ]; then
+          require_sha256 "$KUBECTL_SHA256" "kubectl-sha256"
+          kubectl_bin="${work_dir}/kubectl"
+          download \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+            "$kubectl_bin"
+          assert_official_checksum_matches_pin \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \
+            "$KUBECTL_SHA256" \
+            "kubectl ${KUBECTL_VERSION}"
+          verify_pinned_sha256 "$kubectl_bin" "$KUBECTL_SHA256" "kubectl ${KUBECTL_VERSION}"
+          install -m 0755 "$kubectl_bin" "${install_dir}/kubectl"
+          "${install_dir}/kubectl" version --client=true
+        fi
+
+        if [ "$INSTALL_HELM" = "true" ]; then
+          require_sha256 "$HELM_SHA256" "helm-sha256"
+          helm_archive="${work_dir}/helm-linux-amd64.tar.gz"
+          # Official Helm distribution host; never raw.githubusercontent.com/helm/helm/main.
+          download \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+            "$helm_archive"
+          assert_official_checksum_matches_pin \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz.sha256sum" \
+            "$HELM_SHA256" \
+            "helm ${HELM_VERSION}"
+          verify_pinned_sha256 "$helm_archive" "$HELM_SHA256" "helm ${HELM_VERSION}"
+          tar -xzf "$helm_archive" -C "$work_dir"
+          if [ ! -x "${work_dir}/linux-amd64/helm" ]; then
+            echo "::error::helm archive did not contain linux-amd64/helm"
+            exit 1
+          fi
+          install -m 0755 "${work_dir}/linux-amd64/helm" "${install_dir}/helm"
+          "${install_dir}/helm" version --short
+        fi
