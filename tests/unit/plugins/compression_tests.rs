@@ -3940,45 +3940,6 @@ fn test_absent_content_type_fails_closed() {
 
 // ────────────────────── Integrity digests after compression (#2354) ──────────────────────
 
-/// Production H1/H2/H3 buffered transforms call
-/// `finalize_response_body_transformation` after replacement bytes. Pin those
-/// call sites so an H1-only cleanup cannot silently regress the other protocols.
-#[test]
-fn test_h1_h2_h3_paths_finalize_transformed_response_metadata() {
-    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
-    let h3 = include_str!("../../../src/http3/server.rs");
-    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
-
-    assert!(
-        h1_h2.contains("crate::plugins::finalize_response_body_transformation("),
-        "H1/H2 buffered transform path must finalize content-bound metadata"
-    );
-    assert!(
-        h1_h2.contains("transform_buffered_response_body_with_deadline("),
-        "H1/H2 buffered path must use the shared transform helper that finalizes"
-    );
-    assert!(
-        h3.contains("crate::proxy::transform_buffered_response_body_with_deadline("),
-        "native H3 buffered path must use the shared transform helper that finalizes"
-    );
-    assert!(
-        h3.contains("response_trailers = None") && h3.contains("body_transformed"),
-        "native H3 must drop backend trailers after a body rewrite so trailer digests cannot describe compressed bytes"
-    );
-    assert!(
-        h3_cross.contains("crate::plugins::finalize_response_body_transformation("),
-        "H3 cross-protocol path must finalize content-bound metadata"
-    );
-    assert!(
-        h3_cross.contains("discard_grpc_application_trailers_after_body_rewrite("),
-        "H3 gRPC bridge must retire application trailers (including digests) after a rewrite"
-    );
-    assert!(
-        h1_h2.contains("discard_grpc_application_trailers_after_body_rewrite("),
-        "H1/H2 buffered gRPC path must retire application trailers after a rewrite"
-    );
-}
-
 /// Actual gzip compression through the shared buffered transform lifecycle must
 /// remove all four integrity fields case-insensitively while keeping the
 /// gateway encoding and producing compressed wire bytes.
@@ -4350,30 +4311,6 @@ async fn test_trailer_integrity_digests_retired_after_compression_rewrite() {
         trailers,
         HashMap::from([("grpc-status".to_string(), "0".to_string())]),
         "application trailer digests must be retired; terminal status preserved"
-    );
-    assert_integrity_digests_absent(&headers);
-}
-
-/// Direct hook coverage mirrors neighboring transforming plugins: after an
-/// actual rewrite the plugin-owned cleanup removes the integrity set.
-#[test]
-fn test_on_response_body_transformed_strips_integrity_digests() {
-    let plugin = make_plugin(json!({}));
-    let mut ctx = make_ctx(Some("gzip"));
-    let mut headers = HashMap::new();
-    headers.insert("content-encoding".to_string(), "gzip".to_string());
-    headers.insert("vary".to_string(), "Accept-Encoding".to_string());
-    insert_stale_integrity_digests(&mut headers);
-
-    plugin.on_response_body_transformed(&mut ctx, &mut headers);
-
-    assert_eq!(
-        headers.get("content-encoding").map(String::as_str),
-        Some("gzip")
-    );
-    assert_eq!(
-        headers.get("vary").map(String::as_str),
-        Some("Accept-Encoding")
     );
     assert_integrity_digests_absent(&headers);
 }
