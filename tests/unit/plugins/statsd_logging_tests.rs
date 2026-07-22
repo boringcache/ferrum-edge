@@ -676,8 +676,7 @@ fn test_statsd_terminal_body_failure_keeps_header_status() {
 #[test]
 fn test_statsd_bounded_grpc_status_tag_contract() {
     for (status, expected) in [
-        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14",
-        "15", "16",
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
     ]
     .into_iter()
     .enumerate()
