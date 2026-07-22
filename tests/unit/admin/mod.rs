@@ -7,5 +7,6 @@ mod admin_read_only_tests;
 mod admin_tests;
 mod admin_validation_tests;
 mod api_specs_readonly_required_tests;
+mod api_specs_schema_anchor_tests;
 mod mesh_remote_clusters_tests;
 mod openapi_validator_generated_config_contract_tests;
