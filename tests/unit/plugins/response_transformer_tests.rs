@@ -1889,7 +1889,9 @@ async fn response_caching_does_not_revalidate_stripped_origin_etag() {
         PluginResult::Continue
     ));
     assert!(matches!(
-        caching.after_proxy(&mut store_ctx, status, &mut headers).await,
+        caching
+            .after_proxy(&mut store_ctx, status, &mut headers)
+            .await,
         PluginResult::Continue
     ));
     assert!(matches!(
@@ -1904,7 +1906,8 @@ async fn response_caching_does_not_revalidate_stripped_origin_etag() {
     let mut hit_ctx = make_ctx();
     hit_ctx.path = path.to_string();
     hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
-    let mut conditional = HashMap::from([("if-none-match".to_string(), "\"origin-v1\"".to_string())]);
+    let mut conditional =
+        HashMap::from([("if-none-match".to_string(), "\"origin-v1\"".to_string())]);
     match caching.before_proxy(&mut hit_ctx, &mut conditional).await {
         PluginResult::RejectBinary {
             status_code,
