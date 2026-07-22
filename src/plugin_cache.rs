@@ -3087,11 +3087,27 @@ pub(crate) fn build_proxy_lifecycle_generations(
     previous_high_water: u64,
     config: &GatewayConfig,
 ) -> Result<(HashMap<String, u64>, u64), String> {
+    build_proxy_lifecycle_generations_with_advances(
+        previous,
+        previous_high_water,
+        config,
+        &HashSet::new(),
+    )
+}
+
+fn build_proxy_lifecycle_generations_with_advances(
+    previous: &HashMap<String, u64>,
+    previous_high_water: u64,
+    config: &GatewayConfig,
+    advance_proxy_ids: &HashSet<&str>,
+) -> Result<(HashMap<String, u64>, u64), String> {
     let mut next = HashMap::with_capacity(config.proxies.len());
     let previous_max = previous.values().copied().max().unwrap_or(0);
     let mut high = previous_high_water.max(previous_max);
     for proxy in &config.proxies {
-        if let Some(&generation) = previous.get(&proxy.id) {
+        if !advance_proxy_ids.contains(proxy.id.as_str())
+            && let Some(&generation) = previous.get(&proxy.id)
+        {
             next.insert(proxy.id.clone(), generation);
         } else {
             high = high
@@ -3101,6 +3117,23 @@ pub(crate) fn build_proxy_lifecycle_generations(
         }
     }
     Ok((next, high))
+}
+
+/// Whether the effective set of `proxy_alerts` instances changed for one
+/// continuously present proxy. This catches proxy-group leave/rejoin without
+/// resetting alert ownership for unrelated edits to the same proxy.
+fn proxy_alerts_instances_changed(
+    previous: &[Arc<dyn Plugin>],
+    next: &[Arc<dyn Plugin>],
+) -> bool {
+    let instance_ids = |plugins: &[Arc<dyn Plugin>]| -> HashSet<usize> {
+        plugins
+            .iter()
+            .filter(|plugin| plugin.name() == "proxy_alerts")
+            .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
+            .collect()
+    };
+    instance_ids(previous) != instance_ids(next)
 }
 
 /// Extract the active `__mesh_bpf_metrics` scrape exporter from a global
@@ -4672,11 +4705,28 @@ impl PluginCache {
                 .map_err(|error| format!("Config reload rejected: {error}"))?;
         }
 
+        let lifecycle_advances: HashSet<&str> = config
+            .proxies
+            .iter()
+            .filter_map(|proxy| {
+                let previous = current
+                    .proxy_plugins
+                    .get(&proxy.id)
+                    .map(Arc::as_ref)
+                    .unwrap_or(current.global_plugins.as_ref());
+                let next = new_map
+                    .get(&proxy.id)
+                    .map(Arc::as_ref)
+                    .unwrap_or(new_globals.as_ref());
+                proxy_alerts_instances_changed(previous, next).then_some(proxy.id.as_str())
+            })
+            .collect();
         let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
-            build_proxy_lifecycle_generations(
+            build_proxy_lifecycle_generations_with_advances(
                 &current.proxy_lifecycle_generations,
                 current.proxy_lifecycle_generation_high_water,
                 config,
+                &lifecycle_advances,
             )?;
 
         Ok(Arc::new(PluginCacheInner::new(

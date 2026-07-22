@@ -4008,7 +4008,7 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
 }
 
 #[test]
-fn test_apply_delta_prunes_proxy_group_proxy_alerts_when_member_leaves_group() {
+fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
     let group_alerts = make_plugin_config(
         "group-alerts",
         "proxy_alerts",
@@ -4030,12 +4030,10 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_when_member_leaves_group() {
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("group proxy_alerts")
         .clone();
-    shared.seed_proxy_lifecycle_state_for_test(
-        "p1",
-        cache
-            .proxy_lifecycle_generation("p1")
-            .expect("p1 generation"),
-    );
+    let p1_initial_generation = cache
+        .proxy_lifecycle_generation("p1")
+        .expect("initial p1 generation");
+    shared.seed_proxy_lifecycle_state_for_test("p1", p1_initial_generation);
     shared.seed_proxy_lifecycle_state_for_test(
         "p2",
         cache
@@ -4051,7 +4049,7 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_when_member_leaves_group() {
             make_proxy("p1", "/api", vec![]),
             make_proxy("p2", "/web", vec!["group-alerts"]),
         ],
-        vec![group_alerts],
+        vec![group_alerts.clone()],
     );
     let mut proxy_ids = HashSet::new();
     proxy_ids.insert("p1".to_string());
@@ -4065,6 +4063,72 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_when_member_leaves_group() {
         .expect("preserved group proxy_alerts");
     assert!(!alerts_after.has_proxy_lifecycle_state_for_test("p1"));
     assert!(alerts_after.has_proxy_lifecycle_state_for_test("p2"));
+    let p1_left_generation = cache
+        .proxy_lifecycle_generation("p1")
+        .expect("generation after leaving group");
+    assert_ne!(
+        p1_initial_generation, p1_left_generation,
+        "leaving the effective proxy_alerts instance must advance ownership"
+    );
+
+    // Rejoining the same preserved group instance is another ownership
+    // boundary. An in-flight sample admitted before the leave must not write
+    // into the new membership after rejoin.
+    let config3 = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group-alerts"]),
+            make_proxy("p2", "/web", vec!["group-alerts"]),
+        ],
+        vec![group_alerts],
+    );
+    cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
+    let p1_rejoined_generation = cache
+        .proxy_lifecycle_generation("p1")
+        .expect("generation after rejoining group");
+    assert_ne!(p1_left_generation, p1_rejoined_generation);
+
+    let rejoined = cache
+        .get_plugins("p1")
+        .iter()
+        .find(|plugin| plugin.name() == "proxy_alerts")
+        .expect("rejoined group proxy_alerts")
+        .clone();
+    assert_eq!(Arc::as_ptr(&rejoined) as *const () as usize, shared_ptr);
+    let stale = ferrum_edge::plugins::TransactionSummary {
+        proxy_id: Some("p1".to_string()),
+        proxy_lifecycle_generation: Some(p1_initial_generation),
+        response_status_code: 500,
+        ..ferrum_edge::plugins::TransactionSummary::default()
+    };
+    let current = ferrum_edge::plugins::TransactionSummary {
+        proxy_id: Some("p1".to_string()),
+        proxy_lifecycle_generation: Some(p1_rejoined_generation),
+        response_status_code: 500,
+        ..ferrum_edge::plugins::TransactionSummary::default()
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(ferrum_edge::plugins::Plugin::log(
+        rejoined.as_ref(),
+        &stale,
+    ));
+    assert!(
+        !rejoined.has_proxy_lifecycle_state_for_test("p1"),
+        "pre-leave in-flight sample must not repopulate a rejoined membership"
+    );
+    rt.block_on(ferrum_edge::plugins::Plugin::log(
+        rejoined.as_ref(),
+        &current,
+    ));
+    assert!(
+        rejoined.has_proxy_lifecycle_state_for_generation_for_test(
+            "p1",
+            p1_rejoined_generation,
+        ),
+        "rejoined membership must accept its current ownership generation"
+    );
 }
 
 #[test]
