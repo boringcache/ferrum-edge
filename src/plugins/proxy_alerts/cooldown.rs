@@ -17,6 +17,10 @@
 //! ([`CooldownGate::retain_proxies`] / [`RecoveryGate::retain_proxies`]).
 //! Expired cooldown / resolved recovery rows are swept by the plugin's
 //! background eviction task.
+//!
+//! All timestamps here are process-monotonic milliseconds. Zero is reserved
+//! for an unarmed cooldown. Defensive backward-discontinuity handling rebases
+//! injected/test clocks instead of freezing elapsed-time state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,8 +104,16 @@ impl CooldownGate {
             per_generation.get_or_insert_with(ownership_generation, || Arc::new(AtomicU64::new(0)));
         let mut prev = atomic.load(Ordering::Acquire);
         loop {
-            if prev != 0 && now_ms.saturating_sub(prev) < cooldown_ms {
-                return false;
+            if prev != 0 {
+                match now_ms.checked_sub(prev) {
+                    Some(elapsed) if elapsed < cooldown_ms => return false,
+                    Some(_) => {}
+                    None => {
+                        // A real monotonic clock never reaches this branch, but
+                        // injected clocks must rebase instead of suppressing
+                        // alerts until the old timestamp is reached again.
+                    }
+                }
             }
             match atomic.compare_exchange_weak(prev, now_ms, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return true,
@@ -140,7 +152,7 @@ impl CooldownGate {
             per_proxy.retain(|_, generations| {
                 generations.retain(|_, atomic| {
                     let ts = atomic.load(Ordering::Acquire);
-                    ts == 0 || ts > cutoff
+                    ts == 0 || (ts <= now_ms && ts > cutoff)
                 });
                 !generations.is_empty()
             });
@@ -348,13 +360,22 @@ impl RecoveryGate {
                 },
                 false,
             ) => {
-                if recovery_ms > 0 && now_ms.saturating_sub(left_threshold_at_ms) >= recovery_ms {
-                    *state = RuleState::Healthy;
-                    LifecycleOutcome::Resolve
-                } else if recovery_ms == 0 {
+                if recovery_ms == 0 {
                     *state = RuleState::Healthy;
                     LifecycleOutcome::Quiet
+                } else if let Some(elapsed) = now_ms.checked_sub(left_threshold_at_ms) {
+                    if elapsed >= recovery_ms {
+                        *state = RuleState::Healthy;
+                        LifecycleOutcome::Resolve
+                    } else {
+                        LifecycleOutcome::Quiet
+                    }
                 } else {
+                    // Rebase a defensive/injected backward discontinuity so
+                    // recovery accrues from the new monotonic epoch.
+                    *state = RuleState::Recovering {
+                        left_threshold_at_ms: now_ms,
+                    };
                     LifecycleOutcome::Quiet
                 }
             }

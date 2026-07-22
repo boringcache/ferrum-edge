@@ -351,12 +351,18 @@ pub struct AiSemanticCache {
     max_entries: usize,
     /// Maximum size of a single cached response body in bytes.
     max_entry_size_bytes: usize,
-    /// Approximate (soft) ceiling on the total cache size in bytes. The total
-    /// is checked without a lock before each insert, so under concurrent
-    /// inserts the cap may be briefly exceeded by up to
+    /// Approximate (soft) ceiling on the total cache size in bytes for
+    /// **different-key** concurrent admits. The total is checked without a
+    /// lock before each insert, so concurrent stores of distinct keys may
+    /// briefly exceed the cap by up to
     /// `(concurrent inserts) * max_entry_size_bytes` before periodic
-    /// `cleanup_expired` reconciliation brings it back down. It is not a hard
-    /// guarantee, but the overshoot is bounded and self-healing.
+    /// `cleanup_expired` reconciliation (TTL expiry / max-entries eviction)
+    /// brings it back down. It is not a hard guarantee, but that overshoot is
+    /// bounded and self-healing.
+    ///
+    /// Same-key replacement is different: size-delta accounting uses the value
+    /// returned by the winning `DashMap::insert`, so `total_size` never retains
+    /// phantom bytes for an overwritten entry.
     max_total_size_bytes: usize,
     /// Whether to include the model name in the cache key.
     include_model_in_key: bool,
@@ -392,6 +398,15 @@ pub struct AiSemanticCache {
     vector_index_dirty: Arc<AtomicBool>,
     /// Guards detached HNSW rebuild scheduling.
     vector_index_rebuild_running: Arc<AtomicBool>,
+    /// Optional test-only callback after soft-cap admission succeeds and before
+    /// size credit / `DashMap` insert. Production keeps this empty; the
+    /// `ArcSwap` load of `None` is lock-free on the store path.
+    store_post_admit_hook: Arc<ArcSwapOption<StorePostAdmitHook>>,
+}
+
+/// Test-only rendezvous wrapper for deterministic concurrent store races.
+struct StorePostAdmitHook {
+    callback: Arc<dyn Fn() + Send + Sync + 'static>,
 }
 
 /// Serializable form of CacheEntry for Redis storage.
@@ -514,6 +529,7 @@ impl AiSemanticCache {
             last_vector_rebuild: Arc::new(AtomicU64::new(0)),
             vector_index_dirty: Arc::new(AtomicBool::new(false)),
             vector_index_rebuild_running: Arc::new(AtomicBool::new(false)),
+            store_post_admit_hook: Arc::new(ArcSwapOption::empty()),
         })
     }
 
@@ -1007,6 +1023,78 @@ impl AiSemanticCache {
             .store(current_epoch_seconds(), Ordering::Release);
         self.vector_index_rebuild_running
             .store(false, Ordering::Release);
+    }
+
+    /// Tracked `total_size` and the sum of retained entry `approx_size` values.
+    /// External tests assert these stay equal after concurrent same-key stores.
+    #[allow(dead_code)]
+    pub(crate) fn size_accounting_snapshot_for_tests(&self) -> (usize, usize) {
+        let tracked = self.total_size.load(Ordering::Relaxed);
+        let actual = self
+            .cache
+            .iter()
+            .map(|entry| entry.approx_size)
+            .fold(0usize, usize::saturating_add);
+        (tracked, actual)
+    }
+
+    /// Whether the semantic vector snapshot is marked dirty. Used to prove
+    /// same-key replacement still dirties when embeddings are gained or lost.
+    #[allow(dead_code)]
+    pub(crate) fn vector_index_dirty_for_tests(&self) -> bool {
+        self.vector_index_dirty.load(Ordering::Relaxed)
+    }
+
+    /// Clear the dirty flag without rebuilding so tests can assert a subsequent
+    /// store re-dirties the index.
+    #[allow(dead_code)]
+    pub(crate) fn clear_vector_index_dirty_for_tests(&self) {
+        self.vector_index_dirty.store(false, Ordering::Release);
+    }
+
+    /// Hold or release the detached rebuild guard so tests can observe the
+    /// dirtying side effect without racing the asynchronous rebuild that
+    /// normally consumes the flag immediately.
+    #[allow(dead_code)]
+    pub(crate) fn set_vector_index_rebuild_blocked_for_tests(&self, blocked: bool) {
+        self.vector_index_rebuild_running
+            .store(blocked, Ordering::Release);
+    }
+
+    /// Backdate every retained entry past TTL so a forced cleanup pass expires
+    /// them without sleeping on the wall clock.
+    #[allow(dead_code)]
+    pub(crate) fn expire_all_entries_for_tests(&self) {
+        let age = self.ttl.saturating_add(Duration::from_secs(1));
+        let past = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        for mut entry in self.cache.iter_mut() {
+            entry.inserted_at = past;
+        }
+    }
+
+    /// Bypass the cleanup throttle and run `cleanup_expired` immediately.
+    #[allow(dead_code)]
+    pub(crate) fn force_cleanup_for_tests(&self) {
+        self.last_cleanup.store(u64::MAX, Ordering::Relaxed);
+        self.cleanup_expired();
+    }
+
+    /// Install (or clear) a callback that runs after soft-cap admission and
+    /// before size credit / insert. Used by external tests to park concurrent
+    /// stores so distinct-key soft-cap overshoot is deterministic.
+    #[allow(dead_code)]
+    pub(crate) fn set_store_post_admit_hook_for_tests(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        self.store_post_admit_hook
+            .store(hook.map(|callback| Arc::new(StorePostAdmitHook { callback })));
+    }
+
+    fn run_store_post_admit_hook(&self) {
+        if let Some(hook) = self.store_post_admit_hook.load_full() {
+            (hook.callback)();
+        }
     }
 
     fn refresh_vector_index_if_due(&self) {
@@ -2016,12 +2104,17 @@ impl Plugin for AiSemanticCache {
             embedding.as_ref(),
         );
 
-        // Soft total-size enforcement: this load is separate from the
-        // fetch_add/insert below, so concurrent inserts can each observe an
-        // under-limit total and overshoot the cap transiently. The overshoot
-        // is bounded (each entry is <= max_entry_size_bytes, checked above)
-        // and reclaimed by `cleanup_expired`, so `max_total_size_bytes` is an
-        // approximate ceiling rather than a hard guarantee — see its field doc.
+        // Soft total-size enforcement for different-key admits: this load is
+        // separate from the fetch_add/insert below, so concurrent inserts of
+        // distinct keys can each observe an under-limit total and overshoot
+        // the cap transiently. The overshoot is bounded (each entry is
+        // <= max_entry_size_bytes, checked above) and reclaimed by
+        // `cleanup_expired`, so `max_total_size_bytes` is an approximate
+        // ceiling rather than a hard guarantee — see its field doc.
+        //
+        // Same-key races must not leave permanent phantom bytes: accounting
+        // below credits the new size then subtracts whatever `DashMap::insert`
+        // actually displaced (including an entry inserted by a racing store).
         let current_total = self.total_size.load(Ordering::Relaxed);
         if current_total.saturating_add(approx_size) > self.max_total_size_bytes {
             debug!(
@@ -2033,6 +2126,11 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
+        // Optional test rendezvous: park here after admission so concurrent
+        // stores can all observe the same under-limit total before any size
+        // credit runs. Production keeps the hook empty (lock-free no-op).
+        self.run_store_post_admit_hook();
+
         let entry = CacheEntry {
             status_code: response_status,
             headers: safe_headers.clone(),
@@ -2043,16 +2141,19 @@ impl Plugin for AiSemanticCache {
             embedding: embedding.clone(),
         };
 
+        // Credit the new entry first, then insert. `DashMap::insert` is atomic
+        // per key and returns any displaced value; subtracting that size keeps
+        // `total_size` equal to the retained map even when two stores race on
+        // an empty key (both would previously remove-miss, both add, and the
+        // loser would be overwritten with its size left in the counter).
+        self.total_size
+            .fetch_add(entry.approx_size, Ordering::Relaxed);
         let mut replaced_semantic_entry = false;
-        // Remove old entry size if replacing
-        if let Some((_, old)) = self.cache.remove(&cache_key) {
+        if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
             replaced_semantic_entry = old.embedding.is_some();
             self.total_size
                 .fetch_sub(old.approx_size, Ordering::Relaxed);
         }
-        self.total_size
-            .fetch_add(entry.approx_size, Ordering::Relaxed);
-        self.cache.insert(cache_key.clone(), entry);
         if replaced_semantic_entry || embedding.is_some() {
             self.mark_vector_index_dirty();
             self.refresh_vector_index_if_due();

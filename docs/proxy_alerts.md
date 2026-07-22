@@ -175,6 +175,8 @@ Counts stream disconnects whose `disconnect_cause` matches one of `causes`. Stre
 
 ### Cooldown and recovery
 
+- Sliding-window aging, cooldowns, recovery durations, and background eviction use process-monotonic elapsed time. NTP synchronization, administrator wall-clock corrections, and daylight-saving changes therefore cannot freeze or prematurely advance alert lifecycle state. UTC wall time is used only for quiet-hour matching and rendered notification timestamps.
+- The monotonic epoch is process-local. A process restart or full plugin-instance rebuild resets windows, cooldowns, and recovery state; ordinary in-process clock corrections do not. Incremental reload preservation follows the instance-ownership rules in [Operational notes](#operational-notes).
 - **Cooldown** is per `(rule, proxy, channel)`. After a `Trigger` dispatch for proxy P on channel X, subsequent triggers from the same rule/proxy/channel are suppressed for `cooldown_seconds`. Other proxies and other channels remain free to fire.
 - **Recovery** is opt-in via `recovery: { "resolved_window_seconds": N }`. After a rule transitions Active → Recovering (window dropped below threshold), the rule must remain below threshold for `resolved_window_seconds` before a single `Resolve` event is dispatched. A re-breach inside the window quietly returns to Active without re-firing.
 - Without `recovery`, dropping below threshold immediately resets that proxy/rule incident; the next breach can fire a fresh `Trigger` subject to cooldown.

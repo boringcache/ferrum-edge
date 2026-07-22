@@ -842,7 +842,18 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
     // (`schema_draft`). Runtime compiles every operation with that selector;
     // per-operation copies are not part of the published Admin schema.
     for (path_template, path_item) in paths {
-        let Some(path_object) = path_item.as_object() else {
+        // Resolve Path Item `$ref` (including `components.pathItems` and chained
+        // local refs) before looking up HTTP method keys. Without this step,
+        // referenced operations never enter the generated validator table.
+        let resolved_path_item = resolve_path_item(
+            root,
+            path_item,
+            path_template,
+            MAX_SCHEMA_REF_DEPTH,
+            resolver.document_base(),
+            &resolver,
+        )?;
+        let Some(path_object) = resolved_path_item.as_object() else {
             continue;
         };
         for method in HTTP_METHODS {
@@ -883,6 +894,40 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         }
     }
     Ok(operations)
+}
+
+/// Resolve a Path Item Object that may be supplied through a local `$ref`.
+///
+/// OpenAPI Path Item Objects (Swagger 2.0 and OpenAPI 3.x) may carry a `$ref`
+/// whose target is another Path Item Object in the same document (for example
+/// `#/components/pathItems/Pets` on OpenAPI 3.1+). The importer resolves that
+/// reference before enumerating HTTP methods.
+///
+/// Sibling semantics (Swagger 2.0 and OpenAPI 3.x): the OpenAPI Specification
+/// leaves conflicts between `$ref` and adjacent Path Item fields undefined.
+/// Ferrum applies a deterministic overlay — sibling fields override fields from
+/// the referenced Path Item after resolution (same merge used for Reference
+/// Objects elsewhere in the importer). External Path Item refs are rejected as
+/// [`ExtractError::UnsupportedExternalRef`]; unresolved local refs as
+/// [`ExtractError::SchemaReference`]; cycles and excessive depth as
+/// [`ExtractError::SchemaTooDeep`].
+fn resolve_path_item(
+    root: &Value,
+    path_item: &Value,
+    location: &str,
+    depth: usize,
+    current_base: &Url,
+    resolver: &LocalSchemaResolver,
+) -> Result<Value, ExtractError> {
+    resolve_refs(
+        root,
+        path_item,
+        location,
+        depth,
+        current_base,
+        resolver,
+        ResolveContext::ReferenceObject,
+    )
 }
 
 fn extract_openapi_request_body(

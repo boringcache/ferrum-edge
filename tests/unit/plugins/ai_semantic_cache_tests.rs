@@ -1,6 +1,11 @@
 use ferrum_edge::_test_support::{
-    ai_semantic_cache_embedding, ai_semantic_cache_scope_key,
-    rebuild_ai_semantic_cache_vector_index,
+    ai_semantic_cache_clear_vector_index_dirty_for_test, ai_semantic_cache_embedding,
+    ai_semantic_cache_expire_all_entries_for_test, ai_semantic_cache_force_cleanup_for_test,
+    ai_semantic_cache_scope_key, ai_semantic_cache_set_store_post_admit_hook_for_test,
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test,
+    ai_semantic_cache_size_accounting_snapshot_for_test,
+    ai_semantic_cache_vector_index_dirty_for_test, rebuild_ai_semantic_cache_vector_index,
+    set_ai_semantic_cache_embedding, set_ai_semantic_cache_scope_key,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
@@ -11,7 +16,7 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2591,4 +2596,346 @@ fn shared_admission_rejects_unknown_keys_with_keep_last_known_good_policy() {
         err.contains("did you mean 'cache_multimodal'?"),
         "unexpected admission error: {err}"
     );
+}
+
+// === Concurrent same-key size accounting (#2273) ===
+
+fn assert_size_accounting_exact(plugin: &AiSemanticCache) -> usize {
+    let (tracked, actual) = ai_semantic_cache_size_accounting_snapshot_for_test(plugin);
+    assert_eq!(
+        tracked,
+        actual,
+        "tracked total_size must equal the sum of retained entry approx_size values \
+         (tracked={tracked}, actual={actual}, keys={:?})",
+        plugin.tracked_keys_count()
+    );
+    tracked
+}
+
+fn json_pad_body(tag: &str, pad_bytes: usize) -> Vec<u8> {
+    // Valid JSON string large enough to exercise distinct approx_size values.
+    let mut body = format!(r#""{tag}-"#).into_bytes();
+    body.extend(std::iter::repeat_n(b'x', pad_bytes));
+    body.push(b'"');
+    body
+}
+
+async fn miss_cache_key(plugin: &AiSemanticCache, request_body: &str) -> String {
+    let (ctx, result) = run_before_proxy(plugin, request_body, None).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "expected cache MISS so the store path is exercised"
+    );
+    ctx.metadata
+        .get("_ai_cache_key")
+        .cloned()
+        .expect("MISS must stage _ai_cache_key")
+}
+
+async fn store_with_cache_key(
+    plugin: &AiSemanticCache,
+    cache_key: &str,
+    response_body: &[u8],
+    embedding: Option<Vec<f32>>,
+    scope_key: Option<String>,
+) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.metadata
+        .insert("_ai_cache_key".to_string(), cache_key.to_string());
+    set_ai_semantic_cache_embedding(&mut ctx, embedding);
+    set_ai_semantic_cache_scope_key(&mut ctx, scope_key);
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, response_body)
+        .await;
+}
+
+fn install_post_admit_barrier(plugin: &AiSemanticCache, workers: usize) -> Arc<Barrier> {
+    let barrier = Arc::new(Barrier::new(workers));
+    ai_semantic_cache_set_store_post_admit_hook_for_test(
+        plugin,
+        Some(Arc::new({
+            let barrier = Arc::clone(&barrier);
+            move || {
+                let _ = barrier.wait();
+            }
+        })),
+    );
+    barrier
+}
+
+fn clear_post_admit_hook(plugin: &AiSemanticCache) {
+    ai_semantic_cache_set_store_post_admit_hook_for_test(plugin, None);
+}
+
+/// Concurrent empty same-key inserts must leave one retained entry whose size
+/// equals the tracked counter (no phantom bytes from ignored DashMap overwrites).
+#[tokio::test]
+async fn test_concurrent_empty_same_key_inserts_reconcile_size() {
+    let plugin = Arc::new(make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "max_total_size_bytes": 1_048_576
+    })));
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "same-key concurrent insert"}]
+    });
+    let request_body = serde_json::to_string(&request).unwrap();
+    let cache_key = miss_cache_key(&plugin, &request_body).await;
+    let response_body = json_pad_body("insert", 256);
+
+    const WORKERS: usize = 16;
+    let _barrier = install_post_admit_barrier(&plugin, WORKERS);
+    let mut tasks = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let plugin = Arc::clone(&plugin);
+        let cache_key = cache_key.clone();
+        let response_body = response_body.clone();
+        // Blocking pool so the sync post-admit barrier does not stall tokio workers.
+        tasks.push(tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(store_with_cache_key(
+                &plugin,
+                &cache_key,
+                &response_body,
+                None,
+                None,
+            ));
+        }));
+    }
+    for task in tasks {
+        task.await.expect("same-key insert task panicked");
+    }
+    clear_post_admit_hook(&plugin);
+
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_size_accounting_exact(&plugin);
+}
+
+/// Concurrent same-key replacements with different body sizes must keep the
+/// counter equal to the single retained winner's approx_size.
+#[tokio::test]
+async fn test_concurrent_same_key_replacement_different_sizes_reconcile() {
+    let plugin = Arc::new(make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "max_total_size_bytes": 1_048_576
+    })));
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "same-key size replacement"}]
+    });
+    let request_body = serde_json::to_string(&request).unwrap();
+    let cache_key = miss_cache_key(&plugin, &request_body).await;
+
+    // Seed an existing entry so replacements displace a non-empty value.
+    store_with_cache_key(&plugin, &cache_key, &json_pad_body("seed", 64), None, None).await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    let seed_total = assert_size_accounting_exact(&plugin);
+    assert!(seed_total > 0);
+
+    const WORKERS: usize = 12;
+    let _barrier = install_post_admit_barrier(&plugin, WORKERS);
+    let mut tasks = Vec::with_capacity(WORKERS);
+    for i in 0..WORKERS {
+        let plugin = Arc::clone(&plugin);
+        let cache_key = cache_key.clone();
+        let response_body = json_pad_body(&format!("repl-{i}"), 128 + i * 97);
+        tasks.push(tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(store_with_cache_key(
+                &plugin,
+                &cache_key,
+                &response_body,
+                None,
+                None,
+            ));
+        }));
+    }
+    for task in tasks {
+        task.await.expect("same-key replacement task panicked");
+    }
+    clear_post_admit_hook(&plugin);
+
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_size_accounting_exact(&plugin);
+}
+
+/// After a same-key race settles, expiry must subtract exactly the retained
+/// entry — no leftover phantom bytes that would poison later admits.
+#[tokio::test]
+async fn test_expiry_after_same_key_race_reconciles_to_zero() {
+    let plugin = Arc::new(make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "max_total_size_bytes": 1_048_576
+    })));
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "same-key expiry after race"}]
+    });
+    let request_body = serde_json::to_string(&request).unwrap();
+    let cache_key = miss_cache_key(&plugin, &request_body).await;
+
+    const WORKERS: usize = 16;
+    let _barrier = install_post_admit_barrier(&plugin, WORKERS);
+    let mut tasks = Vec::with_capacity(WORKERS);
+    for i in 0..WORKERS {
+        let plugin = Arc::clone(&plugin);
+        let cache_key = cache_key.clone();
+        let response_body = json_pad_body(&format!("expire-{i}"), 160 + i * 17);
+        tasks.push(tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(store_with_cache_key(
+                &plugin,
+                &cache_key,
+                &response_body,
+                None,
+                None,
+            ));
+        }));
+    }
+    for task in tasks {
+        task.await.expect("expiry-race store task panicked");
+    }
+    clear_post_admit_hook(&plugin);
+
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_size_accounting_exact(&plugin);
+
+    ai_semantic_cache_expire_all_entries_for_test(&plugin);
+    ai_semantic_cache_force_cleanup_for_test(&plugin);
+
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    assert_eq!(assert_size_accounting_exact(&plugin), 0);
+}
+
+/// Different-key soft-cap overshoot remains allowed and stays reconcilable:
+/// concurrent distinct keys may briefly exceed `max_total_size_bytes`, but the
+/// counter still equals the retained-entry size sum.
+#[tokio::test]
+async fn test_concurrent_different_key_soft_cap_overshoot_reconciles() {
+    // Each ~4 KiB body plus structural overhead fits under 6 KiB alone; two
+    // concurrent admits both observe an empty total and overshoot together.
+    let max_total = 6_000usize;
+    let plugin = Arc::new(make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "max_total_size_bytes": max_total,
+        "max_entry_size_bytes": 8_192
+    })));
+
+    let request_a = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "soft-cap key A"}]
+    });
+    let request_b = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "soft-cap key B"}]
+    });
+    let key_a = miss_cache_key(&plugin, &serde_json::to_string(&request_a).unwrap()).await;
+    let key_b = miss_cache_key(&plugin, &serde_json::to_string(&request_b).unwrap()).await;
+    assert_ne!(key_a, key_b);
+
+    let body_a = json_pad_body("soft-a", 4_096);
+    let body_b = json_pad_body("soft-b", 4_096);
+    let _barrier = install_post_admit_barrier(&plugin, 2);
+    let mut tasks = Vec::with_capacity(2);
+    for (cache_key, response_body) in [(key_a, body_a), (key_b, body_b)] {
+        let plugin = Arc::clone(&plugin);
+        tasks.push(tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(store_with_cache_key(
+                &plugin,
+                &cache_key,
+                &response_body,
+                None,
+                None,
+            ));
+        }));
+    }
+    for task in tasks {
+        task.await.expect("soft-cap overshoot task panicked");
+    }
+    clear_post_admit_hook(&plugin);
+
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(2),
+        "both different-key admits should land under the documented soft-cap race"
+    );
+    let total = assert_size_accounting_exact(&plugin);
+    assert!(
+        total > max_total,
+        "expected transient different-key soft-cap overshoot (total={total}, max={max_total})"
+    );
+}
+
+/// Same-key replacement that gains or loses an embedding must still dirty the
+/// semantic vector index (accounting fix must not drop that side effect).
+#[tokio::test]
+async fn test_same_key_replacement_dirties_vector_index_on_embedding_change() {
+    // Semantic mode is required so `mark_vector_index_dirty` is armed; the
+    // embedding itself is staged directly so we do not depend on a live
+    // embedding HTTP round-trip for this dirtying side-effect check.
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+        "semantic_embedding_api_key": "test-key",
+        "semantic_similarity_threshold": 0.95
+    }));
+
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "embedding dirty on replace"}]
+    });
+    let request_body = serde_json::to_string(&request).unwrap();
+    // Force an exact-path cache key without calling the (unreachable) embedding
+    // endpoint: stage `_ai_cache_key` via a miss that fails closed to exact.
+    let cache_key = {
+        let (ctx, result) = run_before_proxy(&plugin, &request_body, None).await;
+        assert!(matches!(result, PluginResult::Continue));
+        ctx.metadata
+            .get("_ai_cache_key")
+            .cloned()
+            .expect("embedding failure still stages an exact-cache key")
+    };
+
+    // Exact-only seed (no embedding) then a replace that gains an embedding.
+    store_with_cache_key(&plugin, &cache_key, br#""seed""#, None, None).await;
+    ai_semantic_cache_clear_vector_index_dirty_for_test(&plugin);
+    assert!(!ai_semantic_cache_vector_index_dirty_for_test(&plugin));
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(&plugin, true);
+
+    store_with_cache_key(
+        &plugin,
+        &cache_key,
+        br#""with-embedding""#,
+        Some(vec![1.0, 0.0, 0.0]),
+        Some("scope:embedding-dirty".to_string()),
+    )
+    .await;
+    assert!(
+        ai_semantic_cache_vector_index_dirty_for_test(&plugin),
+        "gaining an embedding on same-key replace must dirty the vector index"
+    );
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(&plugin, false);
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_size_accounting_exact(&plugin);
+
+    // Losing the embedding on a later replace must also dirty.
+    ai_semantic_cache_clear_vector_index_dirty_for_test(&plugin);
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(&plugin, true);
+    store_with_cache_key(&plugin, &cache_key, br#""no-embedding""#, None, None).await;
+    assert!(
+        ai_semantic_cache_vector_index_dirty_for_test(&plugin),
+        "losing an embedding on same-key replace must dirty the vector index"
+    );
+    ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(&plugin, false);
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_size_accounting_exact(&plugin);
 }

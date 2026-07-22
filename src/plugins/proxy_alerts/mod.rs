@@ -35,6 +35,9 @@
 //!   poison-recovering cold-path mutex so a stale sweep cannot delete rows
 //!   for the latest published map. Expired cooldown timestamps and terminal
 //!   Healthy recovery rows are also swept by the background eviction task.
+//! - **Clock separation**: sliding windows, cooldown/recovery durations, and
+//!   lifecycle eviction use one process-monotonic clock. UTC is consulted only
+//!   for quiet-hour policy and human-readable notification timestamps.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -66,9 +69,7 @@ pub mod windows;
 use config::{ProxyAlertsConfig, QuietHourWindow};
 use cooldown::{CooldownGate, LifecycleOutcome, RecoveryGate, RuleState};
 use rules::{Rule, RuleObservation, SampleInput};
-use windows::WindowStore;
-#[cfg(test)]
-use windows::current_epoch_ms;
+use windows::{WindowStore, monotonic_now_ms};
 
 /// Floor for background lifecycle retention, matching the historical window
 /// sweep cadence documented for inactive proxies.
@@ -344,7 +345,7 @@ impl ProxyAlerts {
             return;
         }
         let now = Utc::now();
-        let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+        let now_ms = monotonic_now_ms();
         let in_quiet = self.quiet_hours.iter().any(|w| w.matches(now));
         for rule in self.rules.iter() {
             let Some(observation) = rule.observe(sample, &self.windows, now_ms) else {
@@ -547,7 +548,7 @@ fn start_lifecycle_eviction_task(
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
-            let now_ms = windows::current_epoch_ms();
+            let now_ms = windows::monotonic_now_ms();
             // A sample can pass the admission-generation check immediately
             // before a cache commit and finish its write immediately after the
             // commit-time retain. Generation-keying isolates that row from the
@@ -733,7 +734,7 @@ mod tests {
                 0,
                 "p1",
                 UNARMED_PROXY_LIFECYCLE_GENERATION,
-                current_epoch_ms(),
+                monotonic_now_ms(),
             ),
             (0, 0)
         );
@@ -746,7 +747,7 @@ mod tests {
                 0,
                 "p1",
                 UNARMED_PROXY_LIFECYCLE_GENERATION,
-                current_epoch_ms(),
+                monotonic_now_ms(),
             ),
             (1, 1)
         );
@@ -818,7 +819,7 @@ mod tests {
                 "p1",
                 0,
                 60_000,
-                current_epoch_ms(),
+                monotonic_now_ms(),
                 UNARMED_PROXY_LIFECYCLE_GENERATION,
             ),
             "a dropped dispatch must not arm the trigger cooldown"
@@ -922,7 +923,7 @@ mod tests {
             ]
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
-        let now_ms = current_epoch_ms();
+        let now_ms = monotonic_now_ms();
         assert!(plugin.cooldowns.try_acquire(
             0,
             "p1",
@@ -992,7 +993,20 @@ mod tests {
             ..TransactionSummary::default()
         };
 
-        plugin.log(&summary).await;
+        let sample = SampleInput::Http(&summary);
+        let rule = &plugin.rules[0];
+        let first_resolve_ms = 5_002;
+        let observation = rule
+            .observe(sample, &plugin.windows, first_resolve_ms)
+            .expect("error-rate rule observes HTTP summaries");
+        plugin.process_observation(
+            rule,
+            &observation,
+            sample,
+            first_resolve_ms,
+            chrono::Utc::now(),
+            false,
+        );
         assert!(matches!(
             plugin
                 .recovery
@@ -1001,7 +1015,18 @@ mod tests {
         ));
 
         drop(held_permit);
-        plugin.log(&summary).await;
+        let second_resolve_ms = first_resolve_ms + 1;
+        let observation = rule
+            .observe(sample, &plugin.windows, second_resolve_ms)
+            .expect("error-rate rule observes HTTP summaries");
+        plugin.process_observation(
+            rule,
+            &observation,
+            sample,
+            second_resolve_ms,
+            chrono::Utc::now(),
+            false,
+        );
         assert_eq!(
             plugin
                 .recovery
