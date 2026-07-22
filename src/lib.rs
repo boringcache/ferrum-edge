@@ -1162,6 +1162,18 @@ pub mod _test_support {
         plugin.size_accounting_snapshot_for_tests()
     }
 
+    pub fn response_caching_vary_index_snapshot_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> Vec<(String, Vec<String>)> {
+        plugin.vary_index_snapshot_for_tests()
+    }
+
+    pub fn response_caching_cache_keys_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> Vec<String> {
+        plugin.cache_keys_for_tests()
+    }
+
     /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
     /// standalone counter so tests can prove a drift larger than the current
     /// total saturates at `0` instead of wrapping to `usize::MAX`.

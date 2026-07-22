@@ -4,9 +4,10 @@ use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     advance_response_caching_clock_for_test, clone_log_metadata,
+    response_caching_cache_keys_for_test,
     response_caching_current_total_size_for_test, response_caching_instance_id_for_test,
     response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
-    response_caching_staging_metadata_key_for_test,
+    response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
@@ -3276,6 +3277,92 @@ async fn test_concurrent_stores_keep_size_bounded_and_non_wrapping() {
     assert!(
         total <= 4096,
         "total_size exceeded configured max_total_size_bytes: {total}"
+    );
+}
+
+/// Concurrent cold fills that discover different Vary dimensions must publish
+/// one monotonic union. Widening the index must also remove older narrow-key
+/// entries whose missing request-header values cannot be reconstructed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_stores_atomically_union_vary_dimensions_and_remove_narrow_entries() {
+    let plugin = Arc::new(
+        ResponseCaching::new(&json!({
+            "ttl_seconds": 60,
+            "max_total_size_bytes": 1024 * 1024,
+            "max_entries": 64
+        }))
+        .expect("config should be valid"),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let mut tasks = Vec::new();
+    for (request_header, request_value, body) in
+        [("x-a", "value-a", b"body-a"), ("x-b", "value-b", b"body-b")]
+    {
+        let plugin = Arc::clone(&plugin);
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            let mut ctx = make_ctx("GET", "/vary-race");
+            ctx.headers
+                .insert(request_header.to_string(), request_value.to_string());
+            let mut request_headers = ctx.headers.clone();
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut request_headers).await,
+                PluginResult::Continue
+            ));
+
+            let mut response_headers = HashMap::from([
+                (
+                    "cache-control".to_string(),
+                    "public, max-age=60".to_string(),
+                ),
+                ("vary".to_string(), request_header.to_string()),
+            ]);
+            plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await;
+
+            // Both requests complete lookup before either response is
+            // published, matching concurrent cold fills for one base key.
+            barrier.wait().await;
+            plugin
+                .on_final_response_body(&mut ctx, 200, &response_headers, body)
+                .await;
+        }));
+    }
+    for task in tasks {
+        task.await.expect("store task panicked");
+    }
+
+    let vary_index = response_caching_vary_index_snapshot_for_test(&plugin);
+    assert_eq!(vary_index.len(), 1, "one base key should be indexed");
+    assert_eq!(
+        vary_index[0].1,
+        vec!["x-a".to_string(), "x-b".to_string()],
+        "concurrent stores must publish the full Vary union"
+    );
+
+    let cache_keys = response_caching_cache_keys_for_test(&plugin);
+    assert_eq!(
+        cache_keys.len(),
+        1,
+        "the older narrow-key variant must be deliberately removed when the index widens"
+    );
+    assert_size_accounting_exact(&plugin);
+
+    let mut hit_count = 0;
+    for (request_header, request_value) in [("x-a", "value-a"), ("x-b", "value-b")] {
+        let mut ctx = make_ctx("GET", "/vary-race");
+        ctx.headers
+            .insert(request_header.to_string(), request_value.to_string());
+        let mut request_headers = ctx.headers.clone();
+        if is_reject(&plugin.before_proxy(&mut ctx, &mut request_headers).await) {
+            hit_count += 1;
+        }
+    }
+    assert_eq!(
+        hit_count, 1,
+        "the sole retained wide-key entry must remain reachable under the final union"
     );
 }
 
