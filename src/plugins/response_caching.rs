@@ -1965,7 +1965,7 @@ impl Plugin for ResponseCaching {
 
         if body.len() > self.config.max_entry_size_bytes {
             debug!(
-                cache_key = %cache_key,
+                base_key = %base_key,
                 body_size = body.len(),
                 max_size = self.config.max_entry_size_bytes,
                 "response_caching: response body exceeds max_entry_size_bytes, skipping cache"
