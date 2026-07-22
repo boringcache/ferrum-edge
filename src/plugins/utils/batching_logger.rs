@@ -1,10 +1,12 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -104,6 +106,11 @@ pub struct BatchConfig {
 }
 
 pub struct BatchingLogger<T: Send + 'static> {
+    /// Pre-publication dormancy gate. [`Self::commit`] releases the flush
+    /// worker; dropping this sender without commit makes the worker exit with
+    /// no flush/network side effects.
+    commit_tx: watch::Sender<bool>,
+    committed: AtomicBool,
     sender: Option<mpsc::Sender<T>>,
     worker: Option<JoinHandle<()>>,
     plugin_name: &'static str,
@@ -192,6 +199,10 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// Spawn the flush loop on the current runtime and return a handle that
     /// plugins hold in their `Arc<dyn Plugin>` state.
     ///
+    /// The worker remains dormant until [`Self::commit`] (plugin-cache
+    /// publication). Dropping an uncommitted logger cancels the worker with no
+    /// flush side effects.
+    ///
     /// `flush` is called with a non-empty `Vec<T>` whenever the batch is full
     /// OR the flush interval has elapsed with at least one buffered entry.
     ///
@@ -214,6 +225,25 @@ impl<T: Send + 'static> BatchingLogger<T> {
         F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
+        let (commit_tx, commit_rx) = watch::channel(false);
+        Self::spawn_with_hooks_on_commit_gate(cfg, hooks, commit_tx, commit_rx, flush)
+    }
+
+    /// Like [`Self::spawn_with_hooks`], but shares an external commit gate so
+    /// sibling workers (spool replay, snapshot) wake on the same publication
+    /// signal.
+    pub fn spawn_with_hooks_on_commit_gate<F, Fut>(
+        cfg: BatchConfig,
+        hooks: LoggerHooks<T>,
+        commit_tx: watch::Sender<bool>,
+        commit_rx: watch::Receiver<bool>,
+        flush: F,
+    ) -> Self
+    where
+        T: Clone,
+        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
         let batch_size = cfg.batch_size.clamp(1, MAX_BATCH_SIZE);
         let buffer_capacity = cfg.buffer_capacity.clamp(1, MAX_BUFFER_CAPACITY);
         let flush_interval = if cfg.flush_interval.is_zero() {
@@ -231,25 +261,55 @@ impl<T: Send + 'static> BatchingLogger<T> {
             flush_interval,
             ..cfg
         };
+        let plugin_name = cfg.plugin_name;
+        let buffer_capacity = cfg.buffer_capacity;
         let (sender, receiver) = mpsc::channel(cfg.buffer_capacity);
         let queue_depth = Arc::new(AtomicUsize::new(0));
-        let worker = tokio::spawn(run_flush_loop_with_hooks(
-            cfg,
-            receiver,
-            Arc::clone(&queue_depth),
-            flush,
-            hooks.on_failed_batch.clone(),
-        ));
+        let worker_queue_depth = Arc::clone(&queue_depth);
+        let on_failed_batch = hooks.on_failed_batch.clone();
+        let worker = tokio::spawn(async move {
+            if !wait_until_committed(commit_rx).await {
+                // Staged generation was dropped/rejected before publication.
+                // Discard the receiver without entering the flush loop so no
+                // network or fallback side effects can run.
+                drop(receiver);
+                return;
+            }
+            run_flush_loop_with_hooks(cfg, receiver, worker_queue_depth, flush, on_failed_batch)
+                .await;
+        });
 
         Self {
+            commit_tx,
+            committed: AtomicBool::new(false),
             sender: Some(sender),
             worker: Some(worker),
-            plugin_name: cfg.plugin_name,
+            plugin_name,
             dropped_count: Arc::new(AtomicU64::new(0)),
             queue_depth,
-            buffer_capacity: cfg.buffer_capacity,
+            buffer_capacity,
             hooks,
         }
+    }
+
+    /// Release the pre-publication dormancy gate. Idempotent and infallible.
+    pub fn commit(&self) {
+        if self.committed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.commit_tx.send(true);
+    }
+
+    /// Whether [`Self::commit`] has already released this worker.
+    #[allow(dead_code)] // External lifecycle tests observe pre/post-publication state.
+    pub fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    /// Borrow the commit sender so sibling staged workers can subscribe to the
+    /// same publication signal.
+    pub fn commit_sender(&self) -> &watch::Sender<bool> {
+        &self.commit_tx
     }
 
     /// Cloneable admission handle sharing this logger's channel. Returns
@@ -269,10 +329,17 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// batches finish before a downstream sink (for example librdkafka) is
     /// flushed. Exact-once: subsequent calls are no-ops.
     ///
+    /// Uncommitted loggers abort instead of draining so a rejected staged
+    /// generation cannot flush as a side effect of teardown.
+    ///
     /// Callers that published [`BatchingLoggerHandle`] clones must drop those
     /// handles first; otherwise the channel stays open until every clone is
     /// released.
     pub async fn close_and_await(&mut self) -> bool {
+        if !self.committed.load(Ordering::Acquire) {
+            self.close_and_abort();
+            return true;
+        }
         drop(self.sender.take());
         if let Some(worker) = self.worker.take() {
             return worker.await.is_ok();
@@ -388,6 +455,131 @@ impl<T: Send + 'static> BatchingLogger<T> {
     }
 }
 
+/// Lifecycle owner that stages a [`BatchingLogger`] from
+/// [`crate::plugins::Plugin::start_background_tasks`] and releases it from
+/// [`crate::plugins::Plugin::commit_background_tasks`] after PluginCache
+/// atomically installs the generation.
+///
+/// Offline `ferrum-edge validate` and Admin admission construct plugins without
+/// a Tokio runtime and without calling `start_background_tasks`, so validation
+/// stays runtime-free and leaves no flush worker behind. Staged workers stay
+/// dormant until [`Self::commit`]; dropping an uncommitted logger cancels them
+/// with no flush side effects.
+pub struct DeferredBatchingLogger<T: Send + 'static> {
+    logger: OnceLock<BatchingLogger<T>>,
+    start_lock: Mutex<()>,
+}
+
+impl<T: Send + 'static> Default for DeferredBatchingLogger<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send + 'static> DeferredBatchingLogger<T> {
+    pub fn new() -> Self {
+        Self {
+            logger: OnceLock::new(),
+            start_lock: Mutex::new(()),
+        }
+    }
+
+    #[allow(dead_code)] // External lifecycle tests observe staged activation.
+    pub fn is_started(&self) -> bool {
+        self.logger.get().is_some()
+    }
+
+    #[allow(dead_code)] // Test/support consumers inspect the staged logger directly.
+    pub fn get(&self) -> Option<&BatchingLogger<T>> {
+        self.logger.get()
+    }
+
+    /// Idempotent staging. Requires a Tokio runtime. The flush worker stays
+    /// dormant until [`Self::commit`] after cache publication.
+    pub fn start_with_hooks<F, Fut>(
+        &self,
+        plugin_name: &'static str,
+        cfg: BatchConfig,
+        hooks: LoggerHooks<T>,
+        flush: F,
+    ) -> Result<(), String>
+    where
+        T: Clone,
+        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        if self.logger.get().is_some() {
+            return Ok(());
+        }
+        let _guard = self.start_lock.lock().map_err(|_| {
+            format!("{plugin_name}: start lock poisoned; refusing to start batching worker")
+        })?;
+        if self.logger.get().is_some() {
+            return Ok(());
+        }
+        let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            format!("{plugin_name}: start_background_tasks requires a Tokio runtime")
+        })?;
+        let logger = BatchingLogger::spawn_with_hooks(cfg, hooks, flush);
+        match self.logger.set(logger) {
+            Ok(()) => Ok(()),
+            Err(mut logger) => {
+                // Slot already occupied (should be unreachable under start_lock).
+                // Abort the just-spawned worker so it cannot outlive this failure.
+                logger.close_and_abort();
+                Err(format!(
+                    "{plugin_name}: batching worker already started; refusing duplicate activation"
+                ))
+            }
+        }
+    }
+
+    /// Variant of [`Self::start_with_hooks`] with default logger hooks.
+    pub fn start<F, Fut>(
+        &self,
+        plugin_name: &'static str,
+        cfg: BatchConfig,
+        flush: F,
+    ) -> Result<(), String>
+    where
+        T: Clone,
+        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.start_with_hooks(plugin_name, cfg, LoggerHooks::default(), flush)
+    }
+
+    /// Release the staged flush worker after PluginCache publication.
+    /// Idempotent; no-op when [`Self::start`] has not run.
+    pub fn commit(&self) {
+        if let Some(logger) = self.logger.get() {
+            logger.commit();
+        }
+    }
+
+    /// Whether the staged logger has been released by [`Self::commit`].
+    #[allow(dead_code)] // External lifecycle tests observe pre/post-publication state.
+    pub fn is_committed(&self) -> bool {
+        self.logger.get().is_some_and(BatchingLogger::is_committed)
+    }
+
+    /// Non-blocking send. Returns `false` when the worker has not started yet
+    /// or the underlying logger drops the entry. Queued items stay buffered
+    /// until [`Self::commit`] releases the flush loop.
+    pub fn try_send(&self, item: T) -> bool {
+        match self.logger.get() {
+            Some(logger) => logger.try_send(item),
+            None => false,
+        }
+    }
+
+    /// Reserve a queue slot when the worker is staged. Returns `None` when
+    /// background staging has not run or the buffer is full/closed.
+    pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
+        self.logger.get().and_then(BatchingLogger::try_reserve)
+    }
+}
+
 impl<T: Send + 'static> BatchingLoggerHandle<T> {
     /// Non-blocking send. On full buffer, logs a warning once per N drops and
     /// silently drops intermediate entries so the hot path never blocks.
@@ -482,6 +674,20 @@ fn record_drop(dropped_count: &AtomicU64, plugin_name: &'static str, reason: &st
             DROP_WARN_EVERY,
         );
     }
+}
+
+/// Wait until the owning cache generation is committed, or exit when the
+/// staged generation is dropped without publication.
+pub async fn wait_until_committed(mut commit_rx: watch::Receiver<bool>) -> bool {
+    if *commit_rx.borrow() {
+        return true;
+    }
+    while commit_rx.changed().await.is_ok() {
+        if *commit_rx.borrow() {
+            return true;
+        }
+    }
+    false
 }
 
 async fn run_flush_loop_with_hooks<T, F, Fut>(

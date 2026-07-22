@@ -2787,8 +2787,11 @@ where
                 // An H3 client bridged to an H1/H2 backend must not receive a
                 // protected representation this gateway could not inspect just
                 // because the frontend protocol differs.
+                let owned_grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx)
+                        .map(str::to_owned);
                 let grpc_web_response_content_type =
-                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                    owned_grpc_web_response_content_type.as_deref();
                 let admission = crate::proxy::admit_buffered_response_body_transforms(
                     plugins,
                     ctx,
@@ -4706,8 +4709,9 @@ where
             // the transforms see. A rejection here replaces the response, so the
             // backend trailers no longer describe the bytes being sent and are
             // dropped — the same rule the deadline replacement below follows.
-            let grpc_web_response_content_type =
-                crate::plugins::grpc_web::retained_response_content_type(ctx);
+            let owned_grpc_web_response_content_type =
+                crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+            let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
             let admission = crate::proxy::admit_buffered_response_body_transforms(
                 plugins,
                 ctx,
@@ -5862,15 +5866,20 @@ fn replace_buffered_grpc_response_with_deadline(
     response_trailers: &mut HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
-    let grpc_web_response_content_type =
-        crate::plugins::grpc_web::retained_response_content_type(ctx).or_else(|| {
-            response_headers
-                .get("content-type")
-                .filter(|content_type| {
-                    crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
-                })
-                .map(|content_type| crate::plugins::grpc_web::response_content_type(content_type))
-        });
+    let owned_grpc_web_response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(ctx)
+            .map(str::to_owned)
+            .or_else(|| {
+                response_headers
+                    .get("content-type")
+                    .filter(|content_type| {
+                        crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                    })
+                    .map(|content_type| {
+                        crate::plugins::grpc_web::response_content_type(content_type)
+                    })
+            });
+    let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
     *response_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
         ctx,
         grpc_web_response_content_type,

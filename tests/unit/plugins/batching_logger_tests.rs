@@ -4,12 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::plugins::utils::{
-    BatchConfig, BatchConfigDefaults, BatchingLogger, LoggerHooks, MAX_BATCH_SIZE,
-    MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config, handle_http_batch_response,
-    parse_custom_headers, parse_http_endpoint, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, BatchingLogger, DeferredBatchingLogger, LoggerHooks,
+    MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config,
+    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
+    wait_until_committed,
 };
 use serde_json::json;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::timeout;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -323,6 +324,8 @@ async fn try_send_batch_threshold_triggers_flush() {
         },
     );
 
+    logger.commit();
+
     logger.try_send(1);
     logger.try_send(2);
 
@@ -349,6 +352,8 @@ async fn reserved_slot_excludes_concurrent_reservation_until_send() {
         },
     );
 
+    logger.commit();
+
     let permit = logger.try_reserve().expect("first slot must reserve");
     assert!(
         logger.try_reserve().is_none(),
@@ -365,6 +370,8 @@ async fn dropping_unused_reservation_releases_capacity() {
         test_logger_config("batching_logger_reserve_drop", 1, 1),
         move |_batch: Vec<u32>| async move { Ok(()) },
     );
+
+    logger.commit();
 
     let permit = logger.try_reserve().expect("first slot must reserve");
     drop(permit);
@@ -400,6 +407,8 @@ async fn oversized_batch_size_is_capped_before_flush_loop() {
         },
     );
 
+    logger.commit();
+
     for value in 0..MAX_BATCH_SIZE {
         logger.try_send(value);
     }
@@ -429,6 +438,8 @@ async fn interval_timer_flushes_partial_batch() {
             }
         },
     );
+
+    logger.commit();
 
     logger.try_send(7);
 
@@ -460,6 +471,8 @@ async fn retry_policy_retries_failed_flushes() {
             }
         },
     );
+
+    logger.commit();
 
     logger.try_send(9);
 
@@ -493,6 +506,8 @@ async fn exhausted_retries_log_and_drop_batch() {
             },
         );
 
+        logger.commit();
+
         logger.try_send(1);
         wait_for_flush(&notify).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -523,6 +538,8 @@ async fn dropping_logger_drains_remaining_entries() {
         },
     );
 
+    logger.commit();
+
     logger.try_send(42);
     drop(logger);
 
@@ -549,6 +566,8 @@ async fn full_channel_warns_once_per_rate_limit_window() {
                 Ok(())
             },
         );
+
+        logger.commit();
 
         logger.try_send(1);
         for value in 2..10 {
@@ -590,6 +609,8 @@ async fn high_water_hook_fires_without_overflow_hook() {
             Ok(())
         },
     );
+
+    logger.commit();
 
     assert!(logger.try_send(1));
     assert!(!logger.try_send(2));
@@ -642,6 +663,8 @@ async fn single_attempt_flush_reuses_owned_batch_without_clone() {
         },
     );
 
+    logger.commit();
+
     logger.try_send(CloneTracked::new(11, Arc::clone(&clone_count)));
 
     wait_for_flush(&notify).await;
@@ -674,6 +697,8 @@ async fn retries_clone_only_before_final_attempt() {
             }
         },
     );
+
+    logger.commit();
 
     logger.try_send(CloneTracked::new(22, Arc::clone(&clone_count)));
 
@@ -715,5 +740,75 @@ async fn validate_plugin_config_with_policy_screens_literal_ip_endpoint() {
             &BackendEgressPolicy::unrestricted()
         )
         .is_ok()
+    );
+}
+
+#[test]
+fn deferred_batching_logger_default_is_unstarted() {
+    let logger = DeferredBatchingLogger::<u32>::default();
+    assert!(!logger.is_started());
+    assert!(logger.get().is_none());
+    assert!(!logger.try_send(1));
+}
+
+/// Uncommitted close must abort the dormant worker instead of draining it.
+#[tokio::test]
+async fn batching_logger_close_and_await_aborts_when_uncommitted() {
+    let flushed = Arc::new(AtomicUsize::new(0));
+    let flushed_cb = Arc::clone(&flushed);
+    let mut logger = BatchingLogger::spawn(
+        test_logger_config("batching_logger_uncommitted_close", 1, 8),
+        move |batch: Vec<u32>| {
+            flushed_cb.fetch_add(batch.len(), Ordering::SeqCst);
+            async move { Ok(()) }
+        },
+    );
+    assert!(logger.try_send(9));
+    assert!(
+        logger.close_and_await().await,
+        "uncommitted close_and_await must abort and report success"
+    );
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        flushed.load(Ordering::SeqCst),
+        0,
+        "uncommitted close must not flush buffered entries"
+    );
+}
+
+/// Deferred helpers expose the staged logger for lifecycle observers.
+#[tokio::test]
+async fn deferred_batching_logger_get_returns_staged_logger() {
+    let deferred = DeferredBatchingLogger::<u32>::new();
+    assert!(deferred.get().is_none());
+    deferred
+        .start(
+            "deferred_batching_logger_get",
+            test_logger_config("deferred_batching_logger_get", 1, 8),
+            |_batch| async move { Ok(()) },
+        )
+        .expect("stage under tokio");
+    let staged = deferred.get().expect("staged logger visible via get()");
+    assert!(!staged.is_committed());
+    assert!(deferred.try_send(3));
+    deferred.commit();
+    assert!(deferred.is_committed());
+}
+
+/// wait_until_committed ignores false notifications and returns false when the
+/// commit gate is dropped without publication.
+#[tokio::test]
+async fn wait_until_committed_ignores_false_notifications_then_exits_on_drop() {
+    let (tx, rx) = watch::channel(false);
+    let waiter = tokio::spawn(async move { wait_until_committed(rx).await });
+    // Allow the waiter to park on changed() before emitting a no-op false send.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    tx.send(false).expect("false notification");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    drop(tx);
+    assert!(
+        !waiter.await.expect("join waiter"),
+        "dropping the commit gate without true must return false"
     );
 }
