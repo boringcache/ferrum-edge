@@ -85,6 +85,20 @@ fn wrr_source_no_longer_guards_lane_state_with_mutex_vec() {
         source.contains("try_lock"),
         "schedule publish must use try_lock so misses stay contention-bounded"
     );
+    assert!(
+        source.contains("WRR_MISS_PUBLISH_SAMPLE"),
+        "full-cache schedule replacement must be rate-sampled"
+    );
+    assert!(
+        source.contains("pick_wrr_miss_fallback_bitset")
+            && source.contains("pick_wrr_miss_fallback_vec"),
+        "cache misses must have an allocation-free candidate-scan fallback"
+    );
+    assert!(
+        !source.contains("build a local schedule")
+            && !source.contains("Contending missers build a local"),
+        "contending missers must not allocate ephemeral smooth-WRR schedules"
+    );
 }
 
 #[test]
@@ -398,4 +412,99 @@ fn wrr_vec_path_alternating_exclusions_remain_correct() {
     for handle in handles {
         handle.join().expect("worker");
     }
+}
+
+#[test]
+fn wrr_fingerprint_churn_beyond_cache_capacity_amortizes_publishes() {
+    // WRR_SCHEDULE_CACHE_SLOTS is 8. Rotating exclusions over 9 equal-weight
+    // targets yields capacity+1 distinct healthy-set fingerprints. Sustained
+    // cycling must not publish/rebuild a smooth schedule on every miss, and
+    // selections must stay on eligible positive-weight targets only.
+    const CACHE_SLOTS: usize = 8;
+    const TARGETS: usize = CACHE_SLOTS + 1;
+    let weights = vec![1u32; TARGETS];
+    let targets = weighted_targets(&weights);
+    let lb = LoadBalancer::new(
+        UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    );
+
+    let cycles = 200usize;
+    let mut selections = 0u64;
+    for _ in 0..cycles {
+        for exclude in &targets {
+            let sel = lb
+                .select_excluding("", exclude, None)
+                .expect("capacity+1 churn selection");
+            assert_ne!(
+                sel.host, exclude.host,
+                "miss fallback must not select the excluded target"
+            );
+            assert!(
+                targets.iter().any(|t| t.host == sel.host && t.weight > 0),
+                "selection must be an eligible positive-weight target"
+            );
+            selections += 1;
+        }
+    }
+
+    let (publishes, fallbacks) = lb.wrr_parent_schedule_counters();
+    assert!(
+        fallbacks > 0,
+        "capacity+1 fingerprint churn must exercise the allocation-free miss path"
+    );
+    // Cold-fill can publish up to CACHE_SLOTS schedules; afterward publishes are
+    // rate-sampled (WRR_MISS_PUBLISH_SAMPLE = 64). Even a loose bound stays far
+    // below one publish per selection.
+    let max_publishes = (CACHE_SLOTS as u64) + selections / 32 + 1;
+    assert!(
+        publishes <= max_publishes,
+        "publishes={publishes} exceeded amortized bound {max_publishes} for {selections} selections"
+    );
+    assert!(
+        publishes * 10 < selections,
+        "publishes={publishes} must remain << selections={selections}"
+    );
+}
+
+#[test]
+fn wrr_vec_path_fingerprint_churn_beyond_cache_capacity_amortizes_publishes() {
+    // Same capacity+1 amortization contract on the >128-target Vec cache keys.
+    const CACHE_SLOTS: usize = 8;
+    let n = 129usize;
+    let weights = vec![1u32; n];
+    let targets = weighted_targets(&weights);
+    let lb = LoadBalancer::new(
+        UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    );
+
+    // Use the first CACHE_SLOTS+1 targets as rotating exclusions so fingerprints
+    // thrash the bounded schedule cache without depending on passive health.
+    let churn_excludes = &targets[..CACHE_SLOTS + 1];
+    let cycles = 80usize;
+    let mut selections = 0u64;
+    for _ in 0..cycles {
+        for exclude in churn_excludes {
+            let sel = lb
+                .select_excluding("", exclude, None)
+                .expect("vec capacity+1 churn selection");
+            assert_ne!(sel.host, exclude.host);
+            assert!(sel.weight > 0);
+            selections += 1;
+        }
+    }
+
+    let (publishes, fallbacks) = lb.wrr_parent_schedule_counters();
+    assert!(fallbacks > 0, "vec churn must use allocation-free miss fallback");
+    let max_publishes = (CACHE_SLOTS as u64) + selections / 32 + 1;
+    assert!(
+        publishes <= max_publishes,
+        "vec publishes={publishes} exceeded amortized bound {max_publishes} for {selections} selections"
+    );
+    assert!(publishes * 10 < selections);
 }

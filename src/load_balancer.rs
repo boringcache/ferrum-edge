@@ -219,6 +219,15 @@ const WRR_MAX_SCHEDULE_LEN: usize = 8192;
 /// the rebuild path) under realistic shared-upstream traffic.
 const WRR_SCHEDULE_CACHE_SLOTS: usize = 8;
 
+/// After the fingerprint cache is full, attempt a schedule publish at most once
+/// per this many locked miss decisions.
+///
+/// Cold-start fills of empty slots are uncapped. Sustained churn beyond
+/// [`WRR_SCHEDULE_CACHE_SLOTS`] therefore cannot rebuild/allocate a smooth
+/// schedule on every request; unsampled misses use the allocation-free
+/// candidate scan instead.
+const WRR_MISS_PUBLISH_SAMPLE: u64 = 64;
+
 /// Per-schedule selection-counter shards (power of two).
 ///
 /// Small healthy sets make a single shared `AtomicU64` the throughput ceiling:
@@ -239,9 +248,11 @@ enum WrrScheduleKey {
 
 /// Precomputed smooth weighted round-robin order for one healthy fingerprint.
 ///
-/// Built on the cold path when a fingerprint misses the lane cache; steady-state
+/// Built on the cold path when a fingerprint miss is allowed to publish into
+/// the lane cache (empty-slot fill or rate-sampled replacement); steady-state
 /// selection only loads a matching slot via [`ArcSwap`] and advances one
-/// sharded [`AtomicU64`].
+/// sharded [`AtomicU64`]. Unsampled / contended misses never construct this
+/// value — they use the allocation-free candidate scan instead.
 struct WrrSchedule {
     /// Exact healthy-set identity. The >128-target path retains its indices so
     /// a hash collision can never reuse a schedule for the wrong candidate set.
@@ -318,13 +329,19 @@ fn wrr_counter_shard() -> usize {
 /// Concurrent Tokio workers therefore scale across cores without taking a
 /// blocking mutex on the hot path — including when several recurring
 /// fingerprints alternate. Each worker shard walks the same precomputed
-/// smooth-WRR order, so long-run weighted ratios stay exact; workers do **not**
-/// share a single global interleaving (the intentional contention tradeoff).
+/// smooth-WRR order, so long-run weighted ratios stay exact for cached
+/// fingerprints; workers do **not** share a single global interleaving (the
+/// intentional contention tradeoff).
 ///
-/// On a cache miss, builders use `Mutex::try_lock` so rebuilds stay
-/// contention-bounded: the lock holder publishes into a round-robin slot;
-/// contending missers build a local schedule for that selection only and never
-/// block waiting for the publisher. The lock is never held across `.await`.
+/// On a cache miss, publishers use `Mutex::try_lock` so rebuilds stay
+/// contention-bounded and never block the hot path. Empty cache slots fill
+/// immediately; once the cache is full, further publishes are rate-sampled
+/// ([`WRR_MISS_PUBLISH_SAMPLE`]). Contending missers and unsampled misses
+/// **never** build an ephemeral smooth schedule — they take an allocation-free
+/// O(candidate) weighted lottery (or all-zero round-robin) over eligible
+/// positive-weight targets. That fallback preserves reachability and safety
+/// but does **not** claim exact smooth-WRR interleaving. The lock is never
+/// held across `.await`.
 ///
 /// # Why there is no invalidate flag
 ///
@@ -344,7 +361,10 @@ fn wrr_counter_shard() -> usize {
 /// Wrapping is well-defined and does not bias the schedule's long-run ratios.
 /// Config-valid schedules are capped at [`WRR_MAX_SCHEDULE_LEN`]; larger exact
 /// periods are deterministically apportioned while preserving every positive-
-/// weight target, then smoothed over the complete bounded period.
+/// weight target, then smoothed over the complete bounded period. Those capped
+/// 8192-entry schedules are bounded approximations of the exact period — they
+/// retain every positive-weight target but do not claim exact configured ratios
+/// for pathological weight products that exceed the cap.
 struct WrrLaneState {
     /// Bounded fingerprint → schedule cache. Steady hits load matching slots
     /// with no lock and no per-selection allocation.
@@ -361,8 +381,15 @@ struct WrrLaneState {
     cache_hits: AtomicU64,
     /// Successful schedule publishes into the bounded cache.
     rebuilds: AtomicU64,
-    /// Cold-path seed source for newly built schedules. Distinct seeds avoid a
-    /// herd of contending ephemeral miss schedules all choosing entry zero.
+    /// Allocation-free miss-fallback selections (miss path only; not the
+    /// steady-state hit path).
+    miss_fallbacks: AtomicU64,
+    /// Rate-sample counter for full-cache replacement publishes.
+    miss_publish_tickets: AtomicU64,
+    /// Counter for allocation-free miss-fallback lottery / RR tickets.
+    miss_select: AtomicU64,
+    /// Seed source for newly published schedules. Distinct seeds avoid a herd
+    /// of concurrent first-fill publishes all choosing entry zero.
     schedule_seed: AtomicU64,
 }
 
@@ -386,6 +413,10 @@ impl std::fmt::Debug for WrrLaneState {
         debug
             .field("target_len", &self.target_len)
             .field("rebuilds", &self.rebuilds.load(Ordering::Relaxed))
+            .field(
+                "miss_fallbacks",
+                &self.miss_fallbacks.load(Ordering::Relaxed),
+            )
             .field("slot_keys", &keys);
         #[cfg(test)]
         debug.field("cache_hits", &self.cache_hits.load(Ordering::Relaxed));
@@ -410,6 +441,9 @@ impl WrrLaneState {
             #[cfg(test)]
             cache_hits: AtomicU64::new(0),
             rebuilds: AtomicU64::new(0),
+            miss_fallbacks: AtomicU64::new(0),
+            miss_publish_tickets: AtomicU64::new(0),
+            miss_select: AtomicU64::new(0),
             schedule_seed: AtomicU64::new(0),
         }
     }
@@ -426,6 +460,9 @@ impl WrrLaneState {
             #[cfg(test)]
             cache_hits: AtomicU64::new(0),
             rebuilds: AtomicU64::new(0),
+            miss_fallbacks: AtomicU64::new(0),
+            miss_publish_tickets: AtomicU64::new(0),
+            miss_select: AtomicU64::new(0),
             schedule_seed: AtomicU64::new(0),
         }
     }
@@ -499,6 +536,37 @@ impl WrrLaneState {
         self.schedule_seed.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[inline]
+    fn next_miss_select(&self) -> u64 {
+        self.miss_select.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn record_miss_fallback(&self) {
+        self.miss_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// True when at least one cache slot has never been published.
+    #[inline]
+    fn has_free_slot(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| matches!(slot.load().key, WrrScheduleKey::Invalid))
+    }
+
+    /// Whether a locked miss may build+publish a schedule.
+    ///
+    /// Empty slots always fill. Full-cache replacement is rate-sampled so
+    /// sustained fingerprint churn cannot allocate on every request.
+    #[inline]
+    fn should_publish_on_miss(&self) -> bool {
+        if self.has_free_slot() {
+            return true;
+        }
+        let ticket = self.miss_publish_tickets.fetch_add(1, Ordering::Relaxed);
+        ticket.is_multiple_of(WRR_MISS_PUBLISH_SAMPLE)
+    }
+
     /// Publish `schedule` into the next round-robin slot (caller holds try-lock).
     fn publish_schedule(&self, schedule: Arc<WrrSchedule>) {
         let slot_count = self.slots.len();
@@ -516,6 +584,15 @@ impl WrrLaneState {
         (
             self.cache_hits.load(Ordering::Relaxed),
             self.rebuilds.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(schedule_publishes, allocation_free_miss_fallbacks)` for diagnostics/tests.
+    #[inline]
+    fn schedule_counters(&self) -> (u64, u64) {
+        (
+            self.rebuilds.load(Ordering::Relaxed),
+            self.miss_fallbacks.load(Ordering::Relaxed),
         )
     }
 }
@@ -2438,6 +2515,14 @@ impl LoadBalancer {
                 .value()
                 .store(LATENCY_WARMUP_THRESHOLD, Ordering::Relaxed);
         }
+    }
+
+    /// Parent WRR lane counters: `(schedule_publishes, allocation_free_miss_fallbacks)`.
+    ///
+    /// Intended for diagnostics and deterministic unit coverage of cache-miss
+    /// amortization. Neither counter is touched on the steady-state cache-hit path.
+    pub fn wrr_parent_schedule_counters(&self) -> (u64, u64) {
+        self.wrr_state.schedule_counters()
     }
 
     /// Find the pre-computed host:port key for a target via O(1) HashMap lookup.
@@ -4423,8 +4508,8 @@ impl LoadBalancer {
     ///
     /// Steady-state path is wait-free: hit a precomputed order for the current
     /// healthy fingerprint in the bounded slot cache and advance a sharded
-    /// atomic counter. Schedule rebuild runs only on fingerprint misses — see
-    /// [`WrrLaneState`].
+    /// atomic counter. Schedule rebuild runs only on rate-sampled / cold-fill
+    /// fingerprint misses — see [`WrrLaneState`].
     fn select_wrr_bitset(
         &self,
         healthy: &HealthBitset,
@@ -4461,6 +4546,52 @@ impl LoadBalancer {
         })
     }
 
+    /// Allocation-free miss path: O(healthy) scan, no smooth-schedule build.
+    ///
+    /// Positive-weight targets use a weighted lottery over current weights;
+    /// all-zero sets keep the historical round-robin fallback. This is the
+    /// contention / churn tradeoff vs exact smooth-WRR interleaving.
+    fn pick_wrr_miss_fallback_bitset(
+        &self,
+        healthy: &HealthBitset,
+        wrr_state: &WrrLaneState,
+    ) -> Option<Arc<UpstreamTarget>> {
+        wrr_state.record_miss_fallback();
+        let ticket = wrr_state.next_miss_select();
+        let healthy_count = healthy.count();
+        if healthy_count == 0 {
+            return None;
+        }
+
+        let mut total_weight = 0u64;
+        healthy.for_each_set_bit(|idx| {
+            total_weight += u64::from(self.targets[idx].weight);
+        });
+
+        if total_weight == 0 {
+            let target_idx = healthy.nth_set_bit((ticket % healthy_count as u64) as usize);
+            return Some(Arc::clone(&self.targets[target_idx]));
+        }
+
+        let mut cursor = ticket % total_weight;
+        let mut chosen = None;
+        healthy.for_each_set_bit(|idx| {
+            if chosen.is_some() {
+                return;
+            }
+            let weight = u64::from(self.targets[idx].weight);
+            if weight == 0 {
+                return;
+            }
+            if cursor < weight {
+                chosen = Some(idx);
+            } else {
+                cursor -= weight;
+            }
+        });
+        chosen.map(|idx| Arc::clone(&self.targets[idx]))
+    }
+
     fn build_wrr_schedule_bitset(
         &self,
         healthy: &HealthBitset,
@@ -4486,22 +4617,22 @@ impl LoadBalancer {
         wrr_state: &WrrLaneState,
         fingerprint: u128,
     ) -> Option<Arc<UpstreamTarget>> {
-        // Contention-bounded: try_lock only. Contending missers build a local
-        // schedule for this selection and never block on the publisher.
+        // Contention-bounded: try_lock only. Contending / unsampled misses never
+        // build an ephemeral schedule — they use the allocation-free scan.
         if let Ok(_guard) = wrr_state.rebuild.try_lock() {
             if let Some(schedule) = wrr_state.lookup_bitset_schedule(fingerprint) {
                 return self.pick_wrr_bitset_schedule(healthy, &schedule);
             }
-            let new_schedule = self.build_wrr_schedule_bitset(healthy, wrr_state, fingerprint);
-            wrr_state.publish_schedule(Arc::clone(&new_schedule));
-            return self.pick_wrr_bitset_schedule(healthy, &new_schedule);
-        }
-
-        if let Some(schedule) = wrr_state.lookup_bitset_schedule(fingerprint) {
+            if wrr_state.should_publish_on_miss() {
+                let new_schedule = self.build_wrr_schedule_bitset(healthy, wrr_state, fingerprint);
+                wrr_state.publish_schedule(Arc::clone(&new_schedule));
+                return self.pick_wrr_bitset_schedule(healthy, &new_schedule);
+            }
+        } else if let Some(schedule) = wrr_state.lookup_bitset_schedule(fingerprint) {
             return self.pick_wrr_bitset_schedule(healthy, &schedule);
         }
-        let local = self.build_wrr_schedule_bitset(healthy, wrr_state, fingerprint);
-        self.pick_wrr_bitset_schedule(healthy, &local)
+
+        self.pick_wrr_miss_fallback_bitset(healthy, wrr_state)
     }
 
     #[inline]
@@ -4555,6 +4686,43 @@ impl LoadBalancer {
         })
     }
 
+    /// Allocation-free Vec miss path — same lottery / all-zero RR contract as
+    /// the bitset fallback, scanning only the current candidate slice.
+    fn pick_wrr_miss_fallback_vec(
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+        wrr_state: &WrrLaneState,
+    ) -> Option<Arc<UpstreamTarget>> {
+        wrr_state.record_miss_fallback();
+        let ticket = wrr_state.next_miss_select();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut total_weight = 0u64;
+        for (_, target) in candidates {
+            total_weight += u64::from(target.weight);
+        }
+
+        if total_weight == 0 {
+            return Some(Arc::clone(
+                candidates[(ticket as usize) % candidates.len()].1,
+            ));
+        }
+
+        let mut cursor = ticket % total_weight;
+        for (_, target) in candidates {
+            let weight = u64::from(target.weight);
+            if weight == 0 {
+                continue;
+            }
+            if cursor < weight {
+                return Some(Arc::clone(target));
+            }
+            cursor -= weight;
+        }
+        None
+    }
+
     fn build_wrr_schedule_vec(
         candidates: &[(usize, &Arc<UpstreamTarget>)],
         wrr_state: &WrrLaneState,
@@ -4587,16 +4755,16 @@ impl LoadBalancer {
             if let Some(schedule) = wrr_state.lookup_vec_schedule(candidates) {
                 return Self::pick_wrr_vec_schedule(candidates, &schedule);
             }
-            let new_schedule = Self::build_wrr_schedule_vec(candidates, wrr_state);
-            wrr_state.publish_schedule(Arc::clone(&new_schedule));
-            return Self::pick_wrr_vec_schedule(candidates, &new_schedule);
-        }
-
-        if let Some(schedule) = wrr_state.lookup_vec_schedule(candidates) {
+            if wrr_state.should_publish_on_miss() {
+                let new_schedule = Self::build_wrr_schedule_vec(candidates, wrr_state);
+                wrr_state.publish_schedule(Arc::clone(&new_schedule));
+                return Self::pick_wrr_vec_schedule(candidates, &new_schedule);
+            }
+        } else if let Some(schedule) = wrr_state.lookup_vec_schedule(candidates) {
             return Self::pick_wrr_vec_schedule(candidates, &schedule);
         }
-        let local = Self::build_wrr_schedule_vec(candidates, wrr_state);
-        Self::pick_wrr_vec_schedule(candidates, &local)
+
+        Self::pick_wrr_miss_fallback_vec(candidates, wrr_state)
     }
 
     /// Select target with least active connections using bitset.
