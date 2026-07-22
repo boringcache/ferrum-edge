@@ -1031,12 +1031,36 @@ impl ChargebackRegistry {
             }
         }
 
+        // Per-currency monetary rollup for a consumer. Never sum across
+        // currencies into a unitless headline total (issue #2569).
+        #[derive(Clone, Default)]
+        struct CurrencyTotals {
+            total_calls: u64,
+            per_call_charges: f64,
+            stream_connection_charges: f64,
+            bandwidth_charges: f64,
+        }
+
+        impl CurrencyTotals {
+            fn total_charges(&self) -> f64 {
+                self.per_call_charges + self.stream_connection_charges + self.bandwidth_charges
+            }
+
+            fn to_json(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "total_calls": self.total_calls,
+                    "total_charges": self.total_charges(),
+                    "per_call_charges": self.per_call_charges,
+                    "stream_connection_charges": self.stream_connection_charges,
+                    "bandwidth_charges": self.bandwidth_charges,
+                })
+            }
+        }
+
         let mut consumer_objects = serde_json::Map::new();
         for (consumer, proxies) in &consumers {
             let mut total_calls = 0u64;
-            let mut total_per_call_charges = 0.0f64;
-            let mut total_bandwidth_charges = 0.0f64;
-            let mut total_stream_charges = 0.0f64;
+            let mut by_currency: HashMap<String, CurrencyTotals> = HashMap::new();
             let mut proxy_objects = serde_json::Map::new();
 
             let mut proxy_id_counts: HashMap<&str, usize> = HashMap::new();
@@ -1063,16 +1087,19 @@ impl ChargebackRegistry {
 
                 // Stream connections also count toward total_calls for headline numbers.
                 let proxy_total_calls = proxy_calls + agg.stream_connections;
-                let proxy_total_charges = proxy_per_call_charges
-                    + agg.stream_charges
-                    + agg.bandwidth_charge_sent
-                    + agg.bandwidth_charge_received;
+                let proxy_bandwidth_charges =
+                    agg.bandwidth_charge_sent + agg.bandwidth_charge_received;
+                let proxy_total_charges =
+                    proxy_per_call_charges + agg.stream_charges + proxy_bandwidth_charges;
 
                 total_calls += proxy_total_calls;
-                total_per_call_charges += proxy_per_call_charges;
-                total_stream_charges += agg.stream_charges;
-                total_bandwidth_charges +=
-                    agg.bandwidth_charge_sent + agg.bandwidth_charge_received;
+                let currency_totals = by_currency
+                    .entry(agg.currency.as_ref().to_string())
+                    .or_default();
+                currency_totals.total_calls += proxy_total_calls;
+                currency_totals.per_call_charges += proxy_per_call_charges;
+                currency_totals.stream_connection_charges += agg.stream_charges;
+                currency_totals.bandwidth_charges += proxy_bandwidth_charges;
 
                 // Deterministic protocol_family label: "mixed" when a proxy
                 // carries both HTTP and stream activity, otherwise the single
@@ -1122,18 +1149,60 @@ impl ChargebackRegistry {
                 proxy_objects.insert(output_key, proxy_obj);
             }
 
-            consumer_objects.insert(
-                consumer.clone(),
-                serde_json::json!({
-                    "total_calls": total_calls,
-                    "total_charges":
-                        total_per_call_charges + total_stream_charges + total_bandwidth_charges,
-                    "per_call_charges": total_per_call_charges,
-                    "stream_connection_charges": total_stream_charges,
-                    "bandwidth_charges": total_bandwidth_charges,
-                    "proxies": serde_json::Value::Object(proxy_objects),
-                }),
+            // Single-currency consumers keep the historical flat monetary fields.
+            // Mixed-currency consumers null those fields and expose
+            // `charges_by_currency` so billing integrations never treat a
+            // USD+EUR sum as a settlement total (issue #2569). Call counts stay
+            // flat because they are unitless. Per-proxy rows remain authoritative
+            // within each currency and must reconcile with the matching
+            // `charges_by_currency` partition.
+            let mut consumer_obj = serde_json::Map::new();
+            consumer_obj.insert("total_calls".to_string(), serde_json::json!(total_calls));
+            consumer_obj.insert(
+                "proxies".to_string(),
+                serde_json::Value::Object(proxy_objects),
             );
+
+            if by_currency.len() <= 1 {
+                let totals = by_currency.values().next().cloned().unwrap_or_default();
+                consumer_obj.insert(
+                    "total_charges".to_string(),
+                    serde_json::json!(totals.total_charges()),
+                );
+                consumer_obj.insert(
+                    "per_call_charges".to_string(),
+                    serde_json::json!(totals.per_call_charges),
+                );
+                consumer_obj.insert(
+                    "stream_connection_charges".to_string(),
+                    serde_json::json!(totals.stream_connection_charges),
+                );
+                consumer_obj.insert(
+                    "bandwidth_charges".to_string(),
+                    serde_json::json!(totals.bandwidth_charges),
+                );
+            } else {
+                consumer_obj.insert("total_charges".to_string(), serde_json::Value::Null);
+                consumer_obj.insert("per_call_charges".to_string(), serde_json::Value::Null);
+                consumer_obj.insert(
+                    "stream_connection_charges".to_string(),
+                    serde_json::Value::Null,
+                );
+                consumer_obj.insert("bandwidth_charges".to_string(), serde_json::Value::Null);
+
+                let mut currency_entries: Vec<_> = by_currency.into_iter().collect();
+                currency_entries.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut currency_objects = serde_json::Map::new();
+                for (currency, totals) in currency_entries {
+                    currency_objects.insert(currency, totals.to_json());
+                }
+                consumer_obj.insert(
+                    "charges_by_currency".to_string(),
+                    serde_json::Value::Object(currency_objects),
+                );
+            }
+
+            consumer_objects.insert(consumer.clone(), serde_json::Value::Object(consumer_obj));
         }
 
         let currency = if currency_mixed {

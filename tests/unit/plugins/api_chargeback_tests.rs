@@ -1,11 +1,13 @@
 //! Tests for api_chargeback plugin
 
 use ferrum_edge::plugins::api_chargeback::{
-    ApiChargeback, ChargebackRegistry, InstanceScope, ProtocolFamily,
+    ApiChargeback, ChargebackRegistry, InstanceScope, ProtocolFamily, global_registry,
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, StreamTransactionSummary, TransactionSummary,
 };
+use ferrum_edge::PluginCache;
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -1417,7 +1419,8 @@ fn test_per_instance_currency_and_namespace_not_last_writer_wins() {
         "proxy-a must not be misattributed to EUR (last-writer-wins regression)\n{prom}"
     );
 
-    // JSON: per-proxy currency, and top-level currency signals "mixed".
+    // JSON: per-proxy currency, top-level currency signals "mixed", and
+    // consumer monetary totals are partitioned (never USD+EUR=2).
     let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
     assert_eq!(json["currency"], "mixed");
     assert_eq!(
@@ -1427,6 +1430,15 @@ fn test_per_instance_currency_and_namespace_not_last_writer_wins() {
     assert_eq!(
         json["consumers"]["alice"]["proxies"]["proxy-b"]["currency"],
         "EUR"
+    );
+    assert!(json["consumers"]["alice"]["total_charges"].is_null());
+    assert_eq!(
+        json["consumers"]["alice"]["charges_by_currency"]["USD"]["total_charges"],
+        1.0
+    );
+    assert_eq!(
+        json["consumers"]["alice"]["charges_by_currency"]["EUR"]["total_charges"],
+        2.0
     );
 }
 
@@ -1657,4 +1669,260 @@ fn test_bandwidth_charge_is_exact_from_byte_totals() {
         many_entry.bandwidth_charge_sent(),
         (7 * chunks) as f64 * price
     );
+}
+
+// --- Issue #2569: never sum monetary totals across currencies ---
+
+/// One consumer spanning USD (HTTP per-call + bandwidth) and EUR (stream
+/// connection + bandwidth + HTTP per-call) must null currency-blind monetary
+/// fields and expose reconcilable `charges_by_currency` partitions.
+#[test]
+fn test_json_mixed_currency_consumer_totals_partitioned_not_summed() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let usd = scope_for("USD", "team-usd");
+    let eur = scope_for("EUR", "team-eur");
+
+    // USD HTTP: per-call 1.0 + bandwidth 100*0.01 + 50*0.02 = 1.0 + 1.0 + 1.0 = 3.0
+    registry.record_http(
+        &usd, "alice", "proxy-usd", "USD API", 200, 1.0, 100, 50, 0.01, 0.02,
+    );
+    // EUR stream: connection 0.5 + bandwidth 10*0.1 + 20*0.05 = 0.5 + 1.0 + 1.0 = 2.5
+    registry.record_stream(
+        &eur, "alice", "proxy-eur-stream", "EUR Stream", 0.5, 10, 20, 0.1, 0.05,
+    );
+    // EUR HTTP per-call only: 1.0
+    registry.record_http(
+        &eur, "alice", "proxy-eur-http", "EUR HTTP", 200, 1.0, 0, 0, 0.0, 0.0,
+    );
+    // A second consumer billed only in USD keeps numeric flat totals even when
+    // the response-level currency is "mixed".
+    registry.record_http(&usd, "bob", "proxy-usd", "USD API", 200, 2.0, 0, 0, 0.0, 0.0);
+
+    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    assert_eq!(json["currency"], "mixed");
+
+    let alice = &json["consumers"]["alice"];
+    assert_eq!(alice["total_calls"], 3); // 2 HTTP + 1 stream
+    assert!(
+        alice["total_charges"].is_null(),
+        "mixed consumer must not emit a unitless total_charges"
+    );
+    assert!(alice["per_call_charges"].is_null());
+    assert!(alice["stream_connection_charges"].is_null());
+    assert!(alice["bandwidth_charges"].is_null());
+
+    let by = alice["charges_by_currency"]
+        .as_object()
+        .expect("charges_by_currency required for mixed consumer");
+    assert_eq!(by.len(), 2);
+
+    let usd_totals = &by["USD"];
+    assert_eq!(usd_totals["total_calls"], 1);
+    assert!((usd_totals["per_call_charges"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    assert!((usd_totals["bandwidth_charges"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+    assert!((usd_totals["stream_connection_charges"].as_f64().unwrap()).abs() < 1e-12);
+    assert!((usd_totals["total_charges"].as_f64().unwrap() - 3.0).abs() < 1e-12);
+
+    let eur_totals = &by["EUR"];
+    assert_eq!(eur_totals["total_calls"], 2);
+    assert!((eur_totals["per_call_charges"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    assert!((eur_totals["stream_connection_charges"].as_f64().unwrap() - 0.5).abs() < 1e-12);
+    assert!((eur_totals["bandwidth_charges"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+    assert!((eur_totals["total_charges"].as_f64().unwrap() - 3.5).abs() < 1e-12);
+
+    // Per-proxy rows stay authoritative and reconcile within each currency.
+    let proxies = alice["proxies"].as_object().unwrap();
+    let mut usd_proxy_sum = 0.0;
+    let mut eur_proxy_sum = 0.0;
+    for proxy in proxies.values() {
+        let charge = proxy["total_charges"].as_f64().unwrap();
+        match proxy["currency"].as_str().unwrap() {
+            "USD" => usd_proxy_sum += charge,
+            "EUR" => eur_proxy_sum += charge,
+            other => panic!("unexpected currency {other}"),
+        }
+    }
+    assert!((usd_proxy_sum - 3.0).abs() < 1e-12);
+    assert!((eur_proxy_sum - 3.5).abs() < 1e-12);
+
+    let bob = &json["consumers"]["bob"];
+    assert!(bob["charges_by_currency"].is_null());
+    assert!((bob["total_charges"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+    assert!((bob["per_call_charges"].as_f64().unwrap() - 2.0).abs() < 1e-12);
+    assert!(bob["total_charges"].is_number());
+}
+
+/// Same-currency consumer still emits the historical flat monetary fields.
+#[test]
+fn test_json_single_currency_consumer_keeps_flat_totals() {
+    let registry = ChargebackRegistry::new();
+    let usd = scope_for("USD", "ferrum");
+    registry.record_http(
+        &usd, "alice", "proxy-a", "A", 200, 1.0, 10, 0, 0.1, 0.0,
+    );
+    registry.record_stream(&usd, "alice", "proxy-b", "B", 0.25, 0, 0, 0.0, 0.0);
+
+    let json: serde_json::Value = serde_json::from_str(&registry.render_json_uncached()).unwrap();
+    let alice = &json["consumers"]["alice"];
+    assert_eq!(json["currency"], "USD");
+    assert!(alice["charges_by_currency"].is_null());
+    assert!((alice["total_charges"].as_f64().unwrap() - 2.25).abs() < 1e-12);
+    assert!((alice["per_call_charges"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    assert!((alice["stream_connection_charges"].as_f64().unwrap() - 0.25).abs() < 1e-12);
+    assert!((alice["bandwidth_charges"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    assert_eq!(alice["total_calls"], 2);
+}
+
+fn chargeback_chain_proxy(id: &str, path: &str, plugin_config_id: &str) -> Proxy {
+    serde_json::from_value(json!({
+        "id": id,
+        "name": id,
+        "namespace": "ferrum",
+        "listen_path": path,
+        "backend_scheme": "http",
+        "backend_host": "backend.invalid",
+        "backend_port": 80,
+        "plugins": [{ "plugin_config_id": plugin_config_id }]
+    }))
+    .expect("test proxy config")
+}
+
+fn chargeback_chain_stream_proxy(id: &str, plugin_config_id: &str) -> Proxy {
+    serde_json::from_value(json!({
+        "id": id,
+        "name": id,
+        "namespace": "ferrum",
+        "backend_scheme": "tcp",
+        "backend_host": "backend.invalid",
+        "backend_port": 9000,
+        "listen_port": 65001,
+        "plugins": [{ "plugin_config_id": plugin_config_id }]
+    }))
+    .expect("test stream proxy config")
+}
+
+fn chargeback_chain_plugin(
+    id: &str,
+    proxy_id: &str,
+    currency: &str,
+    pricing: serde_json::Value,
+) -> PluginConfig {
+    let mut config = pricing
+        .as_object()
+        .cloned()
+        .expect("pricing config object");
+    config.insert("currency".to_string(), json!(currency));
+    config.insert("cleanup_interval_seconds".to_string(), json!(0));
+    serde_json::from_value(json!({
+        "id": id,
+        "plugin_name": "api_chargeback",
+        "namespace": "ferrum",
+        "config": config,
+        "scope": "proxy",
+        "proxy_id": proxy_id,
+        "enabled": true
+    }))
+    .expect("test plugin config")
+}
+
+/// Build the effective per-proxy plugin chains, then record through the trait
+/// hooks rather than writing registry rows directly. This proves independent
+/// proxy-scoped instances retain their currencies through PluginCache wiring.
+#[tokio::test]
+async fn test_effective_plugin_chain_partitions_multi_instance_currency_totals() {
+    const CONSUMER: &str = "issue-2569-chain-consumer";
+    const USD_PROXY: &str = "issue-2569-chain-usd";
+    const EUR_HTTP_PROXY: &str = "issue-2569-chain-eur-http";
+    const EUR_STREAM_PROXY: &str = "issue-2569-chain-eur-stream";
+
+    let plugin_configs = vec![
+        chargeback_chain_plugin(
+            "charge-usd",
+            USD_PROXY,
+            "USD",
+            json!({
+                "pricing_tiers": [{ "status_codes": [200], "price_per_call": 1.0 }],
+                "bandwidth_pricing": {
+                    "price_per_byte_sent": 0.01,
+                    "price_per_byte_received": 0.02
+                }
+            }),
+        ),
+        chargeback_chain_plugin(
+            "charge-eur-http",
+            EUR_HTTP_PROXY,
+            "EUR",
+            json!({
+                "pricing_tiers": [{ "status_codes": [200], "price_per_call": 1.0 }]
+            }),
+        ),
+        chargeback_chain_plugin(
+            "charge-eur-stream",
+            EUR_STREAM_PROXY,
+            "EUR",
+            json!({
+                "bandwidth_pricing": {
+                    "price_per_byte_sent": 0.1,
+                    "price_per_byte_received": 0.05
+                },
+                "stream_connection_pricing": { "price_per_connection": 0.5 }
+            }),
+        ),
+    ];
+    let config = GatewayConfig {
+        proxies: vec![
+            chargeback_chain_proxy(USD_PROXY, "/issue-2569-usd", "charge-usd"),
+            chargeback_chain_proxy(
+                EUR_HTTP_PROXY,
+                "/issue-2569-eur-http",
+                "charge-eur-http",
+            ),
+            chargeback_chain_stream_proxy(EUR_STREAM_PROXY, "charge-eur-stream"),
+        ],
+        plugin_configs,
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&config).expect("multi-instance plugin cache");
+
+    let mut usd = make_summary_with_bytes(USD_PROXY, "USD API", Some(CONSUMER), 200, 100, 50);
+    usd.namespace = "ferrum".to_string();
+    let usd_chain = cache.get_plugins(USD_PROXY);
+    let usd_plugin = usd_chain
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .expect("USD chargeback attached");
+    usd_plugin.log(&usd).await;
+
+    let mut eur_http = make_summary(EUR_HTTP_PROXY, "EUR API", Some(CONSUMER), 200);
+    eur_http.namespace = "ferrum".to_string();
+    let eur_http_chain = cache.get_plugins(EUR_HTTP_PROXY);
+    let eur_http_plugin = eur_http_chain
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .expect("EUR HTTP chargeback attached");
+    eur_http_plugin.log(&eur_http).await;
+
+    let eur_stream = make_stream_summary(
+        EUR_STREAM_PROXY,
+        "EUR Stream",
+        Some(CONSUMER),
+        "tcp",
+        10,
+        20,
+    );
+    let eur_stream_chain = cache.get_plugins(EUR_STREAM_PROXY);
+    let eur_stream_plugin = eur_stream_chain
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .expect("EUR stream chargeback attached");
+    eur_stream_plugin.on_stream_disconnect(&eur_stream).await;
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached()).unwrap();
+    let consumer = &rendered["consumers"][CONSUMER];
+    assert!(consumer["total_charges"].is_null());
+    assert_eq!(consumer["total_calls"], 3);
+    assert_eq!(consumer["charges_by_currency"]["USD"]["total_charges"], 3.0);
+    assert_eq!(consumer["charges_by_currency"]["EUR"]["total_charges"], 3.5);
 }
