@@ -245,6 +245,7 @@ fn build_hbone_relay_summary(
         bytes_sent: bytes_client_to_backend,
         bytes_received: bytes_backend_to_client,
         metadata: crate::proxy::clone_log_metadata(ctx),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         ..TransactionSummary::default()
     }
 }

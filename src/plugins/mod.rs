@@ -4604,22 +4604,6 @@ pub async fn log_with_mirror(
     summary: &TransactionSummary,
     ctx: &RequestContext,
 ) {
-    // Stamp admission ownership when the caller left the field unset so every
-    // HTTP/gRPC path (including deferred streaming completion) carries the
-    // generation captured on RequestContext at routing time.
-    let stamped_storage;
-    let summary = if summary.proxy_lifecycle_generation.is_none()
-        && ctx.proxy_lifecycle_generation.is_some()
-    {
-        stamped_storage = {
-            let mut stamped = summary.clone();
-            stamped.proxy_lifecycle_generation = ctx.proxy_lifecycle_generation;
-            stamped
-        };
-        &stamped_storage
-    } else {
-        summary
-    };
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));

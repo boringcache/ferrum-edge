@@ -9612,6 +9612,7 @@ async fn handle_websocket_request_authenticated(
                             error_class: Some(ws_error_class),
                             metadata,
                             ai_usage_export: ctx.ai_usage_export.clone(),
+                            proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -9774,6 +9775,7 @@ async fn handle_websocket_request_authenticated(
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         metadata: clone_log_metadata(&ctx),
         ai_usage_export: ctx.ai_usage_export.clone(),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         ..TransactionSummary::default()
     };
 
@@ -14243,6 +14245,7 @@ async fn log_rejected_request_with_path_and_backend_state(
         // arm, which populates `bytes_received` separately. Leave 0 here.
         metadata,
         ai_usage_export: ctx.ai_usage_export.clone(),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         ..TransactionSummary::default()
     };
 
@@ -21919,6 +21922,7 @@ async fn handle_proxy_request_inner(
                         bytes_sent,
                         metadata,
                         ai_usage_export: ctx.ai_usage_export.clone(),
+                        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
                         ..TransactionSummary::default()
                     };
                     if body_exceeded {
@@ -22816,6 +22820,7 @@ async fn handle_proxy_request_inner(
                         bytes_received,
                         metadata: clone_log_metadata(&ctx),
                         ai_usage_export: ctx.ai_usage_export.clone(),
+                        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
                         ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror_before_buffered_response(
@@ -22995,6 +23000,7 @@ async fn handle_proxy_request_inner(
                             bytes_sent,
                             metadata,
                             ai_usage_export: ctx.ai_usage_export.clone(),
+                            proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
                             ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror_before_buffered_response(
@@ -24548,6 +24554,7 @@ async fn handle_proxy_request_inner(
                 bytes_received: bytes_received_buffered,
                 metadata: clone_log_metadata(&ctx),
                 ai_usage_export: ctx.ai_usage_export.clone(),
+                proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
                 ..TransactionSummary::default()
             };
 
