@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 
 use super::plugin_utils::{
     create_test_stream_transaction_summary, create_test_transaction_summary,
-    read_http11_request_headers,
+    read_http11_request_body, read_http11_request_headers,
 };
 
 fn default_client() -> PluginHttpClient {
@@ -591,4 +591,72 @@ async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
     plugin.log(&create_test_transaction_summary()).await;
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_count(&requests, 2).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_http_logging_delivers_stream_sni_hostname() {
+    // Issue #2531: terminating-DTLS (and other stream paths) must ship
+    // `sni_hostname` unchanged through http_logging's JSON batch.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let bodies_task = Arc::clone(&bodies);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let bodies = Arc::clone(&bodies_task);
+            tokio::spawn(async move {
+                loop {
+                    let Some(body) = read_http11_request_body(&mut socket).await else {
+                        break;
+                    };
+                    bodies.lock().unwrap_or_else(|e| e.into_inner()).push(body);
+                    let response =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+                    if socket.write_all(response).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": format!("http://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 50,
+            "max_retries": 0,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_http_logging(&plugin);
+
+    let mut summary = create_test_stream_transaction_summary();
+    summary.protocol = "dtls".to_string();
+    summary.sni_hostname = Some("device.example".to_string());
+    plugin.on_stream_disconnect(&summary).await;
+
+    for _ in 0..100 {
+        if !bodies.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let captured = bodies.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        !captured.is_empty(),
+        "http_logging must POST the stream summary batch"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&captured[0]).unwrap();
+    let entries = payload
+        .as_array()
+        .expect("http_logging posts a JSON array batch");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["sni_hostname"], "device.example");
+    assert_eq!(entries[0]["protocol"], "dtls");
 }

@@ -1326,3 +1326,311 @@ async fn test_expose_headers_reports_tightest_window() {
     assert_eq!(ctx2.metadata.get("ratelimit_remaining").unwrap(), "1");
     assert_eq!(ctx2.metadata.get("ratelimit_window").unwrap(), "1");
 }
+
+// ─── Shared synthetic/rejection finalizer (issue #2306) ─────────────────
+
+fn assert_standard_ratelimit_headers(
+    headers: &HashMap<String, String>,
+    limit: &str,
+    remaining: &str,
+) {
+    assert_eq!(
+        headers.get("x-ratelimit-limit").map(String::as_str),
+        Some(limit),
+        "expected x-ratelimit-limit={limit}, got {headers:?}"
+    );
+    assert_eq!(
+        headers.get("x-ratelimit-remaining").map(String::as_str),
+        Some(remaining),
+        "expected x-ratelimit-remaining={remaining}, got {headers:?}"
+    );
+    assert_eq!(
+        headers.get("x-ratelimit-window").map(String::as_str),
+        Some("60"),
+        "expected x-ratelimit-window=60, got {headers:?}"
+    );
+    assert!(
+        !headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("x-ratelimit-identity")),
+        "x-ratelimit-identity must never reach the client: {headers:?}"
+    );
+}
+
+#[test]
+fn test_applies_after_proxy_on_reject_for_synthetic_decoration() {
+    let plugin = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    }));
+    assert!(
+        plugin.applies_after_proxy_on_reject(),
+        "rate_limiting must opt into the shared rejection/synthetic after_proxy path"
+    );
+}
+
+/// Issue #2306: H1/H2 and the shared H3 path all decorate gateway-generated
+/// responses through `apply_reject_after_proxy_and_synthetic_body_hooks`.
+#[test]
+fn test_h1_h2_and_shared_h3_reach_reject_synthetic_finalizer() {
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+
+    assert!(
+        h1_h2.contains("apply_reject_after_proxy_and_synthetic_body_hooks("),
+        "H1/H2 reject/synthetic path must use the shared finalizer"
+    );
+    assert!(
+        h3.contains("apply_reject_after_proxy_and_synthetic_body_hooks("),
+        "H3 reject/synthetic path must use the shared finalizer"
+    );
+}
+
+/// Admitted + counted request whose later plugin returns a synthetic 2xx must
+/// still receive the same `x-ratelimit-*` headers as a backend response.
+#[tokio::test]
+async fn test_expose_headers_on_admitted_synthetic_2xx_via_shared_finalizer() {
+    let plugin = Arc::new(make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    }))) as Arc<dyn Plugin>;
+
+    let mut ctx = create_test_context();
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+    assert_eq!(ctx.metadata.get("ratelimit_limit").unwrap(), "5");
+    assert_eq!(ctx.metadata.get("ratelimit_remaining").unwrap(), "4");
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert(
+        "x-ratelimit-identity".to_string(),
+        "spoofed-identity".to_string(),
+    );
+    let body = "mock-ok";
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        std::slice::from_ref(&plugin),
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 200,
+            body: body.to_string(),
+            headers,
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary {
+            status_code,
+            body: final_body,
+            headers: final_headers,
+        } => {
+            assert_eq!(status_code, 200, "finalizer must not change status");
+            assert_eq!(
+                final_body.as_ref(),
+                body.as_bytes(),
+                "finalizer must not change body"
+            );
+            assert_standard_ratelimit_headers(&final_headers, "5", "4");
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+/// Admitted + counted request rejected by a later plugin must still expose the
+/// counted budget on the client-visible 4xx.
+#[tokio::test]
+async fn test_expose_headers_on_later_plugin_4xx_via_shared_finalizer() {
+    let plugin = Arc::new(make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    }))) as Arc<dyn Plugin>;
+
+    let mut ctx = create_test_context();
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    let body = r#"{"error":"forbidden"}"#;
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        std::slice::from_ref(&plugin),
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 403,
+            body: body.to_string(),
+            headers: HashMap::new(),
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary {
+            status_code,
+            body: final_body,
+            headers: final_headers,
+        } => {
+            assert_eq!(status_code, 403, "finalizer must not change status");
+            assert_eq!(
+                final_body.as_ref(),
+                body.as_bytes(),
+                "finalizer must not change body"
+            );
+            assert_standard_ratelimit_headers(&final_headers, "5", "4");
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+/// Even with expose_headers=false, the reject-path after_proxy still strips a
+/// spoofed identity header from gateway-generated responses.
+#[tokio::test]
+async fn test_strips_identity_on_synthetic_path_when_expose_headers_disabled() {
+    let plugin = Arc::new(make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": false
+    }))) as Arc<dyn Plugin>;
+
+    let mut ctx = create_test_context();
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+    assert!(!ctx.metadata.contains_key("ratelimit_limit"));
+
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        std::slice::from_ref(&plugin),
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 200,
+            body: "ok".to_string(),
+            headers: HashMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                (
+                    "X-RateLimit-Identity".to_string(),
+                    "backend-user".to_string(),
+                ),
+            ]),
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(
+                !headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("x-ratelimit-identity")),
+                "identity must be stripped on synthetic responses: {headers:?}"
+            );
+            assert!(
+                !headers
+                    .keys()
+                    .any(|key| key.to_ascii_lowercase().starts_with("x-ratelimit-")),
+                "expose_headers=false must not inject telemetry: {headers:?}"
+            );
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("text/plain")
+            );
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+/// Requests that never reached the rate-limit check have no metadata; the
+/// finalizer must not invent `x-ratelimit-*` values even when expose_headers is on.
+#[tokio::test]
+async fn test_expose_headers_absent_metadata_skips_synthetic_injection() {
+    let plugin = Arc::new(make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    }))) as Arc<dyn Plugin>;
+
+    // Never call on_request_received / authorize — no rate-limit metadata.
+    let mut ctx = create_test_context();
+    assert!(!ctx.metadata.contains_key("ratelimit_limit"));
+
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        std::slice::from_ref(&plugin),
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 200,
+            body: "ok".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(
+                !headers
+                    .keys()
+                    .any(|key| key.to_ascii_lowercase().starts_with("x-ratelimit-")),
+                "must not synthesize rate-limit headers without metadata: {headers:?}"
+            );
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+/// gRPC reject normalization preserves standard rate-limit telemetry headers
+/// (they are part of the supported gRPC response-header contract) while still
+/// stripping `x-ratelimit-identity`.
+#[tokio::test]
+async fn test_expose_headers_survive_grpc_reject_normalization() {
+    let plugin = Arc::new(make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    }))) as Arc<dyn Plugin>;
+
+    let mut ctx = create_test_context();
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "X-RateLimit-Identity".to_string(),
+        "consumer:spoofed".to_string(),
+    );
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        std::slice::from_ref(&plugin),
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"forbidden"}"#.to_string(),
+            headers,
+        },
+    )
+    .await;
+
+    let PluginResult::RejectBinary {
+        status_code,
+        body,
+        headers: decorated,
+    } = finalized
+    else {
+        panic!("Expected finalized RejectBinary");
+    };
+    assert_standard_ratelimit_headers(&decorated, "5", "4");
+
+    let normalized = ferrum_edge::_test_support::normalize_reject_response(
+        hyper::StatusCode::from_u16(status_code).expect("valid status"),
+        &body,
+        &decorated,
+        true,
+    );
+    assert_eq!(normalized.http_status, hyper::StatusCode::OK);
+    assert_eq!(normalized.grpc_status, Some(7)); // PERMISSION_DENIED from 403
+    assert_standard_ratelimit_headers(&normalized.headers, "5", "4");
+    assert_eq!(
+        normalized.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+}

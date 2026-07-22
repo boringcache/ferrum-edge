@@ -4782,9 +4782,10 @@ pub struct StreamConnectionContext {
     /// DER-encoded CA/intermediate certificates from the client's certificate chain.
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    /// SNI hostname from the frontend TLS/DTLS ClientHello or terminated TLS
-    /// handshake when available. Available to plugins for logging, routing, or
-    /// access control.
+    /// SNI hostname from the frontend TLS/DTLS ClientHello (passthrough peek or
+    /// terminating handshake) when available. Available to plugins for logging,
+    /// routing, or access control. The same value is carried into
+    /// `StreamTransactionSummary.sni_hostname` on disconnect.
     pub sni_hostname: Option<String>,
     /// Mesh traffic direction stamped by the stream listener that accepted this
     /// connection. Mirrors `RequestContext::mesh_direction`; `None` for stream
@@ -4976,7 +4977,11 @@ pub struct StreamTransactionSummary {
     pub disconnect_cause: Option<DisconnectCause>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
-    /// SNI hostname extracted from the TLS/DTLS ClientHello during passthrough mode.
+    /// SNI hostname from the frontend TLS/DTLS ClientHello when available.
+    /// Populated for TCP TLS termination, DTLS termination, and TLS/DTLS
+    /// passthrough (ClientHello peek). Omitted from JSON when null so sinks
+    /// that serialize `StreamTransactionSummary` unchanged (e.g. `http_logging`,
+    /// `loki_logging`) retain connect/disconnect parity for every stream path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sni_hostname: Option<String>,
     /// Plugin-injected metadata (e.g., correlation ID, trace ID) carried
@@ -5258,6 +5263,18 @@ pub trait Plugin: Send + Sync {
     /// `FERRUM_REAL_IP_HEADER`, or ambiguous writers.
     #[doc(hidden)]
     fn correlation_id_header_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Cold-path scrape exporter for `__mesh_bpf_metrics`.
+    ///
+    /// Plugin-cache generations extract this once from the constructed global
+    /// instance so authenticated `GET /metrics` can append the BPF surface
+    /// without scanning plugins or allocating a new representation per scrape.
+    /// Ordinary plugins retain the allocation-free default.
+    fn mesh_bpf_metrics_exporter(
+        &self,
+    ) -> Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter> {
         None
     }
 
@@ -6713,9 +6730,12 @@ pub fn create_plugin_with_http_client(
         "request_termination" => Ok(Some(Arc::new(
             request_termination::RequestTermination::new(config)?,
         ))),
-        "response_caching" => Ok(Some(Arc::new(response_caching::ResponseCaching::new(
-            config,
-        )?))),
+        "response_caching" => Ok(Some(Arc::new(
+            response_caching::ResponseCaching::new_with_pool_shard_amount(
+                config,
+                http_client.pool_shard_amount(),
+            )?,
+        ))),
         "fault_injection" => Ok(Some(Arc::new(fault_injection::FaultInjectionPlugin::new(
             config,
         )?))),

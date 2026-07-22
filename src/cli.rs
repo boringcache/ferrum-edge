@@ -261,6 +261,14 @@ pub fn apply_validate_overrides(args: &ValidateArgs) {
 
 /// Infer file mode when a spec is available but no mode is configured anywhere.
 ///
+/// **`--spec` / `-c` interaction:** `apply_common_overrides` may install
+/// `FERRUM_FILE_CONFIG_PATH` from an explicit `--spec`, an env value, or smart
+/// path discovery. That path assignment is independent of mode selection.
+/// This helper never treats `--spec` as an implicit `--mode file`: a
+/// non-empty `FERRUM_MODE` from CLI (`apply_run_overrides`), the process
+/// environment, or the selected `ferrum.conf` always wins, preserving
+/// `CLI > env > conf file > smart defaults`.
+///
 /// # Ordering: must run *after* startup secret resolution
 ///
 /// This is the last rung of `CLI > env > conf file > smart defaults >

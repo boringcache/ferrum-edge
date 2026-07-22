@@ -70,7 +70,15 @@ ferrum-edge run --settings ferrum.conf --mode database -v
 
 ### Mode Inference
 
-When `--spec` is provided (or a spec file is found via smart defaults) and no mode is configured anywhere (CLI, env var, or conf file), the CLI automatically sets `FERRUM_MODE=file`. This means `ferrum-edge run --spec resources.yaml` works without needing `--mode file`.
+`--spec` / `-c` sets only the resources path (`FERRUM_FILE_CONFIG_PATH`). It does **not** set or override the operating mode.
+
+File mode is inferred as a smart default — the lowest-precedence mode source — only when a spec path is available (explicit `--spec`, process-environment `FERRUM_FILE_CONFIG_PATH`, or smart path discovery) **and** no mode is configured by any higher-precedence source:
+
+1. CLI `--mode` (`run` only)
+2. Process environment `FERRUM_MODE` (including values materialized from `FERRUM_MODE_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP`)
+3. `FERRUM_MODE` in the selected `ferrum.conf`
+
+So `ferrum-edge run --settings ferrum.conf --spec resources.yaml` with `FERRUM_MODE=database` (or `cp`, etc.) in that settings file stays in that mode: the spec path is installed at CLI precedence, but mode inference never promotes the smart default over the conf file. The same rule applies to `validate` (which has no `--mode` flag). When no mode is configured anywhere, `ferrum-edge run --spec resources.yaml` still infers file mode so a zero-config file-mode start works.
 
 ## validate
 
@@ -328,5 +336,6 @@ The first file that exists in the search order is used. If no file is found, the
 | Invocation | Behavior |
 |---|---|
 | `ferrum-edge run` | Start the gateway with smart defaults |
-| `ferrum-edge run --spec resources.yaml` | Start the gateway with file mode inferred |
+| `ferrum-edge run --spec resources.yaml` | Sets the spec path; infers file mode only when no CLI/env/conf mode is set |
+| `ferrum-edge run --settings ferrum.conf --spec resources.yaml` | Spec path from CLI; mode from settings/env (never demoted by `--spec`) |
 | `FERRUM_MODE=database ferrum-edge run` | Start the gateway in database mode from env vars |
