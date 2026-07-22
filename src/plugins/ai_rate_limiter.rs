@@ -29,8 +29,9 @@ use crate::proxy::{
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
-/// Bounds below-cap full-map scans under high RPS. Over-cap enforcement is not
-/// cooldown-gated so admission pressure still reclaims space immediately.
+/// Bounds below-cap full-map scans under high RPS. Sampled over-cap
+/// enforcement skips this cooldown so a sampled observation of pressure
+/// still force-reclaims without waiting for the next cool-down window.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 /// Redis sliding-window index the reservation credited (centralized mode only).
@@ -331,26 +332,30 @@ impl AiRateLimiter {
     }
 
     fn evict_stale_entries_at(&self, now: Instant) {
-        let len = self.limiter.tracked_keys_count();
-        if len == 0 {
-            return;
-        }
-
-        // Over-cap pressure force-evicts immediately after pruning idle
-        // keys so sustained traffic cannot grow the map without bound.
-        if len > MAX_STATE_ENTRIES {
-            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
-            return;
-        }
-
-        // Below the hard cap, sample piggyback sweeps so idle identity
-        // state is reclaimed without scanning the map on every request.
-        // A one-second cooldown bounds full DashMap retains under high RPS.
+        // Sample every 1024 requests before any DashMap::len()
+        // (`tracked_keys_count`) so the hot path avoids all-shard locking on
+        // every request.
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
         if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
         }
 
+        let len = self.limiter.tracked_keys_count();
+        if len == 0 {
+            return;
+        }
+
+        // Sampled over-cap observation force-enforces after pruning idle
+        // keys. The below-cap cooldown must not suppress this branch once
+        // pressure is seen on a sampled pass.
+        if len > MAX_STATE_ENTRIES {
+            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+            return;
+        }
+
+        // At/below the hard cap: cooldown-gate to at most one full DashMap
+        // retain per second so high RPS cannot turn periodic reclamation
+        // into an unbounded scan storm.
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
         if now_secs.saturating_sub(last_sweep) < EVICTION_COOLDOWN_SECS {

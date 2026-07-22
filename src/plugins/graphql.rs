@@ -48,8 +48,9 @@ use crate::util::unknown_keys::reject_unknown_keys;
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
-/// Bounds below-cap full-map scans under high RPS. Over-cap enforcement is not
-/// cooldown-gated so admission pressure still reclaims space immediately.
+/// Bounds below-cap full-map scans under high RPS. Sampled over-cap
+/// enforcement skips this cooldown so a sampled observation of pressure
+/// still force-reclaims without waiting for the next cool-down window.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
     &[super::ProxyProtocol::Http, super::ProxyProtocol::WebSocket];
@@ -278,24 +279,29 @@ impl GraphqlPlugin {
     }
 
     fn evict_stale_entries_at(&self, now: Instant) {
-        let len = self.limiter.tracked_keys_count();
-        if len == 0 {
-            return;
-        }
-
-        // Over-cap pressure force-evicts immediately after pruning idle keys.
-        if len > MAX_STATE_ENTRIES {
-            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
-            return;
-        }
-
-        // Below-cap: sample every 1024 requests and cooldown-gate to at most
-        // one full DashMap retain per second under high RPS.
+        // Sample every 1024 requests before any DashMap::len()
+        // (`tracked_keys_count`) so the hot path avoids all-shard locking on
+        // every request.
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
         if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {
             return;
         }
 
+        let len = self.limiter.tracked_keys_count();
+        if len == 0 {
+            return;
+        }
+
+        // Sampled over-cap observation force-enforces after pruning idle keys.
+        // The below-cap cooldown must not suppress this branch once pressure
+        // is seen on a sampled pass.
+        if len > MAX_STATE_ENTRIES {
+            apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+            return;
+        }
+
+        // At/below the hard cap: cooldown-gate to at most one full DashMap
+        // retain per second under high RPS.
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
         if now_secs.saturating_sub(last_sweep) < EVICTION_COOLDOWN_SECS {
