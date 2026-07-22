@@ -1285,12 +1285,12 @@ async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
     }))
     .unwrap();
 
-    let exact = br#"{"name":"abcdefghijkl"}"#;
-    assert!(exact.len() <= 64);
+    let exact = format!(r#"{{"name":"{}"}}"#, "n".repeat(53));
+    assert_eq!(exact.len(), 64);
     let mut ctx = post_ctx("/items");
     assert_continue(
         plugin
-            .on_final_request_body_with_context(&mut ctx, &json_headers(), exact)
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), exact.as_bytes())
             .await,
     );
 
