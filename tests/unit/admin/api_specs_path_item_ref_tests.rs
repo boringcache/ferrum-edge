@@ -6,7 +6,9 @@
 //! referenced object; cycles and depth limits fail closed.
 
 use ferrum_edge::admin::api_specs::{ExtractError, SpecFormat, extract};
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -85,7 +87,10 @@ fn fully_referenced_path_item_contributes_operations() {
     );
 
     let config = extract_validator_config(&spec);
-    assert_eq!(operation_keys(&config), vec![("GET".to_string(), "/pets".to_string())]);
+    assert_eq!(
+        operation_keys(&config),
+        vec![("GET".to_string(), "/pets".to_string())]
+    );
     assert_eq!(
         config["operations"][0]["responses"]["200"]["application/json"]["required"],
         json!(["ok"])
@@ -397,7 +402,10 @@ async fn referenced_path_item_matches_at_runtime() {
 
     let mut unknown = RequestContext::new("127.0.0.1".into(), "GET".into(), "/missing".into());
     let mut unknown_headers = HashMap::new();
-    match plugin.before_proxy(&mut unknown, &mut unknown_headers).await {
+    match plugin
+        .before_proxy(&mut unknown, &mut unknown_headers)
+        .await
+    {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
         other => panic!("unknown operation must reject: {other:?}"),
     }
