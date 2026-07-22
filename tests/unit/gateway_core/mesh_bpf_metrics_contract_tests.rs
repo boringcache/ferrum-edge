@@ -3,17 +3,17 @@
 //! Validates the public Prometheus surface, ABI decode rules, and pin-rotation
 //! dropped-baseline seeding without requiring a live BPF load.
 
-use ferrum_edge::ebpf::bpf_metrics::{BpfDropReason, BpfMetricsState, TcpDirection};
-use ferrum_edge::ebpf::event_consumer::{
-    PollOutcome, SockOpsConsumer, SockOpsEvent, seed_dropped_baseline,
-};
-use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use ferrum_ebpf_common::{
     SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_DROP_BYPASS_UID_HIT,
     SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
     SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
     SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_RST, SockOpsRecord,
 };
+use ferrum_edge::ebpf::bpf_metrics::{BpfDropReason, BpfMetricsState, TcpDirection};
+use ferrum_edge::ebpf::event_consumer::{
+    PollOutcome, SockOpsConsumer, SockOpsEvent, seed_dropped_baseline,
+};
+use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use serde_json::json;
 
 fn render_with(state: std::sync::Arc<BpfMetricsState>) -> String {
@@ -92,19 +92,24 @@ fn abi_drop_reason_and_rst_decode_contract() {
         Some(SockOpsEvent::Rst)
     );
     assert!(
-        SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, 0, 0))
-            .is_none(),
+        SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, 0, 0)).is_none(),
         "reserved accept-to-first-byte discriminant must be ignored"
     );
 
     for (raw, expected) in [
         (SOCK_OPS_DROP_BYPASS_UID_HIT, BpfDropReason::BypassUidHit),
-        (SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, BpfDropReason::ExcludeCidrHit),
+        (
+            SOCK_OPS_DROP_EXCLUDE_CIDR_HIT,
+            BpfDropReason::ExcludeCidrHit,
+        ),
         (
             SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR,
             BpfDropReason::NotInIncludeCidr,
         ),
-        (SOCK_OPS_DROP_EXCLUDE_PORT_HIT, BpfDropReason::ExcludePortHit),
+        (
+            SOCK_OPS_DROP_EXCLUDE_PORT_HIT,
+            BpfDropReason::ExcludePortHit,
+        ),
     ] {
         assert_eq!(
             SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_DROP_REASON, 0, raw)),

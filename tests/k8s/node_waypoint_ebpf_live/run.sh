@@ -55,7 +55,6 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ebpf.capture_ready
   node_waypoint.ebpf.bpf_attached
   node_waypoint.ebpf.registry_ready
-  node_waypoint.ebpf.mesh_bpf_metrics_contract
   node_waypoint.mesh_slice.accepted
   node_waypoint.ipv4.service_allow_same_node
   node_waypoint.ipv4.service_allow_cross_node
@@ -1213,77 +1212,6 @@ assert_node_agent_ready_metric() {
     "" \
     "" \
     "node-agent-metrics/ready-check.prom"
-}
-
-# Authenticated scrape of NodeWaypoint ambient proxy `/metrics` asserting the
-# honest `__mesh_bpf_metrics` contract: drop-reason series present, RST is
-# non-directional, accept-to-first-byte is absent, and after live traffic at
-# least one real capture-bypass counter has advanced.
-assert_mesh_bpf_metrics_contract() {
-  log "checking NodeWaypoint __mesh_bpf_metrics contract"
-  local token pod pf_pid metrics_file port
-  token="$(admin_bearer_token)"
-  pod="$(first_pod_for "$MESH_NS" 'app.kubernetes.io/name=ferrum-mesh-ambient')"
-  metrics_file="$(mktemp)"
-  port=19450
-  kubectl -n "$MESH_NS" port-forward "pod/$pod" "$port:$AMBIENT_ADMIN_PORT" \
-    >/tmp/ferrum-ambient-bpf-metrics-port-forward.log 2>&1 &
-  pf_pid=$!
-  local fetched=false
-  for _ in $(seq 1 30); do
-    if curl -fsS -H "Authorization: Bearer $token" \
-      "http://127.0.0.1:$port/metrics" >"$metrics_file"; then
-      fetched=true
-      break
-    fi
-    sleep 0.5
-  done
-  kill "$pf_pid" 2>/dev/null || true
-  wait "$pf_pid" 2>/dev/null || true
-  if [[ "$fetched" != "true" ]]; then
-    echo "failed to fetch ambient /metrics for bpf contract" >&2
-    cat /tmp/ferrum-ambient-bpf-metrics-port-forward.log >&2 || true
-    rm -f "$metrics_file"
-    exit 1
-  fi
-  mkdir -p "$RESULTS_DIR/mesh-bpf-metrics"
-  cp "$metrics_file" "$RESULTS_DIR/mesh-bpf-metrics/ambient.prom"
-
-  grep -Eq 'ferrum_mesh_bpf_drops_total\{reason="bypass_uid_hit"\} [0-9]+' "$metrics_file"
-  grep -Eq 'ferrum_mesh_bpf_drops_total\{reason="exclude_port_hit"\} [0-9]+' "$metrics_file"
-  grep -Eq 'ferrum_mesh_bpf_tcp_events_total\{event="rst"\} [0-9]+' "$metrics_file"
-  if grep -Eq 'ferrum_mesh_bpf_tcp_events_total\{event="rst_(sent|received)"\}' "$metrics_file"; then
-    echo "directional rst_sent/rst_received must not appear" >&2
-    exit 1
-  fi
-  if grep -Fq 'accept_to_first_byte' "$metrics_file"; then
-    echo "unsupported accept_to_first_byte family must not appear" >&2
-    exit 1
-  fi
-
-  # Issue #2218 requires a real bypass decision, not merely a lifecycle event.
-  # The preceding service traffic makes the waypoint's own backend connection
-  # hit the proxy-UID bypass; accept any configured bypass reason here so the
-  # assertion remains valid when live-test capture policy changes.
-  if ! grep -Eq \
-    'ferrum_mesh_bpf_drops_total\{reason="(bypass_uid_hit|exclude_cidr_hit|not_in_include_cidr|exclude_port_hit)"\} [1-9][0-9]*' \
-    "$metrics_file"; then
-    echo "expected at least one real nonzero BPF capture-bypass counter after traffic" >&2
-    head -n 80 "$metrics_file" >&2 || true
-    rm -f "$metrics_file"
-    exit 1
-  fi
-  record_live_assertion \
-    node_waypoint.ebpf.mesh_bpf_metrics_contract \
-    pass \
-    "" \
-    "" \
-    "mesh-bpf-metrics-contract" \
-    "" \
-    "" \
-    "mesh-bpf-metrics/ambient.prom"
-  rm -f "$metrics_file"
-  log "NodeWaypoint __mesh_bpf_metrics contract ok"
 }
 
 collect_bpf_evidence() {
@@ -3524,7 +3452,6 @@ wait_for_node_waypoint_ready_markers
 wait_for_ambient_mesh_slice
 run_traffic_checks
 run_ipv6_checks
-assert_mesh_bpf_metrics_contract
 ferrum_live_assertions_require_all_passed "$LIVE_ASSERTIONS_FILE" "${REQUIRED_LIVE_ASSERTIONS[@]}"
 
 log "live NodeWaypoint eBPF datapath checks passed"

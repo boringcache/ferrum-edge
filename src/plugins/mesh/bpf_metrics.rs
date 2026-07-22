@@ -197,11 +197,7 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
         "{p}_tcp_events_total{{event=\"accept_established\"}} {}",
         snap.accept_established
     );
-    let _ = writeln!(
-        out,
-        "{p}_tcp_events_total{{event=\"rst\"}} {}",
-        snap.rst
-    );
+    let _ = writeln!(out, "{p}_tcp_events_total{{event=\"rst\"}} {}", snap.rst);
     let _ = writeln!(
         out,
         "{p}_tcp_events_total{{event=\"fin_sent\"}} {}",

@@ -65,9 +65,15 @@ pub enum SockOpsEvent {
     /// Abnormal ESTABLISHED→CLOSE. Direction is not attributed (kernel
     /// SOCK_OPS state callbacks cannot distinguish sent vs received RST).
     Rst,
-    Fin { direction: TcpDirection },
-    RttSample { srtt_us: u64 },
-    SynToAckLatency { us: u64 },
+    Fin {
+        direction: TcpDirection,
+    },
+    RttSample {
+        srtt_us: u64,
+    },
+    SynToAckLatency {
+        us: u64,
+    },
     DropReason(BpfDropReason),
 }
 
@@ -737,13 +743,10 @@ mod tests {
             Some(SockOpsEvent::SynToAckLatency { us: 60 })
         );
         // Reserved accept-to-first-byte discriminant has no producer — ignored.
-        assert!(SockOpsEvent::from_record(rec(
-            SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
-            0,
-            0,
-            800
-        ))
-        .is_none());
+        assert!(
+            SockOpsEvent::from_record(rec(SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, 0, 0, 800))
+                .is_none()
+        );
 
         for (raw, expected) in [
             (SOCK_OPS_DROP_BYPASS_UID_HIT, BpfDropReason::BypassUidHit),
@@ -887,7 +890,10 @@ mod tests {
         consumer.handle_event(SockOpsEvent::DropReason(BpfDropReason::ExcludePortHit));
         assert_eq!(seed_dropped_baseline(&consumer, 42), 42);
         let s = snap(&consumer);
-        assert_eq!(s.connect, 1, "cumulative userspace state must survive reattach");
+        assert_eq!(
+            s.connect, 1,
+            "cumulative userspace state must survive reattach"
+        );
         assert_eq!(s.drop_exclude_port_hit, 1);
         assert_eq!(s.ringbuf_overruns, 1);
         assert!(s.in_overrun_regime);

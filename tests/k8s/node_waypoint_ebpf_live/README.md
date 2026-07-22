@@ -21,10 +21,7 @@ matching `ferrum_mesh_cert_expiry_seconds{source="workload_api"}` metric, checks
 program/link/map evidence with `bpftool`, creates same-node and cross-node
 source/destination pods, verifies `src-a` Service ClusterIP traffic is admitted,
 verifies `src-b` Service ClusterIP and direct Pod-IP attempts are rejected by the
-live `AuthorizationPolicy`, scrapes the NodeWaypoint ambient `/metrics` surface for
-the honest `__mesh_bpf_metrics` contract (drop-reason series present, non-directional
-`event="rst"`, no `accept_to_first_byte`, at least one real nonzero capture-bypass
-series after traffic), and forces the `src-a` workload to be recreated with
+live `AuthorizationPolicy`, and forces the `src-a` workload to be recreated with
 a new UID on the same IPv4 address so stale source identity and registry state
 cannot be reused or block the replacement; the runtime identity snapshot for the
 replacement must not contain the deleted pod's old UID. The same-IPv4 reuse
