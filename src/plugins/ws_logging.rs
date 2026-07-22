@@ -41,7 +41,7 @@ use super::utils::log_schema::{
     TimestampFormat, resolve_schema,
 };
 use super::utils::{
-    BatchConfigDefaults, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_RETRIES, MAX_BATCH_SIZE,
+    BatchConfigDefaults, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
     MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config, wait_until_committed,
 };
 use super::{

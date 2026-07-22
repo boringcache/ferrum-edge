@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, DeferredBatchingLogger, LoggerHooks,
-    MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_RETRIES, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
+    MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
     build_batch_config, handle_http_batch_response, parse_custom_headers, parse_http_endpoint,
     validate_batch_config, wait_until_committed,
 };

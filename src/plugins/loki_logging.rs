@@ -36,7 +36,7 @@ use crate::config::types::MAX_ID_LENGTH;
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, HttpBatchDrainOutcome,
-    MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_RETRIES, PluginHttpClient, RetryPolicy, build_batch_config,
+    MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, PluginHttpClient, RetryPolicy, build_batch_config,
     drain_http_batch_response_body, parse_custom_headers, parse_http_endpoint,
     validate_batch_config,
 };

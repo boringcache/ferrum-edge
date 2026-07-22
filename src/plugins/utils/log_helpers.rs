@@ -8,7 +8,7 @@ use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
 use super::response_body::{BoundedReadError, measure_response_body_bounded};
 use super::{
-    BatchConfig, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_RETRIES, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
+    BatchConfig, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
     RetryPolicy,
 };
 

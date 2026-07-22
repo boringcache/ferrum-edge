@@ -36,8 +36,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use super::chargeback::pricing::{ChargeComputation, PricingConfig};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
 use super::utils::{
-    BatchConfig, BatchingLogger, LoggerHooks, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    RetryPolicy, wait_until_committed,
+    BatchConfig, BatchingLogger, LoggerHooks, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
+    PluginHttpClient, RetryPolicy, wait_until_committed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
