@@ -74,35 +74,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
 
-      - name: Validate GitHub Action pinning and Kubernetes tool installs
-        run: |
-          set -euo pipefail
-          # The preceding Cross-policy step fetches origin/${BASE_REF}; reuse that
-          # immutable ref rather than trusting a PR-controlled fetch here.
-          checker=.github/scripts/verify_action_pinning.py
-
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            base_ref="origin/${BASE_REF}"
-            if git cat-file -e "${base_ref}:${checker}" 2>/dev/null; then
-              trusted_checker="$RUNNER_TEMP/verify-action-pinning.py"
-              git show "${base_ref}:${checker}" > "$trusted_checker"
-              checker="$trusted_checker"
-            else
-              # Bootstrap: base has no checker yet. Compile, then run this
-              # reviewed proposal. Later PRs take the trusted-base branch above.
-              PYTHONPYCACHEPREFIX="$RUNNER_TEMP/action-pinning-pyc" \
-                python3 -I -m py_compile "$checker"
-            fi
-          fi
-
-          python3 -I "$checker" \
-            --self-test \
-            --workflows-dir .github/workflows \
-            --actions-dir .github/actions
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-
       - name: Validate trusted PR CI planner examples
         run: |
           set -euo pipefail

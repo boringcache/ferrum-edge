@@ -264,9 +264,9 @@ jobs are a separate supply-chain surface from Rust crates. Policy:
 3. **Do not** use `azure/setup-helm`, `curl … | bash` installers, or
    `raw.githubusercontent.com/helm/helm/main` (or any other mutable-branch
    install script).
-4. **Static enforcement.** `ci-plan` runs
-   `.github/scripts/verify_action_pinning.py` on every CI run (including
-   lightweight documentation PRs). The checker rejects mutable action refs,
+4. **Static enforcement.** The `ci-plan` job runs the trusted base branch's
+   `.github/scripts/pr_ci_plan.py --self-test` on every CI run (including
+   lightweight documentation PRs). Its checker rejects mutable action refs,
    pipe-to-shell installers, mutable-branch install scripts, and direct
    kind/kubectl/Helm downloads outside the composite action. Local actions and
    expression-only generated matrix refs are not false positives.
@@ -303,7 +303,7 @@ Versions and digests live as defaults on the
    `.github/actions/setup-kubernetes-tools/action.yml`.
 4. Leave workflow jobs calling `uses: ./.github/actions/setup-kubernetes-tools`
    unchanged unless a job must pin an override input for a temporary skew.
-5. Land the change via PR; `verify_action_pinning.py` and the live suites that
+5. Land the change via PR; the trusted CI planner policy and the live suites that
    path-filter on the composite action will exercise the new pins.
 
 Never refresh a checksum by copying a digest from an unpinned adjacent path

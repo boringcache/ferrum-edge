@@ -6,9 +6,301 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from live_suite_path_filter import matched_files, self_test as live_suite_self_test
+
+
+# This planner is copied from the trusted base branch before CI executes it.
+# Keeping the action/tool policy here means a pull request cannot weaken the
+# scanner it is evaluated by, and avoids adding a new executable surface to the
+# Cross-protected CI workflow.
+ACTION_SHA40 = re.compile(r"^[0-9a-f]{40}$")
+ACTION_EXPRESSION_ONLY = re.compile(
+    r"^\$\{\{\s*matrix(?:\.[A-Za-z_][A-Za-z0-9_-]*)+\s*\}\}$"
+)
+ACTION_USES_VALUE = (
+    r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\$\{\{[^\r\n]*\}\}|[^\s,#}]+)'
+)
+ACTION_USES_BLOCK = re.compile(
+    rf"^\s*(?:-\s*)?uses\s*:\s*(?P<ref>{ACTION_USES_VALUE})\s*(?:#.*)?$",
+    re.MULTILINE,
+)
+ACTION_USES_FLOW = re.compile(
+    rf"(?:^|[{{,])\s*uses\s*:\s*(?P<ref>{ACTION_USES_VALUE})"
+    r"(?=\s*(?:[,}]|#|$))",
+    re.MULTILINE,
+)
+ACTION_PIPE_TO_SHELL = re.compile(
+    r"(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:bash|sh)\b",
+    re.IGNORECASE,
+)
+ACTION_MUTABLE_HELM_INSTALL = re.compile(
+    r"raw\.githubusercontent\.com/helm/helm/(?:main|master)/|"
+    r"get\.helm\.sh/helm-install|"
+    r"https://raw\.githubusercontent\.com/[^/\s]+/[^/\s]+/"
+    r"(?:main|master)/[^\s]*install",
+    re.IGNORECASE,
+)
+ACTION_DIRECT_K8S_TOOL_DOWNLOAD = re.compile(
+    r"(?:kind\.sigs\.k8s\.io/dl/|"
+    r"github\.com/kubernetes-sigs/kind/releases/download/|"
+    r"dl\.k8s\.io/release/.*/kubectl|"
+    r"get\.helm\.sh/helm-)",
+    re.IGNORECASE,
+)
+ACTION_DISALLOWED_HELM = re.compile(r"^(?:azure|Azure)/setup-helm(?:@|$)")
+
+
+def normalize_action_uses_ref(raw: str) -> str:
+    ref = raw.strip()
+    if len(ref) >= 2 and ref[0] == ref[-1] and ref[0] in {"\"", "'"}:
+        ref = ref[1:-1].strip()
+    return ref
+
+
+def action_pin_status(raw: str) -> tuple[bool, str]:
+    """Validate one parsed `uses:` value without resolving untrusted paths."""
+    ref = normalize_action_uses_ref(raw)
+    if not ref:
+        return False, "empty uses reference"
+    if ACTION_EXPRESSION_ONLY.fullmatch(ref):
+        return True, "expression-only generated matrix ref"
+    if "${{" in ref:
+        return False, f"dynamic or partially interpolated uses ref: {ref}"
+    if ref.startswith("./"):
+        # Local actions have no @ref syntax. Treat every character as path data
+        # so an embedded `@../` cannot hide traversal from the parts check.
+        local = ref
+        if "\\" in local:
+            return False, f"local action path must use forward slashes: {ref}"
+        parts = PurePosixPath(local).parts
+        if (
+            ".." in parts
+            or len(parts) < 3
+            or tuple(parts[:2]) != (".github", "actions")
+        ):
+            return False, f"local action outside .github/actions: {ref}"
+        return True, "repository-local action"
+    if ref.startswith(("../", "/")):
+        return False, f"local action outside .github/actions: {ref}"
+    if ref.startswith("docker://"):
+        return True, "docker image reference outside action-pin scope"
+    if "@" not in ref:
+        return False, f"missing action pin (@ref): {ref}"
+    name, pin = ref.rsplit("@", 1)
+    if not name:
+        return False, f"missing action name: {ref}"
+    if ACTION_DISALLOWED_HELM.match(name):
+        return (
+            False,
+            "azure/setup-helm is disallowed; use "
+            "./.github/actions/setup-kubernetes-tools",
+        )
+    if not ACTION_SHA40.fullmatch(pin):
+        return False, f"mutable action ref (not a 40-char SHA): {ref}"
+    return True, "sha-pinned"
+
+
+def find_action_uses_refs(text: str) -> list[tuple[int, str]]:
+    """Extract block and flow-style `uses:` values, including spaced expressions."""
+    refs: list[tuple[int, str]] = []
+    seen: set[tuple[int, int]] = set()
+    for pattern in (ACTION_USES_BLOCK, ACTION_USES_FLOW):
+        for match in pattern.finditer(text):
+            span = match.span("ref")
+            if span in seen:
+                continue
+            seen.add(span)
+            line_no = text.count("\n", 0, match.start("ref")) + 1
+            refs.append((line_no, normalize_action_uses_ref(match.group("ref"))))
+    return sorted(refs)
+
+
+def action_policy_yaml_files(repo_root: Path) -> tuple[list[Path], list[str]]:
+    workflows = repo_root / ".github" / "workflows"
+    actions = repo_root / ".github" / "actions"
+    failures: list[str] = []
+    if not workflows.is_dir():
+        failures.append("missing .github/workflows directory")
+    if not actions.is_dir():
+        failures.append("missing .github/actions directory")
+    files = [*workflows.glob("*.yml"), *workflows.glob("*.yaml")]
+    files.extend(actions.glob("*/action.yml"))
+    files.extend(actions.glob("*/action.yaml"))
+    if not files:
+        failures.append("no workflow or composite-action YAML found")
+    return sorted(set(files)), failures
+
+
+def action_policy_relative_path(path: Path, repo_root: Path) -> str:
+    try:
+        return path.relative_to(repo_root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def scan_action_policy_text(
+    text: str,
+    rel: str,
+    *,
+    allow_direct_downloads: bool,
+) -> list[str]:
+    failures: list[str] = []
+    for line_no, ref in find_action_uses_refs(text):
+        ok, reason = action_pin_status(ref)
+        if not ok:
+            failures.append(f"{rel}:{line_no}: {reason}")
+
+    pipe_found = False
+    mutable_helm_found = False
+    direct_download_found = False
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ACTION_PIPE_TO_SHELL.search(line):
+            pipe_found = True
+            failures.append(
+                f"{rel}:{line_no}: pipe-to-shell installer is forbidden"
+            )
+        if ACTION_MUTABLE_HELM_INSTALL.search(line):
+            mutable_helm_found = True
+            failures.append(
+                f"{rel}:{line_no}: mutable-branch Helm installer is forbidden"
+            )
+        if not allow_direct_downloads and ACTION_DIRECT_K8S_TOOL_DOWNLOAD.search(line):
+            direct_download_found = True
+            failures.append(
+                f"{rel}:{line_no}: direct kind/kubectl/Helm download must use "
+                "./.github/actions/setup-kubernetes-tools"
+            )
+
+    # Explicit shell continuations can split a forbidden URL or `| bash`
+    # across physical YAML lines. Collapse those continuations after dropping
+    # comment-only lines, then add a file-level finding if the line scan did not
+    # already locate the same category.
+    non_comment_text = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    continued = re.sub(r"\\\r?\n[ \t]*", "", non_comment_text)
+    if not pipe_found and ACTION_PIPE_TO_SHELL.search(continued):
+        failures.append(f"{rel}: continued pipe-to-shell installer is forbidden")
+    if not mutable_helm_found and ACTION_MUTABLE_HELM_INSTALL.search(continued):
+        failures.append(f"{rel}: continued mutable-branch Helm installer is forbidden")
+    if (
+        not allow_direct_downloads
+        and not direct_download_found
+        and ACTION_DIRECT_K8S_TOOL_DOWNLOAD.search(continued)
+    ):
+        failures.append(
+            f"{rel}: continued direct kind/kubectl/Helm download must use "
+            "./.github/actions/setup-kubernetes-tools"
+        )
+    return failures
+
+
+def scan_action_policy_file(path: Path, repo_root: Path) -> list[str]:
+    rel = action_policy_relative_path(path, repo_root)
+    if path.is_symlink():
+        return [f"{rel}: workflow/action YAML must not be a symlink"]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return [f"{rel}: failed to read UTF-8 YAML: {exc}"]
+    return scan_action_policy_text(
+        text,
+        rel,
+        allow_direct_downloads=(
+            rel == ".github/actions/setup-kubernetes-tools/action.yml"
+        ),
+    )
+
+
+def validate_action_pinning_policy(repo_root: Path) -> list[str]:
+    root = repo_root.resolve()
+    files, failures = action_policy_yaml_files(root)
+    setup = root / ".github" / "actions" / "setup-kubernetes-tools" / "action.yml"
+    if not setup.is_file() or setup.is_symlink():
+        failures.append(
+            "missing regular centralized installer: "
+            ".github/actions/setup-kubernetes-tools/action.yml"
+        )
+    for path in files:
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            failures.append(
+                f"{action_policy_relative_path(path, root)}: path escapes repository"
+            )
+            continue
+        failures.extend(scan_action_policy_file(path, root))
+    return failures
+
+
+def action_pinning_self_test() -> list[str]:
+    failures: list[str] = []
+
+    def expect_ok(ref: str) -> None:
+        ok, reason = action_pin_status(ref)
+        if not ok:
+            failures.append(f"expected {ref!r} to pass: {reason}")
+
+    def expect_bad(ref: str, needle: str) -> None:
+        ok, reason = action_pin_status(ref)
+        if ok or needle not in reason:
+            failures.append(
+                f"expected {ref!r} to fail with {needle!r}, got {reason!r}"
+            )
+
+    sha = "a" * 40
+    expect_ok(f"actions/checkout@{sha}")
+    expect_ok("./.github/actions/setup-kubernetes-tools")
+    expect_ok("${{ matrix.action }}")
+    expect_bad("actions/checkout@v7", "mutable action ref")
+    expect_bad("actions/checkout@abcd123", "mutable action ref")
+    expect_bad("actions/checkout", "missing action pin")
+    expect_bad("./actions/evil", "outside .github/actions")
+    expect_bad("../.github/actions/evil", "outside .github/actions")
+    expect_bad("./.github/actions/../evil", "outside .github/actions")
+    expect_bad("./.github/actions/good@../../evil", "outside .github/actions")
+    expect_bad("./.github/actions-evil/tool", "outside .github/actions")
+    expect_bad("owner/action@${{ env.REF }}", "dynamic or partially interpolated")
+    expect_bad("${{ env.ACTION }}", "dynamic or partially interpolated")
+    expect_bad(f"azure/setup-helm@{sha}", "azure/setup-helm is disallowed")
+
+    sample = (
+        "steps:\n"
+        f"  - uses: actions/checkout@{sha} # pinned\n"
+        "  - uses: '${{ matrix.action }}'\n"
+        f"  - {{uses: owner/action@{sha}, name: inline}}\n"
+        "  # uses: owner/action@v7\n"
+    )
+    found = find_action_uses_refs(sample)
+    expected = [
+        f"actions/checkout@{sha}",
+        "${{ matrix.action }}",
+        f"owner/action@{sha}",
+    ]
+    if [ref for _, ref in found] != expected:
+        failures.append(f"uses parser mismatch: {found!r}")
+    continued_bad = (
+        "steps:\n"
+        "  - run: curl -fsSL https://kind.sigs.k8s.io/dl/\\\n"
+        "      v0.27.0/kind-linux-amd64 \\\n"
+        "      | bash\n"
+    )
+    continued_failures = scan_action_policy_text(
+        continued_bad,
+        "synthetic.yml",
+        allow_direct_downloads=False,
+    )
+    if not any("pipe-to-shell" in failure for failure in continued_failures):
+        failures.append("continued pipe-to-shell self-test was not rejected")
+    if not any("direct kind" in failure for failure in continued_failures):
+        failures.append("continued direct-download self-test was not rejected")
+    return failures
 
 
 # These files cannot affect the Rust workspace, build/release inputs, runtime
@@ -131,7 +423,6 @@ GATE_CONTROLLER_PATHS = frozenset(
     {
         ".github/scripts/pr_ci_plan.py",
         ".github/scripts/live_suite_path_filter.py",
-        ".github/scripts/verify_action_pinning.py",
     }
 )
 
@@ -271,11 +562,6 @@ def self_test() -> int:
         ),
         (
             "pull_request",
-            [".github/scripts/verify_action_pinning.py"],
-            {name: True for name in JOB_GATE_NAMES},
-        ),
-        (
-            "pull_request",
             [".github/actions/setup-kubernetes-tools/action.yml"],
             {"run_ebpf_live": True, "run_helm": True},
         ),
@@ -298,6 +584,8 @@ def self_test() -> int:
 
     if live_suite_self_test() != 0:
         failures.append("live-suite path-filter self-test failed")
+    failures.extend(action_pinning_self_test())
+    failures.extend(validate_action_pinning_policy(Path.cwd()))
     for failure in failures:
         print(f"::error::{failure}", file=sys.stderr)
     return 1 if failures else 0
