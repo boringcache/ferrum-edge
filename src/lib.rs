@@ -1110,6 +1110,50 @@ pub mod _test_support {
         plugin.rebuild_vector_index_for_tests().await;
     }
 
+    pub fn ai_semantic_cache_size_accounting_snapshot_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> (usize, usize) {
+        plugin.size_accounting_snapshot_for_tests()
+    }
+
+    pub fn ai_semantic_cache_vector_index_dirty_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> bool {
+        plugin.vector_index_dirty_for_tests()
+    }
+
+    pub fn ai_semantic_cache_clear_vector_index_dirty_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) {
+        plugin.clear_vector_index_dirty_for_tests();
+    }
+
+    pub fn ai_semantic_cache_set_vector_index_rebuild_blocked_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        blocked: bool,
+    ) {
+        plugin.set_vector_index_rebuild_blocked_for_tests(blocked);
+    }
+
+    pub fn ai_semantic_cache_expire_all_entries_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) {
+        plugin.expire_all_entries_for_tests();
+    }
+
+    pub fn ai_semantic_cache_force_cleanup_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) {
+        plugin.force_cleanup_for_tests();
+    }
+
+    pub fn ai_semantic_cache_set_store_post_admit_hook_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        plugin.set_store_post_admit_hook_for_tests(hook);
+    }
+
     // ── plugins/response_caching ─────────────────────────────────────────────
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all
@@ -2642,6 +2686,20 @@ pub mod _test_support {
 
     pub fn ai_semantic_cache_scope_key(ctx: &crate::plugins::RequestContext) -> Option<&str> {
         ctx.ai_semantic_cache_scope_key.as_deref()
+    }
+
+    pub fn set_ai_semantic_cache_embedding(
+        ctx: &mut crate::plugins::RequestContext,
+        embedding: Option<Vec<f32>>,
+    ) {
+        ctx.ai_semantic_cache_embedding = embedding;
+    }
+
+    pub fn set_ai_semantic_cache_scope_key(
+        ctx: &mut crate::plugins::RequestContext,
+        scope_key: Option<String>,
+    ) {
+        ctx.ai_semantic_cache_scope_key = scope_key;
     }
 
     // ── WebSocket tunnel-mode disconnect hook ────────────────────────────────
