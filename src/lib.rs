@@ -1236,6 +1236,19 @@ pub mod _test_support {
         plugin.set_store_post_admit_hook_for_tests(hook);
     }
 
+    pub fn ai_semantic_cache_instance_id_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> u64 {
+        plugin.instance_id_for_tests()
+    }
+
+    pub fn ai_semantic_cache_staging_metadata_key_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        suffix: &str,
+    ) -> String {
+        plugin.staging_metadata_key_for_tests(suffix)
+    }
+
     // ── plugins/response_caching ─────────────────────────────────────────────
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all
@@ -2818,31 +2831,56 @@ pub mod _test_support {
 
     // ── plugins/ai_semantic_cache staging fields ─────────────────────────────
     //
-    // `RequestContext::ai_semantic_cache_embedding` / `..._scope_key` are
+    // `RequestContext::ai_semantic_cache_embeddings` / `..._scope_keys` are
     // `pub(crate)` so the high-dimensional embedding vector and scope key cannot
-    // leak into transaction logs. The read-only accessors below let external
-    // unit tests assert that `exact_only` mode never stages either field for
-    // multimodal requests, without widening the fields to `pub`.
-    pub fn ai_semantic_cache_embedding(ctx: &crate::plugins::RequestContext) -> Option<&Vec<f32>> {
-        ctx.ai_semantic_cache_embedding.as_ref()
+    // leak into transaction logs. The accessors below let external unit tests
+    // assert per-instance staging (including `exact_only` multimodal skips)
+    // without widening the maps to `pub`.
+    pub fn ai_semantic_cache_embedding(
+        ctx: &crate::plugins::RequestContext,
+        instance_id: u64,
+    ) -> Option<&Vec<f32>> {
+        ctx.ai_semantic_cache_embeddings.get(&instance_id)
     }
 
-    pub fn ai_semantic_cache_scope_key(ctx: &crate::plugins::RequestContext) -> Option<&str> {
-        ctx.ai_semantic_cache_scope_key.as_deref()
+    pub fn ai_semantic_cache_scope_key(
+        ctx: &crate::plugins::RequestContext,
+        instance_id: u64,
+    ) -> Option<&str> {
+        ctx.ai_semantic_cache_scope_keys
+            .get(&instance_id)
+            .map(String::as_str)
     }
 
     pub fn set_ai_semantic_cache_embedding(
         ctx: &mut crate::plugins::RequestContext,
+        instance_id: u64,
         embedding: Option<Vec<f32>>,
     ) {
-        ctx.ai_semantic_cache_embedding = embedding;
+        match embedding {
+            Some(values) => {
+                ctx.ai_semantic_cache_embeddings
+                    .insert(instance_id, values);
+            }
+            None => {
+                ctx.ai_semantic_cache_embeddings.remove(&instance_id);
+            }
+        }
     }
 
     pub fn set_ai_semantic_cache_scope_key(
         ctx: &mut crate::plugins::RequestContext,
+        instance_id: u64,
         scope_key: Option<String>,
     ) {
-        ctx.ai_semantic_cache_scope_key = scope_key;
+        match scope_key {
+            Some(key) => {
+                ctx.ai_semantic_cache_scope_keys.insert(instance_id, key);
+            }
+            None => {
+                ctx.ai_semantic_cache_scope_keys.remove(&instance_id);
+            }
+        }
     }
 
     // ── WebSocket tunnel-mode disconnect hook ────────────────────────────────

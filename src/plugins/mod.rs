@@ -1796,12 +1796,15 @@ pub struct RequestContext {
     /// the shared reject finalizer can remove transport-owned handshake fields
     /// after every ordered response hook without reclassifying or allocating.
     websocket_response_boundary: bool,
-    /// Semantic-cache embedding vector staged between `before_proxy` and
-    /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
-    /// vectors cannot enter transaction logs.
-    pub(crate) ai_semantic_cache_embedding: Option<Vec<f32>>,
-    /// Semantic-cache scope key paired with `ai_semantic_cache_embedding`.
-    pub(crate) ai_semantic_cache_scope_key: Option<String>,
+    /// Per-`ai_semantic_cache`-instance embedding vectors staged between
+    /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
+    /// high-dimensional vectors cannot enter transaction logs. The outer key is
+    /// a process-unique cache instance ID so sibling instances on one proxy
+    /// cannot overwrite or consume each other's staged vectors.
+    pub(crate) ai_semantic_cache_embeddings: HashMap<u64, Vec<f32>>,
+    /// Per-instance semantic-cache scope keys paired with
+    /// `ai_semantic_cache_embeddings`.
+    pub(crate) ai_semantic_cache_scope_keys: HashMap<u64, String>,
     /// OpenAPI validator operation matches staged between `before_proxy` and
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
@@ -2279,8 +2282,8 @@ impl RequestContext {
             request_http_flavor: HttpFlavor::Plain,
             original_accept_encoding: None,
             websocket_response_boundary: false,
-            ai_semantic_cache_embedding: None,
-            ai_semantic_cache_scope_key: None,
+            ai_semantic_cache_embeddings: HashMap::new(),
+            ai_semantic_cache_scope_keys: HashMap::new(),
             openapi_validator_matches: HashMap::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
@@ -2964,8 +2967,8 @@ impl RequestContext {
             request_http_flavor: self.request_http_flavor,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
-            ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
-            ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
+            ai_semantic_cache_embeddings: self.ai_semantic_cache_embeddings.clone(),
+            ai_semantic_cache_scope_keys: self.ai_semantic_cache_scope_keys.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
