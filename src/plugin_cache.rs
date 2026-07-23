@@ -650,6 +650,9 @@ impl Plugin for PriorityOverridePlugin {
     fn warn_on_rejection_response_replacement(&self) -> bool {
         self.inner.warn_on_rejection_response_replacement()
     }
+    fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        self.inner.requires_buffered_grpc_web_trailer_policy(ctx)
+    }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
     }
