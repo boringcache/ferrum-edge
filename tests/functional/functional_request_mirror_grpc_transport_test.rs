@@ -251,16 +251,8 @@ async fn spawn_plain_backend(steps: Vec<GrpcStep>) -> (u16, ScriptedGrpcBackend)
     (port, backend)
 }
 
-async fn spawn_plain_backend_connections(
-    scripts: Vec<Vec<GrpcStep>>,
-) -> (u16, ScriptedGrpcBackend) {
-    let reservation = reserve_port().await.expect("port");
-    let port = reservation.port;
-    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
-        .connection_scripts(scripts)
-        .spawn()
-        .expect("spawn plain grpc backend");
-    (port, backend)
+fn concatenate_grpc_scripts(scripts: Vec<Vec<GrpcStep>>) -> Vec<GrpcStep> {
+    scripts.into_iter().flatten().collect()
 }
 
 async fn spawn_tls_backend(steps: Vec<GrpcStep>) -> (u16, ScriptedGrpcBackend, TestCa) {
@@ -411,7 +403,10 @@ async fn request_mirror_grpc_h2c_streaming_shapes_and_multiframe_body() {
         },
     ];
 
-    let (primary_port, _primary) = spawn_plain_backend_connections(primary_scripts).await;
+    // Ferrum's primary gRPC pool reuses one HTTP/2 connection across these
+    // sequential RPCs, so the fixture must expose one sequential stream script.
+    let (primary_port, _primary) =
+        spawn_plain_backend(concatenate_grpc_scripts(primary_scripts)).await;
     let (mirror_port, mirror) = spawn_plain_backend(mirror_steps).await;
 
     let harness = GatewayHarness::builder()
@@ -538,7 +533,10 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
         },
     ];
 
-    let (primary_port, _primary) = spawn_plain_backend_connections(primary_scripts).await;
+    // Ferrum's primary gRPC pool reuses one HTTP/2 connection across these
+    // sequential RPCs, so the fixture must expose one sequential stream script.
+    let (primary_port, _primary) =
+        spawn_plain_backend(concatenate_grpc_scripts(primary_scripts)).await;
     let (mirror_port, mirror, _ca) = spawn_tls_backend(mirror_steps).await;
 
     let harness = GatewayHarness::builder()
@@ -600,8 +598,11 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn request_mirror_grpc_h2c_missing_and_client_supplied_te() {
-    let (primary_port, _primary) =
-        spawn_plain_backend_connections(vec![unary_ok_script(), unary_ok_script()]).await;
+    let (primary_port, _primary) = spawn_plain_backend(concatenate_grpc_scripts(vec![
+        unary_ok_script(),
+        unary_ok_script(),
+    ]))
+    .await;
     let (mirror_port, mirror) = spawn_plain_backend(vec![
         GrpcStep::AcceptRpc(MatchRpc::any()),
         GrpcStep::SendInitialHeaders,
@@ -721,8 +722,11 @@ async fn request_mirror_grpc_h2c_mirror_error_status_does_not_affect_primary() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn request_mirror_grpc_h2c_reuses_http2_connection_across_mirrors() {
-    let (primary_port, _primary) =
-        spawn_plain_backend_connections(vec![unary_ok_script(), unary_ok_script()]).await;
+    let (primary_port, _primary) = spawn_plain_backend(concatenate_grpc_scripts(vec![
+        unary_ok_script(),
+        unary_ok_script(),
+    ]))
+    .await;
     let (mirror_port, mirror) = spawn_plain_backend(vec![
         GrpcStep::AcceptRpc(MatchRpc::method(UNARY_PATH)),
         GrpcStep::SendInitialHeaders,
