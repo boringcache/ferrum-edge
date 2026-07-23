@@ -2859,8 +2859,7 @@ pub mod _test_support {
     ) {
         match embedding {
             Some(values) => {
-                ctx.ai_semantic_cache_embeddings
-                    .insert(instance_id, values);
+                ctx.ai_semantic_cache_embeddings.insert(instance_id, values);
             }
             None => {
                 ctx.ai_semantic_cache_embeddings.remove(&instance_id);

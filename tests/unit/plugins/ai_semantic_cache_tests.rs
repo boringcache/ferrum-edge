@@ -5,8 +5,7 @@ use ferrum_edge::_test_support::{
     ai_semantic_cache_set_store_post_admit_hook_for_test,
     ai_semantic_cache_set_vector_index_rebuild_blocked_for_test,
     ai_semantic_cache_size_accounting_snapshot_for_test,
-    ai_semantic_cache_staging_metadata_key_for_test,
-    ai_semantic_cache_vector_index_dirty_for_test,
+    ai_semantic_cache_staging_metadata_key_for_test, ai_semantic_cache_vector_index_dirty_for_test,
     apply_buffered_request_body_normalization_before_before_proxy_for_test,
     rebuild_ai_semantic_cache_vector_index, set_ai_semantic_cache_embedding,
     set_ai_semantic_cache_scope_key,
@@ -861,10 +860,7 @@ async fn configured_decompression_preserves_semantic_cache_miss_store_hit_lifecy
         assert_eq!(first_body, body);
         let first = cache.before_proxy(&mut first_ctx, &mut first_headers).await;
         assert!(matches!(first, PluginResult::Continue));
-        assert_eq!(
-            staged_status(&cache, &first_ctx),
-            Some("MISS")
-        );
+        assert_eq!(staged_status(&cache, &first_ctx), Some("MISS"));
 
         let response_headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
@@ -977,10 +973,7 @@ async fn synthetic_short_circuit_2xx_is_not_stored_in_semantic_cache() {
         matches!(result, PluginResult::Continue),
         "request matching a synthetic short-circuit must MISS, not replay a poisoned cache entry; got {result:?}"
     );
-    assert_eq!(
-        staged_status(&plugin, &ctx2),
-        Some("MISS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx2), Some("MISS"));
 }
 
 // Control: a GENUINE backend response (no synthetic marker) on a MISS IS stored
@@ -1070,10 +1063,7 @@ async fn exact_cache_key_differs_for_different_image_url() {
         matches!(result, PluginResult::Continue),
         "different image_url must exact-miss instead of replaying cached response A"
     );
-    assert_eq!(
-        staged_status(&plugin, &ctx_b),
-        Some("MISS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx_b), Some("MISS"));
 
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -1210,10 +1200,7 @@ async fn exact_cache_key_treats_mixed_case_text_type_as_non_text() {
         matches!(result, PluginResult::Continue),
         "mixed-case \"Text\" part must be fingerprinted (non-text) and exact-miss vs lowercase \"text\""
     );
-    assert_eq!(
-        staged_status(&plugin, &ctx_mixed),
-        Some("MISS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx_mixed), Some("MISS"));
 }
 
 #[tokio::test]
@@ -1295,10 +1282,7 @@ async fn semantic_cache_scope_differs_for_different_image_url() {
         matches!(result, PluginResult::Continue),
         "semantic scope must include image fingerprint and miss different image_url"
     );
-    assert_eq!(
-        staged_status(&plugin, &ctx_b),
-        Some("MISS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx_b), Some("MISS"));
 }
 
 #[tokio::test]
@@ -1365,10 +1349,7 @@ async fn scope_by_consumer_false_still_does_not_cross_replay_multimodal() {
         matches!(result, PluginResult::Continue),
         "multimodal fingerprint must prevent cross-replay even when consumer scoping is disabled"
     );
-    assert_eq!(
-        staged_status(&plugin, &ctx_b),
-        Some("MISS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx_b), Some("MISS"));
 }
 
 #[tokio::test]
@@ -1382,10 +1363,7 @@ async fn cache_multimodal_reject_bypasses_multimodal_and_text_only_still_caches(
     let body_str = serde_json::to_string(&body).unwrap();
     let (mut ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(
-        staged_status(&plugin, &ctx),
-        Some("BYPASS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx), Some("BYPASS"));
     assert!(
         !has_staged_cache_key(&plugin, &ctx),
         "reject-mode multimodal bypass must not mark the response for storage"
@@ -1400,10 +1378,7 @@ async fn cache_multimodal_reject_bypasses_multimodal_and_text_only_still_caches(
 
     let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(
-        staged_status(&plugin, &ctx),
-        Some("BYPASS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx), Some("BYPASS"));
     assert_eq!(
         plugin.tracked_keys_count(),
         Some(0),
@@ -1435,10 +1410,7 @@ async fn exact_only_multimodal_skips_semantic_embedding_call() {
         run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
 
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(
-        staged_status(&plugin, &ctx),
-        Some("MISS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx), Some("MISS"));
     assert!(
         ai_semantic_cache_embedding(&ctx, instance_id(&plugin)).is_none(),
         "default exact_only mode must not compute text-only embeddings for multimodal requests"
@@ -1500,10 +1472,7 @@ async fn test_semantic_similarity_hit_after_exact_miss() {
                 Some("semantic")
             );
             assert_eq!(&body[..], br#""Paris""#);
-            assert_eq!(
-                staged_match(&plugin, &ctx),
-                Some("semantic")
-            );
+            assert_eq!(staged_match(&plugin, &ctx), Some("semantic"));
         }
         _ => panic!(
             "Expected semantic cache HIT (RejectBinary), got {:?}",
@@ -1568,10 +1537,7 @@ async fn test_semantic_embedding_failure_falls_back_to_miss() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(
-        staged_status(&plugin, &ctx),
-        Some("MISS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx), Some("MISS"));
 
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -1764,10 +1730,7 @@ async fn test_semantic_similarity_respects_consumer_scope() {
         matches!(result, PluginResult::Continue),
         "semantic match must not cross consumer scope"
     );
-    assert_eq!(
-        staged_status(&plugin, &ctx),
-        Some("MISS")
-    );
+    assert_eq!(staged_status(&plugin, &ctx), Some("MISS"));
 }
 
 #[tokio::test]
@@ -3562,10 +3525,7 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
                 Some("semantic")
             );
             assert_eq!(&body[..], br#"{"city":"Paris"}"#);
-            assert_eq!(
-                staged_match(&plugin, &ctx),
-                Some("semantic")
-            );
+            assert_eq!(staged_match(&plugin, &ctx), Some("semantic"));
         }
         other => panic!("expected Gemini semantic HIT, got {other:?}"),
     }
@@ -4227,8 +4187,7 @@ async fn reject_bypass_clears_only_current_instance_staging() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
-    ctx.metadata
-        .insert("request_body".to_string(), body_str);
+    ctx.metadata.insert("request_body".to_string(), body_str);
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 

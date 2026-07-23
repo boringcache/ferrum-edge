@@ -3071,10 +3071,8 @@ impl Plugin for AiSemanticCache {
                         self.set_cache_status(ctx, "HIT");
                         ctx.metadata
                             .insert(self.meta_match.clone(), "semantic".to_string());
-                        ctx.metadata.insert(
-                            self.meta_similarity.clone(),
-                            format!("{similarity:.6}"),
-                        );
+                        ctx.metadata
+                            .insert(self.meta_similarity.clone(), format!("{similarity:.6}"));
                         return PluginResult::RejectBinary {
                             status_code: entry.status_code,
                             body: entry.body.clone(),
@@ -3098,8 +3096,7 @@ impl Plugin for AiSemanticCache {
             cache_key = %cache_key,
             "ai_semantic_cache: cache MISS"
         );
-        ctx.metadata
-            .insert(self.meta_cache_key.clone(), cache_key);
+        ctx.metadata.insert(self.meta_cache_key.clone(), cache_key);
         self.set_cache_status(ctx, "MISS");
 
         PluginResult::Continue
@@ -3801,7 +3798,9 @@ mod tests {
             Some(&vec![0.1, 0.2, 0.3])
         );
         assert_eq!(
-            ctx.ai_semantic_cache_scope_keys.get(&sibling_id).map(String::as_str),
+            ctx.ai_semantic_cache_scope_keys
+                .get(&sibling_id)
+                .map(String::as_str),
             Some("sibling-scope")
         );
 
