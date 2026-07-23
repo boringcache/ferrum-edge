@@ -40,8 +40,7 @@
 use std::time::Duration;
 
 use crate::scaffolding::backends::{
-    GrpcStep, MatchRpc, ReceivedStream, ScriptedGrpcBackend, ScriptedTlsBackend, TcpStep,
-    TlsConfig,
+    GrpcStep, MatchRpc, ReceivedStream, ScriptedGrpcBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GrpcClient, GrpcResponse};
