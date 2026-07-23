@@ -32,16 +32,44 @@ impl Http3Client {
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
-        Self::from_rustls(client_tls)
+        Self::from_rustls(client_tls, None)
+    }
+
+    /// Build an insecure client with an explicit per-stream receive window.
+    ///
+    /// Slow-client tests use this to create deterministic QUIC backpressure
+    /// without relying on Quinn's substantially larger default window.
+    pub fn insecure_with_stream_receive_window(
+        stream_receive_window: u32,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let provider = rustls::crypto::ring::default_provider();
+        let verifier = Arc::new(DangerousAcceptAnyServer);
+        let client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        Self::from_rustls(client_tls, Some(stream_receive_window))
     }
 
     fn from_rustls(
         mut client_tls: rustls::ClientConfig,
+        stream_receive_window: Option<u32>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         client_tls.alpn_protocols = vec![b"h3".to_vec()];
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
             .map_err(|e| format!("QuicClientConfig build failed: {e}"))?;
-        let client_config = ClientConfig::new(Arc::new(quic_config));
+        let mut client_config = ClientConfig::new(Arc::new(quic_config));
+        if let Some(window) = stream_receive_window {
+            let mut transport = quinn::TransportConfig::default();
+            transport.stream_receive_window(quinn::VarInt::from_u32(window));
+            // Leave enough connection-level credit for the response stream
+            // plus H3 control/QPACK streams while the response itself stalls.
+            transport.receive_window(quinn::VarInt::from_u32(
+                window.saturating_mul(64).max(1_048_576),
+            ));
+            client_config.transport_config(Arc::new(transport));
+        }
 
         // Bind ephemeral local UDP. quinn picks an IPv4 endpoint by default
         // which matches the gateway's IPv4 bind in test mode.

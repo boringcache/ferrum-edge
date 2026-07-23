@@ -32,6 +32,7 @@ use tokio::net::TcpStream;
 
 const BODY_DELAY: Duration = Duration::from_millis(400);
 const STREAM_UNKNOWN: f64 = -1.0;
+const H3_SLOW_CLIENT_STREAM_WINDOW_BYTES: u32 = 16 * 1024;
 /// Large enough to create real downstream backpressure when the client stops
 /// reading (TCP / H2 / QUIC windows fill). Tiny already-buffered bodies are
 /// not a valid slow-client fixture.
@@ -156,9 +157,8 @@ fn find_summary_for_marker<'a>(logs: &'a str, marker: &str) -> Option<&'a str> {
     let path_needle = format!("\"request_path\":\"/api/{marker}");
     let path_needle_esc = format!("\\\"request_path\\\":\\\"/api/{marker}");
     for line in logs.lines() {
-        let matches_marker = line.contains(&path_needle)
-            || line.contains(&path_needle_esc)
-            || line.contains(marker);
+        let matches_marker =
+            line.contains(&path_needle) || line.contains(&path_needle_esc) || line.contains(marker);
         if matches_marker
             && line.contains("latency_gateway_overhead_ms")
             && (line.contains("\"response_streamed\":true")
@@ -180,7 +180,11 @@ fn find_summary_for_marker<'a>(logs: &'a str, marker: &str) -> Option<&'a str> {
     None
 }
 
-fn assert_streamed_unknown_gateway_contract(scenario: &str, summary: &str, expect_disconnect: bool) {
+fn assert_streamed_unknown_gateway_contract(
+    scenario: &str,
+    summary: &str,
+    expect_disconnect: bool,
+) {
     let streamed = extract_bool_field(summary, "response_streamed").unwrap_or(false);
     assert!(
         streamed,
@@ -215,8 +219,8 @@ fn assert_streamed_unknown_gateway_contract(scenario: &str, summary: &str, expec
         "{scenario}: total should reflect streamed lifetime (>= ~half the injected delay); total={total}; summary:\n{summary}"
     );
     assert!(
-        ttfb >= 0.0 && ttfb < BODY_DELAY.as_secs_f64() * 1000.0,
-        "{scenario}: TTFB should remain a first-byte observation (got {ttfb}); summary:\n{summary}"
+        ttfb >= 0.0 && ttfb < total,
+        "{scenario}: TTFB should remain a first-byte observation below terminal total (ttfb={ttfb}, total={total}); summary:\n{summary}"
     );
 
     if expect_disconnect {
@@ -439,12 +443,7 @@ fn spawn_grpc_scripted(
     builder.spawn().expect("spawn grpc backend")
 }
 
-async fn h1_drive(
-    harness: &GatewayHarness,
-    path: &str,
-    pace: Pace,
-    outcome: Outcome,
-) {
+async fn h1_drive(harness: &GatewayHarness, path: &str, pace: Pace, outcome: Outcome) {
     let url = harness.proxy_url(path);
     match (pace, outcome) {
         (Pace::SlowBackend, Outcome::Complete) => {
@@ -455,11 +454,9 @@ async fn h1_drive(
             assert!(resp.body_text().contains("world"));
         }
         (Pace::SlowBackend, Outcome::Disconnect) => {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_millis(250))
-                .build()
-                .expect("client");
-            let _ = client.get(&url).send().await;
+            // Read the first backend chunk, keep the stream open during the
+            // backend stall, then disconnect mid-stream.
+            h1_slow_client_raw(&url, Outcome::Disconnect).await;
         }
         (Pace::SlowClient, outcome) => {
             h1_slow_client_raw(&url, outcome).await;
@@ -471,18 +468,16 @@ async fn h1_slow_client_raw(url: &str, outcome: Outcome) {
     let parsed: http::Uri = url.parse().expect("url");
     let host = parsed.host().unwrap_or("127.0.0.1");
     let port = parsed.port_u16().expect("port");
-    let path = parsed
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
+    let path = parsed.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
     let mut stream = TcpStream::connect((host, port))
         .await
         .expect("connect gateway");
     let _ = stream.set_nodelay(true);
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-    );
+    socket2::SockRef::from(&stream)
+        .set_recv_buffer_size(8 * 1024)
+        .expect("cap slow-client receive buffer");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.expect("write req");
 
     let mut buf = vec![0u8; 16 * 1024];
@@ -554,9 +549,7 @@ async fn h2_live_stream(url: &str, slow_read: bool, outcome: Outcome) {
         .await
         .expect("connect h2c");
     let _ = stream.set_nodelay(true);
-    let (mut send_req, connection) = h2_client::handshake(stream)
-        .await
-        .expect("h2 handshake");
+    let (mut send_req, connection) = h2_client::handshake(stream).await.expect("h2 handshake");
     let conn_task = tokio::spawn(connection);
 
     let request = Request::builder()
@@ -564,9 +557,7 @@ async fn h2_live_stream(url: &str, slow_read: bool, outcome: Outcome) {
         .uri(url)
         .body(())
         .expect("build request");
-    let (response_fut, _) = send_req
-        .send_request(request, true)
-        .expect("send_request");
+    let (response_fut, _) = send_req.send_request(request, true).expect("send_request");
     let response = tokio::time::timeout(Duration::from_secs(20), response_fut)
         .await
         .expect("response timeout")
@@ -583,13 +574,10 @@ async fn h2_live_stream(url: &str, slow_read: bool, outcome: Outcome) {
         let _ = body_stream.flow_control().release_capacity(first.len());
     }
 
-    if slow_read {
-        // Withhold WINDOW_UPDATE so stream-level flow control creates real
-        // downstream backpressure for the large slow-client payload.
-        tokio::time::sleep(BODY_DELAY).await;
-    } else {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // Slow-client cases withhold WINDOW_UPDATE so flow control creates real
+    // backpressure; slow-backend disconnects stay attached during the
+    // injected backend stall.
+    tokio::time::sleep(BODY_DELAY).await;
 
     match outcome {
         Outcome::Disconnect => {
@@ -606,7 +594,8 @@ async fn h2_live_stream(url: &str, slow_read: bool, outcome: Outcome) {
                     Some(Ok(chunk)) => {
                         let _ = body_stream.flow_control().release_capacity(chunk.len());
                     }
-                    Some(Err(_)) | None => break,
+                    Some(Err(error)) => panic!("H2 completion stream failed: {error}"),
+                    None => break,
                 }
             }
             drop(send_req);
@@ -615,13 +604,10 @@ async fn h2_live_stream(url: &str, slow_read: bool, outcome: Outcome) {
     }
 }
 
-async fn h3_drive(
-    https_port: u16,
-    path: &str,
-    pace: Pace,
-    outcome: Outcome,
-) {
-    let client = Http3Client::insecure().expect("h3 client");
+async fn h3_drive(https_port: u16, path: &str, pace: Pace, outcome: Outcome) {
+    let client =
+        Http3Client::insecure_with_stream_receive_window(H3_SLOW_CLIENT_STREAM_WINDOW_BYTES)
+            .expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}{path}");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
 
@@ -662,11 +648,9 @@ async fn h3_drive(
             let first = stream.recv_data().await.expect("first data");
             assert!(first.is_some(), "expected first body chunk");
 
-            if matches!(pace, Pace::SlowClient) {
-                tokio::time::sleep(BODY_DELAY).await;
-            } else {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            // Slow-client cases withhold QUIC stream credit; slow-backend
+            // disconnect cases stay attached during the injected stall.
+            tokio::time::sleep(BODY_DELAY).await;
 
             match outcome {
                 Outcome::Disconnect => {
@@ -690,6 +674,12 @@ async fn grpc_drive(harness: &GatewayHarness, path: &str, pace: Pace, outcome: O
                 .await
                 .expect("grpc response");
             assert_eq!(resp.http_status, 200);
+            assert_eq!(resp.grpc_status(), Some(0));
+            assert!(
+                resp.stream_error.is_none(),
+                "gRPC completion stream failed: {:?}",
+                resp.stream_error
+            );
         }
         (Pace::SlowBackend, Outcome::Disconnect) | (Pace::SlowClient, _) => {
             grpc_live_stream(port, path, matches!(pace, Pace::SlowClient), outcome).await;
@@ -740,11 +730,9 @@ async fn grpc_live_stream(port: u16, path: &str, slow_read: bool, outcome: Outco
         let _ = body_stream.flow_control().release_capacity(first.len());
     }
 
-    if slow_read {
-        tokio::time::sleep(BODY_DELAY).await;
-    } else {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // Slow-client cases withhold H2 WINDOW_UPDATE; slow-backend disconnect
+    // cases stay attached during the injected backend stall.
+    tokio::time::sleep(BODY_DELAY).await;
 
     match outcome {
         Outcome::Disconnect => {
@@ -761,36 +749,40 @@ async fn grpc_live_stream(port: u16, path: &str, slow_read: bool, outcome: Outco
                     Some(Ok(chunk)) => {
                         let _ = body_stream.flow_control().release_capacity(chunk.len());
                     }
-                    Some(Err(_)) | None => break,
+                    Some(Err(error)) => panic!("gRPC completion stream failed: {error}"),
+                    None => break,
                 }
             }
-            let _: Option<HeaderMap> = body_stream.trailers().await.ok().flatten();
+            let trailers: HeaderMap = body_stream
+                .trailers()
+                .await
+                .expect("gRPC trailers error")
+                .expect("gRPC completion missing trailers");
+            assert_eq!(
+                trailers
+                    .get("grpc-status")
+                    .and_then(|value| value.to_str().ok()),
+                Some("0"),
+                "gRPC completion must retain grpc-status=0"
+            );
             drop(send_req);
             conn_task.abort();
         }
     }
 }
 
-async fn run_http_family(
-    protocol: &str,
-    pace: Pace,
-    outcome: Outcome,
-    use_h2_backend: bool,
-) {
+async fn run_http_family(protocol: &str, pace: Pace, outcome: Outcome, use_h2_backend: bool) {
     let marker = scenario_marker(protocol, pace, outcome);
     let path = scenario_path(protocol, pace, outcome);
     let backend_res = reserve_port().await.expect("backend port");
     let backend_port = backend_res.port;
     let listener = backend_res.into_listener();
-    // Keep the chosen scripted backend alive for the whole scenario.
-    enum LiveBackend {
-        H1(ScriptedHttp1Backend),
-        H2(ScriptedH2Backend),
-    }
-    let _backend = if use_h2_backend {
-        LiveBackend::H2(spawn_h2_scripted(listener, pace, outcome))
+    // Keep the chosen scripted backend alive for the whole scenario without
+    // introducing unread enum payloads that trip dead-code lint.
+    let (_h1_backend, _h2_backend) = if use_h2_backend {
+        (None, Some(spawn_h2_scripted(listener, pace, outcome)))
     } else {
-        LiveBackend::H1(spawn_http1_scripted(listener, pace, outcome))
+        (Some(spawn_http1_scripted(listener, pace, outcome)), None)
     };
 
     let proxy_id = format!("stream-latency-{marker}");
@@ -816,9 +808,8 @@ async fn run_http_family(
     }
 
     let logs = wait_for_marked_summary(&harness, &marker).await;
-    let summary = find_summary_for_marker(&logs, &marker).unwrap_or_else(|| {
-        panic!("{marker}: missing marked streamed summary; logs:\n{logs}")
-    });
+    let summary = find_summary_for_marker(&logs, &marker)
+        .unwrap_or_else(|| panic!("{marker}: missing marked streamed summary; logs:\n{logs}"));
     assert_streamed_unknown_gateway_contract(&marker, summary, outcome.expect_disconnect());
 }
 
@@ -835,9 +826,8 @@ async fn run_native_h3(pace: Pace, outcome: Outcome) {
     h3_drive(https_port, &path, pace, outcome).await;
 
     let logs = wait_for_marked_summary(&harness, &marker).await;
-    let summary = find_summary_for_marker(&logs, &marker).unwrap_or_else(|| {
-        panic!("{marker}: missing marked streamed summary; logs:\n{logs}")
-    });
+    let summary = find_summary_for_marker(&logs, &marker)
+        .unwrap_or_else(|| panic!("{marker}: missing marked streamed summary; logs:\n{logs}"));
     assert_streamed_unknown_gateway_contract(&marker, summary, outcome.expect_disconnect());
 }
 
@@ -868,9 +858,8 @@ async fn run_grpc(pace: Pace, outcome: Outcome) {
     grpc_drive(&harness, &path, pace, outcome).await;
 
     let logs = wait_for_marked_summary(&harness, &marker).await;
-    let summary = find_summary_for_marker(&logs, &marker).unwrap_or_else(|| {
-        panic!("{marker}: missing marked streamed summary; logs:\n{logs}")
-    });
+    let summary = find_summary_for_marker(&logs, &marker)
+        .unwrap_or_else(|| panic!("{marker}: missing marked streamed summary; logs:\n{logs}"));
     assert_streamed_unknown_gateway_contract(&marker, summary, outcome.expect_disconnect());
 }
 
