@@ -198,7 +198,9 @@ fn mirror_error() -> MirrorResponseMeta {
     MirrorResponseMeta {
         mirror_plugin_id: Some("mirror-billing".to_string()),
         mirror_target_url: "http://shadow.local/chargeback-mirror".to_string(),
-        mirror_response_status_code: None,
+        // Keep a valid, billable status alongside the transport error so this
+        // fixture would create a duplicate charge without the mirror guard.
+        mirror_response_status_code: Some(500),
         mirror_response_size_bytes: None,
         mirror_latency_ms: 1.0,
         mirror_error: Some("connection refused".to_string()),
@@ -225,8 +227,7 @@ fn sink_pricing_config(spool_dir: &std::path::Path, mode: &str, clickhouse_url: 
         },
         "pricing_tiers": [
             {"status_codes": [200], "price_per_call": 0.01},
-            {"status_codes": [500], "price_per_call": 0.05},
-            {"status_codes": [0], "price_per_call": 0.07}
+            {"status_codes": [500], "price_per_call": 0.05}
         ],
         "bandwidth_pricing": {
             "price_per_byte_sent": 0.000001,
@@ -262,8 +263,7 @@ async fn in_memory_chargeback_bills_primary_once_for_mirror_success_and_error() 
     let config = json!({
         "pricing_tiers": [
             {"status_codes": [200], "price_per_call": 0.01},
-            {"status_codes": [500], "price_per_call": 0.05},
-            {"status_codes": [0], "price_per_call": 0.07}
+            {"status_codes": [500], "price_per_call": 0.05}
         ],
         "bandwidth_pricing": {
             "price_per_byte_sent": 0.000001,
@@ -301,7 +301,7 @@ async fn in_memory_chargeback_bills_primary_once_for_mirror_success_and_error() 
         "mirror 500 must not create a second billable status bucket"
     );
 
-    // Mirror error path (status 0 / mirror_error metadata).
+    // Mirror error path with a valid, otherwise billable 500 status.
     let error_consumer = "mirror-billing-error";
     let error_proxy = "proxy-mirror-error";
     let error_summary = primary_summary(error_consumer, error_proxy, 200);
@@ -311,12 +311,12 @@ async fn in_memory_chargeback_bills_primary_once_for_mirror_success_and_error() 
         !registry.entries.contains_key(&chargeback_key(
             error_consumer,
             error_proxy,
-            0,
-            0.07,
+            500,
+            0.05,
             0.000001,
             0.000002
         )),
-        "failed mirror summary must not bill status 0"
+        "failed mirror summary must not bill its status 500"
     );
 }
 
