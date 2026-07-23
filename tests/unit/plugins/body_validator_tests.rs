@@ -1,5 +1,7 @@
 //! Tests for body_validator plugin — XML CDATA, comments, processing instructions
 
+use chrono::Utc;
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::{
     HTTP_GRPC_PROTOCOLS, Plugin, RequestContext, body_validator::BodyValidator, priority,
 };
@@ -7,6 +9,26 @@ use serde_json::json;
 use std::collections::HashMap;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+
+fn body_validator_plugin_config(
+    id: &str,
+    enabled: bool,
+    config: serde_json::Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: "ferrum".to_string(),
+        plugin_name: "body_validator".to_string(),
+        config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
 
 fn make_xml_ctx(body: &str) -> RequestContext {
     let mut ctx = RequestContext::new(
@@ -2669,18 +2691,75 @@ async fn test_protobuf_invalid_response() {
 
 // ─── Invalid Config Graceful Handling ───────────���───────────────────
 
-#[test]
-fn test_protobuf_invalid_descriptor_path_degrades_gracefully() {
-    let result = BodyValidator::new(&serde_json::json!({
+#[tokio::test]
+async fn test_protobuf_missing_descriptor_fails_closed_for_applicable_request_and_response() {
+    let config = serde_json::json!({
         "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
-        "protobuf_request_type": "test.HelloRequest"
-    }));
-    let err = result
-        .err()
-        .expect("expected error for invalid descriptor path");
+        "protobuf_request_type": "test.HelloRequest",
+        "protobuf_response_type": "test.HelloResponse"
+    });
+    let plugin = BodyValidator::new(&config)
+        .expect("runtime construction must tolerate a missing node-local descriptor");
     assert!(
-        err.contains("failed to read protobuf descriptor file"),
-        "got: {err}"
+        ferrum_edge::plugins::validate_plugin_config("body_validator", &config).is_ok(),
+        "shape-only admission must not open a DP-local descriptor"
+    );
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_response_body_buffering());
+
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (":path".to_string(), "/test.Greeter/SayHello".to_string()),
+    ]);
+    assert_reject(
+        plugin
+            .on_final_request_body(&headers, &[0, 0, 0, 0, 0])
+            .await,
+        Some(400),
+    );
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &[0, 0, 0, 0, 0])
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_missing_descriptor_only_rejects_configured_method_targets() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
+        "protobuf_method_messages": {
+            "/test.Greeter/SayHello": {
+                "request": "test.HelloRequest"
+            }
+        }
+    }))
+    .expect("missing node-local descriptor must produce a fail-closed runtime");
+    let unmatched = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (":path".to_string(), "/test.Greeter/Health".to_string()),
+    ]);
+    assert_continue(
+        plugin
+            .on_final_request_body(&unmatched, &[0, 0, 0, 0, 0])
+            .await,
+    );
+    let matched = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (":path".to_string(), "/test.Greeter/SayHello".to_string()),
+    ]);
+    assert_reject(
+        plugin
+            .on_final_request_body(&matched, &[0, 0, 0, 0, 0])
+            .await,
+        Some(400),
     );
 }
 
@@ -2697,6 +2776,96 @@ fn test_protobuf_invalid_message_type_degrades_gracefully() {
         err.contains("protobuf_request_type 'nonexistent.MessageType' not found"),
         "got: {err}"
     );
+}
+
+#[test]
+fn test_protobuf_readable_malformed_descriptor_rejects_runtime_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("invalid.pb");
+    std::fs::write(&path, b"not-a-file-descriptor-set").unwrap();
+    let config = json!({
+        "protobuf_descriptor_path": path.to_string_lossy(),
+        "protobuf_request_type": "test.HelloRequest"
+    });
+    let error = BodyValidator::new(&config)
+        .err()
+        .expect("a readable malformed descriptor must reject the runtime candidate");
+    assert!(error.contains("failed to parse protobuf descriptor"));
+
+    let gateway = GatewayConfig {
+        plugin_configs: vec![body_validator_plugin_config("body-validator", true, config)],
+        ..Default::default()
+    };
+    let errors = gateway.validate_plugin_file_dependencies();
+    assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
+    assert!(errors[0].contains("failed to parse protobuf descriptor"));
+}
+
+#[test]
+fn test_protobuf_descriptor_file_dependency_reports_missing_path_once() {
+    let missing = "/nonexistent/path/shared-descriptor.bin";
+    let gateway = GatewayConfig {
+        plugin_configs: vec![
+            body_validator_plugin_config(
+                "body-validator-a",
+                true,
+                json!({
+                    "protobuf_descriptor_path": missing,
+                    "protobuf_request_type": "test.HelloRequest"
+                }),
+            ),
+            body_validator_plugin_config(
+                "body-validator-b",
+                true,
+                json!({
+                    "protobuf_descriptor_path": missing,
+                    "protobuf_response_type": "test.HelloResponse"
+                }),
+            ),
+        ],
+        ..Default::default()
+    };
+    let errors = gateway.validate_plugin_file_dependencies();
+    assert_eq!(
+        errors.len(),
+        1,
+        "shared descriptor paths must be read and reported once: {errors:?}"
+    );
+    assert!(errors[0].contains("failed to read protobuf descriptor file"));
+}
+
+#[test]
+fn test_protobuf_descriptor_file_dependency_validates_message_references() {
+    let gateway = GatewayConfig {
+        plugin_configs: vec![body_validator_plugin_config(
+            "body-validator",
+            true,
+            json!({
+                "protobuf_descriptor_path": test_descriptor_path(),
+                "protobuf_request_type": "missing.Request"
+            }),
+        )],
+        ..Default::default()
+    };
+    let errors = gateway.validate_plugin_file_dependencies();
+    assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
+    assert!(errors[0].contains("protobuf_request_type 'missing.Request' not found"));
+}
+
+#[test]
+fn test_protobuf_descriptor_file_dependency_skips_disabled_plugins() {
+    let gateway = GatewayConfig {
+        plugin_configs: vec![body_validator_plugin_config(
+            "body-validator",
+            false,
+            json!({
+                "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
+                "protobuf_request_type": "test.HelloRequest"
+            }),
+        )],
+        ..Default::default()
+    };
+    assert!(gateway.validate_plugin_file_dependencies().is_empty());
 }
 
 // ─── gRPC before_proxy is skipped (uses on_final_request_body instead) ──

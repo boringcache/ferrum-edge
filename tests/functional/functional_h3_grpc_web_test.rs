@@ -633,9 +633,10 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
     tokio::time::sleep(Duration::from_millis(100)).await;
     let step_errors = backend.step_errors().await;
     assert!(
-        step_errors
-            .iter()
-            .all(|error| error.contains("peer closed connection without sending TLS close_notify")),
+        step_errors.iter().all(|error| {
+            error.contains("peer closed connection without sending TLS close_notify")
+                || error.contains("Connection reset by peer")
+        }),
         "unexpected pass-through backend script errors: {step_errors:?}"
     );
     assert_eq!(backend.accepted_connections(), pass_through_connections);

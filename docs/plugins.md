@@ -3432,6 +3432,19 @@ Request-side validation only buffers matching request bodies: methods that can c
 
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
+**Descriptor deployment**: `protobuf_descriptor_path` is a node-local plugin
+file dependency. File mode validates the file and every configured message type
+at startup. Database mode reports unavailable dependencies through its existing
+configuration warnings, while CP admission validates only the JSON/message-map
+shape and does not require files that are installed on DPs. DP dependency
+validation happens on the DP node before accepting a configuration generation.
+Runtime construction also tolerates a temporarily missing or unreadable
+descriptor without disabling the rule: applicable gRPC requests fail closed
+with 400 and applicable backend gRPC responses fail closed with 502 until a
+valid descriptor-backed generation is loaded. A readable malformed descriptor
+or a configured message type absent from it rejects the candidate generation,
+preserving the last accepted plugin cache.
+
 When response validation is configured, request `Accept` and internal streaming
 markers cannot waive it. The plugin buffers conservatively until pristine
 backend headers are known and rejects a genuine `text/event-stream` response

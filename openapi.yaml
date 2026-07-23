@@ -16849,7 +16849,12 @@ components:
             parameter collisions and malformed headers do not match).
         protobuf_descriptor_path:
           type: string
-          description: Path to compiled FileDescriptorSet binary (protoc --descriptor_set_out --include_imports)
+          description: >-
+            Node-local path to a compiled FileDescriptorSet binary
+            (protoc --descriptor_set_out --include_imports). CP admission is
+            shape-only; file/DP nodes validate the local dependency, and an
+            unavailable runtime dependency fails applicable gRPC validation
+            closed.
         protobuf_request_type:
           type: string
           description: Default fully-qualified protobuf message type for request validation
