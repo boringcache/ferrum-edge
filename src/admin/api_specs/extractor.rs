@@ -1503,9 +1503,7 @@ fn normalize_request_body_encoding(
             _ => {}
         }
 
-        if style == "deepObject"
-            && !request_body_schema_accepts_object(property_schema, 0)
-        {
+        if style == "deepObject" && !request_body_schema_accepts_object(property_schema, 0) {
             return Err(ExtractError::MalformedExtension {
                 which: "requestBody.content.encoding",
                 error: format!(
