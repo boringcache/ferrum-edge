@@ -12,8 +12,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    api_chargeback_sink_snapshot_accumulator_for_test,
-    request_mirror_should_mirror_for_test,
+    api_chargeback_sink_snapshot_accumulator_for_test, request_mirror_should_mirror_for_test,
 };
 use ferrum_edge::plugins::api_chargeback::{
     ApiChargeback, InstanceScope, ProtocolFamily, global_registry,
