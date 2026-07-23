@@ -461,6 +461,12 @@ async fn get_http2_companion_speaks_h2c_prior_knowledge() {
             };
             tokio::spawn(async move {
                 let version = request.version();
+                let mut body = request.into_body();
+                while let Some(chunk) = body.data().await {
+                    if let Ok(bytes) = chunk {
+                        let _ = body.flow_control().release_capacity(bytes.len());
+                    }
+                }
                 let response = http::Response::builder()
                     .status(200)
                     .body(())

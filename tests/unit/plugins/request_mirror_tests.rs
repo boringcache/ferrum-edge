@@ -2044,6 +2044,12 @@ async fn capture_mirror_request_headers_h2c(
                         captured.insert(name.as_str().to_ascii_lowercase(), v.to_string());
                     }
                 }
+                let mut body = request.into_body();
+                while let Some(chunk) = body.data().await {
+                    if let Ok(bytes) = chunk {
+                        let _ = body.flow_control().release_capacity(bytes.len());
+                    }
+                }
                 let response = http::Response::builder()
                     .status(200)
                     .body(())
