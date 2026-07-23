@@ -257,6 +257,72 @@ fn importer_preserves_form_encoding_objects_in_generated_config() {
 }
 
 #[test]
+fn importer_resolves_multipart_encoding_header_and_schema_refs() {
+    let spec = r##"{
+  "openapi": "3.1.0",
+  "info": {"title": "Upload API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "upload-api",
+    "backend_host": "upload.internal",
+    "backend_port": 8080
+  },
+  "components": {
+    "schemas": {
+      "PartTokenValue": {
+        "type": "string",
+        "pattern": "^[A-Z]{8}$"
+      }
+    },
+    "headers": {
+      "PartToken": {
+        "required": true,
+        "schema": {"$ref": "#/components/schemas/PartTokenValue"}
+      }
+    }
+  },
+  "paths": {
+    "/upload": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                  "file": {"type": "string", "format": "binary"}
+                }
+              },
+              "encoding": {
+                "file": {
+                  "headers": {
+                    "X-Part-Token": {"$ref": "#/components/headers/PartToken"}
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {"204": {"description": "ok"}}
+      }
+    }
+  }
+}"##;
+
+    let config = extract_validator_config(spec);
+    let header = &config["operations"][0]["request_body"]["content"]
+        ["multipart/form-data"]["encoding"]["file"]["headers"]["X-Part-Token"];
+    assert!(header.get("$ref").is_none());
+    assert!(header["schema"].get("$ref").is_none());
+    assert_eq!(header["required"], true);
+    assert_eq!(header["schema"]["type"], "string");
+    assert_eq!(header["schema"]["pattern"], "^[A-Z]{8}$");
+    assert_valid_against_admin_schema(&config, "resolved multipart header refs");
+}
+
+#[test]
 fn importer_rejects_unsupported_encoding_style_at_admission() {
     let spec = r##"{
   "openapi": "3.1.0",
