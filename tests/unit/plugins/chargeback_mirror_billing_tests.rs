@@ -11,7 +11,10 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use ferrum_edge::_test_support::request_mirror_should_mirror_for_test;
+use ferrum_edge::_test_support::{
+    api_chargeback_sink_snapshot_accumulator_for_test,
+    request_mirror_should_mirror_for_test,
+};
 use ferrum_edge::plugins::api_chargeback::{
     ApiChargeback, InstanceScope, ProtocolFamily, global_registry,
 };
@@ -447,8 +450,7 @@ async fn sink_snapshot_records_exactly_one_charge_across_mirror_outcomes() {
     plugin.start_background_tasks().expect("stage sink");
     plugin.commit_background_tasks();
     let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
-    let accumulator = plugin
-        .snapshot_accumulator_for_tests()
+    let accumulator = api_chargeback_sink_snapshot_accumulator_for_test(&plugin)
         .expect("snapshot mode must activate an accumulator");
 
     drive_log_with_mirror(

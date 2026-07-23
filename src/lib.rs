@@ -617,6 +617,13 @@ pub mod _test_support {
         plugin.sample_phase_for_test()
     }
 
+    // ── plugins/api_chargeback_sink ──────────────────────────────────────────
+    pub fn api_chargeback_sink_snapshot_accumulator_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<Arc<crate::plugins::api_chargeback_sink::SnapshotAccumulator>> {
+        plugin.snapshot_accumulator_for_tests()
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,

@@ -1059,11 +1059,7 @@ impl ApiChargebackSink {
         &self.plugin_config_id
     }
 
-    /// Snapshot accumulator after activation, for unit tests that drive
-    /// [`crate::plugins::log_with_mirror`] through the real HTTP log hook.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn snapshot_accumulator_for_tests(&self) -> Option<Arc<SnapshotAccumulator>> {
+    pub(crate) fn snapshot_accumulator_for_tests(&self) -> Option<Arc<SnapshotAccumulator>> {
         self.snapshot_accumulator.get().cloned()
     }
 }
