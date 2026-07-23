@@ -174,6 +174,25 @@ impl ScriptedGrpcBackendBuilder {
         self
     }
 
+    /// Supply connection-indexed gRPC scripts.
+    ///
+    /// Each inner script is lowered independently before delegating to the H2
+    /// fixture. This is useful when a test client intentionally opens a fresh
+    /// connection per RPC.
+    pub fn connection_scripts(
+        mut self,
+        scripts: impl IntoIterator<Item = Vec<GrpcStep>>,
+    ) -> Self {
+        let scripts = scripts.into_iter().map(|script| {
+            script
+                .into_iter()
+                .flat_map(lower_grpc_step)
+                .collect::<Vec<_>>()
+        });
+        self.h2_builder = self.h2_builder.connection_scripts(scripts);
+        self
+    }
+
     /// Override pre-handshake H2 settings (window sizes, max concurrent
     /// streams).
     pub fn with_settings(mut self, settings: ConnectionSettings) -> Self {
