@@ -18,6 +18,10 @@ Recommended async-insert settings wait for persistence:
 "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "1" }
 ```
 
+When `async_insert` is enabled and `wait_for_async_insert` is omitted, the sink
+pins `wait_for_async_insert=1` on the request instead of inheriting a potentially
+lossy ClickHouse user/profile default.
+
 `wait_for_async_insert=0` (and equivalent falsy values `false` / `no` / `off`)
 is rejected unless `clickhouse.allow_lossy_async_insert` is explicitly `true`.
 That named opt-in is intentionally separate from durable mode: ClickHouse may

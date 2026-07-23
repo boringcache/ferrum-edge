@@ -1474,13 +1474,15 @@ async fn post_json_each_row(
     match result {
         Ok(response) => {
             let status = response.status();
-            let exception_header = clickhouse_exception_code_header(response.headers());
+            let has_exception_header = response
+                .headers()
+                .contains_key("x-clickhouse-exception-code");
             let ack = read_clickhouse_acknowledgement(response).await;
             classify_clickhouse_delivery(
                 cfg,
                 status,
                 ack,
-                exception_header.as_deref(),
+                has_exception_header,
                 event_count,
                 start.elapsed(),
             )
@@ -1492,15 +1494,6 @@ async fn post_json_each_row(
             DeliveryOutcome::Retryable { message }
         }
     }
-}
-
-fn clickhouse_exception_code_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    headers
-        .get("x-clickhouse-exception-code")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| bound_string(value, 32))
 }
 
 async fn read_clickhouse_acknowledgement(response: reqwest::Response) -> ClickHouseAckRead {
@@ -1554,14 +1547,16 @@ fn find_bytes_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn classify_clickhouse_delivery(
     cfg: &ClickHouseFlushConfig,
     status: StatusCode,
     ack: ClickHouseAckRead,
-    exception_header: Option<&str>,
+    has_exception_header: bool,
     event_count: usize,
     elapsed: Duration,
 ) -> DeliveryOutcome {
@@ -1570,7 +1565,7 @@ fn classify_clickhouse_delivery(
             cfg,
             status,
             ack,
-            exception_header,
+            has_exception_header,
             event_count,
             elapsed,
         );
@@ -1609,15 +1604,13 @@ fn classify_success_status_acknowledgement(
     cfg: &ClickHouseFlushConfig,
     status: StatusCode,
     ack: ClickHouseAckRead,
-    exception_header: Option<&str>,
+    has_exception_header: bool,
     event_count: usize,
     elapsed: Duration,
 ) -> DeliveryOutcome {
     let code = status.as_u16();
-    if exception_header.is_some() {
-        let message = format!(
-            "clickhouse returned HTTP {code} with X-ClickHouse-Exception-Code"
-        );
+    if has_exception_header {
+        let message = format!("clickhouse returned HTTP {code} with X-ClickHouse-Exception-Code");
         cfg.metrics
             .record_failure(FailureReason::Http4xx, message.clone());
         return DeliveryOutcome::Permanent {
@@ -1974,6 +1967,13 @@ fn build_insert_url(base: &Url, cfg: &ClickHouseConfig) -> String {
     let mut url = base.clone();
     url.set_query(None);
     url.set_fragment(None);
+    let pins_durable_async_ack = cfg
+        .insert_query_params
+        .get("async_insert")
+        .is_some_and(|value| !is_falsy_clickhouse_setting(value))
+        && !cfg
+            .insert_query_params
+            .contains_key(WAIT_FOR_ASYNC_INSERT_PARAM);
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("database", &cfg.database);
@@ -1983,6 +1983,12 @@ fn build_insert_url(base: &Url, cfg: &ClickHouseConfig) -> String {
         );
         for (key, value) in &cfg.insert_query_params {
             pairs.append_pair(key, value);
+        }
+        if pins_durable_async_ack {
+            // Do not inherit a ClickHouse user/profile default that may be
+            // fire-and-forget. An explicit falsy value remains available only
+            // through the separately validated lossy opt-in.
+            pairs.append_pair(WAIT_FOR_ASYNC_INSERT_PARAM, "1");
         }
     }
     url.to_string()
@@ -2689,7 +2695,7 @@ pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
 pub fn classify_clickhouse_acknowledgement_for_tests(
     status: u16,
     body: Option<&[u8]>,
-    exception_code_header: Option<&str>,
+    has_exception_code_header: bool,
 ) -> &'static str {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let ack = match body {
@@ -2714,11 +2720,19 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
         &cfg,
         status,
         ack,
-        exception_code_header,
+        has_exception_code_header,
         1,
         Duration::from_millis(1),
     )
     .label()
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn clickhouse_insert_url_for_tests(config: &ApiChargebackSinkConfig) -> Result<String, String> {
+    let base = Url::parse(&config.clickhouse.url)
+        .map_err(|err| format!("invalid ClickHouse URL: {err}"))?;
+    Ok(build_insert_url(&base, &config.clickhouse))
 }
 
 #[doc(hidden)]

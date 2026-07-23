@@ -20679,7 +20679,10 @@ components:
                 Durable mode rejects `wait_for_async_insert` values that disable
                 persistence waits (`0`, `false`, `no`, `off`) unless
                 `allow_lossy_async_insert` is true. Recommended durable settings
-                use `async_insert=1` with `wait_for_async_insert=1`.
+                use `async_insert=1` with `wait_for_async_insert=1`. When
+                `async_insert` is enabled and the wait setting is omitted, the
+                sink pins `wait_for_async_insert=1` rather than inheriting the
+                ClickHouse user/profile default.
             allow_lossy_async_insert:
               type: boolean
               default: false

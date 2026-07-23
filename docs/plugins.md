@@ -1431,10 +1431,12 @@ at least one nonempty pricing dimension (`pricing_tiers`, `bandwidth_pricing`,
 or `stream_connection_pricing` with `PricingConfig::has_any_pricing`
 semantics). Durable delivery requires a complete empty ClickHouse
 acknowledgement (HTTP 200/204 alone is insufficient); `wait_for_async_insert=0`
-needs explicit `clickhouse.allow_lossy_async_insert=true`. It supports per-event
-mode for transaction-level provenance, snapshot mode for lower ingest volume
-(requires `spool.enabled=true`), an on-disk spool for ClickHouse outages,
-`GET /charges/sink/status`, and Prometheus metrics under `/metrics`. See
+needs explicit `clickhouse.allow_lossy_async_insert=true`, and enabling
+`async_insert` without a wait setting pins `wait_for_async_insert=1`. It
+supports per-event mode for transaction-level provenance, snapshot mode for
+lower ingest volume (requires `spool.enabled=true`), an on-disk spool for
+ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics under
+`/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
 reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
