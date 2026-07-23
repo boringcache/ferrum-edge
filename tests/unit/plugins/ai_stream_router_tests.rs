@@ -1559,7 +1559,7 @@ const ANTHROPIC_PARTIAL_SSE: &str = concat!(
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut short\"}}\n\n",
 );
 
-async fn run_sse(body: &str) -> (String, bool) {
+async fn run_sse_bytes(body: &[u8]) -> (String, bool) {
     let plugin = build(openai_and_anthropic_config());
     let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
     let mut ctx = post_ctx(&claude);
@@ -1570,7 +1570,7 @@ async fn run_sse(body: &str) -> (String, bool) {
         .expect("inspector");
     let mut collected = Vec::new();
     let mut terminated = false;
-    match inspector.on_chunk(body.as_bytes()).await {
+    match inspector.on_chunk(body).await {
         ResponseStreamAction::Forward(bytes) => collected.extend_from_slice(&bytes),
         ResponseStreamAction::Terminate(bytes) => {
             terminated = true;
@@ -1591,6 +1591,10 @@ async fn run_sse(body: &str) -> (String, bool) {
         }
     }
     (String::from_utf8(collected).unwrap(), terminated)
+}
+
+async fn run_sse(body: &str) -> (String, bool) {
+    run_sse_bytes(body.as_bytes()).await
 }
 
 #[tokio::test]
@@ -1659,6 +1663,18 @@ async fn test_known_anthropic_events_cannot_hide_malformed_protocol_data() {
         assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
         assert!(!out.contains("\"content\":\"lost\""), "{out}");
     }
+}
+
+#[tokio::test]
+async fn test_invalid_utf8_anthropic_event_fails_closed() {
+    let mut body = b"event: content_block_delta\ndata: {".to_vec();
+    body.push(0xff);
+    body.extend_from_slice(b"}\n\n");
+
+    let (out, terminated) = run_sse_bytes(&body).await;
+    assert!(terminated);
+    assert!(out.contains("\"type\":\"upstream_error\""));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
 }
 
 #[tokio::test]
@@ -2039,7 +2055,7 @@ async fn test_anthropic_parallel_tool_calls_and_results_preserve_order() {
                     {"id": "call_b", "type": "function", "function": {"name": "beta", "arguments": "{\"x\":1}"}}
                 ]
             },
-            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_a", "content": null},
             {"role": "tool", "tool_call_id": "call_b", "content": "B", "is_error": true}
         ]
     });
@@ -2063,6 +2079,7 @@ async fn test_anthropic_parallel_tool_calls_and_results_preserve_order() {
     let results = parsed["messages"][2]["content"].as_array().unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0]["tool_use_id"], json!("call_a"));
+    assert_eq!(results[0]["content"], json!(""));
     assert_eq!(results[1]["tool_use_id"], json!("call_b"));
     assert_eq!(results[1]["is_error"], json!(true));
 }
