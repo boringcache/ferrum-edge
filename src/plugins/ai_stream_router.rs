@@ -1216,6 +1216,14 @@ impl Plugin for AiStreamRouter {
         self.enabled
     }
 
+    fn needs_final_request_body_context(&self) -> bool {
+        // Request translation consumes the provider/model decision recorded by
+        // `before_proxy`, and the final hook verifies that the translation
+        // completed. The H1/H2 dispatch path only supplies that metadata when
+        // this capability is advertised.
+        self.enabled
+    }
+
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.enabled
     }
