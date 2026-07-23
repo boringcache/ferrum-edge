@@ -243,6 +243,8 @@ async fn max_in_flight_drop_emits_explicit_mirror_result() {
 
 #[tokio::test]
 async fn closed_task_channel_returns_seeded_failure_result() {
+    // Issue #2472 acceptance: mirror task cancellation / incomplete publish
+    // stays observable through the seeded watch-channel fallback.
     let mut ctx = make_ctx_with_proxy();
     let fallback = MirrorResponseMeta {
         mirror_target_url: "http://mirror.local/cancelled".to_string(),
@@ -268,6 +270,10 @@ async fn closed_task_channel_returns_seeded_failure_result() {
 
 #[tokio::test]
 async fn backend_read_timeout_emits_explicit_mirror_error() {
+    // Issue #2472 acceptance: mirror timeout remains observable via
+    // `mirror_error` for the fire-and-forget task. Generic HTTP sink is
+    // sufficient — the timeout is applied on the reqwest builder before
+    // transport selection, so h2c/TLS companions inherit the same budget.
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2088,6 +2094,23 @@ async fn test_native_grpc_mirror_uses_h2c_prior_knowledge() {
 }
 
 #[tokio::test]
+async fn test_native_grpc_mirror_synthesises_te_when_client_omits_it() {
+    // Issue #2472: missing inbound TE must still yield synthesised trailers
+    // after the canonical secondary-request strip.
+    let mut ctx = make_ctx_with_proxy();
+    ctx.path = "/pkg.Service/Method".to_string();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    let observed = capture_mirror_request_headers_h2c(&mut ctx, &mut headers).await;
+    assert_eq!(
+        observed.get("te").map(String::as_str),
+        Some("trailers"),
+        "gRPC mirror must synthesise te: trailers when the client omitted TE: {observed:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_ordinary_http_mirror_still_uses_http1() {
     // Non-gRPC mirrors must remain HTTP/1.1-capable against plain H1 sinks.
     let mut ctx = make_ctx_with_proxy();
@@ -2328,5 +2351,80 @@ async fn test_grpc_mirror_preserves_binary_body_over_h2c() {
     assert_eq!(
         body, grpc_frame,
         "binary gRPC frame must be preserved byte-for-byte"
+    );
+}
+
+#[tokio::test]
+async fn test_grpc_mirror_preserves_multiframe_client_stream_body_over_h2c() {
+    // Client-streaming body shape: multiple length-prefixed gRPC messages in
+    // one buffered request body must survive the h2c companion path.
+    use bytes::Bytes;
+    use h2::server as h2_server;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok((mut connection, mut h2)) = h2_server::handshake(tcp).await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        if let Some(Ok((request, mut respond))) = h2.accept().await {
+            let mut body = request.into_body();
+            let mut buf = Vec::new();
+            while let Some(chunk) = body.data().await {
+                if let Ok(bytes) = chunk {
+                    let _ = body.flow_control().release_capacity(bytes.len());
+                    buf.extend_from_slice(&bytes);
+                }
+            }
+            let response = http::Response::builder()
+                .status(200)
+                .body(())
+                .expect("empty response");
+            if let Ok(mut send) = respond.send_response(response, false) {
+                let _ = send.send_data(Bytes::new(), true);
+            }
+            let _ = tx.send(buf);
+        }
+    });
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.path = "/pkg.Service/ClientStream".to_string();
+    // Two frames: "ab" (len=2) and "cdef" (len=4).
+    let multi_frame = vec![
+        0, 0, 0, 0, 2, b'a', b'b', 0, 0, 0, 0, 4, b'c', b'd', b'e', b'f',
+    ];
+    ctx.request_body_bytes = Some(bytes::Bytes::from(multi_frame.clone()));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": true,
+            "percentage": 100.0
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let meta = ctx.collect_mirror_result().await.expect("mirror result");
+    assert!(
+        meta.mirror_error.is_none(),
+        "h2c gRPC mirror with multi-frame body failed: {meta:?}"
+    );
+    let body = rx.await.expect("h2c sink should capture multi-frame body");
+    assert_eq!(
+        body, multi_frame,
+        "client-streaming multi-frame body must be preserved byte-for-byte"
     );
 }
