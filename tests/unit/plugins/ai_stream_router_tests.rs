@@ -1858,9 +1858,10 @@ async fn test_identity_provider_content_encoding_passes_through() {
             plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
             PluginResult::Continue
         ));
-        assert!(!ctx
-            .metadata
-            .contains_key("ai_stream_router.provider_content_encoding"));
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_stream_router.provider_content_encoding")
+        );
     }
 }
 
