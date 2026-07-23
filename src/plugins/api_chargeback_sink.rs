@@ -1059,6 +1059,9 @@ impl ApiChargebackSink {
         &self.plugin_config_id
     }
 
+    // The library's hidden test-support module calls this accessor; the binary
+    // compiles this module separately and cannot observe that use.
+    #[allow(dead_code)]
     pub(crate) fn snapshot_accumulator_for_tests(&self) -> Option<Arc<SnapshotAccumulator>> {
         self.snapshot_accumulator.get().cloned()
     }
