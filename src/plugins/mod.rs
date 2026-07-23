@@ -7088,7 +7088,20 @@ pub fn create_plugin_with_http_client_and_config_id(
         "spiffe_identity" => Ok(Some(Arc::new(mesh::spiffe_identity::SpiffeIdentity::new(
             config,
         )?))),
-        "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
+        "compression" => {
+            let gzip_enabled = http_client.compression_gzip_enabled();
+            let brotli_enabled = http_client.compression_brotli_enabled();
+            let plugin = if gzip_enabled && brotli_enabled {
+                compression::CompressionPlugin::new(config)?
+            } else {
+                compression::CompressionPlugin::new_with_algorithm_support(
+                    config,
+                    gzip_enabled,
+                    brotli_enabled,
+                )?
+            };
+            Ok(Some(Arc::new(plugin)))
+        }
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
         "security_headers" => Ok(Some(Arc::new(security_headers::SecurityHeaders::new(
             config,

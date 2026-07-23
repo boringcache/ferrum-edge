@@ -955,6 +955,40 @@ fn test_env_config_custom_ports() {
 }
 
 #[test]
+fn test_compression_algorithm_gates_default_enabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_COMPRESSION_GZIP_ENABLED");
+            remove_var("FERRUM_COMPRESSION_BROTLI_ENABLED");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.compression_gzip_enabled);
+            assert!(config.compression_brotli_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_compression_algorithm_gates_parse_independently() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_COMPRESSION_GZIP_ENABLED", "false"),
+            ("FERRUM_COMPRESSION_BROTLI_ENABLED", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(!config.compression_gzip_enabled);
+            assert!(config.compression_brotli_enabled);
+        },
+    );
+}
+
+#[test]
 fn test_env_config_default_log_level() {
     with_env_vars(
         &[

@@ -127,6 +127,10 @@ pub(crate) const REQUEST_DECODED_METADATA_KEY: &str = "compression:request_decod
 struct CompressionConfig {
     /// Enabled algorithms in server-preference order (used to break q-value ties).
     algorithms: Vec<Algorithm>,
+    /// Process-wide codec gates. These apply to response compression and
+    /// opt-in request decompression.
+    gzip_enabled: bool,
+    brotli_enabled: bool,
 
     // -- Response compression --
     min_content_length: usize,
@@ -153,6 +157,19 @@ pub struct CompressionPlugin {
 
 impl CompressionPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_with_algorithm_support(config, true, true)
+    }
+
+    /// Construct a compression plugin under the process-wide codec policy.
+    ///
+    /// The configured `algorithms` order remains the per-instance response
+    /// preference, while disabled codecs are removed before the instance is
+    /// published. Request decompression observes the same gates.
+    pub fn new_with_algorithm_support(
+        config: &Value,
+        gzip_enabled: bool,
+        brotli_enabled: bool,
+    ) -> Result<Self, String> {
         let default_config = Value::Object(serde_json::Map::new());
         let config = if config.is_null() {
             &default_config
@@ -184,7 +201,7 @@ impl CompressionPlugin {
         // Parse `algorithms` strictly. Unknown values are rejected (no silent
         // skip) so configuration typos surface immediately at load time
         // instead of producing a partially-functional plugin.
-        let algorithms: Vec<Algorithm> = match config.get("algorithms") {
+        let mut algorithms: Vec<Algorithm> = match config.get("algorithms") {
             Some(Value::Array(arr)) => {
                 let mut algos = Vec::with_capacity(arr.len());
                 for (idx, v) in arr.iter().enumerate() {
@@ -208,6 +225,16 @@ impl CompressionPlugin {
                 return Err("compression: 'algorithms' must be an array of strings".to_string());
             }
         };
+        if algorithms.is_empty() {
+            return Err(
+                "compression: no valid algorithms configured — plugin will have no effect"
+                    .to_string(),
+            );
+        }
+        algorithms.retain(|algorithm| match algorithm {
+            Algorithm::Gzip => gzip_enabled,
+            Algorithm::Brotli => brotli_enabled,
+        });
 
         let content_types = parse_content_types(config)?;
 
@@ -244,17 +271,12 @@ impl CompressionPlugin {
             .transpose()?
             .unwrap_or(4);
 
-        if algorithms.is_empty() {
-            return Err(
-                "compression: no valid algorithms configured — plugin will have no effect"
-                    .to_string(),
-            );
-        }
-
         let instance_id = NEXT_COMPRESSION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             config: CompressionConfig {
                 algorithms,
+                gzip_enabled,
+                brotli_enabled,
                 min_content_length,
                 content_types,
                 remove_accept_encoding,
@@ -296,7 +318,7 @@ impl CompressionPlugin {
         let Some(ce) = headers.get("content-encoding") else {
             return PluginResult::Continue;
         };
-        let Some(encoding) = supported_request_encoding(ce) else {
+        let Some(encoding) = self.supported_request_encoding(ce) else {
             return PluginResult::Continue;
         };
 
@@ -407,8 +429,13 @@ impl CompressionPlugin {
                 continue;
             }
 
-            let (encoding, quality) = parse_encoding_quality(part);
-            if encoding.eq_ignore_ascii_case("gzip") {
+            let encoding = part.split(';').next().unwrap_or("").trim();
+            let Some(quality) = rfc9110_entry_quality(part) else {
+                // Malformed qvalues do not express a usable preference or a
+                // refusal. Ignore the member and keep evaluating the field.
+                continue;
+            };
+            if encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("x-gzip") {
                 explicit_gzip = Some(quality);
             } else if encoding.eq_ignore_ascii_case("br") {
                 explicit_br = Some(quality);
@@ -697,6 +724,18 @@ impl CompressionPlugin {
         let mut reader = brotli::Decompressor::new(data, 4096);
         read_with_limit(&mut reader, max_size, "brotli")
     }
+
+    fn supported_request_encoding(&self, value: &str) -> Option<&'static str> {
+        if self.config.gzip_enabled
+            && (value.eq_ignore_ascii_case("gzip") || value.eq_ignore_ascii_case("x-gzip"))
+        {
+            Some("gzip")
+        } else if self.config.brotli_enabled && value.eq_ignore_ascii_case("br") {
+            Some("br")
+        } else {
+            None
+        }
+    }
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -776,16 +815,6 @@ fn parse_content_types(config: &Value) -> Result<Vec<String>, String> {
     Ok(content_types)
 }
 
-fn supported_request_encoding(value: &str) -> Option<&'static str> {
-    if value.eq_ignore_ascii_case("gzip") {
-        Some("gzip")
-    } else if value.eq_ignore_ascii_case("br") {
-        Some("br")
-    } else {
-        None
-    }
-}
-
 fn comma_header_contains_token(value: &str, token: &str) -> bool {
     value
         .split(',')
@@ -846,47 +875,6 @@ fn read_with_limit(
         }
     }
     Ok(output)
-}
-
-/// Parse a single `Accept-Encoding` token like `gzip;q=0.8` or `br`.
-///
-/// Returns the encoding token and its effective quality value, clamped to
-/// `0.0..=1.0` per RFC 9110 §12.4.2. A `q=`/`Q=` parameter that is present but
-/// unparseable (e.g. `gzip;q=abc`, `gzip;q=`) or non-finite (e.g. `gzip;q=NaN`,
-/// `gzip;q=inf`) is treated as **not acceptable** (`q = 0.0`) rather than
-/// silently defaulting to the maximum preference of `1.0` — a malformed weight
-/// must not let a codec win the selection or poison the tie-break math. A token
-/// with no `q=` parameter at all defaults to `q = 1.0` as the spec requires.
-fn parse_encoding_quality(token: &str) -> (&str, f32) {
-    // Split on ';' and look for q= parameter
-    if let Some(semi_idx) = token.find(';') {
-        let encoding = token[..semi_idx].trim();
-        let params = token[semi_idx + 1..].trim();
-        // Find q= (could be "q=0.8" or " q=0.8")
-        for param in params.split(';') {
-            let param = param.trim();
-            if let Some(stripped) = param
-                .strip_prefix("q=")
-                .or_else(|| param.strip_prefix("Q="))
-            {
-                // A q-parameter is present: its value is authoritative. Parse
-                // and clamp to [0.0, 1.0]; reject unparseable/non-finite values
-                // as q=0.0 (not acceptable). Do NOT fall through to the q=1.0
-                // default — that is only for tokens with no q-parameter.
-                let q = stripped
-                    .trim()
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|value| value.is_finite())
-                    .map(|value| value.clamp(0.0, 1.0))
-                    .unwrap_or(0.0);
-                return (encoding, q);
-            }
-        }
-        (encoding, 1.0)
-    } else {
-        (token.trim(), 1.0)
-    }
 }
 
 /// Parse one `Accept-Encoding` member's qvalue under the RFC 9110 §12.4.2
@@ -1030,7 +1018,7 @@ impl Plugin for CompressionPlugin {
             && ctx
                 .headers
                 .get("content-encoding")
-                .and_then(|value| supported_request_encoding(value))
+                .and_then(|value| self.supported_request_encoding(value))
                 .is_some()
     }
 
@@ -1381,7 +1369,7 @@ impl Plugin for CompressionPlugin {
         let encoding = request_headers
             .get("x-ferrum-original-content-encoding")
             .or_else(|| request_headers.get("content-encoding"))
-            .and_then(|v| supported_request_encoding(v))?;
+            .and_then(|v| self.supported_request_encoding(v))?;
 
         match self.decompress(encoding, body, self.config.max_decompressed_request_size) {
             Ok(decompressed) => {

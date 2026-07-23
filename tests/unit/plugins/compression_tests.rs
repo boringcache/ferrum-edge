@@ -125,6 +125,55 @@ fn test_decompress_request_config() {
 }
 
 #[test]
+fn test_global_algorithm_gates_intersect_response_and_request_support() {
+    let plugin = CompressionPlugin::new_with_algorithm_support(
+        &json!({"algorithms": ["gzip", "br"], "decompress_request": true}),
+        false,
+        true,
+    )
+    .expect("Brotli remains enabled");
+    assert!(plugin.requires_response_body_buffering());
+
+    let mut gzip_ctx = make_ctx(None);
+    gzip_ctx
+        .headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(
+        !plugin.should_buffer_request_body(&gzip_ctx),
+        "globally disabled gzip must not buffer or decode requests"
+    );
+
+    let mut br_ctx = make_ctx(None);
+    br_ctx
+        .headers
+        .insert("content-encoding".to_string(), "br".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&br_ctx),
+        "globally enabled Brotli remains available for request decoding"
+    );
+
+    let disabled = CompressionPlugin::new_with_algorithm_support(
+        &json!({"algorithms": ["gzip", "br"], "decompress_request": true}),
+        false,
+        false,
+    )
+    .expect("global gates may intentionally disable every codec");
+    assert!(!disabled.requires_response_body_buffering());
+    assert!(!disabled.should_buffer_request_body(&gzip_ctx));
+    assert!(!disabled.should_buffer_request_body(&br_ctx));
+
+    let default_policy = make_plugin(json!({"decompress_request": true}));
+    let mut x_gzip_ctx = make_ctx(None);
+    x_gzip_ctx
+        .headers
+        .insert("content-encoding".to_string(), "x-gzip".to_string());
+    assert!(
+        default_policy.should_buffer_request_body(&x_gzip_ctx),
+        "legacy x-gzip requests must use the canonical gzip decoder"
+    );
+}
+
+#[test]
 fn test_applies_after_proxy_on_reject() {
     let plugin = make_plugin(json!({}));
     assert!(plugin.applies_after_proxy_on_reject());
@@ -366,6 +415,30 @@ async fn test_selects_brotli_from_accept_encoding() {
 
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "br");
+}
+
+#[tokio::test]
+async fn test_x_gzip_compatibility_token_selects_canonical_gzip() {
+    let plugin = make_plugin(json!({"algorithms": ["gzip"]}));
+    let mut ctx = make_ctx(Some("x-gzip"));
+    let mut request_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut request_headers).await;
+
+    let mut response_headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), "1000".to_string()),
+    ]);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "legacy x-gzip negotiation must emit the canonical gzip coding"
+    );
 }
 
 #[tokio::test]
@@ -3395,14 +3468,14 @@ async fn test_bare_wildcard_still_enables_codec() {
     assert_eq!(selected.as_deref(), Some("gzip"));
 }
 
-/// #87: a present-but-unparseable q-value (`gzip;q=abc`) is treated as not
-/// acceptable (q=0), so gzip must NOT be selected when it is the only codec.
+/// #87: a present-but-unparseable q-value (`gzip;q=abc`) is ignored, so gzip
+/// must NOT be selected when it is the only offered codec.
 #[tokio::test]
 async fn test_malformed_q_value_treated_as_not_acceptable() {
     let selected = negotiate_encoding(json!(["gzip"]), "gzip;q=abc").await;
     assert_eq!(
         selected, None,
-        "a garbage q-value must be treated as q=0 (not acceptable), not q=1.0"
+        "a garbage q-value must be ignored, not treated as q=1.0"
     );
 }
 
@@ -3414,17 +3487,17 @@ async fn test_empty_q_value_treated_as_not_acceptable() {
 }
 
 /// #87: a malformed q on one codec must not let it beat a well-formed,
-/// genuinely-preferred codec. `gzip;q=abc` (→ q=0) loses to `br;q=1`.
+/// genuinely-preferred codec. The invalid gzip member is ignored.
 #[tokio::test]
 async fn test_malformed_q_value_does_not_outrank_valid_codec() {
     // Server preference is gzip-first; without the fix gzip;q=abc would parse as
-    // q=1.0 and win the tie. With the fix it is q=0 and excluded, so br wins.
+    // q=1.0 and win the tie. With the fix it is ignored, so br wins.
     let selected = negotiate_encoding(json!(["gzip", "br"]), "gzip;q=abc, br;q=1").await;
     assert_eq!(selected.as_deref(), Some("br"));
 }
 
-/// #87: `q=NaN` parses to a float in Rust but must be rejected as non-finite
-/// (q=0) so it neither wins selection nor poisons the highest-q tie-break math.
+/// #87: `q=NaN` parses to a float in Rust but is not valid RFC 9110 syntax and
+/// must be ignored so it neither wins selection nor poisons tie-break math.
 #[tokio::test]
 async fn test_nan_q_value_does_not_poison_selection() {
     // gzip;q=NaN must be excluded. br;q=0.5 is the only acceptable configured
@@ -3442,13 +3515,12 @@ async fn test_nan_q_value_does_not_poison_selection() {
     assert_eq!(none, None);
 }
 
-/// #87: a q-value above 1.0 is clamped to 1.0 (still acceptable) rather than
-/// rejected — clamping must not turn a valid (if out-of-range) weight into a
-/// refusal.
+/// #87: a q-value above 1.0 is outside the RFC 9110 qvalue grammar. It is
+/// ignored rather than clamped into an accepted coding.
 #[tokio::test]
-async fn test_out_of_range_q_value_is_clamped_not_refused() {
+async fn test_out_of_range_q_value_is_ignored() {
     let selected = negotiate_encoding(json!(["gzip"]), "gzip;q=5").await;
-    assert_eq!(selected.as_deref(), Some("gzip"));
+    assert_eq!(selected, None);
 }
 
 // ──────────────── #60: multi-member gzip request decompression ────────────────

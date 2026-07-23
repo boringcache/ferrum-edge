@@ -981,6 +981,14 @@ pub struct EnvConfig {
     // Proxy traffic
     pub proxy_http_port: u16,
     pub proxy_https_port: u16,
+    /// Global gzip content-coding gate for the built-in compression plugin.
+    /// Intersects with each plugin instance's `algorithms` list and also
+    /// disables opt-in gzip request decompression when false.
+    pub compression_gzip_enabled: bool,
+    /// Global Brotli content-coding gate for the built-in compression plugin.
+    /// Intersects with each plugin instance's `algorithms` list and also
+    /// disables opt-in Brotli request decompression when false.
+    pub compression_brotli_enabled: bool,
     pub frontend_tls_cert_path: Option<String>,
     pub frontend_tls_key_path: Option<String>,
     /// DER OCSP response bytes, or a source URI resolving to DER bytes, to
@@ -2314,6 +2322,8 @@ impl Default for EnvConfig {
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
+            compression_gzip_enabled: true,
+            compression_brotli_enabled: true,
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_ocsp_response_source: None,
@@ -2649,6 +2659,8 @@ impl EnvConfig {
             [proxy]
             proxy_http_port: u16 = "FERRUM_PROXY_HTTP_PORT" => 8000u16;
             proxy_https_port: u16 = "FERRUM_PROXY_HTTPS_PORT" => 8443u16;
+            compression_gzip_enabled: bool = "FERRUM_COMPRESSION_GZIP_ENABLED" => true;
+            compression_brotli_enabled: bool = "FERRUM_COMPRESSION_BROTLI_ENABLED" => true;
             frontend_tls_cert_path: Option<String> = "FERRUM_FRONTEND_TLS_CERT_PATH";
             frontend_tls_key_path: Option<String> = "FERRUM_FRONTEND_TLS_KEY_PATH";
             frontend_tls_live_reload_enabled: bool = "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED" => false;
@@ -3364,6 +3376,8 @@ impl EnvConfig {
             enable_streaming_latency_tracking,
             proxy_http_port,
             proxy_https_port,
+            compression_gzip_enabled,
+            compression_brotli_enabled,
             frontend_tls_cert_path,
             frontend_tls_key_path,
             frontend_tls_live_reload_enabled,

@@ -3105,7 +3105,7 @@ config:
 
 ### `compression`
 
-On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3), including the `identity` (uncoded) representation. Supports gzip and brotli.
+On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3), including the `identity` (uncoded) representation. Supports gzip and Brotli on HTTP/1.1, HTTP/2, and HTTP/3.
 
 **Priority:** 4050
 
@@ -3121,6 +3121,8 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
 | `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
+
+The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTLI_ENABLED` settings default to `true` and intersect with every instance's `algorithms` list. A codec disabled globally cannot be re-enabled by file, database, Admin API, or CP/DP plugin configuration. The same gate also disables that codec for opt-in request decompression. This gives operators a node-wide emergency/performance switch while preserving per-proxy policy.
 
 **Request decompression** (opt-in):
 
@@ -3144,7 +3146,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 8. Response `Content-Length` is below `min_content_length`
 9. Client did not send `Accept-Encoding` with a supported algorithm, or the `identity` (uncoded) representation is the most preferred acceptable one
 
-**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; a nonzero wildcard (`*;q=0.3`) does **not** lower that default identity quality — the wildcard assigns quality only to unlisted configured algorithms. Explicit algorithm and `identity` entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Only a well-formed `q=0` weight can forbid identity: a malformed qvalue on an `identity` or `*` entry is ignored rather than read as a refusal. When the client refuses identity and no acceptable coded representation is available — including when a configured algorithm would otherwise win but the response cannot be encoded because of content-type / `min_content_length` eligibility, `no-transform`, a strong `ETag`, or because the response is an identity range/delta (`206`/`226`, `Content-Range`, or the internal range marker) — the plugin rejects with `406 Not Acceptable` (`Vary: Accept-Encoding`) and does not commit compression headers or body transforms. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable) rather than protocol hard skips. No-body statuses (`204`/`205`/`304`), `HEAD` requests, and responses that already carry `Content-Encoding` remain protocol hard skips and are left unchanged. On the synthetic reject path, fail-closed 406 replacement is scoped to `response_caching` HITs of identity variants (including legacy identity responses that omit `Vary: Accept-Encoding` per #2355) so a cache hit cannot bypass negotiation; unrelated auth/policy rejection statuses are not replaced.
+**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured and globally enabled algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. `gzip` and its legacy `x-gzip` token select the same gzip representation; the response always emits the canonical `Content-Encoding: gzip`. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; a nonzero wildcard (`*;q=0.3`) does **not** lower that default identity quality — the wildcard assigns quality only to unlisted configured algorithms. Explicit algorithm and `identity` entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Quality weights are parsed with the RFC 9110 qvalue grammar; a malformed weighted member is ignored and cannot enable or forbid a representation. When the client refuses identity and no acceptable coded representation is available — including when a configured algorithm would otherwise win but the response cannot be encoded because of content-type / `min_content_length` eligibility, `no-transform`, a strong `ETag`, or because the response is an identity range/delta (`206`/`226`, `Content-Range`, or the internal range marker) — the plugin rejects with `406 Not Acceptable` (`Vary: Accept-Encoding`) and does not commit compression headers or body transforms. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable) rather than protocol hard skips. No-body statuses (`204`/`205`/`304`), `HEAD` requests, and responses that already carry `Content-Encoding` remain protocol hard skips and are left unchanged. On the synthetic reject path, fail-closed 406 replacement is scoped to `response_caching` HITs of identity variants (including legacy identity responses that omit `Vary: Accept-Encoding` per #2355) so a cache hit cannot bypass negotiation; unrelated auth/policy rejection statuses are not replaced.
 
 **Behavior:**
 - Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
@@ -3172,7 +3174,7 @@ config:
   decompress_request: false
 ```
 
-**Note:** This plugin handles HTTP-level `Content-Encoding` compression/decompression. gRPC message-level compression (the compressed flag in gRPC wire frames) is handled separately by `body_validator` for protobuf validation — these are different protocol layers and should not be confused.
+**Protocol scope:** HTTP/1.1, HTTP/2, and HTTP/3 use the same negotiation and buffered transform lifecycle. WebSocket data compression is a separate extension (`permessage-deflate`) and is not provided by this plugin. gRPC message-level compression uses `grpc-encoding` plus the compressed flag in gRPC wire frames; `body_validator` handles gzip decompression for protobuf validation. Raw TCP/UDP have no HTTP content-coding layer.
 
 ---
 
