@@ -2542,6 +2542,8 @@ async fn handle_h3_request(
                 &mut ctx,
                 &mut tmp_headers,
                 body_data,
+                before_proxy_body_requirements.needs_text,
+                before_proxy_body_requirements.needs_bytes,
             )
             .await;
         ctx.headers = tmp_headers;

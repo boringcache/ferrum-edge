@@ -2711,23 +2711,23 @@ pub(crate) fn store_request_body_metadata(
 pub(crate) fn refresh_request_body_views_after_normalization(
     ctx: &mut RequestContext,
     body: &[u8],
+    needs_body_text: bool,
+    needs_body_bytes: bool,
 ) {
     ctx.metadata.insert(
         "request_body_size_bytes".to_string(),
         body.len().to_string(),
     );
-    if ctx.request_body_bytes.is_some()
-        || ctx
-            .metadata
-            .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY)
-    {
+    if needs_body_bytes || ctx.request_body_bytes.is_some() {
         ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
     }
-    if let Ok(body_str) = std::str::from_utf8(body) {
-        ctx.metadata
-            .insert("request_body".to_string(), body_str.to_string());
-    } else {
-        ctx.metadata.remove("request_body");
+    if needs_body_text || ctx.metadata.contains_key("request_body") {
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            ctx.metadata
+                .insert("request_body".to_string(), body_str.to_string());
+        } else {
+            ctx.metadata.remove("request_body");
+        }
     }
 }
 
@@ -2741,13 +2741,16 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
     body: &mut Vec<u8>,
+    needs_body_text: bool,
+    needs_body_bytes: bool,
 ) -> PluginResult {
-    let mut ran_normalizer = false;
+    let was_decoded = ctx
+        .metadata
+        .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
     for plugin in plugins {
         if !plugin.normalizes_buffered_request_body_before_before_proxy() {
             continue;
         }
-        ran_normalizer = true;
         let deadline = ctx.grpc_deadline_at();
         match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
@@ -2762,8 +2765,17 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
             }
         }
     }
-    if ran_normalizer {
-        refresh_request_body_views_after_normalization(ctx, body);
+    let body_was_rewritten = !was_decoded
+        && ctx
+            .metadata
+            .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    if body_was_rewritten {
+        refresh_request_body_views_after_normalization(
+            ctx,
+            body,
+            needs_body_text,
+            needs_body_bytes,
+        );
     }
     PluginResult::Continue
 }
@@ -19531,6 +19543,8 @@ async fn handle_proxy_request_inner(
             &mut ctx,
             &mut tmp_headers,
             body,
+            before_proxy_body_requirements.needs_text,
+            before_proxy_body_requirements.needs_bytes,
         )
         .await;
         ctx.headers = tmp_headers;

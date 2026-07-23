@@ -2699,7 +2699,26 @@ pub mod _test_support {
         body: &mut Vec<u8>,
     ) -> crate::plugins::PluginResult {
         crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
-            plugins, ctx, headers, body,
+            plugins, ctx, headers, body, true, true,
+        )
+        .await
+    }
+
+    pub async fn apply_buffered_request_body_normalization_with_requirements_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: &mut Vec<u8>,
+        needs_body_text: bool,
+        needs_body_bytes: bool,
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+            plugins,
+            ctx,
+            headers,
+            body,
+            needs_body_text,
+            needs_body_bytes,
         )
         .await
     }

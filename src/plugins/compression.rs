@@ -305,23 +305,9 @@ impl CompressionPlugin {
         } else if let Some(bytes) = ctx.request_body_bytes.as_ref() {
             bytes.as_ref()
         } else {
-            // Unbuffered path (e.g. HBONE CONNECT): claim/strip for the later
-            // transform fallback without a rejectable body view.
-            let claimed = ctx.claim_compression_request_decode(self.instance_id);
-            debug_assert!(
-                claimed,
-                "request decode owner changed within a sequential hook chain"
-            );
-            ctx.metadata.insert(
-                "compression:request_encoding".to_string(),
-                encoding.to_string(),
-            );
-            headers.remove("content-encoding");
-            headers.insert(
-                "x-ferrum-original-content-encoding".to_string(),
-                encoding.to_string(),
-            );
-            headers.remove("content-length");
+            // Unbuffered path (e.g. HBONE CONNECT): without a rejectable body
+            // view, decompression cannot safely strip representation metadata.
+            // Preserve both bytes and headers unchanged for the backend.
             return PluginResult::Continue;
         };
 
@@ -1408,13 +1394,9 @@ impl Plugin for CompressionPlugin {
                 Some(decompressed)
             }
             Err(e) => {
-                // On the normal buffered path `before_proxy` already validated
-                // decodability and rejected a malformed body before stripping
-                // Content-Encoding, so this branch is only reachable on the rare
-                // path where the body was not buffered before before_proxy (e.g.
-                // an HBONE CONNECT tunnel). There we cannot reject from this
-                // hook, so we leave the body unchanged (returning `None`) as a
-                // best-effort fallback.
+                // The normal context-aware path validates buffered bytes before
+                // stripping Content-Encoding. Direct callers cannot reject from
+                // this transform hook, so preserve the encoded body on failure.
                 warn!("compression: request decompression failed: {e}");
                 None
             }
