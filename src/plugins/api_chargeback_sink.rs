@@ -1109,9 +1109,18 @@ impl ApiChargebackSink {
 
         let failed_spool = spool.clone();
         let overflow_spool = spool.clone();
+        let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
         let overflow_metrics = Arc::clone(&metrics);
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |batch, error| {
+                if snapshot_events_are_pre_spooled {
+                    warn!(
+                        plugin = PLUGIN_NAME,
+                        error = %error,
+                        "Chargeback snapshot export failed; the batch remains in the durable spool"
+                    );
+                    return;
+                }
                 if let Some(spool) = failed_spool.as_ref() {
                     if let Err(spool_error) = spool.write_events(&batch) {
                         warn!(
@@ -1133,6 +1142,15 @@ impl ApiChargebackSink {
                 overflow_metrics
                     .queue_high_water_hits_total
                     .fetch_add(1, Ordering::Relaxed);
+                if snapshot_events_are_pre_spooled {
+                    warn!(
+                        plugin = PLUGIN_NAME,
+                        overflow_reason = reason,
+                        "Chargeback snapshot queue overflowed; the event remains in the durable spool"
+                    );
+                    invalidate_status_cache();
+                    return;
+                }
                 if let Some(spool) = overflow_spool.as_ref() {
                     if let Err(error) = spool.write_events(&[event]) {
                         warn!(
@@ -4259,8 +4277,8 @@ fn emit_periodic_snapshot(
     };
     let snapshot_id = new_ulid();
     let received_at = unix_timestamp_nanos();
-    let events = match accumulator.compute_deltas(config, node_id, received_at, &snapshot_id) {
-        Ok(events) => events,
+    let prepared = match accumulator.prepare_deltas(config, node_id, received_at, &snapshot_id) {
+        Ok(prepared) => prepared,
         Err(error) => {
             runtime
                 .metrics
@@ -4273,15 +4291,45 @@ fn emit_periodic_snapshot(
             return Err(error);
         }
     };
-    let event_count = events.len();
+    let event_count = prepared.events.len();
     if event_count == 0 {
         return Ok(0);
     }
+    let Some(spool) = runtime.spool.as_ref() else {
+        let error = "snapshot emission requires an available spool".to_string();
+        runtime
+            .metrics
+            .record_failure(FailureReason::Serialize, error.clone());
+        return Err(error);
+    };
+    if let Err(error) = spool.write_events(&prepared.events) {
+        runtime
+            .metrics
+            .spool_available
+            .store(false, Ordering::Release);
+        let error = format!("periodic snapshot spool handoff failed: {error}");
+        runtime
+            .metrics
+            .record_failure(FailureReason::Serialize, error.clone());
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = runtime.generation,
+            error = %error,
+            "Chargeback sink could not durably spool its periodic snapshot; no baseline was advanced"
+        );
+        return Err(error);
+    }
+    // Snapshot mode requires the spool. Make it the durable commit point before
+    // advancing the accumulator baseline, then enqueue the exact same event IDs
+    // as a low-latency delivery attempt. A reload racing this point can abort the
+    // queue worker without losing or double-charging the snapshot: replay is
+    // idempotent on event_id.
+    accumulator.commit_prepared(&prepared);
     runtime
         .metrics
         .snapshot_emits_total
         .fetch_add(event_count as u64, Ordering::Relaxed);
-    for event in events {
+    for event in prepared.events {
         runtime
             .metrics
             .events_enqueued_total

@@ -64,9 +64,9 @@ silently labeling a mixed aggregate with the first record's metadata.
 per-transaction only). Every `snapshot.interval_secs`, the sink emits deltas
 since the last snapshot. Use this when event volume dominates ingest cost and
 aggregate reconciliation is sufficient. Snapshot mode requires
-`spool.enabled: true` because the accumulator advances after a delta is handed
-to the sink queue; the spool is the durable path when ClickHouse or the
-in-memory queue is unavailable. Idle snapshot keys are evicted after
+`spool.enabled: true` because the accumulator advances only after a delta is
+written to the spool; the queue is an additional low-latency delivery attempt,
+not the durability boundary. Idle snapshot keys are evicted after
 `snapshot.stale_entry_ttl_secs` and checked every
 `snapshot.cleanup_interval_secs`.
 
@@ -90,9 +90,13 @@ only):
   present, so emission and cleanup cannot orphan or double-subtract totals
   across a remove/reinsert.
 - Each accumulator has exactly one periodic snapshot task and therefore one
-  delta emitter. This single-emitter ownership prevents same-generation
-  baseline publication from being reordered; request-path recorders remain
-  concurrent with that emitter and cleanup.
+  delta emitter. Before that emitter advances a baseline, it writes the exact
+  snapshot events to the required spool. It then enqueues the same event IDs as
+  a low-latency ClickHouse attempt; spool replay remains the durable path and
+  `ReplacingMergeTree` makes the duplicate-safe attempts idempotent. This
+  single-emitter ownership prevents same-generation baseline publication from
+  being reordered; request-path recorders remain concurrent with that emitter
+  and cleanup.
 - Unrelated keys never block each other on the request path.
 
 ### Snapshot generation shutdown
@@ -108,10 +112,14 @@ logger queue, so an unavailable endpoint or queue pressure cannot wedge reload
 or shutdown.
 
 Shutdown wins a simultaneous timer selection. If a periodic tick has already
-advanced the baseline, the final handoff observes a zero delta; if shutdown
-wins first, the final spool write advances that same baseline. Thus one path,
-but never both, owns each pending delta. Repeated finalization is idempotent,
-and record hooks arriving after admission closes are ignored.
+durably spooled its events and advanced the baseline, the final handoff
+observes a zero delta; if shutdown wins first, the final spool write advances
+that same baseline. Thus one path, but never both, owns each pending delta.
+The periodic queue attempt may still be in flight during reload, but it uses
+the same event IDs as the durable spool rows, so aborting it cannot lose the
+delta and successful duplicate delivery cannot double-charge it. Repeated
+finalization is idempotent, and record hooks arriving after admission closes
+are ignored.
 
 Spool write failure leaves the generation unfinalized and retains its
 accumulator in the process-wide lifecycle registry for a later bounded retry.

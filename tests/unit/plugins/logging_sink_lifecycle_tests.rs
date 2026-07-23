@@ -1127,6 +1127,13 @@ async fn chargeback_snapshot_tick_racing_finalization_advances_exactly_one_path(
         api_chargeback_sink_emit_snapshot_tick_for_test(&tick_first),
         Some(Ok(1))
     );
+    let tick_rows = chargeback_spool_rows(&spool_dir);
+    assert_eq!(
+        tick_rows.len(),
+        1,
+        "a periodic tick must durably spool before advancing its baseline"
+    );
+    assert_eq!(tick_rows[0]["call_count"], 1);
     assert_eq!(
         api_chargeback_sink_finalize_snapshot_for_test(&tick_first).await,
         Some(true)
