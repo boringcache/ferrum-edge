@@ -368,29 +368,32 @@ node and time window.
 
 ## Status And Metrics
 
-`GET /charges/sink/status` is JWT-authenticated and returns accepted-generation
-observability for every live `api_chargeback_sink` instance. Validation-only
-construction and uncommitted staged reloads never publish into this view.
+`GET /charges/sink/status` is JWT-authenticated and returns the current
+accepted-generation observability for every stable `api_chargeback_sink`
+plugin-config ID. Validation-only construction and uncommitted staged reloads
+never publish into this view.
 
 Response contract:
 
 - `enabled` is `true` when at least one accepted instance is live.
 - `instance_count` is the number of published instances.
 - `totals` aggregates queue depth/capacity/high-water hits, spool files/bytes/
-  drops/prepare failures, and export counters across every live instance.
+  drops/prepare failures, and export counters across every current accepted
+  instance.
   `totals.spool.available` is `true` only when every spool-enabled live instance
   is currently writable.
-- `instances` lists each accepted sink in ascending
-  `(plugin_config_id, generation)` order. Each entry includes that identity plus
+- `instances` lists the current accepted generation for each sink in ascending
+  `plugin_config_id` order. Each entry includes its generation plus
   mode, pricing version, sanitized ClickHouse endpoint metadata, batch/retry
   settings, per-instance queue/spool/export counters, and timestamps.
 
-Cardinality is bounded by the number of accepted live plugin-config instances
-(config-bounded). Dropping an instance removes only that exact
-`plugin_config_id` + `generation` pair and leaves siblings untouched.
+Cardinality is bounded by the number of accepted plugin-config IDs. A newly
+accepted generation replaces the prior status entry for the same stable ID;
+dropping an older in-flight runtime removes nothing unless it is still the
+published generation.
 
-`/metrics` includes unlabeled process-wide aggregates plus the same series
-labeled with `plugin_config_id` and `generation` for each live instance:
+`/metrics` preserves the existing metric names as process-wide aggregates
+across the current accepted sink generation for every stable plugin-config ID:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`
@@ -404,9 +407,11 @@ labeled with `plugin_config_id` and `generation` for each live instance:
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
 
-Unlabeled series are the sum across live instances. Labeled series use fixed
-`plugin_config_id` / `generation` identity labels only (no request-path or
-high-cardinality dimensions).
+Per-instance identity, generation, configuration, and counters are available
+from the authenticated status endpoint. Prometheus deliberately does not add a
+generation label: repeated reloads therefore cannot create an unbounded stream
+of historical time series, and ordinary sums cannot double-count aggregate plus
+component samples.
 
 ## Security Notes
 

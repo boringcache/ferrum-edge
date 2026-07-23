@@ -1178,34 +1178,13 @@ async fn chargeback_two_accepted_instances_render_deterministically() {
 
     let prom = api_chargeback_sink::render_prometheus();
     assert!(
-        prom.contains(&format!(
-            "chargeback_sink_events_enqueued_total{{plugin_config_id=\"sink-alpha\",generation=\"{gen_a}\"}}"
-        )),
-        "missing labeled alpha series:\n{prom}"
-    );
-    assert!(
-        prom.contains(&format!(
-            "chargeback_sink_events_enqueued_total{{plugin_config_id=\"sink-bravo\",generation=\"{gen_b}\"}}"
-        )),
-        "missing labeled bravo series:\n{prom}"
-    );
-    // Unlabeled aggregate series must also be present (process totals).
-    assert!(
         prom.lines()
             .any(|line| line == "chargeback_sink_events_enqueued_total 0"),
-        "missing unlabeled aggregate counter:\n{prom}"
+        "missing process-wide aggregate counter:\n{prom}"
     );
-
-    // Alpha's position in the rendered string must precede bravo's (BTreeMap order).
-    let alpha_pos = prom
-        .find("plugin_config_id=\"sink-alpha\"")
-        .expect("alpha label");
-    let bravo_pos = prom
-        .find("plugin_config_id=\"sink-bravo\"")
-        .expect("bravo label");
     assert!(
-        alpha_pos < bravo_pos,
-        "prometheus instance series must follow ascending plugin_config_id order"
+        !prom.contains("plugin_config_id=") && !prom.contains("generation="),
+        "generation labels would create reload-driven time-series churn:\n{prom}"
     );
 
     drop(a);
@@ -1249,18 +1228,9 @@ async fn chargeback_removing_either_instance_preserves_sibling() {
         second.owns_active_sink(),
         "sibling must keep its exact published generation"
     );
-    let prom = api_chargeback_sink::render_prometheus();
     assert!(
-        !prom.contains(&format!(
-            "plugin_config_id=\"sink-one\",generation=\"{gen_one}\""
-        )),
-        "removed instance must leave no labeled series"
-    );
-    assert!(
-        prom.contains(&format!(
-            "plugin_config_id=\"sink-two\",generation=\"{gen_two}\""
-        )),
-        "sibling labeled series must remain"
+        !api_chargeback_sink::render_prometheus().is_empty(),
+        "the surviving sibling must keep aggregate metrics enabled"
     );
 
     // Recreate first with a new generation; dropping second must leave the new first.
@@ -1285,6 +1255,55 @@ async fn chargeback_removing_either_instance_preserves_sibling() {
     assert_eq!(after_second["instances"][0]["plugin_config_id"], "sink-one");
     assert_eq!(after_second["instances"][0]["generation"], gen_one_again);
     drop(first_again);
+}
+
+/// A newly accepted generation replaces the prior view for the same stable ID,
+/// and dropping the old in-flight generation must not clear the replacement.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_replacement_generation_is_current_and_exact_drop_safe() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let old = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "old"),
+        client(),
+        "default",
+        Some("sink-reload"),
+    )
+    .expect("old generation");
+    old.start_background_tasks().expect("start old generation");
+    old.commit_background_tasks();
+    let old_generation = old.active_generation().expect("old generation id");
+
+    let new = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "new"),
+        client(),
+        "default",
+        Some("sink-reload"),
+    )
+    .expect("new generation");
+    new.start_background_tasks().expect("start new generation");
+    new.commit_background_tasks();
+    let new_generation = new.active_generation().expect("new generation id");
+    assert_ne!(old_generation, new_generation);
+
+    let current: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(current["instance_count"], 1);
+    assert_eq!(current["instances"][0]["plugin_config_id"], "sink-reload");
+    assert_eq!(current["instances"][0]["generation"], new_generation);
+    assert_eq!(current["instances"][0]["pricing_version"], "pricing-new");
+
+    drop(old);
+    let after_old_drop: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(after_old_drop["instance_count"], 1);
+    assert_eq!(
+        after_old_drop["instances"][0]["generation"],
+        new_generation,
+        "dropping the superseded runtime must not clear the accepted replacement"
+    );
+
+    drop(new);
 }
 
 /// Admin/config validation throwaways must not mutate a live accepted view.
@@ -1398,13 +1417,15 @@ async fn chargeback_rejected_reload_after_staging_preserves_live() {
 #[test]
 fn chargeback_rejects_blank_plugin_config_id() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let err = ApiChargebackSink::new_with_config_id(
+    let err = match ApiChargebackSink::new_with_config_id(
         &chargeback_sink_config(&tmp),
         client(),
         "default",
         Some("   "),
-    )
-    .expect_err("blank plugin config id must fail closed");
+    ) {
+        Ok(_) => panic!("blank plugin config id must fail closed"),
+        Err(error) => error,
+    };
     assert!(
         err.contains("plugin config id") && err.contains("non-empty"),
         "unexpected error: {err}"

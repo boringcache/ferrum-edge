@@ -1514,13 +1514,13 @@ paths:
       operationId: getChargebackSinkStatus
       summary: API chargeback sink status
       description: |
-        Returns accepted-generation status for every live `api_chargeback_sink`
-        instance: aggregate queue/spool/export totals plus per-instance batch,
-        retry, queue, spool, and export counters ordered by
-        `(plugin_config_id, generation)`. Validation throwaways and uncommitted
-        staged reloads are excluded. Requires a valid admin JWT because sink
-        status can expose billing topology and ClickHouse endpoint metadata.
-        Credentials and URL user-info are never returned.
+        Returns the current accepted generation for every stable
+        `api_chargeback_sink` plugin-config ID: aggregate queue/spool/export
+        totals plus per-instance batch, retry, queue, spool, and export counters
+        ordered by `plugin_config_id`. Validation throwaways, uncommitted staged
+        reloads, and superseded generations are excluded. Requires a valid admin
+        JWT because sink status can expose billing topology and ClickHouse
+        endpoint metadata. Credentials and URL user-info are never returned.
       tags: [Metrics]
       responses:
         "200":
@@ -21035,10 +21035,11 @@ components:
     ChargebackSinkStatusResponse:
       type: object
       description: |
-        Status response from `GET /charges/sink/status`. Reports every accepted
-        live `api_chargeback_sink` instance plus process-wide totals. Instances
-        are ordered by ascending `(plugin_config_id, generation)`. Validation
-        throwaways and uncommitted staged reloads are excluded.
+        Status response from `GET /charges/sink/status`. Reports the current
+        accepted generation for every stable `api_chargeback_sink` plugin-config
+        ID plus process-wide totals. Instances are ordered by ascending
+        `plugin_config_id`. Validation throwaways, uncommitted staged reloads,
+        and superseded generations are excluded.
       required: [enabled, instance_count, totals, instances]
       properties:
         enabled:
@@ -21047,7 +21048,7 @@ components:
         instance_count:
           type: integer
           minimum: 0
-          description: Number of accepted live sink instances in `instances`.
+          description: Number of current accepted plugin-config IDs in `instances`.
         totals:
           type: object
           description: Aggregates across every accepted live instance.
@@ -21100,8 +21101,8 @@ components:
         instances:
           type: array
           description: |
-            Per-instance status for each accepted live sink, ordered by
-            ascending `(plugin_config_id, generation)`.
+            Per-instance status for the current accepted generation of each
+            stable plugin-config ID, ordered by ascending `plugin_config_id`.
           items:
             $ref: "#/components/schemas/ChargebackSinkInstanceStatus"
 

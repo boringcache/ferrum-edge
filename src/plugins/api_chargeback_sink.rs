@@ -15,9 +15,9 @@
 //! the batching worker / background tasks, or publish accepted-generation
 //! observability. Live staging happens from [`Plugin::start_background_tasks`];
 //! workers stay dormant until [`Plugin::commit_background_tasks`] after
-//! PluginCache publication. Observability tracks every accepted live instance
-//! by stable plugin-config ID and generation — never a last-constructor-wins
-//! singleton.
+//! PluginCache publication. Observability tracks the current accepted
+//! generation for every stable plugin-config ID — never a process-wide
+//! last-constructor-wins singleton.
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -83,25 +83,17 @@ const WAIT_FOR_ASYNC_INSERT_PARAM: &str = "wait_for_async_insert";
 /// Production `PluginCache` always supplies the configured resource id.
 const DEFAULT_PLUGIN_CONFIG_ID: &str = "__standalone__";
 
-/// Stable identity for one accepted live sink instance in process-global
-/// observability. Ordering is `(plugin_config_id, generation)` ascending so
-/// status and Prometheus rendering stay deterministic across reloads.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ActiveSinkKey {
-    plugin_config_id: String,
-    generation: u64,
-}
-
 /// Accepted active sinks published after PluginCache commit. Keyed by stable
-/// plugin-config ID and per-activation generation so siblings coexist and Drop
-/// removes only the exact instance being torn down.
-static ACTIVE_SINKS: OnceLock<ArcSwap<BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>>> = OnceLock::new();
+/// plugin-config ID so sibling configurations coexist while a newly accepted
+/// generation atomically replaces the prior generation for the same ID. Drop
+/// removes an entry only when it still points at that exact runtime.
+static ACTIVE_SINKS: OnceLock<ArcSwap<BTreeMap<String, Arc<SinkRuntime>>>> = OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
 static NEXT_SINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 static ULID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ULID_RANDOM_PREFIX: OnceLock<u128> = OnceLock::new();
 
-fn active_sinks() -> &'static ArcSwap<BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>> {
+fn active_sinks() -> &'static ArcSwap<BTreeMap<String, Arc<SinkRuntime>>> {
     ACTIVE_SINKS.get_or_init(|| ArcSwap::from_pointee(BTreeMap::new()))
 }
 
@@ -113,15 +105,8 @@ fn invalidate_status_cache() {
     status_cache().store(Arc::new(None));
 }
 
-fn active_sink_key(runtime: &SinkRuntime) -> ActiveSinkKey {
-    ActiveSinkKey {
-        plugin_config_id: runtime.plugin_config_id.to_string(),
-        generation: runtime.generation,
-    }
-}
-
 fn register_active_sink(runtime: Arc<SinkRuntime>) {
-    let key = active_sink_key(&runtime);
+    let key = runtime.plugin_config_id.to_string();
     active_sinks().rcu(|map| {
         if map
             .get(&key)
@@ -137,23 +122,23 @@ fn register_active_sink(runtime: Arc<SinkRuntime>) {
 }
 
 fn unregister_active_sink(runtime: &Arc<SinkRuntime>) {
-    let key = active_sink_key(runtime);
+    let key = runtime.plugin_config_id.as_ref();
     let previous = active_sinks().load_full();
     if !previous
-        .get(&key)
+        .get(key)
         .is_some_and(|existing| Arc::ptr_eq(existing, runtime))
     {
         return;
     }
     active_sinks().rcu(|map| {
         if !map
-            .get(&key)
+            .get(key)
             .is_some_and(|existing| Arc::ptr_eq(existing, runtime))
         {
             return Arc::clone(map);
         }
         let mut next = (**map).clone();
-        next.remove(&key);
+        next.remove(key);
         Arc::new(next)
     });
     invalidate_status_cache();
@@ -743,6 +728,7 @@ impl ClickHouseHttpClient {
 }
 
 impl ApiChargebackSink {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(
         raw_config: &Value,
         http_client: PluginHttpClient,
@@ -1055,10 +1041,9 @@ impl ApiChargebackSink {
         let Some(runtime) = self.runtime.get() else {
             return false;
         };
-        let key = active_sink_key(runtime);
         active_sinks()
             .load_full()
-            .get(&key)
+            .get(runtime.plugin_config_id.as_ref())
             .is_some_and(|published| Arc::ptr_eq(published, runtime))
     }
 
@@ -1092,9 +1077,9 @@ impl Drop for ApiChargebackSink {
             // Never started: ACTIVE_SINKS was never published for this instance.
             return;
         };
-        // Remove only this exact plugin-config ID + generation. Sibling live
-        // instances stay published; a validation throwaway that never committed
-        // is a no-op because it was never registered.
+        // Remove only when this exact runtime is still the accepted generation
+        // for its plugin-config ID. Siblings and a newer replacement stay
+        // published; a validation throwaway that never committed is a no-op.
         unregister_active_sink(runtime);
     }
 }
@@ -1285,7 +1270,7 @@ fn disabled_status_snapshot() -> Value {
     })
 }
 
-fn aggregate_status_snapshot(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>) -> Value {
+fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Value {
     if sinks.is_empty() {
         return disabled_status_snapshot();
     }
@@ -1376,14 +1361,6 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>) 
 }
 
 impl SinkRuntime {
-    fn prometheus_labels(&self) -> String {
-        format!(
-            "plugin_config_id=\"{}\",generation=\"{}\"",
-            super::prometheus_metrics::escape_label_value(self.plugin_config_id.as_ref()),
-            self.generation
-        )
-    }
-
     fn status_snapshot(&self) -> Value {
         let (spool_enabled, spool_files, spool_bytes) = match self.spool.as_ref() {
             Some(spool) => {
@@ -1442,111 +1419,16 @@ impl SinkRuntime {
             }
         })
     }
-
-    fn append_prometheus_instance(&self, output: &mut String) {
-        let metrics = &self.metrics;
-        let labels = self.prometheus_labels();
-        output.push_str(&format!(
-            "chargeback_sink_events_enqueued_total{{{labels}}} {}\n",
-            metrics.events_enqueued_total.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "chargeback_sink_events_exported_total{{{labels}}} {}\n",
-            metrics.events_exported_total.load(Ordering::Relaxed)
-        ));
-        for (reason, value) in [
-            (
-                "network",
-                metrics.failure_reasons.network.load(Ordering::Relaxed),
-            ),
-            (
-                "http_4xx",
-                metrics.failure_reasons.http_4xx.load(Ordering::Relaxed),
-            ),
-            (
-                "http_5xx",
-                metrics.failure_reasons.http_5xx.load(Ordering::Relaxed),
-            ),
-            (
-                "serialize",
-                metrics.failure_reasons.serialize.load(Ordering::Relaxed),
-            ),
-            ("tls", metrics.failure_reasons.tls.load(Ordering::Relaxed)),
-            (
-                "timeout",
-                metrics.failure_reasons.timeout.load(Ordering::Relaxed),
-            ),
-        ] {
-            output.push_str(&format!(
-                "chargeback_sink_export_failures_total{{{labels},reason=\"{reason}\"}} {value}\n"
-            ));
-        }
-        output.push_str(&format!(
-            "chargeback_sink_queue_depth{{{labels}}} {}\n",
-            self.logger.queue_depth()
-        ));
-        let spool_stats = self
-            .spool
-            .as_ref()
-            .and_then(|spool| spool.scan_stats().ok())
-            .unwrap_or_default();
-        output.push_str(&format!(
-            "chargeback_sink_spool_bytes{{{labels}}} {}\n",
-            spool_stats.bytes
-        ));
-        output.push_str(&format!(
-            "chargeback_sink_spool_files{{{labels}}} {}\n",
-            spool_stats.files
-        ));
-        output.push_str(&format!(
-            "chargeback_sink_spool_drops_total{{{labels}}} {}\n",
-            metrics.spool_drops_total.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "chargeback_sink_spool_available{{{labels}}} {}\n",
-            if metrics.spool_available.load(Ordering::Acquire) {
-                1
-            } else {
-                0
-            }
-        ));
-        output.push_str(&format!(
-            "chargeback_sink_spool_prepare_failures_total{{{labels}}} {}\n",
-            metrics.spool_prepare_failures_total.load(Ordering::Relaxed)
-        ));
-        for (idx, bucket) in metrics.latency.buckets.iter().enumerate() {
-            let cumulative = metrics.latency.counts[idx].load(Ordering::Relaxed);
-            output.push_str(&format!(
-                "chargeback_sink_export_latency_seconds_bucket{{{labels},le=\"{bucket}\"}} {cumulative}\n"
-            ));
-        }
-        let count = metrics.latency.count.load(Ordering::Relaxed);
-        output.push_str(&format!(
-            "chargeback_sink_export_latency_seconds_bucket{{{labels},le=\"+Inf\"}} {count}\n"
-        ));
-        output.push_str(&format!(
-            "chargeback_sink_export_latency_seconds_sum{{{labels}}} {:.6}\n",
-            f64::from_bits(metrics.latency.sum_bits.load(Ordering::Relaxed))
-        ));
-        output.push_str(&format!(
-            "chargeback_sink_export_latency_seconds_count{{{labels}}} {count}\n"
-        ));
-        if self.summary.mode == SinkMode::Snapshot {
-            output.push_str(&format!(
-                "chargeback_sink_snapshot_emits_total{{{labels}}} {}\n",
-                metrics.snapshot_emits_total.load(Ordering::Relaxed)
-            ));
-        }
-    }
 }
 
-fn render_prometheus_for_sinks(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>) -> String {
+fn render_prometheus_for_sinks(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> String {
     let mut output = String::with_capacity(4096 * sinks.len().max(1));
 
-    // Unlabeled series are process-wide aggregates across every accepted live
-    // instance. Labeled series expose the same counters with bounded
-    // `plugin_config_id` + `generation` cardinality (one series set per live
-    // accepted plugin-config instance).
+    // Preserve the existing metric names as process-wide aggregates across
+    // every current accepted instance. Per-instance identity and counters live in
+    // the authenticated status endpoint; avoiding generation labels keeps
+    // scrape cardinality stable across reloads and prevents aggregate +
+    // component double-counting in ordinary PromQL sums.
     let mut events_enqueued = 0u64;
     let mut events_exported = 0u64;
     let mut failure_network = 0u64;
@@ -1712,9 +1594,6 @@ fn render_prometheus_for_sinks(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>
         ));
     }
 
-    for runtime in sinks.values() {
-        runtime.append_prometheus_instance(&mut output);
-    }
     output
 }
 

@@ -159,6 +159,7 @@ async fn wait_for_requests(server: &MockServer, at_least: usize) -> Vec<wiremock
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn grpc_per_event_exports_billable_and_raw_terminal_statuses() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1353,6 +1354,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn prometheus_counts_quarantined_owned_spool_bytes() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1617,6 +1619,7 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn websocket_disconnect_exports_bandwidth_charge() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1667,6 +1670,7 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn connect_method_is_not_classified_as_websocket() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

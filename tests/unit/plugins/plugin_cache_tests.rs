@@ -2626,6 +2626,35 @@ async fn serverless_instances_keep_independent_transaction_metadata() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_sink_cache_construction_preserves_plugin_config_id() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["chargeback-stable-id"])],
+        vec![make_plugin_config(
+            "chargeback-stable-id",
+            "api_chargeback_sink",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("chargeback sink cache");
+    let status: serde_json::Value = serde_json::from_str(
+        &ferrum_edge::plugins::api_chargeback_sink::render_status_json(),
+    )
+    .expect("chargeback status");
+
+    assert_eq!(status["instance_count"], 1);
+    assert_eq!(
+        status["instances"][0]["plugin_config_id"],
+        "chargeback-stable-id",
+        "production PluginCache must pass the stable resource id"
+    );
+
+    drop(cache);
+}
+
 #[test]
 fn serverless_body_egress_rejects_request_body_transform_composition() {
     let mut transform_cases = vec![
