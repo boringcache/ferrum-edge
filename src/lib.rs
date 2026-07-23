@@ -3159,6 +3159,20 @@ pub mod _test_support {
         crate::proxy::early_upload_phase_needs_fresh_drain(prebuffered_body)
     }
 
+    pub fn effective_request_body_limit_for_protocol_for_test(
+        is_grpc_request: bool,
+        http_limit: usize,
+        grpc_limit: usize,
+        plugin_limit: Option<usize>,
+    ) -> usize {
+        crate::proxy::effective_request_body_limit_for_protocol(
+            is_grpc_request,
+            http_limit,
+            grpc_limit,
+            plugin_limit,
+        )
+    }
+
     pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(
         collect: F,
         deadline: Option<tokio::time::Instant>,

@@ -109,6 +109,70 @@ fn native_grpc_strips_raw_geo_assertion_before_authoritative_merge() {
 }
 
 #[test]
+fn native_grpc_preserves_unchanged_repeated_metadata_field_lines() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.append(
+        "x-grpc-trace",
+        hyper::header::HeaderValue::from_static("first"),
+    );
+    headers.append(
+        "x-grpc-trace",
+        hyper::header::HeaderValue::from_static("second"),
+    );
+    headers.append(
+        "trace-proto-bin",
+        hyper::header::HeaderValue::from_static("AQID"),
+    );
+    headers.append(
+        "trace-proto-bin",
+        hyper::header::HeaderValue::from_static("BAUG"),
+    );
+
+    let proxy_headers = HashMap::from([
+        ("x-grpc-trace".to_string(), "first, second".to_string()),
+        ("trace-proto-bin".to_string(), "AQID, BAUG".to_string()),
+    ]);
+
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+    let trace_values: Vec<_> = headers
+        .get_all("x-grpc-trace")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(trace_values, ["first", "second"]);
+    let binary_values: Vec<_> = headers
+        .get_all("trace-proto-bin")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(binary_values, ["AQID", "BAUG"]);
+}
+
+#[test]
+fn native_grpc_replaces_repeated_metadata_after_plugin_mutation() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.append(
+        "x-grpc-trace",
+        hyper::header::HeaderValue::from_static("first"),
+    );
+    headers.append(
+        "x-grpc-trace",
+        hyper::header::HeaderValue::from_static("second"),
+    );
+    let proxy_headers = HashMap::from([("x-grpc-trace".to_string(), "replacement".to_string())]);
+
+    merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+    let values: Vec<_> = headers
+        .get_all("x-grpc-trace")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(values, ["replacement"]);
+}
+
+#[test]
 fn h3_grpc_bridge_preserves_trusted_geo_assertion_on_both_dispatch_paths() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
     let helper = source
