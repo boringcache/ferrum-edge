@@ -762,6 +762,7 @@ impl ChargebackRegistry {
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // Used by external tests; dead in the separately compiled bin target.
     pub fn cleanup_interval_seconds_for_test(&self) -> u64 {
         self.cleanup_interval_seconds.load(Ordering::Acquire)
     }
