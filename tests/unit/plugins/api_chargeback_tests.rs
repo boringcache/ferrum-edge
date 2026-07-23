@@ -15,6 +15,7 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// Default per-instance scope used by registry tests (USD / "ferrum").
 fn scope() -> InstanceScope {
@@ -1033,6 +1034,28 @@ fn test_json_render_empty() {
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert!(parsed["consumers"].as_object().unwrap().is_empty());
     assert_eq!(parsed["currency"], "USD");
+}
+
+#[tokio::test]
+async fn test_cleanup_interval_reconfigures_across_reload_values() {
+    let registry = Arc::new(ChargebackRegistry::new());
+
+    registry.start_cleanup_task(60);
+    assert_eq!(registry.cleanup_interval_seconds_for_test(), 60);
+
+    registry.start_cleanup_task(0);
+    assert_eq!(
+        registry.cleanup_interval_seconds_for_test(),
+        0,
+        "reload must be able to disable an already-started cleanup task"
+    );
+
+    registry.start_cleanup_task(1);
+    assert_eq!(
+        registry.cleanup_interval_seconds_for_test(),
+        1,
+        "reload must be able to re-enable cleanup with a new interval"
+    );
 }
 
 #[test]

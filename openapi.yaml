@@ -20859,7 +20859,8 @@ components:
             When `"mixed"`, any consumer whose proxies span more than one currency
             nulls its flat monetary totals and exposes `charges_by_currency`
             instead; never treat a mixed consumer's omitted/null totals as a
-            settlement amount.
+            settlement amount. An empty registry reports `"USD"` because no
+            recorded entry has an authoritative instance currency.
           example: "USD"
         generated_at:
           type: string

@@ -473,7 +473,11 @@ fn effective_api_chargeback_plugins_by_proxy(
                     let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
                     let scope_applies = match plugin.scope {
                         PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
-                        PluginScope::ProxyGroup => plugin.proxy_id.is_none(),
+                        // Config validation already requires proxy-group
+                        // instances to omit proxy_id. Applicability here mirrors
+                        // the runtime merge, which is driven by scope plus the
+                        // proxy's explicit plugin association.
+                        PluginScope::ProxyGroup => true,
                         PluginScope::Global => false,
                     };
                     (plugin.enabled && plugin.plugin_name == "api_chargeback" && scope_applies)
@@ -623,7 +627,8 @@ pub struct ChargebackRegistry {
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
-    configured_currency: ArcSwap<String>,
+    cleanup_interval_seconds: AtomicU64,
+    cleanup_interval_changed: tokio::sync::Notify,
     /// Guards against spawning duplicate background cleanup tasks.
     cleanup_task_started: AtomicBool,
 }
@@ -648,14 +653,10 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
-            configured_currency: ArcSwap::from_pointee("USD".to_string()),
+            cleanup_interval_seconds: AtomicU64::new(0),
+            cleanup_interval_changed: tokio::sync::Notify::new(),
             cleanup_task_started: AtomicBool::new(false),
         }
-    }
-
-    pub fn set_configured_currency(&self, currency: &str) {
-        self.configured_currency
-            .store(Arc::new(currency.to_string()));
     }
 
     /// Replace live display metadata after a gateway configuration is
@@ -704,11 +705,19 @@ impl ChargebackRegistry {
         );
     }
 
-    /// Start a background task that periodically evicts stale entries.
+    /// Start or reconfigure the background task that periodically evicts stale
+    /// entries. The desired interval is reloadable, including transitions to
+    /// and from `0`; `Notify` wakes an existing task so a shorter interval or
+    /// disable takes effect without waiting for the previous timer.
+    ///
     /// Uses `compare_exchange` to ensure only one cleanup task runs per registry.
     /// Guard with `Handle::try_current()` so `new()` works in non-tokio test contexts.
     pub fn start_cleanup_task(self: &Arc<Self>, interval_seconds: u64) {
-        if interval_seconds == 0 {
+        self.cleanup_interval_seconds
+            .store(interval_seconds, Ordering::Release);
+        self.cleanup_interval_changed.notify_waiters();
+
+        if interval_seconds == 0 && !self.cleanup_task_started.load(Ordering::Acquire) {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -723,13 +732,38 @@ impl ChargebackRegistry {
         }
         let registry = Arc::clone(self);
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
             loop {
-                timer.tick().await;
-                let ttl_nanos = registry.stale_entry_ttl_nanos.load(Ordering::Relaxed);
-                registry.evict_stale(ttl_nanos);
+                // Register before loading so an interval update cannot be lost
+                // between observing the value and beginning the wait.
+                let interval_changed = registry.cleanup_interval_changed.notified();
+                let interval_seconds = registry.cleanup_interval_seconds.load(Ordering::Acquire);
+                if interval_seconds == 0 {
+                    interval_changed.await;
+                    continue;
+                }
+
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(interval_seconds)) => {
+                        // If a simultaneous reload changed the interval, let
+                        // the next loop honor it instead of evicting on the old
+                        // schedule.
+                        if registry.cleanup_interval_seconds.load(Ordering::Acquire)
+                            == interval_seconds
+                        {
+                            let ttl_nanos =
+                                registry.stale_entry_ttl_nanos.load(Ordering::Relaxed);
+                            registry.evict_stale(ttl_nanos);
+                        }
+                    }
+                    () = interval_changed => {}
+                }
             }
         });
+    }
+
+    #[doc(hidden)]
+    pub fn cleanup_interval_seconds_for_test(&self) -> u64 {
+        self.cleanup_interval_seconds.load(Ordering::Acquire)
     }
 
     /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
@@ -1596,11 +1630,13 @@ impl ChargebackRegistry {
         let currency = if currency_mixed {
             "mixed".to_string()
         } else {
-            let configured_currency = self.configured_currency.load();
             overall_currency
                 .as_deref()
                 .map(str::to_string)
-                .unwrap_or_else(|| configured_currency.as_str().to_string())
+                // With no recorded entries there is no authoritative instance
+                // currency. Keep the response deterministic instead of using
+                // constructor order from the process-global registry.
+                .unwrap_or_else(|| "USD".to_string())
         };
 
         let result = serde_json::json!({
@@ -1695,7 +1731,6 @@ impl ApiChargeback {
             tunables.stale_entry_ttl_secs,
             tunables.cache_invalidation_min_age_ms,
         );
-        registry.set_configured_currency(currency);
         registry.start_cleanup_task(tunables.cleanup_interval_seconds);
 
         let scope = InstanceScope::new(currency, namespace);
