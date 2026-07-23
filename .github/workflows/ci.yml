@@ -598,6 +598,7 @@ jobs:
               integration::example_audit_plugin_opt_in_tests
               integration::kafka_logging_broker_tests
               integration::example_plugin_contract_tests
+              integration::ai_stream_router_normalization_tests
               integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
               integration::k8s_controller_gateway_status_tests
@@ -891,6 +892,7 @@ jobs:
               functional_router_cache_test
               functional_secrets_test
               functional_ai_plugins_test
+              functional_ai_stream_router_test
               functional_ai_semantic_firewall_streaming_test
               functional_body_validator_response_stream_test
               functional_grpc_method_pre_hook_test

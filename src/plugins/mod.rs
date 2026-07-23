@@ -4190,10 +4190,12 @@ pub async fn normalize_response_body_for_inspection(
 
 /// Pipes each chunk through a chain of [`ResponseStreamInspector`]s: inspector
 /// *i*'s `Forward` output is the input to inspector *i+1*, so each plugin sees
-/// the (frame-aligned) bytes its predecessors released. The first `Terminate`
-/// short-circuits and cuts the stream. Same-call clean releases from an
-/// upstream inspector are dropped on a downstream cut — the stream is ending
-/// anyway, and that preserves the single-`ResponseStreamAction` contract.
+/// the (frame-aligned) bytes its predecessors released. Policy-inspector
+/// `Terminate` actions short-circuit and cut the stream. A normalizer's terminal
+/// payload is different: it is the final client-visible window, so it is passed
+/// through every downstream inspector and their end-of-stream flushes before
+/// the chain returns `Terminate`. Same-call clean releases from a downstream
+/// policy cut are dropped, preserving the single-action contract.
 struct ChainedResponseStreamInspector {
     inspectors: Vec<Box<dyn ResponseStreamInspector>>,
 }
@@ -4210,6 +4212,14 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
             }
             match self.inspectors[index].on_chunk(&buf).await {
                 ResponseStreamAction::Forward(out) => buf = out,
+                ResponseStreamAction::Terminate(final_bytes)
+                    if self.inspectors[index].stage()
+                        == ResponseStreamInspectorStage::Normalize =>
+                {
+                    return self
+                        .finish_after_normalizer_termination(index, final_bytes)
+                        .await;
+                }
                 terminate @ ResponseStreamAction::Terminate(_) => {
                     self.notify_prior_downstream_terminated(index);
                     return terminate;
@@ -4228,6 +4238,14 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
             if !carry.is_empty() {
                 match self.inspectors[index].on_chunk(&carry).await {
                     ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
+                    ResponseStreamAction::Terminate(final_bytes)
+                        if self.inspectors[index].stage()
+                            == ResponseStreamInspectorStage::Normalize =>
+                    {
+                        return self
+                            .finish_after_normalizer_termination(index, final_bytes)
+                            .await;
+                    }
                     terminate @ ResponseStreamAction::Terminate(_) => {
                         self.notify_prior_downstream_terminated(index);
                         return terminate;
@@ -4236,6 +4254,20 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
             }
             match self.inspectors[index].on_end().await {
                 ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
+                ResponseStreamAction::Terminate(final_bytes)
+                    if self.inspectors[index].stage()
+                        == ResponseStreamInspectorStage::Normalize =>
+                {
+                    if let Some(final_bytes) = final_bytes {
+                        released.extend_from_slice(&final_bytes);
+                    }
+                    return self
+                        .finish_after_normalizer_termination(
+                            index,
+                            (!released.is_empty()).then(|| released.freeze()),
+                        )
+                        .await;
+                }
                 terminate @ ResponseStreamAction::Terminate(_) => {
                     self.notify_prior_downstream_terminated(index);
                     return terminate;
@@ -4248,6 +4280,58 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
 }
 
 impl ChainedResponseStreamInspector {
+    async fn finish_after_normalizer_termination(
+        &mut self,
+        normalizer_index: usize,
+        final_bytes: Option<bytes::Bytes>,
+    ) -> ResponseStreamAction {
+        self.notify_prior_downstream_terminated(normalizer_index);
+        let mut carry = final_bytes.unwrap_or_default();
+        for index in normalizer_index + 1..self.inspectors.len() {
+            let stage = self.inspectors[index].stage();
+            let mut released = bytes::BytesMut::new();
+            if !carry.is_empty() {
+                match self.inspectors[index].on_chunk(&carry).await {
+                    ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
+                    ResponseStreamAction::Terminate(final_bytes)
+                        if stage == ResponseStreamInspectorStage::Normalize =>
+                    {
+                        self.notify_prior_downstream_terminated(index);
+                        carry = final_bytes.unwrap_or_default();
+                        continue;
+                    }
+                    terminate @ ResponseStreamAction::Terminate(_) => {
+                        self.notify_prior_downstream_terminated(index);
+                        return terminate;
+                    }
+                }
+            }
+            match self.inspectors[index].on_end().await {
+                ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
+                ResponseStreamAction::Terminate(final_bytes)
+                    if stage == ResponseStreamInspectorStage::Normalize =>
+                {
+                    self.notify_prior_downstream_terminated(index);
+                    if let Some(final_bytes) = final_bytes {
+                        released.extend_from_slice(&final_bytes);
+                    }
+                    carry = released.freeze();
+                    continue;
+                }
+                terminate @ ResponseStreamAction::Terminate(_) => {
+                    self.notify_prior_downstream_terminated(index);
+                    return terminate;
+                }
+            }
+            carry = released.freeze();
+        }
+        if carry.is_empty() {
+            ResponseStreamAction::Terminate(None)
+        } else {
+            ResponseStreamAction::Terminate(Some(carry))
+        }
+    }
+
     fn notify_prior_downstream_terminated(&mut self, index: usize) {
         for inspector in &mut self.inspectors[..index] {
             inspector.on_downstream_terminated();
@@ -4283,6 +4367,19 @@ mod chained_inspector_tests {
     impl ResponseStreamInspector for CutNow {
         async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"CUT")))
+        }
+    }
+
+    /// Emits a final normalized window and asks the driver to stop upstream.
+    struct NormalizeAndCut;
+    #[async_trait]
+    impl ResponseStreamInspector for NormalizeAndCut {
+        fn stage(&self) -> ResponseStreamInspectorStage {
+            ResponseStreamInspectorStage::Normalize
+        }
+
+        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+            ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"FINAL")))
         }
     }
 
@@ -4335,6 +4432,21 @@ mod chained_inspector_tests {
             chain.on_chunk(b"x").await,
             ResponseStreamAction::Terminate(Some(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn normalizer_terminal_window_reaches_downstream_inspector_and_flush() {
+        let mut chain = chain_response_stream_inspectors(vec![
+            Box::new(TagAtEnd { tag: "B" }),
+            Box::new(NormalizeAndCut),
+        ])
+        .expect("chain");
+        match chain.on_chunk(b"provider-native").await {
+            ResponseStreamAction::Terminate(Some(bytes)) => {
+                assert_eq!(bytes.as_ref(), b"FINALB");
+            }
+            other => panic!("expected terminal downstream output, got {other:?}"),
+        }
     }
 
     #[tokio::test]

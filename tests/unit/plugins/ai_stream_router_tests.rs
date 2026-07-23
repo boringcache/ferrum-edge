@@ -11,7 +11,10 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -104,11 +107,19 @@ fn forwarded(action: ResponseStreamAction) -> Vec<u8> {
 /// Test guardrail that cuts if provider-native Anthropic framing reaches it.
 /// Its default stage is `Inspect`, so the chain must move a normalizer supplied
 /// later in the vector ahead of it.
-struct RejectProviderNative;
+struct RejectProviderNative {
+    saw_normalized: Arc<AtomicBool>,
+}
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for RejectProviderNative {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if chunk
+            .windows(b"chat.completion.chunk".len())
+            .any(|window| window == b"chat.completion.chunk")
+        {
+            self.saw_normalized.store(true, Ordering::SeqCst);
+        }
         if chunk
             .windows(b"content_block_delta".len())
             .any(|window| window == b"content_block_delta")
@@ -153,6 +164,7 @@ fn test_valid_config_parses() {
     assert!(plugin.requires_request_body_before_before_proxy());
     assert!(plugin.modifies_request_headers());
     assert!(plugin.modifies_request_body());
+    assert!(plugin.needs_final_request_body_context());
     // An anthropic provider with normalization on wires the response-stream hook.
     assert!(plugin.requires_response_stream_hooks());
 }
@@ -971,18 +983,29 @@ async fn test_stream_normalizer_stage_precedes_policy_inspection() {
     // Deliberately supply the policy inspector first. Stage ordering must still
     // normalize before it, without hard-coding plugin names or changing
     // request-side priority semantics.
-    let mut chain =
-        chain_response_stream_inspectors(vec![Box::new(RejectProviderNative), normalizer])
-            .expect("chained inspectors");
+    let saw_normalized = Arc::new(AtomicBool::new(false));
+    let mut chain = chain_response_stream_inspectors(vec![
+        Box::new(RejectProviderNative {
+            saw_normalized: Arc::clone(&saw_normalized),
+        }),
+        normalizer,
+    ])
+    .expect("chained inspectors");
     let output = match chain.on_chunk(ANTHROPIC_SSE.as_bytes()).await {
-        ResponseStreamAction::Forward(output) => output,
-        ResponseStreamAction::Terminate(_) => {
-            panic!("policy inspector saw provider-native Anthropic SSE")
+        ResponseStreamAction::Forward(output) | ResponseStreamAction::Terminate(Some(output)) => {
+            output
+        }
+        ResponseStreamAction::Terminate(None) => {
+            panic!("normalizer terminated without releasing OpenAI SSE")
         }
     };
     let output = String::from_utf8(output.to_vec()).expect("normalized UTF-8 SSE");
     assert!(output.contains("chat.completion.chunk"));
     assert!(!output.contains("content_block_delta"));
+    assert!(
+        saw_normalized.load(Ordering::SeqCst),
+        "the downstream policy inspector must receive the normalizer's terminal window"
+    );
 }
 
 const ANTHROPIC_SSE: &str = concat!(
@@ -1463,11 +1486,13 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
     assert!(text.contains("oversized"), "{text}");
     assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
 
-    // After termination the inspector is inert.
+    // After termination the inspector keeps the stream closed without
+    // emitting the terminal payload a second time.
     let after = inspector.on_chunk(b"data: {}\n\n").await;
     match after {
-        ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
-        ResponseStreamAction::Terminate(_) => panic!("must not terminate twice"),
+        ResponseStreamAction::Terminate(None) => {}
+        ResponseStreamAction::Terminate(Some(_)) => panic!("must not emit terminal bytes twice"),
+        ResponseStreamAction::Forward(_) => panic!("terminated inspector must remain closed"),
     }
 }
 
@@ -1568,4 +1593,838 @@ async fn test_end_to_end_composition_streaming_vs_non_streaming() {
         PluginResult::Continue
     ));
     assert!(!ctx2.metadata.contains_key("ai_stream_router_claimed"));
+}
+
+// ---------------------------------------------------------------------------
+// #2272 — Anthropic terminal-state failure posture
+// ---------------------------------------------------------------------------
+
+const ANTHROPIC_PARTIAL_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut short\"}}\n\n",
+);
+
+async fn run_sse_bytes(body: &[u8]) -> (String, bool) {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let mut collected = Vec::new();
+    let mut terminated = false;
+    match inspector.on_chunk(body).await {
+        ResponseStreamAction::Forward(bytes) => collected.extend_from_slice(&bytes),
+        ResponseStreamAction::Terminate(bytes) => {
+            terminated = true;
+            if let Some(bytes) = bytes {
+                collected.extend_from_slice(&bytes);
+            }
+        }
+    }
+    if !terminated {
+        match inspector.on_end().await {
+            ResponseStreamAction::Forward(bytes) => collected.extend_from_slice(&bytes),
+            ResponseStreamAction::Terminate(bytes) => {
+                terminated = true;
+                if let Some(bytes) = bytes {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    (String::from_utf8(collected).unwrap(), terminated)
+}
+
+async fn run_sse(body: &str) -> (String, bool) {
+    run_sse_bytes(body.as_bytes()).await
+}
+
+#[tokio::test]
+async fn test_premature_anthropic_eof_is_upstream_error_not_success() {
+    let (out, terminated) = run_sse(ANTHROPIC_PARTIAL_SSE).await;
+    assert!(terminated);
+    assert!(out.contains("\"type\":\"upstream_error\""));
+    assert!(out.contains("before message_stop"));
+    assert!(out.contains("cut short"));
+    assert!(out.trim_end().ends_with("data: [DONE]"));
+    // Exactly one DONE sentinel.
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_anthropic_message_stop_without_start_is_protocol_error() {
+    let (out, terminated) = run_sse("data: {\"type\":\"message_stop\"}\n\n").await;
+    assert!(terminated);
+    assert!(out.contains("before message_start"));
+    assert!(out.contains("upstream_error"));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_malformed_complete_sse_event_fails_closed() {
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bad\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {not-json\n\n",
+    );
+    let (out, terminated) = run_sse(body).await;
+    assert!(terminated);
+    assert!(out.contains("\"type\":\"upstream_error\""));
+    assert!(out.contains("malformed SSE JSON"));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_known_anthropic_events_cannot_hide_malformed_protocol_data() {
+    let malformed_events = [
+        concat!(
+            "event: content_block_delta\n",
+            "data : {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lost\"}}\n\n",
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lost\"}}\n\n",
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ),
+    ];
+
+    for malformed_event in malformed_events {
+        let body = format!(
+            "{}{}{}",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bad_protocol\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            malformed_event,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (out, terminated) = run_sse(&body).await;
+        assert!(terminated);
+        assert!(out.contains("\"type\":\"upstream_error\""), "{out}");
+        assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+        assert!(!out.contains("\"content\":\"lost\""), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_utf8_anthropic_event_fails_closed() {
+    let mut body = b"event: content_block_delta\ndata: {".to_vec();
+    body.push(0xff);
+    body.extend_from_slice(b"}\n\n");
+
+    let (out, terminated) = run_sse_bytes(&body).await;
+    assert!(terminated);
+    assert!(out.contains("\"type\":\"upstream_error\""));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_explicit_anthropic_error_event_terminates_once() {
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_err\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"provider blew up\"}}\n\n",
+    );
+    let (out, terminated) = run_sse(body).await;
+    assert!(terminated);
+    assert!(out.contains("provider blew up"));
+    assert!(out.contains("\"type\":\"upstream_error\""));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_unknown_anthropic_sse_events_are_forward_compatible() {
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_unk\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "event: future_event\n",
+        "data: {\"type\":\"future_event\",\"payload\":true}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let (out, terminated) = run_sse(body).await;
+    assert!(terminated);
+    assert!(out.contains("\"content\":\"ok\""));
+    assert!(out.contains("\"finish_reason\":\"stop\""));
+    assert!(!out.contains("upstream_error"));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_message_stop_terminates_without_waiting_for_extra_eof_bytes() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let first = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    match first {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let out = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(out.trim_end().ends_with("data: [DONE]"));
+        }
+        other => panic!("message_stop must Terminate the inspector driver: {other:?}"),
+    }
+    // Exactly-once: a later on_end must not emit a second DONE.
+    let trailing = forwarded(inspector.on_end().await);
+    assert!(trailing.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #2274 — Accept-Encoding / Content-Encoding identity handling
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_normalized_claim_requests_identity_encoding() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    headers.insert("accept-encoding".to_string(), "gzip, br".to_string());
+    headers.insert("Accept-Encoding".to_string(), "deflate".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let values: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(
+        values,
+        vec!["identity"],
+        "normalized Anthropic claims must replace every client variant with identity"
+    );
+}
+
+#[tokio::test]
+async fn test_openai_passthrough_keeps_accept_encoding() {
+    let plugin = build(openai_and_anthropic_config());
+    let body =
+        json!({"model": "gpt-4o", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        headers.get("accept-encoding").map(String::as_str),
+        Some("gzip")
+    );
+}
+
+fn gzip_bytes(plain: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(plain).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn brotli_bytes(plain: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+        std::io::Write::write_all(&mut encoder, plain).unwrap();
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_gzip_encoded_streamed_anthropic_sse_is_normalized() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    resp_headers.insert("vary".to_string(), "Accept-Encoding, Origin".to_string());
+    let after = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(after, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("vary").map(String::as_str), Some("Origin"));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.provider_content_encoding")
+            .map(String::as_str),
+        Some("gzip")
+    );
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("decoding inspector");
+    let encoded = gzip_bytes(ANTHROPIC_SSE.as_bytes());
+    let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+    assert!(out.contains("\"content\":\"Hello\""));
+    assert!(out.trim_end().ends_with("data: [DONE]"));
+    assert!(!out.contains("upstream_error"));
+}
+
+#[tokio::test]
+async fn test_gzip_streaming_decode_rejects_expansion_over_limit() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("bounded decoding inspector");
+    let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+    let encoded = gzip_bytes(&oversized);
+    let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+    assert!(out.contains("upstream_error"));
+    assert!(out.contains("decoded content exceeds"));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_brotli_encoded_buffered_anthropic_sse_is_normalized() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "br".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+        PluginResult::Continue
+    ));
+
+    let encoded = brotli_bytes(ANTHROPIC_SSE.as_bytes());
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            &encoded,
+            Some("text/event-stream"),
+            &resp_headers,
+        )
+        .await
+        .expect("buffered decode+normalize");
+    let out = String::from_utf8(buffered).unwrap();
+    assert!(out.contains("chat.completion.chunk"));
+    assert!(out.contains("\"content\":\"Hello\""));
+    assert!(out.trim_end().ends_with("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn test_unsupported_content_encoding_is_rejected() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    for encoding in ["zstd", "gzip,", "gzip; q=1", "gzip, br"] {
+        let mut ctx = post_ctx(&claude);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("content-encoding".to_string(), encoding.to_string());
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert_eq!(
+            reject_status(&reject),
+            Some(502),
+            "{encoding} must fail closed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_case_variant_duplicate_content_encoding_is_rejected() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "identity".to_string());
+    resp_headers.insert("Content-Encoding".to_string(), "gzip".to_string());
+    assert_eq!(
+        reject_status(&plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await),
+        Some(502)
+    );
+}
+
+#[tokio::test]
+async fn test_identity_provider_content_encoding_repairs_rewritten_representation_headers() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+
+    for encoding in [None, Some("identity")] {
+        let mut ctx = post_ctx(&claude);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("Content-Length".to_string(), "999".to_string());
+        resp_headers.insert("ETag".to_string(), "\"provider\"".to_string());
+        resp_headers.insert("Digest".to_string(), "sha-256=provider".to_string());
+        resp_headers.insert("vary".to_string(), "Accept-Encoding, Origin".to_string());
+        resp_headers.insert("Vary".to_string(), "origin, X-Trace".to_string());
+        if let Some(encoding) = encoding {
+            resp_headers.insert("Content-Encoding".to_string(), encoding.to_string());
+        }
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_stream_router.provider_content_encoding")
+        );
+        for invalidated in ["content-encoding", "content-length", "etag", "digest"] {
+            assert!(
+                !resp_headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(invalidated)),
+                "{invalidated} must be removed after identity SSE normalization"
+            );
+        }
+        let vary_values: Vec<_> = resp_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(vary_values.len(), 1);
+        let vary_tokens: Vec<_> = vary_values[0]
+            .split(',')
+            .map(|token| token.trim().to_ascii_lowercase())
+            .collect();
+        assert_eq!(vary_tokens.len(), 2);
+        assert!(vary_tokens.iter().any(|token| token == "origin"));
+        assert!(vary_tokens.iter().any(|token| token == "x-trace"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2280 — tool-call / tool-result history translation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_anthropic_tool_history_round_trip_translation() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "22C and sunny"},
+            {"role": "user", "content": "thanks"}
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let raw = serde_json::to_vec(&body).unwrap();
+    let out = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("translated");
+    let parsed: Value = serde_json::from_slice(&out).unwrap();
+    let messages = parsed["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0]["role"], json!("user"));
+    assert_eq!(messages[1]["role"], json!("assistant"));
+    let assistant_blocks = messages[1]["content"].as_array().unwrap();
+    assert_eq!(assistant_blocks[0]["type"], json!("text"));
+    assert_eq!(assistant_blocks[0]["text"], json!("Let me check."));
+    assert_eq!(assistant_blocks[1]["type"], json!("tool_use"));
+    assert_eq!(assistant_blocks[1]["id"], json!("call_1"));
+    assert_eq!(assistant_blocks[1]["name"], json!("get_weather"));
+    assert_eq!(assistant_blocks[1]["input"]["location"], json!("Paris"));
+    assert_eq!(messages[2]["role"], json!("user"));
+    let tool_results = messages[2]["content"].as_array().unwrap();
+    assert_eq!(tool_results[0]["type"], json!("tool_result"));
+    assert_eq!(tool_results[0]["tool_use_id"], json!("call_1"));
+    assert_eq!(tool_results[0]["content"], json!("22C and sunny"));
+    assert_eq!(messages[3]["content"], json!("thanks"));
+}
+
+#[tokio::test]
+async fn test_anthropic_parallel_tool_calls_and_results_preserve_order() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "multi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "alpha", "arguments": "{}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "beta", "arguments": "{\"x\":1}"}}
+                ]
+            },
+            {"role": "tool", "tool_call_id": "call_a", "content": null},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B", "is_error": true}
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let raw = serde_json::to_vec(&body).unwrap();
+    let parsed: Value = serde_json::from_slice(
+        &plugin
+            .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let assistant = parsed["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(assistant[0]["id"], json!("call_a"));
+    assert_eq!(assistant[1]["id"], json!("call_b"));
+    let results = parsed["messages"][2]["content"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["tool_use_id"], json!("call_a"));
+    assert_eq!(results[0]["content"], json!(""));
+    assert_eq!(results[1]["tool_use_id"], json!("call_b"));
+    assert_eq!(results[1]["is_error"], json!(true));
+}
+
+#[tokio::test]
+async fn test_null_tool_call_fields_are_treated_as_absent() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": null,
+                "function_call": null
+            }
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let raw = serde_json::to_vec(&body).unwrap();
+    let translated: Value = serde_json::from_slice(
+        &plugin
+            .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+            .await
+            .expect("translated"),
+    )
+    .unwrap();
+    assert_eq!(translated["messages"][1]["content"], json!("done"));
+}
+
+#[tokio::test]
+async fn test_malformed_tool_history_rejects_with_400() {
+    let plugin = build(openai_and_anthropic_config());
+
+    let orphaned = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "missing", "content": "x"}
+        ]
+    });
+    let mut ctx = post_ctx(&orphaned);
+    let mut headers = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+        Some(400)
+    );
+
+    let bad_args = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "not-json"}
+                }]
+            }
+        ]
+    });
+    let mut ctx2 = post_ctx(&bad_args);
+    let mut headers2 = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx2, &mut headers2).await),
+        Some(400)
+    );
+
+    let missing_result = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"}
+                }]
+            },
+            {"role": "user", "content": "continue without a result"}
+        ]
+    });
+    let mut ctx3 = post_ctx(&missing_result);
+    let mut headers3 = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx3, &mut headers3).await),
+        Some(400)
+    );
+
+    let duplicate_result = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "first"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "duplicate"}
+        ]
+    });
+    let mut ctx4 = post_ctx(&duplicate_result);
+    let mut headers4 = json_headers();
+    assert_eq!(
+        reject_status(&plugin.before_proxy(&mut ctx4, &mut headers4).await),
+        Some(400)
+    );
+}
+
+#[tokio::test]
+async fn test_anthropic_translation_rejects_each_malformed_tool_history_shape() {
+    let plugin = build(openai_and_anthropic_config());
+    let invalid_requests = vec![
+        (
+            "missing messages",
+            json!({"model": "claude-3-5-sonnet", "stream": true}),
+        ),
+        (
+            "non-object message",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": ["bad"]}),
+        ),
+        (
+            "missing role",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"content": "bad"}]}),
+        ),
+        (
+            "unsupported role",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "critic", "content": "bad"}]}),
+        ),
+        (
+            "non-text user content",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "user", "content": 42}]}),
+        ),
+        (
+            "legacy function call",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": "calling", "function_call": {"name": "run", "arguments": "{}"}}]}),
+        ),
+        (
+            "empty tool call list",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": []}]}),
+        ),
+        (
+            "non-array tool calls",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": {}}]}),
+        ),
+        (
+            "non-object tool call",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [7]}]}),
+        ),
+        (
+            "non-function tool call",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "custom", "function": {"name": "run", "arguments": "{}"}}]}]}),
+        ),
+        (
+            "missing tool call id",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"type": "function", "function": {"name": "run", "arguments": "{}"}}]}]}),
+        ),
+        (
+            "missing function object",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function"}]}]}),
+        ),
+        (
+            "invalid function name",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "not valid!", "arguments": "{}"}}]}]}),
+        ),
+        (
+            "non-string arguments",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": {}}}]}]}),
+        ),
+        (
+            "non-object encoded arguments",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "[]"}}]}]}),
+        ),
+        (
+            "tool calls on user message",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "user", "content": "bad", "tool_calls": []}]}),
+        ),
+        (
+            "repeated tool call id",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"id": "same", "type": "function", "function": {"name": "first", "arguments": "{}"}},
+                        {"id": "same", "type": "function", "function": {"name": "second", "arguments": "{}"}}
+                    ]
+                }]
+            }),
+        ),
+        (
+            "missing final tool result",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]}]}),
+        ),
+        (
+            "object tool result content",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": {}}
+                ]
+            }),
+        ),
+        (
+            "non-text tool result part",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": [{"type": "image", "text": "bad"}]}
+                ]
+            }),
+        ),
+        (
+            "missing tool result text",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": [{"type": "text"}]}
+                ]
+            }),
+        ),
+        (
+            "empty assistant content",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": ""}]}),
+        ),
+    ];
+
+    for (label, body) in invalid_requests {
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert_eq!(
+            reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+            Some(400),
+            "{label} must fail closed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_late_translation_failure_is_rejected_before_dispatch() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                b"{",
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        reject_status(
+            &plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, b"{")
+                .await
+        ),
+        Some(400)
+    );
 }
