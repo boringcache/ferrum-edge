@@ -1905,16 +1905,7 @@ fn record_payment(
     price: f64,
 ) {
     registry.record_http(
-        scope,
-        "alice",
-        "payments",
-        proxy_name,
-        200,
-        price,
-        0,
-        0,
-        0.0,
-        0.0,
+        scope, "alice", "payments", proxy_name, 200, price, 0, 0, 0.0, 0.0,
     );
 }
 
@@ -2030,8 +2021,7 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
     let cached_v2: serde_json::Value =
         serde_json::from_str(&registry.render_json().unwrap()).unwrap();
     assert_eq!(
-        cached_v2["consumers"]["alice"]["proxies"]["payments"]["proxy_name"],
-        "Payments v2",
+        cached_v2["consumers"]["alice"]["proxies"]["payments"]["proxy_name"], "Payments v2",
         "metadata publication must invalidate the cached old label immediately"
     );
     for _ in 0..5 {

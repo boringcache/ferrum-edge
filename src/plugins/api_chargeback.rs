@@ -457,7 +457,7 @@ impl ChargebackRegistry {
     pub fn set_active_proxy_names(&self, names: HashMap<String, String>) {
         let unchanged = {
             let current = self.active_proxy_names.load();
-            current.as_ref().as_ref() == &names
+            current.as_ref() == &names
         };
         if unchanged {
             return;
