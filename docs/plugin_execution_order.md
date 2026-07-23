@@ -584,7 +584,7 @@ Given all built-in plugins enabled, the execution order is:
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 57 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
 | 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 59 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 59 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 61 | `ai_federation` | 4060 | final request body (HTTP only) |
 | 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body |
