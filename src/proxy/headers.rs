@@ -403,6 +403,42 @@ fn strip_reserved_gateway_assertion_headers(headers: &mut http::HeaderMap) {
     headers.remove("x-geo-country");
 }
 
+/// Whether the materialized single-value view still represents the exact raw
+/// field-line sequence. Keeping the raw lines in that case preserves repeated
+/// gRPC metadata (including `-bin` metadata) instead of collapsing it into one
+/// comma-folded field. A plugin mutation no longer matches and therefore still
+/// replaces the raw values below.
+fn raw_header_values_match_materialized(
+    headers: &http::HeaderMap,
+    name: &http::HeaderName,
+    expected: &str,
+) -> bool {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return false;
+    };
+    let Ok(first) = first.to_str() else {
+        return false;
+    };
+    let Some(mut remaining) = expected.strip_prefix(first) else {
+        return false;
+    };
+    let separator = crate::plugins::repeated_request_header_separator(name.as_str());
+    for value in values {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        let Some(after_separator) = remaining.strip_prefix(separator) else {
+            return false;
+        };
+        let Some(after_value) = after_separator.strip_prefix(value) else {
+            return false;
+        };
+        remaining = after_value;
+    }
+    remaining.is_empty()
+}
+
 /// Merge plugin/proxy headers on top of `headers` and then run the
 /// gRPC-specific backend strip on the union. This is the canonical
 /// order for gRPC dispatch — stripping BEFORE the merge would let any
@@ -438,10 +474,13 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
     strip_reserved_gateway_assertion_headers(headers);
 
     for (k, v) in proxy_headers {
-        if let (Ok(name), Ok(val)) = (
-            http::HeaderName::from_bytes(k.as_bytes()),
-            http::HeaderValue::from_str(v),
-        ) {
+        let Ok(name) = http::HeaderName::from_bytes(k.as_bytes()) else {
+            continue;
+        };
+        if raw_header_values_match_materialized(headers, &name, v) {
+            continue;
+        }
+        if let Ok(val) = http::HeaderValue::from_str(v) {
             headers.insert(name, val);
         }
     }
@@ -906,6 +945,55 @@ mod tests {
             headers.get(http::header::TE),
             Some(&http::HeaderValue::from_static("trailers"))
         );
+    }
+
+    #[test]
+    fn grpc_merge_preserves_unchanged_repeated_metadata_field_lines() {
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-grpc-trace", http::HeaderValue::from_static("first"));
+        headers.append("x-grpc-trace", http::HeaderValue::from_static("second"));
+        headers.append("trace-proto-bin", http::HeaderValue::from_static("AQID"));
+        headers.append("trace-proto-bin", http::HeaderValue::from_static("BAUG"));
+
+        let proxy_headers = std::collections::HashMap::from([
+            ("x-grpc-trace".to_string(), "first, second".to_string()),
+            ("trace-proto-bin".to_string(), "AQID, BAUG".to_string()),
+        ]);
+
+        merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+        let trace_values: Vec<_> = headers
+            .get_all("x-grpc-trace")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(trace_values, ["first", "second"]);
+        let binary_values: Vec<_> = headers
+            .get_all("trace-proto-bin")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(binary_values, ["AQID", "BAUG"]);
+    }
+
+    #[test]
+    fn grpc_merge_replaces_repeated_metadata_after_plugin_mutation() {
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-grpc-trace", http::HeaderValue::from_static("first"));
+        headers.append("x-grpc-trace", http::HeaderValue::from_static("second"));
+        let proxy_headers = std::collections::HashMap::from([(
+            "x-grpc-trace".to_string(),
+            "replacement".to_string(),
+        )]);
+
+        merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+        let values: Vec<_> = headers
+            .get_all("x-grpc-trace")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(values, ["replacement"]);
     }
 
     #[test]

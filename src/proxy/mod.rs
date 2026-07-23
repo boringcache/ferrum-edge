@@ -19609,7 +19609,7 @@ async fn handle_proxy_request_inner(
     // runs after the pre-`before_proxy` buffer is stored and before any
     // `before_proxy` hook, so earlier body consumers see validated plaintext.
     if capabilities.has(PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
-        && let ClientRequestBody::Buffered(body) = &mut client_request_body
+        && let ClientRequestBody::Buffered(buffered) = &mut client_request_body
     {
         let phase_start = Instant::now();
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
@@ -19617,7 +19617,7 @@ async fn handle_proxy_request_inner(
             &plugins,
             &mut ctx,
             &mut tmp_headers,
-            body,
+            &mut buffered.body,
             before_proxy_body_requirements.needs_text,
             before_proxy_body_requirements.needs_bytes,
         )
@@ -36830,7 +36830,11 @@ mod tests {
                 backend_url,
                 "GET",
                 &HashMap::new(),
-                ClientRequestBody::Buffered(Vec::new()),
+                ClientRequestBody::Buffered(BufferedClientRequestBody {
+                    method: hyper::Method::GET,
+                    headers: hyper::HeaderMap::new(),
+                    body: Vec::new(),
+                }),
                 None,
                 plugins,
                 &[],
