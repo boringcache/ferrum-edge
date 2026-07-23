@@ -3209,8 +3209,14 @@ async fn test_before_proxy_preserves_encoded_headers_without_body_view() {
 
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert_eq!(headers.get("content-encoding").map(String::as_str), Some("gzip"));
-    assert_eq!(headers.get("content-length").map(String::as_str), Some("42"));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some("42")
+    );
     assert!(!ctx.metadata.contains_key("compression:request_encoding"));
 }
 
