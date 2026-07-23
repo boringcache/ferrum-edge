@@ -2112,7 +2112,7 @@ fn serialized_object_to_value(
 }
 
 fn object_tokens_to_value(tokens: Vec<String>, schema: &Value) -> Result<Value, String> {
-    if tokens.len() % 2 != 0 {
+    if !tokens.len().is_multiple_of(2) {
         return Err(
             "Serialized object property must contain alternating key/value items".to_string(),
         );
