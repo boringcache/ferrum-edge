@@ -3398,10 +3398,7 @@ impl SnapshotAccumulator {
     }
 
     #[cfg(test)]
-    fn set_cleanup_after_stale_check_hook(
-        &self,
-        hook: Option<CleanupAfterStaleCheckHook>,
-    ) {
+    fn set_cleanup_after_stale_check_hook(&self, hook: Option<CleanupAfterStaleCheckHook>) {
         if let Ok(mut slot) = self.cleanup_after_stale_check_hook.lock() {
             *slot = hook;
         }
