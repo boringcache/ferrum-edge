@@ -2870,7 +2870,8 @@ async fn multipart_accepts_quoted_boundary_with_interior_space() {
     }))
     .unwrap();
     let headers = content_type_headers("multipart/form-data; boundary=\"a b\"");
-    let body = b"--a b\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--a b--\r\n";
+    let body =
+        b"--a b\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--a b--\r\n";
     let mut ctx = post_ctx("/space-boundary");
     ctx.headers = headers.clone();
     assert_continue(
@@ -2934,7 +2935,8 @@ async fn multipart_empty_header_block_does_not_promote_body_lines() {
     }))
     .unwrap();
     let headers = content_type_headers("multipart/form-data; boundary=abc");
-    let body = b"--abc\r\n\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--abc--\r\n";
+    let body =
+        b"--abc\r\n\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--abc--\r\n";
     let mut ctx = post_ctx("/empty-headers");
     ctx.headers = headers.clone();
     assert_reject(
@@ -2966,12 +2968,8 @@ async fn explode_false_arrays_require_one_serialized_property_occurrence() {
     let mut ctx = post_ctx("/form-array");
     ctx.headers = form_headers.clone();
     assert_reject(
-        form.on_final_request_body_with_context(
-            &mut ctx,
-            &form_headers,
-            b"tags=a,b&tags=c",
-        )
-        .await,
+        form.on_final_request_body_with_context(&mut ctx, &form_headers, b"tags=a,b&tags=c")
+            .await,
         Some(400),
     );
 

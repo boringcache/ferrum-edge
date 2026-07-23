@@ -1361,12 +1361,7 @@ fn extract_openapi_request_body(
             let encoding = match media_object.get("encoding") {
                 None | Some(Value::Null) => None,
                 Some(encoding) => Some(normalize_request_body_encoding(
-                    root,
-                    media_type,
-                    encoding,
-                    &schema,
-                    version,
-                    resolver,
+                    root, media_type, encoding, &schema, version, resolver,
                 )?),
             };
             let media_value = match encoding {

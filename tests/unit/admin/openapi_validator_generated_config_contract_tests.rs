@@ -312,8 +312,8 @@ fn importer_resolves_multipart_encoding_header_and_schema_refs() {
 }"##;
 
     let config = extract_validator_config(spec);
-    let header = &config["operations"][0]["request_body"]["content"]
-        ["multipart/form-data"]["encoding"]["file"]["headers"]["X-Part-Token"];
+    let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]["encoding"]
+        ["file"]["headers"]["X-Part-Token"];
     assert!(header.get("$ref").is_none());
     assert!(header["schema"].get("$ref").is_none());
     assert_eq!(header["required"], true);

@@ -176,10 +176,7 @@ impl ConversionPlan {
             .unwrap_or(&Value::Null)
     }
 
-    fn composed_scalar_validator(
-        &self,
-        schema: &Value,
-    ) -> Option<&jsonschema::Validator> {
+    fn composed_scalar_validator(&self, schema: &Value) -> Option<&jsonschema::Validator> {
         self.composed_scalar_validators
             .get(&(schema as *const Value as usize))
     }
@@ -1524,13 +1521,7 @@ fn validate_media_body(
     validator: &MediaValidator,
     max_body_bytes: usize,
 ) -> Result<(), String> {
-    match body_to_schema_instance(
-        headers,
-        body,
-        content_type,
-        validator,
-        max_body_bytes,
-    )? {
+    match body_to_schema_instance(headers, body, content_type, validator, max_body_bytes)? {
         SchemaInstance::Value(instance) => validator
             .validator
             .validate(&instance)
@@ -1620,8 +1611,8 @@ fn xml_node_to_value(
     let object_schema = object_schema_for_conversion(schema, conversion);
     if schema_accepts_object(object_schema) || object_schema.get("properties").is_some() {
         let empty_properties = serde_json::Map::new();
-        let properties = merged_object_properties(object_schema, conversion)
-            .unwrap_or(&empty_properties);
+        let properties =
+            merged_object_properties(object_schema, conversion).unwrap_or(&empty_properties);
         if properties.is_empty() {
             return Ok(generic_xml_node_to_value(node));
         }
@@ -1642,8 +1633,7 @@ fn xml_node_to_value(
                 continue;
             }
             if schema_accepts_array(property_schema) {
-                let values =
-                    xml_array_values(node, property_name, property_schema, conversion)?;
+                let values = xml_array_values(node, property_name, property_schema, conversion)?;
                 if !values.is_empty() {
                     out.insert(property_name.clone(), Value::Array(values));
                 }
@@ -1800,9 +1790,8 @@ fn validate_form_serialization(
         validate_percent_encoding(raw_key)?;
         validate_percent_encoding(raw_value)?;
         let allow_reserved = property_encoding.allow_reserved;
-        let comma_is_style_delimiter = {
-            property_encoding.style == EncodingStyle::Form && !property_encoding.explode
-        };
+        let comma_is_style_delimiter =
+            { property_encoding.style == EncodingStyle::Form && !property_encoding.explode };
         if !allow_reserved
             && raw_value.bytes().any(|byte| {
                 is_unescaped_form_reserved_byte(byte) && !(comma_is_style_delimiter && byte == b',')
@@ -2105,8 +2094,7 @@ fn fields_to_schema_object(
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema, conversion);
-    if !(schema_accepts_object(object_schema) || object_schema.get("properties").is_some())
-    {
+    if !(schema_accepts_object(object_schema) || object_schema.get("properties").is_some()) {
         let Some(values) = fields.values().next() else {
             return Ok(Value::Null);
         };
@@ -2475,8 +2463,7 @@ fn multipart_parts_to_schema_object(
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema, conversion);
-    if !(schema_accepts_object(object_schema) || object_schema.get("properties").is_some())
-    {
+    if !(schema_accepts_object(object_schema) || object_schema.get("properties").is_some()) {
         let Some(values) = parts.values().next() else {
             return Ok(Value::Null);
         };
@@ -2566,12 +2553,7 @@ fn multipart_parts_to_schema_object(
             let array = values
                 .iter()
                 .map(|part| {
-                    multipart_part_to_schema_value(
-                        part,
-                        item_schema,
-                        property_encoding,
-                        conversion,
-                    )
+                    multipart_part_to_schema_value(part, item_schema, property_encoding, conversion)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             out.insert(property.clone(), Value::Array(array));
@@ -2599,12 +2581,7 @@ fn multipart_parts_to_schema_object(
                 });
             out.insert(
                 property.clone(),
-                values_to_schema_value(
-                    &[joined],
-                    property_schema,
-                    property_encoding,
-                    conversion,
-                )?,
+                values_to_schema_value(&[joined], property_schema, property_encoding, conversion)?,
             );
             continue;
         }
@@ -2679,14 +2656,12 @@ fn exploded_multipart_object_to_value(
             }
             consumed.insert(child.clone());
             let value = match additional_schema {
-                Some(additional_schema) => {
-                    multipart_values_to_schema_value(
-                        values,
-                        additional_schema,
-                        Some(encoding),
-                        conversion,
-                    )?
-                }
+                Some(additional_schema) => multipart_values_to_schema_value(
+                    values,
+                    additional_schema,
+                    Some(encoding),
+                    conversion,
+                )?,
                 None => multipart_values_to_schema_value(
                     values,
                     &Value::Null,
