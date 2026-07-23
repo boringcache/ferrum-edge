@@ -3084,7 +3084,8 @@ async fn start_grpc_web_cadence_backend() -> (SocketAddr, tokio::task::JoinHandl
                         // must flush a padded base64 segment before EOF.
                         let first = Bytes::from_static(&[0, 0, 0, 0, 0]);
                         let second = Bytes::from_static(&[0, 0, 0, 0, 1, b'x']);
-                        if tx.send(Ok::<_, std::convert::Infallible>(Frame::data(first)))
+                        if tx
+                            .send(Ok::<_, std::convert::Infallible>(Frame::data(first)))
                             .await
                             .is_err()
                         {

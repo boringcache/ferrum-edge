@@ -1200,10 +1200,7 @@ impl http_body::Body for ProxyBody {
                         outcome.grpc_trailer_http_status = Some(status);
                     }
                 }
-                if is_trailers
-                    || is_grpc_web_deadline_terminal
-                    || is_grpc_web_streaming_terminal
-                {
+                if is_trailers || is_grpc_web_deadline_terminal || is_grpc_web_streaming_terminal {
                     if let Some(logger) = this.logger.take() {
                         let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                         let terminal_grpc_status = if is_grpc_web_deadline_terminal {

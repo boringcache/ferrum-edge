@@ -22,8 +22,7 @@ impl http_body::Body for GrpcWebPollDropProbeBody {
         mut self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        self.polls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::task::Poll::Ready(self.frames.pop_front().map(Ok))
     }
 }
@@ -73,12 +72,8 @@ async fn streaming_grpc_web_deadline_emits_encoded_status_before_backend_data() 
         deadline,
         Some("application/grpc-web+proto"),
     );
-    let mut body = proxy_body_into_grpc_web_streaming_for_test(
-        body,
-        "application/grpc-web+proto",
-        200,
-        None,
-    );
+    let mut body =
+        proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
 
     let frame = body
         .frame()
@@ -118,10 +113,7 @@ async fn grpc_web_binary_streams_data_and_converts_exactly_one_terminal_trailer(
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", HeaderValue::from_static("0"));
     trailers.insert("grpc-message", HeaderValue::from_static("ok"));
-    trailers.insert(
-        "grpc-status-details-bin",
-        HeaderValue::from_static("AQID"),
-    );
+    trailers.insert("grpc-status-details-bin", HeaderValue::from_static("AQID"));
     trailers.append("x-result-meta", HeaderValue::from_static("one"));
     trailers.append("x-result-meta", HeaderValue::from_static("two"));
     let source = StreamBody::new(stream::iter(vec![
@@ -130,12 +122,8 @@ async fn grpc_web_binary_streams_data_and_converts_exactly_one_terminal_trailer(
         Ok(Frame::trailers(trailers)),
     ]));
     let body = proxy_body_streaming_for_test(Box::pin(source));
-    let mut body = proxy_body_into_grpc_web_streaming_for_test(
-        body,
-        "application/grpc-web+proto",
-        200,
-        None,
-    );
+    let mut body =
+        proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
 
     assert_eq!(
         body.frame()
@@ -171,7 +159,10 @@ async fn grpc_web_binary_streams_data_and_converts_exactly_one_terminal_trailer(
     assert!(payload.contains("grpc-status-details-bin: AQID\r\n"));
     assert!(payload.contains("x-result-meta: one\r\n"));
     assert!(payload.contains("x-result-meta: two\r\n"));
-    assert!(body.frame().await.is_none(), "terminal frame must be unique");
+    assert!(
+        body.frame().await.is_none(),
+        "terminal frame must be unique"
+    );
 }
 
 #[tokio::test]
@@ -255,20 +246,11 @@ async fn grpc_web_streaming_propagates_backend_error_without_false_terminal_stat
         Err(Box::new(std::io::Error::other("backend reset")) as ProxyBodyError),
     ]));
     let body = proxy_body_streaming_for_test(Box::pin(source));
-    let mut body = proxy_body_into_grpc_web_streaming_for_test(
-        body,
-        "application/grpc-web+proto",
-        200,
-        None,
-    );
+    let mut body =
+        proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
 
     assert!(body.frame().await.expect("partial frame").is_ok());
-    assert!(
-        body.frame()
-            .await
-            .expect("backend error frame")
-            .is_err()
-    );
+    assert!(body.frame().await.expect("backend error frame").is_err());
     assert!(
         body.frame().await.is_none(),
         "an errored stream must not synthesize a clean trailer frame"
@@ -295,12 +277,8 @@ async fn grpc_web_streaming_preserves_backpressure_and_cancellation_drop() {
         dropped: Arc::clone(&dropped),
     };
     let body = proxy_body_streaming_for_test(Box::pin(source));
-    let mut body = proxy_body_into_grpc_web_streaming_for_test(
-        body,
-        "application/grpc-web+proto",
-        200,
-        None,
-    );
+    let mut body =
+        proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
 
     assert_eq!(
         body.frame()

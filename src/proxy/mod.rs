@@ -24540,12 +24540,10 @@ async fn handle_proxy_request_inner(
         _ => false,
     };
     let pristine_streaming_grpc_web_trailers_only_terminal_metadata =
-        (grpc_request_is_web_translated && streaming_h2_body_ended).then(|| {
-            grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers)
-        });
-    let pristine_streaming_grpc_web_terminal_names =
-        (grpc_request_is_web_translated
-            && (streaming_h2_body_ended || streaming_h3_body_ended))
+        (grpc_request_is_web_translated && streaming_h2_body_ended)
+            .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
+    let pristine_streaming_grpc_web_terminal_names = (grpc_request_is_web_translated
+        && (streaming_h2_body_ended || streaming_h3_body_ended))
         .then(|| {
             response_headers
                 .keys()
@@ -25760,9 +25758,7 @@ async fn handle_proxy_request_inner(
             ProxyBody::full(Bytes::from(data))
         }
     };
-    let body = if let Some((content_type, initial_terminal_metadata)) =
-        grpc_web_streaming_adapter
-    {
+    let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
         body.into_grpc_web_streaming(
             &content_type,
             response_status,

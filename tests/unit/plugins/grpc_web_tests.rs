@@ -408,12 +408,11 @@ fn streaming_trailers_only_excludes_gateway_authored_initial_headers() {
         ),
     ]);
 
-    let terminal =
-        ferrum_edge::_test_support::take_streaming_initial_terminal_metadata_for_test(
-            &mut headers,
-            true,
-            &pristine_names,
-        );
+    let terminal = ferrum_edge::_test_support::take_streaming_initial_terminal_metadata_for_test(
+        &mut headers,
+        true,
+        &pristine_names,
+    );
 
     assert_eq!(terminal.get("grpc-status").map(String::as_str), Some("7"));
     assert_eq!(

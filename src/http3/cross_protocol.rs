@@ -3483,16 +3483,14 @@ where
     }
     let grpc_web_body_ended = http_body::Body::is_end_stream(&streaming.body);
     let pristine_grpc_web_trailers_only_terminal_metadata =
-        (crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
-            && grpc_web_body_ended)
+        (crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) && grpc_web_body_ended)
             .then(|| {
                 crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
                     &streaming.headers,
                 )
             });
     let pristine_grpc_web_terminal_names =
-        (crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
-            && grpc_web_body_ended)
+        (crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) && grpc_web_body_ended)
             .then(|| {
                 streaming
                     .headers
@@ -3595,11 +3593,10 @@ where
         sticky_cookie_needed,
         &mut streaming.headers,
     );
-    let grpc_web_content_type =
-        crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
-            .then(|| crate::plugins::grpc_web::retained_response_content_type(ctx))
-            .flatten()
-            .map(str::to_owned);
+    let grpc_web_content_type = crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+        .then(|| crate::plugins::grpc_web::retained_response_content_type(ctx))
+        .flatten()
+        .map(str::to_owned);
     let grpc_web_text_mode = grpc_web_content_type
         .as_deref()
         .map(crate::plugins::grpc_web::is_grpc_web_text);
@@ -3731,7 +3728,9 @@ where
         crate::http3::stream_util::abort_response_stream(stream);
         final_body_completed = false;
     } else if body_completed && let Some(text_mode) = grpc_web_text_mode {
-        let mut collected = grpc_web_initial_terminal_metadata.take().unwrap_or_default();
+        let mut collected = grpc_web_initial_terminal_metadata
+            .take()
+            .unwrap_or_default();
         if let Some(mut trailers) = trailers {
             grpc_trailer_status = trailers.get("grpc-status").map(|value| {
                 value.to_str().map_or(u32::MAX, |value| {
@@ -3740,10 +3739,7 @@ where
             });
             strip_response_hop_by_hop_trailers(&mut trailers);
             collected.clear();
-            crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(
-                &trailers,
-                &mut collected,
-            );
+            crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
         }
         let (terminal_data, terminal_status) =
             crate::plugins::grpc_web::build_streaming_trailer_data(

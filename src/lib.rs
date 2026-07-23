@@ -3031,11 +3031,7 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(
-            content_type,
-            http_status,
-            initial_terminal_metadata,
-        )
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata)
     }
 
     pub fn take_streaming_initial_terminal_metadata_for_test(

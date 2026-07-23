@@ -1971,9 +1971,7 @@ pub(crate) fn take_streaming_initial_terminal_metadata(
     pristine_terminal_names: Option<&HashSet<String>>,
 ) -> HashMap<String, String> {
     let mut terminal = HashMap::new();
-    if body_ended
-        && let Some(pristine_terminal_names) = pristine_terminal_names
-    {
+    if body_ended && let Some(pristine_terminal_names) = pristine_terminal_names {
         for (name, value) in response_headers.iter() {
             if pristine_terminal_names.contains(name) {
                 terminal.insert(name.clone(), value.clone());
@@ -1992,11 +1990,7 @@ pub(crate) fn take_streaming_initial_terminal_metadata(
     for name in application_terminal_names {
         response_headers.remove(&name);
     }
-    for name in [
-        "grpc-status",
-        "grpc-message",
-        "grpc-status-details-bin",
-    ] {
+    for name in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
         if let Some(value) = response_headers.remove(name)
             && body_ended
             && pristine_terminal_names.is_some_and(|names| names.contains(name))

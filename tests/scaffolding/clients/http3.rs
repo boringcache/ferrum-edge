@@ -577,10 +577,11 @@ impl Http3GrpcStream {
     pub async fn recv_data(
         &mut self,
     ) -> Result<Option<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(mut chunk) = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data())
-            .await
-            .map_err(|_| "recv_data timed out")?
-            .map_err(|e| format!("recv_data: {e}"))?
+        let Some(mut chunk) =
+            tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data())
+                .await
+                .map_err(|_| "recv_data timed out")?
+                .map_err(|e| format!("recv_data: {e}"))?
         else {
             return Ok(None);
         };
