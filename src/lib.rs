@@ -624,6 +624,39 @@ pub mod _test_support {
         plugin.snapshot_accumulator_for_tests()
     }
 
+    pub async fn api_chargeback_sink_finalize_snapshot_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.finalize_snapshot_for_tests().await
+    }
+
+    pub async fn api_chargeback_sink_finalize_with_held_admission_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        timeout: std::time::Duration,
+    ) -> Option<bool> {
+        plugin
+            .finalize_snapshot_with_held_admission_for_tests(timeout)
+            .await
+    }
+
+    pub fn api_chargeback_sink_snapshot_finalized_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.snapshot_finalized_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_generation_registered_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.snapshot_generation_registered_for_tests()
+    }
+
+    pub fn api_chargeback_sink_emit_snapshot_tick_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<Result<usize, String>> {
+        plugin.emit_snapshot_tick_for_tests()
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,

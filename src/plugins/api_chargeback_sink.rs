@@ -31,10 +31,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use tracing::warn;
 use url::Url;
 
@@ -58,6 +58,8 @@ const DEFAULT_PRICING_VERSION: &str = "default";
 const DEFAULT_CURRENCY: &str = "USD";
 const DEFAULT_SPOOL_DIR: &str = "/var/lib/ferrum/chargeback-spool";
 const STATUS_CACHE_TTL: Duration = Duration::from_secs(1);
+const SNAPSHOT_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+const SNAPSHOT_FINALIZE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FIELD_LEN: usize = 512;
 const MAX_METADATA_FIELD_LEN: usize = 256;
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
@@ -88,6 +90,8 @@ const DEFAULT_PLUGIN_CONFIG_ID: &str = "__standalone__";
 /// generation atomically replaces the prior generation for the same ID. Drop
 /// removes an entry only when it still points at that exact runtime.
 static ACTIVE_SINKS: OnceLock<ArcSwap<BTreeMap<String, Arc<SinkRuntime>>>> = OnceLock::new();
+static ACTIVE_SNAPSHOT_GENERATIONS: OnceLock<Mutex<BTreeMap<u64, Arc<SnapshotLifecycle>>>> =
+    OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
 static NEXT_SINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 static ULID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -103,6 +107,63 @@ fn status_cache() -> &'static ArcSwap<Option<(Instant, String)>> {
 
 fn invalidate_status_cache() {
     status_cache().store(Arc::new(None));
+}
+
+fn active_snapshot_generations() -> &'static Mutex<BTreeMap<u64, Arc<SnapshotLifecycle>>> {
+    ACTIVE_SNAPSHOT_GENERATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn register_snapshot_generation(lifecycle: Arc<SnapshotLifecycle>) {
+    let mut generations = match active_snapshot_generations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    generations
+        .entry(lifecycle.generation)
+        .or_insert(lifecycle);
+}
+
+fn unregister_snapshot_generation(generation: u64) {
+    let mut generations = match active_snapshot_generations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    generations.remove(&generation);
+}
+
+fn pending_snapshot_finalizations() -> usize {
+    let generations = match active_snapshot_generations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    generations
+        .values()
+        .filter(|lifecycle| {
+            lifecycle.committed.load(Ordering::Acquire)
+                && !lifecycle.accepting.load(Ordering::Acquire)
+                && !lifecycle.finalized.load(Ordering::Acquire)
+        })
+        .count()
+}
+
+/// Stop snapshot admission and durably spool every generation's final delta.
+///
+/// Serving modes call this after request/connection drain. Reload disposal
+/// follows the same exact-once lifecycle from [`Drop for ApiChargebackSink`].
+pub async fn finalize_all_snapshot_generations() {
+    let generations: Vec<Arc<SnapshotLifecycle>> = {
+        let generations = match active_snapshot_generations().lock() {
+            Ok(generations) => generations,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        generations.values().cloned().collect()
+    };
+    futures_util::future::join_all(
+        generations
+            .iter()
+            .map(|generation| generation.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT)),
+    )
+    .await;
 }
 
 fn register_active_sink(runtime: Arc<SinkRuntime>) {
@@ -540,10 +601,12 @@ pub struct ApiChargebackSink {
     /// Live sink runtime after [`Plugin::start_background_tasks`].
     runtime: OnceLock<Arc<SinkRuntime>>,
     snapshot_accumulator: OnceLock<Arc<SnapshotAccumulator>>,
+    /// Awaitable ownership of snapshot admission and the periodic emitter.
+    /// Present only in snapshot mode.
+    snapshot_lifecycle: OnceLock<Arc<SnapshotLifecycle>>,
     /// Handles for the per-instance background loops (spool replayer and, in
-    /// snapshot mode, the snapshot emitter). Aborted on `Drop` so a config
-    /// reload or admin-validation throwaway does not leak immortal tasks that
-    /// would otherwise keep racing on the shared spool directory.
+    /// per-event mode, all runtime work). Snapshot emitter ownership lives in
+    /// [`SnapshotLifecycle`] so reload/shutdown can await its final handoff.
     background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     start_lock: Mutex<()>,
 }
@@ -555,6 +618,210 @@ struct SinkRuntime {
     logger: BatchingLogger<ChargeEvent>,
     metrics: Arc<SinkMetrics>,
     spool: Option<Arc<SpoolManager>>,
+}
+
+struct SnapshotLifecycle {
+    generation: u64,
+    runtime: Arc<SinkRuntime>,
+    accumulator: Arc<SnapshotAccumulator>,
+    config: Arc<ApiChargebackSinkConfig>,
+    node_id: Arc<str>,
+    accepting: AtomicBool,
+    in_flight: AtomicUsize,
+    committed: AtomicBool,
+    finalized: AtomicBool,
+    shutdown_tx: watch::Sender<bool>,
+    task: Mutex<Option<tokio::task::JoinHandle<bool>>>,
+    emission_lock: Arc<Mutex<()>>,
+    finalize_lock: AsyncMutex<()>,
+}
+
+struct SnapshotAdmissionGuard<'a> {
+    in_flight: &'a AtomicUsize,
+}
+
+impl Drop for SnapshotAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl SnapshotLifecycle {
+    fn admit(&self) -> Option<SnapshotAdmissionGuard<'_>> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        if !self.accepting.load(Ordering::Acquire) {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(SnapshotAdmissionGuard {
+            in_flight: &self.in_flight,
+        })
+    }
+
+    fn commit(&self) {
+        self.committed.store(true, Ordering::Release);
+    }
+
+    async fn finalize_attempt(&self, deadline: Instant) -> bool {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let _guard = match tokio::time::timeout(remaining, self.finalize_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        if self.finalized.load(Ordering::Acquire) {
+            unregister_snapshot_generation(self.generation);
+            return true;
+        }
+
+        self.accepting.store(false, Ordering::Release);
+        while self.in_flight.load(Ordering::Acquire) > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                invalidate_status_cache();
+                return false;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(1))).await;
+        }
+
+        let _ = self.shutdown_tx.send(true);
+        let mut task = {
+            let mut task = match self.task.lock() {
+                Ok(task) => task,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            task.take()
+        };
+        if task.is_none() && self.committed.load(Ordering::Acquire) {
+            let accumulator = Arc::clone(&self.accumulator);
+            let runtime = Arc::clone(&self.runtime);
+            let config = Arc::clone(&self.config);
+            let node_id = Arc::clone(&self.node_id);
+            let emission_lock = Arc::clone(&self.emission_lock);
+            task = Some(tokio::task::spawn_blocking(move || {
+                emit_final_snapshot_to_spool(
+                    &accumulator,
+                    &runtime,
+                    &config,
+                    &node_id,
+                    &emission_lock,
+                )
+            }));
+        }
+        let durable = match task {
+            Some(mut task) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    let mut slot = match self.task.lock() {
+                        Ok(slot) => slot,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    *slot = Some(task);
+                    invalidate_status_cache();
+                    return false;
+                }
+                match tokio::time::timeout(remaining, &mut task).await {
+                    Ok(Ok(durable)) => durable,
+                    Ok(Err(_)) if self.committed.load(Ordering::Acquire) => {
+                        self.runtime.metrics.record_failure(
+                            FailureReason::Serialize,
+                            "snapshot finalizer task did not complete",
+                        );
+                        false
+                    }
+                    Ok(Err(_)) => true,
+                    Err(_) => {
+                        let mut slot = match self.task.lock() {
+                            Ok(slot) => slot,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        *slot = Some(task);
+                        invalidate_status_cache();
+                        return false;
+                    }
+                }
+            }
+            None => true,
+        };
+        if durable {
+            self.finalized.store(true, Ordering::Release);
+            unregister_snapshot_generation(self.generation);
+        }
+        invalidate_status_cache();
+        durable
+    }
+
+    async fn finalize_within(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.finalize_attempt(deadline).await {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    generation = self.generation,
+                    timeout_ms = timeout.as_millis(),
+                    "Chargeback sink final snapshot handoff timed out; generation state retained"
+                );
+                return false;
+            }
+            tokio::time::sleep(remaining.min(SNAPSHOT_FINALIZE_RETRY_INTERVAL)).await;
+        }
+    }
+
+    fn finalize_without_await(&self) {
+        if self.finalized.load(Ordering::Acquire) {
+            unregister_snapshot_generation(self.generation);
+            return;
+        }
+        self.accepting.store(false, Ordering::Release);
+        let _ = self.shutdown_tx.send(true);
+        let task = {
+            let mut task = match self.task.lock() {
+                Ok(task) => task,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            task.take()
+        };
+        if let Some(task) = task {
+            task.abort();
+        }
+        let durable = if self.committed.load(Ordering::Acquire) {
+            emit_final_snapshot_to_spool(
+                &self.accumulator,
+                &self.runtime,
+                &self.config,
+                &self.node_id,
+                &self.emission_lock,
+            )
+        } else {
+            true
+        };
+        if durable {
+            self.finalized.store(true, Ordering::Release);
+            unregister_snapshot_generation(self.generation);
+        }
+        invalidate_status_cache();
+    }
+}
+
+impl Drop for SnapshotLifecycle {
+    fn drop(&mut self) {
+        let task = match self.task.get_mut() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = task.take() {
+            task.abort();
+        }
+    }
 }
 
 struct SinkMetrics {
@@ -800,6 +1067,7 @@ impl ApiChargebackSink {
             http_client,
             runtime: OnceLock::new(),
             snapshot_accumulator: OnceLock::new(),
+            snapshot_lifecycle: OnceLock::new(),
             background_tasks: Mutex::new(Vec::new()),
             start_lock: Mutex::new(()),
         })
@@ -963,17 +1231,39 @@ impl ApiChargebackSink {
             ));
         }
 
-        let snapshot_accumulator = if self.config.mode == SinkMode::Snapshot {
+        let snapshot_lifecycle = if self.config.mode == SinkMode::Snapshot {
             let accumulator = Arc::new(SnapshotAccumulator::new());
-            background_tasks.push(start_snapshot_task(
+            let emission_lock = Arc::new(Mutex::new(()));
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let task = start_snapshot_task(
                 Arc::clone(&accumulator),
                 Arc::clone(&runtime),
                 Arc::clone(&self.config),
                 Arc::clone(&self.node_id),
                 self.namespace.clone(),
                 runtime.logger.commit_sender().subscribe(),
-            ));
-            Some(accumulator)
+                shutdown_rx,
+                Arc::clone(&emission_lock),
+            );
+            Some(Arc::new(SnapshotLifecycle {
+                generation: runtime.generation,
+                runtime: Arc::clone(&runtime),
+                accumulator,
+                config: Arc::clone(&self.config),
+                node_id: Arc::clone(&self.node_id),
+                // The cache atomically publishes this staged instance just
+                // before commit_background_tasks runs. Admission must already
+                // be ready for readers that observe that new cache snapshot;
+                // external workers and spool activity remain commit-gated.
+                accepting: AtomicBool::new(true),
+                in_flight: AtomicUsize::new(0),
+                committed: AtomicBool::new(false),
+                finalized: AtomicBool::new(false),
+                shutdown_tx,
+                task: Mutex::new(Some(task)),
+                emission_lock,
+                finalize_lock: AsyncMutex::new(()),
+            }))
         } else {
             None
         };
@@ -993,6 +1283,9 @@ impl ApiChargebackSink {
             Ok(guard) => guard,
             Err(_) => {
                 abort_tasks(&mut background_tasks);
+                if let Some(lifecycle) = snapshot_lifecycle.as_ref() {
+                    lifecycle.finalize_without_await();
+                }
                 return Err(format!(
                     "{PLUGIN_NAME}: background task lock poisoned; refusing to start"
                 ));
@@ -1001,10 +1294,14 @@ impl ApiChargebackSink {
 
         *owned_tasks = std::mem::take(&mut background_tasks);
 
-        if let Some(accumulator) = snapshot_accumulator
-            && self.snapshot_accumulator.set(accumulator).is_err()
+        if let Some(lifecycle) = snapshot_lifecycle.as_ref()
+            && self
+                .snapshot_accumulator
+                .set(Arc::clone(&lifecycle.accumulator))
+                .is_err()
         {
             abort_tasks(&mut owned_tasks);
+            lifecycle.finalize_without_await();
             return Err(format!(
                 "{PLUGIN_NAME}: snapshot accumulator already activated; refusing duplicate start"
             ));
@@ -1012,9 +1309,22 @@ impl ApiChargebackSink {
 
         if self.runtime.set(Arc::clone(&runtime)).is_err() {
             abort_tasks(&mut owned_tasks);
+            if let Some(lifecycle) = snapshot_lifecycle.as_ref() {
+                lifecycle.finalize_without_await();
+            }
             return Err(format!(
                 "{PLUGIN_NAME}: runtime already activated; refusing duplicate start"
             ));
+        }
+
+        if let Some(lifecycle) = snapshot_lifecycle {
+            if let Err(lifecycle) = self.snapshot_lifecycle.set(lifecycle) {
+                abort_tasks(&mut owned_tasks);
+                lifecycle.finalize_without_await();
+                return Err(format!(
+                    "{PLUGIN_NAME}: snapshot lifecycle already activated; refusing duplicate start"
+                ));
+            }
         }
 
         Ok(())
@@ -1065,16 +1375,95 @@ impl ApiChargebackSink {
     pub(crate) fn snapshot_accumulator_for_tests(&self) -> Option<Arc<SnapshotAccumulator>> {
         self.snapshot_accumulator.get().cloned()
     }
+
+    #[allow(dead_code)]
+    pub(crate) async fn finalize_snapshot_for_tests(&self) -> Option<bool> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        Some(
+            lifecycle
+                .finalize_attempt(Instant::now() + SNAPSHOT_FINALIZE_TIMEOUT)
+                .await,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn finalize_snapshot_with_held_admission_for_tests(
+        &self,
+        timeout: Duration,
+    ) -> Option<bool> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        let _admission = lifecycle.admit()?;
+        Some(
+            lifecycle
+                .finalize_attempt(Instant::now() + timeout)
+                .await,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_finalized_for_tests(&self) -> Option<bool> {
+        self.snapshot_lifecycle
+            .get()
+            .map(|lifecycle| lifecycle.finalized.load(Ordering::Acquire))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_generation_registered_for_tests(&self) -> Option<bool> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        let generations = match active_snapshot_generations().lock() {
+            Ok(generations) => generations,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Some(
+            generations
+                .get(&lifecycle.generation)
+                .is_some_and(|registered| Arc::ptr_eq(registered, lifecycle)),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn emit_snapshot_tick_for_tests(&self) -> Option<Result<usize, String>> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        Some(emit_periodic_snapshot(
+            &lifecycle.accumulator,
+            &lifecycle.runtime,
+            &lifecycle.config,
+            &lifecycle.node_id,
+            &lifecycle.emission_lock,
+        ))
+    }
 }
 
 impl Drop for ApiChargebackSink {
     fn drop(&mut self) {
-        // Stop the per-instance background loops so a config reload or an admin
-        // validation throwaway does not leak immortal tasks that keep racing on
-        // the shared spool directory (duplicate replays, delete races). The
-        // BatchingLogger flush loop is intentionally left running: it owns the
-        // mpsc receiver and terminates on its own once the sender is dropped,
-        // after draining any buffered events.
+        if let Some(lifecycle) = self.snapshot_lifecycle.get()
+            && !lifecycle.finalized.load(Ordering::Acquire)
+        {
+            if let Ok(handle) = tokio::runtime::Handle::try_current()
+                && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            {
+                let lifecycle = Arc::clone(lifecycle);
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        lifecycle
+                            .finalize_within(SNAPSHOT_FINALIZE_TIMEOUT)
+                            .await;
+                    });
+                });
+            } else {
+                // Current-thread tests and teardown after runtime exit cannot
+                // synchronously await a Tokio task. No task can run
+                // concurrently on the current-thread path while Drop is
+                // executing, so abort it and perform the same final spool
+                // handoff inline.
+                lifecycle.finalize_without_await();
+            }
+        }
+
+        // Stop the per-instance spool replay loop so a config reload or an
+        // admin-validation throwaway does not leak an immortal task. The
+        // BatchingLogger flush loop remains covered by the shared queued-work
+        // lifecycle tracked in issue #2533.
         if let Ok(mut tasks) = self.background_tasks.lock() {
             for task in tasks.drain(..) {
                 task.abort();
@@ -1128,6 +1517,10 @@ impl Plugin for ApiChargebackSink {
         // Release flush/replay/snapshot dormancy before publishing diagnostics
         // so the live instance cannot appear active while workers are gated.
         runtime.logger.commit();
+        if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+            lifecycle.commit();
+            register_snapshot_generation(Arc::clone(lifecycle));
+        }
         register_active_sink(Arc::clone(runtime));
     }
 
@@ -1152,8 +1545,12 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.get() {
-                accumulator.record_http(summary, consumer, outcome, charge);
+            if let Some(lifecycle) = self.snapshot_lifecycle.get()
+                && let Some(_admission) = lifecycle.admit()
+            {
+                lifecycle
+                    .accumulator
+                    .record_http(summary, consumer, outcome, charge);
             }
             return;
         }
@@ -1180,8 +1577,12 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.get() {
-                accumulator.record_stream(summary, consumer, charge);
+            if let Some(lifecycle) = self.snapshot_lifecycle.get()
+                && let Some(_admission) = lifecycle.admit()
+            {
+                lifecycle
+                    .accumulator
+                    .record_stream(summary, consumer, charge);
             }
             return;
         }
@@ -1211,8 +1612,12 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.get() {
-                accumulator.record_websocket(summary, consumer, charge);
+            if let Some(lifecycle) = self.snapshot_lifecycle.get()
+                && let Some(_admission) = lifecycle.admit()
+            {
+                lifecycle
+                    .accumulator
+                    .record_websocket(summary, consumer, charge);
             }
             return;
         }
@@ -1246,7 +1651,7 @@ pub fn render_status_json() -> String {
 
     let body = serde_json::to_string(&aggregate_status_snapshot(&active_sinks().load_full()))
         .unwrap_or_else(|_| {
-            "{\"enabled\":false,\"instance_count\":0,\"totals\":{},\"instances\":[]}".to_string()
+            "{\"enabled\":false,\"instance_count\":0,\"snapshot_finalizations_pending\":0,\"totals\":{},\"instances\":[]}".to_string()
         });
 
     cache.store(Arc::new(Some((Instant::now(), body.clone()))));
@@ -1255,16 +1660,18 @@ pub fn render_status_json() -> String {
 
 pub fn render_prometheus() -> String {
     let sinks = active_sinks().load_full();
-    if sinks.is_empty() {
+    let pending_finalizations = pending_snapshot_finalizations();
+    if sinks.is_empty() && pending_finalizations == 0 {
         return String::new();
     }
-    render_prometheus_for_sinks(sinks.as_ref())
+    render_prometheus_for_sinks(sinks.as_ref(), pending_finalizations)
 }
 
 fn disabled_status_snapshot() -> Value {
     serde_json::json!({
         "enabled": false,
         "instance_count": 0,
+        "snapshot_finalizations_pending": pending_snapshot_finalizations(),
         "totals": {
             "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
             "spool": {
@@ -1351,6 +1758,7 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     serde_json::json!({
         "enabled": true,
         "instance_count": sinks.len(),
+        "snapshot_finalizations_pending": pending_snapshot_finalizations(),
         "totals": {
             "queue": {
                 "depth": queue_depth,
@@ -1435,7 +1843,10 @@ impl SinkRuntime {
     }
 }
 
-fn render_prometheus_for_sinks(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> String {
+fn render_prometheus_for_sinks(
+    sinks: &BTreeMap<String, Arc<SinkRuntime>>,
+    pending_finalizations: usize,
+) -> String {
     let mut output = String::with_capacity(4096 * sinks.len().max(1));
 
     // Preserve the existing metric names as process-wide aggregates across
@@ -1546,6 +1957,12 @@ fn render_prometheus_for_sinks(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> St
     output.push_str("# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n");
     output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
     output.push_str(&format!("chargeback_sink_queue_depth {}\n", queue_depth));
+    output.push_str("# HELP chargeback_sink_snapshot_finalizations_pending Snapshot generations retaining unspooled terminal deltas after admission closed.\n");
+    output.push_str("# TYPE chargeback_sink_snapshot_finalizations_pending gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_snapshot_finalizations_pending {}\n",
+        pending_finalizations
+    ));
     output.push_str(
         "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).\n",
     );
@@ -3441,6 +3858,11 @@ struct LastEmitted {
     totals: SnapshotTotals,
 }
 
+struct PreparedSnapshot {
+    events: Vec<ChargeEvent>,
+    emitted_totals: Vec<(SnapshotMetadata, u64, SnapshotTotals)>,
+}
+
 #[cfg(test)]
 type CleanupAfterStaleCheckHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -3568,6 +3990,18 @@ impl SnapshotAccumulator {
         received_at: i64,
         snapshot_id: &str,
     ) -> Result<Vec<ChargeEvent>, String> {
+        let prepared = self.prepare_deltas(config, node_id, received_at, snapshot_id)?;
+        self.commit_prepared(&prepared);
+        Ok(prepared.events)
+    }
+
+    fn prepare_deltas(
+        &self,
+        config: &ApiChargebackSinkConfig,
+        node_id: &str,
+        received_at: i64,
+        snapshot_id: &str,
+    ) -> Result<PreparedSnapshot, String> {
         let mut events = Vec::new();
         let mut emitted_totals = Vec::new();
         for entry in self.entries.iter() {
@@ -3597,27 +4031,33 @@ impl SnapshotAccumulator {
                 emitted_totals.push((key, generation, current));
             }
         }
-        for (key, generation, current) in emitted_totals {
+        Ok(PreparedSnapshot {
+            events,
+            emitted_totals,
+        })
+    }
+
+    fn commit_prepared(&self, prepared: &PreparedSnapshot) {
+        for (key, generation, current) in &prepared.emitted_totals {
             // Publish the baseline only while this generation is still live so
             // a concurrent eviction cannot leave an orphaned baseline that a
             // later reinsert would mis-subtract, and so we cannot overwrite a
             // newer generation's baseline with an older snapshot read.
-            if let Some(entry) = self.entries.get(&key)
-                && entry.generation == generation
+            if let Some(entry) = self.entries.get(key)
+                && entry.generation == *generation
             {
                 // Keep the entry guard through publication. Cleanup cannot
                 // evict this generation and remove its baseline between
                 // the generation check and the insert.
                 self.last_emitted.insert(
-                    key,
+                    key.clone(),
                     LastEmitted {
-                        generation,
-                        totals: current,
+                        generation: *generation,
+                        totals: *current,
                     },
                 );
             }
         }
-        Ok(events)
     }
 
     #[allow(dead_code)]
@@ -3738,54 +4178,71 @@ fn start_snapshot_task(
     node_id: Arc<str>,
     _namespace: String,
     commit_rx: watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
+    mut shutdown_rx: watch::Receiver<bool>,
+    emission_lock: Arc<Mutex<()>>,
+) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
-        if !wait_until_committed(commit_rx).await {
-            return;
+        if *shutdown_rx.borrow() {
+            return if *commit_rx.borrow() {
+                emit_final_snapshot_to_spool(
+                    &accumulator,
+                    &runtime,
+                    &config,
+                    &node_id,
+                    &emission_lock,
+                )
+            } else {
+                true
+            };
+        }
+        let commit_observer = commit_rx.clone();
+        let committed = tokio::select! {
+            committed = wait_until_committed(commit_rx) => committed,
+            _ = wait_for_snapshot_shutdown(&mut shutdown_rx) => {
+                if *commit_observer.borrow() {
+                    return emit_final_snapshot_to_spool(
+                        &accumulator,
+                        &runtime,
+                        &config,
+                        &node_id,
+                        &emission_lock,
+                    );
+                }
+                false
+            },
+        };
+        if !committed {
+            return true;
         }
         let mut snapshot_timer =
             tokio::time::interval(Duration::from_secs(config.snapshot.interval_secs));
         let mut cleanup_timer =
             tokio::time::interval(Duration::from_secs(config.snapshot.cleanup_interval_secs));
+        // Tokio intervals are immediately ready on their first tick. Consume
+        // those scheduling ticks so the documented interval starts at
+        // generation commit instead of racing the first request.
+        snapshot_timer.tick().await;
+        cleanup_timer.tick().await;
         loop {
             tokio::select! {
-                _ = snapshot_timer.tick() => {
-                    let snapshot_id = new_ulid();
-                    let received_at = unix_timestamp_nanos();
-                    let events = match accumulator.compute_deltas(
+                biased;
+                _ = wait_for_snapshot_shutdown(&mut shutdown_rx) => {
+                    return emit_final_snapshot_to_spool(
+                        &accumulator,
+                        &runtime,
                         &config,
                         &node_id,
-                        received_at,
-                        &snapshot_id,
-                    ) {
-                        Ok(events) => events,
-                        Err(error) => {
-                            runtime
-                                .metrics
-                                .record_failure(FailureReason::Serialize, error.clone());
-                            warn!(
-                                plugin = PLUGIN_NAME,
-                                error = %error,
-                                "Chargeback sink snapshot arithmetic failed; no delta was advanced"
-                            );
-                            continue;
-                        }
-                    };
-                    if events.is_empty() {
-                        continue;
-                    }
-                    runtime
-                        .metrics
-                        .snapshot_emits_total
-                        .fetch_add(events.len() as u64, Ordering::Relaxed);
-                    for event in events {
-                        runtime
-                            .metrics
-                            .events_enqueued_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        runtime.logger.try_send(event);
-                    }
-                    invalidate_status_cache();
+                        &emission_lock,
+                    );
+                }
+                _ = snapshot_timer.tick() => {
+                    let _ = emit_periodic_snapshot(
+                        &accumulator,
+                        &runtime,
+                        &config,
+                        &node_id,
+                        &emission_lock,
+                    );
                 }
                 _ = cleanup_timer.tick() => {
                     let removed = accumulator.cleanup_stale(
@@ -3799,6 +4256,126 @@ fn start_snapshot_task(
             }
         }
     })
+}
+
+fn emit_periodic_snapshot(
+    accumulator: &SnapshotAccumulator,
+    runtime: &SinkRuntime,
+    config: &ApiChargebackSinkConfig,
+    node_id: &str,
+    emission_lock: &Mutex<()>,
+) -> Result<usize, String> {
+    let _emission_guard = match emission_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let snapshot_id = new_ulid();
+    let received_at = unix_timestamp_nanos();
+    let events =
+        match accumulator.compute_deltas(config, node_id, received_at, &snapshot_id) {
+            Ok(events) => events,
+            Err(error) => {
+                runtime
+                    .metrics
+                    .record_failure(FailureReason::Serialize, error.clone());
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %error,
+                    "Chargeback sink snapshot arithmetic failed; no delta was advanced"
+                );
+                return Err(error);
+            }
+        };
+    let event_count = events.len();
+    if event_count == 0 {
+        return Ok(0);
+    }
+    runtime
+        .metrics
+        .snapshot_emits_total
+        .fetch_add(event_count as u64, Ordering::Relaxed);
+    for event in events {
+        runtime
+            .metrics
+            .events_enqueued_total
+            .fetch_add(1, Ordering::Relaxed);
+        runtime.logger.try_send(event);
+    }
+    invalidate_status_cache();
+    Ok(event_count)
+}
+
+async fn wait_for_snapshot_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    while !*shutdown_rx.borrow() {
+        if shutdown_rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+fn emit_final_snapshot_to_spool(
+    accumulator: &SnapshotAccumulator,
+    runtime: &SinkRuntime,
+    config: &ApiChargebackSinkConfig,
+    node_id: &str,
+    emission_lock: &Mutex<()>,
+) -> bool {
+    let _emission_guard = match emission_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let snapshot_id = new_ulid();
+    let received_at = unix_timestamp_nanos();
+    let prepared =
+        match accumulator.prepare_deltas(config, node_id, received_at, &snapshot_id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                runtime
+                    .metrics
+                    .record_failure(FailureReason::Serialize, error.clone());
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    generation = runtime.generation,
+                    error = %error,
+                    "Chargeback sink final snapshot arithmetic failed; generation state retained"
+                );
+                return false;
+            }
+        };
+    if prepared.events.is_empty() {
+        return true;
+    }
+    let Some(spool) = runtime.spool.as_ref() else {
+        runtime.metrics.record_failure(
+            FailureReason::Serialize,
+            "snapshot finalization requires an available spool",
+        );
+        return false;
+    };
+    if let Err(error) = spool.write_events(&prepared.events) {
+        runtime
+            .metrics
+            .spool_available
+            .store(false, Ordering::Release);
+        runtime.metrics.record_failure(
+            FailureReason::Serialize,
+            format!("final snapshot spool handoff failed: {error}"),
+        );
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = runtime.generation,
+            error = %error,
+            "Chargeback sink could not durably spool its final snapshot; generation state retained"
+        );
+        return false;
+    }
+    accumulator.commit_prepared(&prepared);
+    runtime
+        .metrics
+        .snapshot_emits_total
+        .fetch_add(prepared.events.len() as u64, Ordering::Relaxed);
+    invalidate_status_cache();
+    true
 }
 
 fn event_from_http_summary(

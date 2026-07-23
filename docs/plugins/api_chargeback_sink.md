@@ -95,6 +95,31 @@ only):
   concurrent with that emitter and cleanup.
 - Unrelated keys never block each other on the request path.
 
+### Snapshot generation shutdown
+
+Every committed snapshot generation owns an explicit shutdown lifecycle. A
+successful config replacement and graceful shutdown in database, file,
+data-plane, and mesh modes stop admission to the old generation, wait for
+already-entered record hooks, and then await its snapshot task. The task
+computes the final delta and writes it directly to the required spool before
+the accumulator baseline advances or the generation is released. This direct
+handoff bypasses both the ClickHouse request path and the bounded in-memory
+logger queue, so an unavailable endpoint or queue pressure cannot wedge reload
+or shutdown.
+
+Shutdown wins a simultaneous timer selection. If a periodic tick has already
+advanced the baseline, the final handoff observes a zero delta; if shutdown
+wins first, the final spool write advances that same baseline. Thus one path,
+but never both, owns each pending delta. Repeated finalization is idempotent,
+and record hooks arriving after admission closes are ignored.
+
+Spool write failure leaves the generation unfinalized and retains its
+accumulator in the process-wide lifecycle registry for a later bounded retry.
+The failure is reported through the sink failure/spool-availability metrics and
+status. Because snapshot mode requires the spool, operators should treat an
+unwritable or exhausted spool as a billing-durability incident and restore it
+before terminating the process.
+
 Both modes use the same pricing fields as `api_chargeback`. At least one
 nonempty pricing dimension is mandatory and matches
 `PricingConfig::has_any_pricing`: a nonempty `pricing_tiers` list, bandwidth

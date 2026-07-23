@@ -10,6 +10,13 @@
 //! that spool replay/snapshot stay dormant until commit and that staged drop
 //! exits without flush side effects.
 
+use ferrum_edge::_test_support::{
+    api_chargeback_sink_emit_snapshot_tick_for_test,
+    api_chargeback_sink_finalize_snapshot_for_test,
+    api_chargeback_sink_finalize_with_held_admission_for_test,
+    api_chargeback_sink_snapshot_finalized_for_test,
+    api_chargeback_sink_snapshot_generation_registered_for_test,
+};
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::plugins::api_chargeback_sink::{self, ApiChargebackSink};
 use ferrum_edge::plugins::kafka_logging::KafkaLogging;
@@ -22,6 +29,7 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -108,6 +116,62 @@ fn chargeback_sink_config(tmp: &tempfile::TempDir) -> Value {
         "pricing_version": "test-v1",
         "currency": "USD"
     })
+}
+
+fn chargeback_snapshot_sink_config(spool_dir: &Path) -> Value {
+    json!({
+        "mode": "snapshot",
+        "clickhouse": {
+            "url": "http://127.0.0.1:9",
+            "database": "ferrum",
+            "table": "charges_raw",
+            "timeout_ms": 50
+        },
+        "batch": {"size": 1, "flush_interval_ms": 60000, "buffer_capacity": 1},
+        "retry": {"max_attempts": 1, "initial_delay_ms": 1, "max_delay_ms": 1, "jitter": false},
+        "spool": {
+            "enabled": true,
+            "dir": spool_dir.to_string_lossy(),
+            "max_bytes": 1_048_576,
+            "replay_interval_secs": 3600,
+            "compression": "none"
+        },
+        "snapshot": {
+            "interval_secs": 3600,
+            "cleanup_interval_secs": 3600,
+            "stale_entry_ttl_secs": 7200
+        },
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "pricing_version": "snapshot-lifecycle-v1",
+        "currency": "USD"
+    })
+}
+
+fn chargeback_spool_rows(root: &Path) -> Vec<Value> {
+    fn visit(path: &Path, rows: &mut Vec<Value>) {
+        if path.is_dir() {
+            let entries = std::fs::read_dir(path).expect("read spool directory");
+            for entry in entries {
+                visit(&entry.expect("spool directory entry").path(), rows);
+            }
+            return;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("ndjson") {
+            return;
+        }
+        let body = std::fs::read_to_string(path).expect("read spool file");
+        rows.extend(
+            body.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str(line).expect("valid spooled JSONEachRow")),
+        );
+    }
+
+    let mut rows = Vec::new();
+    if root.exists() {
+        visit(root, &mut rows);
+    }
+    rows
 }
 
 fn transcript_sink_config() -> Value {
@@ -877,6 +941,313 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
     unsafe {
         std::env::remove_var("FERRUM_NODE_ID");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_snapshot_staged_admission_covers_cache_publish_commit_gap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spool_dir = tmp.path().join("publish-gap-spool");
+    let plugin =
+        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
+            .expect("snapshot sink");
+    plugin.start_background_tasks().expect("stage snapshot sink");
+
+    // PluginCache publishes the staged graph immediately before invoking
+    // commit_background_tasks. A concurrent reader may call the hook in that
+    // interval, but no external worker or spool replay may start yet.
+    plugin.log(&create_test_transaction_summary()).await;
+    assert_eq!(
+        chargeback_spool_rows(&spool_dir).len(),
+        0,
+        "staged admission must remain memory-only before commit"
+    );
+
+    plugin.commit_background_tasks();
+    assert_eq!(
+        api_chargeback_sink_finalize_snapshot_for_test(&plugin).await,
+        Some(true)
+    );
+    let rows = chargeback_spool_rows(&spool_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["call_count"], 1);
+    drop(plugin);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_snapshot_reload_before_first_tick_spools_old_generation_delta() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spool_dir = tmp.path().join("reload-spool");
+    let cfg = chargeback_snapshot_sink_config(&spool_dir);
+    let old = ApiChargebackSink::new_with_config_id(
+        &cfg,
+        client(),
+        "default",
+        Some("snapshot-reload"),
+    )
+    .expect("old generation");
+    old.start_background_tasks().expect("start old generation");
+    old.commit_background_tasks();
+    old.log(&create_test_transaction_summary()).await;
+
+    let replacement = ApiChargebackSink::new_with_config_id(
+        &cfg,
+        client(),
+        "default",
+        Some("snapshot-reload"),
+    )
+    .expect("replacement generation");
+    replacement
+        .start_background_tasks()
+        .expect("start replacement generation");
+    replacement.commit_background_tasks();
+    assert!(replacement.owns_active_sink());
+
+    drop(old);
+
+    let rows = chargeback_spool_rows(&spool_dir);
+    assert_eq!(
+        rows.len(),
+        1,
+        "dropping the superseded generation before its first timer tick must durably spool one delta"
+    );
+    assert_eq!(rows[0]["call_count"], 1);
+    assert_eq!(rows[0]["consumer_id"], "testuser");
+    assert!(
+        replacement.owns_active_sink(),
+        "old-generation finalization must not clear the accepted replacement"
+    );
+    drop(replacement);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_snapshot_graceful_shutdown_is_durable_idempotent_and_stops_admission() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spool_dir = tmp.path().join("shutdown-spool");
+    let plugin =
+        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
+            .expect("snapshot sink");
+    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    api_chargeback_sink::finalize_all_snapshot_generations().await;
+    assert_eq!(
+        api_chargeback_sink_snapshot_finalized_for_test(&plugin),
+        Some(true)
+    );
+    assert_eq!(
+        api_chargeback_sink_snapshot_generation_registered_for_test(&plugin),
+        Some(false)
+    );
+    let first_rows = chargeback_spool_rows(&spool_dir);
+    assert_eq!(first_rows.len(), 1);
+    assert_eq!(first_rows[0]["call_count"], 1);
+
+    plugin.log(&create_test_transaction_summary()).await;
+    api_chargeback_sink::finalize_all_snapshot_generations().await;
+    assert_eq!(
+        chargeback_spool_rows(&spool_dir).len(),
+        1,
+        "repeat shutdown and post-shutdown hooks must not duplicate or admit charges"
+    );
+    drop(plugin);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_snapshot_finalization_deadline_bounds_in_flight_admission() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spool_dir = tmp.path().join("bounded-finalization-spool");
+    let plugin =
+        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
+            .expect("snapshot sink");
+    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        api_chargeback_sink_finalize_with_held_admission_for_test(
+            &plugin,
+            Duration::from_millis(10),
+        )
+        .await,
+        Some(false),
+        "an entered record hook must not make the finalization deadline unbounded"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the configured finalization deadline must be observed promptly"
+    );
+    assert_eq!(
+        api_chargeback_sink_snapshot_generation_registered_for_test(&plugin),
+        Some(true),
+        "a timed-out finalizer must retain the generation for a later retry"
+    );
+
+    assert_eq!(
+        api_chargeback_sink_finalize_snapshot_for_test(&plugin).await,
+        Some(true),
+        "finalization must recover after the in-flight hook exits"
+    );
+    let rows = chargeback_spool_rows(&spool_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["call_count"], 1);
+    drop(plugin);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_snapshot_tick_racing_finalization_advances_exactly_one_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spool_dir = tmp.path().join("tick-first-spool");
+    let tick_first =
+        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
+            .expect("tick-first sink");
+    tick_first
+        .start_background_tasks()
+        .expect("start tick-first sink");
+    tick_first.commit_background_tasks();
+    tick_first.log(&create_test_transaction_summary()).await;
+
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&tick_first),
+        Some(Ok(1))
+    );
+    assert_eq!(
+        api_chargeback_sink_finalize_snapshot_for_test(&tick_first).await,
+        Some(true)
+    );
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&tick_first),
+        Some(Ok(0)),
+        "a timer delta published before shutdown must leave no duplicate final delta"
+    );
+    drop(tick_first);
+
+    let spool_dir = tmp.path().join("final-first-spool");
+    let final_first =
+        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
+            .expect("final-first sink");
+    final_first
+        .start_background_tasks()
+        .expect("start final-first sink");
+    final_first.commit_background_tasks();
+    final_first.log(&create_test_transaction_summary()).await;
+
+    assert_eq!(
+        api_chargeback_sink_finalize_snapshot_for_test(&final_first).await,
+        Some(true)
+    );
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&final_first),
+        Some(Ok(0)),
+        "a final spool handoff must publish the baseline before a racing tick can emit"
+    );
+    let rows = chargeback_spool_rows(&spool_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["call_count"], 1);
+    drop(final_first);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_snapshot_final_handoff_bypasses_full_queue_and_clickhouse_outage() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spool_dir = tmp.path().join("queue-pressure-spool");
+    let plugin =
+        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
+            .expect("snapshot sink");
+    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    for index in 0..8 {
+        let mut summary = create_test_transaction_summary();
+        summary.consumer_username = Some(format!("queued-{index}"));
+        plugin.log(&summary).await;
+    }
+    assert_eq!(
+        api_chargeback_sink_emit_snapshot_tick_for_test(&plugin),
+        Some(Ok(8)),
+        "the periodic path should contend for the one-entry logger queue"
+    );
+
+    let mut final_summary = create_test_transaction_summary();
+    final_summary.consumer_username = Some("final-direct-spool".to_string());
+    plugin.log(&final_summary).await;
+    assert_eq!(
+        api_chargeback_sink_finalize_snapshot_for_test(&plugin).await,
+        Some(true),
+        "final handoff must bypass the saturated logger and unavailable endpoint"
+    );
+    let final_rows = chargeback_spool_rows(&spool_dir)
+        .into_iter()
+        .filter(|row| row["consumer_id"] == "final-direct-spool")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        final_rows.len(),
+        1,
+        "the post-tick delta must enter the spool exactly once"
+    );
+    assert_eq!(final_rows[0]["call_count"], 1);
+    drop(plugin);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_snapshot_spool_failure_retains_generation_for_bounded_retry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spool_dir = tmp.path().join("blocked-spool");
+    std::fs::write(&spool_dir, b"not a directory").expect("plant blocking file");
+    let plugin =
+        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
+            .expect("snapshot sink");
+    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    assert_eq!(
+        api_chargeback_sink_finalize_snapshot_for_test(&plugin).await,
+        Some(false),
+        "unwritable spool must report an incomplete handoff"
+    );
+    assert_eq!(
+        api_chargeback_sink_snapshot_finalized_for_test(&plugin),
+        Some(false)
+    );
+    assert_eq!(
+        api_chargeback_sink_snapshot_generation_registered_for_test(&plugin),
+        Some(true),
+        "failed handoff must retain the accumulator in the global lifecycle registry"
+    );
+    let failed_status: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("failed status");
+    assert_eq!(failed_status["snapshot_finalizations_pending"], 1);
+    assert!(
+        api_chargeback_sink::render_prometheus()
+            .contains("chargeback_sink_snapshot_finalizations_pending 1")
+    );
+
+    std::fs::remove_file(&spool_dir).expect("remove blocking file");
+    assert_eq!(
+        api_chargeback_sink_finalize_snapshot_for_test(&plugin).await,
+        Some(true),
+        "a later bounded retry must durably hand off the retained delta"
+    );
+    assert_eq!(
+        api_chargeback_sink_snapshot_generation_registered_for_test(&plugin),
+        Some(false)
+    );
+    let recovered_status: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("recovered status");
+    assert_eq!(recovered_status["snapshot_finalizations_pending"], 0);
+    let rows = chargeback_spool_rows(&spool_dir);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["call_count"], 1);
+    drop(plugin);
 }
 
 fn test_ws_disconnect_context() -> WsDisconnectContext {
