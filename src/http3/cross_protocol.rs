@@ -3732,11 +3732,6 @@ where
             .take()
             .unwrap_or_default();
         if let Some(mut trailers) = trailers {
-            grpc_trailer_status = trailers.get("grpc-status").map(|value| {
-                value.to_str().map_or(u32::MAX, |value| {
-                    crate::proxy::grpc_proxy::parse_grpc_status_value(value)
-                })
-            });
             strip_response_hop_by_hop_trailers(&mut trailers);
             collected.clear();
             crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
