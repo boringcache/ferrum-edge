@@ -41,14 +41,33 @@ values so `ReplacingMergeTree` deduplicates duplicate-safe retries.
 transaction, stream disconnect, or WebSocket disconnect. This preserves
 transaction-level provenance and is the default.
 
-`mode: snapshot` keeps a local accumulator keyed by namespace, consumer, proxy,
-billable status, raw HTTP status, final gRPC status, and protocol. Every
-`snapshot.interval_secs`, it emits deltas since the last snapshot. Use this when
-event volume dominates ingest cost and aggregate reconciliation is sufficient.
-Snapshot mode requires `spool.enabled: true` because the accumulator advances
-after a delta is handed to the sink queue; the spool is the durable path when
-ClickHouse or the in-memory queue is unavailable. Idle snapshot keys are evicted
-after `snapshot.stale_entry_ttl_secs` and checked every
+`mode: snapshot` keeps a local accumulator whose **identity** is every
+exported categorical field on the resulting `ChargeEvent`:
+
+- `namespace`
+- `consumer_id`
+- `consumer_name` (empty segment when absent)
+- `proxy_id`
+- `proxy_name`
+- `route_id` (empty segment when absent)
+- billable `status_code`
+- raw `http_status_code` (empty when absent, e.g. stream/WebSocket)
+- final `grpc_status` (empty when absent; non-standard codes collapse to a
+  bounded sentinel)
+- `protocol` (`http`, `grpc`, `ws`, stream protocol labels, etc.)
+
+Delta emission, last-emitted bookkeeping, and stale-entry cleanup all use this
+same key. Display-name changes (consumer or proxy rename on reload) and
+distinct routes or protocols therefore produce separate snapshot rows instead of
+silently labeling a mixed aggregate with the first record's metadata.
+`request_id` and `trace_id` are omitted from snapshot events (they are
+per-transaction only). Every `snapshot.interval_secs`, the sink emits deltas
+since the last snapshot. Use this when event volume dominates ingest cost and
+aggregate reconciliation is sufficient. Snapshot mode requires
+`spool.enabled: true` because the accumulator advances after a delta is handed
+to the sink queue; the spool is the durable path when ClickHouse or the
+in-memory queue is unavailable. Idle snapshot keys are evicted after
+`snapshot.stale_entry_ttl_secs` and checked every
 `snapshot.cleanup_interval_secs`.
 
 Both modes use the same pricing fields as `api_chargeback`. At least one

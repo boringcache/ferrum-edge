@@ -3075,6 +3075,11 @@ fn finalize_replayed_spool_file(
     Ok(())
 }
 
+/// Immutable categorical dimensions for one snapshot accumulator identity.
+///
+/// These fields are part of [`snapshot_key`] and are copied into emitted
+/// `ChargeEvent`s. They must not be treated as first-writer-wins decoration on
+/// a coarser key.
 #[derive(Clone)]
 struct SnapshotMetadata {
     namespace: String,
@@ -3280,15 +3285,9 @@ impl SnapshotAccumulator {
     }
 
     fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) {
-        let key = snapshot_key(
-            &meta.namespace,
-            &meta.consumer_id,
-            &meta.proxy_id,
-            meta.status_code,
-            meta.http_status_code,
-            meta.grpc_status,
-            &meta.protocol,
-        );
+        // Snapshot identity must include every exported categorical field so
+        // first-record metadata cannot silently label a mixed aggregate.
+        let key = snapshot_key(&meta);
         let now = unix_timestamp_seconds();
         let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
             meta,
@@ -3722,23 +3721,31 @@ fn bound_string(value: &str, max_len: usize) -> String {
     value[..end].to_string()
 }
 
-fn snapshot_key(
-    namespace: &str,
-    consumer: &str,
-    proxy_id: &str,
-    status_code: u16,
-    http_status_code: Option<u16>,
-    grpc_status: Option<u32>,
-    protocol: &str,
-) -> String {
+/// Truthful snapshot dimension contract.
+///
+/// Every categorical field exported on a snapshot `ChargeEvent` is part of the
+/// accumulator identity shared by `record`, `compute_deltas`, and
+/// `cleanup_stale`. Absent optional dimensions use an empty segment so keys stay
+/// stable and comparable:
+///
+/// `namespace|consumer_id|consumer_name|proxy_id|proxy_name|route_id|status_code|http_status_code|grpc_status|protocol`
+fn snapshot_key(meta: &SnapshotMetadata) -> String {
     format!(
-        "{namespace}|{consumer}|{proxy_id}|{status_code}|{}|{}|{protocol}",
-        http_status_code
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        meta.namespace,
+        meta.consumer_id,
+        meta.consumer_name.as_deref().unwrap_or(""),
+        meta.proxy_id,
+        meta.proxy_name,
+        meta.route_id.as_deref().unwrap_or(""),
+        meta.status_code,
+        meta.http_status_code
             .map(|status| status.to_string())
             .unwrap_or_default(),
-        grpc_status
+        meta.grpc_status
             .map(|status| status.to_string())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        meta.protocol,
     )
 }
 

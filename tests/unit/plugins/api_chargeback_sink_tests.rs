@@ -92,6 +92,59 @@ fn grpc_summary(proxy_id: &str, grpc_status: &str) -> TransactionSummary {
     summary
 }
 
+fn http_summary_with_dims(
+    proxy_id: &str,
+    proxy_name: &str,
+    route_id: Option<&str>,
+    consumer_name: Option<&str>,
+    protocol: &str,
+    status: u16,
+) -> TransactionSummary {
+    let mut summary = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        consumer_username: Some("alice".to_string()),
+        proxy_id: Some(proxy_id.to_string()),
+        proxy_name: Some(proxy_name.to_string()),
+        response_status_code: status,
+        ..TransactionSummary::default()
+    };
+    if protocol != "http" {
+        summary
+            .metadata
+            .insert("request_protocol".to_string(), protocol.to_string());
+    }
+    if let Some(route_id) = route_id {
+        summary
+            .metadata
+            .insert("route_id".to_string(), route_id.to_string());
+    }
+    if let Some(consumer_name) = consumer_name {
+        summary
+            .metadata
+            .insert("consumer_name".to_string(), consumer_name.to_string());
+    }
+    summary
+}
+
+fn unit_call_charge(price: f64) -> ChargeComputation {
+    ChargeComputation {
+        call_count: 1,
+        charge_call: price,
+        charge_total: price,
+        ..ChargeComputation::default()
+    }
+}
+
+fn snapshot_test_config() -> ApiChargebackSinkConfig {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    config
+}
+
 async fn wait_for_requests(server: &MockServer, at_least: usize) -> Vec<wiremock::Request> {
     for _ in 0..40 {
         if let Some(requests) = server.received_requests().await
@@ -1683,6 +1736,222 @@ fn snapshot_cleanup_removes_idle_entries_and_last_emitted() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn snapshot_keeps_distinct_routes_that_share_consumer_proxy_status() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-b"), None, "http", 200),
+        "alice",
+        charge,
+    );
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-routes")
+        .unwrap();
+    events.sort_by(|left, right| left.route_id.cmp(&right.route_id));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(events[0].call_count, 1);
+    assert_eq!(events[1].route_id.as_deref(), Some("route-b"));
+    assert_eq!(events[1].call_count, 1);
+    assert!(events.iter().all(|event| {
+        event.consumer_id == "alice"
+            && event.proxy_id == "proxy-a"
+            && event.proxy_name == "Payments"
+            && event.status_code == 200
+            && event.protocol == "http"
+    }));
+}
+
+#[test]
+fn snapshot_preserves_display_name_changes_as_separate_identities() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_http_for_test(
+        &http_summary_with_dims(
+            "proxy-a",
+            "Payments",
+            Some("route-a"),
+            Some("Alice"),
+            "http",
+            200,
+        ),
+        "alice",
+        charge,
+    );
+    accumulator.record_http_for_test(
+        &http_summary_with_dims(
+            "proxy-a",
+            "Payments v2",
+            Some("route-a"),
+            Some("Alice Example"),
+            "http",
+            200,
+        ),
+        "alice",
+        charge,
+    );
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-names")
+        .unwrap();
+    events.sort_by(|left, right| {
+        (
+            left.consumer_name.as_deref().unwrap_or(""),
+            left.proxy_name.as_str(),
+        )
+            .cmp(&(
+                right.consumer_name.as_deref().unwrap_or(""),
+                right.proxy_name.as_str(),
+            ))
+    });
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].consumer_name.as_deref(), Some("Alice"));
+    assert_eq!(events[0].proxy_name, "Payments");
+    assert_eq!(events[0].call_count, 1);
+    assert_eq!(events[1].consumer_name.as_deref(), Some("Alice Example"));
+    assert_eq!(events[1].proxy_name, "Payments v2");
+    assert_eq!(events[1].call_count, 1);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.route_id.as_deref() == Some("route-a") && event.proxy_id == "proxy-a")
+    );
+
+    // Additional traffic under the new names must delta only that identity.
+    accumulator.record_http_for_test(
+        &http_summary_with_dims(
+            "proxy-a",
+            "Payments v2",
+            Some("route-a"),
+            Some("Alice Example"),
+            "http",
+            200,
+        ),
+        "alice",
+        charge,
+    );
+    let second = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-names-2")
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].consumer_name.as_deref(), Some("Alice Example"));
+    assert_eq!(second[0].proxy_name, "Payments v2");
+    assert_eq!(second[0].call_count, 1);
+}
+
+#[test]
+fn snapshot_keeps_supported_protocols_that_share_proxy_status_separate() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    // Same consumer/proxy/route/billable+raw status — only protocol differs.
+    // These would collapse into one mislabeled aggregate if protocol were
+    // omitted from the snapshot identity (issue #2583).
+    for protocol in ["http", "http2", "http3"] {
+        accumulator.record_http_for_test(
+            &http_summary_with_dims(
+                "proxy-a",
+                "Payments",
+                Some("route-a"),
+                None,
+                protocol,
+                200,
+            ),
+            "alice",
+            charge,
+        );
+    }
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-protocols")
+        .unwrap();
+    events.sort_by(|left, right| left.protocol.cmp(&right.protocol));
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].protocol, "http");
+    assert_eq!(events[1].protocol, "http2");
+    assert_eq!(events[2].protocol, "http3");
+    assert!(events.iter().all(|event| {
+        event.call_count == 1
+            && event.status_code == 200
+            && event.http_status_code == Some(200)
+            && event.grpc_status.is_none()
+            && event.route_id.as_deref() == Some("route-a")
+            && event.proxy_id == "proxy-a"
+    }));
+}
+
+#[test]
+fn snapshot_delta_and_stale_cleanup_share_revised_route_identity() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-b"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    assert_eq!(
+        accumulator
+            .compute_deltas(&config, "node-a", 100, "snap-1")
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Only route-a receives more traffic before cleanup.
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    let delta = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(delta[0].call_count, 1);
+
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 2);
+    assert!(
+        accumulator
+            .compute_deltas(&config, "node-a", 300, "snap-3")
+            .unwrap()
+            .is_empty(),
+        "stale cleanup must drop entries and last-emitted for every revised identity"
+    );
+
+    // Re-recording after cleanup starts fresh (full totals, not residual deltas).
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    let restarted = accumulator
+        .compute_deltas(&config, "node-a", 400, "snap-4")
+        .unwrap();
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(restarted[0].call_count, 1);
 }
 
 #[test]
