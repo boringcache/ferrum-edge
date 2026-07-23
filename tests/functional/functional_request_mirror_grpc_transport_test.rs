@@ -8,6 +8,7 @@
 //!
 //! Live functional coverage in this file:
 //! - Unary h2c / TLS+h2 TE + transport handshake
+//! - TLS native-gRPC transport rejects an HTTP/1.1-only ALPN endpoint
 //! - Client-streaming multi-frame ingress shape (h2c + TLS+h2), with exact
 //!   mirrored-byte preservation covered by the h2c plugin network unit test
 //! - Server-streaming and bidirectional method/path shapes (h2c + TLS+h2)
@@ -38,7 +39,10 @@
 
 use std::time::Duration;
 
-use crate::scaffolding::backends::{GrpcStep, MatchRpc, ReceivedStream, ScriptedGrpcBackend};
+use crate::scaffolding::backends::{
+    GrpcStep, MatchRpc, ReceivedStream, ScriptedGrpcBackend, ScriptedTlsBackend, TcpStep,
+    TlsConfig,
+};
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GrpcClient, GrpcResponse};
 use crate::scaffolding::harness::GatewayHarness;
@@ -340,6 +344,85 @@ async fn request_mirror_grpc_tls_alpn_h2_carries_te_trailers() {
         "mirror must complete an ALPN h2 handshake"
     );
     mirror.assert_no_step_errors().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn request_mirror_grpc_tls_rejects_http1_only_alpn() {
+    let (primary_port, _primary) = spawn_plain_backend(unary_ok_script()).await;
+    let ca = TestCa::new("request-mirror-grpc-http1-only").expect("ca");
+    let (cert_pem, key_pem) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("port");
+    let mirror_port = reservation.port;
+    // This endpoint is a valid TLS HTTP/1.1 mirror sink. The default
+    // all-version plugin client would negotiate HTTP/1.1 and send the request,
+    // while the native-gRPC companion offers only ALPN h2 and must fail the TLS
+    // handshake before any HTTP/1.1 bytes are written.
+    let mirror = ScriptedTlsBackend::builder(
+        reservation.into_listener(),
+        TlsConfig::new(cert_pem, key_pem).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn HTTP/1.1-only TLS mirror");
+
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(grpc_mirror_yaml(
+            primary_port,
+            mirror_port,
+            "https",
+            /* mirror_request_body */ false,
+            5000,
+        ))
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
+    let response = client
+        .unary(UNARY_PATH, Bytes::from_static(UNARY_BODY))
+        .await
+        .expect("primary unary rpc");
+    assert_eq!(
+        response.grpc_status(),
+        Some(0),
+        "mirror transport failure must not affect the primary response: {response:?}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let errors = loop {
+        let errors = mirror.step_errors().await;
+        if !errors.is_empty() || tokio::time::Instant::now() >= deadline {
+            break errors;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        mirror.accepted_connections() >= 1,
+        "native gRPC mirror must attempt the configured TLS destination"
+    );
+    assert_eq!(
+        mirror.handshakes_completed(),
+        0,
+        "HTTP/2 companion must not negotiate the HTTP/1.1-only ALPN endpoint"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("TLS handshake failed")),
+        "expected an ALPN-mismatch TLS failure, got {errors:?}"
+    );
+    assert!(
+        mirror.received_bytes().await.is_empty(),
+        "native gRPC mirror must not fall back to an HTTP/1.1 request"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -760,13 +843,19 @@ async fn request_mirror_grpc_h2c_reuses_http2_connection_across_mirrors() {
         .expect("spawn gateway");
 
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
-    for _ in 0..2 {
-        let response = client
-            .unary(UNARY_PATH, Bytes::from_static(UNARY_BODY))
-            .await
-            .expect("unary rpc");
-        assert_eq!(response.grpc_status(), Some(0), "response={response:?}");
-    }
+    let first = client
+        .unary(UNARY_PATH, Bytes::from_static(UNARY_BODY))
+        .await
+        .expect("first unary rpc");
+    assert_eq!(first.grpc_status(), Some(0), "response={first:?}");
+    let first_observed = wait_for_mirror_streams(&mirror, 1).await;
+    assert_eq!(first_observed.len(), 1);
+
+    let second = client
+        .unary(UNARY_PATH, Bytes::from_static(UNARY_BODY))
+        .await
+        .expect("second unary rpc");
+    assert_eq!(second.grpc_status(), Some(0), "response={second:?}");
 
     let observed = wait_for_mirror_streams(&mirror, 2).await;
     assert_eq!(observed.len(), 2);

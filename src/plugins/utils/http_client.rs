@@ -165,7 +165,6 @@ impl std::fmt::Debug for PluginHttpClient {
             .field("max_retries", &self.max_retries)
             .field("retry_delay", &self.retry_delay)
             .field("has_dns_cache", &self.dns_cache.is_some())
-            .field("has_http2_companion", &true)
             .field("tls_no_verify", &self.tls_no_verify)
             .field("has_tls_ca_bundle", &self.tls_ca_bundle_path.is_some())
             .field("tls_crls_count", &self.tls_crls.len())
@@ -370,8 +369,8 @@ fn build_configured_plugin_client(
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
     }
 
-    // Force HTTP/2 before keep-alive tuning so both the default and companion
-    // clients share identical PING settings when `enable_http2` is on.
+    // The companion is HTTP/2-only; the common block below applies identical
+    // PING settings to both clients when `enable_http2` is on.
     if http2_prior_knowledge {
         builder = builder.http2_prior_knowledge();
     }
