@@ -3998,14 +3998,12 @@ impl PluginCache {
         Ok(())
     }
 
-    /// Whether the exact delta-build scope, including adaptive-concurrency
-    /// route-definition expansion, reconstructs an active geo plugin.
-    pub(crate) fn country_mmdb_preload_required(
+    fn expanded_file_dependency_rebuild_scope(
         &self,
         config: &GatewayConfig,
         proxy_ids_to_rebuild: &HashSet<String>,
         rebuild_globals: bool,
-    ) -> bool {
+    ) -> (HashSet<String>, bool) {
         let current = self.inner.load();
         let mut expanded_proxy_ids = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -4015,24 +4013,49 @@ impl PluginCache {
             &mut expanded_proxy_ids,
             &mut rebuild_adaptive_globals,
         );
-        country_mmdb_preload_required_for_scope(
-            config,
-            &expanded_proxy_ids,
+        (
+            expanded_proxy_ids,
             rebuild_globals || rebuild_adaptive_globals,
         )
     }
 
-    /// Whether an incremental cache stage reconstructs an active
-    /// body_validator with a node-local protobuf descriptor dependency.
+    /// Whether the exact delta-build scope, including adaptive-concurrency
+    /// route-definition expansion, reconstructs an active geo plugin.
+    pub(crate) fn country_mmdb_preload_required(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        rebuild_globals: bool,
+    ) -> bool {
+        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
+            config,
+            proxy_ids_to_rebuild,
+            rebuild_globals,
+        );
+        country_mmdb_preload_required_for_scope(
+            config,
+            &expanded_proxy_ids,
+            rebuild_globals,
+        )
+    }
+
+    /// Whether the exact delta-build scope, including adaptive-concurrency
+    /// route-definition expansion, reconstructs an active body_validator with
+    /// a node-local protobuf descriptor dependency.
     pub(crate) fn body_validator_descriptor_preload_required(
         &self,
         config: &GatewayConfig,
         proxy_ids_to_rebuild: &HashSet<String>,
         rebuild_globals: bool,
     ) -> bool {
-        body_validator_descriptor_preload_required_for_scope(
+        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
             config,
             proxy_ids_to_rebuild,
+            rebuild_globals,
+        );
+        body_validator_descriptor_preload_required_for_scope(
+            config,
+            &expanded_proxy_ids,
             rebuild_globals,
         )
     }
