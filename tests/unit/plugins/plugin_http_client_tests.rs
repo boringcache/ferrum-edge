@@ -437,7 +437,6 @@ async fn test_shared_client_does_not_follow_redirects() {
 
 #[tokio::test]
 async fn get_http2_companion_speaks_h2c_prior_knowledge() {
-    use bytes::Bytes;
     use h2::server as h2_server;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -452,16 +451,23 @@ async fn get_http2_companion_speaks_h2c_prior_knowledge() {
         let Ok(mut h2) = h2_server::handshake(tcp).await else {
             return;
         };
-        if let Some(Ok((request, mut respond))) = h2.accept().await {
-            let version = request.version();
-            let response = http::Response::builder()
-                .status(200)
-                .body(())
-                .expect("empty response");
-            if let Ok(mut send) = respond.send_response(response, false) {
-                let _ = send.send_data(Bytes::new(), true);
-            }
-            let _ = tx.send(version);
+        let mut tx = Some(tx);
+        while let Some(result) = h2.accept().await {
+            let Ok((request, mut respond)) = result else {
+                break;
+            };
+            let Some(tx) = tx.take() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let version = request.version();
+                let response = http::Response::builder()
+                    .status(200)
+                    .body(())
+                    .expect("empty response");
+                let _ = respond.send_response(response, true);
+                let _ = tx.send(version);
+            });
         }
     });
 

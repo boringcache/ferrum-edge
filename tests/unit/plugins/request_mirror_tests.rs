@@ -2015,7 +2015,6 @@ async fn capture_mirror_request_headers_h2c(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
 ) -> HashMap<String, String> {
-    use bytes::Bytes;
     use h2::server as h2_server;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2030,21 +2029,28 @@ async fn capture_mirror_request_headers_h2c(
         let Ok(mut h2) = h2_server::handshake(tcp).await else {
             return;
         };
-        if let Some(Ok((request, mut respond))) = h2.accept().await {
-            let mut captured = HashMap::new();
-            for (name, value) in request.headers().iter() {
-                if let Ok(v) = value.to_str() {
-                    captured.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+        let mut tx = Some(tx);
+        while let Some(result) = h2.accept().await {
+            let Ok((request, mut respond)) = result else {
+                break;
+            };
+            let Some(tx) = tx.take() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut captured = HashMap::new();
+                for (name, value) in request.headers().iter() {
+                    if let Ok(v) = value.to_str() {
+                        captured.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+                    }
                 }
-            }
-            let response = http::Response::builder()
-                .status(200)
-                .body(())
-                .expect("empty response");
-            if let Ok(mut send) = respond.send_response(response, false) {
-                let _ = send.send_data(Bytes::new(), true);
-            }
-            let _ = tx.send(captured);
+                let response = http::Response::builder()
+                    .status(200)
+                    .body(())
+                    .expect("empty response");
+                let _ = respond.send_response(response, true);
+                let _ = tx.send(captured);
+            });
         }
     });
 
@@ -2282,7 +2288,6 @@ async fn test_mirror_rejects_grpc_prefix_smuggling_for_te_resynthesis() {
 
 #[tokio::test]
 async fn test_grpc_mirror_preserves_binary_body_over_h2c() {
-    use bytes::Bytes;
     use h2::server as h2_server;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2297,23 +2302,30 @@ async fn test_grpc_mirror_preserves_binary_body_over_h2c() {
         let Ok(mut h2) = h2_server::handshake(tcp).await else {
             return;
         };
-        if let Some(Ok((request, mut respond))) = h2.accept().await {
-            let mut body = request.into_body();
-            let mut buf = Vec::new();
-            while let Some(chunk) = body.data().await {
-                if let Ok(bytes) = chunk {
-                    let _ = body.flow_control().release_capacity(bytes.len());
-                    buf.extend_from_slice(&bytes);
+        let mut tx = Some(tx);
+        while let Some(result) = h2.accept().await {
+            let Ok((request, mut respond)) = result else {
+                break;
+            };
+            let Some(tx) = tx.take() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut body = request.into_body();
+                let mut buf = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    if let Ok(bytes) = chunk {
+                        let _ = body.flow_control().release_capacity(bytes.len());
+                        buf.extend_from_slice(&bytes);
+                    }
                 }
-            }
-            let response = http::Response::builder()
-                .status(200)
-                .body(())
-                .expect("empty response");
-            if let Ok(mut send) = respond.send_response(response, false) {
-                let _ = send.send_data(Bytes::new(), true);
-            }
-            let _ = tx.send(buf);
+                let response = http::Response::builder()
+                    .status(200)
+                    .body(())
+                    .expect("empty response");
+                let _ = respond.send_response(response, true);
+                let _ = tx.send(buf);
+            });
         }
     });
 
@@ -2352,7 +2364,6 @@ async fn test_grpc_mirror_preserves_binary_body_over_h2c() {
 async fn test_grpc_mirror_preserves_multiframe_client_stream_body_over_h2c() {
     // Client-streaming body shape: multiple length-prefixed gRPC messages in
     // one buffered request body must survive the h2c companion path.
-    use bytes::Bytes;
     use h2::server as h2_server;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2367,23 +2378,30 @@ async fn test_grpc_mirror_preserves_multiframe_client_stream_body_over_h2c() {
         let Ok(mut h2) = h2_server::handshake(tcp).await else {
             return;
         };
-        if let Some(Ok((request, mut respond))) = h2.accept().await {
-            let mut body = request.into_body();
-            let mut buf = Vec::new();
-            while let Some(chunk) = body.data().await {
-                if let Ok(bytes) = chunk {
-                    let _ = body.flow_control().release_capacity(bytes.len());
-                    buf.extend_from_slice(&bytes);
+        let mut tx = Some(tx);
+        while let Some(result) = h2.accept().await {
+            let Ok((request, mut respond)) = result else {
+                break;
+            };
+            let Some(tx) = tx.take() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut body = request.into_body();
+                let mut buf = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    if let Ok(bytes) = chunk {
+                        let _ = body.flow_control().release_capacity(bytes.len());
+                        buf.extend_from_slice(&bytes);
+                    }
                 }
-            }
-            let response = http::Response::builder()
-                .status(200)
-                .body(())
-                .expect("empty response");
-            if let Ok(mut send) = respond.send_response(response, false) {
-                let _ = send.send_data(Bytes::new(), true);
-            }
-            let _ = tx.send(buf);
+                let response = http::Response::builder()
+                    .status(200)
+                    .body(())
+                    .expect("empty response");
+                let _ = respond.send_response(response, true);
+                let _ = tx.send(buf);
+            });
         }
     });
 
