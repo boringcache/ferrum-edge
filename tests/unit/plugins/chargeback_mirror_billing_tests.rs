@@ -11,10 +11,12 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use ferrum_edge::_test_support::request_mirror_should_mirror_for_test;
 use ferrum_edge::plugins::api_chargeback::{
     ApiChargeback, InstanceScope, ProtocolFamily, global_registry,
 };
 use ferrum_edge::plugins::api_chargeback_sink::{ApiChargebackSink, ApiChargebackSinkConfig};
+use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
     MirrorResponseMeta, Plugin, PluginHttpClient, RequestContext, TransactionSummary,
     log_with_mirror, priority,
@@ -319,34 +321,36 @@ async fn in_memory_chargeback_bills_primary_once_for_mirror_success_and_error() 
 }
 
 #[tokio::test]
-async fn in_memory_chargeback_percentage_below_100_still_one_charge_when_selected() {
-    // percentage < 100%: unselected requests never push a mirror receiver;
-    // selected ones still must not double-bill after log_with_mirror.
+async fn in_memory_chargeback_bills_each_primary_once_below_100_percent() {
     let config = json!({
         "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
     });
     let plugin = Arc::new(ApiChargeback::new(&config, "ferrum").unwrap());
     let plugins: Vec<Arc<dyn Plugin>> = vec![plugin];
-
-    let missed_consumer = "mirror-pct-missed";
-    let missed_proxy = "proxy-mirror-pct-missed";
-    drive_log_with_mirror(
-        &plugins,
-        &primary_summary(missed_consumer, missed_proxy, 200),
-        None,
+    let sampler = RequestMirror::new(
+        &json!({
+            "mirror_host": "shadow.local",
+            "percentage": 50.0,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
     )
-    .await;
-    assert_eq!(total_http_calls(missed_consumer, missed_proxy), 1);
+    .expect("valid below-100 request_mirror sampler");
+    let consumer = "mirror-pct-billing";
+    let proxy = "proxy-mirror-pct-billing";
+    let summary = primary_summary(consumer, proxy, 200);
 
-    let selected_consumer = "mirror-pct-selected";
-    let selected_proxy = "proxy-mirror-pct-selected";
-    drive_log_with_mirror(
-        &plugins,
-        &primary_summary(selected_consumer, selected_proxy, 200),
-        Some(mirror_success(200)),
-    )
-    .await;
-    assert_eq!(total_http_calls(selected_consumer, selected_proxy), 1);
+    // The real 50% sampler starts with a miss and then a selection. Translate
+    // those decisions into the receiver presence that log_with_mirror sees.
+    let missed = request_mirror_should_mirror_for_test(&sampler);
+    let selected = request_mirror_should_mirror_for_test(&sampler);
+    assert!(!missed, "first 50% sample must be the deterministic miss");
+    assert!(selected, "second 50% sample must be selected");
+    drive_log_with_mirror(&plugins, &summary, missed.then(|| mirror_success(200))).await;
+    drive_log_with_mirror(&plugins, &summary, selected.then(|| mirror_success(200))).await;
+
+    assert_eq!(total_http_calls(consumer, proxy), 2);
+    assert_eq!(total_http_bytes(consumer, proxy), (64, 128));
 }
 
 #[tokio::test]
