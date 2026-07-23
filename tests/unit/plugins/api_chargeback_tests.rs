@@ -2264,12 +2264,8 @@ fn test_deleted_proxy_uses_lexicographic_admission_name_fallback() {
         registry.record_http(
             &s, "alice", &proxy_id, "Zulu", 200, 0.002, 20, 10, 0.02, 0.02,
         );
-        registry.record_stream(
-            &s, "alice", &proxy_id, "Alpha", 0.001, 30, 15, 0.01, 0.01,
-        );
-        registry.record_stream(
-            &s, "alice", &proxy_id, "Zulu", 0.002, 40, 20, 0.02, 0.02,
-        );
+        registry.record_stream(&s, "alice", &proxy_id, "Alpha", 0.001, 30, 15, 0.01, 0.01);
+        registry.record_stream(&s, "alice", &proxy_id, "Zulu", 0.002, 40, 20, 0.02, 0.02);
     }
 
     let prom = registry.render_prometheus_uncached().unwrap();
@@ -2302,8 +2298,7 @@ fn test_deleted_proxy_uses_lexicographic_admission_name_fallback() {
             "deleted proxy stream export must pick lex-max admission name\n{stream_line}"
         );
         assert_eq!(
-            json["consumers"]["alice"]["proxies"][&proxy_id]["proxy_name"],
-            "Zulu",
+            json["consumers"]["alice"]["proxies"][&proxy_id]["proxy_name"], "Zulu",
             "deleted proxy json export must match prometheus lex-max fallback"
         );
     }
