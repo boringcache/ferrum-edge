@@ -15,18 +15,38 @@
 //! mirror destination. The main request proceeds immediately — mirror latency
 //! has zero impact on client response time.
 //!
+//! Multiple independent `request_mirror` instances on one proxy each dispatch
+//! and each push their own result receiver onto a per-request collection. A
+//! later instance never overwrites an earlier one. Transaction logging emits
+//! one `mirror: true` summary per dispatched instance, attributable by plugin
+//! config id and query-stripped destination URL. Sampled-out work leaves no
+//! record; concurrency-limit rejection still publishes an explicit per-instance
+//! failure (preserving prior observability).
+//!
 //! Outbound mirror headers cross the same canonical secondary-request boundary
 //! as primary backend dispatch (Connection-listed hop-by-hop, Trailer, framing,
 //! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Forwarding
-//! identity is stripped rather than regenerated. Client `Host` is omitted so
-//! authority comes from the mirror URL; native gRPC content-types re-synthesise
-//! `te: trailers` for HTTP/2-capable mirror targets. Native gRPC mirrors dial
-//! through `PluginHttpClient::get_http2` (h2c prior knowledge for cleartext
-//! `http` targets, ALPN `h2` for `https`); ordinary HTTP mirrors keep the
-//! default all-version client so HTTP/1.1 destinations continue to work. The
+//! identity is stripped rather than regenerated. Off-mesh mirrors omit client
+//! `Host` so authority comes from the mirror URL. When `mesh_route_dispatch`
+//! has already matched the request, the mirror instead applies Istio/Envoy
+//! shadow Host/:authority semantics: dial and validate the configured mirror
+//! destination, but set Host to the selected (rewritten) authority with a
+//! `-shadow` suffix. Native gRPC content-types re-synthesise `te: trailers` for
+//! HTTP/2-capable mirror targets. Native gRPC mirrors dial through
+//! `PluginHttpClient::get_http2` (h2c prior knowledge for cleartext `http`
+//! targets, ALPN `h2` for `https`); ordinary HTTP mirrors keep the default
+//! all-version client so HTTP/1.1 destinations continue to work. The
 //! request-target prefers the original raw query (after the same auth
 //! credential strips the primary backend uses) so duplicate keys, order, flags,
 //! `+`, percent escapes, and encoded bytes match the primary contract.
+//!
+//! Path selection precedence when building the mirror URL:
+//! 1. explicit plugin `mirror_path` (operator override; wins)
+//! 2. else mesh `route_override_path` when set (final selected/rebased URI;
+//!    read without consuming the override primary dispatch still needs)
+//! 3. else the backend-effective authorized path when backend-path policy is
+//!    active
+//! 4. else the original request path
 //!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
 //! it inherits the gateway's DNS cache, connection pool keepalive, TLS
@@ -63,7 +83,7 @@
 //! | `mirror_host` | string | **(required)** | Hostname or IP of the mirror target |
 //! | `mirror_port` | u16 | 80 (http) / 443 (https) | Port of the mirror target |
 //! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"` |
-//! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, the backend-effective authorized path is used if backend-path policy is active; otherwise the original request path is used |
+//! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, prefers the mesh route rewrite path when present; otherwise the backend-effective authorized path if backend-path policy is active; otherwise the original request path |
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0). Deterministic evenly spaced sampling at 0.1% granularity (see sampling notes below) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes read from a mirror response when sizing it (only consulted when the response has no `content-length`). Streaming aborts as soon as the limit is crossed; mirror task discards the bytes after sizing. |
@@ -140,14 +160,59 @@ fn strip_query_params(url: &str) -> &str {
     url.split_once('?').map_or(url, |(base, _)| base)
 }
 
-fn mirror_failure_meta(target_url: String, error: &'static str) -> MirrorResponseMeta {
+fn mirror_failure_meta(
+    plugin_id: Option<String>,
+    target_url: String,
+    error: &'static str,
+) -> MirrorResponseMeta {
     MirrorResponseMeta {
+        mirror_plugin_id: plugin_id,
         mirror_target_url: target_url,
         mirror_response_status_code: None,
         mirror_response_size_bytes: None,
         mirror_latency_ms: 0.0,
         mirror_error: Some(error.to_string()),
     }
+}
+
+/// Append Envoy/Istio's `-shadow` suffix to a Host/:authority value.
+///
+/// Matches Envoy's documented shadowing behavior (`cluster1` →
+/// `cluster1-shadow`). The suffix is appended to the hostname portion when a
+/// `:port` is present so `internal.example:8080` becomes
+/// `internal.example-shadow:8080`; bare authorities and bracketed IPv6 hosts
+/// without a port receive a simple trailing `-shadow`.
+fn append_shadow_host_suffix(authority: &str) -> String {
+    let host_end = if authority.starts_with('[') {
+        authority
+            .find(']')
+            .map(|index| index + 1)
+            .unwrap_or(authority.len())
+    } else if let Some((host, port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+        && !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        host.len()
+    } else {
+        authority.len()
+    };
+
+    let mut shadow = String::with_capacity(authority.len() + "-shadow".len());
+    shadow.push_str(&authority[..host_end]);
+    shadow.push_str("-shadow");
+    shadow.push_str(&authority[host_end..]);
+    shadow
+}
+
+fn request_host_header(headers: &HashMap<String, String>) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| {
+            name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case(":authority")
+        })
+        .map(|(_, value)| value.as_str())
 }
 
 fn completed_mirror_result(
@@ -173,6 +238,10 @@ fn sample_threshold_from_percentage(percentage: f64) -> u64 {
 
 pub struct RequestMirror {
     http_client: PluginHttpClient,
+    /// Stable plugin-config resource id when constructed through the plugin
+    /// cache / factory. Surfaced on mirror summaries for multi-instance
+    /// attribution; never a secret.
+    plugin_config_id: Option<String>,
     mirror_host: String,
     mirror_port: u16,
     mirror_protocol: String,
@@ -196,6 +265,14 @@ pub struct RequestMirror {
 
 impl RequestMirror {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, None)
+    }
+
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
         if !config.is_object() {
             return Err("request_mirror: config must be an object".to_string());
         }
@@ -277,8 +354,17 @@ impl RequestMirror {
             DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES,
         )?;
 
+        let plugin_config_id = match plugin_config_id {
+            Some(id) if id.trim().is_empty() => {
+                return Err("request_mirror: plugin_config_id must not be blank".to_string());
+            }
+            Some(id) => Some(id.trim().to_owned()),
+            None => None,
+        };
+
         Ok(Self {
             http_client,
+            plugin_config_id,
             mirror_host,
             mirror_port,
             mirror_protocol,
@@ -308,6 +394,23 @@ impl RequestMirror {
     #[allow(dead_code)]
     pub(crate) fn sample_phase_for_test(&self) -> u64 {
         self.sample_phase.load(Ordering::Relaxed)
+    }
+
+    /// Select the path segment for the mirror URL without consuming primary
+    /// route overrides.
+    ///
+    /// Precedence: explicit `mirror_path` → mesh `route_override_path` →
+    /// authorized backend path → original `ctx.path`.
+    fn select_mirror_path<'a>(&'a self, ctx: &'a RequestContext) -> &'a str {
+        if let Some(path) = self.mirror_path.as_deref() {
+            return path;
+        }
+        if ctx.mesh_route_dispatch_matched
+            && let Some(path) = ctx.route_override_path.as_deref()
+        {
+            return path;
+        }
+        ctx.authorized_backend_path().unwrap_or(&ctx.path)
     }
 
     /// Build the full mirror URL from the configured or gateway-selected path.
@@ -540,10 +643,10 @@ impl Plugin for RequestMirror {
             return PluginResult::Continue;
         }
 
-        // When backend-path policy is active, mirror the exact path that passed
-        // final authorization. Falling back to the ordinary client path keeps
-        // the established behavior for proxies without that policy boundary.
-        let mirror_path = ctx.authorized_backend_path().unwrap_or(&ctx.path);
+        // Mirror the final route-selected path without consuming the override
+        // that primary dispatch still needs. An explicit operator mirror_path
+        // remains authoritative.
+        let mirror_path = self.select_mirror_path(ctx);
         // Match primary backend query construction: start from the retained raw
         // query, then apply auth credential strips marked on the context.
         // Decoded `request_transformer` query-map mutations are intentionally
@@ -569,11 +672,26 @@ impl Plugin for RequestMirror {
         // backend. Apply the canonical secondary-request sanitizer (hop-by-hop,
         // Connection-listed, framing, proxy-owned forwarding identity, Host
         // strip) before any mirror-specific exclusions.
+        let mesh_shadow_host = if ctx.mesh_route_dispatch_matched {
+            ctx.route_override_authority
+                .as_deref()
+                .or_else(|| request_host_header(headers))
+                .filter(|authority| !authority.is_empty())
+                .map(append_shadow_host_suffix)
+        } else {
+            None
+        };
         let mut mirror_headers = filter_secondary_request_headers(
             headers,
             SecondaryRequestHostPolicy::Strip,
             &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
         );
+        if let Some(shadow_host) = mesh_shadow_host {
+            // Keep the configured mirror URL as the dial/TLS identity. Only
+            // the application Host/:authority follows Envoy's route-local
+            // shadow contract.
+            mirror_headers.push(("host".to_string(), shadow_host));
+        }
         // gRPC mirrors need `te: trailers` after the generic strip removes `te`.
         synthesize_grpc_te_trailers_if_needed(&mut mirror_headers);
         let is_native_grpc = mirror_headers.iter().any(|(name, value)| {
@@ -602,7 +720,8 @@ impl Plugin for RequestMirror {
                     "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
                     method, mirror_url_for_log
                 );
-                ctx.mirror_result_rx = Some(completed_mirror_result(mirror_failure_meta(
+                ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
+                    self.plugin_config_id.clone(),
                     mirror_url_for_log,
                     MIRROR_CONCURRENCY_DROP_ERROR,
                 )));
@@ -638,13 +757,17 @@ impl Plugin for RequestMirror {
         // collector waits for the task's update, but if the task is cancelled
         // or panics its sender closes and the fallback becomes the explicit
         // mirror outcome instead of disappearing from observability.
-        let task_fallback =
-            mirror_failure_meta(mirror_url_for_log.clone(), MIRROR_TASK_INCOMPLETE_ERROR);
+        let task_fallback = mirror_failure_meta(
+            self.plugin_config_id.clone(),
+            mirror_url_for_log.clone(),
+            MIRROR_TASK_INCOMPLETE_ERROR,
+        );
         let (tx, rx) = tokio::sync::watch::channel(Some(task_fallback));
-        ctx.mirror_result_rx = Some(rx);
+        ctx.push_mirror_result_rx(rx);
 
         let http_client = self.http_client.clone();
         let max_response_body_bytes = self.max_response_body_bytes;
+        let mirror_plugin_id = self.plugin_config_id.clone();
 
         // Fire-and-forget: spawn an async task to send the mirror request.
         // The main request proceeds immediately — mirror latency has zero
@@ -681,8 +804,8 @@ impl Plugin for RequestMirror {
 
             // Forward sanitized headers from the original (transformed) request.
             // The canonical secondary-request filter already removed hop-by-hop,
-            // Connection-listed, framing, proxy-owned forwarding, Host, and the
-            // reserved load-testing controls.
+            // Connection-listed, framing, proxy-owned forwarding, and Host
+            // fields.
             for (key, value) in &mirror_headers {
                 req_builder = req_builder.header(key.as_str(), value.as_str());
             }
@@ -754,6 +877,7 @@ impl Plugin for RequestMirror {
             let elapsed = start.elapsed();
 
             let meta = MirrorResponseMeta {
+                mirror_plugin_id,
                 mirror_target_url: mirror_url_for_log,
                 mirror_response_status_code: status_code,
                 mirror_response_size_bytes: response_size,
