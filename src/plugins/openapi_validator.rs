@@ -1922,6 +1922,13 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
                 "Multipart body exceeds {MAX_MULTIPART_PARTS} parts"
             ));
         }
+        // `find_mime_boundary` already consumes the delimiter line ending.
+        // Another line ending here is therefore an empty header block. Reject
+        // it before searching for a later separator, or a body line that looks
+        // like Content-Disposition could be promoted into the header section.
+        if segment.starts_with(b"\r\n") || segment.starts_with(b"\n") {
+            return Err("Malformed multipart part: empty header block".to_string());
+        }
         let Some((header_bytes, part_body)) = split_header_body(segment) else {
             return Err("Malformed multipart part: missing header/body separator".to_string());
         };
