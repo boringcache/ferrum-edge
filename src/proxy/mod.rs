@@ -24542,14 +24542,6 @@ async fn handle_proxy_request_inner(
     let pristine_streaming_grpc_web_trailers_only_terminal_metadata =
         (grpc_request_is_web_translated && streaming_h2_body_ended)
             .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
-    let pristine_streaming_grpc_web_terminal_names = (grpc_request_is_web_translated
-        && (streaming_h2_body_ended || streaming_h3_body_ended))
-        .then(|| {
-            response_headers
-                .keys()
-                .cloned()
-                .collect::<HashSet<String>>()
-        });
     let streaming_h3_header_content_length = match &response_body {
         ResponseBody::StreamingH3(_) => response_headers
             .get("content-length")
@@ -24561,6 +24553,14 @@ async fn handle_proxy_request_inner(
     // HEAD/204/304 are still covered by `streaming_dispatch_should_defer`.
     let streaming_h3_body_ended = matches!(&response_body, ResponseBody::StreamingH3(_))
         && streaming_h3_header_content_length == Some(0);
+    let pristine_streaming_grpc_web_terminal_names = (grpc_request_is_web_translated
+        && (streaming_h2_body_ended || streaming_h3_body_ended))
+        .then(|| {
+            response_headers
+                .keys()
+                .cloned()
+                .collect::<HashSet<String>>()
+        });
     let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
         && streaming_dispatch_should_defer(
             &proxy,
