@@ -1796,12 +1796,15 @@ pub struct RequestContext {
     /// the shared reject finalizer can remove transport-owned handshake fields
     /// after every ordered response hook without reclassifying or allocating.
     websocket_response_boundary: bool,
-    /// Semantic-cache embedding vector staged between `before_proxy` and
-    /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
-    /// vectors cannot enter transaction logs.
-    pub(crate) ai_semantic_cache_embedding: Option<Vec<f32>>,
-    /// Semantic-cache scope key paired with `ai_semantic_cache_embedding`.
-    pub(crate) ai_semantic_cache_scope_key: Option<String>,
+    /// Per-`ai_semantic_cache`-instance embedding vectors staged between
+    /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
+    /// high-dimensional vectors cannot enter transaction logs. The outer key is
+    /// a process-unique cache instance ID so sibling instances on one proxy
+    /// cannot overwrite or consume each other's staged vectors.
+    pub(crate) ai_semantic_cache_embeddings: HashMap<u64, Vec<f32>>,
+    /// Per-instance semantic-cache scope keys paired with
+    /// `ai_semantic_cache_embeddings`.
+    pub(crate) ai_semantic_cache_scope_keys: HashMap<u64, String>,
     /// OpenAPI validator operation matches staged between `before_proxy` and
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
@@ -2279,8 +2282,8 @@ impl RequestContext {
             request_http_flavor: HttpFlavor::Plain,
             original_accept_encoding: None,
             websocket_response_boundary: false,
-            ai_semantic_cache_embedding: None,
-            ai_semantic_cache_scope_key: None,
+            ai_semantic_cache_embeddings: HashMap::new(),
+            ai_semantic_cache_scope_keys: HashMap::new(),
             openapi_validator_matches: HashMap::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
@@ -2964,8 +2967,8 @@ impl RequestContext {
             request_http_flavor: self.request_http_flavor,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
-            ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
-            ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
+            ai_semantic_cache_embeddings: self.ai_semantic_cache_embeddings.clone(),
+            ai_semantic_cache_scope_keys: self.ai_semantic_cache_scope_keys.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
@@ -5296,7 +5299,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
@@ -5339,11 +5342,10 @@ pub mod priority {
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
-    /// Runs before reject-capable AI guardrails so blocked prompts can still be
-    /// staged for `always_capture_on_guardrail`, while final request-body hooks
-    /// refresh the capture after downstream redaction/transforms when traffic
-    /// continues.
-    pub const AI_TRANSCRIPT_AUDIT: u16 = 2924;
+    /// Runs before request deduplication and reject-capable AI guardrails so
+    /// cached replays and blocked prompts are staged for audit, while final
+    /// request-body hooks refresh the capture after downstream transforms.
+    pub const AI_TRANSCRIPT_AUDIT: u16 = 2740;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
     pub const WAF: u16 = 2930;
     pub const FAULT_INJECTION: u16 = 2940;
@@ -6811,6 +6813,17 @@ pub trait Plugin: Send + Sync {
     /// pay. Distinct from response-body buffering — a plugin that inspects a
     /// stream window-by-window does **not** buffer the whole body.
     fn requires_response_stream_hooks(&self) -> bool {
+        false
+    }
+
+    /// Run this plugin's stream-termination hook after ordinary termination
+    /// hooks, while preserving relative priority order within each group.
+    ///
+    /// Terminal observers that aggregate metadata from peer plugins use this
+    /// to see the final request context before the transaction summary is
+    /// cloned. This affects only the post-body terminal path, never request,
+    /// response, or inspector ordering.
+    fn defers_response_stream_termination_until_after_peers(&self) -> bool {
         false
     }
 

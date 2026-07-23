@@ -4,20 +4,70 @@
 to `api_chargeback`: use either plugin independently, or run both when you want
 the existing in-memory `/charges` view plus a durable event stream.
 
+## Durability Contract
+
+Durable (default) export treats a charge event as delivered only after ClickHouse
+returns HTTP 200 or 204 **and** a complete, empty acknowledgement body with no
+`X-ClickHouse-Exception-Code` header and no exception markers in the body.
+HTTP status alone is never treated as proof of success: ClickHouse can return
+200 with an exception in the body, and incomplete drains are ambiguous.
+
+Recommended async-insert settings wait for persistence:
+
+```json
+"insert_query_params": { "async_insert": "1", "wait_for_async_insert": "1" }
+```
+
+When `async_insert` is enabled and `wait_for_async_insert` is omitted, the sink
+pins `wait_for_async_insert=1` on the request instead of inheriting a potentially
+lossy ClickHouse user/profile default.
+
+`wait_for_async_insert=0` (and equivalent falsy values `false` / `no` / `off`)
+is rejected unless `clickhouse.allow_lossy_async_insert` is explicitly `true`.
+That named opt-in is intentionally separate from durable mode: ClickHouse may
+acknowledge a buffered async insert before it is persisted, so a later flush
+failure or crash can lose rows that the sink already counted as exported and
+removed from the spool. Use it only when that loss is acceptable.
+
+Spool replay deletes a file only after an unambiguous persistence-aware success
+result under the durable contract (or after the same complete empty ACK when the
+lossy opt-in is enabled). Timeouts, incomplete acknowledgement drains, and other
+ambiguous outcomes keep the spool file and retry with unchanged `event_id`
+values so `ReplacingMergeTree` deduplicates duplicate-safe retries.
+
 ## Modes
 
 `mode: per_event` emits one `ChargeEvent` for each chargeable HTTP-family
 transaction, stream disconnect, or WebSocket disconnect. This preserves
 transaction-level provenance and is the default.
 
-`mode: snapshot` keeps a local accumulator keyed by namespace, consumer, proxy,
-billable status, raw HTTP status, final gRPC status, and protocol. Every
-`snapshot.interval_secs`, it emits deltas since the last snapshot. Use this when
-event volume dominates ingest cost and aggregate reconciliation is sufficient.
-Snapshot mode requires `spool.enabled: true` because the accumulator advances
-after a delta is handed to the sink queue; the spool is the durable path when
-ClickHouse or the in-memory queue is unavailable. Idle snapshot keys are evicted
-after `snapshot.stale_entry_ttl_secs` and checked every
+`mode: snapshot` keeps a local accumulator whose **identity** is every
+exported categorical field on the resulting `ChargeEvent`:
+
+- `namespace`
+- `consumer_id`
+- `consumer_name` (empty segment when absent)
+- `proxy_id`
+- `proxy_name`
+- `route_id` (empty segment when absent)
+- billable `status_code`
+- raw `http_status_code` (empty when absent, e.g. stream/WebSocket)
+- final `grpc_status` (empty when absent; non-standard codes collapse to a
+  bounded sentinel)
+- `protocol` (`http`, `grpc`, `ws`, stream protocol labels, etc.)
+
+Delta emission, last-emitted bookkeeping, and stale-entry cleanup all use this
+same key. Display-name changes (consumer or proxy rename on reload) and
+distinct routes or protocols therefore produce separate snapshot rows instead of
+silently labeling a mixed aggregate with the first record's metadata.
+`request_id` and `trace_id` are omitted from snapshot events (they are
+per-transaction only). Every `snapshot.interval_secs`, the sink emits deltas
+since the last snapshot. Use this when event volume dominates ingest cost and
+aggregate reconciliation is sufficient. Snapshot mode requires
+`spool.enabled: true` because the accumulator advances after a delta is handed
+to the sink queue; the spool is the durable path when ClickHouse or the
+in-memory queue is unavailable. Idle snapshot keys are evicted after
+`snapshot.stale_entry_ttl_secs` and checked every
 `snapshot.cleanup_interval_secs`.
 
 Both modes use the same pricing fields as `api_chargeback`. At least one
@@ -57,8 +107,10 @@ mode with `spool.enabled=true`, and compatible `password_ref`/TLS settings.
 Constructor validation additionally enforces relationships OpenAPI 3.1 cannot
 express safely (notably `retry.max_delay_ms >= retry.initial_delay_ms` and the
 600000 ms worst-case cumulative inter-attempt delay budget),
-spool directory privacy, ClickHouse egress screening, and that a nonempty
-`password_ref` names a set `FERRUM_*` environment variable.
+spool directory privacy, ClickHouse egress screening, that a nonempty
+`password_ref` names a set `FERRUM_*` environment variable, and that
+`wait_for_async_insert` falsy values require
+`clickhouse.allow_lossy_async_insert=true`.
 
 ## ClickHouse Setup
 
@@ -105,7 +157,7 @@ bucket.
       "table": "charges_raw",
       "username": "ferrum_ingest",
       "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
-      "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "0" },
+      "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "1" },
       "timeout_ms": 5000
     },
     "batch": { "size": 500, "flush_interval_ms": 2000, "buffer_capacity": 50000 },
@@ -126,6 +178,17 @@ bucket.
     "pricing_version": "2026-01-rev3",
     "currency": "USD"
   }
+}
+```
+
+Fire-and-forget (lossy) async inserts require an explicit opt-in that cannot be
+confused with durable mode:
+
+```json
+"clickhouse": {
+  "url": "https://clickhouse.internal:8443",
+  "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "0" },
+  "allow_lossy_async_insert": true
 }
 ```
 
@@ -173,14 +236,15 @@ split, or skip a file:
 
 | Outcome | Status / cause | Replay behavior |
 | --- | --- | --- |
-| Delivered | HTTP 200 / 204 | Remove the spool file after the accepted insert |
-| Retryable | network / timeout / TLS transport errors, HTTP 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
+| Delivered | HTTP 200 / 204 with a complete empty acknowledgement body and no exception header/markers | Remove the spool file after the accepted insert |
+| Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
 | Payload too large | HTTP 413 | Deterministically split the JSONEachRow body (preferring `batch.size`, otherwise halving) and retry each part without rewriting row bytes, so each event keeps its stable `event_id` idempotency identity. A single row that still returns 413 is dead-lettered |
-| Permanent | other HTTP 4xx (for example 400, 401, 403) | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
+| Permanent | other HTTP 4xx (for example 400, 401, 403), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
 
 Logs and error strings for these outcomes carry only safe metadata (plugin name,
-HTTP status code, reason class, row count, and file path). Response bodies,
-ClickHouse credentials, and charge-record fields are never logged.
+HTTP status code, reason class, row count, acknowledgement byte length class,
+and file path). Response bodies, ClickHouse credentials, and charge-record
+fields are never logged.
 
 ### Quarantine and dead-letter
 

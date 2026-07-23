@@ -1945,6 +1945,16 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
         let Some(name) = params.get("name").filter(|value| !value.is_empty()) else {
             return Err("Malformed multipart part: missing form-data name".to_string());
         };
+        // RFC 7578 form-data uses `filename`; silently treating RFC 2231/5987
+        // extended filename parameters as an ordinary non-file field would
+        // re-enable structured JSON/XML body spoofing. Reject unsupported
+        // extended/continued forms instead of dropping their file semantics.
+        if params.keys().any(|key| key.starts_with("filename*")) {
+            return Err(
+                "Malformed multipart part: extended filename parameters are unsupported"
+                    .to_string(),
+            );
+        }
         if name.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err("Multipart form-data name exceeds size limit".to_string());
         }
@@ -2489,6 +2499,7 @@ fn multipart_parts_to_schema_object(
         if schema_accepts_object(property_schema)
             && let Some(values) = parts.get(property)
             && values.len() == 1
+            && values[0].filename.is_none()
             && is_structured_multipart_object_part(&values[0])
         {
             consumed_keys.insert(property.clone());
@@ -2819,10 +2830,11 @@ fn multipart_part_to_schema_value(
     }
 
     if schema_accepts_object(schema) || schema.get("properties").is_some() {
-        if let Some(media_type) = part
-            .content_type
-            .as_deref()
-            .and_then(|value| content_type_base(Some(value)).map(str::to_ascii_lowercase))
+        if part.filename.is_none()
+            && let Some(media_type) = part
+                .content_type
+                .as_deref()
+                .and_then(|value| content_type_base(Some(value)).map(str::to_ascii_lowercase))
         {
             if is_json_media_type(&media_type) {
                 return serde_json::from_slice(&part.body).map_err(|error| {

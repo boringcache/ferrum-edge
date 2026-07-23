@@ -1441,6 +1441,15 @@ paths:
         still overflows, this endpoint returns HTTP 500 with an explicit error
         object instead of JSON `null` or Prometheus `inf`.
 
+        `proxy_name` is live display metadata for the stable `proxy_id` and is
+        not part of the registry key, so name-only reloads keep accumulated
+        counter values. Both formats resolve active IDs through the same
+        snapshot of the published configuration, so late retired-generation
+        traffic cannot restore an old name. As a Prometheus label, a rename
+        creates a controlled label transition whose new series carries the
+        existing cumulative value. Overlapping pricing generations collapse
+        under that authoritative current name.
+
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
       tags: [Metrics]
@@ -17500,8 +17509,11 @@ components:
         request-only markers, and proxy-owned X-Forwarded-* identity); these
         forwarding fields are stripped rather than regenerated, so mirrors do
         not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
-        the mirror URL. Native gRPC mirrors require HTTP/2 and re-synthesise te:
-        trailers. The mirror request-target preserves the raw query (after the
+        the mirror URL. Native gRPC mirrors re-synthesise te: trailers and dial
+        via the shared PluginHttpClient HTTP/2 companion (h2c prior knowledge for
+        cleartext http targets; ALPN h2 for https). Ordinary HTTP mirrors keep
+        the default all-version client so HTTP/1.1 destinations continue to work.
+        The mirror request-target preserves the raw query (after the
         same auth credential strips as primary) including repeated pairs,
         order, flags, empty values, +, percent escapes, and non-ASCII encoded
         bytes.
@@ -17521,7 +17533,11 @@ components:
           type: string
           enum: [http, https]
           default: http
-          description: "Transport protocol used for the mirror request."
+          description: >
+            Transport scheme for the mirror URL. For native gRPC content-types,
+            http uses cleartext HTTP/2 prior knowledge (h2c) and https negotiates
+            ALPN h2 via the shared plugin HTTP/2 companion. Ordinary HTTP mirrors
+            retain the default all-version client (HTTP/1.1 capable).
         mirror_path:
           type: string
           pattern: '^$|^/[^?#]*$'
@@ -18198,13 +18214,13 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
           enum: [metadata_only, redacted_body, full_body, hash_only]
           default: redacted_body
-          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts — SSE captures whose frames are all parseable OpenAI chat.completion.chunk frames export a reassembled per-choice completion-text excerpt (annotated sse_reassembled) so PII split across streaming deltas cannot evade per-frame redaction; other SSE shapes keep the per-frame-redacted raw frames. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256 (a mostly-predictable payload around one secret would make an unkeyed digest an offline brute-force oracle)."
+          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Other or malformed SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
         allow_full_body:
           type: boolean
           default: false
@@ -18249,6 +18265,7 @@ components:
             always_capture_on_guardrail:
               type: boolean
               default: true
+              description: "Override a losing sampling roll for a fired guardrail. A non-empty ai_tool_governor.decision other than allow (deny, dry_run, require_approval, or redact_args) fires this override on request, buffered-response, and terminal-stream paths; ordinary allow does not. Exported guardrails include bounded ai_tool_governor.enabled, mode, decision, tool_names, risk, policy_ids, approval_id, arguments_hashes, and redacted_tools fields."
             always_capture_on_error:
               type: boolean
               default: true
@@ -18260,7 +18277,7 @@ components:
         redaction:
           type: [object, "null"]
           additionalProperties: false
-          description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
+          description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt). redacted_body also replaces values beneath normalized sensitive parent keys and recursively redacts JSON-encoded object/array strings before applying regex patterns."
           properties:
             builtins:
               type: array
@@ -18312,7 +18329,7 @@ components:
           type: object
           required: [endpoint_url]
           additionalProperties: false
-          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Unknown sink keys are rejected; custom_headers remains an open string map."
+          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map."
           properties:
             type:
               type: string
@@ -18321,7 +18338,11 @@ components:
             endpoint_url:
               type: string
               format: uri
-              description: "http(s) collector URL."
+              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true."
+            allow_insecure_loopback:
+              type: boolean
+              default: false
+              description: "Allow an http:// collector only when endpoint_url uses localhost or a loopback IP. This never permits remote cleartext delivery."
             custom_headers:
               type: object
               additionalProperties:
@@ -18357,12 +18378,12 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue is full (never block). reject: fail selected buffered or streaming audit records with 503 before response commit when a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
+              description: "drop: silently drop when the queue or 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail selected buffered or streaming audit records with 503 before response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
           type: [object, "null"]
           additionalProperties: false
@@ -18697,10 +18718,15 @@ components:
         Unknown or ambiguous JSON shapes bypass caching. Exact-match
         normalization is enabled by default; optional semantic similarity uses
         a configured embedding provider and a local HNSW vector index.
-        Supports local DashMap and Redis exact-response storage. Unknown root,
-        semantic-policy, and Redis sync keys are rejected at admission with
-        path-qualified diagnostics (registration policy KeepLastKnownGood).
-        There are no intentionally open maps.
+        Supports local DashMap and Redis exact-response storage. Multiple
+        instances on one proxy namespace request staging metadata under
+        ai_semantic_cache.<instance_id>.* and keep embedding/scope vectors in
+        per-instance RequestContext maps so differing key policies and
+        semantic/non-semantic combinations remain independent across priority
+        order and reload generations. Unknown root, semantic-policy, and Redis
+        sync keys are rejected at admission with path-qualified diagnostics
+        (registration policy KeepLastKnownGood). There are no intentionally
+        open maps.
       properties:
         ttl_seconds:
           type: integer
@@ -20298,6 +20324,15 @@ components:
         Unknown top-level keys and unknown `pricing_tiers[]` keys are
         rejected so a misspelled pricing dimension cannot silently bill
         at zero.
+        Exactly-once accounting: after scope merging, each proxy may retain
+        at most one effective `api_chargeback` instance. Multiple proxy-scoped,
+        proxy-group-scoped, or mixed attachments on one proxy are rejected
+        because the process-global `/charges` registry has no ledger/instance
+        dimension. Distinct proxies may each attach one instance (including
+        different currencies/pricing). Shared render/cleanup tunables
+        (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
+        `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`) must
+        agree across every enabled instance in the process.
       properties:
         currency:
           type: string
@@ -20382,19 +20417,32 @@ components:
         render_cache_ttl_seconds:
           type: integer
           default: 5
-          description: How long the cached /charges response is served before rebuilding.
+          description: |
+            How long the cached /charges response is served before rebuilding.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
         stale_entry_ttl_seconds:
           type: integer
           default: 3600
-          description: How long idle chargeback entries live before eviction.
+          description: |
+            How long idle chargeback entries live before eviction.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
         cache_invalidation_min_age_ms:
           type: integer
           default: 500
-          description: Minimum age (ms) of the render cache before record() will invalidate it.
+          description: |
+            Minimum age (ms) of the render cache before record() will invalidate
+            it. Process-global: every enabled api_chargeback instance must use
+            the same value.
         cleanup_interval_seconds:
           type: integer
           default: 300
-          description: How often (seconds) the background task evicts entries that have been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
+          description: |
+            How often (seconds) the background task evicts entries that have
+            been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
 
     ApiChargebackSinkConfig:
       type: object
@@ -20409,7 +20457,11 @@ components:
         status for pricing. Native gRPC and translated gRPC-Web use the final
         normalized grpc-status mapped to the canonical effective HTTP status.
         Durable events preserve that billable status, the raw HTTP status, and
-        the normalized gRPC status separately.
+        the normalized gRPC status separately. Snapshot mode aggregates by every
+        exported categorical dimension (namespace, consumer_id, consumer_name,
+        proxy_id, proxy_name, route_id, billable status, raw HTTP status, final
+        gRPC status, and protocol) so mixed route/protocol/name traffic cannot
+        be labeled with first-record metadata.
 
         At least one nonempty pricing dimension must be configured with the same
         semantics as runtime `PricingConfig::has_any_pricing`: a nonempty
@@ -20433,7 +20485,9 @@ components:
         must not exceed 600000 ms;
         nonempty `password_ref` must name a set `FERRUM_*` process environment
         variable; spool directory privacy/permissions
-        (`ensure_private_dir`); ClickHouse URL egress IP screening; and
+        (`ensure_private_dir`); ClickHouse URL egress IP screening;
+        `wait_for_async_insert` falsy values require
+        `clickhouse.allow_lossy_async_insert=true`; and
         whitespace-only trimming for `currency` / `pricing_version` /
         `password_ref`. File, Admin, and CP-DP admission all invoke the same
         plugin constructor validation path.
@@ -20538,7 +20592,16 @@ components:
           type: string
           enum: [per_event, snapshot]
           default: per_event
-          description: Export one event per transaction or periodic snapshot deltas. Snapshot mode requires spool.enabled=true for durable delta delivery.
+          description: |
+            Export one event per transaction or periodic snapshot deltas.
+            Snapshot mode requires spool.enabled=true for durable delta delivery.
+            Snapshot accumulator identity is every exported categorical field:
+            namespace, consumer_id, consumer_name (empty when absent), proxy_id,
+            proxy_name, route_id (empty when absent), billable status_code, raw
+            http_status_code, final grpc_status, and protocol. Delta emission,
+            last-emitted bookkeeping, and stale cleanup share that identity so
+            mixed routes, protocols, or display names cannot collapse into one
+            mislabeled aggregate.
         currency:
           type: string
           minLength: 1
@@ -20672,7 +20735,25 @@ components:
               additionalProperties:
                 type: string
               default: {}
-              description: Extra query parameters appended to the ClickHouse INSERT request, such as async_insert.
+              description: |
+                Extra query parameters appended to the ClickHouse INSERT request.
+                Durable mode rejects `wait_for_async_insert` values that disable
+                persistence waits (`0`, `false`, `no`, `off`) unless
+                `allow_lossy_async_insert` is true. Recommended durable settings
+                use `async_insert=1` with `wait_for_async_insert=1`. When
+                `async_insert` is enabled and the wait setting is omitted, the
+                sink pins `wait_for_async_insert=1` rather than inheriting the
+                ClickHouse user/profile default.
+            allow_lossy_async_insert:
+              type: boolean
+              default: false
+              description: |
+                Explicit fire-and-forget opt-in. When true, permits
+                `insert_query_params.wait_for_async_insert=0` (and equivalent
+                falsy values). ClickHouse may acknowledge buffered inserts before
+                persistence; spool deletion still follows a complete
+                exception-free HTTP acknowledgement, which is not a durability
+                proof in this mode. Default false keeps the durable contract.
             timeout_ms:
               type: integer
               minimum: 1
@@ -20803,7 +20884,8 @@ components:
             When `"mixed"`, any consumer whose proxies span more than one currency
             nulls its flat monetary totals and exposes `charges_by_currency`
             instead; never treat a mixed consumer's omitted/null totals as a
-            settlement amount.
+            settlement amount. An empty registry reports `"USD"` because no
+            recorded entry has an authoritative instance currency.
           example: "USD"
         generated_at:
           type: string
@@ -20875,6 +20957,17 @@ components:
                   properties:
                     proxy_name:
                       type: string
+                      description: |
+                        Live display name for the stable `proxy_id`. Not part of
+                        the in-memory chargeback key, so name-only reloads
+                        preserve accumulated counter values. JSON and Prometheus
+                        resolve active IDs through the same snapshot of the
+                        published configuration; late retired-generation traffic
+                        cannot restore an old name. As a Prometheus label, a
+                        rename creates a controlled label transition whose new
+                        series carries the existing cumulative value.
+                        Overlapping pricing generations collapse under that
+                        authoritative current name.
                     currency:
                       type: string
                       description: |

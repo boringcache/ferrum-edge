@@ -115,7 +115,7 @@ fn transcript_sink_config() -> Value {
         "mode": "metadata_only",
         "sink": {
             "type": "http",
-            "endpoint_url": "http://127.0.0.1:9/audit",
+            "endpoint_url": "https://127.0.0.1:9/audit",
             "batch_size": 1,
             "flush_interval_ms": 100
         }
