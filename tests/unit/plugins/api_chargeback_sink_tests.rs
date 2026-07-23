@@ -1915,7 +1915,10 @@ fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
             let events = emit_acc
                 .compute_deltas(&emit_cfg, "node-a", snap as i64, &format!("stress-{snap}"))
                 .expect("delta arithmetic must stay finite under stress");
-            let calls: u64 = events.iter().map(|event| event.call_count).sum();
+            let calls: u64 = events
+                .iter()
+                .map(|event| u64::from(event.call_count))
+                .sum();
             emit_calls.fetch_add(calls, Ordering::Relaxed);
         }
     });
@@ -1941,7 +1944,10 @@ fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
     let final_events = accumulator
         .compute_deltas(&config, "node-a", 9_999, "stress-final")
         .expect("final delta");
-    let final_calls: u64 = final_events.iter().map(|event| event.call_count).sum();
+    let final_calls: u64 = final_events
+        .iter()
+        .map(|event| u64::from(event.call_count))
+        .sum();
     emitted_calls.fetch_add(final_calls, Ordering::Relaxed);
 
     let recorded = recorded_calls.load(Ordering::Relaxed);
