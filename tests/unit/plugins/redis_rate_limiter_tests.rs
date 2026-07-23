@@ -857,7 +857,10 @@ async fn failover_observer_drop_releases_client_and_stops_task() {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(1)).await;
     }
-    assert!(observer.is_finished(), "drop must abort the failover observer");
+    assert!(
+        observer.is_finished(),
+        "drop must abort the failover observer"
+    );
     assert_eq!(
         weak.strong_count(),
         0,
