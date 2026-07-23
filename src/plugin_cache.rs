@@ -903,6 +903,22 @@ impl Plugin for PriorityOverridePlugin {
             .on_ws_frame(proxy_id, connection_id, direction, message)
             .await
     }
+    fn prepare_ws_frame_delivery(
+        &self,
+        message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<crate::plugins::WsFrameDeliveryObservation> {
+        self.inner.prepare_ws_frame_delivery(message)
+    }
+    fn emit_ws_frame_delivery(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        observation: crate::plugins::WsFrameDeliveryObservation,
+    ) {
+        self.inner
+            .emit_ws_frame_delivery(proxy_id, connection_id, direction, observation)
+    }
     fn requires_response_stream_hooks(&self) -> bool {
         self.inner.requires_response_stream_hooks()
     }

@@ -23,9 +23,20 @@ use tracing_subscriber::registry::LookupSpan;
 struct CapturedWsLog {
     preview: Option<String>,
     event: Option<String>,
+    outcome: Option<String>,
+    frame_type: Option<String>,
+    direction: Option<String>,
+    size_bytes: Option<u64>,
+    close_code: Option<u64>,
+    close_reason_len: Option<u64>,
     correlation_id: Option<String>,
     connection_id: Option<u64>,
     configured_level: Option<String>,
+    frames_c2b: Option<u64>,
+    frames_b2c: Option<u64>,
+    bytes_c2b: Option<u64>,
+    bytes_b2c: Option<u64>,
+    io_side: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -70,9 +81,20 @@ where
         self.events.lock().unwrap().push(CapturedWsLog {
             preview: visitor.preview,
             event: visitor.event,
+            outcome: visitor.outcome,
+            frame_type: visitor.frame_type,
+            direction: visitor.direction,
+            size_bytes: visitor.size_bytes,
+            close_code: visitor.close_code,
+            close_reason_len: visitor.close_reason_len,
             correlation_id: visitor.correlation_id,
             connection_id: visitor.connection_id,
             configured_level: visitor.configured_level,
+            frames_c2b: visitor.frames_c2b,
+            frames_b2c: visitor.frames_b2c,
+            bytes_c2b: visitor.bytes_c2b,
+            bytes_b2c: visitor.bytes_b2c,
+            io_side: visitor.io_side,
         });
     }
 }
@@ -81,50 +103,80 @@ where
 struct WsLogVisitor {
     preview: Option<String>,
     event: Option<String>,
+    outcome: Option<String>,
+    frame_type: Option<String>,
+    direction: Option<String>,
+    size_bytes: Option<u64>,
+    close_code: Option<u64>,
+    close_reason_len: Option<u64>,
     correlation_id: Option<String>,
     connection_id: Option<u64>,
     configured_level: Option<String>,
+    frames_c2b: Option<u64>,
+    frames_b2c: Option<u64>,
+    bytes_c2b: Option<u64>,
+    bytes_b2c: Option<u64>,
+    io_side: Option<String>,
 }
 
 impl tracing::field::Visit for WsLogVisitor {
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        if field.name() == "connection_id" {
-            self.connection_id = Some(value);
+        match field.name() {
+            "connection_id" => self.connection_id = Some(value),
+            "size_bytes" => self.size_bytes = Some(value),
+            "close_code" => self.close_code = Some(value),
+            "close_reason_len" => self.close_reason_len = Some(value),
+            "frames_c2b" => self.frames_c2b = Some(value),
+            "frames_b2c" => self.frames_b2c = Some(value),
+            "bytes_c2b" => self.bytes_c2b = Some(value),
+            "bytes_b2c" => self.bytes_b2c = Some(value),
+            _ => {}
         }
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        if field.name() == "connection_id" && value >= 0 {
-            self.connection_id = Some(value as u64);
+        if value >= 0 {
+            self.record_u64(field, value as u64);
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "preview" {
-            self.preview = Some(value.to_string());
-        } else if field.name() == "event" {
-            self.event = Some(value.to_string());
-        } else if field.name() == "correlation_id" {
-            self.correlation_id = Some(value.to_string());
-        } else if field.name() == "configured_level" {
-            self.configured_level = Some(value.to_string());
+        match field.name() {
+            "preview" => self.preview = Some(value.to_string()),
+            "event" => self.event = Some(value.to_string()),
+            "outcome" => self.outcome = Some(value.to_string()),
+            "frame_type" => self.frame_type = Some(value.to_string()),
+            "direction" => self.direction = Some(value.to_string()),
+            "correlation_id" => self.correlation_id = Some(value.to_string()),
+            "configured_level" => self.configured_level = Some(value.to_string()),
+            "io_side" => self.io_side = Some(value.to_string()),
+            _ => {}
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "preview" {
-            self.preview = Some(format!("{value:?}").trim_matches('"').to_string());
-        } else if field.name() == "event" {
-            self.event = Some(format!("{value:?}").trim_matches('"').to_string());
-        } else if field.name() == "correlation_id" {
-            self.correlation_id = Some(format!("{value:?}").trim_matches('"').to_string());
-        } else if field.name() == "configured_level" {
-            self.configured_level = Some(format!("{value:?}").trim_matches('"').to_string());
-        } else if field.name() == "connection_id" {
-            let rendered = format!("{value:?}").trim_matches('"').to_string();
-            if let Ok(parsed) = rendered.parse::<u64>() {
-                self.connection_id = Some(parsed);
+        let rendered = format!("{value:?}").trim_matches('"').to_string();
+        match field.name() {
+            "preview" => self.preview = Some(rendered),
+            "event" => self.event = Some(rendered),
+            "outcome" => self.outcome = Some(rendered),
+            "frame_type" => self.frame_type = Some(rendered),
+            "direction" => self.direction = Some(rendered),
+            "correlation_id" => self.correlation_id = Some(rendered),
+            "configured_level" => self.configured_level = Some(rendered),
+            "io_side" => self.io_side = Some(rendered),
+            "connection_id" => {
+                if let Ok(parsed) = rendered.parse::<u64>() {
+                    self.connection_id = Some(parsed);
+                }
             }
+            "size_bytes" | "close_code" | "close_reason_len" | "frames_c2b" | "frames_b2c"
+            | "bytes_c2b" | "bytes_b2c" => {
+                if let Ok(parsed) = rendered.parse::<u64>() {
+                    self.record_u64(field, parsed);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -195,14 +247,16 @@ fn disconnect_context_with_id(
 }
 
 async fn log_frame(plugin: &WsFrameLogging, connection_id: u64, message: &Message) {
-    plugin
-        .on_ws_frame(
+    // Ordinary frames emit only on the post-delivery path (prepare + emit),
+    // matching the shared H1/H2/H3 relay success boundary.
+    if let Some(observation) = plugin.prepare_ws_frame_delivery(message) {
+        plugin.emit_ws_frame_delivery(
             "test-proxy",
             connection_id,
             WebSocketFrameDirection::ClientToBackend,
-            message,
-        )
-        .await;
+            observation,
+        );
+    }
 }
 
 fn assert_fingerprint_shape(preview: &str, len: usize) {
@@ -1067,5 +1121,209 @@ async fn explicit_levels_respect_gateway_filter_combinations() {
             visible, expect_visible,
             "plugin={plugin_level} filter={filter}: visibility={visible}, expected={expect_visible}"
         );
+    }
+}
+
+// === Delivery-accurate frame logging (#2554 / #2556 / #2563) ===
+
+#[tokio::test(flavor = "current_thread")]
+async fn on_ws_frame_does_not_emit_ordinary_frames_before_delivery() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+    let msg = Message::Text("not-yet-delivered".into());
+
+    let result = plugin
+        .on_ws_frame(
+            "test-proxy",
+            9,
+            WebSocketFrameDirection::ClientToBackend,
+            &msg,
+        )
+        .await;
+    assert!(result.is_none());
+    assert!(
+        capture.events().is_empty(),
+        "ordinary frames must not emit from on_ws_frame: {:?}",
+        capture.events()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delivered_frame_emits_outcome_delivered_after_prepare_emit() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+    log_frame(&plugin, 3, &Message::Text("hello".into())).await;
+
+    let events = capture.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].outcome.as_deref(), Some("delivered"));
+    assert_eq!(events[0].frame_type.as_deref(), Some("text"));
+    assert_eq!(events[0].size_bytes, Some(5));
+    assert!(events[0].event.is_none());
+    assert!(events[0].close_code.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_close_delivery_logs_code_and_reason_len_without_raw_reason() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+    let secret_reason = "password=supersecret-close-reason";
+    let msg = Message::Close(Some(CloseFrame {
+        code: CloseCode::Normal,
+        reason: secret_reason.into(),
+    }));
+
+    log_frame(&plugin, 11, &msg).await;
+
+    let events = capture.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].outcome.as_deref(), Some("delivered"));
+    assert_eq!(events[0].frame_type.as_deref(), Some("close"));
+    assert_eq!(events[0].close_code, Some(1000));
+    assert_eq!(events[0].close_reason_len, Some(secret_reason.len() as u64));
+    assert_eq!(
+        events[0].size_bytes,
+        Some(2 + secret_reason.len() as u64),
+        "size_bytes must include the 2-byte status code"
+    );
+    let rendered = format!("{:?}", events[0]);
+    assert!(
+        !rendered.contains("supersecret"),
+        "raw Close reason must never appear in the log capture: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn policy_close_emits_from_on_ws_frame_with_distinct_outcome() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+    let msg = Message::Close(Some(CloseFrame {
+        code: CloseCode::Policy,
+        reason: "rate exceeded".into(),
+    }));
+
+    let result = plugin
+        .on_ws_frame(
+            "test-proxy",
+            12,
+            WebSocketFrameDirection::BackendToClient,
+            &msg,
+        )
+        .await;
+    assert!(result.is_none());
+
+    let events = capture.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].outcome.as_deref(), Some("policy_close"));
+    assert_eq!(events[0].frame_type.as_deref(), Some("close"));
+    assert_eq!(events[0].close_code, Some(1008));
+    assert_eq!(
+        events[0].close_reason_len,
+        Some("rate exceeded".len() as u64)
+    );
+    assert_eq!(events[0].direction.as_deref(), Some("backend->client"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn discarded_prepare_without_emit_produces_no_frame_event() {
+    // Models cancel / write-failure: observation is prepared then dropped.
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+    let prepared = plugin.prepare_ws_frame_delivery(&Message::Text("abandoned".into()));
+    assert!(prepared.is_some());
+    drop(prepared);
+    assert!(
+        capture.events().is_empty(),
+        "prepared-but-not-emitted observations must not log"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disconnect_emits_io_side_and_success_only_byte_totals() {
+    use ferrum_edge::_test_support::StreamIoSide;
+    use ferrum_edge::plugins::Direction;
+    use ferrum_edge::retry::ErrorClass;
+
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+
+    let mut ctx = disconnect_context_with_id(77, HashMap::new());
+    ctx.frames_client_to_backend = 4;
+    ctx.frames_backend_to_client = 2;
+    ctx.bytes_client_to_backend = 40;
+    ctx.bytes_backend_to_client = 20;
+    ctx.direction = Some(Direction::BackendToClient);
+    ctx.io_side = Some(StreamIoSide::Write);
+    ctx.error_class = Some(ErrorClass::ClientDisconnect);
+
+    plugin.on_ws_disconnect(&ctx).await;
+
+    let event = capture
+        .events()
+        .into_iter()
+        .find(|e| e.event.as_deref() == Some("disconnect"))
+        .expect("disconnect event");
+    assert_eq!(event.connection_id, Some(77));
+    assert_eq!(event.frames_c2b, Some(4));
+    assert_eq!(event.frames_b2c, Some(2));
+    assert_eq!(event.bytes_c2b, Some(40));
+    assert_eq!(event.bytes_b2c, Some(20));
+    assert_eq!(event.io_side.as_deref(), Some("write"));
+    assert_eq!(event.direction.as_deref(), Some("backend_to_client"));
+
+    // Clean close / unknown side uses explicit "none".
+    let capture2 = WsLogCapture::default();
+    let _guard2 = install_ws_log_capture(&capture2);
+    let clean = disconnect_context_with_id(78, HashMap::new());
+    plugin.on_ws_disconnect(&clean).await;
+    let clean_event = capture2
+        .events()
+        .into_iter()
+        .find(|e| e.event.as_deref() == Some("disconnect"))
+        .expect("clean disconnect");
+    assert_eq!(clean_event.io_side.as_deref(), Some("none"));
+    assert_eq!(clean_event.bytes_c2b, Some(4));
+    assert_eq!(clean_event.bytes_b2c, Some(4));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn disconnect_schema_complete_at_each_configured_log_level() {
+    use ferrum_edge::_test_support::StreamIoSide;
+    use ferrum_edge::plugins::Direction;
+    use ferrum_edge::retry::ErrorClass;
+
+    for level in ["trace", "debug", "info", "warn"] {
+        let capture = WsLogCapture::default();
+        let _guard = install_filtered_ws_log_capture(level, &capture);
+        let plugin = WsFrameLogging::new(&json!({"log_level": level})).unwrap();
+        let mut ctx = disconnect_context_with_id(90, HashMap::new());
+        ctx.direction = Some(Direction::ClientToBackend);
+        ctx.io_side = Some(StreamIoSide::Read);
+        ctx.error_class = Some(ErrorClass::ConnectionReset);
+        ctx.bytes_client_to_backend = 8;
+        ctx.bytes_backend_to_client = 16;
+        plugin.on_ws_disconnect(&ctx).await;
+
+        let event = capture
+            .events()
+            .into_iter()
+            .find(|e| e.event.as_deref() == Some("disconnect"))
+            .unwrap_or_else(|| panic!("disconnect missing at level {level}"));
+        assert_eq!(event.io_side.as_deref(), Some("read"), "level={level}");
+        assert_eq!(event.bytes_c2b, Some(8), "level={level}");
+        assert_eq!(event.bytes_b2c, Some(16), "level={level}");
+        assert_eq!(event.connection_id, Some(90), "level={level}");
     }
 }
