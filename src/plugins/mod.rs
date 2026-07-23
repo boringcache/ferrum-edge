@@ -1298,6 +1298,30 @@ pub enum WebSocketFrameDirection {
     BackendToClient,
 }
 
+/// Precomputed, allocation-light observation for a frame that will be emitted
+/// only after the destination sink accepts the final post-plugin message.
+///
+/// The shared H1/H2/H3 relay prepares these **before** `send()` moves the
+/// message (so large payloads are never cloned solely for logging) and emits
+/// them only on the same success boundary as the per-direction frame/byte
+/// counters. Cancelled or failed sends discard the prepared observation.
+#[derive(Debug, Clone)]
+pub struct WsFrameDeliveryObservation {
+    /// Stable frame-type label (`text`, `binary`, `ping`, `pong`, `close`, `frame`).
+    pub frame_type: &'static str,
+    /// Operator-visible size. For Close frames with a status code this is
+    /// `2 + reason.len()` (status code bytes plus reason); Close without a
+    /// code is `0`. Application Close reasons are never logged in the clear.
+    pub size_bytes: usize,
+    /// Optional keyed payload fingerprint for Text/Binary only.
+    pub preview: Option<String>,
+    /// RFC 6455 close status code when `frame_type == "close"` and a code was
+    /// present. Never accompanied by the raw reason string.
+    pub close_code: Option<u16>,
+    /// UTF-8 reason byte length when a Close code was present.
+    pub close_reason_len: Option<usize>,
+}
+
 /// Context passed to `on_ws_disconnect` when a WebSocket session ends.
 ///
 /// Mirrors the information made available on `StreamTransactionSummary`
@@ -1337,14 +1361,22 @@ pub struct WsDisconnectContext {
     /// Total session lifetime in milliseconds (upgrade → close).
     pub duration_ms: f64,
     /// Number of frames proxied from client toward backend.
+    /// Success-only: incremented after the destination sink accepts a forward
+    /// (including successfully forwarded peer Close frames). Cancelled or
+    /// failed writes and plugin policy Closes that never complete a counted
+    /// forward are omitted.
     pub frames_client_to_backend: u64,
     /// Number of frames proxied from backend toward client.
+    /// Success-only; see [`Self::frames_client_to_backend`].
     pub frames_backend_to_client: u64,
     /// Total payload bytes proxied from client toward backend over the
     /// lifetime of this WebSocket session.
+    /// Success-only and aligned with `ws_frame_logging` `size_bytes` (Close
+    /// frames with a status code contribute `2 + reason.len()`).
     pub bytes_client_to_backend: u64,
     /// Total payload bytes proxied from backend toward client over the
     /// lifetime of this WebSocket session.
+    /// Success-only; see [`Self::bytes_client_to_backend`].
     pub bytes_backend_to_client: u64,
     /// Wall-clock session start (RFC3339). Captured at upgrade and carried
     /// through delayed `ws_logging` delivery so collectors do not depend on
@@ -1823,14 +1855,16 @@ pub struct RequestContext {
     /// bounded by the configured deduplication instances on the matched proxy.
     pub(crate) request_deduplication_states:
         HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
-    /// Whether `request_deduplication` supplied an already-finalized committed
-    /// representation for this request. The shared synthetic rejection path
-    /// must not run ordinary presentation transforms over it again. Inspection
-    /// and final-body validation still run over the replayed client
-    /// representation, and a current redaction decision can require its own
-    /// transform or fail closed.
-    /// Kept private so request metadata cannot suppress response inspection.
-    pub(crate) deduplication_replay_response_finalized: bool,
+    /// Whether this request is replaying an already-finalized client
+    /// representation — a `response_caching` HIT/REVALIDATED or a
+    /// `request_deduplication` idempotent replay. The shared synthetic
+    /// rejection path must not run ordinary presentation transforms (body or
+    /// response-header rewrite rules) over it again. Inspection and final-body
+    /// validation still run over the replayed client representation, and a
+    /// current redaction decision can require its own transform or fail closed.
+    /// Kept private so request metadata cannot suppress transforms or inspection,
+    /// and unrelated synthetic short-circuits cannot opt into the skip.
+    pub(crate) finalized_response_replay: bool,
     /// Deduplication instances whose in-flight ownership can be released after
     /// a serverless rejection proven to occur before external invocation. Each
     /// committed hook consumes only its own entry, preserving exactly-once
@@ -2256,7 +2290,7 @@ impl RequestContext {
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
-            deduplication_replay_response_finalized: false,
+            finalized_response_replay: false,
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
@@ -2941,7 +2975,7 @@ impl RequestContext {
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
-            deduplication_replay_response_finalized: self.deduplication_replay_response_finalized,
+            finalized_response_replay: self.finalized_response_replay,
             serverless_pre_invocation_rejection_owners: self
                 .serverless_pre_invocation_rejection_owners
                 .clone(),
@@ -6317,7 +6351,8 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Whether this plugin's response inspection just determined that its
-    /// transform is required to make an already-finalized deduplication replay
+    /// transform is required to make an already-finalized response replay
+    /// (`response_caching` HIT/REVALIDATED or `request_deduplication` replay)
     /// safe under current policy.
     ///
     /// Ordinary presentation transforms do not run twice over replayed bytes.
@@ -6582,6 +6617,12 @@ pub trait Plugin: Send + Sync {
     /// is preserved for the rest of the chain: later mutating plugins are not
     /// invoked for that frame, and observational hooks
     /// ([`Plugin::observes_ws_frame_decisions`]) may still see the final Close.
+    ///
+    /// Delivery-accurate frame logging must use
+    /// [`Plugin::prepare_ws_frame_delivery`] /
+    /// [`Plugin::emit_ws_frame_delivery`] instead of emitting from this hook:
+    /// this chain runs before the control-frame guard and before the destination
+    /// sink accepts the write.
     async fn on_ws_frame(
         &self,
         _proxy_id: &str,
@@ -6590,6 +6631,31 @@ pub trait Plugin: Send + Sync {
         _message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
         None
+    }
+
+    /// Prepare a deferred delivery observation from the final post-plugin,
+    /// post-control-guard message **before** the destination `send()` moves it.
+    ///
+    /// Return `Some` only when this plugin will emit after a successful sink
+    /// accept. The relay discards prepared observations on cancel/write failure
+    /// so frame logs share the success-only boundary with `frames_*` /
+    /// `bytes_*` counters. Default: no observation.
+    fn prepare_ws_frame_delivery(
+        &self,
+        _message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<WsFrameDeliveryObservation> {
+        None
+    }
+
+    /// Emit a previously prepared delivery observation after the destination
+    /// sink accepted the frame. Must not mutate protocol state.
+    fn emit_ws_frame_delivery(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
+        _observation: WsFrameDeliveryObservation,
+    ) {
     }
 
     /// Returns `true` if this plugin needs per-chunk inspection of *streaming*

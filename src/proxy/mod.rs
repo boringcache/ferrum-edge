@@ -11606,11 +11606,82 @@ fn ws_message_payload_bytes(msg: &Message) -> u64 {
         Message::Text(t) => t.len() as u64,
         Message::Binary(b) => b.len() as u64,
         Message::Ping(b) | Message::Pong(b) => b.len() as u64,
-        Message::Close(opt) => opt
-            .as_ref()
-            .map(|frame| frame.reason.len() as u64)
-            .unwrap_or(0),
+        // Close with a status code: 2 status bytes + UTF-8 reason length.
+        // Matches `ws_frame_logging` `size_bytes` so success-only byte totals
+        // reconcile with delivered Close frame events. Raw reason text is never
+        // retained here.
+        Message::Close(Some(frame)) => 2u64.saturating_add(frame.reason.len() as u64),
+        Message::Close(None) => 0,
         Message::Frame(_) => 0,
+    }
+}
+
+/// Prepare deferred delivery observations from the final post-plugin message
+/// before `send()` moves it. Empty when no plugin wants a delivery record.
+pub(crate) enum WsFrameDeliveryBatch {
+    None,
+    One(usize, crate::plugins::WsFrameDeliveryObservation),
+    Many(Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>),
+}
+
+impl WsFrameDeliveryBatch {
+    fn push(&mut self, index: usize, observation: crate::plugins::WsFrameDeliveryObservation) {
+        let previous = std::mem::replace(self, Self::None);
+        *self = match previous {
+            Self::None => Self::One(index, observation),
+            Self::One(first_index, first_observation) => {
+                Self::Many(vec![(first_index, first_observation), (index, observation)])
+            }
+            Self::Many(mut entries) => {
+                entries.push((index, observation));
+                Self::Many(entries)
+            }
+        };
+    }
+}
+
+pub(crate) fn prepare_ws_frame_deliveries(
+    plugins: &[Arc<dyn Plugin>],
+    message: &Message,
+) -> WsFrameDeliveryBatch {
+    if plugins.is_empty() {
+        return WsFrameDeliveryBatch::None;
+    }
+    // The normal deployment has one ws_frame_logging instance. Keep that path
+    // stack-only; allocate only when multiple delivery observers are configured.
+    let mut out = WsFrameDeliveryBatch::None;
+    for (index, plugin) in plugins.iter().enumerate() {
+        if let Some(observation) = plugin.prepare_ws_frame_delivery(message) {
+            out.push(index, observation);
+        }
+    }
+    out
+}
+
+/// Emit previously prepared delivery observations after the destination sink
+/// accepted the frame. Discarded observations (cancel / write failure) must
+/// never reach this helper — that keeps frame logs on the same success boundary
+/// as `frames_*` / `bytes_*` counters.
+pub(crate) fn emit_ws_frame_deliveries(
+    plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
+    prepared: WsFrameDeliveryBatch,
+) {
+    let emit = |index: usize, observation: crate::plugins::WsFrameDeliveryObservation| {
+        if let Some(plugin) = plugins.get(index) {
+            plugin.emit_ws_frame_delivery(proxy_id, connection_id, direction, observation);
+        }
+    };
+    match prepared {
+        WsFrameDeliveryBatch::None => {}
+        WsFrameDeliveryBatch::One(index, observation) => emit(index, observation),
+        WsFrameDeliveryBatch::Many(entries) => {
+            for (index, observation) in entries {
+                emit(index, observation);
+            }
+        }
     }
 }
 
@@ -11628,7 +11699,7 @@ fn ws_control_kind(message: &Message) -> Option<WsControlKind> {
     }
 }
 
-fn guard_ws_control_transform(
+pub(crate) fn guard_ws_control_transform(
     original: &Message,
     transformed: Message,
     direction: WebSocketFrameDirection,
@@ -11652,7 +11723,13 @@ fn guard_ws_control_transform(
 /// later mutating plugins are skipped so they cannot charge budget or replace
 /// the Close, while observational hooks
 /// ([`Plugin::observes_ws_frame_decisions`]) still receive the final decision.
+/// The control-frame guard runs after the chain so Ping/Pong type flips are
+/// restored before any post-send delivery observation sees the message.
 /// Both relay directions and all H1/H2/H3 frontends share this helper.
+///
+/// Delivery-accurate frame logging uses [`prepare_ws_frame_deliveries`] /
+/// [`emit_ws_frame_deliveries`] after a successful sink accept — not this
+/// mutating chain — so cancelled or failed writes never appear as delivered.
 pub(crate) async fn apply_ws_frame_plugins(
     plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
@@ -12251,11 +12328,14 @@ where
                             // check); the send future is polled first on wakeup so successful
                             // sends pay no extra latency. No heap allocation, no timer wheel.
                             //
-                            // Snapshot the payload byte count before `send(outgoing)` moves
-                            // the frame into the future so the success-arm accounting still
-                            // has a usable value. `ws_message_payload_bytes` reads
-                            // `Message::len()`, no allocation.
+                            // Snapshot payload bytes and prepare delivery observations
+                            // before `send(outgoing)` moves the frame. Prepared logs are
+                            // emitted only on the success arm so they share the
+                            // success-only boundary with frame/byte counters; cancel and
+                            // write failure discard them (no "attempted" frame event).
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&ctb_plugins, &outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_ctb.cancelled() => {
@@ -12281,11 +12361,27 @@ where
                                         outgoing_payload_bytes,
                                         Ordering::Relaxed,
                                     );
+                                    emit_ws_frame_deliveries(
+                                        &ctb_plugins,
+                                        &proxy_id_ctb,
+                                        connection_id,
+                                        WebSocketFrameDirection::ClientToBackend,
+                                        delivery,
+                                    );
                                 }
                             }
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Client sent close frame");
+                            // Peer Close bypasses mutating admission hooks so a later
+                            // plugin cannot replace the peer's code/reason. Observational
+                            // delivery logging still records the forwarded Close after a
+                            // successful sink accept (exactly once; not double-counted
+                            // with policy_close records from plugin rejection).
+                            let close_msg = Message::Close(close_frame);
+                            let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&ctb_plugins, &close_msg);
                             // Race cancel in case the opposite direction already exited while
                             // we were decoding this Close frame. The send future is polled
                             // first after the cancel check so the happy path does not block.
@@ -12294,9 +12390,30 @@ where
                                 _ = cancel_ctb.cancelled() => {
                                     debug!("Client->backend: cancel fired during client-close forward");
                                 }
-                                res = backend_sink.send(Message::Close(close_frame)) => {
-                                    if let Err(e) = res {
-                                        error!("Failed to send close to backend: {}", e);
+                                res = backend_sink.send(close_msg) => {
+                                    match res {
+                                        Err(e) => {
+                                            error!("Failed to send close to backend: {}", e);
+                                            let _ = first_failure_ctb.set((
+                                                crate::plugins::Direction::ClientToBackend,
+                                                retry::classify_boxed_error(&e),
+                                                Some(tcp_proxy::StreamIoSide::Write),
+                                            ));
+                                        }
+                                        Ok(()) => {
+                                            frames_c2b_task.fetch_add(1, Ordering::Relaxed);
+                                            bytes_c2b_task.fetch_add(
+                                                outgoing_payload_bytes,
+                                                Ordering::Relaxed,
+                                            );
+                                            emit_ws_frame_deliveries(
+                                                &ctb_plugins,
+                                                &proxy_id_ctb,
+                                                connection_id,
+                                                WebSocketFrameDirection::ClientToBackend,
+                                                delivery,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -12438,10 +12555,11 @@ where
                             // otherwise block indefinitely. One atomic load per frame; send
                             // polled first so successful frames pay no extra latency.
                             //
-                            // Snapshot the payload byte count before `send(outgoing)` moves
-                            // the frame into the future so the success-arm accounting still
-                            // has a usable value.
+                            // Snapshot payload bytes and prepare delivery observations
+                            // before `send(outgoing)` moves the frame (mirror of c2b).
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&btc_plugins, &outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
@@ -12467,20 +12585,54 @@ where
                                         outgoing_payload_bytes,
                                         Ordering::Relaxed,
                                     );
+                                    emit_ws_frame_deliveries(
+                                        &btc_plugins,
+                                        &proxy_id_btc,
+                                        connection_id,
+                                        WebSocketFrameDirection::BackendToClient,
+                                        delivery,
+                                    );
                                 }
                             }
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Backend sent close frame");
+                            // Peer Close bypasses mutating hooks; observational delivery
+                            // logging records the forwarded Close after sink accept.
+                            let close_msg = Message::Close(close_frame);
+                            let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&btc_plugins, &close_msg);
                             // Race cancel in case c2b has already exited.
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
                                     debug!("Backend->client: cancel fired during backend-close forward");
                                 }
-                                res = ws_sink.send(Message::Close(close_frame)) => {
-                                    if let Err(e) = res {
-                                        error!("Failed to send close to client: {}", e);
+                                res = ws_sink.send(close_msg) => {
+                                    match res {
+                                        Err(e) => {
+                                            error!("Failed to send close to client: {}", e);
+                                            let _ = first_failure_btc.set((
+                                                crate::plugins::Direction::BackendToClient,
+                                                retry::classify_boxed_error(&e),
+                                                Some(tcp_proxy::StreamIoSide::Write),
+                                            ));
+                                        }
+                                        Ok(()) => {
+                                            frames_b2c_task.fetch_add(1, Ordering::Relaxed);
+                                            bytes_b2c_task.fetch_add(
+                                                outgoing_payload_bytes,
+                                                Ordering::Relaxed,
+                                            );
+                                            emit_ws_frame_deliveries(
+                                                &btc_plugins,
+                                                &proxy_id_btc,
+                                                connection_id,
+                                                WebSocketFrameDirection::BackendToClient,
+                                                delivery,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -14932,9 +15084,9 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     ) {
         let mut mandatory_replay_transform_failed = None;
         for plugin in plugins.iter() {
-            let mandatory_replay_transform = ctx.deduplication_replay_response_finalized
+            let mandatory_replay_transform = ctx.finalized_response_replay
                 && plugin.requires_replay_response_body_transform(ctx);
-            if ctx.deduplication_replay_response_finalized && !mandatory_replay_transform {
+            if ctx.finalized_response_replay && !mandatory_replay_transform {
                 continue;
             }
             let deadline = ctx.grpc_deadline_at();
