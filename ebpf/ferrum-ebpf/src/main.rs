@@ -23,6 +23,7 @@ mod getpeername4;
 mod getpeername6;
 mod maps;
 mod sock_ops;
+mod sock_ops_emit;
 mod tc_inbound;
 
 #[panic_handler]

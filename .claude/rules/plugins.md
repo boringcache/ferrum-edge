@@ -56,6 +56,10 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     - First terminal Close from an admission/mutating hook wins; later mutating
       plugins are skipped for that frame while observational hooks
       (`observes_ws_frame_decisions`) may still record the final decision.
+    - Delivery-accurate observers use `prepare_ws_frame_delivery` /
+      `emit_ws_frame_delivery` after the control-frame guard and a successful
+      destination sink accept (same success boundary as frame/byte counters).
+      Peer Close bypasses mutating hooks and is observed on that delivery path.
 14. `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
 15. `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`
 

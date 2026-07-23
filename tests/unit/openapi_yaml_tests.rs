@@ -5834,6 +5834,8 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
         "ProxyAlertsLatencyPercentileRule",
         "ProxyAlertsErrorClassRule",
         "ProxyAlertsStreamDisconnectCauseRule",
+        "ProxyAlertsGrpcStatusCountRule",
+        "ProxyAlertsGrpcStatusRateRule",
     ] {
         assert_eq!(
             spec["components"]["schemas"][rule]["unevaluatedProperties"],
@@ -6130,6 +6132,68 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
                 "threshold_percent": 5.0,
                 "channels": ["ops"]
             }]
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "name": "grpc_unavailable",
+            "type": "grpc_status_count",
+            "grpc_statuses": [14, "OTHER"],
+            "threshold_count": 10,
+            "channels": ["ops"]
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "name": "grpc_error_rate",
+            "type": "grpc_status_rate",
+            "grpc_statuses": [0, 14, 16],
+            "threshold_percent": 5.0,
+            "min_request_count": 20,
+            "channels": ["ops"]
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "name": "grpc_bad",
+            "type": "grpc_status_count",
+            "grpc_statuses": [17],
+            "threshold_count": 1,
+            "channels": ["ops"]
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "name": "grpc_http_bleed",
+            "type": "grpc_status_count",
+            "grpc_statuses": [14],
+            "status_codes": [500],
+            "threshold_count": 1,
+            "channels": ["ops"]
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsRule",
+        &json!({
+            "name": "grpc_lowercase_other",
+            "type": "grpc_status_count",
+            "grpc_statuses": ["other"],
+            "threshold_count": 1,
+            "channels": ["ops"]
         }),
         false,
     );

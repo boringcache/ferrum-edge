@@ -70,7 +70,7 @@ Unknown properties are rejected at the top level and within quiet-hours, recover
 |-------|---------|-------|
 | `enabled` | `true` | Master runtime switch. Must be a boolean when present; strings/null are rejected. |
 | `default_cooldown_seconds` | `300` | Per-rule fallback if `cooldown_seconds` is omitted; must be in `[1, 86400]`. Applied per `(rule, proxy, channel)` so one proxy's incident does not suppress another proxy that shares a global/group rule, while each channel still throttles independently. |
-| `default_min_request_count` | `50` | Per-rule fallback for `min_request_count` (used by `error_rate` and `latency_percentile`); must be at least `1`. Avoids noisy alerts from low-traffic windows. |
+| `default_min_request_count` | `50` | Per-rule fallback for `min_request_count` (used by `error_rate`, `latency_percentile`, and `grpc_status_rate`); must be at least `1`. Avoids noisy alerts from low-traffic windows. |
 | `default_window_seconds` | `60` | Per-rule fallback for `window_seconds`; must be in `[5, 3600]`. |
 | `default_resolved_window_seconds` | `300` | Per-rule fallback for `recovery.resolved_window_seconds`; must be in `[5, 86400]`. |
 | `max_concurrent_dispatches` | `8` | Bounded-concurrency semaphore for outbound notifications (`>= 1`). When exhausted, alerts are dropped with a `warn!` rather than queued. |
@@ -118,7 +118,42 @@ Fires when ≥ `threshold_percent` of the last `window_seconds` of HTTP requests
 }
 ```
 
-Fires when at least `threshold_count` requests with a status in `status_codes` occurred within `window_seconds`. HTTP-only. Useful for security signals (4xx auth-failure spikes).
+Fires when at least `threshold_count` requests with a status in `status_codes` occurred within `window_seconds`. HTTP-only. Useful for security signals (4xx auth-failure spikes). HTTP transport status stays independent of gRPC application outcome — use `grpc_status_count` / `grpc_status_rate` for terminal `grpc-status`.
+
+#### `grpc_status_count`
+
+```jsonc
+{
+  "name": "grpc_unavailable_burst",
+  "type": "grpc_status_count",
+  "grpc_statuses": [14, 13, "OTHER"],
+  "window_seconds": 60,
+  "threshold_count": 25,
+  "channels": ["ops_slack"],
+  "recovery": { "resolved_window_seconds": 300 },
+  "severity": "high"
+}
+```
+
+Fires when at least `threshold_count` completed gRPC transactions carried a terminal application status matching `grpc_statuses` within `window_seconds`. Entries are standard numeric codes `0..=16`, or the string `"OTHER"` for malformed / future out-of-range codes (the same bounded bucket used by StatsD/Prometheus). HTTP `response_status_code` is never consulted — an RPC that finishes HTTP 200 with `grpc-status: 14` counts as a match.
+
+Evaluation runs from the terminal `log()` summary after buffered, trailers-only, and streamed bodies finish (including deferred trailer completion on H2/H3 native and bridge paths, plus gateway-generated gRPC rejections). Streaming RPCs therefore cannot trigger until the client-visible terminal status is known.
+
+#### `grpc_status_rate`
+
+```jsonc
+{
+  "name": "grpc_error_rate",
+  "type": "grpc_status_rate",
+  "grpc_statuses": [1, 2, 4, 8, 13, 14, 16, "OTHER"],
+  "window_seconds": 60,
+  "threshold_percent": 5.0,
+  "min_request_count": 50,
+  "channels": ["ops_slack"]
+}
+```
+
+Fires when ≥ `threshold_percent` of gRPC transactions in the window matched `grpc_statuses`, provided the window saw at least `min_request_count` gRPC transactions. The denominator is gRPC-only (`TransactionSummary::grpc_status()` present); plain HTTP samples neither match nor dilute the rate, but still allow recovery/resolve observation against the existing window. Status `0` (OK) may be selected explicitly when operators want an inverted success-rate style signal.
 
 #### `latency_percentile`
 

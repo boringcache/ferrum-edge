@@ -384,6 +384,12 @@ policy is the exception: `ws_message_size_limiting` installs the strictest
 configured actual-frame and reassembled-message ceilings before either parser
 reads, so continuation payloads are checked individually before allocation.
 
+Peer-originated **Close** frames take a separate forward path: mutating
+admission hooks are skipped so a later plugin cannot replace the peer's
+code/reason, while observational delivery hooks (see below) still record the
+successfully forwarded Close. Plugin-generated rejection Closes are visible to
+observational `on_ws_frame` hooks inside the applicator as the final decision.
+
 ```
 WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy → ...)
     │
@@ -394,13 +400,32 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 │  ┌───────────────────────────────┐  │
 │  │ on_ws_frame (ClientToBackend) │──┼── For each Text/Binary/Ping/Pong from client
 │  └───────────────────────────────┘  │
+│  ┌───────────────────────────────┐  │
+│  │ control-frame guard           │──┼── Restore illegal Ping↔Pong flips
+│  └───────────────────────────────┘  │
+│  ┌───────────────────────────────┐  │
+│  │ destination send              │──┼── Success-only frame/byte counters
+│  └───────────────────────────────┘  │
+│  ┌───────────────────────────────┐  │
+│  │ emit_ws_frame_delivery        │──┼── Observational logs (final message)
+│  └───────────────────────────────┘  │
 │                                     │
 │  ┌───────────────────────────────┐  │
 │  │ on_ws_frame (BackendToClient) │──┼── For each Text/Binary/Ping/Pong from backend
 │  └───────────────────────────────┘  │
+│  … same guard → send → delivery …   │
 │                                     │
+│  Peer Close → forward → delivery    │── No mutating hooks; log after accept
 └─────────────────────────────────────┘
 ```
+
+Delivery-accurate observers prepare metadata before `send()` (so large payloads
+are not cloned solely for logging) and emit only after the sink accepts the
+write — the same success boundary as `frames_*` / `bytes_*`. Cancelled or failed
+writes discard the prepared observation. `ws_frame_logging` uses this path for
+ordinary frames and peer Close (`outcome=delivered`) and records plugin
+rejection Closes separately (`outcome=policy_close`) when it observes the final
+decision in the mutating chain.
 
 ### Connection Tracking
 
@@ -432,7 +457,7 @@ Plugins execute in priority order (lower number runs first):
 |---|--------|----------|----------|
 | 1 | `ws_message_size_limiting` | 2810 | Pre-read actual-frame and bounded-reassembly policy; closes both peers with 1009 |
 | 2 | `ws_rate_limiting` | 2910 | Per-connection token-bucket frame rate limiting |
-| 3 | `ws_frame_logging` | 9050 | Logs frame metadata (direction, opcode, payload size) |
+| 3 | `ws_frame_logging` | 9050 | Logs final delivered frame metadata (and policy Close decisions); never mutates |
 
 ### Zero-Overhead Opt-In
 

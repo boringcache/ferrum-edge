@@ -18,10 +18,12 @@ use crate::maps::{
     FERRUM_BYPASS_UIDS, FERRUM_CAPTURE_CONFIG, FERRUM_CIDR_EXCLUDE4, FERRUM_CIDR_INCLUDE4,
     FERRUM_INCLUDE_PORTS, FERRUM_ORIG_DST4, FERRUM_PORT_EXCLUDE, FERRUM_WORKLOAD_IDENTITY,
 };
+use crate::sock_ops_emit::emit_drop_reason;
 use ferrum_ebpf_common::{
     host_port_to_sock_addr_user_port, sock_addr_user_port_to_host, CidrKey4, IncludePortsPolicy,
     OrigDst4, OrigDstKey, WorkloadIdentity, FERRUM_CAPTURE_CONFIG_KEY, IPV4_LOOPBACK_NBO,
-    OUTBOUND_CAPTURE_PORT,
+    OUTBOUND_CAPTURE_PORT, SOCK_OPS_DROP_BYPASS_UID_HIT, SOCK_OPS_DROP_EXCLUDE_CIDR_HIT,
+    SOCK_OPS_DROP_EXCLUDE_PORT_HIT, SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR,
 };
 
 #[cgroup_sock_addr(connect4)]
@@ -38,6 +40,9 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
 
     let uid = (aya_ebpf::helpers::bpf_get_current_uid_gid() & 0xFFFFFFFF) as u32;
     if unsafe { FERRUM_BYPASS_UIDS.get(&uid) }.is_some() {
+        // Recursion-prevention / operator UID bypass — still counted so
+        // operators can see how often capture was intentionally skipped.
+        emit_drop_reason(SOCK_OPS_DROP_BYPASS_UID_HIT);
         return Ok(1);
     }
 
@@ -47,11 +52,13 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     let dst_port = sock_addr_user_port_to_host(sock_addr.user_port);
 
     if unsafe { FERRUM_PORT_EXCLUDE.get(&dst_port) }.is_some() {
+        emit_drop_reason(SOCK_OPS_DROP_EXCLUDE_PORT_HIT);
         return Ok(1);
     }
 
     let exclude_key = LpmKey::new(32, CidrKey4::host(dst_ip));
     if FERRUM_CIDR_EXCLUDE4.get(&exclude_key).is_some() {
+        emit_drop_reason(SOCK_OPS_DROP_EXCLUDE_CIDR_HIT);
         return Ok(1);
     }
 
@@ -62,6 +69,9 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     // that per-cgroup policy narrows capture and must not be widened by the
     // node-global implicit include CIDR default (0.0.0.0/0).
     if !capture_allowed(dst_port, include_cidr_match) {
+        // Include-CIDR miss and includeOutboundPorts miss share the
+        // `not_in_include_cidr` reason label (the advertised four-reason set).
+        emit_drop_reason(SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR);
         return Ok(1);
     }
 
