@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
@@ -1735,6 +1736,141 @@ fn snapshot_cleanup_removes_idle_entries_and_last_emitted() {
             .compute_deltas(&config, "node-a", 200, "snap-2")
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn snapshot_cleanup_preserves_unrelated_key_and_new_generation_baseline() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_for_test(
+        "ferrum", "alice", "proxy-a", "Payments", 200, "http", charge,
+    );
+    accumulator.record_for_test("ferrum", "bob", "proxy-b", "Billing", 200, "http", charge);
+    assert_eq!(
+        accumulator
+            .compute_deltas(&config, "node-a", 100, "snap-1")
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Evict both idle identities, then re-record only alice. Cleanup of the
+    // old alice generation must not strip bob's already-removed baseline in a
+    // way that breaks alice's fresh generation, and alice must emit a full
+    // restart total (not a residual against an orphaned baseline).
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 2);
+
+    accumulator.record_for_test(
+        "ferrum", "alice", "proxy-a", "Payments", 200, "http", charge,
+    );
+    let restarted = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted[0].consumer_id, "alice");
+    assert_eq!(restarted[0].call_count, 1);
+}
+
+#[test]
+fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
+    let config = Arc::new(snapshot_test_config());
+    let accumulator = Arc::new(SnapshotAccumulator::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let emitted_calls = Arc::new(AtomicU64::new(0));
+    let recorded_calls = Arc::new(AtomicU64::new(0));
+    let emitter_iterations = Arc::new(AtomicU64::new(0));
+    let cleaner_iterations = Arc::new(AtomicU64::new(0));
+    let start = Arc::new(Barrier::new(4));
+
+    let record_acc = Arc::clone(&accumulator);
+    let record_stop = Arc::clone(&stop);
+    let record_start = Arc::clone(&start);
+    let record_calls = Arc::clone(&recorded_calls);
+    let recorder = thread::spawn(move || {
+        record_start.wait();
+        let mut i = 0u64;
+        while !record_stop.load(Ordering::Relaxed) {
+            let consumer = if i.is_multiple_of(2) { "alice" } else { "bob" };
+            record_acc.record_for_test(
+                "ferrum",
+                consumer,
+                "proxy-a",
+                "Payments",
+                200,
+                "http",
+                unit_call_charge(0.01),
+            );
+            record_calls.fetch_add(1, Ordering::Relaxed);
+            i = i.wrapping_add(1);
+        }
+    });
+
+    let emit_acc = Arc::clone(&accumulator);
+    let emit_cfg = Arc::clone(&config);
+    let emit_stop = Arc::clone(&stop);
+    let emit_start = Arc::clone(&start);
+    let emit_calls = Arc::clone(&emitted_calls);
+    let emit_iterations = Arc::clone(&emitter_iterations);
+    let emitter = thread::spawn(move || {
+        emit_start.wait();
+        let mut snap = 0u64;
+        while !emit_stop.load(Ordering::Relaxed) {
+            snap += 1;
+            let events = emit_acc
+                .compute_deltas(&emit_cfg, "node-a", snap as i64, &format!("stress-{snap}"))
+                .expect("delta arithmetic must stay finite under stress");
+            let calls: u64 = events.iter().map(|event| u64::from(event.call_count)).sum();
+            emit_calls.fetch_add(calls, Ordering::Relaxed);
+            emit_iterations.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let cleanup_acc = Arc::clone(&accumulator);
+    let cleanup_stop = Arc::clone(&stop);
+    let cleanup_start = Arc::clone(&start);
+    let cleanup_iterations = Arc::clone(&cleaner_iterations);
+    let cleaner = thread::spawn(move || {
+        cleanup_start.wait();
+        while !cleanup_stop.load(Ordering::Relaxed) {
+            let _ = cleanup_acc.cleanup_stale_for_tests(0);
+            cleanup_iterations.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    start.wait();
+    thread::sleep(Duration::from_millis(150));
+    stop.store(true, Ordering::Relaxed);
+    recorder.join().expect("recorder");
+    emitter.join().expect("emitter");
+    cleaner.join().expect("cleaner");
+
+    // Drain whatever survived concurrent cleanup.
+    let final_events = accumulator
+        .compute_deltas(&config, "node-a", 9_999, "stress-final")
+        .expect("final delta");
+    let final_calls: u64 = final_events
+        .iter()
+        .map(|event| u64::from(event.call_count))
+        .sum();
+    emitted_calls.fetch_add(final_calls, Ordering::Relaxed);
+
+    let recorded = recorded_calls.load(Ordering::Relaxed);
+    let emitted = emitted_calls.load(Ordering::Relaxed);
+    assert!(recorded > 0, "stress recorder must make progress");
+    assert!(
+        emitter_iterations.load(Ordering::Relaxed) > 0,
+        "stress emitter must make progress"
+    );
+    assert!(
+        cleaner_iterations.load(Ordering::Relaxed) > 0,
+        "stress cleaner must make progress"
+    );
+    assert!(
+        emitted <= recorded,
+        "emitted calls ({emitted}) must not exceed recorded calls ({recorded})"
     );
 }
 

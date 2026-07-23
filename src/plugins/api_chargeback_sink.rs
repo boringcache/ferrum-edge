@@ -3197,11 +3197,33 @@ struct SnapshotEntry {
     meta: SnapshotMetadata,
     totals: SnapshotAtomicTotals,
     last_seen_at: AtomicI64,
+    /// Stable identity for this map slot. Assigned once at insert and never
+    /// changed by in-place refreshes. Couples `last_emitted` cleanup to the
+    /// exact entry generation that eviction removed.
+    generation: u64,
+    /// Bumped on every `record` (insert or refresh). Stale cleanup observes a
+    /// revision and only evicts when that exact revision is still present, so a
+    /// same-key refresh that races after the stale check cannot be deleted.
+    revision: AtomicU64,
 }
+
+/// Baseline emitted for one accumulator generation of a snapshot identity.
+struct LastEmitted {
+    generation: u64,
+    totals: SnapshotTotals,
+}
+
+#[cfg(test)]
+type CleanupAfterStaleCheckHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub struct SnapshotAccumulator {
     entries: DashMap<SnapshotMetadata, SnapshotEntry>,
-    last_emitted: DashMap<SnapshotMetadata, SnapshotTotals>,
+    last_emitted: DashMap<SnapshotMetadata, LastEmitted>,
+    next_generation: AtomicU64,
+    /// Test-only callback invoked after a key is selected as a stale candidate
+    /// and before conditional eviction. Production leaves this unset.
+    #[cfg(test)]
+    cleanup_after_stale_check_hook: Mutex<Option<CleanupAfterStaleCheckHook>>,
 }
 
 impl SnapshotAccumulator {
@@ -3209,6 +3231,9 @@ impl SnapshotAccumulator {
         Self {
             entries: DashMap::new(),
             last_emitted: DashMap::new(),
+            next_generation: AtomicU64::new(1),
+            #[cfg(test)]
+            cleanup_after_stale_check_hook: Mutex::new(None),
         }
     }
 
@@ -3285,17 +3310,26 @@ impl SnapshotAccumulator {
     }
 
     fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) {
+        self.record_at(meta, charge, unix_timestamp_seconds());
+    }
+
+    fn record_at(&self, meta: SnapshotMetadata, charge: ChargeComputation, now: i64) {
         // Use the typed metadata value itself as the key. A delimiter-encoded
         // string would allow hostile or ordinary `|` characters in route/name
         // dimensions to collide and recreate mixed attribution.
         let key = meta.clone();
-        let now = unix_timestamp_seconds();
         let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
             meta,
             totals: SnapshotAtomicTotals::default(),
             last_seen_at: AtomicI64::new(now),
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            revision: AtomicU64::new(0),
         });
+        // Refresh under the DashMap entry guard so a concurrent same-key
+        // `remove_if` either observes the bumped revision or runs entirely
+        // before this refresh (in which case this `entry` insert recreates).
         entry.last_seen_at.store(now, Ordering::Relaxed);
+        entry.revision.fetch_add(1, Ordering::Relaxed);
         entry.totals.add(charge);
     }
 
@@ -3310,11 +3344,17 @@ impl SnapshotAccumulator {
         let mut emitted_totals = Vec::new();
         for entry in self.entries.iter() {
             let key = entry.key().clone();
+            let generation = entry.value().generation;
             let current = entry.value().totals.snapshot();
+            // Ignore a baseline tagged for a different generation (for example
+            // an orphan left after eviction+reinsert). That treats the live
+            // entry as starting from zero rather than subtracting a stale
+            // prior total.
             let last = self
                 .last_emitted
                 .get(&key)
-                .map(|value| *value)
+                .filter(|value| value.generation == generation)
+                .map(|value| value.totals)
                 .unwrap_or_default();
             let delta = current.delta_since(last)?;
             if !delta.is_zero() || config.snapshot.emit_zero_deltas {
@@ -3326,11 +3366,28 @@ impl SnapshotAccumulator {
                     received_at,
                     snapshot_id,
                 ));
-                emitted_totals.push((key, current));
+                emitted_totals.push((key, generation, current));
             }
         }
-        for (key, current) in emitted_totals {
-            self.last_emitted.insert(key, current);
+        for (key, generation, current) in emitted_totals {
+            // Publish the baseline only while this generation is still live so
+            // a concurrent eviction cannot leave an orphaned baseline that a
+            // later reinsert would mis-subtract, and so we cannot overwrite a
+            // newer generation's baseline with an older snapshot read.
+            if let Some(entry) = self.entries.get(&key)
+                && entry.generation == generation
+            {
+                // Keep the entry guard through publication. Cleanup cannot
+                // evict this generation and remove its baseline between
+                // the generation check and the insert.
+                self.last_emitted.insert(
+                    key,
+                    LastEmitted {
+                        generation,
+                        totals: current,
+                    },
+                );
+            }
         }
         Ok(events)
     }
@@ -3340,23 +3397,58 @@ impl SnapshotAccumulator {
         self.cleanup_stale(unix_timestamp_seconds(), stale_entry_ttl_secs)
     }
 
+    #[cfg(test)]
+    fn set_cleanup_after_stale_check_hook(&self, hook: Option<CleanupAfterStaleCheckHook>) {
+        if let Ok(mut slot) = self.cleanup_after_stale_check_hook.lock() {
+            *slot = hook;
+        }
+    }
+
+    #[cfg(test)]
+    fn run_cleanup_after_stale_check_hook(&self) {
+        let hook = self
+            .cleanup_after_stale_check_hook
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn cleanup_stale(&self, now: i64, stale_entry_ttl_secs: u64) -> usize {
         let cutoff = now.saturating_sub(stale_entry_ttl_secs.min(i64::MAX as u64) as i64);
-        let keys: Vec<SnapshotMetadata> = self
+        // Candidate scan is best-effort. Eviction re-validates generation,
+        // revision, and staleness atomically under the DashMap shard lock so a
+        // same-key refresh cannot be deleted, and unrelated keys stay
+        // non-blocking (no global request-path lock).
+        let candidates: Vec<(SnapshotMetadata, u64, u64)> = self
             .entries
             .iter()
             .filter(|entry| entry.value().last_seen_at.load(Ordering::Relaxed) <= cutoff)
-            .map(|entry| entry.key().clone())
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().generation,
+                    entry.value().revision.load(Ordering::Relaxed),
+                )
+            })
             .collect();
         let mut removed = 0;
-        for key in keys {
-            let should_remove = self
-                .entries
-                .get(&key)
-                .is_some_and(|entry| entry.last_seen_at.load(Ordering::Relaxed) <= cutoff);
-            if should_remove {
-                self.entries.remove(&key);
-                self.last_emitted.remove(&key);
+        for (key, observed_generation, observed_revision) in candidates {
+            #[cfg(test)]
+            self.run_cleanup_after_stale_check_hook();
+            if let Some((_, evicted)) = self.entries.remove_if(&key, |_, entry| {
+                entry.generation == observed_generation
+                    && entry.revision.load(Ordering::Relaxed) == observed_revision
+                    && entry.last_seen_at.load(Ordering::Relaxed) <= cutoff
+            }) {
+                // Drop the baseline only for the generation that was actually
+                // evicted. A concurrent reinsert+emit for a newer generation
+                // must keep its last_emitted row.
+                self.last_emitted.remove_if(&key, |_, baseline| {
+                    baseline.generation == evicted.generation
+                });
                 removed += 1;
             }
         }
@@ -3375,7 +3467,7 @@ impl SnapshotAccumulator {
         protocol: &str,
         charge: ChargeComputation,
     ) {
-        self.record(
+        self.record_at(
             SnapshotMetadata {
                 namespace: namespace.to_string(),
                 consumer_id: consumer.to_string(),
@@ -3389,6 +3481,7 @@ impl SnapshotAccumulator {
                 protocol: protocol.to_string(),
             },
             charge,
+            unix_timestamp_seconds(),
         );
     }
 
@@ -3831,5 +3924,102 @@ fn timestamp_json(timestamp: i64) -> Value {
             Some(dt) => Value::String(dt.to_rfc3339_opts(SecondsFormat::Secs, true)),
             None => Value::Null,
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_cleanup_race_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    fn test_metadata() -> SnapshotMetadata {
+        SnapshotMetadata {
+            namespace: "ferrum".to_string(),
+            consumer_id: "alice".to_string(),
+            consumer_name: None,
+            proxy_id: "proxy-a".to_string(),
+            proxy_name: "Payments".to_string(),
+            route_id: None,
+            status_code: 200,
+            http_status_code: Some(200),
+            grpc_status: None,
+            protocol: "http".to_string(),
+        }
+    }
+
+    fn call_charge(call_count: u32, price: f64) -> ChargeComputation {
+        ChargeComputation {
+            call_count,
+            charge_call: price,
+            charge_total: price,
+            ..ChargeComputation::default()
+        }
+    }
+
+    #[test]
+    fn cleanup_loses_race_to_same_key_refresh_after_stale_check() {
+        // Deterministic issue #2576 interleaving: park cleanup after candidate
+        // selection, refresh the same key, then prove conditional eviction
+        // preserves and emits the refresh exactly once.
+        let config = ApiChargebackSinkConfig {
+            mode: SinkMode::Snapshot,
+            currency: "USD".to_string(),
+            pricing_version: "test-v1".to_string(),
+            ..Default::default()
+        };
+
+        let accumulator = Arc::new(SnapshotAccumulator::new());
+        let metadata = test_metadata();
+        accumulator.record_at(metadata.clone(), call_charge(1, 0.01), 100);
+        assert_eq!(
+            accumulator
+                .compute_deltas(&config, "node-a", 100, "snap-1")
+                .expect("initial delta")
+                .len(),
+            1
+        );
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        accumulator.set_cleanup_after_stale_check_hook(Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        })));
+
+        let cleanup_accumulator = Arc::clone(&accumulator);
+        let cleanup =
+            thread::spawn(move || cleanup_accumulator.cleanup_stale(200, /* ttl */ 0));
+
+        entered.wait();
+        accumulator.record_at(metadata, call_charge(2, 0.02), 201);
+        release.wait();
+
+        assert_eq!(
+            cleanup.join().expect("cleanup thread"),
+            0,
+            "conditional eviction must preserve a same-key refresh"
+        );
+        accumulator.set_cleanup_after_stale_check_hook(None);
+        assert_eq!(accumulator.entries.len(), 1);
+        assert_eq!(accumulator.last_emitted.len(), 1);
+
+        let delta = accumulator
+            .compute_deltas(&config, "node-a", 200, "snap-2")
+            .expect("refresh delta");
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].call_count, 2);
+        assert!((delta[0].charge_total - 0.02).abs() < f64::EPSILON);
+        assert!(
+            accumulator
+                .compute_deltas(&config, "node-a", 300, "snap-3")
+                .expect("post-refresh delta")
+                .is_empty(),
+            "refreshed charge must emit exactly once"
+        );
     }
 }
