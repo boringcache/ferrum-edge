@@ -1178,6 +1178,15 @@ fn parse_property_encoding(
             "encoding['{property}']: style 'deepObject' requires an object schema property"
         ));
     }
+    if matches!(
+        style,
+        EncodingStyle::SpaceDelimited | EncodingStyle::PipeDelimited
+    ) && !(schema_accepts_array(property_schema) || schema_accepts_object(property_schema))
+    {
+        return Err(format!(
+            "encoding['{property}']: style '{style_raw}' requires an array or object schema property"
+        ));
+    }
 
     let content_type = match object.get("contentType") {
         None | Some(Value::Null) => None,
@@ -1596,19 +1605,33 @@ fn form_urlencoded_to_value(
     schema: &Value,
     encoding: &AHashMap<String, PropertyEncoding>,
 ) -> Result<Value, String> {
-    validate_form_serialization(body, encoding)?;
+    validate_form_serialization(body, schema, encoding)?;
     let mut fields: HashMap<String, Vec<String>> = HashMap::new();
-    for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
+    let mut raw_fields: HashMap<String, Vec<String>> = HashMap::new();
+    for pair in body.split('&') {
+        let (_raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some((key, value)) = url::form_urlencoded::parse(pair.as_bytes()).next() else {
+            continue;
+        };
+        let key = key.into_owned();
         fields
-            .entry(key.into_owned())
+            .entry(key.clone())
             .or_default()
             .push(value.into_owned());
+        // Keep the encoded value so style delimiters can be split before
+        // percent-decoding. Otherwise an item containing `%2C` would be
+        // mistaken for an `explode=false` comma delimiter.
+        raw_fields
+            .entry(key)
+            .or_default()
+            .push(raw_value.to_string());
     }
-    fields_to_schema_object(fields, schema, encoding, "form")
+    fields_to_schema_object(fields, &raw_fields, schema, encoding)
 }
 
 fn validate_form_serialization(
     body: &str,
+    schema: &Value,
     encoding: &AHashMap<String, PropertyEncoding>,
 ) -> Result<(), String> {
     for pair in body.split('&') {
@@ -1623,7 +1646,7 @@ fn validate_form_serialization(
             .split_once('[')
             .map(|(base, _)| base)
             .unwrap_or(decoded_key.as_str());
-        let property_encoding = encoding.get(property);
+        let property_encoding = form_encoding_for_key(property, schema, encoding);
         let allow_reserved =
             property_encoding.is_some_and(|property_encoding| property_encoding.allow_reserved);
         let comma_is_style_delimiter = property_encoding.is_some_and(|property_encoding| {
@@ -1640,6 +1663,22 @@ fn validate_form_serialization(
         }
     }
     Ok(())
+}
+
+fn form_encoding_for_key<'a>(
+    key: &str,
+    schema: &Value,
+    encoding: &'a AHashMap<String, PropertyEncoding>,
+) -> Option<&'a PropertyEncoding> {
+    encoding.get(key).or_else(|| {
+        encoding.iter().find_map(|(property, property_encoding)| {
+            if property_encoding.style != EncodingStyle::Form || !property_encoding.explode {
+                return None;
+            }
+            let property_schema = property_schema_from_object(schema, property)?;
+            object_property_schema(property_schema, key).map(|_| property_encoding)
+        })
+    })
 }
 
 fn validate_percent_encoding(value: &str) -> Result<(), String> {
@@ -1906,9 +1945,9 @@ fn validate_multipart_boundary(boundary: &str) -> Result<(), String> {
 
 fn fields_to_schema_object(
     fields: HashMap<String, Vec<String>>,
+    raw_fields: &HashMap<String, Vec<String>>,
     schema: &Value,
     encoding: &AHashMap<String, PropertyEncoding>,
-    label: &'static str,
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema);
     if !(schema_accepts_object(object_schema.as_ref()) || object_schema.get("properties").is_some())
@@ -1934,11 +1973,46 @@ fn fields_to_schema_object(
             }
             continue;
         }
+        if schema_accepts_object(property_schema)
+            && let Some(property_encoding) = property_encoding
+        {
+            if property_encoding.style == EncodingStyle::Form && property_encoding.explode {
+                let object = exploded_form_object_to_value(
+                    &fields,
+                    property_schema,
+                    &mut consumed_keys,
+                )?;
+                if object.as_object().is_some_and(|object| !object.is_empty()) {
+                    out.insert(property.clone(), object);
+                }
+                continue;
+            }
+            if !property_encoding.explode {
+                if let Some(values) = fields.get(property) {
+                    consumed_keys.insert(property.clone());
+                    out.insert(
+                        property.clone(),
+                        serialized_object_to_value(
+                            values,
+                            raw_fields.get(property).map(Vec::as_slice),
+                            property_schema,
+                            property_encoding.style,
+                        )?,
+                    );
+                }
+                continue;
+            }
+        }
         if let Some(values) = fields.get(property) {
             consumed_keys.insert(property.clone());
             out.insert(
                 property.clone(),
-                values_to_schema_value(values, property_schema, property_encoding)?,
+                form_values_to_schema_value(
+                    values,
+                    raw_fields.get(property).map(Vec::as_slice),
+                    property_schema,
+                    property_encoding,
+                )?,
             );
         }
     }
@@ -1951,19 +2025,189 @@ fn fields_to_schema_object(
                 .get(parent)
                 .is_some_and(|enc| enc.style == EncodingStyle::DeepObject)
         {
-            // Parent handled above (or absent from schema); skip orphans already
-            // consumed. Remaining unmatched deep-object keys fall through.
+            // The configured parent consumed all syntactically valid children
+            // above. Do not leak an orphan back into the root object.
             let _ = child;
+            continue;
         }
         out.insert(
             key.clone(),
             values_to_schema_value(values, &Value::Null, None)?,
         );
     }
-    if out.is_empty() && schema_has_required(object_schema.as_ref()) {
-        return Err(format!("{label} body did not contain any schema fields"));
+    Ok(Value::Object(out))
+}
+
+fn exploded_form_object_to_value(
+    fields: &HashMap<String, Vec<String>>,
+    schema: &Value,
+    consumed: &mut HashSet<String>,
+) -> Result<Value, String> {
+    let properties = merged_object_properties(schema);
+    let mut out = serde_json::Map::new();
+    for (child, child_schema) in &properties {
+        let Some(values) = fields.get(child) else {
+            continue;
+        };
+        consumed.insert(child.clone());
+        out.insert(
+            child.clone(),
+            values_to_schema_value(values, child_schema, None)?,
+        );
     }
     Ok(Value::Object(out))
+}
+
+fn serialized_object_to_value(
+    values: &[String],
+    raw_values: Option<&[String]>,
+    schema: &Value,
+    style: EncodingStyle,
+) -> Result<Value, String> {
+    if values.len() != 1 {
+        return Err("Serialized object property must occur exactly once when explode=false".to_string());
+    }
+    let tokens = match raw_values {
+        Some(raw_values) if raw_values.len() == 1 => split_raw_form_tokens(&raw_values[0], style)?
+            .into_iter()
+            .map(decode_raw_form_component)
+            .collect::<Vec<_>>(),
+        _ => split_decoded_style_value(&values[0], style),
+    };
+    object_tokens_to_value(tokens, schema)
+}
+
+fn object_tokens_to_value(tokens: Vec<String>, schema: &Value) -> Result<Value, String> {
+    if tokens.len() % 2 != 0 {
+        return Err("Serialized object property must contain alternating key/value items".to_string());
+    }
+    let properties = merged_object_properties(schema);
+    let mut out = serde_json::Map::new();
+    for pair in tokens.chunks_exact(2) {
+        let key = pair[0].clone();
+        if key.is_empty() {
+            return Err("Serialized object property contains an empty key".to_string());
+        }
+        if out.contains_key(&key) {
+            return Err(format!("Serialized object property contains duplicate key '{key}'"));
+        }
+        let child_schema = properties.get(&key).unwrap_or(&Value::Null);
+        out.insert(
+            key,
+            scalar_to_schema_value(pair[1].as_str(), child_schema)?,
+        );
+    }
+    Ok(Value::Object(out))
+}
+
+fn form_values_to_schema_value(
+    values: &[String],
+    raw_values: Option<&[String]>,
+    schema: &Value,
+    encoding: Option<&PropertyEncoding>,
+) -> Result<Value, String> {
+    let Some(encoding) = encoding.filter(|encoding| !encoding.explode) else {
+        return values_to_schema_value(values, schema, encoding);
+    };
+    if !schema_accepts_array(schema) {
+        return values_to_schema_value(values, schema, Some(encoding));
+    }
+    let Some(raw_values) = raw_values else {
+        return values_to_schema_value(values, schema, Some(encoding));
+    };
+    let item_schema = schema.get("items").unwrap_or(&Value::Null);
+    let mut converted = Vec::new();
+    for raw in raw_values {
+        for token in split_raw_form_tokens(raw, encoding.style)? {
+            let value = decode_raw_form_component(token);
+            converted.push(scalar_to_schema_value(&value, item_schema)?);
+        }
+    }
+    Ok(Value::Array(converted))
+}
+
+fn split_decoded_style_value(value: &str, style: EncodingStyle) -> Vec<String> {
+    let delimiter = match style {
+        EncodingStyle::Form => ',',
+        EncodingStyle::SpaceDelimited => ' ',
+        EncodingStyle::PipeDelimited => '|',
+        EncodingStyle::DeepObject => return vec![value.to_string()],
+    };
+    value
+        .split(delimiter)
+        .map(str::trim)
+        .map(str::to_string)
+        .collect()
+}
+
+fn split_raw_form_tokens(value: &str, style: EncodingStyle) -> Result<Vec<&str>, String> {
+    if style == EncodingStyle::DeepObject {
+        return Err("deepObject style does not use a delimited property value".to_string());
+    }
+    let bytes = value.as_bytes();
+    let mut tokens = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let delimiter_len = match style {
+            EncodingStyle::Form if bytes[index] == b',' => 1,
+            EncodingStyle::SpaceDelimited if matches!(bytes[index], b' ' | b'+') => 1,
+            EncodingStyle::SpaceDelimited
+                if bytes[index..].get(..3).is_some_and(|candidate| {
+                    candidate[0] == b'%' && candidate[1] == b'2' && candidate[2] == b'0'
+                }) =>
+            {
+                3
+            }
+            EncodingStyle::PipeDelimited
+                if bytes[index] == b'|'
+                    || bytes[index..].get(..3).is_some_and(|candidate| {
+                        candidate[0] == b'%'
+                            && candidate[1] == b'7'
+                            && candidate[2].eq_ignore_ascii_case(&b'c')
+                    }) =>
+            {
+                if bytes[index] == b'|' { 1 } else { 3 }
+            }
+            _ => 0,
+        };
+        if delimiter_len == 0 {
+            index += 1;
+            continue;
+        }
+        tokens.push(&value[start..index]);
+        index += delimiter_len;
+        start = index;
+    }
+    tokens.push(&value[start..]);
+    Ok(tokens)
+}
+
+fn decode_raw_form_component(value: &str) -> String {
+    let encoded = format!("value={value}");
+    url::form_urlencoded::parse(encoded.as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
+}
+
+fn object_property_schema<'a>(schema: &'a Value, property: &str) -> Option<&'a Value> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(property))
+        .or_else(|| {
+            ["allOf", "oneOf", "anyOf"].into_iter().find_map(|keyword| {
+                schema
+                    .get(keyword)
+                    .and_then(Value::as_array)
+                    .and_then(|branches| {
+                        branches
+                            .iter()
+                            .find_map(|branch| object_property_schema(branch, property))
+                    })
+            })
+        })
 }
 
 fn take_deep_object_fields(
@@ -2038,11 +2282,56 @@ fn multipart_parts_to_schema_object(
     }
     let mut out = serde_json::Map::new();
     let properties = merged_object_properties(object_schema.as_ref());
+    let mut consumed_keys = HashSet::new();
     for (property, property_schema) in &properties {
+        let property_encoding = encoding.get(property.as_str());
+        if schema_accepts_object(property_schema)
+            && let Some(property_encoding) = property_encoding
+        {
+            if property_encoding.style == EncodingStyle::DeepObject {
+                let object = deep_object_parts_to_value(
+                    &parts,
+                    property,
+                    property_schema,
+                    property_encoding,
+                    &mut consumed_keys,
+                )?;
+                if object.as_object().is_some_and(|object| !object.is_empty()) {
+                    out.insert(property.clone(), object);
+                }
+                continue;
+            }
+            if property_encoding.style == EncodingStyle::Form && property_encoding.explode {
+                let object = exploded_multipart_object_to_value(
+                    &parts,
+                    property_schema,
+                    property_encoding,
+                    &mut consumed_keys,
+                )?;
+                if object.as_object().is_some_and(|object| !object.is_empty()) {
+                    out.insert(property.clone(), object);
+                }
+                continue;
+            }
+            if !property_encoding.explode {
+                if let Some(values) = parts.get(property) {
+                    consumed_keys.insert(property.clone());
+                    out.insert(
+                        property.clone(),
+                        serialized_multipart_object_to_value(
+                            values,
+                            property_schema,
+                            property_encoding.style,
+                        )?,
+                    );
+                }
+                continue;
+            }
+        }
         let Some(values) = parts.get(property) else {
             continue;
         };
-        let property_encoding = encoding.get(property.as_str());
+        consumed_keys.insert(property.clone());
         let explode = property_encoding.map(|enc| enc.explode).unwrap_or(true);
         if schema_accepts_array(property_schema) && explode {
             let item_schema = property_schema.get("items").unwrap_or(&Value::Null);
@@ -2081,7 +2370,7 @@ fn multipart_parts_to_schema_object(
         }
     }
     for (key, values) in parts {
-        if out.contains_key(&key) {
+        if consumed_keys.contains(&key) || out.contains_key(&key) {
             continue;
         }
         let value = if values.len() == 1 {
@@ -2099,6 +2388,107 @@ fn multipart_parts_to_schema_object(
         out.insert(key, value);
     }
     Ok(Value::Object(out))
+}
+
+fn exploded_multipart_object_to_value(
+    parts: &HashMap<String, Vec<MultipartPart>>,
+    schema: &Value,
+    encoding: &PropertyEncoding,
+    consumed: &mut HashSet<String>,
+) -> Result<Value, String> {
+    let properties = merged_object_properties(schema);
+    let mut out = serde_json::Map::new();
+    for (child, child_schema) in &properties {
+        let Some(values) = parts.get(child) else {
+            continue;
+        };
+        consumed.insert(child.clone());
+        out.insert(
+            child.clone(),
+            multipart_values_to_schema_value(values, child_schema, Some(encoding))?,
+        );
+    }
+    Ok(Value::Object(out))
+}
+
+fn deep_object_parts_to_value(
+    parts: &HashMap<String, Vec<MultipartPart>>,
+    property: &str,
+    schema: &Value,
+    encoding: &PropertyEncoding,
+    consumed: &mut HashSet<String>,
+) -> Result<Value, String> {
+    let properties = merged_object_properties(schema);
+    let mut out = serde_json::Map::new();
+    for (key, values) in parts {
+        let Some((parent, child)) = split_deep_object_key(key) else {
+            continue;
+        };
+        if parent != property {
+            continue;
+        }
+        consumed.insert(key.clone());
+        let child_schema = properties.get(child).unwrap_or(&Value::Null);
+        out.insert(
+            child.to_string(),
+            multipart_values_to_schema_value(values, child_schema, Some(encoding))?,
+        );
+    }
+    Ok(Value::Object(out))
+}
+
+fn serialized_multipart_object_to_value(
+    values: &[MultipartPart],
+    schema: &Value,
+    style: EncodingStyle,
+) -> Result<Value, String> {
+    if values.len() != 1 {
+        return Err("Serialized multipart object property must occur exactly once when explode=false"
+            .to_string());
+    }
+    let text = std::str::from_utf8(&values[0].body).map_err(|error| {
+        format!(
+            "Multipart field '{}' is not UTF-8: {error}",
+            values[0].name
+        )
+    })?;
+    object_tokens_to_value(split_decoded_style_value(text, style), schema)
+}
+
+fn multipart_values_to_schema_value(
+    values: &[MultipartPart],
+    schema: &Value,
+    encoding: Option<&PropertyEncoding>,
+) -> Result<Value, String> {
+    let explode = encoding.map(|enc| enc.explode).unwrap_or(true);
+    if schema_accepts_array(schema) && explode {
+        let item_schema = schema.get("items").unwrap_or(&Value::Null);
+        return values
+            .iter()
+            .map(|part| multipart_part_to_schema_value(part, item_schema, encoding))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array);
+    }
+    if schema_accepts_array(schema) && !explode {
+        let joined = values
+            .iter()
+            .map(|part| {
+                std::str::from_utf8(&part.body).map_err(|error| {
+                    format!("Multipart field '{}' is not UTF-8: {error}", part.name)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(match encoding.map(|enc| enc.style) {
+                Some(EncodingStyle::SpaceDelimited) => " ",
+                Some(EncodingStyle::PipeDelimited) => "|",
+                _ => ",",
+            });
+        return values_to_schema_value(&[joined], schema, encoding);
+    }
+    let Some(first) = values.first() else {
+        return Ok(Value::Null);
+    };
+    multipart_part_to_schema_value(first, schema, encoding)
 }
 
 fn multipart_part_to_schema_value(
@@ -2228,7 +2618,6 @@ fn values_to_schema_value(
                     value
                         .split(delimiter)
                         .map(str::trim)
-                        .filter(|piece| !piece.is_empty())
                         .map(str::to_string)
                 })
                 .collect()
@@ -2868,13 +3257,6 @@ fn trim_trailing_line_break(mut value: &[u8]) -> &[u8] {
 
 fn schema_format(schema: &Value) -> Option<&str> {
     schema.get("format").and_then(Value::as_str)
-}
-
-fn schema_has_required(schema: &Value) -> bool {
-    schema
-        .get("required")
-        .and_then(Value::as_array)
-        .is_some_and(|values| values.iter().any(Value::is_string))
 }
 
 fn xml_name<'a>(schema: &'a Value, default: Option<&'a str>) -> Option<&'a str> {

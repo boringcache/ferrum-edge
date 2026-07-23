@@ -1511,6 +1511,17 @@ fn normalize_request_body_encoding(
                 ),
             });
         }
+        if matches!(style, "spaceDelimited" | "pipeDelimited")
+            && !(request_body_schema_accepts_array(property_schema, 0)
+                || request_body_schema_accepts_object(property_schema, 0))
+        {
+            return Err(ExtractError::MalformedExtension {
+                which: "requestBody.content.encoding",
+                error: format!(
+                    "encoding['{property}']: style '{style}' requires an array or object schema property"
+                ),
+            });
+        }
 
         if let Some(content_type) = property_object.get("contentType") {
             if base != "multipart/form-data" {
@@ -1674,6 +1685,31 @@ fn request_body_schema_accepts_object(schema: &Value, depth: usize) -> bool {
                 branches
                     .iter()
                     .any(|branch| request_body_schema_accepts_object(branch, depth + 1))
+            })
+    })
+}
+
+fn request_body_schema_accepts_array(schema: &Value, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("array")
+        || schema
+            .get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| types.iter().any(|value| value.as_str() == Some("array")))
+        || schema.get("items").is_some()
+    {
+        return true;
+    }
+    ["allOf", "oneOf", "anyOf"].into_iter().any(|keyword| {
+        schema
+            .get(keyword)
+            .and_then(Value::as_array)
+            .is_some_and(|branches| {
+                branches
+                    .iter()
+                    .any(|branch| request_body_schema_accepts_array(branch, depth + 1))
             })
     })
 }

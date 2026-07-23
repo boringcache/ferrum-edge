@@ -1587,6 +1587,100 @@ async fn urlencoded_deep_object_encoding_rebuilds_objects() {
 }
 
 #[tokio::test]
+async fn urlencoded_form_object_encoding_honors_explode_modes() {
+    for (explode, body) in [
+        (true, "R=100&G=200"),
+        (false, "color=R,100,G,200"),
+    ] {
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/color",
+                "path_regex": "^/color$",
+                "request_body": {
+                    "content": {
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["color"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "color": {
+                                        "type": "object",
+                                        "required": ["R", "G"],
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "R": {"type": "integer", "const": 100},
+                                            "G": {"type": "integer", "const": 200}
+                                        }
+                                    }
+                                }
+                            },
+                            "encoding": {
+                                "color": {"style": "form", "explode": explode}
+                            }
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let headers = content_type_headers("application/x-www-form-urlencoded");
+        let mut ctx = post_ctx("/color");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                .await,
+        );
+    }
+}
+
+#[tokio::test]
+async fn urlencoded_explode_false_splits_before_percent_decoding() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/tags",
+            "path_regex": "^/tags$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["tags"],
+                            "properties": {
+                                "tags": {
+                                    "type": "array",
+                                    "const": ["red,green", "blue"],
+                                    "items": {"type": "string"}
+                                }
+                            }
+                        },
+                        "encoding": {
+                            "tags": {"style": "form", "explode": false}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/x-www-form-urlencoded");
+    let mut ctx = post_ctx("/tags");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                b"tags=red%2Cgreen,blue",
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
 async fn urlencoded_composed_oneof_is_branch_order_invariant() {
     for branches in [
         json!([{"type": "integer"}, {"type": "string", "pattern": "^[a-z]+$"}]),
@@ -2241,6 +2335,75 @@ async fn multipart_composed_anyof_scalar_is_branch_order_invariant() {
                     &content_type_headers("multipart/form-data; boundary=abc"),
                     body.as_bytes(),
                 )
+                .await,
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_form_object_encoding_honors_explode_modes() {
+    for (explode, body) in [
+        (
+            true,
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"R\"\r\n\r\n",
+                "100\r\n",
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"G\"\r\n\r\n",
+                "200\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            false,
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"color\"\r\n\r\n",
+                "R,100,G,200\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+    ] {
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/color",
+                "path_regex": "^/color$",
+                "request_body": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["color"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "color": {
+                                        "type": "object",
+                                        "required": ["R", "G"],
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "R": {"type": "integer", "const": 100},
+                                            "G": {"type": "integer", "const": 200}
+                                        }
+                                    }
+                                }
+                            },
+                            "encoding": {
+                                "color": {"style": "form", "explode": explode}
+                            }
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+        let headers = content_type_headers("multipart/form-data; boundary=abc");
+        let mut ctx = post_ctx("/color");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
                 .await,
         );
     }
