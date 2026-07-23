@@ -63,6 +63,8 @@ value.
 |---|---|---|---|
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port. Set to `0` to disable the plaintext HTTP listener (TLS-only operation) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
+| `FERRUM_COMPRESSION_GZIP_ENABLED` | No | `true` | Process-wide gzip content-coding gate for the built-in `compression` plugin. When `false`, gzip (including the `x-gzip` compatibility token) is removed from every instance's response `algorithms` and opt-in gzip request decompression is disabled. Per-plugin configuration can narrow this global policy but cannot re-enable gzip |
+| `FERRUM_COMPRESSION_BROTLI_ENABLED` | No | `true` | Process-wide Brotli content-coding gate for the built-in `compression` plugin. When `false`, `br` is removed from every instance's response `algorithms` and opt-in Brotli request decompression is disabled. Per-plugin configuration can narrow this global policy but cannot re-enable Brotli |
 | `FERRUM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for proxy listeners (HTTP, HTTPS, HTTP/3). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | If HTTPS | — | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
 | `FERRUM_FRONTEND_TLS_CERT_SOURCE` | If HTTPS and set | — | Source override for `FERRUM_FRONTEND_TLS_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |

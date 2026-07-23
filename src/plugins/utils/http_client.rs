@@ -156,6 +156,10 @@ pub struct PluginHttpClient {
     bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     /// Operator override for hot-path DashMap shard counts.
     pool_shard_amount: usize,
+    /// Process-wide content-coding gates carried into compression plugin
+    /// construction. Defaults keep both supported codecs enabled.
+    compression_gzip_enabled: bool,
+    compression_brotli_enabled: bool,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -171,6 +175,11 @@ impl std::fmt::Debug for PluginHttpClient {
             .field("namespace", &self.namespace)
             .field("backend_allow_ips", &self.backend_allow_ips)
             .field("pool_shard_amount", &self.pool_shard_amount)
+            .field("compression_gzip_enabled", &self.compression_gzip_enabled)
+            .field(
+                "compression_brotli_enabled",
+                &self.compression_brotli_enabled,
+            )
             .finish()
     }
 }
@@ -461,6 +470,8 @@ impl PluginHttpClient {
             mesh_egress_strip_baggage_keys,
             bpf_metrics_state: None,
             pool_shard_amount,
+            compression_gzip_enabled: true,
+            compression_brotli_enabled: true,
         }
     }
 
@@ -514,6 +525,8 @@ impl PluginHttpClient {
             mesh_egress_strip_baggage_keys: Arc::new(Vec::new()),
             bpf_metrics_state: None,
             pool_shard_amount: 0,
+            compression_gzip_enabled: true,
+            compression_brotli_enabled: true,
         }
     }
 
@@ -574,6 +587,27 @@ impl PluginHttpClient {
     pub(crate) fn with_real_ip_header(mut self, real_ip_header: Option<String>) -> Self {
         self.real_ip_header = real_ip_header;
         self
+    }
+
+    /// Carry the resolved process-wide compression codec gates into plugin
+    /// cache construction. Per-plugin `algorithms` configuration is
+    /// intersected with these values.
+    pub(crate) fn with_compression_algorithms(
+        mut self,
+        gzip_enabled: bool,
+        brotli_enabled: bool,
+    ) -> Self {
+        self.compression_gzip_enabled = gzip_enabled;
+        self.compression_brotli_enabled = brotli_enabled;
+        self
+    }
+
+    pub(crate) fn compression_gzip_enabled(&self) -> bool {
+        self.compression_gzip_enabled
+    }
+
+    pub(crate) fn compression_brotli_enabled(&self) -> bool {
+        self.compression_brotli_enabled
     }
 
     /// Carry the configured gateway CRL source for non-rustls sinks. Only a
