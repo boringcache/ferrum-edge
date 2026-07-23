@@ -4,6 +4,12 @@
 //! same pricing parser/math but owns its queue, spool, replay, metrics, and
 //! optional snapshot accumulator.
 //!
+//! Delivery is persistence-aware by default: HTTP 200/204 alone is not success.
+//! The sink requires a complete empty acknowledgement without ClickHouse
+//! exception markers/headers before counting an export or deleting spool data.
+//! `wait_for_async_insert=0` is rejected unless
+//! `clickhouse.allow_lossy_async_insert` is explicitly enabled.
+//!
 //! Construction (`new`) is runtime-free shape validation: it does not create
 //! spool directories, materialize secrets, build a dedicated TLS client, spawn
 //! the batching worker / background tasks, or publish `ACTIVE_SINK`. Live
@@ -35,10 +41,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
+use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::utils::{
-    BatchConfig, BatchingLogger, LoggerHooks, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE,
-    MAX_BUFFER_CAPACITY, PluginHttpClient, RetryPolicy, drain_http_batch_response_body,
-    wait_until_committed,
+    BatchConfig, BatchingLogger, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
+    MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
+    RetryPolicy, wait_until_committed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -63,6 +70,13 @@ const MAX_RETRY_DELAY_MS: u64 = 60_000;
 /// Worst-case cumulative inter-attempt delay budget across retries after the
 /// initial try (exponential/capped schedule, ignoring jitter reduction).
 const MAX_RETRY_TOTAL_DELAY_MS: u64 = 600_000;
+/// Hard cap on ClickHouse acknowledgement bodies retained for exception sniffing.
+///
+/// Successful inserts are empty; exception text is small. Bytes are classified
+/// and dropped — never logged or retained beyond the drain.
+const CLICKHOUSE_ACK_BODY_LIMIT_BYTES: usize = 64 * 1024;
+/// ClickHouse HTTP setting that disables persistence-aware async-insert waits.
+const WAIT_FOR_ASYNC_INSERT_PARAM: &str = "wait_for_async_insert";
 
 static ACTIVE_SINK: OnceLock<ArcSwap<Option<Arc<SinkRuntime>>>> = OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
@@ -227,6 +241,11 @@ pub struct ClickHouseConfig {
     pub password_ref: Option<String>,
     pub tls: ClickHouseTlsConfig,
     pub insert_query_params: HashMap<String, String>,
+    /// Explicit opt-in to fire-and-forget ClickHouse async inserts
+    /// (`wait_for_async_insert=0`). Default durable mode rejects that setting
+    /// because ClickHouse acknowledges buffered inserts before persistence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_lossy_async_insert: bool,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -241,6 +260,7 @@ impl Default for ClickHouseConfig {
             password_ref: None,
             tls: ClickHouseTlsConfig::default(),
             insert_query_params: HashMap::new(),
+            allow_lossy_async_insert: false,
             timeout_ms: default_timeout_ms(),
         }
     }
@@ -1386,6 +1406,41 @@ impl DeliveryOutcome {
             | DeliveryOutcome::PayloadTooLarge { message } => message.as_str(),
         }
     }
+
+    fn label(&self) -> &'static str {
+        match self {
+            DeliveryOutcome::Delivered => "delivered",
+            DeliveryOutcome::Retryable { .. } => "retryable",
+            DeliveryOutcome::Permanent { .. } => "permanent",
+            DeliveryOutcome::PayloadTooLarge { .. } => "payload_too_large",
+        }
+    }
+}
+
+/// Bounded ClickHouse HTTP acknowledgement after headers arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickHouseAckRead {
+    /// Full body drained within the byte/time caps.
+    Complete { byte_len: u64, has_exception: bool },
+    /// Drain did not finish cleanly; treat as ambiguous for durability.
+    Incomplete { kind: ClickHouseAckIncomplete },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickHouseAckIncomplete {
+    LimitExceeded,
+    Timeout,
+    TransportFailure,
+}
+
+impl ClickHouseAckIncomplete {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LimitExceeded => "acknowledgement body exceeded the drain limit",
+            Self::Timeout => "acknowledgement body drain timed out",
+            Self::TransportFailure => "acknowledgement body drain had a transport failure",
+        }
+    }
 }
 
 async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Result<(), String> {
@@ -1419,10 +1474,16 @@ async fn post_json_each_row(
     match result {
         Ok(response) => {
             let status = response.status();
-            // Boundedly discard the body so keep-alive reuse works and peer
-            // bytes are never retained or logged.
-            let _drain = drain_http_batch_response_body(response).await;
-            classify_clickhouse_status(cfg, status, event_count, start.elapsed())
+            let exception_header = clickhouse_exception_code_header(response.headers());
+            let ack = read_clickhouse_acknowledgement(response).await;
+            classify_clickhouse_delivery(
+                cfg,
+                status,
+                ack,
+                exception_header.as_deref(),
+                event_count,
+                start.elapsed(),
+            )
         }
         Err(error) => {
             let reason = classify_reqwest_failure(&error);
@@ -1433,15 +1494,86 @@ async fn post_json_each_row(
     }
 }
 
-fn classify_clickhouse_status(
+fn clickhouse_exception_code_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get("x-clickhouse-exception-code")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| bound_string(value, 32))
+}
+
+async fn read_clickhouse_acknowledgement(response: reqwest::Response) -> ClickHouseAckRead {
+    if response
+        .content_length()
+        .is_some_and(|length| length > CLICKHOUSE_ACK_BODY_LIMIT_BYTES as u64)
+    {
+        return ClickHouseAckRead::Incomplete {
+            kind: ClickHouseAckIncomplete::LimitExceeded,
+        };
+    }
+    match tokio::time::timeout(
+        HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT,
+        read_response_body_bounded(response, CLICKHOUSE_ACK_BODY_LIMIT_BYTES),
+    )
+    .await
+    {
+        Err(_) => ClickHouseAckRead::Incomplete {
+            kind: ClickHouseAckIncomplete::Timeout,
+        },
+        Ok(Ok(bytes)) => {
+            // Response (and its pooled connection) were dropped when the read
+            // future completed; yield so idle-pool reclaim can run before the
+            // next POST on this client.
+            tokio::task::yield_now().await;
+            ClickHouseAckRead::Complete {
+                byte_len: bytes.len() as u64,
+                has_exception: body_has_clickhouse_exception(&bytes),
+            }
+        }
+        Ok(Err(BoundedReadError::LimitExceeded { .. })) => ClickHouseAckRead::Incomplete {
+            kind: ClickHouseAckIncomplete::LimitExceeded,
+        },
+        Ok(Err(BoundedReadError::Stream(_))) => ClickHouseAckRead::Incomplete {
+            kind: ClickHouseAckIncomplete::TransportFailure,
+        },
+    }
+}
+
+/// Detect ClickHouse exception markers in a bounded acknowledgement body.
+///
+/// Inspects bytes only for known markers; never logs or returns the payload.
+fn body_has_clickhouse_exception(body: &[u8]) -> bool {
+    const MARKERS: &[&[u8]] = &[b"DB::Exception", b"Code: "];
+    MARKERS
+        .iter()
+        .any(|marker| find_bytes_subslice(body, marker).is_some())
+}
+
+fn find_bytes_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn classify_clickhouse_delivery(
     cfg: &ClickHouseFlushConfig,
     status: StatusCode,
+    ack: ClickHouseAckRead,
+    exception_header: Option<&str>,
     event_count: usize,
     elapsed: Duration,
 ) -> DeliveryOutcome {
     if matches!(status, StatusCode::OK | StatusCode::NO_CONTENT) {
-        cfg.metrics.record_success(event_count, elapsed);
-        return DeliveryOutcome::Delivered;
+        return classify_success_status_acknowledgement(
+            cfg,
+            status,
+            ack,
+            exception_header,
+            event_count,
+            elapsed,
+        );
     }
 
     let code = status.as_u16();
@@ -1471,6 +1603,77 @@ fn classify_clickhouse_status(
     cfg.metrics
         .record_failure(FailureReason::Network, message.clone());
     DeliveryOutcome::Retryable { message }
+}
+
+fn classify_success_status_acknowledgement(
+    cfg: &ClickHouseFlushConfig,
+    status: StatusCode,
+    ack: ClickHouseAckRead,
+    exception_header: Option<&str>,
+    event_count: usize,
+    elapsed: Duration,
+) -> DeliveryOutcome {
+    let code = status.as_u16();
+    if exception_header.is_some() {
+        let message = format!(
+            "clickhouse returned HTTP {code} with X-ClickHouse-Exception-Code"
+        );
+        cfg.metrics
+            .record_failure(FailureReason::Http4xx, message.clone());
+        return DeliveryOutcome::Permanent {
+            status: code,
+            message,
+        };
+    }
+    match ack {
+        ClickHouseAckRead::Complete {
+            byte_len: 0,
+            has_exception: false,
+        } => {
+            cfg.metrics.record_success(event_count, elapsed);
+            DeliveryOutcome::Delivered
+        }
+        ClickHouseAckRead::Complete {
+            has_exception: true,
+            ..
+        } => {
+            let message = format!(
+                "clickhouse returned HTTP {code} with an exception in the acknowledgement body"
+            );
+            cfg.metrics
+                .record_failure(FailureReason::Http4xx, message.clone());
+            DeliveryOutcome::Permanent {
+                status: code,
+                message,
+            }
+        }
+        ClickHouseAckRead::Complete {
+            byte_len,
+            has_exception: false,
+        } => {
+            // Non-empty success bodies are not a persistence-proof ACK for
+            // INSERT JSONEachRow; keep the spool and retry idempotently.
+            let message = format!(
+                "clickhouse returned HTTP {code} with an ambiguous non-empty acknowledgement ({byte_len} bytes)"
+            );
+            cfg.metrics
+                .record_failure(FailureReason::Network, message.clone());
+            DeliveryOutcome::Retryable { message }
+        }
+        ClickHouseAckRead::Incomplete { kind } => {
+            let message = format!(
+                "clickhouse returned HTTP {code} but acknowledgement was incomplete: {}",
+                kind.as_str()
+            );
+            let reason = match kind {
+                ClickHouseAckIncomplete::Timeout => FailureReason::Timeout,
+                ClickHouseAckIncomplete::LimitExceeded
+                | ClickHouseAckIncomplete::TransportFailure => FailureReason::Network,
+            };
+            cfg.metrics.record_failure(reason, message.clone());
+            DeliveryOutcome::Retryable { message }
+        }
+    }
 }
 
 /// Deterministic split point for a 413 replay chunk.
@@ -1541,6 +1744,7 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         ));
     }
     validate_query_params(&config.clickhouse.insert_query_params)?;
+    validate_insert_durability_settings(&config.clickhouse)?;
 
     if config.batch.size == 0 || config.batch.size > MAX_BATCH_SIZE {
         return Err(format!(
@@ -1736,6 +1940,34 @@ fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+/// Durable mode rejects fire-and-forget async inserts unless the operator sets
+/// an explicitly named lossy opt-in that cannot be confused with durable mode.
+fn validate_insert_durability_settings(cfg: &ClickHouseConfig) -> Result<(), String> {
+    let Some(wait_value) = cfg.insert_query_params.get(WAIT_FOR_ASYNC_INSERT_PARAM) else {
+        return Ok(());
+    };
+    if !is_falsy_clickhouse_setting(wait_value) {
+        return Ok(());
+    }
+    if !cfg.allow_lossy_async_insert {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.insert_query_params['{WAIT_FOR_ASYNC_INSERT_PARAM}']=\
+             {wait_value:?} disables persistence-aware acknowledgement; set \
+             wait_for_async_insert to \"1\" for durable export, or set \
+             clickhouse.allow_lossy_async_insert=true to explicitly opt into \
+             fire-and-forget loss"
+        ));
+    }
+    Ok(())
+}
+
+fn is_falsy_clickhouse_setting(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 fn build_insert_url(base: &Url, cfg: &ClickHouseConfig) -> String {
@@ -2433,6 +2665,9 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
+    // Status-only helper for non-success paths. HTTP 200/204 durable success
+    // additionally requires a complete empty acknowledgement body with no
+    // exception header; see classify_clickhouse_acknowledgement_for_tests.
     match status {
         200 | 204 => "delivered",
         413 => "payload_too_large",
@@ -2441,6 +2676,49 @@ pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
         code if (400..500).contains(&code) => "permanent",
         _ => "retryable",
     }
+}
+
+/// Classify a ClickHouse acknowledgement the same way production delivery does.
+///
+/// `body = None` models an incomplete/ambiguous drain. `body = Some(b"")` is the
+/// durable success shape for HTTP 200/204. Exception markers and
+/// `X-ClickHouse-Exception-Code` never appear in returned labels or messages
+/// beyond bounded reason classes.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn classify_clickhouse_acknowledgement_for_tests(
+    status: u16,
+    body: Option<&[u8]>,
+    exception_code_header: Option<&str>,
+) -> &'static str {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let ack = match body {
+        Some(bytes) => ClickHouseAckRead::Complete {
+            byte_len: bytes.len() as u64,
+            has_exception: body_has_clickhouse_exception(bytes),
+        },
+        None => ClickHouseAckRead::Incomplete {
+            kind: ClickHouseAckIncomplete::TransportFailure,
+        },
+    };
+    let metrics = Arc::new(SinkMetrics::default());
+    let cfg = ClickHouseFlushConfig {
+        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        insert_url: "http://127.0.0.1/".to_string(),
+        username: None,
+        password: None,
+        timeout: Duration::from_secs(1),
+        metrics,
+    };
+    classify_clickhouse_delivery(
+        &cfg,
+        status,
+        ack,
+        exception_code_header,
+        1,
+        Duration::from_millis(1),
+    )
+    .label()
 }
 
 #[doc(hidden)]
