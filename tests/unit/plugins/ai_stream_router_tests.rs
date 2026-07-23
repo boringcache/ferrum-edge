@@ -1822,15 +1822,46 @@ async fn test_brotli_encoded_buffered_anthropic_sse_is_normalized() {
 async fn test_unsupported_content_encoding_is_rejected() {
     let plugin = build(openai_and_anthropic_config());
     let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
-    let mut ctx = post_ctx(&claude);
-    let mut req_headers = json_headers();
-    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+    for encoding in ["zstd", "gzip,", "gzip; q=1", "gzip, br"] {
+        let mut ctx = post_ctx(&claude);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
 
-    let mut resp_headers = HashMap::new();
-    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
-    resp_headers.insert("content-encoding".to_string(), "zstd".to_string());
-    let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
-    assert_eq!(reject_status(&reject), Some(502));
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("content-encoding".to_string(), encoding.to_string());
+        let reject = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert_eq!(
+            reject_status(&reject),
+            Some(502),
+            "{encoding} must fail closed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_identity_provider_content_encoding_passes_through() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+
+    for encoding in [None, Some("identity")] {
+        let mut ctx = post_ctx(&claude);
+        let mut req_headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        if let Some(encoding) = encoding {
+            resp_headers.insert("content-encoding".to_string(), encoding.to_string());
+        }
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(!ctx
+            .metadata
+            .contains_key("ai_stream_router.provider_content_encoding"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,6 +2054,139 @@ async fn test_malformed_tool_history_rejects_with_400() {
         reject_status(&plugin.before_proxy(&mut ctx4, &mut headers4).await),
         Some(400)
     );
+}
+
+#[tokio::test]
+async fn test_anthropic_translation_rejects_each_malformed_tool_history_shape() {
+    let plugin = build(openai_and_anthropic_config());
+    let invalid_requests = vec![
+        (
+            "missing messages",
+            json!({"model": "claude-3-5-sonnet", "stream": true}),
+        ),
+        (
+            "non-object message",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": ["bad"]}),
+        ),
+        (
+            "missing role",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"content": "bad"}]}),
+        ),
+        (
+            "unsupported role",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "critic", "content": "bad"}]}),
+        ),
+        (
+            "non-text user content",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "user", "content": 42}]}),
+        ),
+        (
+            "empty tool call list",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": []}]}),
+        ),
+        (
+            "non-array tool calls",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": {}}]}),
+        ),
+        (
+            "non-object tool call",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [7]}]}),
+        ),
+        (
+            "non-function tool call",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "custom", "function": {"name": "run", "arguments": "{}"}}]}]}),
+        ),
+        (
+            "missing tool call id",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"type": "function", "function": {"name": "run", "arguments": "{}"}}]}]}),
+        ),
+        (
+            "missing function object",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function"}]}]}),
+        ),
+        (
+            "invalid function name",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "not valid!", "arguments": "{}"}}]}]}),
+        ),
+        (
+            "non-string arguments",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": {}}}]}]}),
+        ),
+        (
+            "non-object encoded arguments",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "[]"}}]}]}),
+        ),
+        (
+            "tool calls on user message",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "user", "content": "bad", "tool_calls": []}]}),
+        ),
+        (
+            "repeated tool call id",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"id": "same", "type": "function", "function": {"name": "first", "arguments": "{}"}},
+                        {"id": "same", "type": "function", "function": {"name": "second", "arguments": "{}"}}
+                    ]
+                }]
+            }),
+        ),
+        (
+            "missing final tool result",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]}]}),
+        ),
+        (
+            "object tool result content",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": {}}
+                ]
+            }),
+        ),
+        (
+            "non-text tool result part",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": [{"type": "image", "text": "bad"}]}
+                ]
+            }),
+        ),
+        (
+            "missing tool result text",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": [{"type": "text"}]}
+                ]
+            }),
+        ),
+        (
+            "empty assistant content",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": ""}]}),
+        ),
+    ];
+
+    for (label, body) in invalid_requests {
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert_eq!(
+            reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+            Some(400),
+            "{label} must fail closed"
+        );
+    }
 }
 
 #[tokio::test]
