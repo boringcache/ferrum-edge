@@ -9,8 +9,8 @@ use ferrum_edge::plugins::chargeback::pricing::{
     MAX_UNIT_PRICE, checked_add_charge, checked_mul_quantity,
 };
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, StreamTransactionSummary, TransactionSummary,
-    WsDisconnectContext,
+    ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, StreamTransactionSummary,
+    TransactionSummary, WsDisconnectContext,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -2634,14 +2634,8 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
         })
         .await;
 
-    let mut old_stream = make_stream_summary(
-        PROXY_ID,
-        "Old Stream",
-        Some(CONSUMER),
-        "tcp",
-        100,
-        200,
-    );
+    let mut old_stream =
+        make_stream_summary(PROXY_ID, "Old Stream", Some(CONSUMER), "tcp", 100, 200);
     old_stream.proxy_lifecycle_generation = Some(1);
     old_plugin.on_stream_disconnect(&old_stream).await;
 
