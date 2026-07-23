@@ -2649,6 +2649,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
+    validate_api_chargeback_ownership(config)?;
     let mut errors = Vec::new();
     let mut global_plugins: BTreeMap<&str, Vec<Arc<dyn Plugin>>> = BTreeMap::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
@@ -3747,6 +3748,14 @@ fn validate_prometheus_metrics_ownership(config: &GatewayConfig) -> Result<(), S
     Ok(())
 }
 
+/// `api_chargeback` writes into one process-global `/charges` registry. Reject
+/// multiple effective instances on one proxy and disagreeing shared tunables
+/// before constructing plugins that would otherwise double-count or race on
+/// ownership (issue #2564).
+fn validate_api_chargeback_ownership(config: &GatewayConfig) -> Result<(), String> {
+    crate::plugins::api_chargeback::validate_composition(config).map_err(|errors| errors.join("; "))
+}
+
 /// `__mesh_bpf_metrics` is a single scrape exporter per process. Require at
 /// most one enabled global instance so reload never registers duplicate
 /// collectors / double-emits series on authenticated `/metrics`.
@@ -3836,6 +3845,7 @@ impl PluginCache {
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         validate_mesh_bpf_metrics_ownership(config)?;
+        validate_api_chargeback_ownership(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -4130,6 +4140,7 @@ impl PluginCache {
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         validate_mesh_bpf_metrics_ownership(config)?;
+        validate_api_chargeback_ownership(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -4170,6 +4181,7 @@ impl PluginCache {
     ) -> Result<Option<Arc<PluginCacheInner>>, String> {
         validate_prometheus_metrics_ownership(config)?;
         validate_mesh_bpf_metrics_ownership(config)?;
+        validate_api_chargeback_ownership(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);
@@ -4693,6 +4705,17 @@ impl PluginCache {
                 validate_correlation_id_composition(&merged, self.http_client.real_ip_header())
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
+            let chargeback_count = merged
+                .iter()
+                .filter(|plugin| plugin.name() == "api_chargeback")
+                .count();
+            if chargeback_count > 1 {
+                plugin_errors.push(format!(
+                    "proxy_id={}: api_chargeback permits at most one effective instance per proxy \
+                     (shared /charges registry is exactly-once); found {chargeback_count}",
+                    proxy.id
+                ));
             }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
         }
@@ -5373,6 +5396,17 @@ impl PluginCache {
                 validate_correlation_id_composition(&merged, http_client.real_ip_header())
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
+            let chargeback_count = merged
+                .iter()
+                .filter(|plugin| plugin.name() == "api_chargeback")
+                .count();
+            if chargeback_count > 1 {
+                plugin_errors.push(format!(
+                    "proxy_id={}: api_chargeback permits at most one effective instance per proxy \
+                     (shared /charges registry is exactly-once); found {chargeback_count}",
+                    proxy.id
+                ));
             }
 
             // Pre-compute whether any plugin requires response body buffering

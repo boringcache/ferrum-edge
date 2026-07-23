@@ -156,6 +156,7 @@ type BandwidthAggregateKey = (String, String, ProtocolFamily, Arc<str>, Arc<str>
 /// (first record per unique key) stamps these `Arc<str>` onto the new
 /// [`ChargebackEntry`] with a cheap `Arc` clone; the hot path (cache hit)
 /// touches none of them, preserving the zero-allocation recording path.
+/// Multiple effective instances on one proxy are rejected (issue #2564).
 #[derive(Clone)]
 pub struct InstanceScope {
     /// Instance currency label (e.g. "USD"). Emitted per-row at render time.
@@ -232,10 +233,11 @@ fn write_chargeback_key(
 /// **Per-instance scoping (finding #24)**: `currency` and `namespace_label` are
 /// stored per entry (set from the constructing plugin instance) rather than in
 /// a single process-global, last-writer-wins registry field. A single process
-/// legitimately hosts multiple `api_chargeback` instances with different
-/// currencies/namespaces (global / proxy / proxy_group scopes), so each
-/// exported row carries the currency and namespace of the instance that
-/// recorded it.
+/// may host multiple `api_chargeback` instances on **different** proxies with
+/// different currencies/namespaces, so each exported row carries the currency
+/// and namespace of the instance that recorded it. Multiple effective instances
+/// on one proxy are rejected (issue #2564) because this registry has no
+/// ledger/instance dimension and would double-count the same client transaction.
 ///
 /// The `consumer`, `proxy_id`, `status_code`, `protocol_family`, prices,
 /// `currency`, and `namespace_label` fields are set once on creation and read
@@ -375,10 +377,219 @@ impl ChargebackEntry {
 const DEFAULT_STALE_TTL_NANOS: u64 = 3_600_000_000_000;
 
 /// Default render cache TTL: 5 seconds.
-const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
+pub const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
+
+/// Default stale-entry TTL in seconds (matches [`DEFAULT_STALE_TTL_NANOS`]).
+pub const DEFAULT_STALE_ENTRY_TTL_SECS: u64 = DEFAULT_STALE_TTL_NANOS / 1_000_000_000;
 
 /// Default minimum cache age (in nanoseconds) before record() will invalidate.
 const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
+
+/// Default minimum cache age in milliseconds.
+pub const DEFAULT_CACHE_INVALIDATION_MIN_AGE_MS: u64 =
+    DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000;
+
+/// Default background cleanup interval in seconds.
+pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 300;
+
+/// Process-global render/cleanup knobs shared by every `api_chargeback` instance
+/// through the singleton `/charges` registry.
+///
+/// Pricing and currency remain per-instance and may differ across proxies.
+/// These four values must agree across every enabled instance because one
+/// cleanup task and one render cache serve the whole process (issue #2564).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedRegistryTunables {
+    pub render_cache_ttl_secs: u64,
+    pub stale_entry_ttl_secs: u64,
+    pub cache_invalidation_min_age_ms: u64,
+    pub cleanup_interval_seconds: u64,
+}
+
+impl SharedRegistryTunables {
+    /// Resolve shared tunables from one plugin config object, applying defaults.
+    pub fn from_config(config: &Value) -> Result<Self, String> {
+        Ok(Self {
+            render_cache_ttl_secs: optional_u64(
+                config,
+                "render_cache_ttl_seconds",
+                DEFAULT_RENDER_CACHE_TTL_SECS,
+            )?,
+            stale_entry_ttl_secs: optional_u64(
+                config,
+                "stale_entry_ttl_seconds",
+                DEFAULT_STALE_ENTRY_TTL_SECS,
+            )?,
+            cache_invalidation_min_age_ms: optional_u64(
+                config,
+                "cache_invalidation_min_age_ms",
+                DEFAULT_CACHE_INVALIDATION_MIN_AGE_MS,
+            )?,
+            cleanup_interval_seconds: optional_u64(
+                config,
+                "cleanup_interval_seconds",
+                DEFAULT_CLEANUP_INTERVAL_SECS,
+            )?,
+        })
+    }
+}
+
+/// Resolve the enabled `api_chargeback` configs that the plugin cache would
+/// install for each proxy. Any local proxy/proxy-group instance shadows all
+/// global instances of the same plugin type on that proxy — matching the
+/// general merge contract — but chargeback additionally requires the resulting
+/// effective list to contain at most one instance (issue #2564).
+fn effective_api_chargeback_plugins_by_proxy(
+    config: &crate::config::types::GatewayConfig,
+) -> Vec<(
+    &crate::config::types::Proxy,
+    Vec<&crate::config::types::PluginConfig>,
+)> {
+    use crate::config::types::PluginScope;
+
+    let plugin_by_id: HashMap<&str, &crate::config::types::PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| (plugin.id.as_str(), plugin))
+        .collect();
+    let global_chargeback: Vec<&crate::config::types::PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "api_chargeback"
+        })
+        .collect();
+
+    config
+        .proxies
+        .iter()
+        .map(|proxy| {
+            let local_chargeback: Vec<&crate::config::types::PluginConfig> = proxy
+                .plugins
+                .iter()
+                .filter_map(|association| {
+                    let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                    let scope_applies = match plugin.scope {
+                        PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                        // Config validation already requires proxy-group
+                        // instances to omit proxy_id. Applicability here mirrors
+                        // the runtime merge, which is driven by scope plus the
+                        // proxy's explicit plugin association.
+                        PluginScope::ProxyGroup => true,
+                        PluginScope::Global => false,
+                    };
+                    (plugin.enabled && plugin.plugin_name == "api_chargeback" && scope_applies)
+                        .then_some(plugin)
+                })
+                .collect();
+            let effective = if local_chargeback.is_empty() {
+                global_chargeback.clone()
+            } else {
+                local_chargeback
+            };
+            (proxy, effective)
+        })
+        .collect()
+}
+
+/// Enforce exactly-once `/charges` accounting and deterministic ownership of the
+/// shared render/cleanup tunables (issue #2564).
+///
+/// Rules:
+/// 1. The process may have at most one enabled global `api_chargeback`
+///    instance. Although a local instance shadows globals on a configured
+///    proxy, unmatched/fallback transaction paths retain the global chain, so
+///    multiple globals would still double-count.
+/// 2. After scope merging, each proxy may have at most one effective
+///    `api_chargeback` instance. Multiple proxy-scoped, proxy-group-scoped, or
+///    mixed attachments on one proxy are rejected — the process-global registry
+///    has no ledger/instance dimension, so every retained hook would double-count
+///    the same client transaction.
+/// 3. Across the whole process, every enabled `api_chargeback` instance must
+///    resolve to identical shared tunables
+///    (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
+///    `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`). Since every
+///    constructor applies the same values, construction order cannot change
+///    registry behavior. Pricing and currency may still differ per proxy.
+pub fn validate_composition(
+    config: &crate::config::types::GatewayConfig,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    let global_ids: Vec<&str> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.plugin_name == "api_chargeback"
+                && plugin.scope == crate::config::types::PluginScope::Global
+        })
+        .map(|plugin| plugin.id.as_str())
+        .collect();
+    if global_ids.len() > 1 {
+        errors.push(format!(
+            "api_chargeback permits at most one enabled global instance \
+             (shared /charges registry is exactly-once); found: {}",
+            global_ids.join(", ")
+        ));
+    }
+
+    for (proxy, effective) in effective_api_chargeback_plugins_by_proxy(config) {
+        if effective.len() > 1 {
+            let ids: Vec<&str> = effective.iter().map(|plugin| plugin.id.as_str()).collect();
+            errors.push(format!(
+                "api_chargeback permits at most one effective instance per proxy \
+                 (shared /charges registry is exactly-once); proxy '{}' has: {}",
+                proxy.id,
+                ids.join(", ")
+            ));
+        }
+    }
+
+    let mut enabled: Vec<&crate::config::types::PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "api_chargeback")
+        .collect();
+    enabled.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if let Some(reference) = enabled.first() {
+        let reference_tunables = match SharedRegistryTunables::from_config(&reference.config) {
+            Ok(tunables) => tunables,
+            Err(error) => {
+                errors.push(format!(
+                    "api_chargeback shared tunables in '{}': {error}",
+                    reference.id
+                ));
+                return Err(errors);
+            }
+        };
+        for sibling in enabled.iter().skip(1) {
+            match SharedRegistryTunables::from_config(&sibling.config) {
+                Ok(tunables) if tunables == reference_tunables => {}
+                Ok(_) => errors.push(format!(
+                    "api_chargeback shared render/cleanup tunables must match across all enabled \
+                     instances; '{}' disagrees with '{}'. \
+                     Align render_cache_ttl_seconds, stale_entry_ttl_seconds, \
+                     cache_invalidation_min_age_ms, and cleanup_interval_seconds",
+                    reference.id, sibling.id
+                )),
+                Err(error) => errors.push(format!(
+                    "api_chargeback shared tunables in '{}': {error}",
+                    sibling.id
+                )),
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 /// Sentinel `status_code` for stream sessions and WebSocket-disconnect
 /// bandwidth rows. Ordinary HTTP wire statuses are in `100..=599`; the
@@ -416,7 +627,8 @@ pub struct ChargebackRegistry {
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
-    configured_currency: ArcSwap<String>,
+    cleanup_interval_seconds: AtomicU64,
+    cleanup_interval_changed: tokio::sync::Notify,
     /// Guards against spawning duplicate background cleanup tasks.
     cleanup_task_started: AtomicBool,
 }
@@ -441,14 +653,10 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
-            configured_currency: ArcSwap::from_pointee("USD".to_string()),
+            cleanup_interval_seconds: AtomicU64::new(0),
+            cleanup_interval_changed: tokio::sync::Notify::new(),
             cleanup_task_started: AtomicBool::new(false),
         }
-    }
-
-    pub fn set_configured_currency(&self, currency: &str) {
-        self.configured_currency
-            .store(Arc::new(currency.to_string()));
     }
 
     /// Replace live display metadata after a gateway configuration is
@@ -473,10 +681,12 @@ impl ChargebackRegistry {
     /// registry infrastructure (render cache TTL, stale-entry eviction TTL,
     /// cache-invalidation min age). These intentionally remain registry-global
     /// because a single cleanup task and a single render cache serve all plugin
-    /// instances. Currency and namespace are NOT configured here — they are
-    /// scoped per [`ChargebackEntry`] so multiple instances with different
-    /// currencies/namespaces never misattribute one another's charges
-    /// (finding #24).
+    /// instances. Admission requires every enabled `api_chargeback` instance to
+    /// resolve to the same tunables so construction order cannot change
+    /// ownership (issue #2564). Currency and namespace are NOT configured here —
+    /// they are scoped per [`ChargebackEntry`] so instances on different proxies
+    /// with different currencies/namespaces never misattribute one another's
+    /// charges (finding #24).
     pub fn configure(
         &self,
         render_cache_ttl_secs: u64,
@@ -495,11 +705,19 @@ impl ChargebackRegistry {
         );
     }
 
-    /// Start a background task that periodically evicts stale entries.
+    /// Start or reconfigure the background task that periodically evicts stale
+    /// entries. The desired interval is reloadable, including transitions to
+    /// and from `0`; `Notify` wakes an existing task so a shorter interval or
+    /// disable takes effect without waiting for the previous timer.
+    ///
     /// Uses `compare_exchange` to ensure only one cleanup task runs per registry.
     /// Guard with `Handle::try_current()` so `new()` works in non-tokio test contexts.
     pub fn start_cleanup_task(self: &Arc<Self>, interval_seconds: u64) {
-        if interval_seconds == 0 {
+        self.cleanup_interval_seconds
+            .store(interval_seconds, Ordering::Release);
+        self.cleanup_interval_changed.notify_waiters();
+
+        if interval_seconds == 0 && !self.cleanup_task_started.load(Ordering::Acquire) {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -514,13 +732,39 @@ impl ChargebackRegistry {
         }
         let registry = Arc::clone(self);
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
             loop {
-                timer.tick().await;
-                let ttl_nanos = registry.stale_entry_ttl_nanos.load(Ordering::Relaxed);
-                registry.evict_stale(ttl_nanos);
+                // Register before loading so an interval update cannot be lost
+                // between observing the value and beginning the wait.
+                let interval_changed = registry.cleanup_interval_changed.notified();
+                let interval_seconds = registry.cleanup_interval_seconds.load(Ordering::Acquire);
+                if interval_seconds == 0 {
+                    interval_changed.await;
+                    continue;
+                }
+
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(interval_seconds)) => {
+                        // If a simultaneous reload changed the interval, let
+                        // the next loop honor it instead of evicting on the old
+                        // schedule.
+                        if registry.cleanup_interval_seconds.load(Ordering::Acquire)
+                            == interval_seconds
+                        {
+                            let ttl_nanos =
+                                registry.stale_entry_ttl_nanos.load(Ordering::Relaxed);
+                            registry.evict_stale(ttl_nanos);
+                        }
+                    }
+                    () = interval_changed => {}
+                }
             }
         });
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // Used by external tests; dead in the separately compiled bin target.
+    pub fn cleanup_interval_seconds_for_test(&self) -> u64 {
+        self.cleanup_interval_seconds.load(Ordering::Acquire)
     }
 
     /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
@@ -1387,11 +1631,13 @@ impl ChargebackRegistry {
         let currency = if currency_mixed {
             "mixed".to_string()
         } else {
-            let configured_currency = self.configured_currency.load();
             overall_currency
                 .as_deref()
                 .map(str::to_string)
-                .unwrap_or_else(|| configured_currency.as_str().to_string())
+                // With no recorded entries there is no authoritative instance
+                // currency. Keep the response deterministic instead of using
+                // constructor order from the process-global registry.
+                .unwrap_or_else(|| "USD".to_string())
         };
 
         let result = serde_json::json!({
@@ -1457,23 +1703,11 @@ impl ApiChargeback {
             None => "USD",
         };
 
-        let render_cache_ttl_secs = optional_u64(
-            config,
-            "render_cache_ttl_seconds",
-            DEFAULT_RENDER_CACHE_TTL_SECS,
-        )?;
-
-        let stale_entry_ttl_secs = optional_u64(
-            config,
-            "stale_entry_ttl_seconds",
-            DEFAULT_STALE_TTL_NANOS / 1_000_000_000,
-        )?;
-
-        let cache_invalidation_min_age_ms = optional_u64(
-            config,
-            "cache_invalidation_min_age_ms",
-            DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000,
-        )?;
+        // Resolve shared tunables before mutating the registry so a bad value
+        // never leaves process-global state half-applied. When multiple
+        // instances exist on different proxies they must already agree on these
+        // values (see [`validate_composition`]).
+        let tunables = SharedRegistryTunables::from_config(config)?;
 
         // Validate ALL pricing dimensions before touching the global registry,
         // so a config error never leaves shared state half-mutated.
@@ -1491,16 +1725,14 @@ impl ApiChargeback {
         // Validation passed — now safe to configure the shared registry. Only
         // the process-global render/cleanup knobs are set here; currency and
         // namespace are scoped per entry via this instance's `InstanceScope`
-        // (finding #24).
+        // (finding #24). Admission requires every enabled instance to resolve
+        // to the same tunables so construction order cannot change ownership.
         registry.configure(
-            render_cache_ttl_secs,
-            stale_entry_ttl_secs,
-            cache_invalidation_min_age_ms,
+            tunables.render_cache_ttl_secs,
+            tunables.stale_entry_ttl_secs,
+            tunables.cache_invalidation_min_age_ms,
         );
-        registry.set_configured_currency(currency);
-
-        let cleanup_interval_seconds = optional_u64(config, "cleanup_interval_seconds", 300)?;
-        registry.start_cleanup_task(cleanup_interval_seconds);
+        registry.start_cleanup_task(tunables.cleanup_interval_seconds);
 
         let scope = InstanceScope::new(currency, namespace);
 
