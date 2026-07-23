@@ -2232,7 +2232,7 @@ impl AnthropicSseNormalizer {
     fn ingest_complete_event(&mut self, raw: &[u8], out: &mut String) -> bool {
         match extract_sse_event_result(raw) {
             Ok((event_name, None)) => {
-                if event_name.as_deref().is_some_and(is_known_anthropic_event) {
+                if event_name.is_some_and(is_known_anthropic_event) {
                     self.emit_upstream_error(
                         "upstream provider sent a known Anthropic SSE event without valid data framing; stream terminated",
                         out,
@@ -2253,7 +2253,7 @@ impl AnthropicSseNormalizer {
                         self.finish(StreamTerminal::UpstreamFailure, out);
                         return true;
                     };
-                    if let Some(event_name) = event_name.as_deref()
+                    if let Some(event_name) = event_name
                         && is_known_anthropic_event(event_name)
                         && event_name != payload_type
                     {
@@ -2581,7 +2581,7 @@ fn is_known_anthropic_event(event_type: &str) -> bool {
 /// events cannot disguise malformed/missing `data:` framing as a harmless
 /// comment or forward-compatible unknown event. Returns `Err` for invalid
 /// UTF-8 framing.
-fn extract_sse_event_result(raw: &[u8]) -> Result<(Option<String>, Option<String>), ()> {
+fn extract_sse_event_result(raw: &[u8]) -> Result<(Option<&str>, Option<String>), ()> {
     let text = std::str::from_utf8(raw).map_err(|_| ())?;
     let mut data = String::new();
     let mut found = false;
@@ -2596,7 +2596,7 @@ fn extract_sse_event_result(raw: &[u8]) -> Result<(Option<String>, Option<String
             data.push_str(rest);
         } else if let Some(rest) = line.strip_prefix("event:") {
             let rest = rest.strip_prefix(' ').unwrap_or(rest);
-            event_name = (!rest.is_empty()).then(|| rest.to_string());
+            event_name = (!rest.is_empty()).then_some(rest);
         }
     }
     Ok((event_name, found.then_some(data)))
