@@ -2019,10 +2019,16 @@ pub struct RequestContext {
     /// times these hooks inline. Clone-safe via Arc; stays 0 on the H3 path
     /// (which never calls the finalizer), so it never double-counts there.
     pub reject_hook_execution_ns: Arc<std::sync::atomic::AtomicU64>,
-    /// Receiver for mirror response metadata from the `request_mirror` plugin.
-    /// Set by the plugin in `before_proxy`; collected before building
-    /// `TransactionSummary` so all logging plugins receive mirror results.
-    pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// Receivers for mirror response metadata from every dispatched
+    /// `request_mirror` instance on this request.
+    ///
+    /// Each enabled instance that actually selects work (sampling hit, including
+    /// saturated concurrency drops) pushes one watch receiver. Sampled-out
+    /// instances leave no slot. Bounded by the number of configured instances
+    /// that dispatch on this request — never a singleton last-writer slot.
+    /// Collected by detached mirror logging so each destination emits its own
+    /// `mirror: true` summary.
+    pub mirror_result_rxs: Vec<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
     /// One-shot HMAC work staged before request-body collection and consumed
     /// at authentication. This is private rather than transaction metadata so
     /// credential/signature/Consumer secret data cannot be forwarded or
@@ -2326,7 +2332,7 @@ impl RequestContext {
             peer_spiffe_id: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            mirror_result_rx: None,
+            mirror_result_rxs: Vec::new(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -3024,7 +3030,11 @@ impl RequestContext {
             peer_spiffe_id: self.peer_spiffe_id.clone(),
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
-            mirror_result_rx: None,
+            // Watch receivers are clone-safe. Preserve them so the detached
+            // gRPC-deadline logging path (which intentionally clones the
+            // context before spawning cleanup) still emits every dispatched
+            // mirror result.
+            mirror_result_rxs: self.mirror_result_rxs.clone(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -3641,15 +3651,39 @@ impl RequestContext {
         self.query_params_materialized = true;
     }
 
-    /// Collect mirror response metadata from the `request_mirror` plugin.
+    /// Collect mirror response metadata from every dispatched `request_mirror`
+    /// instance on this request.
     ///
-    /// Returns `Some(meta)` when a selected mirror attempt completes or emits
-    /// an explicit bounded failure/drop outcome. Collection follows the actual
-    /// mirror task/request lifetime; it has no shorter independent cutoff.
-    /// Callers on a client-visible response path must run this in a detached
-    /// task.
+    /// Returns one entry per selected mirror attempt that completes or emits an
+    /// explicit bounded failure/drop outcome. Sampled-out instances contribute
+    /// nothing. Collection follows each mirror task/request lifetime and has no
+    /// shorter independent cutoff. Callers on a client-visible response path
+    /// must run this in a detached task.
+    pub async fn collect_mirror_results(&self) -> Vec<MirrorResponseMeta> {
+        let mut results = Vec::with_capacity(self.mirror_result_rxs.len());
+        for rx in &self.mirror_result_rxs {
+            if let Some(meta) = collect_mirror_result(rx.clone()).await {
+                results.push(meta);
+            }
+        }
+        results
+    }
+
+    /// Collect the first dispatched mirror result, if any.
+    ///
+    /// Prefer [`Self::collect_mirror_results`] when multiple instances may have
+    /// dispatched. Kept for single-instance call sites and tests.
     pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
-        collect_mirror_result(self.mirror_result_rx.clone()?).await
+        collect_mirror_result(self.mirror_result_rxs.first()?.clone()).await
+    }
+
+    /// Record a mirror result receiver for one dispatched `request_mirror`
+    /// instance. Does not replace earlier instance receivers.
+    pub fn push_mirror_result_rx(
+        &mut self,
+        rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
+    ) {
+        self.mirror_result_rxs.push(rx);
     }
 
     /// Return the stable authenticated identity for downstream policy and
@@ -4468,10 +4502,18 @@ mod chained_inspector_tests {
 ///
 /// Communicated via `tokio::sync::watch` channel from the spawned mirror task
 /// to the proxy handler, which builds a second `TransactionSummary` (with
-/// `mirror: true`) and logs it through the normal plugin pipeline.
+/// `mirror: true`) and logs it through the normal plugin pipeline. When several
+/// `request_mirror` instances dispatch on one request, each produces an
+/// independently attributable record (plugin config id + query-stripped
+/// destination URL) rather than overwriting a singleton slot.
 #[derive(Debug, Clone)]
 pub struct MirrorResponseMeta {
-    /// URL the mirror request was sent to.
+    /// Stable plugin-config resource id of the originating `request_mirror`
+    /// instance when known (never a secret). `None` for synthetic/test
+    /// construction without a config id.
+    pub mirror_plugin_id: Option<String>,
+    /// URL the mirror request was sent to (query string stripped so credentials
+    /// in the original request query cannot leak into logs).
     pub mirror_target_url: String,
     /// HTTP status code from the mirror target. `None` when the request failed
     /// before a response was received or was dropped/cancelled (DNS, connect,
@@ -4841,6 +4883,7 @@ impl TransactionSummary {
             "grpc_message",
             "rejection_phase",
             "mirror_error",
+            "mirror_plugin_id",
             "response_size_bytes",
         ] {
             mirror.metadata.remove(key);
@@ -4858,17 +4901,23 @@ impl TransactionSummary {
         if let Some(err) = result.mirror_error {
             mirror.metadata.insert("mirror_error".to_string(), err);
         }
+        if let Some(plugin_id) = result.mirror_plugin_id {
+            mirror
+                .metadata
+                .insert("mirror_plugin_id".to_string(), plugin_id);
+        }
         mirror
     }
 }
 
-/// Log a transaction summary through all logging plugins, then log a mirror
-/// summary if a mirror request was dispatched.
+/// Log a transaction summary through all logging plugins, then log one mirror
+/// summary per dispatched `request_mirror` instance.
 ///
-/// Mirror results are collected after the main summary is logged, giving the
-/// spawned mirror task maximum time to complete. The mirror entry uses the
+/// Mirror results are collected after the main summary is logged, giving each
+/// spawned mirror task maximum time to complete. Each mirror entry uses the
 /// same `TransactionSummary` schema with `mirror: true` so existing log
-/// pipelines work without changes.
+/// pipelines work without changes. Mixed completion order and mixed
+/// success/failure across instances do not drop earlier results.
 ///
 /// Some proxy paths call this with an empty plugin slice so runtime transaction
 /// metrics still see no-plugin error and streaming-disconnect outcomes.
@@ -4896,30 +4945,35 @@ pub async fn log_with_mirror(
 
     // Mirror completion and mirror-summary logging are fully detached from the
     // primary transaction. Buffered response paths call `log_with_mirror`
-    // before handing the response to hyper, so awaiting the mirror receiver
+    // before handing the response to hyper, so awaiting mirror receivers
     // here would make a stalled shadow target client-visible. Do not clone the
     // summary or plugin list when this request was not mirrored.
-    let Some(mirror_result_rx) = ctx.mirror_result_rx.clone() else {
+    if ctx.mirror_result_rxs.is_empty() {
         return;
-    };
-    let summary = summary.clone();
-    let plugins = plugins.to_vec();
-    tokio::spawn(async move {
-        let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
-            return;
-        };
-        let mirror_summary = summary.as_mirror_entry(mirror_result);
-        let mirror_mesh_key = if precompute_mesh_key {
-            crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
-        } else {
-            None
-        };
-        for plugin in plugins {
-            plugin
-                .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
-                .await;
-        }
-    });
+    }
+    let plugins: Arc<[Arc<dyn Plugin>]> = Arc::from(plugins.to_vec());
+    // Register one detached collector per instance before returning so mixed
+    // completion order cannot drop an earlier destination's summary.
+    for mirror_result_rx in ctx.mirror_result_rxs.iter().cloned() {
+        let summary = summary.clone();
+        let plugins = Arc::clone(&plugins);
+        tokio::spawn(async move {
+            let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
+                return;
+            };
+            let mirror_summary = summary.as_mirror_entry(mirror_result);
+            let mirror_mesh_key = if precompute_mesh_key {
+                crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
+            } else {
+                None
+            };
+            for plugin in plugins.iter() {
+                plugin
+                    .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
+                    .await;
+            }
+        });
+    }
 }
 
 /// Run terminal transaction logging before a buffered H1/H2 response is handed
@@ -6995,11 +7049,12 @@ pub trait Plugin: Send + Sync {
 /// Prefer [`create_plugin_with_http_client`] in production to share the gateway's
 /// pooled client across all plugins for connection reuse and keepalive.
 ///
-/// Plugins that partition state by configured identity (notably
-/// `request_deduplication` and `waf` anomaly scoring) should be constructed
-/// through [`create_plugin_with_http_client_and_config_id`] with the stable
-/// plugin-config resource id. Direct construction here uses a validation-only
-/// default identity.
+/// Plugins that partition or attribute work by configured identity (notably
+/// `request_deduplication`, `waf` anomaly scoring, and `request_mirror`
+/// transaction records) should be constructed through
+/// [`create_plugin_with_http_client_and_config_id`] with the stable plugin-config
+/// resource id. Direct construction here uses a validation-only default
+/// identity.
 #[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
     create_plugin_with_http_client(name, config, PluginHttpClient::default())
@@ -7035,10 +7090,13 @@ pub fn create_plugin_with_http_client(
 /// `plugin_config_id` is the configured plugin-config resource id (global /
 /// proxy / proxy_group). Production `PluginCache` passes `Some(&pc.id)` so
 /// Redis-backed `request_deduplication` instances partition logical keys by that
-/// identity and `waf` instances isolate anomaly-score accumulators / ownership
-/// metadata. Pass `None` for config-validation and direct/test construction that
-/// does not need sibling isolation (uses the plugin's standalone default id).
-/// Blank ids fail closed when supplied.
+/// identity, `waf` instances isolate anomaly-score accumulators / ownership
+/// metadata, and `api_chargeback_sink` instances publish accepted-generation
+/// status/metrics under that stable identity, while `request_mirror` records
+/// attribute each shadow destination. Pass `None` for config-validation and
+/// direct/test construction that does not need sibling isolation or attribution
+/// (uses the plugin's standalone default id). Blank ids fail closed when
+/// supplied.
 pub fn create_plugin_with_http_client_and_config_id(
     name: &str,
     config: &Value,
@@ -7188,10 +7246,13 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.clone(),
         )?))),
-        "request_mirror" => Ok(Some(Arc::new(request_mirror::RequestMirror::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "request_mirror" => Ok(Some(Arc::new(
+            request_mirror::RequestMirror::new_with_config_id(
+                config,
+                http_client.clone(),
+                plugin_config_id,
+            )?,
+        ))),
         "load_testing" => Ok(Some(Arc::new(load_testing::LoadTesting::new(
             config,
             http_client.clone(),
@@ -7256,11 +7317,14 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.namespace(),
         )?))),
-        "api_chargeback_sink" => Ok(Some(Arc::new(api_chargeback_sink::ApiChargebackSink::new(
-            config,
-            http_client.clone(),
-            http_client.namespace(),
-        )?))),
+        "api_chargeback_sink" => Ok(Some(Arc::new(
+            api_chargeback_sink::ApiChargebackSink::new_with_config_id(
+                config,
+                http_client.clone(),
+                http_client.namespace(),
+                plugin_config_id,
+            )?,
+        ))),
         "otel_tracing" => Ok(Some(Arc::new(
             otel_tracing::OtelTracing::new_with_http_client(config, http_client)?,
         ))),

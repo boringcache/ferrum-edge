@@ -830,6 +830,11 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
+Mirror entries add `metadata.mirror_plugin_id` (the stable plugin-config ID)
+and any `metadata.mirror_error`; their standard `backend_target` field contains
+the query-stripped mirror URL. Several shadow destinations therefore remain
+independently attributable without logging request credentials.
+
 **Notes on conditional fields:** `auth_method`, `grpc_status`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when not applicable/false/null to keep log entries compact.
 
 **`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_received` reflect the full client-visible outcome.
@@ -1477,8 +1482,9 @@ needs explicit `clickhouse.allow_lossy_async_insert=true`, and enabling
 `async_insert` without a wait setting pins `wait_for_async_insert=1`. It
 supports per-event mode for transaction-level provenance, snapshot mode for
 lower ingest volume (requires `spool.enabled=true`), an on-disk spool for
-ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics under
-`/metrics`. See
+ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generation
+status with aggregate totals), and process-wide aggregate Prometheus metrics
+under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
 reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
@@ -3860,20 +3866,29 @@ Duplicates live proxy traffic to a secondary destination for shadow testing, val
 **Priority:** 3075
 **Protocols:** HTTP, gRPC
 
-Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger). Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the proxy's `backend_read_timeout_ms` is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream failure, and `max_in_flight` drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. The gateway runtime cancels outstanding detached mirror/logging tasks during shutdown; they never delay the client response or extend shutdown. The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
+Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger). Every dispatched `request_mirror` instance owns an independent result receiver and emits its own entry, identified by `metadata.mirror_plugin_id` plus the query-stripped target URL. A later instance never replaces an earlier result, and collectors run independently so mixed completion order or one slow destination does not suppress another. An instance sampled out by `percentage` emits no entry because it sent no shadow request; a selected instance rejected by its own `max_in_flight` limit emits an attributable failure entry. Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the proxy's `backend_read_timeout_ms` is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream failure, and `max_in_flight` drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. The gateway runtime cancels outstanding detached mirror/logging tasks during shutdown; they never delay the client response or extend shutdown. The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `mirror_host` | String | **(required)** | Hostname or IP of the mirror target |
 | `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
 | `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
-| `mirror_path` | String | _(none)_ | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
+| `mirror_path` | String | _(none)_ | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. Precedence is explicit `mirror_path`, then the matched mesh route rewrite, then the backend-effective authorized path when backend-path policy is active, then the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0). Quantized to 0.1% steps via `round(percentage × 10)` |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
 | `max_response_body_bytes` | Integer | `1048576` | Cap on bytes read from a mirror response when sizing it. Only consulted when the response has no `content-length` header — streaming aborts as soon as the limit is crossed and the truncated count is recorded. The mirror task discards the bytes after sizing, so this only bounds memory pressure from a misbehaving mirror endpoint streaming an unbounded body to a fire-and-forget task. Default is 1 MiB |
 | `max_in_flight` | Integer | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1). Bounds the mirror concurrency/backpressure budget: saturation drops the new mirror attempt without affecting the primary request |
 
 **Percentage sampling:** Selection is deterministic and evenly spaced (Bresenham / dithered phase accumulator), not randomized and not a contiguous prefix of each 1,000-request window. The effective threshold is `round(percentage × 10)` clamped to `0..=1000` tenths of a percent. `0%` never mirrors; `100%` always mirrors. For other values, each request adds the threshold to a phase in `0..1000`; when the sum reaches or exceeds `1000` the request is mirrored and the phase wraps by subtracting `1000`. Every complete 1,000-request cycle therefore mirrors exactly `threshold` requests, with inter-selection gaps of `floor(1000/threshold)` or `ceil(1000/threshold)`. Construction and config reload reset the phase to `0`, which defers the first selection until the accumulator crosses `1000` — reload does not reopen with a mirrored burst. The phase is bounded on every update (no unbounded counter wrap), and updates are lock-free via a single `AtomicU64` compare-exchange on the request hot path (no per-request allocation, RNG, formatting, or mutex).
+
+**Mesh route parity:** When `mesh_route_dispatch` selected the request,
+`request_mirror` reads (without consuming) the finalized route URI. An explicit
+`mirror_path` still wins. The configured mirror URL remains the dial, DNS, TLS,
+and egress-validation identity, while the application Host/authority is the
+selected rewritten authority (or selected request Host when no authority
+rewrite exists) with Envoy/Istio's `-shadow` hostname suffix. Standalone
+off-mesh mirrors retain the stricter boundary: client Host and proxy-owned
+`X-Forwarded-*` fields are stripped and authority derives from the mirror URL.
 
 When `mirror_request_body` is enabled, the plugin preserves binary payloads (including gRPC protobuf) using a binary-safe body store. Non-UTF-8 request bodies are mirrored correctly. For native gRPC, H1/H2 and H3 frontends reuse that one bounded prebuffer for both the detached shadow and primary dispatch: they do not read the client stream or run request transforms/final hooks twice. The prebuffer uses the gRPC receive ceiling and the proxy request-body read timeout; a cancelled or timed-out upload is rejected before either destination receives a partial request. Shadow connection, response, or logging failures remain detached from the primary RPC.
 

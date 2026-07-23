@@ -1140,10 +1140,13 @@ fn try_create_plugin(
             &pc.id,
         )
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
-    } else if pc.plugin_name == "request_deduplication" {
+    } else if matches!(
+        pc.plugin_name.as_str(),
+        "request_deduplication" | "request_mirror" | "api_chargeback_sink"
+    ) {
         // Pass the stable plugin-config resource id through the production
-        // factory so Redis logical keys partition sibling instances. Do not use
-        // the process-local runtime instance id here.
+        // factory so identity-aware plugins partition or attribute sibling
+        // instances. Do not use the process-local runtime instance id here.
         create_plugin_with_http_client_and_config_id(
             &pc.plugin_name,
             &pc.config,

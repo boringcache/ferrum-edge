@@ -2582,6 +2582,16 @@ Per-route `mirror` (Istio `http[].mirror` + `mirrorPercentage` / legacy `mirrorP
 
 Because mirror is a per-route action realized as a proxy-scoped plugin, a route carrying a mirror is route-local: if that route would have to be **collapsed** with a sibling route onto one Ferrum proxy (rare — same listen path, guarded predicates), translation **fails closed** rather than silently mirroring the sibling's traffic. Model such cases with distinct listen paths.
 
+The shadow request reflects the final selected route. When `rewrite.uri` is
+present and the mirror plugin has no explicit `mirror_path`, it reuses the
+rebased URI without consuming the override required by primary dispatch. An
+explicit `mirror_path` is an operator override and wins. For route-local mesh
+mirrors, the configured mirror destination remains the dial/TLS identity, while
+the application Host/authority is the selected rewritten authority (or the
+selected request Host when no authority rewrite exists) with the Envoy/Istio
+`-shadow` suffix. This mesh-only behavior does not relax standalone
+`request_mirror` egress sanitization.
+
 ### URI / Authority Rewrite
 
 Per-route `rewrite` (Istio `http[].rewrite`) rides on each emitted `mesh_route_dispatch` rule as a per-rule `rewrite` action, so it follows the matched route through route-collapse without rewriting sibling routes:
