@@ -523,6 +523,13 @@ pub struct RedisRateLimitClient {
     health_checker_started: AtomicBool,
     /// Abort handle for the background recovery checker (set once on start).
     health_checker_abort: Mutex<Option<AbortHandle>>,
+    /// Times the recovery checker armed `sleep(interval)` (test-observable).
+    ///
+    /// Incremented immediately before each interval wait so paused-time tests
+    /// can wait for the timer to register before advancing the clock.
+    health_checker_interval_waits: Arc<AtomicUsize>,
+    /// Times the recovery checker began a post-interval dial attempt (tests).
+    health_checker_probe_attempts: Arc<AtomicUsize>,
     /// Gateway-level TLS no-verify setting (`FERRUM_TLS_NO_VERIFY`).
     tls_no_verify: bool,
     /// Pre-read CA bundle PEM bytes from `FERRUM_TLS_CA_BUNDLE_PATH`.
@@ -606,6 +613,8 @@ impl RedisRateLimitClient {
             available: Arc::new(AtomicBool::new(true)),
             health_checker_started: AtomicBool::new(false),
             health_checker_abort: Mutex::new(None),
+            health_checker_interval_waits: Arc::new(AtomicUsize::new(0)),
+            health_checker_probe_attempts: Arc::new(AtomicUsize::new(0)),
             tls_no_verify,
             tls_ca_bundle_pem,
         }
@@ -644,6 +653,24 @@ impl RedisRateLimitClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// How many times the recovery checker armed its interval sleep (tests).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn health_checker_interval_waits_for_test(&self) -> usize {
+        self.health_checker_interval_waits.load(Ordering::Acquire)
+    }
+
+    /// How many post-interval dial attempts the recovery checker began (tests).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn health_checker_probe_attempts_for_test(&self) -> usize {
+        self.health_checker_probe_attempts.load(Ordering::Acquire)
+    }
+
+    /// Shared probe-attempt counter for observing the checker after Drop (tests).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn health_checker_probe_attempts_arc_for_test(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.health_checker_probe_attempts)
     }
 
     /// Configured pool cardinality (`redis_pool_size`).
@@ -1062,10 +1089,18 @@ impl RedisRateLimitClient {
         let connect_timeout = self.connect_timeout();
         let tls_no_verify = self.tls_no_verify;
         let tls_ca_bundle_pem = self.tls_ca_bundle_pem.clone();
+        let interval_waits = Arc::clone(&self.health_checker_interval_waits);
+        let probe_attempts = Arc::clone(&self.health_checker_probe_attempts);
 
         let handle = tokio::spawn(async move {
             loop {
+                // Count before `sleep(...).await` so tests can wait for this
+                // task to reach its interval wait. On the current-thread test
+                // runtime there is no yield between the increment and the first
+                // Sleep poll that registers the timer.
+                interval_waits.fetch_add(1, Ordering::Release);
                 tokio::time::sleep(interval).await;
+                probe_attempts.fetch_add(1, Ordering::Release);
 
                 // Screen + resolve through the shared DNS cache, fail-closed: the
                 // recovery checker must NOT hand an unscreened host to the Redis
