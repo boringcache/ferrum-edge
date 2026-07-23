@@ -1267,10 +1267,7 @@ impl Plugin for CompressionPlugin {
         //
         // Stripping is gated on successful decompression so we never forward a
         // body whose headers and contents disagree (RFC 9110 §8.4).
-        match self.try_claim_and_decode_request(ctx, headers, None) {
-            PluginResult::Continue => PluginResult::Continue,
-            reject @ (PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }) => reject,
-        }
+        self.try_claim_and_decode_request(ctx, headers, None)
     }
 
     async fn after_proxy(
