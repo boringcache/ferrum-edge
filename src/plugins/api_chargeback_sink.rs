@@ -3075,7 +3075,12 @@ fn finalize_replayed_spool_file(
     Ok(())
 }
 
-#[derive(Clone)]
+/// Immutable categorical dimensions for one snapshot accumulator identity.
+///
+/// The complete value is the typed accumulator key and is also copied into
+/// emitted `ChargeEvent`s. It must not be treated as first-writer-wins
+/// decoration on a coarser or delimiter-encoded identity.
+#[derive(Clone, Eq, Hash, PartialEq)]
 struct SnapshotMetadata {
     namespace: String,
     consumer_id: String,
@@ -3195,8 +3200,8 @@ struct SnapshotEntry {
 }
 
 pub struct SnapshotAccumulator {
-    entries: DashMap<String, SnapshotEntry>,
-    last_emitted: DashMap<String, SnapshotTotals>,
+    entries: DashMap<SnapshotMetadata, SnapshotEntry>,
+    last_emitted: DashMap<SnapshotMetadata, SnapshotTotals>,
 }
 
 impl SnapshotAccumulator {
@@ -3280,15 +3285,10 @@ impl SnapshotAccumulator {
     }
 
     fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) {
-        let key = snapshot_key(
-            &meta.namespace,
-            &meta.consumer_id,
-            &meta.proxy_id,
-            meta.status_code,
-            meta.http_status_code,
-            meta.grpc_status,
-            &meta.protocol,
-        );
+        // Use the typed metadata value itself as the key. A delimiter-encoded
+        // string would allow hostile or ordinary `|` characters in route/name
+        // dimensions to collide and recreate mixed attribution.
+        let key = meta.clone();
         let now = unix_timestamp_seconds();
         let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
             meta,
@@ -3342,7 +3342,7 @@ impl SnapshotAccumulator {
 
     fn cleanup_stale(&self, now: i64, stale_entry_ttl_secs: u64) -> usize {
         let cutoff = now.saturating_sub(stale_entry_ttl_secs.min(i64::MAX as u64) as i64);
-        let keys: Vec<String> = self
+        let keys: Vec<SnapshotMetadata> = self
             .entries
             .iter()
             .filter(|entry| entry.value().last_seen_at.load(Ordering::Relaxed) <= cutoff)
@@ -3720,26 +3720,6 @@ fn bound_string(value: &str, max_len: usize) -> String {
         end -= 1;
     }
     value[..end].to_string()
-}
-
-fn snapshot_key(
-    namespace: &str,
-    consumer: &str,
-    proxy_id: &str,
-    status_code: u16,
-    http_status_code: Option<u16>,
-    grpc_status: Option<u32>,
-    protocol: &str,
-) -> String {
-    format!(
-        "{namespace}|{consumer}|{proxy_id}|{status_code}|{}|{}|{protocol}",
-        http_status_code
-            .map(|status| status.to_string())
-            .unwrap_or_default(),
-        grpc_status
-            .map(|status| status.to_string())
-            .unwrap_or_default()
-    )
 }
 
 fn normalize_snapshot_grpc_status(status: u32) -> u32 {

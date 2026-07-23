@@ -20423,7 +20423,11 @@ components:
         status for pricing. Native gRPC and translated gRPC-Web use the final
         normalized grpc-status mapped to the canonical effective HTTP status.
         Durable events preserve that billable status, the raw HTTP status, and
-        the normalized gRPC status separately.
+        the normalized gRPC status separately. Snapshot mode aggregates by every
+        exported categorical dimension (namespace, consumer_id, consumer_name,
+        proxy_id, proxy_name, route_id, billable status, raw HTTP status, final
+        gRPC status, and protocol) so mixed route/protocol/name traffic cannot
+        be labeled with first-record metadata.
 
         At least one nonempty pricing dimension must be configured with the same
         semantics as runtime `PricingConfig::has_any_pricing`: a nonempty
@@ -20554,7 +20558,16 @@ components:
           type: string
           enum: [per_event, snapshot]
           default: per_event
-          description: Export one event per transaction or periodic snapshot deltas. Snapshot mode requires spool.enabled=true for durable delta delivery.
+          description: |
+            Export one event per transaction or periodic snapshot deltas.
+            Snapshot mode requires spool.enabled=true for durable delta delivery.
+            Snapshot accumulator identity is every exported categorical field:
+            namespace, consumer_id, consumer_name (empty when absent), proxy_id,
+            proxy_name, route_id (empty when absent), billable status_code, raw
+            http_status_code, final grpc_status, and protocol. Delta emission,
+            last-emitted bookkeeping, and stale cleanup share that identity so
+            mixed routes, protocols, or display names cannot collapse into one
+            mislabeled aggregate.
         currency:
           type: string
           minLength: 1
