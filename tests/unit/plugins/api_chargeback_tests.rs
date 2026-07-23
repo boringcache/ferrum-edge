@@ -10,6 +10,7 @@ use ferrum_edge::plugins::chargeback::pricing::{
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, DisconnectCause, Plugin, StreamTransactionSummary, TransactionSummary,
+    WsDisconnectContext,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -2550,4 +2551,130 @@ async fn test_effective_plugin_chain_partitions_multi_instance_currency_totals()
     assert_eq!(consumer["total_calls"], 3);
     assert_eq!(consumer["charges_by_currency"]["USD"]["total_charges"], 3.0);
     assert_eq!(consumer["charges_by_currency"]["EUR"]["total_charges"], 3.5);
+}
+
+/// Model an atomic reload that reuses one proxy id for HTTP/WebSocket while an
+/// old stream generation remains alive. The retained old plugin instance must
+/// not merge its late disconnect into the new generation's status-0 WebSocket
+/// bandwidth row.
+#[tokio::test]
+async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_partitioned() {
+    const CONSUMER: &str = "issue-2571-reload-consumer";
+    const PROXY_ID: &str = "issue-2571-reused-proxy";
+    let pricing = json!({
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.001,
+            "price_per_byte_received": 0.001
+        }
+    });
+
+    let old_config = GatewayConfig {
+        proxies: vec![chargeback_chain_stream_proxy(PROXY_ID, "charge-old-stream")],
+        plugin_configs: vec![chargeback_chain_plugin(
+            "charge-old-stream",
+            PROXY_ID,
+            "USD",
+            pricing.clone(),
+        )],
+        ..GatewayConfig::default()
+    };
+    let old_cache = PluginCache::new(&old_config).expect("old stream generation cache");
+    let old_plugin = old_cache
+        .get_plugins(PROXY_ID)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("old stream generation chargeback plugin");
+
+    let new_config = GatewayConfig {
+        proxies: vec![chargeback_chain_proxy(
+            PROXY_ID,
+            "/issue-2571-reused",
+            "charge-new-http",
+        )],
+        plugin_configs: vec![chargeback_chain_plugin(
+            "charge-new-http",
+            PROXY_ID,
+            "USD",
+            pricing,
+        )],
+        ..GatewayConfig::default()
+    };
+    let new_cache = PluginCache::new(&new_config).expect("new HTTP generation cache");
+    let new_plugin = new_cache
+        .get_plugins(PROXY_ID)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("new HTTP generation chargeback plugin");
+
+    new_plugin
+        .on_ws_disconnect(&WsDisconnectContext {
+            namespace: "ferrum".to_string(),
+            proxy_id: PROXY_ID.to_string(),
+            proxy_name: Some("New WebSocket".to_string()),
+            client_ip: "127.0.0.1".to_string(),
+            backend_target: "http://127.0.0.1:9000".to_string(),
+            listen_port: 8080,
+            connection_id: 1,
+            duration_ms: 10.0,
+            frames_client_to_backend: 1,
+            frames_backend_to_client: 1,
+            bytes_client_to_backend: 50,
+            bytes_backend_to_client: 75,
+            timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
+            timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
+            direction: None,
+            io_side: None,
+            error_class: None,
+            consumer_username: Some(CONSUMER.to_string()),
+            auth_method: None,
+            metadata: HashMap::new(),
+            proxy_lifecycle_generation: Some(2),
+        })
+        .await;
+
+    let mut old_stream = make_stream_summary(
+        PROXY_ID,
+        "Old Stream",
+        Some(CONSUMER),
+        "tcp",
+        100,
+        200,
+    );
+    old_stream.proxy_lifecycle_generation = Some(1);
+    old_plugin.on_stream_disconnect(&old_stream).await;
+
+    let registry = global_registry();
+    let http_key = make_key_with_prices(
+        CONSUMER,
+        PROXY_ID,
+        0,
+        ProtocolFamily::Http,
+        0.0,
+        0.001,
+        0.001,
+    );
+    let stream_key = make_key_with_prices(
+        CONSUMER,
+        PROXY_ID,
+        0,
+        ProtocolFamily::Stream,
+        0.0,
+        0.001,
+        0.001,
+    );
+    let http = registry
+        .entries
+        .get(&http_key)
+        .expect("new WebSocket generation entry");
+    assert_eq!(http.protocol_family, ProtocolFamily::Http);
+    assert_eq!(http.call_count.load(Ordering::Relaxed), 0);
+    drop(http);
+    let stream = registry
+        .entries
+        .get(&stream_key)
+        .expect("retained old stream generation entry");
+    assert_eq!(stream.protocol_family, ProtocolFamily::Stream);
+    assert_eq!(stream.call_count.load(Ordering::Relaxed), 1);
 }
