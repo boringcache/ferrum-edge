@@ -1771,7 +1771,8 @@ async fn unsupported_encoding_combinations_fail_at_admission() {
             }
         }]
     }))
-    .unwrap_err();
+    .err()
+    .expect("unsupported encoding style must fail admission");
     assert!(
         err.contains("unsupported"),
         "matrix style must fail closed, got {err}"
@@ -1797,7 +1798,8 @@ async fn unsupported_encoding_combinations_fail_at_admission() {
             }
         }]
     }))
-    .unwrap_err();
+    .err()
+    .expect("unsupported explode combination must fail admission");
     assert!(
         err.contains("explode=false"),
         "spaceDelimited+explode true must fail, got {err}"
@@ -1832,7 +1834,8 @@ async fn unsupported_encoding_combinations_fail_at_admission() {
                 }
             }]
         }))
-        .unwrap_err();
+        .err()
+        .expect("invalid encoding configuration must fail admission");
         assert!(
             error.contains(expected),
             "invalid encoding must fail with {expected:?}, got {error}"

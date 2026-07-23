@@ -1503,15 +1503,15 @@ fn normalize_request_body_encoding(
             _ => {}
         }
 
-        if style == "deepObject" {
-            if !request_body_schema_accepts_object(property_schema, 0) {
-                return Err(ExtractError::MalformedExtension {
-                    which: "requestBody.content.encoding",
-                    error: format!(
-                        "encoding['{property}']: style 'deepObject' requires an object schema property"
-                    ),
-                });
-            }
+        if style == "deepObject"
+            && !request_body_schema_accepts_object(property_schema, 0)
+        {
+            return Err(ExtractError::MalformedExtension {
+                which: "requestBody.content.encoding",
+                error: format!(
+                    "encoding['{property}']: style 'deepObject' requires an object schema property"
+                ),
+            });
         }
 
         if let Some(content_type) = property_object.get("contentType") {

@@ -1173,12 +1173,10 @@ fn parse_property_encoding(
         }
     }
 
-    if style == EncodingStyle::DeepObject {
-        if !schema_accepts_object(property_schema) {
-            return Err(format!(
-                "encoding['{property}']: style 'deepObject' requires an object schema property"
-            ));
-        }
+    if style == EncodingStyle::DeepObject && !schema_accepts_object(property_schema) {
+        return Err(format!(
+            "encoding['{property}']: style 'deepObject' requires an object schema property"
+        ));
     }
 
     let content_type = match object.get("contentType") {
@@ -2745,10 +2743,9 @@ fn parse_header_params(value: &str) -> Result<HashMap<String, String>, String> {
 fn split_header_param_segments(value: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut current = String::new();
-    let mut chars = value.chars().peekable();
     let mut in_quotes = false;
     let mut escaped = false;
-    while let Some(ch) = chars.next() {
+    for ch in value.chars() {
         if escaped {
             current.push(ch);
             escaped = false;
