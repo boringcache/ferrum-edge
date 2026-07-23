@@ -2280,10 +2280,7 @@ async fn mesh_tier3_mirror_and_exact_rewrite_share_one_route_scope() {
 
     let rewrite = &dispatch_config.config["rules"][0]["rewrite"];
     assert_eq!(rewrite["uri"].as_str(), Some("/internal/exact"));
-    assert_eq!(
-        rewrite["authority"].as_str(),
-        Some("internal.example.com")
-    );
+    assert_eq!(rewrite["authority"].as_str(), Some("internal.example.com"));
     assert!(
         rewrite.get("match_prefix").is_none(),
         "an exact rewrite replaces the whole request target"
@@ -2300,10 +2297,7 @@ async fn mesh_tier3_mirror_and_exact_rewrite_share_one_route_scope() {
         dispatch.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    assert_eq!(
-        ctx.route_override_path.as_deref(),
-        Some("/internal/exact")
-    );
+    assert_eq!(ctx.route_override_path.as_deref(), Some("/internal/exact"));
     assert_eq!(
         ctx.route_override_authority.as_deref(),
         Some("internal.example.com")

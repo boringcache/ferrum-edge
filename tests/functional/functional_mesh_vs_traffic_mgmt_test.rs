@@ -424,14 +424,14 @@ plugin_configs:
     );
     let lines = mirror.request_lines().await;
     assert!(
-        lines
-            .iter()
-            .any(|l| l == "GET /internal/ping HTTP/1.1"),
+        lines.iter().any(|l| l == "GET /internal/ping HTTP/1.1"),
         "mirror must replay the matched route rewrite, got: {lines:?}"
     );
     let hosts = mirror.host_headers().await;
     assert!(
-        hosts.iter().any(|host| host == "internal.example.com-shadow"),
+        hosts
+            .iter()
+            .any(|host| host == "internal.example.com-shadow"),
         "mirror must carry the rewritten authority with -shadow, got: {hosts:?}"
     );
 }

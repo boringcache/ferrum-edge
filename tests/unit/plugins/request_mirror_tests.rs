@@ -615,7 +615,10 @@ fn test_blank_plugin_config_id_is_error() {
     )
     .err()
     .expect("supplied plugin identity must fail closed when blank");
-    assert!(error.contains("plugin_config_id"), "unexpected error: {error}");
+    assert!(
+        error.contains("plugin_config_id"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -1631,17 +1634,12 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
         Some("internal.example.com:8443")
     );
     plugin_utils::assert_continue(route_mirror.before_proxy(&mut ctx, &mut headers).await);
-    plugin_utils::assert_continue(
-        explicit_mirror
-            .before_proxy(&mut ctx, &mut headers)
-            .await,
-    );
+    plugin_utils::assert_continue(explicit_mirror.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(ctx.mirror_result_rxs.len(), 2);
 
     let mut exact_ctx = make_ctx_with_proxy();
     exact_ctx.path = "/legacy".to_string();
-    let mut exact_headers =
-        HashMap::from([("host".to_string(), "public.example.com".to_string())]);
+    let mut exact_headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
     plugin_utils::assert_continue(route.before_proxy(&mut exact_ctx, &mut exact_headers).await);
     assert_eq!(
         exact_ctx.route_override_path.as_deref(),
@@ -1698,9 +1696,7 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
             .all(|request| {
                 request
                     .lines()
-                    .any(|line| {
-                        line.eq_ignore_ascii_case("host: internal.example.com-shadow:8443")
-                    })
+                    .any(|line| line.eq_ignore_ascii_case("host: internal.example.com-shadow:8443"))
             }),
         "each prefix-route mirror must carry the rewritten shadow authority: {requests:?}"
     );
