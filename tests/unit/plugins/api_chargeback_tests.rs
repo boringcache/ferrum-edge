@@ -159,12 +159,16 @@ fn make_key_with_prices(
     bw_price_received: f64,
 ) -> String {
     let scope = scope();
+    let protocol_family = match protocol_family {
+        ProtocolFamily::Http => "http",
+        ProtocolFamily::Stream => "stream",
+    };
     format!(
         "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
         consumer,
         proxy_id,
         status_code,
-        protocol_family.label(),
+        protocol_family,
         scope.currency,
         scope.namespace_label,
         call_price.to_bits(),
@@ -631,7 +635,15 @@ fn test_registry_records_charge() {
         0.0,
     );
 
-    let key = make_key_with_prices("user-1", "proxy-a", 200, ProtocolFamily::Http, 0.00001, 0.0, 0.0);
+    let key = make_key_with_prices(
+        "user-1",
+        "proxy-a",
+        200,
+        ProtocolFamily::Http,
+        0.00001,
+        0.0,
+        0.0,
+    );
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
     assert!((entry.call_charge().unwrap() - 0.00001).abs() < 1e-15);
@@ -661,7 +673,15 @@ fn test_registry_accumulates_charges() {
         );
     }
 
-    let key = make_key_with_prices("user-1", "proxy-a", 200, ProtocolFamily::Http, 0.00001, 0.0, 0.0);
+    let key = make_key_with_prices(
+        "user-1",
+        "proxy-a",
+        200,
+        ProtocolFamily::Http,
+        0.00001,
+        0.0,
+        0.0,
+    );
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1000);
     assert!((entry.call_charge().unwrap() - 0.01).abs() < 1e-10);
@@ -813,7 +833,15 @@ fn test_registry_records_bandwidth_for_http() {
         0.0000002,
     );
 
-    let key = make_key_with_prices("alice", "proxy-1", 200, ProtocolFamily::Http, 0.0, 0.0000001, 0.0000002);
+    let key = make_key_with_prices(
+        "alice",
+        "proxy-1",
+        200,
+        ProtocolFamily::Http,
+        0.0,
+        0.0000001,
+        0.0000002,
+    );
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_000_000);
     assert_eq!(
@@ -839,7 +867,15 @@ fn test_registry_records_stream_session() {
         0.0000002,
     );
 
-    let key = make_key_with_prices("alice", "stream-proxy", 0, ProtocolFamily::Stream, 0.0005, 0.0000001, 0.0000002);
+    let key = make_key_with_prices(
+        "alice",
+        "stream-proxy",
+        0,
+        ProtocolFamily::Stream,
+        0.0005,
+        0.0000001,
+        0.0000002,
+    );
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert_eq!(entry.status_code, 0);
@@ -1166,7 +1202,15 @@ async fn test_log_prices_final_grpc_status_as_effective_http_status() {
         plugin
             .log(&make_grpc_summary(proxy_id, consumer, grpc_status))
             .await;
-        let key = make_key_with_prices(consumer, proxy_id, effective_status, ProtocolFamily::Http, price, 0.0, 0.0);
+        let key = make_key_with_prices(
+            consumer,
+            proxy_id,
+            effective_status,
+            ProtocolFamily::Http,
+            price,
+            0.0,
+            0.0,
+        );
         let entry = registry
             .entries
             .get(&key)
@@ -1178,8 +1222,13 @@ async fn test_log_prices_final_grpc_status_as_effective_http_status() {
         assert!(
             effective_status == 200
                 || !registry.entries.contains_key(&make_key_with_prices(
-                    consumer, proxy_id, 200,
-                    ProtocolFamily::Http, 0.001, 0.0, 0.0,
+                    consumer,
+                    proxy_id,
+                    200,
+                    ProtocolFamily::Http,
+                    0.001,
+                    0.0,
+                    0.0,
                 )),
             "non-OK gRPC status must not be charged in the HTTP 200 bucket"
         );
@@ -1243,7 +1292,15 @@ async fn test_log_records_bandwidth_even_when_status_is_uncharged() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key_with_prices("derek", "proxy-bw", 404, ProtocolFamily::Http, 0.0, 0.0000001, 0.0000002);
+    let key = make_key_with_prices(
+        "derek",
+        "proxy-bw",
+        404,
+        ProtocolFamily::Http,
+        0.0,
+        0.0000001,
+        0.0000002,
+    );
     let entry = registry
         .entries
         .get(&key)
@@ -1757,7 +1814,8 @@ fn assert_bandwidth_only_stream_and_websocket_reconcile(
     // WebSocket bandwidth uses status 0 with call_count=0. A colliding stream
     // session must never promote that row into a chargeable HTTP call (count 1).
     for line in prom.lines() {
-        if line.starts_with("ferrum_api_chargeable_calls_total{") && line.contains("proxy_id=\"edge\"")
+        if line.starts_with("ferrum_api_chargeable_calls_total{")
+            && line.contains("proxy_id=\"edge\"")
         {
             assert!(
                 line.contains("status_code=\"0\"") && line.ends_with(" 0"),
@@ -1840,8 +1898,13 @@ fn test_high_volume_charge_has_no_accumulation_drift() {
     let entry = registry
         .entries
         .get(&make_key_with_prices(
-            "alice", "proxy-1", 200,
-            ProtocolFamily::Http, price, 0.0, 0.0,
+            "alice",
+            "proxy-1",
+            200,
+            ProtocolFamily::Http,
+            price,
+            0.0,
+            0.0,
         ))
         .unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), n);
@@ -1865,8 +1928,13 @@ fn test_bandwidth_charge_is_exact_from_byte_totals() {
     let many_entry = many
         .entries
         .get(&make_key_with_prices(
-            "alice", "proxy-1", 200,
-            ProtocolFamily::Http, 0.0, price, 0.0,
+            "alice",
+            "proxy-1",
+            200,
+            ProtocolFamily::Http,
+            0.0,
+            price,
+            0.0,
         ))
         .unwrap();
     assert_eq!(
@@ -2119,8 +2187,13 @@ fn test_render_fails_closed_on_aggregate_addition_overflow() {
         let entry = registry
             .entries
             .get(&make_key_with_prices(
-                "alice", proxy, status,
-                ProtocolFamily::Http, price, 0.0, 0.0,
+                "alice",
+                proxy,
+                status,
+                ProtocolFamily::Http,
+                price,
+                0.0,
+                0.0,
             ))
             .unwrap();
         entry.call_count.store(1, Ordering::Relaxed);

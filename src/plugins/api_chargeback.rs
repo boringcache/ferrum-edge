@@ -94,7 +94,7 @@ pub enum ProtocolFamily {
 
 impl ProtocolFamily {
     /// Stable registry-key / export label for this family (`"http"` or `"stream"`).
-    pub fn label(&self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             ProtocolFamily::Http => "http",
             ProtocolFamily::Stream => "stream",
