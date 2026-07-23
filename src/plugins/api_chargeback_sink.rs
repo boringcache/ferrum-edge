@@ -3503,103 +3503,6 @@ impl Default for SnapshotAccumulator {
     }
 }
 
-#[cfg(test)]
-mod snapshot_cleanup_race_tests {
-    use super::*;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-
-    fn test_metadata() -> SnapshotMetadata {
-        SnapshotMetadata {
-            namespace: "ferrum".to_string(),
-            consumer_id: "alice".to_string(),
-            consumer_name: None,
-            proxy_id: "proxy-a".to_string(),
-            proxy_name: "Payments".to_string(),
-            route_id: None,
-            status_code: 200,
-            http_status_code: Some(200),
-            grpc_status: None,
-            protocol: "http".to_string(),
-        }
-    }
-
-    fn call_charge(call_count: u32, price: f64) -> ChargeComputation {
-        ChargeComputation {
-            call_count,
-            charge_call: price,
-            charge_total: price,
-            ..ChargeComputation::default()
-        }
-    }
-
-    #[test]
-    fn cleanup_loses_race_to_same_key_refresh_after_stale_check() {
-        // Deterministic issue #2576 interleaving: park cleanup after candidate
-        // selection, refresh the same key, then prove conditional eviction
-        // preserves and emits the refresh exactly once.
-        let config = ApiChargebackSinkConfig {
-            mode: SinkMode::Snapshot,
-            currency: "USD".to_string(),
-            pricing_version: "test-v1".to_string(),
-            ..Default::default()
-        };
-
-        let accumulator = Arc::new(SnapshotAccumulator::new());
-        let metadata = test_metadata();
-        accumulator.record_at(metadata.clone(), call_charge(1, 0.01), 100);
-        assert_eq!(
-            accumulator
-                .compute_deltas(&config, "node-a", 100, "snap-1")
-                .expect("initial delta")
-                .len(),
-            1
-        );
-
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        accumulator.set_cleanup_after_stale_check_hook(Some(Arc::new({
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            move || {
-                entered.wait();
-                release.wait();
-            }
-        })));
-
-        let cleanup_accumulator = Arc::clone(&accumulator);
-        let cleanup =
-            thread::spawn(move || cleanup_accumulator.cleanup_stale(200, /* ttl */ 0));
-
-        entered.wait();
-        accumulator.record_at(metadata, call_charge(2, 0.02), 201);
-        release.wait();
-
-        assert_eq!(
-            cleanup.join().expect("cleanup thread"),
-            0,
-            "conditional eviction must preserve a same-key refresh"
-        );
-        accumulator.set_cleanup_after_stale_check_hook(None);
-        assert_eq!(accumulator.entries.len(), 1);
-        assert_eq!(accumulator.last_emitted.len(), 1);
-
-        let delta = accumulator
-            .compute_deltas(&config, "node-a", 200, "snap-2")
-            .expect("refresh delta");
-        assert_eq!(delta.len(), 1);
-        assert_eq!(delta[0].call_count, 2);
-        assert!((delta[0].charge_total - 0.02).abs() < f64::EPSILON);
-        assert!(
-            accumulator
-                .compute_deltas(&config, "node-a", 300, "snap-3")
-                .expect("post-refresh delta")
-                .is_empty(),
-            "refreshed charge must emit exactly once"
-        );
-    }
-}
-
 fn start_snapshot_task(
     accumulator: Arc<SnapshotAccumulator>,
     runtime: Arc<SinkRuntime>,
@@ -4021,5 +3924,102 @@ fn timestamp_json(timestamp: i64) -> Value {
             Some(dt) => Value::String(dt.to_rfc3339_opts(SecondsFormat::Secs, true)),
             None => Value::Null,
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_cleanup_race_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    fn test_metadata() -> SnapshotMetadata {
+        SnapshotMetadata {
+            namespace: "ferrum".to_string(),
+            consumer_id: "alice".to_string(),
+            consumer_name: None,
+            proxy_id: "proxy-a".to_string(),
+            proxy_name: "Payments".to_string(),
+            route_id: None,
+            status_code: 200,
+            http_status_code: Some(200),
+            grpc_status: None,
+            protocol: "http".to_string(),
+        }
+    }
+
+    fn call_charge(call_count: u32, price: f64) -> ChargeComputation {
+        ChargeComputation {
+            call_count,
+            charge_call: price,
+            charge_total: price,
+            ..ChargeComputation::default()
+        }
+    }
+
+    #[test]
+    fn cleanup_loses_race_to_same_key_refresh_after_stale_check() {
+        // Deterministic issue #2576 interleaving: park cleanup after candidate
+        // selection, refresh the same key, then prove conditional eviction
+        // preserves and emits the refresh exactly once.
+        let config = ApiChargebackSinkConfig {
+            mode: SinkMode::Snapshot,
+            currency: "USD".to_string(),
+            pricing_version: "test-v1".to_string(),
+            ..Default::default()
+        };
+
+        let accumulator = Arc::new(SnapshotAccumulator::new());
+        let metadata = test_metadata();
+        accumulator.record_at(metadata.clone(), call_charge(1, 0.01), 100);
+        assert_eq!(
+            accumulator
+                .compute_deltas(&config, "node-a", 100, "snap-1")
+                .expect("initial delta")
+                .len(),
+            1
+        );
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        accumulator.set_cleanup_after_stale_check_hook(Some(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        })));
+
+        let cleanup_accumulator = Arc::clone(&accumulator);
+        let cleanup =
+            thread::spawn(move || cleanup_accumulator.cleanup_stale(200, /* ttl */ 0));
+
+        entered.wait();
+        accumulator.record_at(metadata, call_charge(2, 0.02), 201);
+        release.wait();
+
+        assert_eq!(
+            cleanup.join().expect("cleanup thread"),
+            0,
+            "conditional eviction must preserve a same-key refresh"
+        );
+        accumulator.set_cleanup_after_stale_check_hook(None);
+        assert_eq!(accumulator.entries.len(), 1);
+        assert_eq!(accumulator.last_emitted.len(), 1);
+
+        let delta = accumulator
+            .compute_deltas(&config, "node-a", 200, "snap-2")
+            .expect("refresh delta");
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].call_count, 2);
+        assert!((delta[0].charge_total - 0.02).abs() < f64::EPSILON);
+        assert!(
+            accumulator
+                .compute_deltas(&config, "node-a", 300, "snap-3")
+                .expect("post-refresh delta")
+                .is_empty(),
+            "refreshed charge must emit exactly once"
+        );
     }
 }
