@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
@@ -1730,11 +1731,257 @@ fn snapshot_cleanup_removes_idle_entries_and_last_emitted() {
     );
 
     assert_eq!(accumulator.cleanup_stale_for_tests(0), 1);
+    assert_eq!(accumulator.entry_count_for_tests(), 0);
+    assert_eq!(accumulator.last_emitted_count_for_tests(), 0);
     assert!(
         accumulator
             .compute_deltas(&config, "node-a", 200, "snap-2")
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn snapshot_cleanup_loses_race_to_same_key_refresh_after_stale_check() {
+    // Deterministic interleaving for issue #2576:
+    // 1) cleanup selects a stale candidate
+    // 2) pause after the stale check
+    // 3) record refreshes the same key and adds a charge
+    // 4) cleanup resumes and must not delete the refreshed generation
+    // 5) the next delta emits that charge exactly once
+    let config = snapshot_test_config();
+    let accumulator = Arc::new(SnapshotAccumulator::new());
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        charge,
+    );
+    assert_eq!(
+        accumulator
+            .compute_deltas(&config, "node-a", 100, "snap-1")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    accumulator.set_cleanup_after_stale_check_hook_for_tests(Some(Arc::new({
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        move || {
+            entered.wait();
+            release.wait();
+        }
+    })));
+
+    let cleanup_acc = Arc::clone(&accumulator);
+    let cleanup = thread::spawn(move || cleanup_acc.cleanup_stale_for_tests(0));
+
+    entered.wait();
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        ChargeComputation {
+            call_count: 2,
+            charge_call: 0.02,
+            bytes_sent: 0,
+            bytes_received: 0,
+            charge_bytes_sent: 0.0,
+            charge_bytes_received: 0.0,
+            charge_total: 0.02,
+        },
+    );
+    release.wait();
+
+    let removed = cleanup.join().expect("cleanup thread");
+    accumulator.set_cleanup_after_stale_check_hook_for_tests(None);
+
+    assert_eq!(
+        removed, 0,
+        "conditional eviction must not delete a same-key refresh that raced after the stale check"
+    );
+    assert_eq!(accumulator.entry_count_for_tests(), 1);
+    assert_eq!(accumulator.last_emitted_count_for_tests(), 1);
+
+    let delta = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0].call_count, 2);
+    assert!((delta[0].charge_total - 0.02).abs() < f64::EPSILON);
+
+    let again = accumulator
+        .compute_deltas(&config, "node-a", 300, "snap-3")
+        .unwrap();
+    assert!(
+        again.is_empty(),
+        "refreshed charge must appear exactly once, not double-emit"
+    );
+}
+
+#[test]
+fn snapshot_cleanup_preserves_unrelated_key_and_new_generation_baseline() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        charge,
+    );
+    accumulator.record_for_test(
+        "ferrum",
+        "bob",
+        "proxy-b",
+        "Billing",
+        200,
+        "http",
+        charge,
+    );
+    assert_eq!(
+        accumulator
+            .compute_deltas(&config, "node-a", 100, "snap-1")
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Evict both idle identities, then re-record only alice. Cleanup of the
+    // old alice generation must not strip bob's already-removed baseline in a
+    // way that breaks alice's fresh generation, and alice must emit a full
+    // restart total (not a residual against an orphaned baseline).
+    assert_eq!(accumulator.cleanup_stale_at_for_tests(i64::MAX, 1), 2);
+    assert_eq!(accumulator.entry_count_for_tests(), 0);
+    assert_eq!(accumulator.last_emitted_count_for_tests(), 0);
+
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        charge,
+    );
+    let restarted = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted[0].consumer_id, "alice");
+    assert_eq!(restarted[0].call_count, 1);
+}
+
+#[test]
+fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
+    let config = Arc::new(snapshot_test_config());
+    let accumulator = Arc::new(SnapshotAccumulator::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let emitted_calls = Arc::new(AtomicU64::new(0));
+    let recorded_calls = Arc::new(AtomicU64::new(0));
+    let start = Arc::new(Barrier::new(4));
+    // Logical clock: cleanup uses now=1_010 with ttl=5 → cutoff=1_005.
+    // Recorder alternates last_seen just below / just above that cutoff so
+    // eviction constantly races refresh at the TTL boundary.
+    const CLEANUP_NOW: i64 = 1_010;
+    const TTL_SECS: u64 = 5;
+    const STALE_SEEN: i64 = 1_000; // <= cutoff 1_005
+    const FRESH_SEEN: i64 = 1_008; // > cutoff 1_005
+
+    let record_acc = Arc::clone(&accumulator);
+    let record_stop = Arc::clone(&stop);
+    let record_start = Arc::clone(&start);
+    let record_calls = Arc::clone(&recorded_calls);
+    let recorder = thread::spawn(move || {
+        record_start.wait();
+        let mut i = 0u64;
+        while !record_stop.load(Ordering::Relaxed) {
+            let consumer = if i % 2 == 0 { "alice" } else { "bob" };
+            let seen_at = if i % 3 == 0 { STALE_SEEN } else { FRESH_SEEN };
+            record_acc.record_for_test_at(
+                "ferrum",
+                consumer,
+                "proxy-a",
+                "Payments",
+                200,
+                "http",
+                seen_at,
+                unit_call_charge(0.01),
+            );
+            record_calls.fetch_add(1, Ordering::Relaxed);
+            i = i.wrapping_add(1);
+        }
+    });
+
+    let emit_acc = Arc::clone(&accumulator);
+    let emit_cfg = Arc::clone(&config);
+    let emit_stop = Arc::clone(&stop);
+    let emit_start = Arc::clone(&start);
+    let emit_calls = Arc::clone(&emitted_calls);
+    let emitter = thread::spawn(move || {
+        emit_start.wait();
+        let mut snap = 0u64;
+        while !emit_stop.load(Ordering::Relaxed) {
+            snap += 1;
+            let events = emit_acc
+                .compute_deltas(&emit_cfg, "node-a", snap as i64, &format!("stress-{snap}"))
+                .expect("delta arithmetic must stay finite under stress");
+            let calls: u64 = events.iter().map(|event| event.call_count).sum();
+            emit_calls.fetch_add(calls, Ordering::Relaxed);
+        }
+    });
+
+    let cleanup_acc = Arc::clone(&accumulator);
+    let cleanup_stop = Arc::clone(&stop);
+    let cleanup_start = Arc::clone(&start);
+    let cleaner = thread::spawn(move || {
+        cleanup_start.wait();
+        while !cleanup_stop.load(Ordering::Relaxed) {
+            let _ = cleanup_acc.cleanup_stale_at_for_tests(CLEANUP_NOW, TTL_SECS);
+        }
+    });
+
+    start.wait();
+    thread::sleep(Duration::from_millis(150));
+    stop.store(true, Ordering::Relaxed);
+    recorder.join().expect("recorder");
+    emitter.join().expect("emitter");
+    cleaner.join().expect("cleaner");
+
+    // Drain whatever survived concurrent cleanup.
+    let final_events = accumulator
+        .compute_deltas(&config, "node-a", 9_999, "stress-final")
+        .expect("final delta");
+    let final_calls: u64 = final_events.iter().map(|event| event.call_count).sum();
+    emitted_calls.fetch_add(final_calls, Ordering::Relaxed);
+
+    let recorded = recorded_calls.load(Ordering::Relaxed);
+    let emitted = emitted_calls.load(Ordering::Relaxed);
+    assert!(recorded > 0, "stress recorder must make progress");
+    assert!(
+        emitted <= recorded,
+        "emitted calls ({emitted}) must not exceed recorded calls ({recorded})"
+    );
+    // Live refreshes (FRESH_SEEN) must survive cleanup; stale-only keys may be
+    // evicted. Either way we must not invent totals above what was recorded.
+    assert!(
+        emitted > 0 || accumulator.entry_count_for_tests() > 0,
+        "stress must leave emitted deltas and/or live accumulator state"
     );
 }
 

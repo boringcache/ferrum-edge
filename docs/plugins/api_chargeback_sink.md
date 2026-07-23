@@ -70,6 +70,27 @@ in-memory queue is unavailable. Idle snapshot keys are evicted after
 `snapshot.stale_entry_ttl_secs` and checked every
 `snapshot.cleanup_interval_secs`.
 
+### Snapshot concurrency contract
+
+Request-path `record`, periodic delta emission, and stale cleanup share the
+accumulator without a global request-path lock (per-key DashMap shard locking
+only):
+
+- Each accumulator slot has a stable **generation** (assigned at insert) and a
+  **revision** that bumps on every refresh. Stale cleanup may scan candidates
+  first, but eviction is a single conditional `remove_if`: the entry is removed
+  only when generation, revision, and `last_seen_at` still match the stale
+  observation. A same-key refresh that races after the stale check wins and
+  remains available for the next snapshot.
+- `last_emitted` baselines are tagged with the entry generation. Cleanup drops a
+  baseline only for the generation that was actually evicted, so a concurrent
+  reinsert cannot lose a newer baseline. Delta emission ignores a baseline whose
+  generation does not match the live entry (treats the live entry as starting
+  from zero) and publishes a new baseline only while that generation is still
+  present, so emission and cleanup cannot orphan or double-subtract totals
+  across a remove/reinsert.
+- Unrelated keys never block each other on the request path.
+
 Both modes use the same pricing fields as `api_chargeback`. At least one
 nonempty pricing dimension is mandatory and matches
 `PricingConfig::has_any_pricing`: a nonempty `pricing_tiers` list, bandwidth
