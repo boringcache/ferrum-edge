@@ -89,6 +89,10 @@ only):
   from zero) and publishes a new baseline only while that generation is still
   present, so emission and cleanup cannot orphan or double-subtract totals
   across a remove/reinsert.
+- Each accumulator has exactly one periodic snapshot task and therefore one
+  delta emitter. This single-emitter ownership prevents same-generation
+  baseline publication from being reordered; request-path recorders remain
+  concurrent with that emitter and cleanup.
 - Unrelated keys never block each other on the request path.
 
 Both modes use the same pricing fields as `api_chargeback`. At least one
