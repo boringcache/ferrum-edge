@@ -895,6 +895,69 @@ async fn multipart_request_validation_checks_fields_and_file_metadata() {
 }
 
 #[tokio::test]
+async fn multipart_file_part_with_structured_content_type_validates_actual_metadata() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size", "content"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "safe.png"},
+                                    "content_type": {"type": "string", "const": "image/png"},
+                                    "size": {"type": "integer", "maximum": 2},
+                                    "content": {"type": "string", "const": "ok"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename=\"evil.svg\"\r\n",
+        "Content-Type: application/json\r\n\r\n",
+        "{\"filename\":\"safe.png\",\"content_type\":\"image/png\",\"size\":2,\"content\":\"ok\"}\r\n",
+        "--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    let extended_filename_body = body.replace("filename=\"evil.svg\"", "filename*=UTF-8''evil.svg");
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                extended_filename_body.as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
 async fn text_and_binary_response_validation_use_matching_schema_rules() {
     let plugin = OpenapiValidator::new(&json!({
         "operations": [{

@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, classify_clickhouse_http_status_for_tests,
+    SpoolManager, SpoolSettings, classify_clickhouse_acknowledgement_for_tests,
+    classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
     decode_spool_file_for_tests, encode_spool_bytes_for_tests, new_ulid, render_prometheus,
     render_status_json, replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
     serialize_json_each_row, write_private_file_atomically_for_tests,
@@ -1712,6 +1713,123 @@ fn clickhouse_status_classification_distinguishes_permanent_and_retryable() {
     assert_eq!(classify_clickhouse_http_status_for_tests(302), "retryable");
 }
 
+#[test]
+fn clickhouse_acknowledgement_requires_complete_empty_success_body() {
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(200, Some(b""), false),
+        "delivered"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(204, Some(b""), false),
+        "delivered"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(
+            200,
+            Some(b"Code: 60. DB::Exception: Table ferrum.charges_raw does not exist"),
+            false
+        ),
+        "permanent"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(200, Some(b""), true),
+        "permanent"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(200, Some(b"progress-ok"), false),
+        "retryable"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(200, None, false),
+        "retryable"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(400, Some(b""), false),
+        "permanent"
+    );
+}
+
+#[test]
+fn durable_config_rejects_wait_for_async_insert_zero_without_lossy_opt_in() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "0"
+    });
+    let err = validate_plugin_config("api_chargeback_sink", &config)
+        .expect_err("wait_for_async_insert=0 must be rejected in durable mode");
+    assert!(
+        err.contains("wait_for_async_insert"),
+        "error should name the setting: {err}"
+    );
+    assert!(
+        err.contains("allow_lossy_async_insert"),
+        "error should name the lossy opt-in: {err}"
+    );
+    assert!(
+        !err.contains("password") && !err.contains("charge_total"),
+        "validation errors must stay free of secrets and charge fields: {err}"
+    );
+
+    for falsy in ["false", "FALSE", "no", "off", " 0 "] {
+        config["clickhouse"]["insert_query_params"] = json!({
+            "async_insert": "1",
+            "wait_for_async_insert": falsy
+        });
+        assert!(
+            validate_plugin_config("api_chargeback_sink", &config).is_err(),
+            "falsy wait_for_async_insert={falsy:?} must be rejected"
+        );
+    }
+
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "1"
+    });
+    assert!(
+        validate_plugin_config("api_chargeback_sink", &config).is_ok(),
+        "wait_for_async_insert=1 must remain valid"
+    );
+
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "0"
+    });
+    config["clickhouse"]["allow_lossy_async_insert"] = json!(true);
+    assert!(
+        validate_plugin_config("api_chargeback_sink", &config).is_ok(),
+        "explicit allow_lossy_async_insert must permit wait_for_async_insert=0"
+    );
+
+    config["clickhouse"]["allow_lossy_async_insert_typo"] = json!(true);
+    let unknown = validate_plugin_config("api_chargeback_sink", &config)
+        .expect_err("unknown clickhouse keys must stay rejected");
+    assert!(
+        unknown.contains("unknown field") || unknown.contains("allow_lossy_async_insert_typo"),
+        "unknown-key rejection must mention the field: {unknown}"
+    );
+}
+
+#[test]
+fn durable_async_insert_pins_persistence_wait_when_omitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["insert_query_params"] = json!({"async_insert": "1"});
+    let config: ApiChargebackSinkConfig = serde_json::from_value(config).unwrap();
+    let url = url::Url::parse(&clickhouse_insert_url_for_tests(&config).unwrap()).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+    assert_eq!(params.get("async_insert").map(String::as_str), Some("1"));
+    assert_eq!(
+        params.get("wait_for_async_insert").map(String::as_str),
+        Some("1"),
+        "durable async inserts must not inherit a potentially lossy server-profile default"
+    );
+}
+
 fn test_spool(temp: &tempfile::TempDir) -> SpoolManager {
     let settings = SpoolSettings {
         enabled: true,
@@ -2015,4 +2133,175 @@ async fn replay_partial_split_dead_letters_only_poison_row() {
     let requests = wait_for_requests(&server, 3).await;
     let delivered = String::from_utf8(requests[2].body.clone()).unwrap();
     assert!(delivered.contains("evt-good-row"));
+}
+
+#[tokio::test]
+async fn replay_deletes_spool_only_after_empty_200_acknowledgement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool.write_events(&[sample_event("evt-ack-ok")]).unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert!(
+        !path.exists(),
+        "complete empty HTTP 200 acknowledgement must delete the spool file"
+    );
+}
+
+#[tokio::test]
+async fn replay_dead_letters_http_200_exception_body_and_redacts_failure_context() {
+    let server = MockServer::start().await;
+    let exception_body =
+        "Code: 60. DB::Exception: Table ferrum.charges_raw does not exist. password=super-secret";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(exception_body))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool
+        .write_events(&[sample_event("evt-exception-body")])
+        .unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert_rejected_sidecar(&path, 200, "permanent_http");
+    let meta_raw = fs::read_to_string(dead_letter_meta_path(&path)).unwrap();
+    for forbidden in [
+        "super-secret",
+        "DB::Exception",
+        "charges_raw does not exist",
+        "evt-exception-body",
+        "password",
+    ] {
+        assert!(
+            !meta_raw.contains(forbidden),
+            "dead-letter metadata must not retain response or charge contents ({forbidden}): {meta_raw}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_dead_letters_http_200_exception_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).insert_header("X-ClickHouse-Exception-Code", "62"))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool
+        .write_events(&[sample_event("evt-exception-header")])
+        .unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert_rejected_sidecar(&path, 200, "permanent_http");
+}
+
+#[tokio::test]
+async fn replay_keeps_spool_on_ambiguous_non_empty_200_acknowledgement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not-an-exception-but-not-empty"))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let oldest = spool
+        .write_events(&[sample_event("evt-ambiguous")])
+        .unwrap();
+    let newer = spool.write_events(&[sample_event("evt-blocked")]).unwrap();
+
+    let err = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("ambiguous acknowledgement must be retryable");
+    assert!(
+        err.contains("ambiguous") || err.contains("non-empty"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !err.contains("not-an-exception-but-not-empty"),
+        "failure context must not echo the response body: {err}"
+    );
+    assert!(
+        !err.contains("evt-ambiguous") && !err.contains("charge_total"),
+        "failure context must not include charge contents: {err}"
+    );
+    assert!(oldest.exists(), "ambiguous ACK must retain the spool file");
+    assert!(
+        newer.exists(),
+        "ambiguous ACK must not advance past the oldest file"
+    );
+}
+
+#[tokio::test]
+async fn replay_retries_after_ambiguous_acknowledgement_without_double_billing_identity_change() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            let idx = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 {
+                ResponseTemplate::new(200).set_body_string("temporary-ambiguous")
+            } else {
+                ResponseTemplate::new(200)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool
+        .write_events(&[sample_event("evt-idempotent-retry")])
+        .unwrap();
+
+    let first = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("first ambiguous ACK must keep the file");
+    assert!(first.contains("ambiguous") || first.contains("non-empty"));
+    assert!(path.exists());
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+    assert!(
+        !path.exists(),
+        "second empty ACK must delete the spool file"
+    );
+
+    let requests = wait_for_requests(&server, 2).await;
+    assert_eq!(requests.len(), 2);
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|request| String::from_utf8(request.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body.contains("evt-idempotent-retry")),
+        "retry must resend the same event_id for ReplacingMergeTree idempotency"
+    );
+    assert_eq!(
+        bodies[0], bodies[1],
+        "retry payload bytes must stay identical"
+    );
 }
