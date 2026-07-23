@@ -161,7 +161,7 @@ plugin_configs:
 
 #[ignore]
 #[tokio::test]
-async fn test_ai_stream_router_normalizes_anthropic_sse_and_strips_accept_encoding() {
+async fn test_ai_stream_router_normalizes_anthropic_sse_and_requests_identity_encoding() {
     let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider_port = provider_listener.local_addr().unwrap().port();
     let capture = Arc::new(Mutex::new(None));
