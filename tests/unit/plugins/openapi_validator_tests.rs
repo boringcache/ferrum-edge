@@ -1845,6 +1845,10 @@ async fn unsupported_encoding_combinations_fail_at_admission() {
 
 #[tokio::test]
 async fn multipart_boundary_like_bytes_inside_part_body_are_preserved() {
+    // Mid-part `--abc` must remain payload bytes (not a MIME delimiter line).
+    // Length is derived from the payload so the size const cannot drift.
+    const PART_CONTENT: &str = "hello--abcworld";
+    assert_eq!(PART_CONTENT.len(), 15);
     let plugin = OpenapiValidator::new(&json!({
         "operations": [{
             "method": "POST",
@@ -1861,8 +1865,8 @@ async fn multipart_boundary_like_bytes_inside_part_body_are_preserved() {
                                 "required": ["filename", "content", "size"],
                                 "properties": {
                                     "filename": {"type": "string", "const": "a.txt"},
-                                    "content": {"type": "string", "const": "hello--abcworld"},
-                                    "size": {"type": "integer", "const": 14}
+                                    "content": {"type": "string", "const": PART_CONTENT},
+                                    "size": {"type": "integer", "const": PART_CONTENT.len()}
                                 }
                             }
                         }
@@ -1872,12 +1876,70 @@ async fn multipart_boundary_like_bytes_inside_part_body_are_preserved() {
         }]
     }))
     .unwrap();
-    let body = concat!(
-        "--abc\r\n",
-        "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n",
-        "Content-Type: text/plain\r\n\r\n",
-        "hello--abcworld\r\n",
-        "--abc--\r\n"
+    let body = format!(
+        concat!(
+            "--abc\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "{part_content}\r\n",
+            "--abc--\r\n"
+        ),
+        part_content = PART_CONTENT
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = content_type_headers("multipart/form-data; boundary=abc");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &content_type_headers("multipart/form-data; boundary=abc"),
+                body.as_bytes(),
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn multipart_boundary_prefix_line_without_terminator_is_preserved() {
+    // A line starting with `--abc` is not a delimiter unless transport-padding
+    // and CRLF/LF (or end-of-body) follow the boundary token exactly.
+    const PART_CONTENT: &str = "line1\r\n--abcworld\r\nline3";
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content", "size"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "a.txt"},
+                                    "content": {"type": "string", "const": PART_CONTENT},
+                                    "size": {"type": "integer", "const": PART_CONTENT.len()}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let body = format!(
+        concat!(
+            "--abc\r\n",
+            "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "{part_content}\r\n",
+            "--abc--\r\n"
+        ),
+        part_content = PART_CONTENT
     );
     let mut ctx = post_ctx("/upload");
     ctx.headers = content_type_headers("multipart/form-data; boundary=abc");
