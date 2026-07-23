@@ -4032,11 +4032,7 @@ impl PluginCache {
             proxy_ids_to_rebuild,
             rebuild_globals,
         );
-        country_mmdb_preload_required_for_scope(
-            config,
-            &expanded_proxy_ids,
-            rebuild_globals,
-        )
+        country_mmdb_preload_required_for_scope(config, &expanded_proxy_ids, rebuild_globals)
     }
 
     /// Whether the exact delta-build scope, including adaptive-concurrency
