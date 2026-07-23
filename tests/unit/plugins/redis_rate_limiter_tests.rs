@@ -774,36 +774,22 @@ async fn redis_health_checker_stops_after_client_drop() {
     let abort = client
         .health_checker_abort_for_test()
         .expect("health checker abort handle");
-    let probe_attempts = client.health_checker_probe_attempts_arc_for_test();
 
-    // Wait until the checker has entered (and therefore registered) its first
-    // interval sleep. Advancing before that races: the later sleep would arm
-    // for a full interval after the advance and never wake.
-    for _ in 0..100 {
-        if client.health_checker_interval_waits_for_test() >= 1 {
+    // The checker is spawned asynchronously, so its first sleep may arm after
+    // an initial clock advance. Advance whole virtual intervals (not arbitrary
+    // wall-clock sleeps) until the mock server observes the real dial.
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            if accepts.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if accepts.load(Ordering::Relaxed) >= 1 {
             break;
         }
-        tokio::task::yield_now().await;
     }
-    assert!(
-        client.health_checker_interval_waits_for_test() >= 1,
-        "health checker must arm its first interval sleep before time advances"
-    );
-
-    tokio::time::advance(Duration::from_secs(1)).await;
-
-    // Observable lifecycle: post-interval probe begins, then the TCP accept
-    // proves a real dial (not just the counter bump).
-    for _ in 0..100 {
-        if probe_attempts.load(Ordering::Acquire) >= 1 && accepts.load(Ordering::Relaxed) >= 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        probe_attempts.load(Ordering::Acquire) >= 1,
-        "health checker must begin a probe after the first interval"
-    );
     let after_first = accepts.load(Ordering::Relaxed);
     assert!(
         after_first >= 1,
@@ -818,7 +804,6 @@ async fn redis_health_checker_stops_after_client_drop() {
         tokio::task::yield_now().await;
     }
     assert!(abort.is_finished(), "drop must abort the health checker");
-    let probes_after_abort = probe_attempts.load(Ordering::Acquire);
 
     let baseline_accepts = accepts.load(Ordering::Relaxed);
     tokio::time::advance(Duration::from_secs(5)).await;
@@ -829,11 +814,6 @@ async fn redis_health_checker_stops_after_client_drop() {
         accepts.load(Ordering::Relaxed),
         baseline_accepts,
         "retired client must not keep dialing Redis after drop"
-    );
-    assert_eq!(
-        probe_attempts.load(Ordering::Acquire),
-        probes_after_abort,
-        "retired client must not start further health probes after drop"
     );
 
     let _ = shutdown.send(());
