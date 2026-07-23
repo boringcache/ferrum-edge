@@ -3072,6 +3072,8 @@ async fn grpc_web_custom_trailer_exchange(
     content_type: &str,
     body: Bytes,
 ) -> Vec<u8> {
+    use base64::Engine;
+
     let mut last_body = Vec::new();
     for _attempt in 0..5 {
         let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
@@ -3118,11 +3120,20 @@ async fn grpc_web_custom_trailer_exchange(
             .expect("body")
             .to_bytes()
             .to_vec();
-        if last_body
-            .windows(b"grpc-status: 0".len())
-            .any(|window| window == b"grpc-status: 0")
-            || (content_type.contains("grpc-web-text") && !last_body.is_empty())
-        {
+        let contains_success_trailer = if content_type.contains("grpc-web-text") {
+            base64::engine::general_purpose::STANDARD
+                .decode(&last_body)
+                .is_ok_and(|decoded| {
+                    decoded
+                        .windows(b"grpc-status: 0".len())
+                        .any(|window| window == b"grpc-status: 0")
+                })
+        } else {
+            last_body
+                .windows(b"grpc-status: 0".len())
+                .any(|window| window == b"grpc-status: 0")
+        };
+        if contains_success_trailer {
             return last_body;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
