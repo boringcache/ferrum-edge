@@ -144,7 +144,14 @@ pub struct CrossProtocolOutcome {
     pub connection_error: bool,
     pub error_class: Option<ErrorClass>,
     pub body_error_class: Option<ErrorClass>,
+    /// Full backend interaction duration when known (buffered / non-streamed).
+    /// For streamed responses the H3 summary builder ignores this in favor of
+    /// [`crate::plugins::LATENCY_UNKNOWN_MS`] so concurrent body/client
+    /// lifetime is not misattributed.
     pub backend_total_ms: f64,
+    /// Backend time-to-first-byte (admission → response headers). Preserved
+    /// for streamed responses where `backend_total_ms` is unknown.
+    pub backend_ttfb_ms: f64,
     /// The bridge already emitted the finalized rejection transaction through
     /// `log_rejected_request`; the H3 frontend must not emit a duplicate generic
     /// transaction summary for the same request.
@@ -310,6 +317,7 @@ fn cross_protocol_header_write_disconnect_outcome(
         error_class: None,
         body_error_class: Some(ErrorClass::ClientDisconnect),
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     }
 }
@@ -3031,6 +3039,7 @@ where
                         error_class: None,
                         body_error_class: Some(ErrorClass::ClientDisconnect),
                         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         rejection_logged: false,
                     });
                 }
@@ -3086,6 +3095,7 @@ where
                 Some(ErrorClass::ClientDisconnect)
             },
             backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+            backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
             rejection_logged: false,
         });
     }
@@ -3211,6 +3221,7 @@ where
                     error_class: None,
                     body_error_class: Some(ErrorClass::ClientDisconnect),
                     backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                    backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
                     rejection_logged: false,
                 });
             }
@@ -3256,6 +3267,7 @@ where
         error_class: None,
         body_error_class,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }
@@ -3482,6 +3494,9 @@ where
         return Ok(outcome);
     }
     let grpc_web_body_ended = http_body::Body::is_end_stream(&streaming.body);
+    // Capture TTFB at header availability — before body relay / client
+    // backpressure can inflate admission-start elapsed.
+    let backend_ttfb_ms = backend_admission_start.elapsed().as_secs_f64() * 1000.0;
     let pristine_grpc_web_trailers_only_terminal_metadata =
         (crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) && grpc_web_body_ended)
             .then(|| {
@@ -3954,6 +3969,7 @@ where
         error_class: None,
         body_error_class: outcome_error_class,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms,
         rejection_logged: false,
     })
 }
@@ -5342,6 +5358,7 @@ where
                     Some(ErrorClass::ClientDisconnect)
                 },
                 backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 rejection_logged: false,
             })
         }
@@ -6772,6 +6789,7 @@ where
         error_class: None,
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }
@@ -7028,6 +7046,7 @@ where
         error_class: None,
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }
@@ -7061,6 +7080,7 @@ fn terminal_deadline_write_aborted_outcome(
         error_class: None,
         body_error_class: client_disconnected.then_some(ErrorClass::ClientDisconnect),
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     }
 }
@@ -7364,6 +7384,7 @@ where
         error_class: None,
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }
@@ -7693,6 +7714,7 @@ where
         error_class: None,
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }

@@ -949,6 +949,21 @@ async fn test_registry_gateway_overhead_histogram() {
 }
 
 #[tokio::test]
+async fn test_registry_skips_streaming_unknown_gateway_overhead() {
+    let registry = MetricsRegistry::new();
+    let mut summary = make_summary("proxy-stream", "GET", 200, 10_000.0, -1.0);
+    summary.response_streamed = true;
+    summary.latency_gateway_overhead_ms = -1.0;
+    registry.record(&summary);
+    assert!(
+        !registry
+            .gateway_overhead_buckets
+            .contains_key(&Arc::from("proxy-stream") as &Arc<str>),
+        "unknown gateway overhead sentinel must not enter histograms"
+    );
+}
+
+#[tokio::test]
 async fn test_registry_render_contains_gateway_overhead() {
     let registry = MetricsRegistry::new();
     registry.record(&make_summary("overhead-render", "GET", 200, 42.0, 35.0));

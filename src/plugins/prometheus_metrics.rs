@@ -1172,10 +1172,15 @@ impl MetricsRegistry {
                 .observe(summary.latency_backend_total_ms, self.epoch);
         }
 
-        self.gateway_overhead_buckets
-            .entry(Arc::clone(&proxy_id))
-            .or_insert_with(|| HistogramBuckets::new(self.epoch))
-            .observe(summary.latency_gateway_overhead_ms, self.epoch);
+        // Same sentinel guard for gateway overhead: streamed responses with an
+        // unknown backend total emit LATENCY_UNKNOWN_MS rather than inventing
+        // overhead from TTFB (issue #2532).
+        if summary.latency_gateway_overhead_ms >= 0.0 {
+            self.gateway_overhead_buckets
+                .entry(Arc::clone(&proxy_id))
+                .or_insert_with(|| HistogramBuckets::new(self.epoch))
+                .observe(summary.latency_gateway_overhead_ms, self.epoch);
+        }
 
         if let Some(usage) = summary.ai_usage_export.as_ref()
             && let Some(provider) = ai_provider_label(usage.provider)

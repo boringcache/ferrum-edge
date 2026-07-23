@@ -455,7 +455,7 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 | `{prefix}.request.count` | Counter | Client request count (mirrors excluded) |
 | `{prefix}.request.latency_total_ms` | Timer | Total request latency (finite, ≥ 0 only) |
 | `{prefix}.request.latency_backend_ttfb_ms` | Timer | Backend time-to-first-byte when a backend call occurred; omitted for the `-1.0` no-backend sentinel |
-| `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead |
+| `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead when attributable; omitted for the `-1.0` streaming-unknown sentinel |
 | `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
 | `{prefix}.request.status.{N}xx` | Counter | HTTP header status-code bucket (2xx, 4xx, 5xx, etc.) — preserved even when the body later fails |
 | `{prefix}.request.grpc_status.{code}` | Counter | Terminal gRPC application status for gRPC transactions only (`0`–`16`, or `OTHER` for malformed/future codes). Absent for plain HTTP |
@@ -812,13 +812,13 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `response_status_code` | u16 | HTTP status code |
 | `grpc_status` | u32 | Final normalized gRPC application status, separate from HTTP transport status; emitted for gRPC transactions. Missing terminal status normalizes to `2` (UNKNOWN); malformed input uses the existing `u32::MAX` invalid-status sentinel |
-| `latency_total_ms` | f64 | Total request-to-response time |
-| `latency_gateway_processing_ms` | f64 | Total time excluding backend communication |
+| `latency_total_ms` | f64 | Total request-to-response time (for streamed responses: request receipt → body terminal) |
+| `latency_gateway_processing_ms` | f64 | Total time excluding attributed backend communication; `-1.0` when streaming backend total is unknown |
 | `latency_backend_ttfb_ms` | f64 | Time to first byte from backend; -1.0 if no backend call |
-| `latency_backend_total_ms` | f64 | Full backend response time; -1.0 for streaming responses |
+| `latency_backend_total_ms` | f64 | Full backend response time; `-1.0` for streaming responses (concurrent backend-body / client-delivery lifetime cannot be separated) |
 | `latency_plugin_execution_ms` | f64 | Wall-clock time in all plugin hooks |
 | `latency_plugin_external_io_ms` | f64 | Subset of plugin time spent on external HTTP calls |
-| `latency_gateway_overhead_ms` | f64 | Pure gateway overhead (routing, framing, pool checkout) |
+| `latency_gateway_overhead_ms` | f64 | Pure gateway overhead (routing, framing, pool checkout); `-1.0` when streaming backend total is unknown — never derived by treating TTFB as full backend duration |
 | `request_user_agent` | String or null | User-Agent header value |
 | `response_streamed` | bool | Present and `true` when body was streamed (not buffered) |
 | `client_disconnected` | bool | Present and `true` when client disconnected early |
@@ -837,7 +837,7 @@ independently attributable without logging request credentials.
 
 **Notes on conditional fields:** `auth_method`, `grpc_status`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when not applicable/false/null to keep log entries compact.
 
-**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_received` reflect the full client-visible outcome.
+**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. For streamed responses, `DeferredTransactionLogger` moves the `log` phase to body-completion so `body_error_class`, `body_completed`, `bytes_received`, and `latency_total_ms` reflect the full client-visible outcome. Gateway processing/overhead stay at the `-1.0` unknown sentinel when `latency_backend_total_ms` is unknown.
 
 **`error_class` values** (serialized as `snake_case` strings — see [docs/error_classification.md](error_classification.md) for the canonical taxonomy and per-protocol semantics):
 
@@ -923,20 +923,21 @@ Only set when the gateway itself could not communicate with the backend (or when
   "backend_target": "10.0.2.15:8080/api/v1/events",
   "backend_resolved_ip": "10.0.2.15",
   "response_status_code": 200,
-  "latency_total_ms": 4.80,
-  "latency_gateway_processing_ms": 1.70,
+  "latency_total_ms": 10004.80,
+  "latency_gateway_processing_ms": -1.0,
   "latency_backend_ttfb_ms": 2.90,
   "latency_backend_total_ms": -1.0,
   "latency_plugin_execution_ms": 0.55,
   "latency_plugin_external_io_ms": 0.0,
-  "latency_gateway_overhead_ms": 1.15,
+  "latency_gateway_overhead_ms": -1.0,
   "request_user_agent": "curl/8.5.0",
   "response_streamed": true,
+  "body_completed": true,
   "metadata": {}
 }
 ```
 
-`latency_backend_total_ms` is `-1.0` because the body is still streaming when the log is emitted. Use `latency_backend_ttfb_ms` for alerting on streaming responses.
+Deferred logging emits this summary at body termination. `latency_total_ms` reflects the full streamed lifetime. `latency_backend_total_ms`, `latency_gateway_processing_ms`, and `latency_gateway_overhead_ms` remain `-1.0` because concurrent backend-body production and client delivery cannot be separated on the default streaming path — they are never filled by treating TTFB as full backend duration. Use `latency_backend_ttfb_ms` for streaming backend alerting.
 
 #### Example: HTTP/3 (QUIC)
 

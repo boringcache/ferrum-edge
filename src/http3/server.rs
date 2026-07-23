@@ -4530,16 +4530,28 @@ async fn handle_h3_request(
 
         // Build the same TransactionSummary shape the native H3 pool path
         // emits so log plugins see a consistent record across dispatch
-        // kinds. `latency_backend_total_ms` is populated (not -1.0) because
-        // the bridge returns once the response is fully delivered — no
-        // deferred completion signal is needed.
+        // kinds. Streamed responses use the shared unknown-backend-total
+        // contract: concurrent backend-body / client-delivery lifetime must
+        // not be labeled as gateway work.
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
         let plugin_external_io_ms = ctx
             .plugin_http_call_ns
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1_000_000.0;
-        let gateway_processing_ms = total_ms - outcome.backend_total_ms;
+        let backend_ttfb_ms = outcome.backend_ttfb_ms;
+        let backend_total_ms = if outcome.response_streamed {
+            crate::plugins::LATENCY_UNKNOWN_MS
+        } else {
+            outcome.backend_total_ms
+        };
+        let (gateway_processing_ms, gateway_overhead_ms) =
+            TransactionSummary::derive_gateway_latencies(
+                total_ms,
+                backend_total_ms,
+                plugin_execution_ms,
+                outcome.response_streamed,
+            );
         if outcome.response_streamed {
             let stream_outcome = BodyOutcome {
                 body_completed: outcome.body_completed,
@@ -4577,11 +4589,11 @@ async fn handle_h3_request(
             response_status_code: outcome.response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
-            latency_backend_ttfb_ms: outcome.backend_total_ms,
-            latency_backend_total_ms: outcome.backend_total_ms,
+            latency_backend_ttfb_ms: backend_ttfb_ms,
+            latency_backend_total_ms: backend_total_ms,
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
-            latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms).max(0.0),
+            latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             response_streamed: outcome.response_streamed,
             client_disconnected: outcome.client_disconnected,
@@ -5474,15 +5486,24 @@ async fn handle_h3_request(
             backend_admission_response_elapsed,
         );
 
-        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+        let backend_ttfb_ms = backend_admission_response_elapsed.as_secs_f64() * 1000.0;
+        // Concurrent backend-body / client-delivery lifetime cannot be split on
+        // the synchronous H3 streaming pipe — emit the shared unknown sentinel
+        // rather than labeling the residual as backend total or gateway work.
+        let backend_total_ms = crate::plugins::LATENCY_UNKNOWN_MS;
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
         let plugin_external_io_ms = ctx
             .plugin_http_call_ns
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1_000_000.0;
-        let gateway_processing_ms = total_ms - backend_total_ms;
-        let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+        let (gateway_processing_ms, gateway_overhead_ms) =
+            TransactionSummary::derive_gateway_latencies(
+                total_ms,
+                backend_total_ms,
+                plugin_execution_ms,
+                true,
+            );
 
         // Native H3 drives the inspector in this task rather than a detached
         // body task. Drop it explicitly so the shared completion signal is set
@@ -5512,11 +5533,7 @@ async fn handle_h3_request(
             response_status_code: response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
-            latency_backend_ttfb_ms: backend_total_ms,
-            // Native H3 streaming completes the `'outer` loop synchronously
-            // before constructing this summary, so the full backend duration
-            // (TTFB + body relay) is known here. Mirrors the symmetric H3
-            // native streaming path in `proxy_to_backend_h3_streaming`.
+            latency_backend_ttfb_ms: backend_ttfb_ms,
             latency_backend_total_ms: backend_total_ms,
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
@@ -6062,8 +6079,8 @@ async fn handle_h3_request(
             h3_stream_result.backend_admission_elapsed,
         );
 
-        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
-        let backend_ttfb_ms = backend_total_ms; // Approximation for streaming
+        let backend_ttfb_ms = h3_stream_result.backend_admission_elapsed.as_secs_f64() * 1000.0;
+        let backend_total_ms = crate::plugins::LATENCY_UNKNOWN_MS;
 
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -6071,8 +6088,13 @@ async fn handle_h3_request(
             .plugin_http_call_ns
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1_000_000.0;
-        let gateway_processing_ms = total_ms - backend_total_ms;
-        let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+        let (gateway_processing_ms, gateway_overhead_ms) =
+            TransactionSummary::derive_gateway_latencies(
+                total_ms,
+                backend_total_ms,
+                plugin_execution_ms,
+                true,
+            );
 
         let stream_outcome = BodyOutcome {
             body_completed: h3_stream_result.body_completed,
@@ -7588,9 +7610,12 @@ fn h3_streaming_body_failure_outcome(
 /// no `Drop` safety net.
 ///
 /// This means H3 summary sites are the only HTTP-family sites that populate
-/// all outcome fields at the same synchronous point in the code — no
-/// re-derivation of latency fields is needed because the "now" at summary
-/// construction time already coincides with body completion.
+/// terminal body outcome fields at the same synchronous point in the code.
+/// Streamed responses still follow the shared unknown-backend-total contract
+/// (`LATENCY_UNKNOWN_MS` for backend total / gateway fields) because concurrent
+/// backend-body and client-delivery lifetime cannot be separated on the pipe;
+/// only `latency_total_ms` and `latency_backend_ttfb_ms` (from
+/// `backend_admission_elapsed`) are concrete terminal observations.
 struct H3StreamResult {
     /// Client-facing HTTP status (what was/will be sent downstream). On an
     /// `after_proxy` reject or a gateway-side size-limit rejection this is the
@@ -8864,7 +8889,7 @@ async fn dispatch_grpc_native_h3(
                 Some(h3_error_class),
                 None,
                 start_time,
-                backend_start,
+                backend_admission_start.elapsed().as_secs_f64() * 1000.0,
                 *plugin_execution_ns,
             )
             .await;
@@ -8963,7 +8988,7 @@ async fn dispatch_grpc_native_h3(
             Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             None,
             start_time,
-            backend_start,
+                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9067,7 +9092,7 @@ async fn dispatch_grpc_native_h3(
             None,
             None,
             start_time,
-            backend_start,
+                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9214,7 +9239,7 @@ async fn dispatch_grpc_native_h3(
             response_header_client_disconnected
                 .then_some(crate::retry::ErrorClass::ClientDisconnect),
             start_time,
-            backend_start,
+                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9825,7 +9850,7 @@ async fn dispatch_grpc_native_h3(
         None,
         body_error_class,
         start_time,
-        backend_start,
+                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
         *plugin_execution_ns,
     )
     .await;
@@ -9856,17 +9881,23 @@ async fn log_h3_grpc_transaction(
     error_class: Option<crate::retry::ErrorClass>,
     body_error_class: Option<crate::retry::ErrorClass>,
     start_time: std::time::Instant,
-    backend_start: std::time::Instant,
+    backend_ttfb_ms: f64,
     plugin_execution_ns: u64,
 ) {
-    let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+    let backend_total_ms = crate::plugins::LATENCY_UNKNOWN_MS;
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
     let plugin_external_io_ms = ctx
         .plugin_http_call_ns
         .load(std::sync::atomic::Ordering::Relaxed) as f64
         / 1_000_000.0;
-    let gateway_processing_ms = total_ms - backend_total_ms;
+    let (gateway_processing_ms, gateway_overhead_ms) =
+        TransactionSummary::derive_gateway_latencies(
+            total_ms,
+            backend_total_ms,
+            plugin_execution_ms,
+            true,
+        );
     let summary = TransactionSummary {
         namespace: proxy.namespace.clone(),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -9882,11 +9913,11 @@ async fn log_h3_grpc_transaction(
         response_status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: gateway_processing_ms,
-        latency_backend_ttfb_ms: backend_total_ms,
+        latency_backend_ttfb_ms: backend_ttfb_ms,
         latency_backend_total_ms: backend_total_ms,
         latency_plugin_execution_ms: plugin_execution_ms,
         latency_plugin_external_io_ms: plugin_external_io_ms,
-        latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms).max(0.0),
+        latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         response_streamed: true,
         client_disconnected,

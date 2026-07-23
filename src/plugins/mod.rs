@@ -4561,6 +4561,21 @@ pub enum DisconnectCause {
     GracefulShutdown,
 }
 
+/// Shared latency sentinel for unknown or not-applicable observations.
+///
+/// Used for:
+/// * no-backend TTFB / backend total on reject paths
+/// * streaming `latency_backend_total_ms` when concurrent backend-body and
+///   client-delivery lifetime cannot be separated
+/// * streaming `latency_gateway_processing_ms` /
+///   `latency_gateway_overhead_ms` when those fields cannot be derived
+///   without inventing a backend duration (never substitute TTFB)
+///
+/// StatsD timers and Prometheus histograms omit samples `< 0`. JSON sinks
+/// still emit the sentinel so consumers can distinguish "unknown" from
+/// "zero".
+pub const LATENCY_UNKNOWN_MS: f64 = -1.0;
+
 /// Transaction summary for logging plugins.
 ///
 /// Implements [`Default`] so call sites that build partial summaries
@@ -4613,6 +4628,13 @@ pub struct TransactionSummary {
     pub backend_resolved_ip: Option<String>,
     pub response_status_code: u16,
     pub latency_total_ms: f64,
+    /// Total time excluding attributed backend communication.
+    ///
+    /// * **Buffered / known backend total**: `total - backend_total`.
+    /// * **Rejected (no backend)**: equals `latency_total_ms`.
+    /// * **Streaming with unknown backend total**: [`LATENCY_UNKNOWN_MS`].
+    ///   Concurrent backend-body and client-delivery lifetime must not be
+    ///   reported as gateway processing by substituting TTFB.
     pub latency_gateway_processing_ms: f64,
     pub latency_backend_ttfb_ms: f64,
     /// Total backend time from connection start to the final response frame.
@@ -4620,13 +4642,12 @@ pub struct TransactionSummary {
     /// Semantics by response type:
     /// * **Buffered responses**: exact — set synchronously when the body has
     ///   been fully received, before the summary is logged.
-    /// * **Streaming responses**: re-derived at deferred-log fire time from
-    ///   the real body-completion timestamp. Replaces the `-1.0` sentinel
-    ///   that was written at header-flush time. If the body never completes
-    ///   (client disconnect before the first frame, drop without any poll),
-    ///   the field may remain at the original `-1.0` sentinel — prefer
-    ///   `latency_backend_ttfb_ms` for alerting on streaming outcomes when
-    ///   you need a guaranteed non-sentinel value.
+    /// * **Streaming responses**: [`LATENCY_UNKNOWN_MS`]. Deferred logging
+    ///   refreshes `latency_total_ms` at body termination but does not invent
+    ///   a backend total from TTFB; concurrent backend-body production and
+    ///   client delivery cannot be separated on the default streaming path.
+    ///   Prefer `latency_backend_ttfb_ms` for streaming alerting when a
+    ///   guaranteed non-sentinel backend observation is required.
     pub latency_backend_total_ms: f64,
     /// Wall-clock time spent executing all plugin hooks (on_request_received
     /// through after_proxy/on_response_body/transform_response_body/
@@ -4639,13 +4660,17 @@ pub struct TransactionSummary {
     pub latency_plugin_external_io_ms: f64,
     /// Pure gateway overhead: routing, header parsing, URL building,
     /// connection pool checkout, response framing, etc.
-    /// Computed as: total - max(backend, 0) - plugin_execution.
-    /// For rejected requests (no backend call): total - plugin_execution.
+    ///
+    /// * **Buffered / known backend total**:
+    ///   `total - backend_total - plugin_execution`.
+    /// * **Rejected (no backend call)**: `total - plugin_execution`.
+    /// * **Streaming with unknown backend total**: [`LATENCY_UNKNOWN_MS`] —
+    ///   never derived by treating TTFB as full backend duration.
     pub latency_gateway_overhead_ms: f64,
     pub request_user_agent: Option<String>,
     /// True when the response body was streamed (not buffered).
-    /// When true, `latency_backend_total_ms` is populated at deferred-log
-    /// fire time from the real body-completion timestamp (see that field).
+    /// When true and `latency_backend_total_ms` is [`LATENCY_UNKNOWN_MS`],
+    /// gateway processing/overhead are also unknown (see those fields).
     pub response_streamed: bool,
     /// True when the client disconnected before receiving the full response.
     ///
@@ -4845,6 +4870,51 @@ impl TransactionSummary {
             || self.metadata.contains_key("rejection_phase")
             || self.metadata.contains_key("mirror_error")
             || self.grpc_status().is_some_and(|status| status != 0)
+    }
+
+    /// Derive gateway processing and overhead from terminal latency observations.
+    ///
+    /// Terminal streaming contract:
+    /// * `latency_total_ms` — wall-clock request receipt → body terminal
+    /// * `latency_backend_ttfb_ms` — preserved first-byte observation
+    /// * `latency_backend_total_ms` — known (`>= 0`) or [`LATENCY_UNKNOWN_MS`]
+    /// * plugin execution / external I/O — preserved pre-stream observations
+    /// * gateway fields — derived only when backend total is known; otherwise
+    ///   [`LATENCY_UNKNOWN_MS`] so streamed body lifetime is never labeled as
+    ///   pure gateway work by substituting TTFB
+    ///
+    /// Reject paths (`response_streamed == false`, backend total unknown)
+    /// keep the historical attribution: all non-plugin time is gateway work.
+    pub fn derive_gateway_latencies(
+        total_ms: f64,
+        backend_total_ms: f64,
+        plugin_execution_ms: f64,
+        response_streamed: bool,
+    ) -> (f64, f64) {
+        if response_streamed && backend_total_ms < 0.0 {
+            return (LATENCY_UNKNOWN_MS, LATENCY_UNKNOWN_MS);
+        }
+        if backend_total_ms < 0.0 {
+            let processing = total_ms.max(0.0);
+            let overhead = (total_ms - plugin_execution_ms).max(0.0);
+            return (processing, overhead);
+        }
+        let processing = (total_ms - backend_total_ms).max(0.0);
+        let overhead = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+        (processing, overhead)
+    }
+
+    /// Apply [`Self::derive_gateway_latencies`] onto this summary using its
+    /// current total / backend-total / plugin-execution / streamed flags.
+    pub fn refresh_gateway_latencies(&mut self) {
+        let (processing, overhead) = Self::derive_gateway_latencies(
+            self.latency_total_ms,
+            self.latency_backend_total_ms,
+            self.latency_plugin_execution_ms,
+            self.response_streamed,
+        );
+        self.latency_gateway_processing_ms = processing;
+        self.latency_gateway_overhead_ms = overhead;
     }
 
     /// Build a mirror transaction summary from this summary and a mirror result.
