@@ -1,19 +1,21 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
+    SpoolManager, SpoolSettings, classify_clickhouse_http_status_for_tests,
+    decode_spool_file_for_tests, encode_spool_bytes_for_tests, new_ulid, render_prometheus,
+    render_status_json, replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
     serialize_json_each_row, write_private_file_atomically_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
 use serde_json::{Value, json};
 use wiremock::matchers::method;
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn valid_config(spool_dir: &Path) -> Value {
     json!({
@@ -988,12 +990,19 @@ fn disk_owned_bytes(root: &Path) -> u64 {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            let owned = name.ends_with(".ndjson")
-                || name.ends_with(".ndjson.zst")
-                || name.ends_with(".ndjson.tmp")
+            let owned = name.ends_with(".ndjson.tmp")
                 || name.ends_with(".ndjson.zst.tmp")
+                || name.ends_with(".ndjson.rejected.meta.tmp")
+                || name.ends_with(".ndjson.zst.rejected.meta.tmp")
                 || name.ends_with(".ndjson.corrupt")
-                || name.ends_with(".ndjson.zst.corrupt");
+                || name.ends_with(".ndjson.zst.corrupt")
+                || name.ends_with(".ndjson.rejected.meta")
+                || name.ends_with(".ndjson.zst.rejected.meta")
+                || ((name.ends_with(".ndjson.zst") || name.ends_with(".ndjson"))
+                    && !name.ends_with(".tmp")
+                    && !name.ends_with(".corrupt")
+                    && !name.ends_with(".rejected")
+                    && !name.ends_with(".meta"));
             if owned {
                 total = total.saturating_add(meta.len());
             }
@@ -1353,13 +1362,13 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
     );
     assert!(
         prom.contains(
-            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, and quarantined files)."
+            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files)."
         ),
         "prometheus HELP must describe the owned-byte ceiling contract"
     );
     assert!(
         prom.contains(
-            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, and quarantined files)."
+            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files)."
         ),
         "prometheus HELP must describe owned file accounting"
     );
@@ -1683,4 +1692,327 @@ fn generated_ulids_are_lexicographically_monotonic() {
         assert!(next > previous, "{next} should sort after {previous}");
         previous = next;
     }
+}
+
+#[test]
+fn clickhouse_status_classification_distinguishes_permanent_and_retryable() {
+    assert_eq!(classify_clickhouse_http_status_for_tests(200), "delivered");
+    assert_eq!(classify_clickhouse_http_status_for_tests(204), "delivered");
+    assert_eq!(classify_clickhouse_http_status_for_tests(400), "permanent");
+    assert_eq!(classify_clickhouse_http_status_for_tests(401), "permanent");
+    assert_eq!(classify_clickhouse_http_status_for_tests(403), "permanent");
+    assert_eq!(classify_clickhouse_http_status_for_tests(408), "retryable");
+    assert_eq!(
+        classify_clickhouse_http_status_for_tests(413),
+        "payload_too_large"
+    );
+    assert_eq!(classify_clickhouse_http_status_for_tests(429), "retryable");
+    assert_eq!(classify_clickhouse_http_status_for_tests(500), "retryable");
+    assert_eq!(classify_clickhouse_http_status_for_tests(503), "retryable");
+    assert_eq!(classify_clickhouse_http_status_for_tests(302), "retryable");
+}
+
+fn test_spool(temp: &tempfile::TempDir) -> SpoolManager {
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    SpoolManager::for_tests(settings, "node-a").unwrap()
+}
+
+async fn mount_status_sequence(server: &MockServer, statuses: &[u16]) {
+    let statuses = statuses.to_vec();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            let idx = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            let status = statuses.get(idx).copied().unwrap_or(200);
+            ResponseTemplate::new(status)
+        })
+        .mount(server)
+        .await;
+}
+
+fn dead_letter_meta_path(source_path: &Path) -> std::path::PathBuf {
+    let name = source_path.file_name().and_then(|n| n.to_str()).unwrap();
+    source_path.with_file_name(format!("{name}.rejected.meta"))
+}
+
+fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_reason: &str) {
+    let meta_path = dead_letter_meta_path(source_path);
+    assert!(
+        meta_path.exists(),
+        "dead-letter meta missing: {}",
+        meta_path.display()
+    );
+    assert!(
+        !source_path.exists(),
+        "rejected payload must leave the replay set: {}",
+        source_path.display()
+    );
+    let rejected_payload = source_path.with_file_name(format!(
+        "{}.rejected",
+        source_path.file_name().and_then(|n| n.to_str()).unwrap()
+    ));
+    assert!(
+        !rejected_payload.exists(),
+        "dead-letter state must not retain charge-record PII: {}",
+        rejected_payload.display()
+    );
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert!(meta["rejected_rows"].as_u64().unwrap() >= 1);
+    assert!(meta["quarantined_at_unix"].as_i64().unwrap() > 0);
+    let outcomes = meta["outcomes"].as_array().unwrap();
+    assert!(outcomes.iter().any(|outcome| {
+        outcome["http_status"] == expected_status
+            && outcome["reason"] == expected_reason
+            && outcome["row_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+    }));
+    // Safe metadata only — no charge-record fields.
+    let serialized = serde_json::to_string(&meta).unwrap();
+    for forbidden in [
+        "consumer_id",
+        "event_id",
+        "password",
+        "body",
+        "response",
+        "charge_total",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "dead-letter meta must not include {forbidden}: {meta}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_dead_letters_permanent_400_and_continues_to_newer_file() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400, 200]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let poison = spool.write_events(&[sample_event("evt-poison")]).unwrap();
+    let newer = spool.write_events(&[sample_event("evt-good")]).unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert_rejected_sidecar(&poison, 400, "permanent_http");
+    assert!(!newer.exists(), "newer valid file must still replay");
+    let requests = wait_for_requests(&server, 2).await;
+    assert_eq!(requests.len(), 2);
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|request| String::from_utf8(request.body.clone()).unwrap())
+        .collect();
+    assert!(bodies.iter().any(|body| body.contains("evt-good")));
+    assert!(bodies.iter().any(|body| body.contains("evt-poison")));
+}
+
+#[tokio::test]
+async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool.write_events(&[sample_event("evt-retained")]).unwrap();
+    let meta_path = dead_letter_meta_path(&source);
+    let tmp_path = meta_path.with_file_name(format!(
+        "{}.tmp",
+        meta_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+    ));
+    fs::create_dir(&tmp_path).unwrap();
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("dead-letter metadata failure must stop the replay tick");
+
+    assert!(error.contains("failed to create spool temp file"));
+    assert!(
+        source.exists(),
+        "source must remain replayable on metadata failure"
+    );
+    assert!(
+        !meta_path.exists(),
+        "partial metadata must not be published"
+    );
+}
+
+#[tokio::test]
+async fn replay_dead_letters_permanent_401_and_403() {
+    for status in [401u16, 403u16] {
+        let server = MockServer::start().await;
+        mount_status_sequence(&server, &[status]).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let spool = test_spool(&temp);
+        let path = spool
+            .write_events(&[sample_event(&format!("evt-{status}"))])
+            .unwrap();
+
+        replay_spool_once_for_tests(&spool, &server.uri())
+            .await
+            .unwrap();
+
+        assert_rejected_sidecar(&path, status, "permanent_http");
+    }
+}
+
+#[tokio::test]
+async fn replay_stops_on_retryable_redirect_408_429_and_5xx_without_removing_file() {
+    for status in [302u16, 408u16, 429u16, 500u16, 503u16] {
+        let server = MockServer::start().await;
+        mount_status_sequence(&server, &[status]).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let spool = test_spool(&temp);
+        let oldest = spool
+            .write_events(&[sample_event(&format!("evt-retry-{status}"))])
+            .unwrap();
+        let newer = spool.write_events(&[sample_event("evt-blocked")]).unwrap();
+
+        let err = replay_spool_once_for_tests(&spool, &server.uri())
+            .await
+            .expect_err("retryable status must fail the replay tick");
+        assert!(
+            err.contains(&format!("clickhouse returned HTTP {status}")),
+            "unexpected error: {err}"
+        );
+        assert!(
+            oldest.exists(),
+            "retryable failure must retain the oldest file"
+        );
+        assert!(
+            newer.exists(),
+            "retryable failure must not advance past the oldest file"
+        );
+        assert!(
+            !err.to_ascii_lowercase().contains("evt-"),
+            "retryable errors must not include charge-record fields: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_stops_on_network_failure_without_removing_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool.write_events(&[sample_event("evt-net")]).unwrap();
+
+    let err = replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect_err("unreachable ClickHouse must be retryable");
+    assert!(
+        err.contains("network") || err.contains("timeout") || err.contains("tls"),
+        "unexpected error class: {err}"
+    );
+    assert!(path.exists(), "network failure must retain the spool file");
+}
+
+#[tokio::test]
+async fn replay_splits_413_payload_and_preserves_event_ids() {
+    let server = MockServer::start().await;
+    // Whole 4-row file -> 413, then each half of size 2 -> 200.
+    mount_status_sequence(&server, &[413, 200, 200]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let events = vec![
+        sample_event("evt-split-a"),
+        sample_event("evt-split-b"),
+        sample_event("evt-split-c"),
+        sample_event("evt-split-d"),
+    ];
+    let path = spool.write_events(&events).unwrap();
+
+    replay_spool_once_with_batch_size_for_tests(&spool, &server.uri(), 2)
+        .await
+        .unwrap();
+
+    assert!(
+        !path.exists(),
+        "split replay should consume the original file"
+    );
+    let requests = wait_for_requests(&server, 3).await;
+    assert_eq!(requests.len(), 3);
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|request| String::from_utf8(request.body.clone()).unwrap())
+        .collect();
+    assert!(bodies[0].contains("evt-split-a") && bodies[0].contains("evt-split-d"));
+    let delivered = bodies[1..].join("\n");
+    for id in ["evt-split-a", "evt-split-b", "evt-split-c", "evt-split-d"] {
+        assert!(
+            delivered.contains(id),
+            "split replay must preserve event_id {id}; bodies={bodies:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_dead_letters_single_row_413_then_replays_newer_file() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[413, 200]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let oversized = spool.write_events(&[sample_event("evt-too-big")]).unwrap();
+    let newer = spool
+        .write_events(&[sample_event("evt-after-413")])
+        .unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert_rejected_sidecar(&oversized, 413, "payload_too_large");
+    assert!(
+        !newer.exists(),
+        "newer file must replay after single-row 413 dead-letter"
+    );
+    let requests = wait_for_requests(&server, 2).await;
+    let last = String::from_utf8(requests.last().unwrap().body.clone()).unwrap();
+    assert!(last.contains("evt-after-413"));
+}
+
+#[tokio::test]
+async fn replay_partial_split_dead_letters_only_poison_row() {
+    // Whole 2-row file -> 413, left row -> 400 permanent, right row -> 200.
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[413, 400, 200]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool
+        .write_events(&[sample_event("evt-bad-row"), sample_event("evt-good-row")])
+        .unwrap();
+
+    replay_spool_once_with_batch_size_for_tests(&spool, &server.uri(), 1)
+        .await
+        .unwrap();
+
+    assert!(
+        !path.exists(),
+        "original file should be consumed after partial split"
+    );
+    assert_rejected_sidecar(&path, 400, "permanent_http");
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(dead_letter_meta_path(&path)).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 1);
+
+    let requests = wait_for_requests(&server, 3).await;
+    let delivered = String::from_utf8(requests[2].body.clone()).unwrap();
+    assert!(delivered.contains("evt-good-row"));
 }

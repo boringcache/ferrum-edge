@@ -37,7 +37,8 @@ use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finit
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
 use super::utils::{
     BatchConfig, BatchingLogger, LoggerHooks, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE,
-    MAX_BUFFER_CAPACITY, PluginHttpClient, RetryPolicy, wait_until_committed,
+    MAX_BUFFER_CAPACITY, PluginHttpClient, RetryPolicy, drain_http_batch_response_body,
+    wait_until_committed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -1291,7 +1292,7 @@ impl SinkRuntime {
             .and_then(|spool| spool.scan_stats().ok())
             .unwrap_or_default();
         output.push_str(
-            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, and quarantined files).\n",
+            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).\n",
         );
         output.push_str("# TYPE chargeback_sink_spool_bytes gauge\n");
         output.push_str(&format!(
@@ -1299,7 +1300,7 @@ impl SinkRuntime {
             spool_stats.bytes
         ));
         output.push_str(
-            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, and quarantined files).\n",
+            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files).\n",
         );
         output.push_str("# TYPE chargeback_sink_spool_files gauge\n");
         output.push_str(&format!(
@@ -1362,19 +1363,47 @@ impl SinkRuntime {
     }
 }
 
+/// Structured ClickHouse delivery result.
+///
+/// Distinguishes retryable transport/backpressure failures from permanent HTTP
+/// rejection and payload-too-large (413) so spool replay can dead-letter or
+/// split without head-of-line blocking newer files. Safe messages never include
+/// response bodies, credentials, or charge-record fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeliveryOutcome {
+    Delivered,
+    Retryable { message: String },
+    Permanent { status: u16, message: String },
+    PayloadTooLarge { message: String },
+}
+
+impl DeliveryOutcome {
+    fn safe_message(&self) -> &str {
+        match self {
+            DeliveryOutcome::Delivered => "delivered",
+            DeliveryOutcome::Retryable { message }
+            | DeliveryOutcome::Permanent { message, .. }
+            | DeliveryOutcome::PayloadTooLarge { message } => message.as_str(),
+        }
+    }
+}
+
 async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Result<(), String> {
     let body = serialize_json_each_row(&batch).inspect_err(|error| {
         cfg.metrics
             .record_failure(FailureReason::Serialize, error.clone());
     })?;
-    post_json_each_row(cfg, body, batch.len()).await
+    match post_json_each_row(cfg, body, batch.len()).await {
+        DeliveryOutcome::Delivered => Ok(()),
+        other => Err(other.safe_message().to_string()),
+    }
 }
 
 async fn post_json_each_row(
     cfg: &ClickHouseFlushConfig,
     body: String,
     event_count: usize,
-) -> Result<(), String> {
+) -> DeliveryOutcome {
     let start = Instant::now();
     let mut request = match &cfg.http {
         ClickHouseHttpClient::Shared(client) => client.get().post(&cfg.insert_url),
@@ -1388,30 +1417,71 @@ async fn post_json_each_row(
     }
     let result = cfg.http.execute(request).await;
     match result {
-        Ok(response) if matches!(response.status(), StatusCode::OK | StatusCode::NO_CONTENT) => {
-            cfg.metrics.record_success(event_count, start.elapsed());
-            Ok(())
-        }
         Ok(response) => {
             let status = response.status();
-            let reason = if status.is_client_error() {
-                FailureReason::Http4xx
-            } else if status.is_server_error() {
-                FailureReason::Http5xx
-            } else {
-                FailureReason::Network
-            };
-            let message = format!("clickhouse returned HTTP {}", status.as_u16());
-            cfg.metrics.record_failure(reason, message.clone());
-            Err(message)
+            // Boundedly discard the body so keep-alive reuse works and peer
+            // bytes are never retained or logged.
+            let _drain = drain_http_batch_response_body(response).await;
+            classify_clickhouse_status(cfg, status, event_count, start.elapsed())
         }
         Err(error) => {
             let reason = classify_reqwest_failure(&error);
             let message = reason.as_str().to_string();
             cfg.metrics.record_failure(reason, message.clone());
-            Err(message)
+            DeliveryOutcome::Retryable { message }
         }
     }
+}
+
+fn classify_clickhouse_status(
+    cfg: &ClickHouseFlushConfig,
+    status: StatusCode,
+    event_count: usize,
+    elapsed: Duration,
+) -> DeliveryOutcome {
+    if matches!(status, StatusCode::OK | StatusCode::NO_CONTENT) {
+        cfg.metrics.record_success(event_count, elapsed);
+        return DeliveryOutcome::Delivered;
+    }
+
+    let code = status.as_u16();
+    let message = format!("clickhouse returned HTTP {code}");
+    if code == 413 {
+        cfg.metrics
+            .record_failure(FailureReason::Http4xx, message.clone());
+        return DeliveryOutcome::PayloadTooLarge { message };
+    }
+    if code == 408 || code == 429 || status.is_server_error() {
+        let reason = if status.is_server_error() {
+            FailureReason::Http5xx
+        } else {
+            FailureReason::Http4xx
+        };
+        cfg.metrics.record_failure(reason, message.clone());
+        return DeliveryOutcome::Retryable { message };
+    }
+    if status.is_client_error() {
+        cfg.metrics
+            .record_failure(FailureReason::Http4xx, message.clone());
+        return DeliveryOutcome::Permanent {
+            status: code,
+            message,
+        };
+    }
+    cfg.metrics
+        .record_failure(FailureReason::Network, message.clone());
+    DeliveryOutcome::Retryable { message }
+}
+
+/// Deterministic split point for a 413 replay chunk.
+///
+/// Prefers `batch_size` when that still shrinks the chunk; otherwise halves.
+/// Always returns a value in `1..len` when `len >= 2` so splitting makes progress.
+fn replay_split_len(len: usize, batch_size: usize) -> usize {
+    debug_assert!(len >= 2);
+    let half = len / 2;
+    let preferred = batch_size.min(half).max(1);
+    preferred.min(len - 1)
 }
 
 pub fn serialize_json_each_row(batch: &[ChargeEvent]) -> Result<String, String> {
@@ -1956,9 +2026,10 @@ impl SpoolManager {
 
     /// Drop oldest owned spool files until `owned_bytes + incoming_len <= max_bytes`.
     ///
-    /// Owned bytes include active data files, crash-left temps, and quarantined
-    /// `*.corrupt` files. When a single encoded batch cannot fit even after
-    /// emptying the spool, the write is rejected (never silently over-admitted).
+    /// Owned bytes include active data files, crash-left temps, corrupt
+    /// quarantine, and metadata-only dead-letter (`.rejected.meta`) files.
+    /// When a single encoded batch cannot fit even after emptying the spool,
+    /// the write is rejected (never silently over-admitted).
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
@@ -2079,7 +2150,8 @@ fn warn_on_sibling_spool_dirs(root: &Path, node_id: &str) {
 
 #[derive(Clone, Copy)]
 enum SpoolFileClass {
-    /// Active data, crash-left temps, and quarantined files — quota/status.
+    /// Active data, crash-left temps, corrupt quarantine, and metadata-only
+    /// dead-letter files — quota/status.
     Owned,
     /// Only durable replay candidates (`*.ndjson` / `*.ndjson.zst`).
     Replayable,
@@ -2141,6 +2213,89 @@ fn quarantine_spool_file(path: &Path) -> Result<PathBuf, String> {
     Ok(quarantine_path)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadLetterReason {
+    PermanentHttp,
+    PayloadTooLarge,
+}
+
+impl DeadLetterReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeadLetterReason::PermanentHttp => "permanent_http",
+            DeadLetterReason::PayloadTooLarge => "payload_too_large",
+        }
+    }
+}
+
+/// One aggregated safe outcome within a metadata-only dead-letter record.
+#[derive(Debug, Clone, Serialize)]
+struct DeadLetterOutcomeMeta {
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    row_count: usize,
+}
+
+/// Safe dead-letter metadata only: no response bodies, credentials, or charge PII.
+#[derive(Debug, Clone, Serialize)]
+struct DeadLetterMeta {
+    rejected_rows: usize,
+    outcomes: Vec<DeadLetterOutcomeMeta>,
+    quarantined_at_unix: i64,
+}
+
+fn dead_letter_meta_paths(path: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
+    let meta_path = path.with_file_name(format!("{name}.rejected.meta"));
+    let tmp_path = path.with_file_name(format!("{name}.rejected.meta.tmp"));
+    Ok((tmp_path, meta_path))
+}
+
+fn write_dead_letter_meta(
+    spool: &SpoolManager,
+    source_path: &Path,
+    meta: &DeadLetterMeta,
+) -> Result<PathBuf, String> {
+    let (tmp_path, meta_path) = dead_letter_meta_paths(source_path)?;
+    let bytes = serde_json::to_vec(&meta).map_err(|error| {
+        format!("{PLUGIN_NAME}: failed to serialize dead-letter metadata: {error}")
+    })?;
+    let _guard = spool
+        .write_lock
+        .lock()
+        .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+    match fs::remove_file(&meta_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
+                meta_path.display()
+            ));
+        }
+    }
+    write_private_file_atomically(&tmp_path, &meta_path, &bytes)?;
+    if let Err(error) = fs::remove_file(source_path) {
+        let cleanup_error = fs::remove_file(&meta_path).err();
+        return Err(format!(
+            "{PLUGIN_NAME}: failed to remove permanently rejected spool file '{}': {error}; dead-letter metadata cleanup: {}",
+            source_path.display(),
+            cleanup_error
+                .map(|cleanup| cleanup.to_string())
+                .unwrap_or_else(|| "ok".to_string())
+        ));
+    }
+    // Reuse the spool's owned-byte eviction policy after replacing the source
+    // payload with its much smaller safe metadata record. This also handles an
+    // operator-configured max_bytes too small to retain even the metadata.
+    spool.evict_until_can_admit(0)?;
+    Ok(meta_path)
+}
+
 fn spool_file_matches(path: &Path, class: SpoolFileClass) -> bool {
     match class {
         SpoolFileClass::Owned => is_spool_owned_file(path),
@@ -2156,13 +2311,17 @@ fn is_spool_data_file(path: &Path) -> bool {
     (name.ends_with(".ndjson.zst") || name.ends_with(".ndjson"))
         && !name.ends_with(".tmp")
         && !name.ends_with(".corrupt")
+        && !name.ends_with(".rejected")
 }
 
 fn is_spool_temp_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    name.ends_with(".ndjson.tmp") || name.ends_with(".ndjson.zst.tmp")
+    name.ends_with(".ndjson.tmp")
+        || name.ends_with(".ndjson.zst.tmp")
+        || name.ends_with(".ndjson.rejected.meta.tmp")
+        || name.ends_with(".ndjson.zst.rejected.meta.tmp")
 }
 
 fn is_spool_corrupt_file(path: &Path) -> bool {
@@ -2172,8 +2331,18 @@ fn is_spool_corrupt_file(path: &Path) -> bool {
     name.ends_with(".ndjson.corrupt") || name.ends_with(".ndjson.zst.corrupt")
 }
 
+fn is_spool_rejected_meta_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.ends_with(".ndjson.rejected.meta") || name.ends_with(".ndjson.zst.rejected.meta")
+}
+
 fn is_spool_owned_file(path: &Path) -> bool {
-    is_spool_data_file(path) || is_spool_temp_file(path) || is_spool_corrupt_file(path)
+    is_spool_data_file(path)
+        || is_spool_temp_file(path)
+        || is_spool_corrupt_file(path)
+        || is_spool_rejected_meta_file(path)
 }
 
 fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec<u8>, String> {
@@ -2210,7 +2379,7 @@ fn decode_spool_file(path: &Path) -> Result<String, String> {
     let decoded = if path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".zst"))
+        .is_some_and(|name| name.contains(".ndjson.zst"))
     {
         zstd::stream::decode_all(bytes.as_slice()).map_err(|error| {
             format!(
@@ -2240,6 +2409,16 @@ pub async fn replay_spool_once_for_tests(
     spool: &SpoolManager,
     insert_url: &str,
 ) -> Result<(), String> {
+    replay_spool_once_with_batch_size_for_tests(spool, insert_url, default_batch_size()).await
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn replay_spool_once_with_batch_size_for_tests(
+    spool: &SpoolManager,
+    insert_url: &str,
+    batch_size: usize,
+) -> Result<(), String> {
     let flush_config = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: insert_url.to_string(),
@@ -2248,7 +2427,20 @@ pub async fn replay_spool_once_for_tests(
         timeout: Duration::from_secs(5),
         metrics: Arc::clone(&spool.metrics),
     };
-    replay_spool_once(spool, &flush_config).await
+    replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
+    match status {
+        200 | 204 => "delivered",
+        413 => "payload_too_large",
+        408 | 429 => "retryable",
+        code if (500..600).contains(&code) => "retryable",
+        code if (400..500).contains(&code) => "permanent",
+        _ => "retryable",
+    }
 }
 
 #[doc(hidden)]
@@ -2384,10 +2576,11 @@ fn start_spool_replayer(
     spool: Arc<SpoolManager>,
     _summary: SinkSummary,
     flush_config: ClickHouseFlushConfig,
-    _batch_size: usize,
+    batch_size: usize,
     replay_interval_secs: u64,
     commit_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    let batch_size = batch_size.max(1);
     tokio::spawn(async move {
         if !wait_until_committed(commit_rx).await {
             return;
@@ -2403,7 +2596,7 @@ fn start_spool_replayer(
                 );
                 continue;
             }
-            if let Err(error) = replay_spool_once(&spool, &flush_config).await {
+            if let Err(error) = replay_spool_once(&spool, &flush_config, batch_size).await {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
             }
         }
@@ -2413,6 +2606,7 @@ fn start_spool_replayer(
 async fn replay_spool_once(
     spool: &SpoolManager,
     flush_config: &ClickHouseFlushConfig,
+    batch_size: usize,
 ) -> Result<(), String> {
     let files = spool.list_replayable_spool_files()?;
     for file in files {
@@ -2445,9 +2639,10 @@ async fn replay_spool_once(
                 continue;
             }
         };
-        let lines: Vec<&str> = body
+        let lines: Vec<String> = body
             .lines()
             .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
             .collect();
         if lines.is_empty() {
             fs::remove_file(&file).map_err(|error| {
@@ -2458,19 +2653,133 @@ async fn replay_spool_once(
             })?;
             continue;
         }
-        post_json_each_row(flush_config, lines.join("\n"), lines.len()).await?;
-        fs::remove_file(&file).map_err(|error| {
+
+        match replay_spool_lines(flush_config, &lines, batch_size).await {
+            Ok(dead_letters) => {
+                finalize_replayed_spool_file(spool, &file, lines.len(), dead_letters)?;
+                spool
+                    .metrics
+                    .last_replay_at
+                    .store(unix_timestamp_seconds(), Ordering::Relaxed);
+                invalidate_status_cache();
+            }
+            Err(error) => {
+                // Retryable delivery failure: keep this file and stop the tick so
+                // ordering is preserved across transient outages. Permanent
+                // rejection is handled inside replay_spool_lines via dead-letter.
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+struct DeadLetterChunk {
+    row_count: usize,
+    reason: DeadLetterReason,
+    http_status: Option<u16>,
+}
+
+/// Deliver spool JSONEachRow lines with status-aware split / dead-letter policy.
+///
+/// On retryable failure returns `Err` and leaves caller-owned durable state
+/// unchanged. Permanent rejection and single-row 413 become dead-letter chunks.
+/// Multi-row 413 splits deterministically using `batch_size` without rewriting
+/// row payloads (event_id and other fields stay byte-identical).
+async fn replay_spool_lines(
+    flush_config: &ClickHouseFlushConfig,
+    lines: &[String],
+    batch_size: usize,
+) -> Result<Vec<DeadLetterChunk>, String> {
+    let mut dead_letters = Vec::new();
+    let mut stack: Vec<Vec<String>> = vec![lines.to_vec()];
+    while let Some(chunk) = stack.pop() {
+        if chunk.is_empty() {
+            continue;
+        }
+        let body = chunk.join("\n");
+        match post_json_each_row(flush_config, body, chunk.len()).await {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::Retryable { message } => return Err(message),
+            DeliveryOutcome::PayloadTooLarge { .. } => {
+                if chunk.len() == 1 {
+                    dead_letters.push(DeadLetterChunk {
+                        row_count: 1,
+                        reason: DeadLetterReason::PayloadTooLarge,
+                        http_status: Some(413),
+                    });
+                } else {
+                    let split_at = replay_split_len(chunk.len(), batch_size);
+                    let right = chunk[split_at..].to_vec();
+                    let left = chunk[..split_at].to_vec();
+                    // Stack: push right first so left is delivered first.
+                    stack.push(right);
+                    stack.push(left);
+                }
+            }
+            DeliveryOutcome::Permanent { status, .. } => {
+                dead_letters.push(DeadLetterChunk {
+                    row_count: chunk.len(),
+                    reason: DeadLetterReason::PermanentHttp,
+                    http_status: Some(status),
+                });
+            }
+        }
+    }
+    Ok(dead_letters)
+}
+
+fn finalize_replayed_spool_file(
+    spool: &SpoolManager,
+    file: &Path,
+    original_row_count: usize,
+    dead_letters: Vec<DeadLetterChunk>,
+) -> Result<(), String> {
+    if dead_letters.is_empty() {
+        fs::remove_file(file).map_err(|error| {
             format!(
                 "{PLUGIN_NAME}: failed to remove replayed spool file '{}': {error}",
                 file.display()
             )
         })?;
-        spool
-            .metrics
-            .last_replay_at
-            .store(unix_timestamp_seconds(), Ordering::Relaxed);
-        invalidate_status_cache();
+        return Ok(());
     }
+
+    let rejected_rows: usize = dead_letters.iter().map(|chunk| chunk.row_count).sum();
+    if rejected_rows > original_row_count {
+        return Err(format!(
+            "{PLUGIN_NAME}: dead-letter row count ({rejected_rows}) exceeds source row count ({original_row_count})"
+        ));
+    }
+    let mut outcomes: Vec<DeadLetterOutcomeMeta> = Vec::new();
+    for chunk in dead_letters {
+        if let Some(existing) = outcomes.iter_mut().find(|outcome| {
+            outcome.reason == chunk.reason.as_str() && outcome.http_status == chunk.http_status
+        }) {
+            existing.row_count = existing.row_count.saturating_add(chunk.row_count);
+        } else {
+            outcomes.push(DeadLetterOutcomeMeta {
+                reason: chunk.reason.as_str(),
+                http_status: chunk.http_status,
+                row_count: chunk.row_count,
+            });
+        }
+    }
+    let meta = DeadLetterMeta {
+        rejected_rows,
+        outcomes,
+        quarantined_at_unix: unix_timestamp_seconds(),
+    };
+    let meta_path = write_dead_letter_meta(spool, file, &meta)?;
+    warn!(
+        plugin = PLUGIN_NAME,
+        rejected_rows,
+        source_rows = original_row_count,
+        outcome_count = meta.outcomes.len(),
+        path = %file.display(),
+        meta_path = %meta_path.display(),
+        "Chargeback sink recorded safe dead-letter metadata for permanently rejected spool rows and will continue replay"
+    );
     Ok(())
 }
 

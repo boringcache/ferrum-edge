@@ -164,11 +164,41 @@ Spool files are written under:
 The sink writes failed batches and queue high-water overflow to disk. Files are
 created with private permissions, written as `*.tmp`, fsynced, and renamed into
 place. The background replayer scans durable data files (`*.ndjson` /
-`*.ndjson.zst`) in lexicographic order and removes a file only after ClickHouse
-accepts the whole file as one insert. Unreadable spool files are renamed with a
-`.corrupt` suffix so newer files can continue to replay. Stale `*.tmp` files left
-by an interrupted atomic write are deleted at spool startup and after a failed
-write/rename so they cannot accumulate indefinitely.
+`*.ndjson.zst`) in lexicographic order.
+
+### Delivery outcomes
+
+Replay classifies each ClickHouse HTTP attempt before deciding whether to keep,
+split, or skip a file:
+
+| Outcome | Status / cause | Replay behavior |
+| --- | --- | --- |
+| Delivered | HTTP 200 / 204 | Remove the spool file after the accepted insert |
+| Retryable | network / timeout / TLS transport errors, HTTP 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
+| Payload too large | HTTP 413 | Deterministically split the JSONEachRow body (preferring `batch.size`, otherwise halving) and retry each part without rewriting row bytes, so each event keeps its stable `event_id` idempotency identity. A single row that still returns 413 is dead-lettered |
+| Permanent | other HTTP 4xx (for example 400, 401, 403) | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
+
+Logs and error strings for these outcomes carry only safe metadata (plugin name,
+HTTP status code, reason class, row count, and file path). Response bodies,
+ClickHouse credentials, and charge-record fields are never logged.
+
+### Quarantine and dead-letter
+
+- Unreadable local spool files are renamed with a `.corrupt` suffix so newer
+  files can continue to replay.
+- Permanently rejected rows (and single-row 413 failures) are discarded only
+  after one deterministic sibling `.rejected.meta` JSON document has been
+  durably written for the source file. The document contains the aggregate
+  `rejected_rows`, safe `outcomes` (`reason`, optional `http_status`, and
+  `row_count`), and `quarantined_at_unix`. It never retains the rejected
+  payload, response bodies, credentials, or charge-record PII. If the metadata
+  write fails, the original file remains replayable; successfully inserted
+  rows may be retried with their unchanged `event_id` idempotency identity.
+- Stale `*.tmp` files left by an interrupted atomic write are deleted at spool
+  startup and after a failed write/rename so they cannot accumulate indefinitely.
+
+Dead-letter metadata and corrupt files remain under the node spool tree and
+count toward `spool.max_bytes` until eviction drops the oldest owned file.
 
 Offline validation and candidate-generation staging do not create, chmod, or
 probe `spool.dir`. After cache publication, the committed replayer prepares and
@@ -182,8 +212,11 @@ sink under `<spool.dir>/<node_id>/` (after compression when `compression` is
 `zstd`). The budget and status/metrics count every retained file class:
 
 - active data files (`*.ndjson` / `*.ndjson.zst`)
-- in-progress atomic-write temps (`*.ndjson.tmp` / `*.ndjson.zst.tmp`)
-- quarantined files (`*.ndjson.corrupt` / `*.ndjson.zst.corrupt`)
+- in-progress atomic-write temps (`*.ndjson.tmp`, `*.ndjson.zst.tmp`, and
+  dead-letter metadata `*.rejected.meta.tmp` files)
+- corrupt quarantine (`*.ndjson.corrupt` / `*.ndjson.zst.corrupt`)
+- metadata-only dead letters (`*.ndjson.rejected.meta` /
+  `*.ndjson.zst.rejected.meta`)
 
 Pending writes are serialized/compressed and sized **before** quota admission.
 Admission holds the spool write lock with eviction so concurrent writers cannot
@@ -195,8 +228,8 @@ still cannot fit after eviction (including on an empty spool), the write is
 (warned and not durably retained). The sink never silently exceeds the ceiling.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
-absorb, using **encoded** average event size (and headroom for any retained
-`.corrupt` quarantine files):
+absorb, using **encoded** average event size (and headroom for retained
+`.corrupt` quarantine and `.rejected.meta` dead-letter files):
 
 ```text
 max_bytes >= peak_events_per_second * average_encoded_event_bytes * outage_seconds
@@ -257,7 +290,7 @@ includes:
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
-- `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, and quarantined)
+- `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
 - `chargeback_sink_spool_available` (1 only while committed storage is writable)
