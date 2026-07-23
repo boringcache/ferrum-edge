@@ -93,7 +93,8 @@ pub enum ProtocolFamily {
 }
 
 impl ProtocolFamily {
-    fn label(&self) -> &'static str {
+    /// Stable registry-key / export label for this family (`"http"` or `"stream"`).
+    pub fn label(&self) -> &'static str {
         match self {
             ProtocolFamily::Http => "http",
             ProtocolFamily::Stream => "stream",
@@ -161,15 +162,20 @@ fn write_chargeback_key(
     consumer: &str,
     proxy_id: &str,
     status_code: u16,
+    protocol_family: ProtocolFamily,
     scope: &InstanceScope,
     prices: EntryPrices,
 ) {
+    // Include protocol_family so status-0 WebSocket bandwidth (HTTP family) and
+    // zero-connection-price stream sessions cannot collide when every other
+    // key dimension matches (issue #2571).
     let _ = write!(
         buf,
-        "{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
         consumer,
         proxy_id,
         status_code,
+        protocol_family.label(),
         scope.currency,
         scope.namespace_label,
         prices.call.to_bits(),
@@ -203,12 +209,15 @@ fn write_chargeback_key(
 /// `protocol_family`, prices, `currency`, and `namespace_label` fields are set
 /// once on creation and read during render. They are included in the DashMap key
 /// string so config reloads that change pricing create fresh entries instead of
-/// adding new traffic to stale prices. The key is still a plain `String`, which
-/// lets the hot-path `get()` use a borrowed `&str` from a thread-local buffer
-/// with zero allocation.
+/// adding new traffic to stale prices, and so HTTP-family status-0 WebSocket
+/// bandwidth cannot share an entry with a stream session. The key is still a
+/// plain `String`, which lets the hot-path `get()` use a borrowed `&str` from a
+/// thread-local buffer with zero allocation.
 ///
 /// For stream entries the `status_code` is `0` and there is exactly one entry
-/// per `(consumer, proxy_id)` (streams have no HTTP status).
+/// per `(consumer, proxy_id, protocol_family=stream)` (streams have no HTTP
+/// status). WebSocket-disconnect bandwidth also uses status `0` but under
+/// `protocol_family=http`, so the family discriminator keeps those rows apart.
 pub struct ChargebackEntry {
     pub call_count: AtomicU64,
     /// Bytes the gateway sent onward toward the backend on the client's behalf
@@ -330,19 +339,24 @@ const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
 /// Default minimum cache age (in nanoseconds) before record() will invalidate.
 const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
 
-/// Sentinel `status_code` for stream entries (TCP/UDP/DTLS). HTTP status codes
-/// are always in the 100..=599 range so `0` cannot collide.
+/// Sentinel `status_code` for stream sessions and WebSocket-disconnect
+/// bandwidth rows. Ordinary HTTP wire statuses are in `100..=599`; the
+/// registry key also carries [`ProtocolFamily`] so a bandwidth-only stream
+/// session and a WebSocket bandwidth record with identical prices cannot
+/// collide on this sentinel.
 const STREAM_STATUS_SENTINEL: u16 = 0;
 
 /// Chargeback registry holding per-consumer, per-proxy charge accumulators.
 ///
 /// **Key design**: The DashMap uses plain `String` keys formatted as
-/// `"consumer|proxy_id|status_code|currency|namespace_label|price_bits..."`.
+/// `"consumer|proxy_id|status_code|protocol_family|currency|namespace_label|price_bits..."`.
 /// Render metadata (consumer, proxy_id, proxy_name, status_code,
-/// protocol_family) is stored in the `ChargebackEntry` value. This allows the
-/// hot-path recording methods to use `DashMap::get(&str)` with a thread-local
-/// buffer — zero allocation on cache hits. Only the cold path (first record per
-/// unique billing/pricing combination) allocates a `String` key and `Arc<str>`
+/// protocol_family) is stored in the `ChargebackEntry` value and
+/// `protocol_family` is also part of the key so immutable family attribution
+/// cannot be fixed by insertion order. This allows the hot-path recording
+/// methods to use `DashMap::get(&str)` with a thread-local buffer — zero
+/// allocation on cache hits. Only the cold path (first record per unique
+/// billing/pricing combination) allocates a `String` key and `Arc<str>`
 /// metadata. This matches the connection pool key pattern in
 /// `connection_pool.rs`.
 pub struct ChargebackRegistry {
@@ -474,8 +488,9 @@ impl ChargebackRegistry {
     }
 
     /// Record a chargeable stream session (TCP, TCP+TLS, UDP, DTLS). Streams
-    /// have no HTTP status code; entries are keyed by `(consumer, proxy_id)`
-    /// with the [`STREAM_STATUS_SENTINEL`].
+    /// have no HTTP status code; entries are keyed by
+    /// `(consumer, proxy_id, ProtocolFamily::Stream)` with the
+    /// [`STREAM_STATUS_SENTINEL`].
     #[allow(clippy::too_many_arguments)]
     pub fn record_stream(
         &self,
@@ -542,11 +557,13 @@ impl ChargebackRegistry {
     /// **Cold-path (first record per unique combination)**: Clones the per-instance
     /// `Arc<str>` render metadata (consumer/proxy/currency/namespace) and allocates
     /// the owned `String` key and a new `ChargebackEntry`. This runs once per unique
-    /// `(consumer, proxy, status_code, currency, namespace)` combination (per
-    /// `(consumer, proxy, currency, namespace)` for streams). The
-    /// currency/namespace come from the recording plugin instance's
-    /// [`InstanceScope`], and are part of the key so multiple instances never
-    /// reuse an entry stamped with another instance's render scope.
+    /// `(consumer, proxy, status_code, protocol_family, currency, namespace, prices)`
+    /// combination. The currency/namespace come from the recording plugin
+    /// instance's [`InstanceScope`], and are part of the key so multiple
+    /// instances never reuse an entry stamped with another instance's render
+    /// scope. `protocol_family` is part of the key so HTTP-family WebSocket
+    /// bandwidth and stream sessions stay distinct even when both use status
+    /// `0` and identical prices.
     #[allow(clippy::too_many_arguments)]
     fn record_inner(
         &self,
@@ -578,6 +595,7 @@ impl ChargebackRegistry {
                 consumer,
                 proxy_id,
                 status_code,
+                protocol_family,
                 scope,
                 EntryPrices {
                     call: call_price,
@@ -597,18 +615,21 @@ impl ChargebackRegistry {
             // Cold path: allocate owned key + metadata for DashMap insertion.
             // Currency/namespace come from the recording instance's scope so the
             // entry is attributed to the instance that created it (finding #24).
+            // Capacity covers separators, status, protocol_family label
+            // ("stream" is longest), and three 16-hex price bit fields.
             let mut owned_key = String::with_capacity(
                 consumer.len()
                     + proxy_id.len()
                     + scope.currency.len()
                     + scope.namespace_label.len()
-                    + 67,
+                    + 74,
             );
             write_chargeback_key(
                 &mut owned_key,
                 consumer,
                 proxy_id,
                 status_code,
+                protocol_family,
                 scope,
                 EntryPrices {
                     call: call_price,

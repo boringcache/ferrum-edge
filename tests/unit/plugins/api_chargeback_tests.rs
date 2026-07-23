@@ -132,24 +132,39 @@ fn make_stream_summary(
 }
 
 /// Build the same key format used by the registry internally.
-fn make_key(consumer: &str, proxy_id: &str, status_code: u16) -> String {
-    make_key_with_prices(consumer, proxy_id, status_code, 0.0, 0.0, 0.0)
+fn make_key(
+    consumer: &str,
+    proxy_id: &str,
+    status_code: u16,
+    protocol_family: ProtocolFamily,
+) -> String {
+    make_key_with_prices(
+        consumer,
+        proxy_id,
+        status_code,
+        protocol_family,
+        0.0,
+        0.0,
+        0.0,
+    )
 }
 
 fn make_key_with_prices(
     consumer: &str,
     proxy_id: &str,
     status_code: u16,
+    protocol_family: ProtocolFamily,
     call_price: f64,
     bw_price_sent: f64,
     bw_price_received: f64,
 ) -> String {
     let scope = scope();
     format!(
-        "{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
+        "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
         consumer,
         proxy_id,
         status_code,
+        protocol_family.label(),
         scope.currency,
         scope.namespace_label,
         call_price.to_bits(),
@@ -348,6 +363,7 @@ async fn test_bandwidth_only_config_records_bytes() {
             "bw-only-user",
             "bw-only-proxy",
             404,
+            ProtocolFamily::Http,
             0.0,
             0.0000001,
             0.0000002,
@@ -379,6 +395,7 @@ async fn test_stream_only_config_charges_connection() {
             "stream-only-user",
             "stream-only-proxy",
             0,
+            ProtocolFamily::Stream,
             0.0005,
             0.0,
             0.0,
@@ -582,6 +599,7 @@ async fn test_combined_pricing_applies_both_call_and_bandwidth_charges() {
             "combined-user",
             "combined-proxy",
             200,
+            ProtocolFamily::Http,
             0.001,
             0.000001,
             0.000002,
@@ -613,7 +631,7 @@ fn test_registry_records_charge() {
         0.0,
     );
 
-    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.00001, 0.0, 0.0);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, ProtocolFamily::Http, 0.00001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
     assert!((entry.call_charge().unwrap() - 0.00001).abs() < 1e-15);
@@ -643,7 +661,7 @@ fn test_registry_accumulates_charges() {
         );
     }
 
-    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.00001, 0.0, 0.0);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, ProtocolFamily::Http, 0.00001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1000);
     assert!((entry.call_charge().unwrap() - 0.01).abs() < 1e-10);
@@ -690,7 +708,7 @@ fn test_registry_zero_alloc_hot_path() {
     );
 
     assert_eq!(registry.entries.len(), 1);
-    let key = make_key_with_prices("user-1", "proxy-a", 200, 0.001, 0.0, 0.0);
+    let key = make_key_with_prices("user-1", "proxy-a", 200, ProtocolFamily::Http, 0.001, 0.0, 0.0);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 3);
 }
@@ -795,7 +813,7 @@ fn test_registry_records_bandwidth_for_http() {
         0.0000002,
     );
 
-    let key = make_key_with_prices("alice", "proxy-1", 200, 0.0, 0.0000001, 0.0000002);
+    let key = make_key_with_prices("alice", "proxy-1", 200, ProtocolFamily::Http, 0.0, 0.0000001, 0.0000002);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_000_000);
     assert_eq!(
@@ -821,7 +839,7 @@ fn test_registry_records_stream_session() {
         0.0000002,
     );
 
-    let key = make_key_with_prices("alice", "stream-proxy", 0, 0.0005, 0.0000001, 0.0000002);
+    let key = make_key_with_prices("alice", "stream-proxy", 0, ProtocolFamily::Stream, 0.0005, 0.0000001, 0.0000002);
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.protocol_family, ProtocolFamily::Stream);
     assert_eq!(entry.status_code, 0);
@@ -850,7 +868,7 @@ fn test_registry_does_not_charge_bandwidth_when_price_zero() {
     );
     let entry = registry
         .entries
-        .get(&make_key("alice", "proxy", 200))
+        .get(&make_key("alice", "proxy", 200, ProtocolFamily::Http))
         .unwrap();
     assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 1_000);
     assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 2_000);
@@ -1089,7 +1107,7 @@ async fn test_log_charges_identified_consumer() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key_with_prices("alice", "proxy-1", 200, 0.001, 0.0, 0.0);
+    let key = make_key_with_prices("alice", "proxy-1", 200, ProtocolFamily::Http, 0.001, 0.0, 0.0);
     assert!(registry.entries.contains_key(&key));
 }
 
@@ -1148,7 +1166,7 @@ async fn test_log_prices_final_grpc_status_as_effective_http_status() {
         plugin
             .log(&make_grpc_summary(proxy_id, consumer, grpc_status))
             .await;
-        let key = make_key_with_prices(consumer, proxy_id, effective_status, price, 0.0, 0.0);
+        let key = make_key_with_prices(consumer, proxy_id, effective_status, ProtocolFamily::Http, price, 0.0, 0.0);
         let entry = registry
             .entries
             .get(&key)
@@ -1160,7 +1178,8 @@ async fn test_log_prices_final_grpc_status_as_effective_http_status() {
         assert!(
             effective_status == 200
                 || !registry.entries.contains_key(&make_key_with_prices(
-                    consumer, proxy_id, 200, 0.001, 0.0, 0.0
+                    consumer, proxy_id, 200,
+                    ProtocolFamily::Http, 0.001, 0.0, 0.0,
                 )),
             "non-OK gRPC status must not be charged in the HTTP 200 bucket"
         );
@@ -1203,7 +1222,7 @@ async fn test_log_skips_uncharged_status_codes() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key("charlie", "proxy-uncharged", 404);
+    let key = make_key("charlie", "proxy-uncharged", 404, ProtocolFamily::Http);
     assert!(!registry.entries.contains_key(&key));
 }
 
@@ -1224,7 +1243,7 @@ async fn test_log_records_bandwidth_even_when_status_is_uncharged() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key_with_prices("derek", "proxy-bw", 404, 0.0, 0.0000001, 0.0000002);
+    let key = make_key_with_prices("derek", "proxy-bw", 404, ProtocolFamily::Http, 0.0, 0.0000001, 0.0000002);
     let entry = registry
         .entries
         .get(&key)
@@ -1261,6 +1280,7 @@ async fn test_on_stream_disconnect_records_bandwidth() {
         "emma",
         "tcp-edge-stream-test",
         0,
+        ProtocolFamily::Stream,
         0.001,
         0.0000001,
         0.0000002,
@@ -1313,7 +1333,7 @@ async fn test_on_stream_disconnect_skips_when_only_per_call_pricing_set() {
     plugin.on_stream_disconnect(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key("frank", "http-only-stream-test", 0);
+    let key = make_key("frank", "http-only-stream-test", 0, ProtocolFamily::Stream);
     assert!(!registry.entries.contains_key(&key));
 }
 
@@ -1619,6 +1639,187 @@ fn test_http_and_stream_share_proxy_id_render_is_deterministic() {
     assert_eq!(proxy["total_calls"], 2); // 1 HTTP call + 1 stream session
 }
 
+// --- Issue #2571: status-0 WebSocket bandwidth vs bandwidth-only stream ---
+
+/// Bandwidth-only stream (zero connection price) and WebSocket-disconnect
+/// bandwidth share status `0` and identical price bits. Registry identity must
+/// include protocol family so insertion order cannot corrupt family attribution,
+/// call/session counts, or Prometheus/JSON reconciliation.
+fn assert_bandwidth_only_stream_and_websocket_reconcile(
+    registry: &ChargebackRegistry,
+    order_label: &str,
+) {
+    assert_eq!(
+        registry.entries.len(),
+        2,
+        "{order_label}: expected distinct HTTP and stream entries"
+    );
+
+    let http_key = make_key_with_prices(
+        "alice",
+        "edge",
+        0,
+        ProtocolFamily::Http,
+        0.0,
+        0.001,
+        0.001,
+    );
+    let stream_key = make_key_with_prices(
+        "alice",
+        "edge",
+        0,
+        ProtocolFamily::Stream,
+        0.0,
+        0.001,
+        0.001,
+    );
+
+    let http_entry = registry
+        .entries
+        .get(&http_key)
+        .unwrap_or_else(|| panic!("{order_label}: missing WebSocket/HTTP entry"));
+    assert_eq!(http_entry.protocol_family, ProtocolFamily::Http);
+    assert_eq!(http_entry.status_code, 0);
+    assert_eq!(
+        http_entry.call_count.load(Ordering::Relaxed),
+        0,
+        "{order_label}: WebSocket bandwidth must not count as a call"
+    );
+    assert_eq!(http_entry.bytes_sent_total.load(Ordering::Relaxed), 50);
+    assert_eq!(http_entry.bytes_received_total.load(Ordering::Relaxed), 75);
+    drop(http_entry);
+
+    let stream_entry = registry
+        .entries
+        .get(&stream_key)
+        .unwrap_or_else(|| panic!("{order_label}: missing stream entry"));
+    assert_eq!(stream_entry.protocol_family, ProtocolFamily::Stream);
+    assert_eq!(stream_entry.status_code, 0);
+    assert_eq!(
+        stream_entry.call_count.load(Ordering::Relaxed),
+        1,
+        "{order_label}: stream session must count as one connection"
+    );
+    assert_eq!(stream_entry.bytes_sent_total.load(Ordering::Relaxed), 100);
+    assert_eq!(
+        stream_entry.bytes_received_total.load(Ordering::Relaxed),
+        200
+    );
+    // Zero connection price keeps the stream call charge at zero.
+    assert_eq!(stream_entry.call_charge().unwrap(), 0.0);
+    drop(stream_entry);
+
+    let prom = registry.render_prometheus_uncached().unwrap();
+    assert!(
+        prom.lines().any(|l| {
+            l.starts_with("ferrum_api_bytes_sent_total{")
+                && l.contains("proxy_id=\"edge\"")
+                && l.contains("protocol_family=\"http\"")
+                && l.ends_with(" 50")
+        }),
+        "{order_label}: missing http bytes_sent row\n{prom}"
+    );
+    assert!(
+        prom.lines().any(|l| {
+            l.starts_with("ferrum_api_bytes_sent_total{")
+                && l.contains("proxy_id=\"edge\"")
+                && l.contains("protocol_family=\"stream\"")
+                && l.ends_with(" 100")
+        }),
+        "{order_label}: missing stream bytes_sent row\n{prom}"
+    );
+    assert!(
+        prom.lines().any(|l| {
+            l.starts_with("ferrum_api_bytes_received_total{")
+                && l.contains("proxy_id=\"edge\"")
+                && l.contains("protocol_family=\"http\"")
+                && l.ends_with(" 75")
+        }),
+        "{order_label}: missing http bytes_received row\n{prom}"
+    );
+    assert!(
+        prom.lines().any(|l| {
+            l.starts_with("ferrum_api_bytes_received_total{")
+                && l.contains("proxy_id=\"edge\"")
+                && l.contains("protocol_family=\"stream\"")
+                && l.ends_with(" 200")
+        }),
+        "{order_label}: missing stream bytes_received row\n{prom}"
+    );
+    assert!(
+        prom.lines().any(|l| {
+            l.starts_with("ferrum_api_stream_connections_total{")
+                && l.contains("proxy_id=\"edge\"")
+                && l.ends_with(" 1")
+        }),
+        "{order_label}: missing stream connection counter\n{prom}"
+    );
+    // WebSocket bandwidth uses status 0 with call_count=0. A colliding stream
+    // session must never promote that row into a chargeable HTTP call (count 1).
+    for line in prom.lines() {
+        if line.starts_with("ferrum_api_chargeable_calls_total{") && line.contains("proxy_id=\"edge\"")
+        {
+            assert!(
+                line.contains("status_code=\"0\"") && line.ends_with(" 0"),
+                "{order_label}: status-0 must stay non-chargeable (count 0)\n{line}\n{prom}"
+            );
+        }
+    }
+
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    let proxy = &json["consumers"]["alice"]["proxies"]["edge"];
+    assert_eq!(
+        proxy["protocol_family"], "mixed",
+        "{order_label}: proxy must remain mixed across families"
+    );
+    assert_eq!(proxy["stream"]["connections"], 1);
+    assert_eq!(proxy["stream"]["connection_charges"].as_f64().unwrap(), 0.0);
+    // WebSocket may leave a zero-call status-0 HTTP bucket; it must never absorb
+    // the stream session as a chargeable HTTP call.
+    if let Some(status0) = proxy["by_status"].get("0") {
+        assert_eq!(
+            status0["calls"], 0,
+            "{order_label}: status-0 must not become a chargeable HTTP call row: {proxy}"
+        );
+    }
+    // Bandwidth folds both families: 50+100 sent, 75+200 received.
+    assert_eq!(proxy["bandwidth"]["bytes_sent"], 150);
+    assert_eq!(proxy["bandwidth"]["bytes_received"], 275);
+    // (150+275)*0.001 = 0.425; zero connection price.
+    let total = proxy["total_charges"].as_f64().unwrap();
+    assert!(
+        (total - 0.425).abs() < 1e-9,
+        "{order_label}: totals must reconcile, got {total}"
+    );
+    assert_eq!(
+        proxy["total_calls"], 1,
+        "{order_label}: only the stream session is a counted call/session"
+    );
+}
+
+#[test]
+fn test_bandwidth_only_stream_then_websocket_keeps_families_distinct() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+    // Stream first: zero connection price + identical directional bandwidth rates.
+    registry.record_stream(&s, "alice", "edge", "Edge", 0.0, 100, 200, 0.001, 0.001);
+    registry.record_websocket_bandwidth(&s, "alice", "edge", "Edge", 50, 75, 0.001, 0.001);
+    assert_bandwidth_only_stream_and_websocket_reconcile(&registry, "stream-then-websocket");
+}
+
+#[test]
+fn test_websocket_then_bandwidth_only_stream_keeps_families_distinct() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+    // WebSocket first: reverse insertion order of the colliding status-0 key.
+    registry.record_websocket_bandwidth(&s, "alice", "edge", "Edge", 50, 75, 0.001, 0.001);
+    registry.record_stream(&s, "alice", "edge", "Edge", 0.0, 100, 200, 0.001, 0.001);
+    assert_bandwidth_only_stream_and_websocket_reconcile(&registry, "websocket-then-stream");
+}
+
 // --- Finding #76: monetary totals do not drift over high volume ---
 
 /// Recording a small per-call price across a large number of calls must yield
@@ -1639,7 +1840,8 @@ fn test_high_volume_charge_has_no_accumulation_drift() {
     let entry = registry
         .entries
         .get(&make_key_with_prices(
-            "alice", "proxy-1", 200, price, 0.0, 0.0,
+            "alice", "proxy-1", 200,
+            ProtocolFamily::Http, price, 0.0, 0.0,
         ))
         .unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), n);
@@ -1663,7 +1865,8 @@ fn test_bandwidth_charge_is_exact_from_byte_totals() {
     let many_entry = many
         .entries
         .get(&make_key_with_prices(
-            "alice", "proxy-1", 200, 0.0, price, 0.0,
+            "alice", "proxy-1", 200,
+            ProtocolFamily::Http, 0.0, price, 0.0,
         ))
         .unwrap();
     assert_eq!(
@@ -1784,6 +1987,7 @@ fn test_max_price_times_max_counter_stays_finite_for_exports() {
             "alice",
             "proxy-max",
             200,
+            ProtocolFamily::Http,
             MAX_UNIT_PRICE,
             0.0,
             0.0,
@@ -1837,6 +2041,7 @@ fn test_bandwidth_max_price_times_max_bytes_stays_finite() {
             "alice",
             "proxy-bw-max",
             404,
+            ProtocolFamily::Http,
             0.0,
             MAX_UNIT_PRICE,
             MAX_UNIT_PRICE,
@@ -1879,6 +2084,7 @@ fn test_render_fails_closed_on_quantity_price_overflow() {
             "alice",
             "proxy-poison",
             200,
+            ProtocolFamily::Http,
             poison,
             0.0,
             0.0,
@@ -1913,7 +2119,8 @@ fn test_render_fails_closed_on_aggregate_addition_overflow() {
         let entry = registry
             .entries
             .get(&make_key_with_prices(
-                "alice", proxy, status, price, 0.0, 0.0,
+                "alice", proxy, status,
+                ProtocolFamily::Http, price, 0.0, 0.0,
             ))
             .unwrap();
         entry.call_count.store(1, Ordering::Relaxed);
