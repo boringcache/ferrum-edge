@@ -1114,11 +1114,6 @@ impl ApiChargebackSink {
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |batch, error| {
                 if snapshot_events_are_pre_spooled {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %error,
-                        "Chargeback snapshot export failed; the batch remains in the durable spool"
-                    );
                     return;
                 }
                 if let Some(spool) = failed_spool.as_ref() {
@@ -1143,11 +1138,6 @@ impl ApiChargebackSink {
                     .queue_high_water_hits_total
                     .fetch_add(1, Ordering::Relaxed);
                 if snapshot_events_are_pre_spooled {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        overflow_reason = reason,
-                        "Chargeback snapshot queue overflowed; the event remains in the durable spool"
-                    );
                     invalidate_status_cache();
                     return;
                 }
