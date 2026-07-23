@@ -15,8 +15,7 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    GrpcStep, H2Step, HttpStep, MatchHeaders, MatchRpc, RequestMatcher, ScriptedGrpcBackend,
-    ScriptedH2Backend, ScriptedHttp1Backend,
+    GrpcStep, HttpStep, MatchRpc, RequestMatcher, ScriptedGrpcBackend, ScriptedHttp1Backend,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, GrpcClient, Http2Client, Http3Client};
@@ -33,10 +32,18 @@ use tokio::net::TcpStream;
 const BODY_DELAY: Duration = Duration::from_millis(400);
 const STREAM_UNKNOWN: f64 = -1.0;
 const H3_SLOW_CLIENT_STREAM_WINDOW_BYTES: u32 = 16 * 1024;
-/// Large enough to create real downstream backpressure when the client stops
-/// reading (TCP / H2 / QUIC windows fill). Tiny already-buffered bodies are
-/// not a valid slow-client fixture.
+/// Slow-client body for H2/H3 frontends. Exceeds Ferrum's 256 KiB H2 stream
+/// window (and the 16 KiB H3 test window) so withheld credit creates real
+/// downstream backpressure. H1 needs a separate, larger payload because TCP
+/// buffering — not stream windows — is the backpressure mechanism there.
 const SLOW_CLIENT_PAYLOAD_BYTES: usize = 512 * 1024;
+/// H1-only: must exceed hosted loopback/gateway TCP send buffering even with
+/// a capped client SO_RCVBUF. 512 KiB was fully absorbed (~3 ms totals) in CI.
+const H1_SLOW_CLIENT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Bounded gRPC DATA frames that together exceed the 256 KiB H2 stream window
+/// without one oversized message (which triggered internal stream errors).
+const GRPC_SLOW_CLIENT_MESSAGE_BYTES: usize = 64 * 1024;
+const GRPC_SLOW_CLIENT_MESSAGE_COUNT: usize = 8;
 
 #[derive(Clone, Copy)]
 enum Pace {
@@ -247,8 +254,8 @@ async fn wait_for_marked_summary(harness: &GatewayHarness, marker: &str) -> Stri
         .await
 }
 
-fn large_payload() -> Vec<u8> {
-    vec![b'x'; SLOW_CLIENT_PAYLOAD_BYTES]
+fn large_payload(nbytes: usize) -> Vec<u8> {
+    vec![b'x'; nbytes]
 }
 
 fn gateway_http_port(harness: &GatewayHarness) -> u16 {
@@ -314,6 +321,7 @@ fn spawn_http1_scripted(
     listener: tokio::net::TcpListener,
     pace: Pace,
     outcome: Outcome,
+    slow_client_payload_bytes: usize,
 ) -> ScriptedHttp1Backend {
     let mut builder = ScriptedHttp1Backend::builder(listener)
         .step(HttpStep::ExpectRequest(RequestMatcher::any()))
@@ -349,7 +357,7 @@ fn spawn_http1_scripted(
                 .step(HttpStep::RespondBodyEnd);
         }
         Pace::SlowClient => {
-            let body = large_payload();
+            let body = large_payload(slow_client_payload_bytes);
             let chunk_header = format!("{:x}\r\n", body.len());
             let mut framed = Vec::with_capacity(chunk_header.len() + body.len() + 7);
             framed.extend_from_slice(chunk_header.as_bytes());
@@ -362,48 +370,6 @@ fn spawn_http1_scripted(
     }
 
     builder.spawn().expect("spawn http1 backend")
-}
-
-fn spawn_h2_scripted(
-    listener: tokio::net::TcpListener,
-    pace: Pace,
-    outcome: Outcome,
-) -> ScriptedH2Backend {
-    let mut builder = ScriptedH2Backend::builder_plain(listener)
-        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
-        .step(H2Step::DrainRequestBody)
-        .step(H2Step::RespondHeaders(vec![
-            (":status", "200".into()),
-            ("content-type", "application/octet-stream".into()),
-        ]));
-
-    match pace {
-        Pace::SlowBackend => {
-            let stall = if outcome.expect_disconnect() {
-                Duration::from_secs(5)
-            } else {
-                BODY_DELAY
-            };
-            builder = builder
-                .step(H2Step::RespondData {
-                    data: Bytes::from_static(b"ping"),
-                    end_stream: false,
-                })
-                .step(H2Step::Sleep(stall))
-                .step(H2Step::RespondData {
-                    data: Bytes::from_static(b"pong"),
-                    end_stream: true,
-                });
-        }
-        Pace::SlowClient => {
-            builder = builder.step(H2Step::RespondData {
-                data: Bytes::from(large_payload()),
-                end_stream: true,
-            });
-        }
-    }
-
-    builder.spawn().expect("spawn h2 backend")
 }
 
 fn spawn_grpc_scripted(
@@ -431,12 +397,17 @@ fn spawn_grpc_scripted(
                 });
         }
         Pace::SlowClient => {
-            builder = builder
-                .step(GrpcStep::RespondMessage(Bytes::from(large_payload())))
-                .step(GrpcStep::RespondStatus {
-                    code: 0,
-                    message: "",
-                });
+            // Multiple bounded messages exhaust H2 flow-control credit; a
+            // single oversized message previously failed completion drains
+            // with "unexpected internal error encountered".
+            let message = Bytes::from(large_payload(GRPC_SLOW_CLIENT_MESSAGE_BYTES));
+            for _ in 0..GRPC_SLOW_CLIENT_MESSAGE_COUNT {
+                builder = builder.step(GrpcStep::RespondMessage(message.clone()));
+            }
+            builder = builder.step(GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            });
         }
     }
 
@@ -492,7 +463,7 @@ async fn h1_slow_client_raw(url: &str, outcome: Outcome) {
             break;
         }
         assert!(
-            collected.len() < SLOW_CLIENT_PAYLOAD_BYTES,
+            collected.len() < H1_SLOW_CLIENT_PAYLOAD_BYTES,
             "headers never arrived"
         );
     }
@@ -513,7 +484,7 @@ async fn h1_slow_client_raw(url: &str, outcome: Outcome) {
                 collected.extend_from_slice(&buf[..n]);
             }
             assert!(
-                collected.len() > SLOW_CLIENT_PAYLOAD_BYTES / 2,
+                collected.len() > H1_SLOW_CLIENT_PAYLOAD_BYTES / 2,
                 "expected large streamed body, got {} bytes",
                 collected.len()
             );
@@ -771,22 +742,23 @@ async fn grpc_live_stream(port: u16, path: &str, slow_read: bool, outcome: Outco
     }
 }
 
-async fn run_http_family(protocol: &str, pace: Pace, outcome: Outcome, use_h2_backend: bool) {
+async fn run_http_family(protocol: &str, pace: Pace, outcome: Outcome) {
     let marker = scenario_marker(protocol, pace, outcome);
     let path = scenario_path(protocol, pace, outcome);
     let backend_res = reserve_port().await.expect("backend port");
     let backend_port = backend_res.port;
     let listener = backend_res.into_listener();
-    // Keep the chosen scripted backend alive for the whole scenario without
-    // introducing unread enum payloads that trip dead-code lint.
-    let (_h1_backend, _h2_backend) = if use_h2_backend {
-        (None, Some(spawn_h2_scripted(listener, pace, outcome)))
-    } else {
-        (Some(spawn_http1_scripted(listener, pace, outcome)), None)
+    // H2 frontend coverage proxies to the stable HTTP/1 scripted backend.
+    // Acceptance is frontend H2; an unconfigured H2 backend transport is out
+    // of scope and previously returned 502 for all four H2 cases.
+    let slow_client_payload_bytes = match protocol {
+        "h1" => H1_SLOW_CLIENT_PAYLOAD_BYTES,
+        _ => SLOW_CLIENT_PAYLOAD_BYTES,
     };
+    let _backend = spawn_http1_scripted(listener, pace, outcome, slow_client_payload_bytes);
 
     let proxy_id = format!("stream-latency-{marker}");
-    let harness = GatewayHarness::builder()
+    let mut builder = GatewayHarness::builder()
         .file_config(logging_proxy_config(
             backend_port,
             &proxy_id,
@@ -796,7 +768,13 @@ async fn run_http_family(protocol: &str, pace: Pace, outcome: Outcome, use_h2_ba
         .log_level("info")
         .env("RUST_LOG", "info")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .capture_output()
+        .capture_output();
+    // H1 slow-client bodies exceed the default 10 MiB response cap so TCP
+    // send buffering can fill; disable the size limit for this fixture only.
+    if protocol == "h1" {
+        builder = builder.env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0");
+    }
+    let harness = builder
         .spawn()
         .await
         .expect("spawn gateway");
@@ -818,7 +796,12 @@ async fn run_native_h3(pace: Pace, outcome: Outcome) {
     let path = scenario_path("h3", pace, outcome);
     let backend_res = reserve_port().await.expect("backend port");
     let backend_port = backend_res.port;
-    let _backend = spawn_http1_scripted(backend_res.into_listener(), pace, outcome);
+    let _backend = spawn_http1_scripted(
+        backend_res.into_listener(),
+        pace,
+        outcome,
+        SLOW_CLIENT_PAYLOAD_BYTES,
+    );
 
     let proxy_id = format!("stream-latency-{marker}");
     let (harness, https_port) = spawn_native_h3_logging_gateway(backend_port, &proxy_id).await;
@@ -868,25 +851,25 @@ async fn run_grpc(pace: Pace, outcome: Outcome) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h1_slow_backend_stream_completion_keeps_gateway_sentinel() {
-    run_http_family("h1", Pace::SlowBackend, Outcome::Complete, false).await;
+    run_http_family("h1", Pace::SlowBackend, Outcome::Complete).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h1_slow_backend_stream_disconnect_keeps_gateway_sentinel() {
-    run_http_family("h1", Pace::SlowBackend, Outcome::Disconnect, false).await;
+    run_http_family("h1", Pace::SlowBackend, Outcome::Disconnect).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h1_slow_client_stream_completion_keeps_gateway_sentinel() {
-    run_http_family("h1", Pace::SlowClient, Outcome::Complete, false).await;
+    run_http_family("h1", Pace::SlowClient, Outcome::Complete).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h1_slow_client_stream_disconnect_keeps_gateway_sentinel() {
-    run_http_family("h1", Pace::SlowClient, Outcome::Disconnect, false).await;
+    run_http_family("h1", Pace::SlowClient, Outcome::Disconnect).await;
 }
 
 // ── HTTP/2 frontend ───────────────────────────────────────────────────────
@@ -894,25 +877,25 @@ async fn h1_slow_client_stream_disconnect_keeps_gateway_sentinel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_slow_backend_stream_completion_keeps_gateway_sentinel() {
-    run_http_family("h2", Pace::SlowBackend, Outcome::Complete, true).await;
+    run_http_family("h2", Pace::SlowBackend, Outcome::Complete).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_slow_backend_stream_disconnect_keeps_gateway_sentinel() {
-    run_http_family("h2", Pace::SlowBackend, Outcome::Disconnect, true).await;
+    run_http_family("h2", Pace::SlowBackend, Outcome::Disconnect).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_slow_client_stream_completion_keeps_gateway_sentinel() {
-    run_http_family("h2", Pace::SlowClient, Outcome::Complete, true).await;
+    run_http_family("h2", Pace::SlowClient, Outcome::Complete).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_slow_client_stream_disconnect_keeps_gateway_sentinel() {
-    run_http_family("h2", Pace::SlowClient, Outcome::Disconnect, true).await;
+    run_http_family("h2", Pace::SlowClient, Outcome::Disconnect).await;
 }
 
 // ── Native HTTP/3 frontend ────────────────────────────────────────────────
