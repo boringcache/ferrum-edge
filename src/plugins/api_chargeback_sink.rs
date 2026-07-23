@@ -3371,19 +3371,19 @@ impl SnapshotAccumulator {
             // a concurrent eviction cannot leave an orphaned baseline that a
             // later reinsert would mis-subtract, and so we cannot overwrite a
             // newer generation's baseline with an older snapshot read.
-            if let Some(entry) = self.entries.get(&key) {
-                if entry.generation == generation {
-                    // Keep the entry guard through publication. Cleanup cannot
-                    // evict this generation and remove its baseline between
-                    // the generation check and the insert.
-                    self.last_emitted.insert(
-                        key,
-                        LastEmitted {
-                            generation,
-                            totals: current,
-                        },
-                    );
-                }
+            if let Some(entry) = self.entries.get(&key)
+                && entry.generation == generation
+            {
+                // Keep the entry guard through publication. Cleanup cannot
+                // evict this generation and remove its baseline between
+                // the generation check and the insert.
+                self.last_emitted.insert(
+                    key,
+                    LastEmitted {
+                        generation,
+                        totals: current,
+                    },
+                );
             }
         }
         Ok(events)
