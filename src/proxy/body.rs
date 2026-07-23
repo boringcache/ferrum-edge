@@ -472,7 +472,12 @@ impl http_body::Body for GrpcWebStreamingBody {
                 super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
                 Poll::Ready(Some(Ok(this.terminal_data(collected))))
             }
-            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Ok(_))) => {
+                this.failed = true;
+                Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                    "gRPC-Web streaming adapter received an unsupported frame",
+                )))))
+            }
             Poll::Ready(None) => {
                 let trailers = this.initial_terminal_metadata.take().unwrap_or_default();
                 Poll::Ready(Some(Ok(this.terminal_data(trailers))))

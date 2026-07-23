@@ -3597,10 +3597,11 @@ where
         .then(|| crate::plugins::grpc_web::retained_response_content_type(ctx))
         .flatten()
         .map(str::to_owned);
-    let grpc_web_text_mode = grpc_web_content_type
+    let grpc_web_translation_mode = grpc_web_content_type
         .as_deref()
+        .filter(|_| crate::plugins::response_body_rewrite_allowed(streaming.status))
         .map(crate::plugins::grpc_web::is_grpc_web_text);
-    if grpc_web_text_mode.is_some() {
+    if grpc_web_translation_mode.is_some() {
         // Match the shared H1/H2 boundary: policies cannot manufacture or
         // replace terminal status in initial headers. Restore only a pristine
         // Trailers-Only status from an initial END_STREAM block.
@@ -3616,7 +3617,12 @@ where
         .headers
         .get("grpc-status")
         .map(|status| crate::proxy::grpc_proxy::parse_grpc_status_value(status));
-    let mut grpc_web_initial_terminal_metadata = grpc_web_text_mode.map(|_| {
+    crate::proxy::grpc_proxy::refresh_grpc_status_metadata(
+        &mut ctx.metadata,
+        &HashMap::new(),
+        &streaming.headers,
+    );
+    let mut grpc_web_initial_terminal_metadata = grpc_web_translation_mode.map(|_| {
         crate::plugins::grpc_web::take_streaming_initial_terminal_metadata(
             &mut streaming.headers,
             grpc_web_body_ended,
@@ -3626,11 +3632,6 @@ where
     if grpc_web_initial_terminal_metadata.is_some() {
         streaming.headers.remove("content-length");
     }
-    crate::proxy::grpc_proxy::refresh_grpc_status_metadata(
-        &mut ctx.metadata,
-        &HashMap::new(),
-        &streaming.headers,
-    );
 
     // The body relay may replace an empty backend stream with terminal
     // deadline trailers. Do not commit the backend's declared length across
@@ -3698,7 +3699,7 @@ where
         max_resp_bytes,
         streaming.response_read_timeout_ms,
         streaming.grpc_deadline_at,
-        grpc_web_text_mode,
+        grpc_web_translation_mode,
     )
     .await;
 
@@ -3727,7 +3728,7 @@ where
         // Suppress the (possibly successful) backend status on an oversized upload.
         crate::http3::stream_util::abort_response_stream(stream);
         final_body_completed = false;
-    } else if body_completed && let Some(text_mode) = grpc_web_text_mode {
+    } else if body_completed && let Some(text_mode) = grpc_web_translation_mode {
         let mut collected = grpc_web_initial_terminal_metadata
             .take()
             .unwrap_or_default();
@@ -6333,7 +6334,7 @@ async fn stream_hyper_incoming<S>(
     max_response_body_size_bytes: usize,
     response_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
-    grpc_web_text_mode: Option<bool>,
+    grpc_web_translation_mode: Option<bool>,
 ) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>, bool)
 where
     // Send-only: this loop writes the response (`send_data` / `finish` /
@@ -6481,7 +6482,7 @@ where
                                 data_len,
                                 coalesce.min_bytes,
                             ) {
-                                let out = if let Some(text_mode) = grpc_web_text_mode {
+                                let out = if let Some(text_mode) = grpc_web_translation_mode {
                                     crate::plugins::grpc_web::encode_streaming_data(data, text_mode)
                                 } else {
                                     data
@@ -6500,7 +6501,7 @@ where
                             coalesce_buf.extend_from_slice(&data);
                             if coalesce_buf.len() >= coalesce.min_bytes {
                                 let out = coalesce_buf.split().freeze();
-                                let out = if let Some(text_mode) = grpc_web_text_mode {
+                                let out = if let Some(text_mode) = grpc_web_translation_mode {
                                     crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
                                 } else {
                                     out
@@ -6533,7 +6534,7 @@ where
             }
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let out = coalesce_buf.split().freeze();
-                let out = if let Some(text_mode) = grpc_web_text_mode {
+                let out = if let Some(text_mode) = grpc_web_translation_mode {
                     crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
                 } else {
                     out
@@ -6560,7 +6561,7 @@ where
         if stream_done {
             if !coalesce_buf.is_empty() {
                 let out = coalesce_buf.split().freeze();
-                let out = if let Some(text_mode) = grpc_web_text_mode {
+                let out = if let Some(text_mode) = grpc_web_translation_mode {
                     crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
                 } else {
                     out
@@ -6575,7 +6576,7 @@ where
             // HEADERS and FIN. Empty trailers are equivalent to absent here:
             // no trailers frame is needed, but the QUIC stream still must be
             // closed with FIN.
-            if grpc_web_text_mode.is_none()
+            if grpc_web_translation_mode.is_none()
                 && should_finish_h3_stream_without_trailers(trailers.as_ref())
                 && let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
                     grpc_deadline_at,

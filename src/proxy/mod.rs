@@ -22573,15 +22573,19 @@ async fn handle_proxy_request_inner(
                     &mut response_headers,
                     grpc_total_deadline,
                 );
+                let grpc_web_streaming_content_type = grpc_web_response_content_type
+                    .filter(|_| {
+                        crate::plugins::response_body_rewrite_allowed(grpc_streaming.status)
+                    });
                 let grpc_web_streaming_initial_metadata =
-                    grpc_web_response_content_type.map(|_| {
+                    grpc_web_streaming_content_type.map(|_| {
                         crate::plugins::grpc_web::take_streaming_initial_terminal_metadata(
                             &mut response_headers,
                             grpc_body_ended,
                             pristine_streaming_grpc_web_terminal_names.as_ref(),
                         )
                     });
-                if grpc_web_response_content_type.is_some() {
+                if grpc_web_streaming_content_type.is_some() {
                     // Incremental translation changes the representation size
                     // and carries terminal metadata in a final DATA frame.
                     response_headers.remove("content-length");
@@ -22748,7 +22752,7 @@ async fn handle_proxy_request_inner(
                             grpc_streaming.request_body_exceeded.clone(),
                         );
                 }
-                if let Some(content_type) = grpc_web_response_content_type {
+                if let Some(content_type) = grpc_web_streaming_content_type {
                     body = body.into_grpc_web_streaming(
                         content_type,
                         grpc_streaming.status,
@@ -25231,6 +25235,7 @@ async fn handle_proxy_request_inner(
     );
     let grpc_web_streaming_adapter = if body_will_stream
         && grpc_request_is_web_translated
+        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let Some(content_type) = grpc_web_response_content_type
     {
         // Terminal fields belong to a real trailer block unless the pristine
