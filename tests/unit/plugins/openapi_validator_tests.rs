@@ -904,19 +904,17 @@ async fn multipart_file_part_with_structured_content_type_validates_actual_metad
             "request_body": {
                 "content": {
                     "multipart/form-data": {
-                        "schema": {
-                            "type": "object",
-                            "required": ["file"],
-                            "properties": {
-                                "file": {
-                                    "type": "object",
-                                    "required": ["filename", "content_type", "size", "content"],
-                                    "properties": {
-                                        "filename": {"type": "string", "const": "safe.png"},
-                                        "content_type": {"type": "string", "const": "image/png"},
-                                        "size": {"type": "integer", "maximum": 2},
-                                        "content": {"type": "string", "const": "ok"}
-                                    }
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size", "content"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "safe.png"},
+                                    "content_type": {"type": "string", "const": "image/png"},
+                                    "size": {"type": "integer", "maximum": 2},
+                                    "content": {"type": "string", "const": "ok"}
                                 }
                             }
                         }
