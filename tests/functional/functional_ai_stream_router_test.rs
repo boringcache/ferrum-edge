@@ -221,11 +221,11 @@ async fn test_ai_stream_router_normalizes_anthropic_sse_and_strips_accept_encodi
         .clone()
         .expect("provider saw request");
     assert!(
-        !captured
+        captured
             .raw
             .to_ascii_lowercase()
-            .contains("accept-encoding:"),
-        "provider must not receive Accept-Encoding: {}",
+            .contains("accept-encoding: identity"),
+        "provider must receive only identity Accept-Encoding: {}",
         captured.raw
     );
     assert!(
