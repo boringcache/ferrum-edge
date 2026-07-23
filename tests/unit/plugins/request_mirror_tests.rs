@@ -2191,6 +2191,20 @@ async fn capture_mirror_request_line(ctx: &mut RequestContext) -> String {
 }
 
 #[tokio::test]
+async fn test_mirror_preserves_supported_and_extension_methods() {
+    for method in ["PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+        let mut ctx = make_ctx_with_proxy();
+        ctx.method = method.to_string();
+
+        let request_line = capture_mirror_request_line(&mut ctx).await;
+        assert!(
+            request_line.starts_with(&format!("{method} ")),
+            "mirror changed request method: {request_line}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_mirror_preserves_raw_query_edge_cases() {
     // Issue #2444: repeated pairs, order, flags, empty values, `+`, encoded
     // delimiters, percent escapes, and non-ASCII encoded bytes must survive.
