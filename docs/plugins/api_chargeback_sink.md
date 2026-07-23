@@ -368,12 +368,32 @@ node and time window.
 
 ## Status And Metrics
 
-`GET /charges/sink/status` is JWT-authenticated and returns the effective batch
-size, flush interval, and retry settings (`max_attempts`, `initial_delay_ms`,
-`max_delay_ms`, `jitter`), queue depth, spool size, replay timestamps, and
-export counters. While the sink is disabled the response keeps the same object
-shape with zeroed batch/retry numerics and `retry.jitter: false`. `/metrics`
-includes:
+`GET /charges/sink/status` is JWT-authenticated and returns the current
+accepted-generation observability for every stable `api_chargeback_sink`
+plugin-config ID. Validation-only construction and uncommitted staged reloads
+never publish into this view.
+
+Response contract:
+
+- `enabled` is `true` when at least one accepted instance is live.
+- `instance_count` is the number of published instances.
+- `totals` aggregates queue depth/capacity/high-water hits, spool files/bytes/
+  drops/prepare failures, and export counters across every current accepted
+  instance.
+  `totals.spool.available` is `true` only when every spool-enabled live instance
+  is currently writable.
+- `instances` lists the current accepted generation for each sink in ascending
+  `plugin_config_id` order. Each entry includes its generation plus
+  mode, pricing version, sanitized ClickHouse endpoint metadata, batch/retry
+  settings, per-instance queue/spool/export counters, and timestamps.
+
+Cardinality is bounded by the number of accepted plugin-config IDs. A newly
+accepted generation replaces the prior status entry for the same stable ID;
+dropping an older in-flight runtime removes nothing unless it is still the
+published generation.
+
+`/metrics` preserves the existing metric names as process-wide aggregates
+across the current accepted sink generation for every stable plugin-config ID:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`
@@ -382,10 +402,16 @@ includes:
 - `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
-- `chargeback_sink_spool_available` (1 only while committed storage is writable)
+- `chargeback_sink_spool_available` (aggregate is `1` only while every spool-enabled live instance is writable)
 - `chargeback_sink_spool_prepare_failures_total`
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
+
+Per-instance identity, generation, configuration, and counters are available
+from the authenticated status endpoint. Prometheus deliberately does not add a
+generation label: repeated reloads therefore cannot create an unbounded stream
+of historical time series, and ordinary sums cannot double-count aggregate plus
+component samples.
 
 ## Security Notes
 

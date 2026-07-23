@@ -7076,10 +7076,12 @@ pub fn create_plugin_with_http_client(
 /// proxy / proxy_group). Production `PluginCache` passes `Some(&pc.id)` so
 /// Redis-backed `request_deduplication` instances partition logical keys by that
 /// identity, `waf` instances isolate anomaly-score accumulators / ownership
-/// metadata, and `request_mirror` records attribute each shadow destination.
-/// Pass `None` for config-validation and direct/test construction that does not
-/// need sibling isolation or attribution (uses the plugin's standalone default
-/// id). Blank ids fail closed when supplied.
+/// metadata, and `api_chargeback_sink` instances publish accepted-generation
+/// status/metrics under that stable identity, while `request_mirror` records
+/// attribute each shadow destination. Pass `None` for config-validation and
+/// direct/test construction that does not need sibling isolation or attribution
+/// (uses the plugin's standalone default id). Blank ids fail closed when
+/// supplied.
 pub fn create_plugin_with_http_client_and_config_id(
     name: &str,
     config: &Value,
@@ -7300,11 +7302,14 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.namespace(),
         )?))),
-        "api_chargeback_sink" => Ok(Some(Arc::new(api_chargeback_sink::ApiChargebackSink::new(
-            config,
-            http_client.clone(),
-            http_client.namespace(),
-        )?))),
+        "api_chargeback_sink" => Ok(Some(Arc::new(
+            api_chargeback_sink::ApiChargebackSink::new_with_config_id(
+                config,
+                http_client.clone(),
+                http_client.namespace(),
+                plugin_config_id,
+            )?,
+        ))),
         "otel_tracing" => Ok(Some(Arc::new(
             otel_tracing::OtelTracing::new_with_http_client(config, http_client)?,
         ))),

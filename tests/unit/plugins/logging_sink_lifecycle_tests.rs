@@ -515,26 +515,29 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         .expect("activation retries after secret is present");
     assert!(
         !plugin.owns_active_sink(),
-        "start must not publish ACTIVE_SINK before commit"
+        "start must not publish ACTIVE_SINKS before commit"
     );
     plugin.commit_background_tasks();
     assert!(
         plugin.owns_active_sink(),
-        "successful commit must publish ACTIVE_SINK for this instance"
+        "successful commit must publish ACTIVE_SINKS for this instance"
     );
     let status: Value =
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
     assert_eq!(
         status.get("enabled").and_then(Value::as_bool),
         Some(true),
-        "successful activation must publish ACTIVE_SINK"
+        "successful activation must publish ACTIVE_SINKS"
     );
-    assert_eq!(status["batch"]["size"], 2);
-    assert_eq!(status["batch"]["flush_interval_ms"], 60_000);
-    assert_eq!(status["retry"]["max_attempts"], 1);
-    assert_eq!(status["retry"]["initial_delay_ms"], 1);
-    assert_eq!(status["retry"]["max_delay_ms"], 1);
-    assert_eq!(status["retry"]["jitter"], false);
+    assert_eq!(status["instance_count"], 1);
+    let instance = &status["instances"][0];
+    assert_eq!(instance["batch"]["size"], 2);
+    assert_eq!(instance["batch"]["flush_interval_ms"], 60_000);
+    assert_eq!(instance["retry"]["max_attempts"], 1);
+    assert_eq!(instance["retry"]["initial_delay_ms"], 1);
+    assert_eq!(instance["retry"]["max_delay_ms"], 1);
+    assert_eq!(instance["retry"]["jitter"], false);
+    assert_eq!(instance["pricing_version"], "test-v1");
 
     // A later staged generation may stage its owned workers before the cache
     // swap, but it must not displace diagnostics for the committed live sink.
@@ -546,20 +549,18 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         .expect("staged activation starts owned workers");
     let status_while_staged: Value =
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
+    assert_eq!(status_while_staged["instance_count"], 1);
     assert_eq!(
-        status_while_staged
-            .get("pricing_version")
-            .and_then(Value::as_str),
+        status_while_staged["instances"][0]["pricing_version"].as_str(),
         Some("test-v1"),
         "uncommitted staged activation must not replace the live sink"
     );
     drop(staged);
     let status_after_staged_drop: Value =
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
+    assert_eq!(status_after_staged_drop["instance_count"], 1);
     assert_eq!(
-        status_after_staged_drop
-            .get("pricing_version")
-            .and_then(Value::as_str),
+        status_after_staged_drop["instances"][0]["pricing_version"].as_str(),
         Some("test-v1"),
         "dropping a rejected staged sink must preserve live diagnostics"
     );
@@ -572,13 +573,15 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
     assert_eq!(
         status_after.get("enabled").and_then(Value::as_bool),
         Some(false),
-        "drop must clear ACTIVE_SINK owned by this instance"
+        "drop must clear ACTIVE_SINKS owned by this instance"
     );
-    assert_eq!(status_after["batch"]["size"], 0);
-    assert_eq!(status_after["retry"]["max_attempts"], 0);
-    assert_eq!(status_after["retry"]["initial_delay_ms"], 0);
-    assert_eq!(status_after["retry"]["max_delay_ms"], 0);
-    assert_eq!(status_after["retry"]["jitter"], false);
+    assert_eq!(status_after["instance_count"], 0);
+    assert!(
+        status_after["instances"]
+            .as_array()
+            .is_some_and(|instances| instances.is_empty())
+    );
+    assert_eq!(status_after["totals"]["export"]["events_enqueued_total"], 0);
 }
 
 #[tokio::test]
@@ -848,12 +851,12 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
         planted_bytes,
         "spool file must remain untouched before commit"
     );
-    // ACTIVE_SINK is process-global; assert instance ownership rather than
+    // ACTIVE_SINKS is process-global; assert instance ownership rather than
     // global emptiness so parallel non-lifecycle suite members cannot flake
     // this dormancy proof. Publication must wait for commit.
     assert!(
         !plugin.owns_active_sink(),
-        "ACTIVE_SINK must stay unpublished for this staged instance before commit"
+        "ACTIVE_SINKS must stay unpublished for this staged instance before commit"
     );
 
     // Drop without commit: workers must exit without spool side effects.
@@ -932,7 +935,7 @@ async fn chargeback_pre_start_commit_and_enqueue_are_noops() {
         ApiChargebackSink::new(&chargeback_sink_config(&tmp), client(), "default").expect("cb");
     assert!(
         !plugin.owns_active_sink(),
-        "validation/construction objects must not own ACTIVE_SINK"
+        "validation/construction objects must not own ACTIVE_SINKS"
     );
     plugin.commit_background_tasks();
     assert!(
@@ -1089,5 +1092,341 @@ async fn kafka_start_restores_pending_when_producer_create_fails() {
     assert!(
         retry_err.is_err(),
         "restored pending activation must remain retryable (still missing material)"
+    );
+}
+
+fn chargeback_sink_config_for_id(tmp: &tempfile::TempDir, id: &str) -> Value {
+    let mut cfg = chargeback_sink_config(tmp);
+    cfg["spool"]["dir"] = json!(tmp.path().join(format!("spool-{id}")).to_string_lossy());
+    cfg["pricing_version"] = json!(format!("pricing-{id}"));
+    cfg["clickhouse"]["table"] = json!(format!("charges_{id}"));
+    cfg
+}
+
+fn status_instance_ids(status: &Value) -> Vec<(String, u64)> {
+    status["instances"]
+        .as_array()
+        .expect("instances array")
+        .iter()
+        .map(|instance| {
+            (
+                instance["plugin_config_id"]
+                    .as_str()
+                    .expect("plugin_config_id")
+                    .to_string(),
+                instance["generation"].as_u64().expect("generation"),
+            )
+        })
+        .collect()
+}
+
+/// Two accepted sinks must coexist in status/metrics with deterministic ordering.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_two_accepted_instances_render_deterministically() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let a = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "alpha"),
+        client(),
+        "default",
+        Some("sink-alpha"),
+    )
+    .expect("alpha");
+    let b = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "bravo"),
+        client(),
+        "default",
+        Some("sink-bravo"),
+    )
+    .expect("bravo");
+
+    a.start_background_tasks().expect("start alpha");
+    b.start_background_tasks().expect("start bravo");
+    assert!(!a.owns_active_sink());
+    assert!(!b.owns_active_sink());
+
+    // Commit bravo first; ordering must still sort by plugin_config_id.
+    b.commit_background_tasks();
+    a.commit_background_tasks();
+    assert!(a.owns_active_sink());
+    assert!(b.owns_active_sink());
+
+    let status: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["instance_count"], 2);
+    let ids = status_instance_ids(&status);
+    assert_eq!(
+        ids.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec!["sink-alpha", "sink-bravo"],
+        "instances must render in ascending plugin_config_id order: {ids:?}"
+    );
+    assert_eq!(status["instances"][0]["pricing_version"], "pricing-alpha");
+    assert_eq!(status["instances"][1]["pricing_version"], "pricing-bravo");
+    assert_eq!(
+        status["instances"][0]["clickhouse"]["table"],
+        "charges_alpha"
+    );
+    assert_eq!(
+        status["instances"][1]["clickhouse"]["table"],
+        "charges_bravo"
+    );
+
+    let gen_a = a.active_generation().expect("alpha generation");
+    let gen_b = b.active_generation().expect("bravo generation");
+    assert_ne!(gen_a, gen_b);
+
+    let prom = api_chargeback_sink::render_prometheus();
+    assert!(
+        prom.lines()
+            .any(|line| line == "chargeback_sink_events_enqueued_total 0"),
+        "missing process-wide aggregate counter:\n{prom}"
+    );
+    assert!(
+        !prom.contains("plugin_config_id=") && !prom.contains("generation="),
+        "generation labels would create reload-driven time-series churn:\n{prom}"
+    );
+
+    drop(a);
+    drop(b);
+}
+
+/// Dropping either accepted instance removes only that exact ID/generation.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_removing_either_instance_preserves_sibling() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "one"),
+        client(),
+        "default",
+        Some("sink-one"),
+    )
+    .expect("one");
+    let second = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "two"),
+        client(),
+        "default",
+        Some("sink-two"),
+    )
+    .expect("two");
+    first.start_background_tasks().expect("start one");
+    second.start_background_tasks().expect("start two");
+    first.commit_background_tasks();
+    second.commit_background_tasks();
+
+    let gen_one = first.active_generation().expect("gen one");
+    let gen_two = second.active_generation().expect("gen two");
+
+    drop(first);
+    let after_first: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(after_first["instance_count"], 1);
+    assert_eq!(after_first["instances"][0]["plugin_config_id"], "sink-two");
+    assert_eq!(after_first["instances"][0]["generation"], gen_two);
+    assert!(
+        second.owns_active_sink(),
+        "sibling must keep its exact published generation"
+    );
+    assert!(
+        !api_chargeback_sink::render_prometheus().is_empty(),
+        "the surviving sibling must keep aggregate metrics enabled"
+    );
+
+    // Recreate first with a new generation; dropping second must leave the new first.
+    let first_again = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "one"),
+        client(),
+        "default",
+        Some("sink-one"),
+    )
+    .expect("one again");
+    first_again
+        .start_background_tasks()
+        .expect("start one again");
+    first_again.commit_background_tasks();
+    let gen_one_again = first_again.active_generation().expect("gen one again");
+    assert_ne!(gen_one_again, gen_one);
+
+    drop(second);
+    let after_second: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(after_second["instance_count"], 1);
+    assert_eq!(after_second["instances"][0]["plugin_config_id"], "sink-one");
+    assert_eq!(after_second["instances"][0]["generation"], gen_one_again);
+    drop(first_again);
+}
+
+/// A newly accepted generation replaces the prior view for the same stable ID,
+/// and dropping the old in-flight generation must not clear the replacement.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_replacement_generation_is_current_and_exact_drop_safe() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let old = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "old"),
+        client(),
+        "default",
+        Some("sink-reload"),
+    )
+    .expect("old generation");
+    old.start_background_tasks().expect("start old generation");
+    old.commit_background_tasks();
+    let old_generation = old.active_generation().expect("old generation id");
+
+    let new = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "new"),
+        client(),
+        "default",
+        Some("sink-reload"),
+    )
+    .expect("new generation");
+    new.start_background_tasks().expect("start new generation");
+    new.commit_background_tasks();
+    let new_generation = new.active_generation().expect("new generation id");
+    assert_ne!(old_generation, new_generation);
+
+    let current: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(current["instance_count"], 1);
+    assert_eq!(current["instances"][0]["plugin_config_id"], "sink-reload");
+    assert_eq!(current["instances"][0]["generation"], new_generation);
+    assert_eq!(current["instances"][0]["pricing_version"], "pricing-new");
+
+    drop(old);
+    let after_old_drop: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(after_old_drop["instance_count"], 1);
+    assert_eq!(
+        after_old_drop["instances"][0]["generation"], new_generation,
+        "dropping the superseded runtime must not clear the accepted replacement"
+    );
+
+    drop(new);
+}
+
+/// Admin/config validation throwaways must not mutate a live accepted view.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_validation_while_live_sink_preserves_status() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let live = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "live"),
+        client(),
+        "default",
+        Some("sink-live"),
+    )
+    .expect("live");
+    live.start_background_tasks().expect("start live");
+    live.commit_background_tasks();
+    let live_gen = live.active_generation().expect("live gen");
+
+    let before: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(before["instance_count"], 1);
+    assert_eq!(before["instances"][0]["generation"], live_gen);
+
+    // Shape-only validation constructs and drops without start/commit.
+    let throwaway = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "validate"),
+        client(),
+        "default",
+        Some("sink-validate"),
+    )
+    .expect("validation construct");
+    assert!(!throwaway.owns_active_sink());
+    drop(throwaway);
+
+    let after_validate: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(after_validate, before);
+
+    // validate_plugin_config also constructs+drops through the shared pipeline.
+    ferrum_edge::plugins::validate_plugin_config(
+        "api_chargeback_sink",
+        &chargeback_sink_config_for_id(&tmp, "pipeline"),
+    )
+    .expect("pipeline validation");
+    let after_pipeline: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(after_pipeline["instance_count"], 1);
+    assert_eq!(
+        after_pipeline["instances"][0]["plugin_config_id"],
+        "sink-live"
+    );
+    assert_eq!(after_pipeline["instances"][0]["generation"], live_gen);
+
+    drop(live);
+}
+
+/// Rejected staged reload must not publish or clear sibling accepted sinks.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_rejected_reload_after_staging_preserves_live() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let live = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "accepted"),
+        client(),
+        "default",
+        Some("sink-accepted"),
+    )
+    .expect("accepted");
+    live.start_background_tasks().expect("start accepted");
+    live.commit_background_tasks();
+    let live_gen = live.active_generation().expect("live gen");
+
+    let staged = ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config_for_id(&tmp, "rejected"),
+        client(),
+        "default",
+        Some("sink-rejected"),
+    )
+    .expect("rejected candidate");
+    staged
+        .start_background_tasks()
+        .expect("stage rejected candidate");
+    assert!(
+        !staged.owns_active_sink(),
+        "staged candidate must stay unpublished before commit"
+    );
+    let status_while_staged: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(status_while_staged["instance_count"], 1);
+    assert_eq!(
+        status_while_staged["instances"][0]["plugin_config_id"],
+        "sink-accepted"
+    );
+    assert_eq!(status_while_staged["instances"][0]["generation"], live_gen);
+
+    // Simulate cache rejecting the staged generation: drop without commit.
+    drop(staged);
+    let after_reject: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(after_reject["instance_count"], 1);
+    assert_eq!(
+        after_reject["instances"][0]["plugin_config_id"],
+        "sink-accepted"
+    );
+    assert_eq!(after_reject["instances"][0]["generation"], live_gen);
+    assert!(live.owns_active_sink());
+
+    drop(live);
+}
+
+#[test]
+fn chargeback_rejects_blank_plugin_config_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let err = match ApiChargebackSink::new_with_config_id(
+        &chargeback_sink_config(&tmp),
+        client(),
+        "default",
+        Some("   "),
+    ) {
+        Ok(_) => panic!("blank plugin config id must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        err.contains("plugin config id") && err.contains("non-empty"),
+        "unexpected error: {err}"
     );
 }

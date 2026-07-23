@@ -1514,11 +1514,13 @@ paths:
       operationId: getChargebackSinkStatus
       summary: API chargeback sink status
       description: |
-        Returns effective batch and retry settings, queue depth, spool size,
-        replay timestamps, and export counters for the `api_chargeback_sink`
-        plugin. Requires a valid admin JWT because sink status can expose
-        billing topology and ClickHouse endpoint metadata. Credentials and URL
-        user-info are never returned.
+        Returns the current accepted generation for every stable
+        `api_chargeback_sink` plugin-config ID: aggregate queue/spool/export
+        totals plus per-instance batch, retry, queue, spool, and export counters
+        ordered by `plugin_config_id`. Validation throwaways, uncommitted staged
+        reloads, and superseded generations are excluded. Requires a valid admin
+        JWT because sink status can expose billing topology and ClickHouse
+        endpoint metadata. Credentials and URL user-info are never returned.
       tags: [Metrics]
       responses:
         "200":
@@ -21032,17 +21034,108 @@ components:
 
     ChargebackSinkStatusResponse:
       type: object
-      description: Status response from `GET /charges/sink/status`.
+      description: |
+        Status response from `GET /charges/sink/status`. Reports the current
+        accepted generation for every stable `api_chargeback_sink` plugin-config
+        ID plus process-wide totals. Instances are ordered by ascending
+        `plugin_config_id`. Validation throwaways, uncommitted staged reloads,
+        and superseded generations are excluded.
+      required: [enabled, instance_count, totals, instances]
       properties:
+        enabled:
+          type: boolean
+          description: True when at least one accepted sink instance is live.
+        instance_count:
+          type: integer
+          minimum: 0
+          description: Number of current accepted plugin-config IDs in `instances`.
+        totals:
+          type: object
+          description: Aggregates across every accepted live instance.
+          required: [queue, spool, export]
+          properties:
+            queue:
+              type: object
+              properties:
+                depth:
+                  type: integer
+                  minimum: 0
+                capacity:
+                  type: integer
+                  minimum: 0
+                high_water_hits_total:
+                  type: integer
+                  minimum: 0
+            spool:
+              type: object
+              properties:
+                files:
+                  type: integer
+                  minimum: 0
+                bytes:
+                  type: integer
+                  minimum: 0
+                drops_total:
+                  type: integer
+                  minimum: 0
+                prepare_failures_total:
+                  type: integer
+                  minimum: 0
+                available:
+                  type: boolean
+                  description: |
+                    True only when every spool-enabled live instance currently
+                    reports writable storage.
+            export:
+              type: object
+              properties:
+                events_enqueued_total:
+                  type: integer
+                  minimum: 0
+                events_exported_total:
+                  type: integer
+                  minimum: 0
+                failures_total:
+                  type: integer
+                  minimum: 0
+        instances:
+          type: array
+          description: |
+            Per-instance status for the current accepted generation of each
+            stable plugin-config ID, ordered by ascending `plugin_config_id`.
+          items:
+            $ref: "#/components/schemas/ChargebackSinkInstanceStatus"
+
+    ChargebackSinkInstanceStatus:
+      type: object
+      description: Status for one accepted live `api_chargeback_sink` instance.
+      required:
+        - plugin_config_id
+        - generation
+        - mode
+        - pricing_version
+        - clickhouse
+        - batch
+        - retry
+        - queue
+        - spool
+        - export
+      properties:
+        plugin_config_id:
+          type: string
+          minLength: 1
+          description: Stable plugin-config resource id for this instance.
+        generation:
+          type: integer
+          minimum: 1
+          description: Accepted-generation identity assigned at activation.
         mode:
           type: string
           enum: [per_event, snapshot]
-        enabled:
-          type: boolean
         pricing_version:
-          type: [string, "null"]
+          type: string
         clickhouse:
-          type: [object, "null"]
+          type: object
           properties:
             endpoint:
               type: string
@@ -21053,7 +21146,7 @@ components:
               type: string
         batch:
           type: object
-          description: Effective admitted batching settings used by the live sink. Values are zero while the sink is disabled.
+          description: Effective admitted batching settings used by this instance.
           properties:
             size:
               type: integer
@@ -21064,10 +21157,7 @@ components:
               minimum: 0
         retry:
           type: object
-          description: |
-            Effective admitted retry settings used by the live sink. Disabled
-            status uses the same object shape with zeroed numeric fields and
-            `jitter: false`.
+          description: Effective admitted retry settings used by this instance.
           properties:
             max_attempts:
               type: integer
@@ -21097,6 +21187,10 @@ components:
           properties:
             enabled:
               type: boolean
+            available:
+              type: boolean
+            prepare_failures_total:
+              type: integer
             files:
               type: integer
               description: Count of owned spool files (active data, temps, and quarantined).
