@@ -20,14 +20,17 @@
 //! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Forwarding
 //! identity is stripped rather than regenerated. Client `Host` is omitted so
 //! authority comes from the mirror URL; native gRPC content-types re-synthesise
-//! `te: trailers` for HTTP/2-capable mirror targets. The request-target prefers
-//! the original raw query (after the same auth credential strips the primary
-//! backend uses) so duplicate keys, order, flags, `+`, percent escapes, and
-//! encoded bytes match the primary contract.
+//! `te: trailers` for HTTP/2-capable mirror targets. Native gRPC mirrors dial
+//! through `PluginHttpClient::get_http2` (h2c prior knowledge for cleartext
+//! `http` targets, ALPN `h2` for `https`); ordinary HTTP mirrors keep the
+//! default all-version client so HTTP/1.1 destinations continue to work. The
+//! request-target prefers the original raw query (after the same auth
+//! credential strips the primary backend uses) so duplicate keys, order, flags,
+//! `+`, percent escapes, and encoded bytes match the primary contract.
 //!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
-//! it inherits the gateway's DNS cache, connection pool keepalive, and TLS
-//! settings (CA bundle, skip-verify).
+//! it inherits the gateway's DNS cache, connection pool keepalive, TLS
+//! settings (CA bundle, skip-verify), egress screening, and redacted logging.
 //!
 //! ## Mirror response logging
 //!
@@ -573,6 +576,10 @@ impl Plugin for RequestMirror {
         );
         // gRPC mirrors need `te: trailers` after the generic strip removes `te`.
         synthesize_grpc_te_trailers_if_needed(&mut mirror_headers);
+        let is_native_grpc = mirror_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && crate::proxy::backend_dispatch::is_native_grpc_content_type(value.as_bytes())
+        });
 
         // Apply the operator-configured baggage strip
         // (`FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`) so mesh-internal identity
@@ -646,14 +653,23 @@ impl Plugin for RequestMirror {
             let _permit = permit;
             let start = std::time::Instant::now();
 
+            // Native gRPC must speak HTTP/2 (h2c prior knowledge on cleartext,
+            // ALPN h2 on TLS). Ordinary HTTP mirrors keep the default client so
+            // HTTP/1.1 destinations continue to work.
+            let outbound = if is_native_grpc {
+                http_client.get_http2()
+            } else {
+                http_client.get()
+            };
+
             let mut req_builder = match method.as_str() {
-                "GET" => http_client.get().get(&mirror_url),
-                "POST" => http_client.get().post(&mirror_url),
-                "PUT" => http_client.get().put(&mirror_url),
-                "DELETE" => http_client.get().delete(&mirror_url),
-                "PATCH" => http_client.get().patch(&mirror_url),
-                "HEAD" => http_client.get().head(&mirror_url),
-                _ => http_client.get().request(
+                "GET" => outbound.get(&mirror_url),
+                "POST" => outbound.post(&mirror_url),
+                "PUT" => outbound.put(&mirror_url),
+                "DELETE" => outbound.delete(&mirror_url),
+                "PATCH" => outbound.patch(&mirror_url),
+                "HEAD" => outbound.head(&mirror_url),
+                _ => outbound.request(
                     reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
                     &mirror_url,
                 ),
@@ -684,10 +700,16 @@ impl Plugin for RequestMirror {
             // output, so stringifying it into `mirror_error` would leak those
             // secrets to every logging sink. `execute_redacted` reduces the
             // transport error to an `ErrorClass` plus the stripped URL.
-            let (status_code, response_size, error_msg) = match http_client
-                .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
-                .await
-            {
+            let response = if is_native_grpc {
+                http_client
+                    .execute_http2_redacted(req_builder, "request_mirror", &mirror_url_for_log)
+                    .await
+            } else {
+                http_client
+                    .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
+                    .await
+            };
+            let (status_code, response_size, error_msg) = match response {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     // Derive response size from content-length when available (avoids
