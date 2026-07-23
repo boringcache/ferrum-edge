@@ -2244,6 +2244,226 @@ async fn test_plugin_cache_reload_publishes_name_before_late_old_completion() {
     assert_eq!(proxy["by_status"]["200"]["calls"], 3);
 }
 
+/// When a proxy is removed from published metadata, overlapping retained pricing
+/// generations fall back to admission-time names and keep the lexicographic
+/// maximum so JSON and Prometheus stay deterministic.
+#[test]
+fn test_deleted_proxy_uses_lexicographic_admission_name_fallback() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+
+    // Leave active_proxy_names empty so exporters must use admission fallbacks.
+    // Multiple proxy IDs make the lex-upgrade path order-independent across
+    // DashMap iteration.
+    for i in 0..16 {
+        let proxy_id = format!("deleted-proxy-{i}");
+        registry.record_http(
+            &s, "alice", &proxy_id, "Alpha", 200, 0.001, 10, 5, 0.01, 0.01,
+        );
+        registry.record_http(
+            &s, "alice", &proxy_id, "Zulu", 200, 0.002, 20, 10, 0.02, 0.02,
+        );
+        registry.record_stream(
+            &s, "alice", &proxy_id, "Alpha", 0.001, 30, 15, 0.01, 0.01,
+        );
+        registry.record_stream(
+            &s, "alice", &proxy_id, "Zulu", 0.002, 40, 20, 0.02, 0.02,
+        );
+    }
+
+    let prom = registry.render_prometheus_uncached().unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    for i in 0..16 {
+        let proxy_id = format!("deleted-proxy-{i}");
+        let call_line = prom
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_api_chargeable_calls_total{")
+                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
+            })
+            .unwrap_or_else(|| panic!("missing http calls for {proxy_id}\n{prom}"));
+        assert_eq!(
+            prometheus_proxy_name(call_line),
+            Some("Zulu"),
+            "deleted proxy http export must pick lex-max admission name\n{call_line}"
+        );
+        let stream_line = prom
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_api_stream_connections_total{")
+                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
+            })
+            .unwrap_or_else(|| panic!("missing stream connections for {proxy_id}\n{prom}"));
+        assert_eq!(
+            prometheus_proxy_name(stream_line),
+            Some("Zulu"),
+            "deleted proxy stream export must pick lex-max admission name\n{stream_line}"
+        );
+        assert_eq!(
+            json["consumers"]["alice"]["proxies"][&proxy_id]["proxy_name"],
+            "Zulu",
+            "deleted proxy json export must match prometheus lex-max fallback"
+        );
+    }
+}
+
+/// Generation-tagged render caches must hit on unchanged metadata and refresh
+/// immediately after a live name publication.
+#[test]
+fn test_render_cache_hits_until_proxy_metadata_generation_advances() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(60, 3600, 500);
+    let s = scope();
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v1".to_string(),
+    )]));
+    record_payment(&registry, &s, "Payments v1", 0.001);
+
+    let prom1 = registry.render_prometheus().unwrap();
+    let prom2 = registry.render_prometheus().unwrap();
+    assert_eq!(
+        prom1, prom2,
+        "unchanged metadata generation must reuse the prometheus render cache"
+    );
+    assert!(
+        prom1.contains("proxy_name=\"Payments v1\""),
+        "cached prometheus must carry the published name\n{prom1}"
+    );
+
+    let json1 = registry.render_json().unwrap();
+    let json2 = registry.render_json().unwrap();
+    assert_eq!(
+        json1, json2,
+        "unchanged metadata generation must reuse the json render cache"
+    );
+    let cached: serde_json::Value = serde_json::from_str(&json1).unwrap();
+    assert_eq!(
+        cached["consumers"]["alice"]["proxies"]["payments"]["proxy_name"],
+        "Payments v1"
+    );
+
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v2".to_string(),
+    )]));
+    let prom3 = registry.render_prometheus().unwrap();
+    assert!(
+        prom3.contains("proxy_name=\"Payments v2\""),
+        "metadata publication must invalidate prometheus cache\n{prom3}"
+    );
+    let json3 = registry.render_json().unwrap();
+    let json3_value: serde_json::Value = serde_json::from_str(&json3).unwrap();
+    assert_eq!(
+        json3_value["consumers"]["alice"]["proxies"]["payments"]["proxy_name"],
+        "Payments v2"
+    );
+
+    // A second pair of renders after the rename must hit the new generation's
+    // cache rather than rebuilding again.
+    assert_eq!(prom3, registry.render_prometheus().unwrap());
+    assert_eq!(json3, registry.render_json().unwrap());
+}
+
+/// Concurrent metadata publication during render must not leave a stale
+/// generation-tagged cache entry; exporters keep serving finite, consistent
+/// output under the race.
+#[test]
+fn test_render_cache_generation_safety_under_concurrent_name_publication() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(3600, 3600, 500);
+    let s = scope();
+    for i in 0..24 {
+        let proxy_id = format!("race-proxy-{i}");
+        registry.record_http(
+            &s,
+            "alice",
+            &proxy_id,
+            "Race v1",
+            200,
+            0.001,
+            100,
+            50,
+            0.01,
+            0.01,
+        );
+    }
+    registry.set_active_proxy_names(
+        (0..24)
+            .map(|i| (format!("race-proxy-{i}"), "Race v1".to_string()))
+            .collect(),
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(2));
+    let publisher_registry = Arc::clone(&registry);
+    let publisher_stop = Arc::clone(&stop);
+    let publisher_barrier = Arc::clone(&barrier);
+    let publisher = thread::spawn(move || {
+        publisher_barrier.wait();
+        let mut generation = 0u64;
+        while !publisher_stop.load(Ordering::Relaxed) {
+            let name = format!("Race v{generation}");
+            publisher_registry.set_active_proxy_names(
+                (0..24)
+                    .map(|i| (format!("race-proxy-{i}"), name.clone()))
+                    .collect(),
+            );
+            generation = generation.wrapping_add(1);
+            thread::yield_now();
+        }
+    });
+
+    barrier.wait();
+    for _ in 0..128 {
+        let prom = registry
+            .render_prometheus()
+            .expect("prometheus render under metadata race");
+        assert!(
+            prom.contains("ferrum_api_chargeable_calls_total{"),
+            "prometheus race render must stay well-formed"
+        );
+        let json = registry
+            .render_json()
+            .expect("json render under metadata race");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("json race render must parse");
+        assert!(
+            parsed["consumers"]["alice"]["proxies"]
+                .as_object()
+                .is_some_and(|proxies| !proxies.is_empty()),
+            "json race render must retain proxy rows"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    publisher.join().expect("metadata publisher thread");
+
+    // Settle on a final published name and confirm both exporters agree after
+    // the race ends (including a cached follow-up scrape).
+    registry.set_active_proxy_names(
+        (0..24)
+            .map(|i| (format!("race-proxy-{i}"), "Race settled".to_string()))
+            .collect(),
+    );
+    thread::sleep(Duration::from_millis(1));
+    let settled_prom = registry.render_prometheus().unwrap();
+    assert!(settled_prom.contains("proxy_name=\"Race settled\""));
+    assert_eq!(settled_prom, registry.render_prometheus().unwrap());
+    let settled_json: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert_eq!(
+        settled_json["consumers"]["alice"]["proxies"]["race-proxy-0"]["proxy_name"],
+        "Race settled"
+    );
+}
+
 // --- Finding #76: monetary totals do not drift over high volume ---
 
 /// Recording a small per-call price across a large number of calls must yield
