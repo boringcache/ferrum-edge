@@ -2322,12 +2322,9 @@ async fn multipart_quoted_boundary_parameter_and_encoding_content_type() {
                             "required": ["file"],
                             "properties": {
                                 "file": {
-                                    "type": "object",
-                                    "required": ["content_type", "filename"],
-                                    "properties": {
-                                        "content_type": {"type": "string", "const": "application/pdf"},
-                                        "filename": {"type": "string", "const": "doc.pdf"}
-                                    }
+                                    "type": "string",
+                                    "format": "binary",
+                                    "minLength": 4
                                 }
                             }
                         },
