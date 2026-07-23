@@ -238,7 +238,10 @@ enum CompletionSkipReason {
 ///
 /// The values are hashed identities or opaque owner tokens, but they still do
 /// not belong in public transaction metadata. `RequestContext` holds at most
-/// one entry per deduplication instance attached to the matched proxy.
+/// one entry per deduplication instance attached to the matched proxy, so
+/// multiple scoped instances (distinct headers / Redis prefixes) mark and
+/// token-release independently without overwriting one another's lifecycle
+/// state.
 #[derive(Clone)]
 pub(crate) struct RequestDeduplicationRequestState {
     key: String,
@@ -568,7 +571,7 @@ impl RequestDeduplication {
         // current inspection/final validation still runs, and a new redaction
         // decision can opt only its mandatory transform back in. Ordinary
         // rejection header hooks still run and cache headers are re-sanitized.
-        ctx.deduplication_replay_response_finalized = true;
+        ctx.finalized_response_replay = true;
         let mut response_headers = sanitize_cached_headers(&cached.headers);
         response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
         PluginResult::RejectBinary {

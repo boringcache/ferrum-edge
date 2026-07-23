@@ -462,6 +462,20 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.inner.requires_request_body_before_before_proxy()
     }
+    fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        self.inner
+            .normalizes_buffered_request_body_before_before_proxy()
+    }
+    async fn normalize_buffered_request_body_before_before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+        body: &mut Vec<u8>,
+    ) -> PluginResult {
+        self.inner
+            .normalize_buffered_request_body_before_before_proxy(ctx, headers, body)
+            .await
+    }
     fn requires_request_body_before_authenticate(&self) -> bool {
         self.inner.requires_request_body_before_authenticate()
     }
@@ -902,6 +916,22 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .on_ws_frame(proxy_id, connection_id, direction, message)
             .await
+    }
+    fn prepare_ws_frame_delivery(
+        &self,
+        message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<crate::plugins::WsFrameDeliveryObservation> {
+        self.inner.prepare_ws_frame_delivery(message)
+    }
+    fn emit_ws_frame_delivery(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        observation: crate::plugins::WsFrameDeliveryObservation,
+    ) {
+        self.inner
+            .emit_ws_frame_delivery(proxy_id, connection_id, direction, observation)
     }
     fn requires_response_stream_hooks(&self) -> bool {
         self.inner.requires_response_stream_hooks()
@@ -2716,6 +2746,7 @@ impl PluginCapabilities {
     pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
     pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
+    pub const NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY: u16 = 1 << 14;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2807,6 +2838,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_request_body_before_before_proxy() {
             caps |= PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY;
+        }
+        if p.normalizes_buffered_request_body_before_before_proxy() {
+            caps |= PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY;
         }
         if p.requires_request_body_before_authenticate() {
             caps |= PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE;

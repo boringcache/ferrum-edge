@@ -4,7 +4,7 @@ use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, Plugin
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-use super::plugin_utils::create_test_context;
+use super::plugin_utils::{create_test_context, normalize_compressed_request_for_plugin_test};
 
 /// Mutex to serialize tests that touch process-global env vars.
 ///
@@ -2345,6 +2345,52 @@ async fn test_forward_body_preserves_exact_bytes_and_active_content_type() {
     assert_eq!(json_payload["body"], r#"{"trusted":true}"#);
     assert_eq!(json_payload["body_encoding"], "utf8");
     assert_eq!(json_payload["body_content_type"], "text/plain");
+}
+
+#[tokio::test]
+async fn configured_decompression_exposes_plaintext_before_serverless_dispatch() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let plaintext = br#"{"decision":"deny","reason":"sensitive"}"#;
+
+    for encoding in ["gzip", "br"] {
+        let (mut ctx, mut headers, _) = normalize_compressed_request_for_plugin_test(
+            "application/json",
+            "/serverless",
+            encoding,
+            plaintext,
+        )
+        .await;
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let payload: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(payload["body"], std::str::from_utf8(plaintext).unwrap());
+        assert_eq!(payload["body_encoding"], "utf8");
+        assert_eq!(payload["body_content_type"], "application/json");
+    }
 }
 
 #[tokio::test]

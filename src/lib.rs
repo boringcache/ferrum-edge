@@ -962,6 +962,88 @@ pub mod _test_support {
         crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw).await
     }
 
+    /// Prepare deferred delivery observations for the final post-plugin message.
+    pub fn prepare_ws_frame_deliveries_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        message: &Message,
+    ) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
+        match crate::proxy::prepare_ws_frame_deliveries(plugins, message) {
+            crate::proxy::WsFrameDeliveryBatch::None => Vec::new(),
+            crate::proxy::WsFrameDeliveryBatch::One(index, observation) => {
+                vec![(index, observation)]
+            }
+            crate::proxy::WsFrameDeliveryBatch::Many(entries) => entries,
+        }
+    }
+
+    /// Emit previously prepared delivery observations after a successful sink accept.
+    pub fn emit_ws_frame_deliveries_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        prepared: Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>,
+    ) {
+        let prepared = match prepared.len() {
+            0 => crate::proxy::WsFrameDeliveryBatch::None,
+            1 => {
+                let mut prepared = prepared;
+                if let Some((index, observation)) = prepared.pop() {
+                    crate::proxy::WsFrameDeliveryBatch::One(index, observation)
+                } else {
+                    crate::proxy::WsFrameDeliveryBatch::None
+                }
+            }
+            _ => crate::proxy::WsFrameDeliveryBatch::Many(prepared),
+        };
+        crate::proxy::emit_ws_frame_deliveries(
+            plugins,
+            proxy_id,
+            connection_id,
+            direction,
+            prepared,
+        )
+    }
+
+    /// Apply the shared Ping/Pong control-frame guard used after frame plugins.
+    pub fn guard_ws_control_transform_for_test(
+        original: &Message,
+        transformed: Message,
+        direction: crate::plugins::WebSocketFrameDirection,
+    ) -> Message {
+        crate::proxy::guard_ws_control_transform(original, transformed, direction)
+    }
+
+    /// Simulate the shared relay's post-plugin success boundary: run plugins,
+    /// apply the control guard, prepare delivery observations from the final
+    /// message, then emit them (as if the destination sink accepted the write).
+    pub async fn apply_ws_frame_plugins_and_emit_delivery_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        raw: Message,
+    ) -> Message {
+        let outgoing =
+            crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw)
+                .await;
+        if matches!(&outgoing, Message::Close(_)) {
+            // Policy Close is already recorded by observational `on_ws_frame`
+            // hooks inside the applicator; the production relay does not also
+            // emit a delivered observation for that rejection path.
+            return outgoing;
+        }
+        let prepared = crate::proxy::prepare_ws_frame_deliveries(plugins, &outgoing);
+        crate::proxy::emit_ws_frame_deliveries(
+            plugins,
+            proxy_id,
+            connection_id,
+            direction,
+            prepared,
+        );
+        outgoing
+    }
+
     /// Report the production parser-policy and post-reassembly hook lists.
     pub fn websocket_relay_plugin_names_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
@@ -1184,6 +1266,10 @@ pub mod _test_support {
 
     pub fn response_cache_hit_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.response_cache_hit()
+    }
+
+    pub fn finalized_response_replay_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.finalized_response_replay
     }
 
     pub fn response_caching_current_total_size_for_test(
@@ -1605,6 +1691,7 @@ pub mod _test_support {
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
+    pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
 
     pub fn redis_config_url_with_ip(config: &RedisConfig, ip: std::net::IpAddr) -> String {
         config.url_with_resolved_ip(ip)
@@ -1631,6 +1718,19 @@ pub mod _test_support {
 
     pub fn redis_rate_limit_client_for_test(config: RedisConfig) -> RedisRateLimitClient {
         RedisRateLimitClient::new(config, None, false, None)
+    }
+
+    /// Deterministic Redis sliding-window index + elapsed fraction for tests.
+    pub fn redis_window_progress_at(
+        now: std::time::Duration,
+        window_seconds: u64,
+    ) -> RedisWindowProgress {
+        RedisRateLimitClient::window_progress_at(now, window_seconds)
+    }
+
+    /// Live-clock Redis sliding-window progress (single timestamp sample).
+    pub fn redis_window_progress(window_seconds: u64) -> RedisWindowProgress {
+        RedisRateLimitClient::window_progress(window_seconds)
     }
 
     // ── config/db_loader ─────────────────────────────────────────────────────
@@ -2606,6 +2706,37 @@ pub mod _test_support {
     ) -> Vec<u8> {
         crate::proxy::apply_request_body_plugins_with_context(
             plugins, None, None, headers, body_bytes,
+        )
+        .await
+    }
+
+    pub async fn apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: &mut Vec<u8>,
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+            plugins, ctx, headers, body, true, true,
+        )
+        .await
+    }
+
+    pub async fn apply_buffered_request_body_normalization_with_requirements_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: &mut Vec<u8>,
+        needs_body_text: bool,
+        needs_body_bytes: bool,
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+            plugins,
+            ctx,
+            headers,
+            body,
+            needs_body_text,
+            needs_body_bytes,
         )
         .await
     }

@@ -66,6 +66,11 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
+│ 3b. normalize body      │  Opt-in buffered request decompression before before_proxy
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
 │ 4. before_proxy         │  Route/header preparation before backend-path policy
 └────────────┬────────────┘
              │
@@ -379,6 +384,12 @@ policy is the exception: `ws_message_size_limiting` installs the strictest
 configured actual-frame and reassembled-message ceilings before either parser
 reads, so continuation payloads are checked individually before allocation.
 
+Peer-originated **Close** frames take a separate forward path: mutating
+admission hooks are skipped so a later plugin cannot replace the peer's
+code/reason, while observational delivery hooks (see below) still record the
+successfully forwarded Close. Plugin-generated rejection Closes are visible to
+observational `on_ws_frame` hooks inside the applicator as the final decision.
+
 ```
 WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy → ...)
     │
@@ -389,13 +400,32 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 │  ┌───────────────────────────────┐  │
 │  │ on_ws_frame (ClientToBackend) │──┼── For each Text/Binary/Ping/Pong from client
 │  └───────────────────────────────┘  │
+│  ┌───────────────────────────────┐  │
+│  │ control-frame guard           │──┼── Restore illegal Ping↔Pong flips
+│  └───────────────────────────────┘  │
+│  ┌───────────────────────────────┐  │
+│  │ destination send              │──┼── Success-only frame/byte counters
+│  └───────────────────────────────┘  │
+│  ┌───────────────────────────────┐  │
+│  │ emit_ws_frame_delivery        │──┼── Observational logs (final message)
+│  └───────────────────────────────┘  │
 │                                     │
 │  ┌───────────────────────────────┐  │
 │  │ on_ws_frame (BackendToClient) │──┼── For each Text/Binary/Ping/Pong from backend
 │  └───────────────────────────────┘  │
+│  … same guard → send → delivery …   │
 │                                     │
+│  Peer Close → forward → delivery    │── No mutating hooks; log after accept
 └─────────────────────────────────────┘
 ```
+
+Delivery-accurate observers prepare metadata before `send()` (so large payloads
+are not cloned solely for logging) and emit only after the sink accepts the
+write — the same success boundary as `frames_*` / `bytes_*`. Cancelled or failed
+writes discard the prepared observation. `ws_frame_logging` uses this path for
+ordinary frames and peer Close (`outcome=delivered`) and records plugin
+rejection Closes separately (`outcome=policy_close`) when it observes the final
+decision in the mutating chain.
 
 ### Connection Tracking
 
@@ -427,7 +457,7 @@ Plugins execute in priority order (lower number runs first):
 |---|--------|----------|----------|
 | 1 | `ws_message_size_limiting` | 2810 | Pre-read actual-frame and bounded-reassembly policy; closes both peers with 1009 |
 | 2 | `ws_rate_limiting` | 2910 | Per-connection token-bucket frame rate limiting |
-| 3 | `ws_frame_logging` | 9050 | Logs frame metadata (direction, opcode, payload size) |
+| 3 | `ws_frame_logging` | 9050 | Logs final delivered frame metadata (and policy Close decisions); never mutates |
 
 ### Zero-Overhead Opt-In
 
@@ -579,7 +609,7 @@ Given all built-in plugins enabled, the execution order is:
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 57 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
 | 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 59 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 59 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 61 | `ai_federation` | 4060 | final request body (HTTP only) |
 | 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body |
@@ -624,6 +654,7 @@ Given all built-in plugins enabled, the execution order is:
 
 That ordering has a few practical effects:
 - Cache entries include the final client-visible body and headers, not the raw backend response.
+- A later `HIT`/`REVALIDATED` synthetic replay marks a private finalized-response capability so ordinary presentation transforms (including `response_transformer` body and header sequences) are not applied a second time, while inspectors, final-body validators, and reject-path observability hooks still run over the replayed bytes.
 - Backend `Vary` headers are respected when building the cache key, so variants such as `Accept-Encoding: gzip` stay isolated from uncompressed responses.
 - Fresh cached validators (`ETag`, `Last-Modified`) can satisfy conditional requests at the edge with a `304 Not Modified` response.
 - The `compression` plugin (4050) generates gzip/brotli responses at the gateway during the response-body transform phase. `response_caching` stores the final encoded representation in `on_final_response_body` (which runs after all response-body transforms), so cache entries contain the gateway-compressed bytes and `Content-Encoding` header — not the uncompressed backend response. A cache `HIT` replays those stored bytes and headers directly from `response_caching::before_proxy` (3500), short-circuiting before `compression::before_proxy` (4050) runs, so no second compression pass occurs and compression-setting changes do not rewrite existing entries. `max_entry_size_bytes` compares the encoded body length; `max_total_size_bytes` and per-entry accounting use the stored entry's approximate footprint, including that body and its headers. The `body_validator` plugin separately decompresses gzip-compressed gRPC frames for protobuf validation — this is internal to the validation path and does not affect the forwarded body.
@@ -733,7 +764,7 @@ Request transformers run after authentication and authorization, so they only mo
 
 ### Compression runs after response transformation (4050)
 
-The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
+The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. Configured request decompression (`decompress_request`) additionally runs in the shared pre-`before_proxy` body-normalization phase on H1/H2 and native H3 so earlier `before_proxy` body consumers (including `soap_ws_security` at priority 1500) observe the same size-bounded plaintext that is forwarded upstream. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
 
 ### Logging runs last (9000+)
 

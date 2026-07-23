@@ -424,3 +424,518 @@ fn plugin_consumers_parse_connect_timeout_above_one_second() {
         );
     }
 }
+
+// ── redis_pool_size cardinality / selection (issue #2304) ─────────────────
+//
+// Before the fix, `redis_pool_size` was parsed and validated but every instance
+// cached exactly one ConnectionManager. These tests prove configured pool size
+// controls runtime cardinality and round-robin selection — not merely parsing.
+
+#[test]
+fn pool_size_controls_client_cardinality_for_named_consumers() {
+    // rate_limiting / graphql / grpc_method_router all construct RedisRateLimitClient
+    // through RedisConfig / RateLimitBackend::from_plugin_config.
+    for (prefix, pool_size) in [
+        ("ferrum:rate_limiting", 1_usize),
+        ("ferrum:graphql", 3_usize),
+        ("ferrum:grpc_method_router", 8_usize),
+    ] {
+        let config = RedisConfig::from_plugin_config(
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "redis_pool_size": pool_size,
+            }),
+            prefix,
+        )
+        .expect("parse")
+        .expect("redis mode");
+        assert_eq!(config.pool_size, pool_size);
+        assert_eq!(config.key_prefix, prefix);
+        let client = redis_rate_limit_client_for_test(config);
+        assert_eq!(
+            client.pool_size_for_test(),
+            pool_size,
+            "client pool must match redis_pool_size for {prefix}"
+        );
+        assert_eq!(
+            client.cached_pool_cardinality_for_test(),
+            0,
+            "pool slots must be empty before lazy establishment"
+        );
+    }
+}
+
+#[test]
+fn pool_slot_selection_is_deterministic_round_robin() {
+    let mut config = make_config("redis://127.0.0.1:6379/0", false);
+    config.pool_size = 4;
+    let client = redis_rate_limit_client_for_test(config);
+    assert_eq!(
+        client.select_slot_indexes_for_test(10),
+        vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1]
+    );
+
+    let mut config = make_config("redis://127.0.0.1:6379/0", false);
+    config.pool_size = 1;
+    let single = redis_rate_limit_client_for_test(config);
+    assert_eq!(single.select_slot_indexes_for_test(5), vec![0, 0, 0, 0, 0]);
+}
+
+#[tokio::test]
+async fn pool_size_one_establishes_single_tcp_connection() {
+    let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.pool_size = 1;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert_eq!(client.warm_pool_for_test().await, 1);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 1);
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        1,
+        "pool_size=1 must open exactly one multiplexed TCP connection"
+    );
+
+    // Re-warming must reuse the cached manager, not dial again.
+    assert_eq!(client.warm_pool_for_test().await, 1);
+    assert_eq!(accepts.load(Ordering::Relaxed), 1);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn pool_size_four_establishes_four_tcp_connections() {
+    let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.pool_size = 4;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert_eq!(client.warm_pool_for_test().await, 4);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 4);
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        4,
+        "pool_size=4 must open four multiplexed TCP connections"
+    );
+
+    // Second warm must reuse all slots.
+    assert_eq!(client.warm_pool_for_test().await, 4);
+    assert_eq!(accepts.load(Ordering::Relaxed), 4);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 4);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn pool_clear_on_reconnect_drops_all_slots_then_reestablishes() {
+    let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.pool_size = 3;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert_eq!(client.warm_pool_for_test().await, 3);
+    assert_eq!(accepts.load(Ordering::Relaxed), 3);
+
+    // Reconnect clearing must wipe every slot (partial-failure / mark_unavailable path).
+    client.clear_pool_for_test();
+    assert_eq!(client.cached_pool_cardinality_for_test(), 0);
+
+    assert_eq!(client.warm_pool_for_test().await, 3);
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        6,
+        "after clear, all three slots must dial again"
+    );
+    assert_eq!(client.cached_pool_cardinality_for_test(), 3);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn named_consumer_pool_sizes_produce_matching_tcp_cardinality() {
+    // End-to-end for the three issue-named consumers: parse their config shape,
+    // construct the shared client, and prove TCP accepts == redis_pool_size.
+    for (prefix, pool_size) in [
+        ("ferrum:rate_limiting", 2_usize),
+        ("ferrum:graphql", 5_usize),
+        ("ferrum:grpc_method_router", 3_usize),
+    ] {
+        let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+        let config = RedisConfig::from_plugin_config(
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": format!("redis://127.0.0.1:{port}/0"),
+                "redis_pool_size": pool_size,
+                "redis_health_check_interval_seconds": 60,
+            }),
+            prefix,
+        )
+        .expect("parse")
+        .expect("redis mode");
+        let client = redis_rate_limit_client_for_test(config);
+        assert_eq!(client.pool_size_for_test(), pool_size);
+        assert_eq!(client.warm_pool_for_test().await, pool_size);
+        assert_eq!(
+            accepts.load(Ordering::Relaxed),
+            pool_size,
+            "{prefix}: TCP accepts must equal redis_pool_size={pool_size}"
+        );
+        assert_eq!(client.cached_pool_cardinality_for_test(), pool_size);
+        let _ = shutdown.send(());
+    }
+}
+
+#[test]
+fn rate_limit_backend_from_plugin_config_honors_pool_size_for_named_consumers() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, RateLimitBackend,
+    };
+
+    let http = PluginHttpClient::default();
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+
+    for (plugin_name, pool_size) in [
+        ("rate_limiting", 1_usize),
+        ("graphql", 4_usize),
+        ("grpc_method_router", 7_usize),
+    ] {
+        let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+            RateLimitBackend::from_plugin_config(
+                plugin_name,
+                &json!({
+                    "sync_mode": "redis",
+                    "redis_url": "redis://127.0.0.1:6379/0",
+                    "redis_pool_size": pool_size,
+                    "redis_health_check_interval_seconds": 60,
+                }),
+                &http,
+                algorithm,
+            )
+            .expect("failover backend");
+        assert!(matches!(backend, RateLimitBackend::Failover(_)));
+        assert_eq!(
+            backend.redis_pool_size_for_test(),
+            Some(pool_size),
+            "{plugin_name}: RateLimitBackend must retain redis_pool_size"
+        );
+    }
+
+    let local: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({"sync_mode": "local"}),
+            &http,
+            algorithm,
+        )
+        .expect("local backend");
+    assert_eq!(local.redis_pool_size_for_test(), None);
+}
+
+// ── Sliding-window subsecond precision (issue #2303) ──────────────────────
+//
+// Before the fix, `elapsed_fraction` used whole epoch seconds, so a one-second
+// window always reported fraction 0.0 and never decayed the previous bucket.
+// Index and fraction also used separate clock reads that could straddle a
+// boundary. Coverage below is pure/deterministic via `window_progress_at`.
+
+#[test]
+fn window_progress_one_second_start_midpoint_and_end() {
+    use ferrum_edge::_test_support::redis_window_progress_at;
+
+    let start = redis_window_progress_at(Duration::from_secs(100), 1);
+    assert_eq!(start.index, 100);
+    assert_eq!(start.elapsed_fraction, 0.0);
+
+    let mid = redis_window_progress_at(Duration::from_millis(100_500), 1);
+    assert_eq!(mid.index, 100);
+    assert!((mid.elapsed_fraction - 0.5).abs() < 1e-12);
+
+    let near_end = redis_window_progress_at(Duration::from_nanos(100_999_999_999), 1);
+    assert_eq!(near_end.index, 100);
+    assert!(near_end.elapsed_fraction > 0.999);
+    assert!(near_end.elapsed_fraction < 1.0);
+
+    let boundary = redis_window_progress_at(Duration::from_secs(101), 1);
+    assert_eq!(boundary.index, 101);
+    assert_eq!(boundary.elapsed_fraction, 0.0);
+}
+
+#[test]
+fn window_progress_multi_second_start_midpoint_and_end() {
+    use ferrum_edge::_test_support::redis_window_progress_at;
+
+    let start = redis_window_progress_at(Duration::from_secs(10), 5);
+    assert_eq!(start.index, 2);
+    assert_eq!(start.elapsed_fraction, 0.0);
+
+    let mid = redis_window_progress_at(Duration::from_millis(12_500), 5);
+    assert_eq!(mid.index, 2);
+    assert!((mid.elapsed_fraction - 0.5).abs() < 1e-12);
+
+    let near_end = redis_window_progress_at(Duration::from_nanos(14_999_999_999), 5);
+    assert_eq!(near_end.index, 2);
+    assert!(near_end.elapsed_fraction > 0.999);
+    assert!(near_end.elapsed_fraction < 1.0);
+
+    let boundary = redis_window_progress_at(Duration::from_secs(15), 5);
+    assert_eq!(boundary.index, 3);
+    assert_eq!(boundary.elapsed_fraction, 0.0);
+}
+
+#[test]
+fn window_progress_rejects_former_boundary_straddle_mismatch() {
+    use ferrum_edge::_test_support::redis_window_progress_at;
+
+    // Instant just before a 5s boundary vs the next instant: each sample must
+    // stay internally consistent. The old bug could pair index from t0 with
+    // fraction from t1 (index=2 with fraction=0.0) and under-decay the prior
+    // bucket.
+    let before = redis_window_progress_at(Duration::from_millis(14_999), 5);
+    let after = redis_window_progress_at(Duration::from_secs(15), 5);
+    assert_eq!(before.index, 2);
+    assert!(before.elapsed_fraction > 0.99);
+    assert_eq!(after.index, 3);
+    assert_eq!(after.elapsed_fraction, 0.0);
+
+    // A single captured sample never yields the mismatched (index=2, frac=0.0)
+    // pairing that separate clock reads produced across this boundary.
+    assert!(
+        !(before.index == 2 && before.elapsed_fraction == 0.0),
+        "pre-boundary sample must not report a zero fraction with the prior index"
+    );
+}
+
+#[test]
+fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
+    use ferrum_edge::_test_support::redis_window_progress_at;
+    use ferrum_edge::plugins::utils::rate_limit::FixedWindow;
+
+    // Redis path: prev bucket full (10), current has the candidate request (1).
+    // At fraction 0.0 the old code always denied; with subsecond decay the mid-
+    // window candidate is admitted.
+    let window = FixedWindow::new(10, 1);
+    let start = redis_window_progress_at(Duration::from_secs(50), 1);
+    let mid = redis_window_progress_at(Duration::from_millis(50_500), 1);
+    let near_end = redis_window_progress_at(Duration::from_nanos(50_900_000_000), 1);
+
+    assert!(
+        !window.outcome(10, 1, start.elapsed_fraction).allowed,
+        "at window start a full prior bucket still suppresses (weighted=11)"
+    );
+    assert!(
+        window.outcome(10, 1, mid.elapsed_fraction).allowed,
+        "mid one-second window must decay prior bucket (weighted=6)"
+    );
+    assert!(
+        window.outcome(10, 1, near_end.elapsed_fraction).allowed,
+        "near end of one-second window prior bucket is nearly gone"
+    );
+    assert!(
+        (window.weighted_count(10, 0, mid.elapsed_fraction) - 5.0).abs() < 1e-12,
+        "half-elapsed prior bucket of 10 contributes exactly 5"
+    );
+}
+
+#[test]
+fn shared_consumers_use_same_window_progress_helper() {
+    // rate_limiting, GraphQL type/named-operation limits, and grpc_method_router
+    // per-method limits all reach check_http_windows_redis → window_progress.
+    // Prove the shared helper (not a per-plugin copy) is what the test support
+    // and live clock path expose.
+    use ferrum_edge::_test_support::{redis_window_progress, redis_window_progress_at};
+    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
+
+    let at = redis_window_progress_at(Duration::from_millis(1_250), 1);
+    let direct = RedisRateLimitClient::window_progress_at(Duration::from_millis(1_250), 1);
+    assert_eq!(at, direct);
+    assert!((at.elapsed_fraction - 0.25).abs() < 1e-12);
+
+    let live = redis_window_progress(1);
+    assert!(live.elapsed_fraction >= 0.0 && live.elapsed_fraction < 1.0);
+}
+
+// ── Redis health-task lifecycle (issue #2305) ─────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn redis_health_checker_stops_after_client_drop() {
+    let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.health_check_interval_seconds = 1;
+    config.connect_timeout_seconds = 1;
+
+    let client = redis_rate_limit_client_for_test(config);
+    client.mark_unavailable_for_test();
+    assert!(client.health_checker_started_for_test());
+    let abort = client
+        .health_checker_abort_for_test()
+        .expect("health checker abort handle");
+
+    // The checker is spawned asynchronously, so its first sleep may arm after
+    // an initial clock advance. Advance whole virtual intervals (not arbitrary
+    // wall-clock sleeps) until the mock server observes the real dial.
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            if accepts.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if accepts.load(Ordering::Relaxed) >= 1 {
+            break;
+        }
+    }
+    let after_first = accepts.load(Ordering::Relaxed);
+    assert!(
+        after_first >= 1,
+        "health checker must dial at least once after the first interval"
+    );
+
+    drop(client);
+    for _ in 0..10 {
+        if abort.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(abort.is_finished(), "drop must abort the health checker");
+
+    let baseline_accepts = accepts.load(Ordering::Relaxed);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        baseline_accepts,
+        "retired client must not keep dialing Redis after drop"
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test(start_paused = true)]
+async fn failover_observer_drop_releases_client_and_stops_task() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, RateLimitBackend,
+    };
+    use std::sync::Arc;
+
+    let http = PluginHttpClient::default();
+    let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:9/0",
+                "redis_health_check_interval_seconds": 1,
+            }),
+            &http,
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("failover backend");
+
+    let client = backend
+        .redis_client_arc_for_test()
+        .expect("redis client arc");
+    let weak = Arc::downgrade(&client);
+    let observer = backend
+        .health_observer_abort_for_test()
+        .expect("observer abort");
+    // Backend + local clone: observer must NOT hold an extra strong Arc.
+    assert_eq!(Arc::strong_count(&client), 2);
+    drop(client);
+
+    drop(backend);
+    for _ in 0..20 {
+        if observer.is_finished() && weak.strong_count() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    assert!(
+        observer.is_finished(),
+        "drop must abort the failover observer"
+    );
+    assert_eq!(
+        weak.strong_count(),
+        0,
+        "dropping the limiter must release Redis client ownership"
+    );
+    assert!(
+        weak.upgrade().is_none(),
+        "retired Redis client must be fully released"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_failover_replacement_leaves_only_active_observer() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, RateLimitBackend,
+    };
+
+    let http = PluginHttpClient::default();
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let mut retired_observers = Vec::new();
+    let mut active: Option<RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>> = None;
+
+    for generation in 0..5 {
+        let next: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+            RateLimitBackend::from_plugin_config(
+                // Shared path used by rate_limiting / graphql / grpc_method_router.
+                match generation % 3 {
+                    0 => "rate_limiting",
+                    1 => "graphql",
+                    _ => "grpc_method_router",
+                },
+                &json!({
+                    "sync_mode": "redis",
+                    "redis_url": format!("redis://127.0.0.1:{}/0", 9000 + generation),
+                    "redis_key_prefix": format!("gen:{generation}"),
+                    "redis_health_check_interval_seconds": 1,
+                }),
+                &http,
+                algorithm,
+            )
+            .expect("failover backend");
+        let next_abort = next
+            .health_observer_abort_for_test()
+            .expect("active observer");
+        if let Some(prev) = active.replace(next) {
+            let prev_abort = prev
+                .health_observer_abort_for_test()
+                .expect("retired observer");
+            drop(prev);
+            retired_observers.push(prev_abort);
+        }
+        assert!(!next_abort.is_finished());
+    }
+
+    for _ in 0..30 {
+        if retired_observers.iter().all(|a| a.is_finished()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    assert!(
+        retired_observers.iter().all(|a| a.is_finished()),
+        "every retired generation observer must stop"
+    );
+    let active_abort = active
+        .as_ref()
+        .and_then(|b| b.health_observer_abort_for_test())
+        .expect("active generation");
+    assert!(
+        !active_abort.is_finished(),
+        "only the active generation observer may remain"
+    );
+}

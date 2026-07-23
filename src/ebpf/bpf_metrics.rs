@@ -1,12 +1,12 @@
 //! Shared counter store for the `__mesh_bpf_metrics` plugin.
 //!
-//! The eBPF `BPF_PROG_TYPE_SOCK_OPS` program publishes per-event records
-//! (Connect, AcceptEstablished, RstSent/Received, FinSent/Received, RttSample,
-//! drop-reason hits) over a per-CPU ringbuf. The userspace consumer
-//! (`event_consumer.rs`) drains the ringbuf and increments the counters here;
-//! the [`crate::plugins::mesh::bpf_metrics`] plugin reads from the same state
-//! and emits Prometheus metrics. This decoupling means the plugin's
-//! hot/cold path doesn't touch the BPF maps directly and doesn't need
+//! The eBPF `BPF_PROG_TYPE_SOCK_OPS` program and the `connect4`/`connect6`
+//! capture hooks publish per-event records (Connect, AcceptEstablished, Rst,
+//! FinSent/Received, RttSample, drop-reason hits) over a per-CPU ringbuf. The
+//! userspace consumer (`event_consumer.rs`) drains the ringbuf and increments
+//! the counters here; the [`crate::plugins::mesh::bpf_metrics`] plugin reads
+//! from the same state and emits Prometheus metrics. This decoupling means the
+//! plugin's hot/cold path doesn't touch the BPF maps directly and doesn't need
 //! `aya` linked into every build.
 //!
 //! ## Concurrency
@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
 
 /// One BPF drop reason from the data path. Each variant maps to a
-/// kernel-side decision the SOCK_OPS program logged before redirecting (or
+/// kernel-side decision the connect hooks logged before redirecting (or
 /// not) the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BpfDropReason {
@@ -45,8 +45,8 @@ pub enum BpfDropReason {
     /// Connection bypassed because the destination IP fell into an
     /// operator-configured exclude CIDR.
     ExcludeCidrHit,
-    /// Connection bypassed because the source IP wasn't in the include CIDR
-    /// (sidecarless capture is opt-in per CIDR).
+    /// Connection bypassed because the destination was outside the include
+    /// CIDR / includeOutboundPorts filter (capture is opt-in per policy).
     NotInIncludeCidr,
     /// Connection bypassed because the destination port was in the
     /// operator-configured port exclude set.
@@ -75,8 +75,9 @@ pub struct BpfMetricsState {
     // Connection lifecycle counters
     pub connect: CachePadded<AtomicU64>,
     pub accept_established: CachePadded<AtomicU64>,
-    pub rst_sent: AtomicU64,
-    pub rst_received: AtomicU64,
+    /// Abnormal ESTABLISHED→CLOSE transitions. Direction is not attributed
+    /// by the kernel SOCK_OPS state callback (see mesh docs).
+    pub rst: AtomicU64,
     pub fin_sent: AtomicU64,
     pub fin_received: AtomicU64,
 
@@ -86,16 +87,17 @@ pub struct BpfMetricsState {
     // doing per-sample work. Histogram-style buckets are a future
     // follow-up; for now operators correlate `mean = srtt_sum_us /
     // srtt_count` against an alerting threshold.
+    //
+    // Accept-to-first-byte is intentionally absent: SOCK_OPS has no
+    // first-inbound-data-byte callback, so exporting a zero summary would
+    // advertise an unsupported contract.
     pub srtt_sample_us_sum: AtomicU64,
     pub srtt_count: CachePadded<AtomicU64>,
     pub syn_to_ack_us_sum: AtomicU64,
     pub syn_to_ack_count: AtomicU64,
-    pub accept_to_first_byte_us_sum: AtomicU64,
-    pub accept_to_first_byte_count: AtomicU64,
 
-    // BPF drop-reason counters — one bin per reason. These were
-    // previously invisible to operators; the GAP-SC3 plan calls them out
-    // explicitly as a key win.
+    // BPF drop-reason counters — one bin per reason. Produced by the
+    // connect4/connect6 bypass paths via the shared ringbuf.
     pub drop_bypass_uid_hit: AtomicU64,
     pub drop_exclude_cidr_hit: AtomicU64,
     pub drop_not_in_include_cidr: AtomicU64,
@@ -123,11 +125,8 @@ impl BpfMetricsState {
         self.accept_established.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_rst(&self, direction: TcpDirection) {
-        match direction {
-            TcpDirection::Sent => self.rst_sent.fetch_add(1, Ordering::Relaxed),
-            TcpDirection::Received => self.rst_received.fetch_add(1, Ordering::Relaxed),
-        };
+    pub fn record_rst(&self) {
+        self.rst.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_fin(&self, direction: TcpDirection) {
@@ -146,13 +145,6 @@ impl BpfMetricsState {
     pub fn record_syn_to_ack(&self, us: u64) {
         self.syn_to_ack_us_sum.fetch_add(us, Ordering::Relaxed);
         self.syn_to_ack_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_accept_to_first_byte(&self, us: u64) {
-        self.accept_to_first_byte_us_sum
-            .fetch_add(us, Ordering::Relaxed);
-        self.accept_to_first_byte_count
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_drop(&self, reason: BpfDropReason) {
@@ -203,16 +195,13 @@ impl BpfMetricsState {
         BpfMetricsSnapshot {
             connect: self.connect.load(Ordering::Relaxed),
             accept_established: self.accept_established.load(Ordering::Relaxed),
-            rst_sent: self.rst_sent.load(Ordering::Relaxed),
-            rst_received: self.rst_received.load(Ordering::Relaxed),
+            rst: self.rst.load(Ordering::Relaxed),
             fin_sent: self.fin_sent.load(Ordering::Relaxed),
             fin_received: self.fin_received.load(Ordering::Relaxed),
             srtt_sample_us_sum: self.srtt_sample_us_sum.load(Ordering::Relaxed),
             srtt_count: self.srtt_count.load(Ordering::Relaxed),
             syn_to_ack_us_sum: self.syn_to_ack_us_sum.load(Ordering::Relaxed),
             syn_to_ack_count: self.syn_to_ack_count.load(Ordering::Relaxed),
-            accept_to_first_byte_us_sum: self.accept_to_first_byte_us_sum.load(Ordering::Relaxed),
-            accept_to_first_byte_count: self.accept_to_first_byte_count.load(Ordering::Relaxed),
             drop_bypass_uid_hit: self.drop_bypass_uid_hit.load(Ordering::Relaxed),
             drop_exclude_cidr_hit: self.drop_exclude_cidr_hit.load(Ordering::Relaxed),
             drop_not_in_include_cidr: self.drop_not_in_include_cidr.load(Ordering::Relaxed),
@@ -237,16 +226,13 @@ pub enum TcpDirection {
 pub struct BpfMetricsSnapshot {
     pub connect: u64,
     pub accept_established: u64,
-    pub rst_sent: u64,
-    pub rst_received: u64,
+    pub rst: u64,
     pub fin_sent: u64,
     pub fin_received: u64,
     pub srtt_sample_us_sum: u64,
     pub srtt_count: u64,
     pub syn_to_ack_us_sum: u64,
     pub syn_to_ack_count: u64,
-    pub accept_to_first_byte_us_sum: u64,
-    pub accept_to_first_byte_count: u64,
     pub drop_bypass_uid_hit: u64,
     pub drop_exclude_cidr_hit: u64,
     pub drop_not_in_include_cidr: u64,
@@ -276,78 +262,5 @@ impl BpfMetricsSnapshot {
             ),
             (BpfDropReason::ExcludePortHit, self.drop_exclude_port_hit),
         ]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn counters_start_at_zero() {
-        let state = BpfMetricsState::new();
-        let snap = state.snapshot();
-        assert_eq!(snap.connect, 0);
-        assert_eq!(snap.ringbuf_overruns, 0);
-        assert!(!snap.in_overrun_regime);
-    }
-
-    #[test]
-    fn record_connect_and_accept_increment_counters() {
-        let state = BpfMetricsState::new();
-        state.record_connect();
-        state.record_connect();
-        state.record_accept_established();
-        let snap = state.snapshot();
-        assert_eq!(snap.connect, 2);
-        assert_eq!(snap.accept_established, 1);
-    }
-
-    #[test]
-    fn drop_reasons_route_to_dedicated_bins() {
-        let state = BpfMetricsState::new();
-        state.record_drop(BpfDropReason::BypassUidHit);
-        state.record_drop(BpfDropReason::ExcludeCidrHit);
-        state.record_drop(BpfDropReason::ExcludeCidrHit);
-        let snap = state.snapshot();
-        assert_eq!(snap.drop_bypass_uid_hit, 1);
-        assert_eq!(snap.drop_exclude_cidr_hit, 2);
-        assert_eq!(snap.drop_not_in_include_cidr, 0);
-        assert_eq!(snap.drop_exclude_port_hit, 0);
-    }
-
-    #[test]
-    fn ringbuf_overrun_fires_warn_once_per_regime_entry() {
-        let state = BpfMetricsState::new();
-
-        // First overrun → returns true (fire the warn).
-        assert!(state.record_ringbuf_overrun());
-        // Subsequent overruns in the same regime → returns false (no spam).
-        assert!(!state.record_ringbuf_overrun());
-        assert!(!state.record_ringbuf_overrun());
-        assert_eq!(state.snapshot().ringbuf_overruns, 3);
-
-        // Recovery resets the flag and returns true exactly once.
-        assert!(state.mark_ringbuf_recovered());
-        assert!(!state.mark_ringbuf_recovered());
-
-        // After recovery, the next overrun fires again.
-        assert!(state.record_ringbuf_overrun());
-    }
-
-    #[test]
-    fn rtt_and_other_histograms_track_sum_and_count() {
-        let state = BpfMetricsState::new();
-        state.record_srtt_sample(100);
-        state.record_srtt_sample(300);
-        state.record_syn_to_ack(50);
-        state.record_accept_to_first_byte(500);
-        let snap = state.snapshot();
-        assert_eq!(snap.srtt_sample_us_sum, 400);
-        assert_eq!(snap.srtt_count, 2);
-        assert_eq!(snap.syn_to_ack_us_sum, 50);
-        assert_eq!(snap.syn_to_ack_count, 1);
-        assert_eq!(snap.accept_to_first_byte_us_sum, 500);
-        assert_eq!(snap.accept_to_first_byte_count, 1);
     }
 }

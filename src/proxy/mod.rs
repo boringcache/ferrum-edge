@@ -2717,6 +2717,84 @@ pub(crate) fn store_request_body_metadata(
     }
 }
 
+/// Refresh body-derived request views after an early normalization rewrite.
+///
+/// Digests are intentionally left untouched: authenticate may already have
+/// verified integrity over the original wire bytes. Size/text/bytes views must
+/// track the normalized plaintext so later `before_proxy` consumers (SOAP,
+/// mirrors, etc.) inspect the same bytes the backend will receive.
+pub(crate) fn refresh_request_body_views_after_normalization(
+    ctx: &mut RequestContext,
+    body: &[u8],
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+) {
+    ctx.metadata.insert(
+        "request_body_size_bytes".to_string(),
+        body.len().to_string(),
+    );
+    if needs_body_bytes || ctx.request_body_bytes.is_some() {
+        ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    }
+    if needs_body_text || ctx.metadata.contains_key("request_body") {
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            ctx.metadata
+                .insert("request_body".to_string(), body_str.to_string());
+        } else {
+            ctx.metadata.remove("request_body");
+        }
+    }
+}
+
+/// Run opt-in buffered-body normalizers after the pre-`before_proxy` buffer is
+/// stored and before any `before_proxy` hook.
+///
+/// Configured request decompression lives here so earlier body consumers see
+/// validated plaintext without each plugin reimplementing gzip/Brotli decode.
+pub(crate) async fn apply_buffered_request_body_normalization_before_before_proxy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: &mut Vec<u8>,
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+) -> PluginResult {
+    let was_decoded = ctx
+        .metadata
+        .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    for plugin in plugins {
+        if !plugin.normalizes_buffered_request_body_before_before_proxy() {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.normalize_buffered_request_body_before_before_proxy(ctx, headers, body),
+        )
+        .await
+        .into_plugin_result(ctx)
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
+        }
+    }
+    let body_was_rewritten = !was_decoded
+        && ctx
+            .metadata
+            .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    if body_was_rewritten {
+        refresh_request_body_views_after_normalization(
+            ctx,
+            body,
+            needs_body_text,
+            needs_body_bytes,
+        );
+    }
+    PluginResult::Continue
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RequestBodyPhaseRequirements {
     pub required: bool,
@@ -11641,11 +11719,82 @@ fn ws_message_payload_bytes(msg: &Message) -> u64 {
         Message::Text(t) => t.len() as u64,
         Message::Binary(b) => b.len() as u64,
         Message::Ping(b) | Message::Pong(b) => b.len() as u64,
-        Message::Close(opt) => opt
-            .as_ref()
-            .map(|frame| frame.reason.len() as u64)
-            .unwrap_or(0),
+        // Close with a status code: 2 status bytes + UTF-8 reason length.
+        // Matches `ws_frame_logging` `size_bytes` so success-only byte totals
+        // reconcile with delivered Close frame events. Raw reason text is never
+        // retained here.
+        Message::Close(Some(frame)) => 2u64.saturating_add(frame.reason.len() as u64),
+        Message::Close(None) => 0,
         Message::Frame(_) => 0,
+    }
+}
+
+/// Prepare deferred delivery observations from the final post-plugin message
+/// before `send()` moves it. Empty when no plugin wants a delivery record.
+pub(crate) enum WsFrameDeliveryBatch {
+    None,
+    One(usize, crate::plugins::WsFrameDeliveryObservation),
+    Many(Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>),
+}
+
+impl WsFrameDeliveryBatch {
+    fn push(&mut self, index: usize, observation: crate::plugins::WsFrameDeliveryObservation) {
+        let previous = std::mem::replace(self, Self::None);
+        *self = match previous {
+            Self::None => Self::One(index, observation),
+            Self::One(first_index, first_observation) => {
+                Self::Many(vec![(first_index, first_observation), (index, observation)])
+            }
+            Self::Many(mut entries) => {
+                entries.push((index, observation));
+                Self::Many(entries)
+            }
+        };
+    }
+}
+
+pub(crate) fn prepare_ws_frame_deliveries(
+    plugins: &[Arc<dyn Plugin>],
+    message: &Message,
+) -> WsFrameDeliveryBatch {
+    if plugins.is_empty() {
+        return WsFrameDeliveryBatch::None;
+    }
+    // The normal deployment has one ws_frame_logging instance. Keep that path
+    // stack-only; allocate only when multiple delivery observers are configured.
+    let mut out = WsFrameDeliveryBatch::None;
+    for (index, plugin) in plugins.iter().enumerate() {
+        if let Some(observation) = plugin.prepare_ws_frame_delivery(message) {
+            out.push(index, observation);
+        }
+    }
+    out
+}
+
+/// Emit previously prepared delivery observations after the destination sink
+/// accepted the frame. Discarded observations (cancel / write failure) must
+/// never reach this helper — that keeps frame logs on the same success boundary
+/// as `frames_*` / `bytes_*` counters.
+pub(crate) fn emit_ws_frame_deliveries(
+    plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
+    prepared: WsFrameDeliveryBatch,
+) {
+    let emit = |index: usize, observation: crate::plugins::WsFrameDeliveryObservation| {
+        if let Some(plugin) = plugins.get(index) {
+            plugin.emit_ws_frame_delivery(proxy_id, connection_id, direction, observation);
+        }
+    };
+    match prepared {
+        WsFrameDeliveryBatch::None => {}
+        WsFrameDeliveryBatch::One(index, observation) => emit(index, observation),
+        WsFrameDeliveryBatch::Many(entries) => {
+            for (index, observation) in entries {
+                emit(index, observation);
+            }
+        }
     }
 }
 
@@ -11663,7 +11812,7 @@ fn ws_control_kind(message: &Message) -> Option<WsControlKind> {
     }
 }
 
-fn guard_ws_control_transform(
+pub(crate) fn guard_ws_control_transform(
     original: &Message,
     transformed: Message,
     direction: WebSocketFrameDirection,
@@ -11687,7 +11836,13 @@ fn guard_ws_control_transform(
 /// later mutating plugins are skipped so they cannot charge budget or replace
 /// the Close, while observational hooks
 /// ([`Plugin::observes_ws_frame_decisions`]) still receive the final decision.
+/// The control-frame guard runs after the chain so Ping/Pong type flips are
+/// restored before any post-send delivery observation sees the message.
 /// Both relay directions and all H1/H2/H3 frontends share this helper.
+///
+/// Delivery-accurate frame logging uses [`prepare_ws_frame_deliveries`] /
+/// [`emit_ws_frame_deliveries`] after a successful sink accept — not this
+/// mutating chain — so cancelled or failed writes never appear as delivered.
 pub(crate) async fn apply_ws_frame_plugins(
     plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
@@ -12286,11 +12441,14 @@ where
                             // check); the send future is polled first on wakeup so successful
                             // sends pay no extra latency. No heap allocation, no timer wheel.
                             //
-                            // Snapshot the payload byte count before `send(outgoing)` moves
-                            // the frame into the future so the success-arm accounting still
-                            // has a usable value. `ws_message_payload_bytes` reads
-                            // `Message::len()`, no allocation.
+                            // Snapshot payload bytes and prepare delivery observations
+                            // before `send(outgoing)` moves the frame. Prepared logs are
+                            // emitted only on the success arm so they share the
+                            // success-only boundary with frame/byte counters; cancel and
+                            // write failure discard them (no "attempted" frame event).
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&ctb_plugins, &outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_ctb.cancelled() => {
@@ -12316,11 +12474,27 @@ where
                                         outgoing_payload_bytes,
                                         Ordering::Relaxed,
                                     );
+                                    emit_ws_frame_deliveries(
+                                        &ctb_plugins,
+                                        &proxy_id_ctb,
+                                        connection_id,
+                                        WebSocketFrameDirection::ClientToBackend,
+                                        delivery,
+                                    );
                                 }
                             }
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Client sent close frame");
+                            // Peer Close bypasses mutating admission hooks so a later
+                            // plugin cannot replace the peer's code/reason. Observational
+                            // delivery logging still records the forwarded Close after a
+                            // successful sink accept (exactly once; not double-counted
+                            // with policy_close records from plugin rejection).
+                            let close_msg = Message::Close(close_frame);
+                            let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&ctb_plugins, &close_msg);
                             // Race cancel in case the opposite direction already exited while
                             // we were decoding this Close frame. The send future is polled
                             // first after the cancel check so the happy path does not block.
@@ -12329,9 +12503,30 @@ where
                                 _ = cancel_ctb.cancelled() => {
                                     debug!("Client->backend: cancel fired during client-close forward");
                                 }
-                                res = backend_sink.send(Message::Close(close_frame)) => {
-                                    if let Err(e) = res {
-                                        error!("Failed to send close to backend: {}", e);
+                                res = backend_sink.send(close_msg) => {
+                                    match res {
+                                        Err(e) => {
+                                            error!("Failed to send close to backend: {}", e);
+                                            let _ = first_failure_ctb.set((
+                                                crate::plugins::Direction::ClientToBackend,
+                                                retry::classify_boxed_error(&e),
+                                                Some(tcp_proxy::StreamIoSide::Write),
+                                            ));
+                                        }
+                                        Ok(()) => {
+                                            frames_c2b_task.fetch_add(1, Ordering::Relaxed);
+                                            bytes_c2b_task.fetch_add(
+                                                outgoing_payload_bytes,
+                                                Ordering::Relaxed,
+                                            );
+                                            emit_ws_frame_deliveries(
+                                                &ctb_plugins,
+                                                &proxy_id_ctb,
+                                                connection_id,
+                                                WebSocketFrameDirection::ClientToBackend,
+                                                delivery,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -12473,10 +12668,11 @@ where
                             // otherwise block indefinitely. One atomic load per frame; send
                             // polled first so successful frames pay no extra latency.
                             //
-                            // Snapshot the payload byte count before `send(outgoing)` moves
-                            // the frame into the future so the success-arm accounting still
-                            // has a usable value.
+                            // Snapshot payload bytes and prepare delivery observations
+                            // before `send(outgoing)` moves the frame (mirror of c2b).
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&btc_plugins, &outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
@@ -12502,20 +12698,54 @@ where
                                         outgoing_payload_bytes,
                                         Ordering::Relaxed,
                                     );
+                                    emit_ws_frame_deliveries(
+                                        &btc_plugins,
+                                        &proxy_id_btc,
+                                        connection_id,
+                                        WebSocketFrameDirection::BackendToClient,
+                                        delivery,
+                                    );
                                 }
                             }
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Backend sent close frame");
+                            // Peer Close bypasses mutating hooks; observational delivery
+                            // logging records the forwarded Close after sink accept.
+                            let close_msg = Message::Close(close_frame);
+                            let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&btc_plugins, &close_msg);
                             // Race cancel in case c2b has already exited.
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
                                     debug!("Backend->client: cancel fired during backend-close forward");
                                 }
-                                res = ws_sink.send(Message::Close(close_frame)) => {
-                                    if let Err(e) = res {
-                                        error!("Failed to send close to client: {}", e);
+                                res = ws_sink.send(close_msg) => {
+                                    match res {
+                                        Err(e) => {
+                                            error!("Failed to send close to client: {}", e);
+                                            let _ = first_failure_btc.set((
+                                                crate::plugins::Direction::BackendToClient,
+                                                retry::classify_boxed_error(&e),
+                                                Some(tcp_proxy::StreamIoSide::Write),
+                                            ));
+                                        }
+                                        Ok(()) => {
+                                            frames_b2c_task.fetch_add(1, Ordering::Relaxed);
+                                            bytes_b2c_task.fetch_add(
+                                                outgoing_payload_bytes,
+                                                Ordering::Relaxed,
+                                            );
+                                            emit_ws_frame_deliveries(
+                                                &btc_plugins,
+                                                &proxy_id_btc,
+                                                connection_id,
+                                                WebSocketFrameDirection::BackendToClient,
+                                                delivery,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -14967,9 +15197,9 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     ) {
         let mut mandatory_replay_transform_failed = None;
         for plugin in plugins.iter() {
-            let mandatory_replay_transform = ctx.deduplication_replay_response_finalized
+            let mandatory_replay_transform = ctx.finalized_response_replay
                 && plugin.requires_replay_response_body_transform(ctx);
-            if ctx.deduplication_replay_response_finalized && !mandatory_replay_transform {
+            if ctx.finalized_response_replay && !mandatory_replay_transform {
                 continue;
             }
             let deadline = ctx.grpc_deadline_at();
@@ -19373,6 +19603,74 @@ async fn handle_proxy_request_inner(
                 ClientRequestBody::Buffered(buffered)
             }
         };
+    }
+
+    // Opt-in buffered-body normalization (configured request decompression)
+    // runs after the pre-`before_proxy` buffer is stored and before any
+    // `before_proxy` hook, so earlier body consumers see validated plaintext.
+    if capabilities.has(PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
+        && let ClientRequestBody::Buffered(body) = &mut client_request_body
+    {
+        let phase_start = Instant::now();
+        let mut tmp_headers = std::mem::take(&mut ctx.headers);
+        let normalize_result = apply_buffered_request_body_normalization_before_before_proxy(
+            &plugins,
+            &mut ctx,
+            &mut tmp_headers,
+            body,
+            before_proxy_body_requirements.needs_text,
+            before_proxy_body_requirements.needs_bytes,
+        )
+        .await;
+        ctx.headers = tmp_headers;
+        match normalize_result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!("request-body normalization rejection could not be normalized");
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status_code = plugin_reject.status_code;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "normalize_buffered_request_body",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
@@ -36513,6 +36811,148 @@ mod tests {
         );
     }
 
+    /// body_validator must release large non-matching responses on the
+    /// reqwest (HTTP/1.1 / H2) path while keeping matching JSON buffered for
+    /// validation. Mirrors the WAF wiring guard for #2323.
+    #[tokio::test]
+    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response() {
+        async fn dispatch_body(
+            state: &ProxyState,
+            proxy: &Proxy,
+            plugins: &[Arc<dyn Plugin>],
+            backend_url: &str,
+        ) -> ResponseBody {
+            let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+            let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let dispatch = proxy_to_backend(
+                state,
+                proxy,
+                backend_url,
+                "GET",
+                &HashMap::new(),
+                ClientRequestBody::Buffered(Vec::new()),
+                None,
+                plugins,
+                &[],
+                PreacquiredBackendAdmission::default(),
+                None,
+                &ctx,
+                false, // stream_response: validator requested buffering pre-flight
+                false,
+                true,
+                false, // retain_request_body (non-retry -> downgrade active)
+                false,
+                "127.0.0.1",
+                "127.0.0.1",
+                false,
+                false,
+                false,
+                false,
+                &bytes_sent,
+                hyper::Version::HTTP_11,
+                &mut std::time::Instant::now(),
+            )
+            .await;
+            let resp = match dispatch {
+                BackendDispatchResult::Response { response, .. } => *response,
+                BackendDispatchResult::AdmissionRejected(_) => {
+                    panic!("test does not configure backend admission plugins")
+                }
+            };
+            resp.body
+        }
+
+        let server = wiremock::MockServer::start().await;
+        // Larger than the eager-buffer cutoff but below the global response
+        // ceiling, so the body type proves whether refinement selected stream.
+        let large_body = vec![0u8; 1_500_000];
+        wiremock::Mock::given(wiremock::matchers::path("/binary"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(large_body.clone()),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(br#"{"id":"ok"}"#.to_vec()),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/grpc"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/grpc")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .mount(&server)
+            .await;
+
+        let mut state = make_test_proxy_state(GatewayConfig::default());
+        state.max_response_body_size_bytes = 2_000_000;
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = server.address().ip().to_string();
+        proxy.backend_port = server.address().port();
+
+        let json_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            crate::plugins::body_validator::BodyValidator::new(&json!({
+                "response_required_fields": ["id"]
+            }))
+            .unwrap(),
+        )];
+
+        let binary = dispatch_body(
+            &state,
+            &proxy,
+            &json_plugins,
+            &format!("{}/binary", server.uri()),
+        )
+        .await;
+        assert!(
+            matches!(binary, ResponseBody::Streaming { .. }),
+            "non-matching image/png above the eager cutoff must stream"
+        );
+
+        let json_body = dispatch_body(
+            &state,
+            &proxy,
+            &json_plugins,
+            &format!("{}/json", server.uri()),
+        )
+        .await;
+        assert!(
+            matches!(json_body, ResponseBody::Buffered(_)),
+            "matching JSON must stay buffered for body_validator"
+        );
+
+        let descriptor = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/test_validator.bin");
+        if descriptor.is_file() {
+            let grpc_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+                crate::plugins::body_validator::BodyValidator::new(&json!({
+                    "protobuf_descriptor_path": descriptor.to_string_lossy(),
+                    "protobuf_response_type": "test.HelloResponse"
+                }))
+                .unwrap(),
+            )];
+            let grpc_body = dispatch_body(
+                &state,
+                &proxy,
+                &grpc_plugins,
+                &format!("{}/grpc", server.uri()),
+            )
+            .await;
+            assert!(
+                matches!(grpc_body, ResponseBody::Buffered(_)),
+                "configured gRPC protobuf responses must stay buffered"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
         let server = wiremock::MockServer::start().await;
@@ -38627,6 +39067,93 @@ mod tests {
             Some(&retry_ctx),
             200,
             &sse_headers,
+        ));
+    }
+
+    #[test]
+    fn refine_stream_response_releases_irrelevant_body_validator_media_types() {
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/download".into());
+        let proxy = test_proxy(ResponseBodyMode::Stream);
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            crate::plugins::body_validator::BodyValidator::new(&json!({
+                "response_required_fields": ["id"]
+            }))
+            .unwrap(),
+        )];
+
+        let png_headers = HashMap::from([("content-type".to_string(), "image/png".to_string())]);
+        let json_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        assert!(
+            refine_stream_response_for_content_type(
+                false,
+                &proxy,
+                &plugins,
+                Some(&ctx),
+                200,
+                &png_headers,
+            ),
+            "body_validator must release non-matching image/png"
+        );
+        assert!(
+            !refine_stream_response_for_content_type(
+                false,
+                &proxy,
+                &plugins,
+                Some(&ctx),
+                200,
+                &json_headers,
+            ),
+            "matching JSON must remain buffered"
+        );
+
+        // Under retries, irrelevant types still release once headers are known.
+        let retry_ctx = retry_response_decision_context(&ctx);
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            Some(&retry_ctx),
+            200,
+            &png_headers,
+        ));
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            Some(&retry_ctx),
+            200,
+            &json_headers,
+        ));
+
+        // A later Content-Type rewrite keeps the original buffered decision.
+        let rewrite_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                crate::plugins::body_validator::BodyValidator::new(&json!({
+                    "response_required_fields": ["id"]
+                }))
+                .unwrap(),
+            ),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "operation": "update",
+                        "target": "header",
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }]
+                }))
+                .expect("response transformer config should be valid"),
+            ),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &rewrite_plugins,
+            Some(&ctx),
+            200,
+            &png_headers,
         ));
     }
 

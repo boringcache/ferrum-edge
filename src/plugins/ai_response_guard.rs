@@ -1069,7 +1069,7 @@ impl AiResponseGuard {
                 }
                 ctx.metadata
                     .insert("ai_response_guard_redacted".to_string(), detected.join(","));
-                if ctx.deduplication_replay_response_finalized {
+                if ctx.finalized_response_replay {
                     ctx.ai_response_guard_replay_redactions
                         .insert(self.instance_id);
                 }

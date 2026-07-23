@@ -429,10 +429,13 @@ pub const SOCK_OPS_EVENT_RST: u32 = 3;
 pub const SOCK_OPS_EVENT_FIN: u32 = 4;
 pub const SOCK_OPS_EVENT_RTT_SAMPLE: u32 = 5;
 pub const SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY: u32 = 6;
+/// Reserved discriminant. SOCK_OPS has no first-inbound-data-byte callback, so
+/// no kernel producer emits this value; userspace ignores it if observed.
 pub const SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY: u32 = 7;
 pub const SOCK_OPS_EVENT_DROP_REASON: u32 = 8;
 
-// `SockOpsRecord::direction` values. Zero is "unused".
+// `SockOpsRecord::direction` values. Zero is "unused / unknown" (RST uses
+// unknown; FIN uses sent/received).
 pub const SOCK_OPS_DIRECTION_SENT: u32 = 1;
 pub const SOCK_OPS_DIRECTION_RECEIVED: u32 = 2;
 
@@ -725,6 +728,24 @@ mod tests {
     #[test]
     fn sock_ops_default_ringbuf_size_is_power_of_two() {
         assert!(SOCK_OPS_RINGBUF_DEFAULT_BYTES.is_power_of_two());
+    }
+
+    #[test]
+    fn sock_ops_event_discriminants_are_stable() {
+        // Wire ABI for the SOCK_OPS ringbuf. Discriminant 7 is reserved
+        // (accept-to-first-byte has no producer); 8 is drop-reason.
+        assert_eq!(SOCK_OPS_EVENT_CONNECT, 1);
+        assert_eq!(SOCK_OPS_EVENT_ACCEPT_ESTABLISHED, 2);
+        assert_eq!(SOCK_OPS_EVENT_RST, 3);
+        assert_eq!(SOCK_OPS_EVENT_FIN, 4);
+        assert_eq!(SOCK_OPS_EVENT_RTT_SAMPLE, 5);
+        assert_eq!(SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, 6);
+        assert_eq!(SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY, 7);
+        assert_eq!(SOCK_OPS_EVENT_DROP_REASON, 8);
+        assert_eq!(SOCK_OPS_DROP_BYPASS_UID_HIT, 1);
+        assert_eq!(SOCK_OPS_DROP_EXCLUDE_CIDR_HIT, 2);
+        assert_eq!(SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, 3);
+        assert_eq!(SOCK_OPS_DROP_EXCLUDE_PORT_HIT, 4);
     }
 
     #[test]
