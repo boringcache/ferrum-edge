@@ -1769,7 +1769,9 @@ fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_re
     assert!(outcomes.iter().any(|outcome| {
         outcome["http_status"] == expected_status
             && outcome["reason"] == expected_reason
-            && outcome["row_count"].as_u64().is_some_and(|count| count >= 1)
+            && outcome["row_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
     }));
     // Safe metadata only — no charge-record fields.
     let serialized = serde_json::to_string(&meta).unwrap();
@@ -1825,7 +1827,10 @@ async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
     let meta_path = dead_letter_meta_path(&source);
     let tmp_path = meta_path.with_file_name(format!(
         "{}.tmp",
-        meta_path.file_name().and_then(|name| name.to_str()).unwrap()
+        meta_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
     ));
     fs::create_dir(&tmp_path).unwrap();
 
@@ -1834,8 +1839,14 @@ async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
         .expect_err("dead-letter metadata failure must stop the replay tick");
 
     assert!(error.contains("failed to create spool temp file"));
-    assert!(source.exists(), "source must remain replayable on metadata failure");
-    assert!(!meta_path.exists(), "partial metadata must not be published");
+    assert!(
+        source.exists(),
+        "source must remain replayable on metadata failure"
+    );
+    assert!(
+        !meta_path.exists(),
+        "partial metadata must not be published"
+    );
 }
 
 #[tokio::test]
