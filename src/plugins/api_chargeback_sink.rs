@@ -589,7 +589,6 @@ pub struct ApiChargebackSink {
     pricing: PricingConfig,
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
-    namespace: String,
     /// Stable plugin-config resource id used for accepted-generation
     /// observability. Production cache supplies `PluginConfig.id`; standalone
     /// constructors fall back to [`DEFAULT_PLUGIN_CONFIG_ID`].
@@ -1010,7 +1009,7 @@ impl ApiChargebackSink {
     pub fn new_with_config_id(
         raw_config: &Value,
         http_client: PluginHttpClient,
-        namespace: &str,
+        _namespace: &str,
         plugin_config_id: Option<&str>,
     ) -> Result<Self, String> {
         if !raw_config.is_object() {
@@ -1060,7 +1059,6 @@ impl ApiChargebackSink {
             pricing,
             config: Arc::new(config),
             node_id: Arc::<str>::from(resolve_node_id()),
-            namespace: namespace.to_string(),
             plugin_config_id,
             http_client,
             runtime: OnceLock::new(),
