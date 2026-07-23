@@ -1238,7 +1238,6 @@ impl ApiChargebackSink {
                 Arc::clone(&runtime),
                 Arc::clone(&self.config),
                 Arc::clone(&self.node_id),
-                self.namespace.clone(),
                 runtime.logger.commit_sender().subscribe(),
                 shutdown_rx,
                 Arc::clone(&emission_lock),
@@ -1315,14 +1314,14 @@ impl ApiChargebackSink {
             ));
         }
 
-        if let Some(lifecycle) = snapshot_lifecycle {
-            if let Err(lifecycle) = self.snapshot_lifecycle.set(lifecycle) {
-                abort_tasks(&mut owned_tasks);
-                lifecycle.finalize_without_await();
-                return Err(format!(
-                    "{PLUGIN_NAME}: snapshot lifecycle already activated; refusing duplicate start"
-                ));
-            }
+        if let Some(lifecycle) = snapshot_lifecycle
+            && let Err(lifecycle) = self.snapshot_lifecycle.set(lifecycle)
+        {
+            abort_tasks(&mut owned_tasks);
+            lifecycle.finalize_without_await();
+            return Err(format!(
+                "{PLUGIN_NAME}: snapshot lifecycle already activated; refusing duplicate start"
+            ));
         }
 
         Ok(())
@@ -4168,7 +4167,6 @@ fn start_snapshot_task(
     runtime: Arc<SinkRuntime>,
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
-    _namespace: String,
     commit_rx: watch::Receiver<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
     emission_lock: Arc<Mutex<()>>,
