@@ -1543,7 +1543,10 @@ fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
             if response.is_some() {
                 targets.method_responses.insert(method_path.clone());
             }
-            methods.insert(method_path.clone(), ProtobufMethodShape { request, response });
+            methods.insert(
+                method_path.clone(),
+                ProtobufMethodShape { request, response },
+            );
         }
     }
 
@@ -1648,13 +1651,12 @@ fn resolve_protobuf_shape(
                 })
             })
             .transpose()?;
-        method_messages.insert(method_path.clone(), ProtobufMethodEntry { request, response });
+        method_messages.insert(
+            method_path.clone(),
+            ProtobufMethodEntry { request, response },
+        );
     }
-    Ok((
-        request_descriptor,
-        response_descriptor,
-        method_messages,
-    ))
+    Ok((request_descriptor, response_descriptor, method_messages))
 }
 
 pub(crate) fn validate_protobuf_descriptor_config(
@@ -2214,8 +2216,7 @@ impl Plugin for BodyValidator {
 
         // Resolve gRPC method path from headers (injected by the proxy handler)
         let grpc_path = headers.get(":path").map(|s| s.as_str()).unwrap_or("");
-        if self.protobuf_dependency_unavailable
-            && self.protobuf_targets.request_applies(grpc_path)
+        if self.protobuf_dependency_unavailable && self.protobuf_targets.request_applies(grpc_path)
         {
             return protobuf_reject(
                 400,

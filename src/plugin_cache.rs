@@ -1332,9 +1332,7 @@ fn body_validator_descriptor_preload_required_for_scope(
                         && proxy
                             .plugins
                             .iter()
-                            .any(|association| {
-                                association.plugin_config_id == plugin_config.id
-                            })
+                            .any(|association| association.plugin_config_id == plugin_config.id)
                 }),
             }
     })

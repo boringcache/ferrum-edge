@@ -2709,10 +2709,7 @@ async fn test_protobuf_missing_descriptor_fails_closed_for_applicable_request_an
 
     let headers = HashMap::from([
         ("content-type".to_string(), "application/grpc".to_string()),
-        (
-            ":path".to_string(),
-            "/test.Greeter/SayHello".to_string(),
-        ),
+        (":path".to_string(), "/test.Greeter/SayHello".to_string()),
     ]);
     assert_reject(
         plugin
@@ -2756,10 +2753,7 @@ async fn test_protobuf_missing_descriptor_only_rejects_configured_method_targets
     );
     let matched = HashMap::from([
         ("content-type".to_string(), "application/grpc".to_string()),
-        (
-            ":path".to_string(),
-            "/test.Greeter/SayHello".to_string(),
-        ),
+        (":path".to_string(), "/test.Greeter/SayHello".to_string()),
     ]);
     assert_reject(
         plugin
@@ -2799,11 +2793,7 @@ fn test_protobuf_readable_malformed_descriptor_rejects_runtime_candidate() {
     assert!(error.contains("failed to parse protobuf descriptor"));
 
     let gateway = GatewayConfig {
-        plugin_configs: vec![body_validator_plugin_config(
-            "body-validator",
-            true,
-            config,
-        )],
+        plugin_configs: vec![body_validator_plugin_config("body-validator", true, config)],
         ..Default::default()
     };
     let errors = gateway.validate_plugin_file_dependencies();

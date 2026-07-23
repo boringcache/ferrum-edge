@@ -8996,8 +8996,10 @@ impl GatewayConfig {
     ) -> Vec<String> {
         let mut errors = Vec::new();
         let mut validated_paths = std::collections::HashSet::new();
-        let mut protobuf_descriptor_cache =
-            std::collections::HashMap::<String, Result<prost_reflect::DescriptorPool, String>>::new();
+        let mut protobuf_descriptor_cache = std::collections::HashMap::<
+            String,
+            Result<prost_reflect::DescriptorPool, String>,
+        >::new();
         let mut reported_protobuf_path_errors = std::collections::HashSet::new();
         // Identical enabled UDP DTLS validation inputs share one materialization
         // (provider/file read) per pass; cached errors are still attached to
@@ -9026,9 +9028,11 @@ impl GatewayConfig {
             if pc.plugin_name == "body_validator" {
                 match crate::plugins::body_validator::protobuf_descriptor_path(&pc.config) {
                     Ok(Some(path)) => {
-                        let cached = protobuf_descriptor_cache.entry(path.to_string()).or_insert_with(
-                            || crate::plugins::body_validator::load_protobuf_descriptor_pool(path),
-                        );
+                        let cached = protobuf_descriptor_cache
+                            .entry(path.to_string())
+                            .or_insert_with(|| {
+                                crate::plugins::body_validator::load_protobuf_descriptor_pool(path)
+                            });
                         match cached {
                             Ok(pool) => {
                                 if let Err(error) =
@@ -9040,7 +9044,9 @@ impl GatewayConfig {
                                     errors.push(format!("PluginConfig '{}': {}", pc.id, error));
                                 }
                             }
-                            Err(error) if reported_protobuf_path_errors.insert(path.to_string()) => {
+                            Err(error)
+                                if reported_protobuf_path_errors.insert(path.to_string()) =>
+                            {
                                 errors.push(format!("PluginConfig '{}': {}", pc.id, error));
                             }
                             Err(_) => {}
