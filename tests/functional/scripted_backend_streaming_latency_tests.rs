@@ -774,10 +774,7 @@ async fn run_http_family(protocol: &str, pace: Pace, outcome: Outcome) {
     if protocol == "h1" {
         builder = builder.env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0");
     }
-    let harness = builder
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let harness = builder.spawn().await.expect("spawn gateway");
 
     match protocol {
         "h1" => h1_drive(&harness, &path, pace, outcome).await,
