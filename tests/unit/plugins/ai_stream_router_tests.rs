@@ -1630,6 +1630,38 @@ async fn test_malformed_complete_sse_event_fails_closed() {
 }
 
 #[tokio::test]
+async fn test_known_anthropic_events_cannot_hide_malformed_protocol_data() {
+    let malformed_events = [
+        concat!(
+            "event: content_block_delta\n",
+            "data : {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lost\"}}\n\n",
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lost\"}}\n\n",
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ),
+    ];
+
+    for malformed_event in malformed_events {
+        let body = format!(
+            "{}{}{}",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bad_protocol\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            malformed_event,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (out, terminated) = run_sse(&body).await;
+        assert!(terminated);
+        assert!(out.contains("\"type\":\"upstream_error\""), "{out}");
+        assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+        assert!(!out.contains("\"content\":\"lost\""), "{out}");
+    }
+}
+
+#[tokio::test]
 async fn test_explicit_anthropic_error_event_terminates_once() {
     let body = concat!(
         "event: message_start\n",
