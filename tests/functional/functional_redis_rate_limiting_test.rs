@@ -25,7 +25,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -177,6 +177,36 @@ async fn redis_sum_counters_by_prefix(prefix: &str) -> i64 {
         .and_then(|value| value.split("\r\n").next())
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0)
+}
+
+async fn set_redis_counter(key: &str, value: u64, ttl_seconds: u64) {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    let result: String = redis::cmd("SET")
+        .arg(key)
+        .arg(value)
+        .arg("EX")
+        .arg(ttl_seconds)
+        .query_async(&mut connection)
+        .await
+        .expect("seed Redis rate-limit counter");
+    assert_eq!(result, "OK");
+}
+
+async fn redis_counter_value(key: &str) -> Option<u64> {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    redis::cmd("GET")
+        .arg(key)
+        .query_async(&mut connection)
+        .await
+        .expect("read Redis rate-limit counter")
 }
 
 // ============================================================================
@@ -837,6 +867,113 @@ async fn test_rate_limiting_redis_centralized() {
     );
 
     println!("test_rate_limiting_redis_centralized PASSED");
+}
+
+/// A full previous one-second Redis bucket must decay during the current
+/// bucket. The old whole-second fraction stayed at zero and rejected this
+/// candidate for the entire second.
+#[tokio::test]
+#[ignore]
+async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
+    if !redis_is_available().await {
+        return;
+    }
+
+    let harness = RedisRateLimitHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let unique_prefix = format!("ferrum:test:rl-decay:{}", Uuid::new_v4().simple());
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-redis-rl-decay",
+        "/redis-rl-decay",
+        backend_port,
+        "http",
+        vec![json!({
+            "id": "plugin-redis-rl-decay",
+            "plugin_name": "rate_limiting",
+            "scope": "proxy",
+            "proxy_id": "proxy-redis-rl-decay",
+            "enabled": true,
+            "config": {
+                "expose_headers": true,
+                "limits": [{"scope": "default", "window_seconds": 1, "max_requests": 10}],
+                "sync_mode": "redis",
+                "redis_url": REDIS_URL,
+                "redis_key_prefix": unique_prefix
+            }
+        })],
+    )
+    .await
+    .unwrap();
+    harness
+        .wait_for_response_header("/redis-rl-decay/test", "x-ratelimit-limit")
+        .await;
+
+    let url = format!("{}/redis-rl-decay/test", harness.proxy_base_url);
+    let mut verified_without_boundary_cross = false;
+    for _ in 0..3 {
+        delete_redis_keys_by_prefix(&unique_prefix).await;
+
+        // Leave at least ~450ms before the next boundary so the Redis seed and
+        // HTTP request use the same current bucket even on a busy hosted runner.
+        let current_index = loop {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch");
+            let fraction_nanos = now.subsec_nanos();
+            if (300_000_000..=500_000_000).contains(&fraction_nanos) {
+                break now.as_secs();
+            }
+            sleep(Duration::from_millis(5)).await;
+        };
+
+        let previous_key = format!(
+            "{unique_prefix}:ip:127.0.0.1:{}",
+            current_index.saturating_sub(1)
+        );
+        let current_key = format!("{unique_prefix}:ip:127.0.0.1:{current_index}");
+        set_redis_counter(&previous_key, 10, 3).await;
+
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .expect("one-second Redis decay request");
+        let finished_index = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_secs();
+        if finished_index != current_index {
+            continue;
+        }
+
+        assert_eq!(
+            redis_counter_value(&current_key).await,
+            Some(1),
+            "request must increment the expected current Redis identity bucket"
+        );
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "a full prior bucket must decay enough to admit a mid-window candidate"
+        );
+        verified_without_boundary_cross = true;
+        break;
+    }
+
+    assert!(
+        verified_without_boundary_cross,
+        "could not complete the Redis decay assertion without crossing a one-second boundary"
+    );
+    delete_redis_keys_by_prefix(&unique_prefix).await;
 }
 
 // ============================================================================

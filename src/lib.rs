@@ -1691,6 +1691,7 @@ pub mod _test_support {
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
+    pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
 
     pub fn redis_config_url_with_ip(config: &RedisConfig, ip: std::net::IpAddr) -> String {
         config.url_with_resolved_ip(ip)
@@ -1717,6 +1718,19 @@ pub mod _test_support {
 
     pub fn redis_rate_limit_client_for_test(config: RedisConfig) -> RedisRateLimitClient {
         RedisRateLimitClient::new(config, None, false, None)
+    }
+
+    /// Deterministic Redis sliding-window index + elapsed fraction for tests.
+    pub fn redis_window_progress_at(
+        now: std::time::Duration,
+        window_seconds: u64,
+    ) -> RedisWindowProgress {
+        RedisRateLimitClient::window_progress_at(now, window_seconds)
+    }
+
+    /// Live-clock Redis sliding-window progress (single timestamp sample).
+    pub fn redis_window_progress(window_seconds: u64) -> RedisWindowProgress {
+        RedisRateLimitClient::window_progress(window_seconds)
     }
 
     // ── config/db_loader ─────────────────────────────────────────────────────
