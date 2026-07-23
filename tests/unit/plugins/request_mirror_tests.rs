@@ -2325,5 +2325,8 @@ async fn test_grpc_mirror_preserves_binary_body_over_h2c() {
         "h2c gRPC mirror with binary body failed: {meta:?}"
     );
     let body = rx.await.expect("h2c sink should capture body");
-    assert_eq!(body, grpc_frame, "binary gRPC frame must be preserved byte-for-byte");
+    assert_eq!(
+        body, grpc_frame,
+        "binary gRPC frame must be preserved byte-for-byte"
+    );
 }
