@@ -306,6 +306,27 @@ impl Http3Client {
         &self,
         url: &str,
     ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
+        self.open_grpc_stream_with_content_type(url, "application/grpc")
+            .await
+    }
+
+    /// Open an H3 gRPC-Web request stream whose response can be consumed one
+    /// DATA chunk at a time. Functional cadence/cancellation tests use this
+    /// instead of the ordinary buffered [`Self::get_with_options`] helper.
+    pub async fn open_grpc_web_stream(
+        &self,
+        url: &str,
+        content_type: &str,
+    ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
+        self.open_grpc_stream_with_content_type(url, content_type)
+            .await
+    }
+
+    async fn open_grpc_stream_with_content_type(
+        &self,
+        url: &str,
+        content_type: &str,
+    ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
         let parsed: http::Uri = url.parse()?;
         let host = parsed.host().ok_or("missing host in url")?.to_string();
         let port = parsed.port_u16().unwrap_or(443);
@@ -324,13 +345,12 @@ impl Http3Client {
         let driver_task = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
-        // Only `content-type: application/grpc` is needed for the gateway's
-        // flavor detection; the gateway synthesizes `te: trailers` toward the
-        // backend itself, so we don't send it from the client.
+        // The gateway synthesizes `te: trailers` toward the backend itself, so
+        // the client only needs the selected native/gRPC-Web content type.
         let req = Request::builder()
             .method(http::Method::POST)
             .uri(url)
-            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header(http::header::CONTENT_TYPE, content_type)
             .body(())
             .map_err(|e| format!("build request: {e}"))?;
         let stream = tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
@@ -499,6 +519,18 @@ pub struct Http3GrpcStream {
 }
 
 impl Http3GrpcStream {
+    /// Send caller-supplied request DATA without closing the request stream.
+    pub async fn send_raw_data(
+        &mut self,
+        data: impl Into<Bytes>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(15), self.stream.send_data(data.into()))
+            .await
+            .map_err(|_| "send_data timed out")?
+            .map_err(|e| format!("send_data: {e}"))?;
+        Ok(())
+    }
+
     /// Send one length-prefixed gRPC message as a DATA frame WITHOUT closing the
     /// request stream (no END_STREAM), so a backend can be observed reacting to
     /// it before the client half-closes.
@@ -539,6 +571,37 @@ impl Http3GrpcStream {
             .map_err(|_| "recv_response timed out")?
             .map_err(|e| format!("recv_response: {e}"))?;
         Ok((resp.status(), resp.headers().clone()))
+    }
+
+    /// Receive the next response DATA chunk without draining to EOF.
+    pub async fn recv_data(
+        &mut self,
+    ) -> Result<Option<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(mut chunk) = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data())
+            .await
+            .map_err(|_| "recv_data timed out")?
+            .map_err(|e| format!("recv_data: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let mut data = Vec::new();
+        while chunk.has_remaining() {
+            let take = chunk.chunk().to_vec();
+            data.extend_from_slice(&take);
+            chunk.advance(take.len());
+        }
+        Ok(Some(Bytes::from(data)))
+    }
+
+    /// Receive terminal HTTP/3 trailers after response DATA reaches EOF.
+    pub async fn recv_trailers(
+        &mut self,
+    ) -> Result<Option<HeaderMap>, Box<dyn std::error::Error + Send + Sync>> {
+        let trailers = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_trailers())
+            .await
+            .map_err(|_| "recv_trailers timed out")?
+            .map_err(|e| format!("recv_trailers: {e}"))?;
+        Ok(trailers)
     }
 
     /// Drain the response body (concatenated DATA) and the gRPC trailers.
