@@ -1477,8 +1477,9 @@ needs explicit `clickhouse.allow_lossy_async_insert=true`, and enabling
 `async_insert` without a wait setting pins `wait_for_async_insert=1`. It
 supports per-event mode for transaction-level provenance, snapshot mode for
 lower ingest volume (requires `spool.enabled=true`), an on-disk spool for
-ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics under
-`/metrics`. See
+ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generation
+status with aggregate totals), and Prometheus metrics under `/metrics`
+(unlabeled aggregates plus `plugin_config_id`/`generation` labeled series). See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
 reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on

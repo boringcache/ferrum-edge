@@ -12,10 +12,12 @@
 //!
 //! Construction (`new`) is runtime-free shape validation: it does not create
 //! spool directories, materialize secrets, build a dedicated TLS client, spawn
-//! the batching worker / background tasks, or publish `ACTIVE_SINK`. Live
-//! staging happens from [`Plugin::start_background_tasks`]; workers stay
-//! dormant until [`Plugin::commit_background_tasks`] after PluginCache
-//! publication.
+//! the batching worker / background tasks, or publish accepted-generation
+//! observability. Live staging happens from [`Plugin::start_background_tasks`];
+//! workers stay dormant until [`Plugin::commit_background_tasks`] after
+//! PluginCache publication. Observability tracks every accepted live instance
+//! by stable plugin-config ID and generation — never a last-constructor-wins
+//! singleton.
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -25,7 +27,7 @@ use http::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,14 +79,30 @@ const MAX_RETRY_TOTAL_DELAY_MS: u64 = 600_000;
 const CLICKHOUSE_ACK_BODY_LIMIT_BYTES: usize = 64 * 1024;
 /// ClickHouse HTTP setting that disables persistence-aware async-insert waits.
 const WAIT_FOR_ASYNC_INSERT_PARAM: &str = "wait_for_async_insert";
+/// Standalone / validation constructors that omit a plugin-config resource id.
+/// Production `PluginCache` always supplies the configured resource id.
+const DEFAULT_PLUGIN_CONFIG_ID: &str = "__standalone__";
 
-static ACTIVE_SINK: OnceLock<ArcSwap<Option<Arc<SinkRuntime>>>> = OnceLock::new();
+/// Stable identity for one accepted live sink instance in process-global
+/// observability. Ordering is `(plugin_config_id, generation)` ascending so
+/// status and Prometheus rendering stay deterministic across reloads.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ActiveSinkKey {
+    plugin_config_id: String,
+    generation: u64,
+}
+
+/// Accepted active sinks published after PluginCache commit. Keyed by stable
+/// plugin-config ID and per-activation generation so siblings coexist and Drop
+/// removes only the exact instance being torn down.
+static ACTIVE_SINKS: OnceLock<ArcSwap<BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>>> = OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
+static NEXT_SINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 static ULID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static ULID_RANDOM_PREFIX: OnceLock<u128> = OnceLock::new();
 
-fn active_sink() -> &'static ArcSwap<Option<Arc<SinkRuntime>>> {
-    ACTIVE_SINK.get_or_init(|| ArcSwap::from_pointee(None))
+fn active_sinks() -> &'static ArcSwap<BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>> {
+    ACTIVE_SINKS.get_or_init(|| ArcSwap::from_pointee(BTreeMap::new()))
 }
 
 fn status_cache() -> &'static ArcSwap<Option<(Instant, String)>> {
@@ -93,6 +111,52 @@ fn status_cache() -> &'static ArcSwap<Option<(Instant, String)>> {
 
 fn invalidate_status_cache() {
     status_cache().store(Arc::new(None));
+}
+
+fn active_sink_key(runtime: &SinkRuntime) -> ActiveSinkKey {
+    ActiveSinkKey {
+        plugin_config_id: runtime.plugin_config_id.to_string(),
+        generation: runtime.generation,
+    }
+}
+
+fn register_active_sink(runtime: Arc<SinkRuntime>) {
+    let key = active_sink_key(&runtime);
+    active_sinks().rcu(|map| {
+        if map
+            .get(&key)
+            .is_some_and(|existing| Arc::ptr_eq(existing, &runtime))
+        {
+            return Arc::clone(map);
+        }
+        let mut next = (**map).clone();
+        next.insert(key.clone(), Arc::clone(&runtime));
+        Arc::new(next)
+    });
+    invalidate_status_cache();
+}
+
+fn unregister_active_sink(runtime: &Arc<SinkRuntime>) {
+    let key = active_sink_key(runtime);
+    let previous = active_sinks().load_full();
+    if !previous
+        .get(&key)
+        .is_some_and(|existing| Arc::ptr_eq(existing, runtime))
+    {
+        return;
+    }
+    active_sinks().rcu(|map| {
+        if !map
+            .get(&key)
+            .is_some_and(|existing| Arc::ptr_eq(existing, runtime))
+        {
+            return Arc::clone(map);
+        }
+        let mut next = (**map).clone();
+        next.remove(&key);
+        Arc::new(next)
+    });
+    invalidate_status_cache();
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,6 +546,10 @@ pub struct ApiChargebackSink {
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
     namespace: String,
+    /// Stable plugin-config resource id used for accepted-generation
+    /// observability. Production cache supplies `PluginConfig.id`; standalone
+    /// constructors fall back to [`DEFAULT_PLUGIN_CONFIG_ID`].
+    plugin_config_id: Arc<str>,
     /// Shared gateway client retained for dedicated ClickHouse client build at start.
     http_client: PluginHttpClient,
     /// Live sink runtime after [`Plugin::start_background_tasks`].
@@ -496,6 +564,8 @@ pub struct ApiChargebackSink {
 }
 
 struct SinkRuntime {
+    plugin_config_id: Arc<str>,
+    generation: u64,
     summary: SinkSummary,
     logger: BatchingLogger<ChargeEvent>,
     metrics: Arc<SinkMetrics>,
@@ -678,6 +748,20 @@ impl ApiChargebackSink {
         http_client: PluginHttpClient,
         namespace: &str,
     ) -> Result<Self, String> {
+        Self::new_with_config_id(raw_config, http_client, namespace, None)
+    }
+
+    /// Construct with an optional stable plugin-config resource id.
+    ///
+    /// `plugin_config_id` partitions accepted-generation status/metrics across
+    /// sibling sink instances. Blank supplied ids fail closed. `None` uses
+    /// [`DEFAULT_PLUGIN_CONFIG_ID`] for standalone validation/tests.
+    pub fn new_with_config_id(
+        raw_config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
         if !raw_config.is_object() {
             return Err(format!("{PLUGIN_NAME}: config must be an object"));
         }
@@ -688,6 +772,16 @@ impl ApiChargebackSink {
                  see docs/plugins.md)"
             ));
         }
+
+        let plugin_config_id = match plugin_config_id {
+            Some(id) if id.trim().is_empty() => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: plugin config id must be a non-empty stable identity"
+                ));
+            }
+            Some(id) => Arc::<str>::from(id),
+            None => Arc::<str>::from(DEFAULT_PLUGIN_CONFIG_ID),
+        };
 
         let config: ApiChargebackSinkConfig = serde_json::from_value(raw_config.clone())
             .map_err(|error| format!("{PLUGIN_NAME}: invalid config: {error}"))?;
@@ -716,6 +810,7 @@ impl ApiChargebackSink {
             config: Arc::new(config),
             node_id: Arc::<str>::from(resolve_node_id()),
             namespace: namespace.to_string(),
+            plugin_config_id,
             http_client,
             runtime: OnceLock::new(),
             snapshot_accumulator: OnceLock::new(),
@@ -726,7 +821,7 @@ impl ApiChargebackSink {
 
     fn activate(&self) -> Result<(), String> {
         // Fallible setup first. Staged workers share one commit gate and stay
-        // dormant until commit_background_tasks; ACTIVE_SINK stays unpublished.
+        // dormant until commit_background_tasks; ACTIVE_SINKS stays unpublished.
         let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
@@ -841,7 +936,10 @@ impl ApiChargebackSink {
             },
         );
 
+        let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let runtime = Arc::new(SinkRuntime {
+            plugin_config_id: Arc::clone(&self.plugin_config_id),
+            generation,
             summary: SinkSummary {
                 mode: self.config.mode,
                 pricing_version: self.config.pricing_version.clone(),
@@ -897,8 +995,8 @@ impl ApiChargebackSink {
         // Stage ownership. Abort every staged task on any failure so infinite
         // replayer/snapshot loops cannot outlive a rejected activation. The
         // BatchingLogger is owned by `runtime` and is not published to
-        // ACTIVE_SINK until commit succeeds; dropping `runtime` cancels its
-        // commit gate. ACTIVE_SINK is published only after `self.runtime` is set.
+        // ACTIVE_SINKS until commit succeeds; dropping `runtime` cancels its
+        // commit gate. ACTIVE_SINKS is published only after `self.runtime` is set.
         let abort_tasks = |tasks: &mut Vec<tokio::task::JoinHandle<()>>| {
             for task in tasks.drain(..) {
                 task.abort();
@@ -948,19 +1046,32 @@ impl ApiChargebackSink {
         invalidate_status_cache();
     }
 
-    /// Whether this instance currently owns the process-global `ACTIVE_SINK`
-    /// diagnostics slot. Staging (`start_background_tasks`) must leave this
-    /// false; only [`Plugin::commit_background_tasks`] publishes ownership.
+    /// Whether this instance currently owns a published slot in the
+    /// process-global accepted-generation registry. Staging
+    /// (`start_background_tasks`) must leave this false; only
+    /// [`Plugin::commit_background_tasks`] publishes ownership.
     #[allow(dead_code)] // lifecycle tests observe pre/post-commit publication
     pub fn owns_active_sink(&self) -> bool {
         let Some(runtime) = self.runtime.get() else {
             return false;
         };
-        active_sink()
+        let key = active_sink_key(runtime);
+        active_sinks()
             .load_full()
-            .as_ref()
-            .as_ref()
+            .get(&key)
             .is_some_and(|published| Arc::ptr_eq(published, runtime))
+    }
+
+    /// Accepted observability generation for this instance, if activated.
+    #[allow(dead_code)] // multi-instance lifecycle tests assert exact-generation removal
+    pub fn active_generation(&self) -> Option<u64> {
+        self.runtime.get().map(|runtime| runtime.generation)
+    }
+
+    /// Stable plugin-config id used for observability identity.
+    #[allow(dead_code)] // multi-instance lifecycle tests assert exact-id removal
+    pub fn plugin_config_id(&self) -> &str {
+        &self.plugin_config_id
     }
 }
 
@@ -978,22 +1089,13 @@ impl Drop for ApiChargebackSink {
             }
         }
         let Some(runtime) = self.runtime.get() else {
-            // Never started: ACTIVE_SINK was never published for this instance.
+            // Never started: ACTIVE_SINKS was never published for this instance.
             return;
         };
-        // If this instance is still the one published for status/metrics
-        // rendering, clear the slot. Without this, a dropped validation
-        // throwaway would leave stale (zeroed) metrics — and its idle flush
-        // loop pinned alive by the global — until the next construction.
-        let current = active_sink().load_full();
-        if current
-            .as_ref()
-            .as_ref()
-            .is_some_and(|published| Arc::ptr_eq(published, runtime))
-        {
-            active_sink().store(Arc::new(None));
-            invalidate_status_cache();
-        }
+        // Remove only this exact plugin-config ID + generation. Sibling live
+        // instances stay published; a validation throwaway that never committed
+        // is a no-op because it was never registered.
+        unregister_active_sink(runtime);
     }
 }
 
@@ -1034,16 +1136,7 @@ impl Plugin for ApiChargebackSink {
         // Release flush/replay/snapshot dormancy before publishing diagnostics
         // so the live instance cannot appear active while workers are gated.
         runtime.logger.commit();
-        let current = active_sink().load_full();
-        if current
-            .as_ref()
-            .as_ref()
-            .is_some_and(|published| Arc::ptr_eq(published, runtime))
-        {
-            return;
-        }
-        active_sink().store(Arc::new(Some(Arc::clone(runtime))));
-        invalidate_status_cache();
+        register_active_sink(Arc::clone(runtime));
     }
 
     async fn log(&self, summary: &TransactionSummary) {
@@ -1152,49 +1245,138 @@ pub fn render_status_json() -> String {
         return output.clone();
     }
 
-    let runtime = active_sink().load_full();
-    let body = match runtime.as_ref() {
-        Some(runtime) => serde_json::to_string(&runtime.status_snapshot())
-            .unwrap_or_else(|_| "{\"enabled\":false}".to_string()),
-        None => serde_json::to_string(&serde_json::json!({
-            "mode": "per_event",
-            "enabled": false,
-            "pricing_version": null,
-            "clickhouse": null,
-            "batch": {"size": 0, "flush_interval_ms": 0},
-            "retry": {
-                "max_attempts": 0,
-                "initial_delay_ms": 0,
-                "max_delay_ms": 0,
-                "jitter": false
-            },
-            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
-            "spool": {"enabled": false, "available": false, "prepare_failures_total": 0, "files": 0, "bytes": 0, "drops_total": 0, "last_replay_at": null},
-            "export": {
-                "events_enqueued_total": 0,
-                "events_exported_total": 0,
-                "failures_total": 0,
-                "last_success_at": null,
-                "last_failure_at": null,
-                "last_failure_reason": null
-            }
-        }))
-        .unwrap_or_else(|_| "{\"enabled\":false}".to_string()),
-    };
+    let body = serde_json::to_string(&aggregate_status_snapshot(&active_sinks().load_full()))
+        .unwrap_or_else(|_| {
+            "{\"enabled\":false,\"instance_count\":0,\"totals\":{},\"instances\":[]}".to_string()
+        });
 
     cache.store(Arc::new(Some((Instant::now(), body.clone()))));
     body
 }
 
 pub fn render_prometheus() -> String {
-    let runtime = active_sink().load_full();
-    let Some(runtime) = runtime.as_ref() else {
+    let sinks = active_sinks().load_full();
+    if sinks.is_empty() {
         return String::new();
-    };
-    runtime.render_prometheus()
+    }
+    render_prometheus_for_sinks(sinks.as_ref())
+}
+
+fn disabled_status_snapshot() -> Value {
+    serde_json::json!({
+        "enabled": false,
+        "instance_count": 0,
+        "totals": {
+            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
+            "spool": {
+                "files": 0,
+                "bytes": 0,
+                "drops_total": 0,
+                "prepare_failures_total": 0,
+                "available": false
+            },
+            "export": {
+                "events_enqueued_total": 0,
+                "events_exported_total": 0,
+                "failures_total": 0
+            }
+        },
+        "instances": []
+    })
+}
+
+fn aggregate_status_snapshot(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>) -> Value {
+    if sinks.is_empty() {
+        return disabled_status_snapshot();
+    }
+
+    let instances: Vec<Value> = sinks
+        .values()
+        .map(|runtime| runtime.status_snapshot())
+        .collect();
+
+    let mut queue_depth = 0u64;
+    let mut queue_capacity = 0u64;
+    let mut high_water = 0u64;
+    let mut spool_files = 0u64;
+    let mut spool_bytes = 0u64;
+    let mut spool_drops = 0u64;
+    let mut spool_prepare_failures = 0u64;
+    let mut spool_enabled_any = false;
+    let mut spool_all_available = true;
+    let mut events_enqueued = 0u64;
+    let mut events_exported = 0u64;
+    let mut failures = 0u64;
+
+    for runtime in sinks.values() {
+        queue_depth = queue_depth.saturating_add(runtime.logger.queue_depth() as u64);
+        queue_capacity = queue_capacity.saturating_add(runtime.logger.buffer_capacity() as u64);
+        high_water = high_water.saturating_add(
+            runtime
+                .metrics
+                .queue_high_water_hits_total
+                .load(Ordering::Relaxed),
+        );
+        events_enqueued = events_enqueued
+            .saturating_add(runtime.metrics.events_enqueued_total.load(Ordering::Relaxed));
+        events_exported = events_exported
+            .saturating_add(runtime.metrics.events_exported_total.load(Ordering::Relaxed));
+        failures =
+            failures.saturating_add(runtime.metrics.failures_total.load(Ordering::Relaxed));
+        spool_prepare_failures = spool_prepare_failures.saturating_add(
+            runtime
+                .metrics
+                .spool_prepare_failures_total
+                .load(Ordering::Relaxed),
+        );
+        spool_drops = spool_drops
+            .saturating_add(runtime.metrics.spool_drops_total.load(Ordering::Relaxed));
+        if let Some(spool) = runtime.spool.as_ref() {
+            spool_enabled_any = true;
+            let stats = spool.scan_stats().unwrap_or_default();
+            spool_files = spool_files.saturating_add(stats.files);
+            spool_bytes = spool_bytes.saturating_add(stats.bytes);
+            if !runtime.metrics.spool_available.load(Ordering::Acquire) {
+                spool_all_available = false;
+            }
+        }
+    }
+
+    serde_json::json!({
+        "enabled": true,
+        "instance_count": sinks.len(),
+        "totals": {
+            "queue": {
+                "depth": queue_depth,
+                "capacity": queue_capacity,
+                "high_water_hits_total": high_water
+            },
+            "spool": {
+                "files": spool_files,
+                "bytes": spool_bytes,
+                "drops_total": spool_drops,
+                "prepare_failures_total": spool_prepare_failures,
+                "available": spool_enabled_any && spool_all_available
+            },
+            "export": {
+                "events_enqueued_total": events_enqueued,
+                "events_exported_total": events_exported,
+                "failures_total": failures
+            }
+        },
+        "instances": instances
+    })
 }
 
 impl SinkRuntime {
+    fn prometheus_labels(&self) -> String {
+        format!(
+            "plugin_config_id=\"{}\",generation=\"{}\"",
+            super::prometheus_metrics::escape_label_value(self.plugin_config_id.as_ref()),
+            self.generation
+        )
+    }
+
     fn status_snapshot(&self) -> Value {
         let (spool_enabled, spool_files, spool_bytes) = match self.spool.as_ref() {
             Some(spool) => {
@@ -1210,8 +1392,9 @@ impl SinkRuntime {
             .ok()
             .and_then(|guard| guard.clone());
         serde_json::json!({
+            "plugin_config_id": self.plugin_config_id.as_ref(),
+            "generation": self.generation,
             "mode": self.summary.mode.as_str(),
-            "enabled": true,
             "pricing_version": self.summary.pricing_version,
             "clickhouse": {
                 "endpoint": self.summary.endpoint,
@@ -1253,23 +1436,17 @@ impl SinkRuntime {
         })
     }
 
-    fn render_prometheus(&self) -> String {
+    fn append_prometheus_instance(&self, output: &mut String) {
         let metrics = &self.metrics;
-        let mut output = String::with_capacity(2048);
-        output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events accepted by the exporter.\n");
-        output.push_str("# TYPE chargeback_sink_events_enqueued_total counter\n");
+        let labels = self.prometheus_labels();
         output.push_str(&format!(
-            "chargeback_sink_events_enqueued_total {}\n",
+            "chargeback_sink_events_enqueued_total{{{labels}}} {}\n",
             metrics.events_enqueued_total.load(Ordering::Relaxed)
         ));
-        output.push_str("# HELP chargeback_sink_events_exported_total Chargeback sink events successfully exported to ClickHouse.\n");
-        output.push_str("# TYPE chargeback_sink_events_exported_total counter\n");
         output.push_str(&format!(
-            "chargeback_sink_events_exported_total {}\n",
+            "chargeback_sink_events_exported_total{{{labels}}} {}\n",
             metrics.events_exported_total.load(Ordering::Relaxed)
         ));
-        output.push_str("# HELP chargeback_sink_export_failures_total Chargeback sink export failures by bounded reason.\n");
-        output.push_str("# TYPE chargeback_sink_export_failures_total counter\n");
         for (reason, value) in [
             (
                 "network",
@@ -1294,16 +1471,11 @@ impl SinkRuntime {
             ),
         ] {
             output.push_str(&format!(
-                "chargeback_sink_export_failures_total{{reason=\"{}\"}} {}\n",
-                reason, value
+                "chargeback_sink_export_failures_total{{{labels},reason=\"{reason}\"}} {value}\n"
             ));
         }
-        output.push_str(
-            "# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n",
-        );
-        output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
         output.push_str(&format!(
-            "chargeback_sink_queue_depth {}\n",
+            "chargeback_sink_queue_depth{{{labels}}} {}\n",
             self.logger.queue_depth()
         ));
         let spool_stats = self
@@ -1311,76 +1483,237 @@ impl SinkRuntime {
             .as_ref()
             .and_then(|spool| spool.scan_stats().ok())
             .unwrap_or_default();
-        output.push_str(
-            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).\n",
-        );
-        output.push_str("# TYPE chargeback_sink_spool_bytes gauge\n");
         output.push_str(&format!(
-            "chargeback_sink_spool_bytes {}\n",
+            "chargeback_sink_spool_bytes{{{labels}}} {}\n",
             spool_stats.bytes
         ));
-        output.push_str(
-            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files).\n",
-        );
-        output.push_str("# TYPE chargeback_sink_spool_files gauge\n");
         output.push_str(&format!(
-            "chargeback_sink_spool_files {}\n",
+            "chargeback_sink_spool_files{{{labels}}} {}\n",
             spool_stats.files
         ));
-        output.push_str("# HELP chargeback_sink_spool_drops_total Chargeback sink spool files dropped to enforce max_bytes.\n");
-        output.push_str("# TYPE chargeback_sink_spool_drops_total counter\n");
         output.push_str(&format!(
-            "chargeback_sink_spool_drops_total {}\n",
+            "chargeback_sink_spool_drops_total{{{labels}}} {}\n",
             metrics.spool_drops_total.load(Ordering::Relaxed)
         ));
-        output.push_str("# HELP chargeback_sink_spool_available Whether committed spool storage is currently writable (1) or unavailable (0).\n");
-        output.push_str("# TYPE chargeback_sink_spool_available gauge\n");
         output.push_str(&format!(
-            "chargeback_sink_spool_available {}\n",
+            "chargeback_sink_spool_available{{{labels}}} {}\n",
             if metrics.spool_available.load(Ordering::Acquire) {
                 1
             } else {
                 0
             }
         ));
-        output.push_str("# HELP chargeback_sink_spool_prepare_failures_total Chargeback sink committed spool storage preparation failures.\n");
-        output.push_str("# TYPE chargeback_sink_spool_prepare_failures_total counter\n");
         output.push_str(&format!(
-            "chargeback_sink_spool_prepare_failures_total {}\n",
-            metrics.spool_prepare_failures_total.load(Ordering::Relaxed)
+            "chargeback_sink_spool_prepare_failures_total{{{labels}}} {}\n",
+            metrics
+                .spool_prepare_failures_total
+                .load(Ordering::Relaxed)
         ));
-        output.push_str("# HELP chargeback_sink_export_latency_seconds Chargeback sink ClickHouse export latency in seconds.\n");
-        output.push_str("# TYPE chargeback_sink_export_latency_seconds histogram\n");
         for (idx, bucket) in metrics.latency.buckets.iter().enumerate() {
             let cumulative = metrics.latency.counts[idx].load(Ordering::Relaxed);
             output.push_str(&format!(
-                "chargeback_sink_export_latency_seconds_bucket{{le=\"{}\"}} {}\n",
-                bucket, cumulative
+                "chargeback_sink_export_latency_seconds_bucket{{{labels},le=\"{bucket}\"}} {cumulative}\n"
             ));
         }
         let count = metrics.latency.count.load(Ordering::Relaxed);
         output.push_str(&format!(
-            "chargeback_sink_export_latency_seconds_bucket{{le=\"+Inf\"}} {}\n",
-            count
+            "chargeback_sink_export_latency_seconds_bucket{{{labels},le=\"+Inf\"}} {count}\n"
         ));
         output.push_str(&format!(
-            "chargeback_sink_export_latency_seconds_sum {:.6}\n",
+            "chargeback_sink_export_latency_seconds_sum{{{labels}}} {:.6}\n",
             f64::from_bits(metrics.latency.sum_bits.load(Ordering::Relaxed))
         ));
         output.push_str(&format!(
-            "chargeback_sink_export_latency_seconds_count {}\n",
-            count
+            "chargeback_sink_export_latency_seconds_count{{{labels}}} {count}\n"
         ));
         if self.summary.mode == SinkMode::Snapshot {
-            output.push_str("# HELP chargeback_sink_snapshot_emits_total Chargeback sink snapshot delta events emitted.\n");
-            output.push_str("# TYPE chargeback_sink_snapshot_emits_total counter\n");
             output.push_str(&format!(
-                "chargeback_sink_snapshot_emits_total {}\n",
+                "chargeback_sink_snapshot_emits_total{{{labels}}} {}\n",
                 metrics.snapshot_emits_total.load(Ordering::Relaxed)
             ));
         }
-        output
     }
+}
+
+fn render_prometheus_for_sinks(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>) -> String {
+    let mut output = String::with_capacity(4096 * sinks.len().max(1));
+
+    // Unlabeled series are process-wide aggregates across every accepted live
+    // instance. Labeled series expose the same counters with bounded
+    // `plugin_config_id` + `generation` cardinality (one series set per live
+    // accepted plugin-config instance).
+    let mut events_enqueued = 0u64;
+    let mut events_exported = 0u64;
+    let mut failure_network = 0u64;
+    let mut failure_http_4xx = 0u64;
+    let mut failure_http_5xx = 0u64;
+    let mut failure_serialize = 0u64;
+    let mut failure_tls = 0u64;
+    let mut failure_timeout = 0u64;
+    let mut queue_depth = 0u64;
+    let mut spool_bytes = 0u64;
+    let mut spool_files = 0u64;
+    let mut spool_drops = 0u64;
+    let mut spool_prepare_failures = 0u64;
+    let mut spool_enabled_any = false;
+    let mut spool_all_available = true;
+    let mut snapshot_emits = 0u64;
+    let mut any_snapshot = false;
+    let mut latency_counts: Vec<u64> = Vec::new();
+    let mut latency_sum = 0.0f64;
+    let mut latency_total = 0u64;
+    let mut latency_buckets: &'static [f64] = &[];
+
+    for runtime in sinks.values() {
+        let metrics = &runtime.metrics;
+        events_enqueued =
+            events_enqueued.saturating_add(metrics.events_enqueued_total.load(Ordering::Relaxed));
+        events_exported =
+            events_exported.saturating_add(metrics.events_exported_total.load(Ordering::Relaxed));
+        failure_network = failure_network
+            .saturating_add(metrics.failure_reasons.network.load(Ordering::Relaxed));
+        failure_http_4xx = failure_http_4xx
+            .saturating_add(metrics.failure_reasons.http_4xx.load(Ordering::Relaxed));
+        failure_http_5xx = failure_http_5xx
+            .saturating_add(metrics.failure_reasons.http_5xx.load(Ordering::Relaxed));
+        failure_serialize = failure_serialize
+            .saturating_add(metrics.failure_reasons.serialize.load(Ordering::Relaxed));
+        failure_tls =
+            failure_tls.saturating_add(metrics.failure_reasons.tls.load(Ordering::Relaxed));
+        failure_timeout = failure_timeout
+            .saturating_add(metrics.failure_reasons.timeout.load(Ordering::Relaxed));
+        queue_depth = queue_depth.saturating_add(runtime.logger.queue_depth() as u64);
+        spool_drops =
+            spool_drops.saturating_add(metrics.spool_drops_total.load(Ordering::Relaxed));
+        spool_prepare_failures = spool_prepare_failures
+            .saturating_add(metrics.spool_prepare_failures_total.load(Ordering::Relaxed));
+        let spool_stats = runtime
+            .spool
+            .as_ref()
+            .and_then(|spool| spool.scan_stats().ok())
+            .unwrap_or_default();
+        spool_bytes = spool_bytes.saturating_add(spool_stats.bytes);
+        spool_files = spool_files.saturating_add(spool_stats.files);
+        if runtime.spool.is_some() {
+            spool_enabled_any = true;
+            if !metrics.spool_available.load(Ordering::Acquire) {
+                spool_all_available = false;
+            }
+        }
+        if runtime.summary.mode == SinkMode::Snapshot {
+            any_snapshot = true;
+            snapshot_emits =
+                snapshot_emits.saturating_add(metrics.snapshot_emits_total.load(Ordering::Relaxed));
+        }
+        if latency_buckets.is_empty() {
+            latency_buckets = metrics.latency.buckets;
+            latency_counts = vec![0u64; latency_buckets.len()];
+        }
+        for (idx, count) in latency_counts.iter_mut().enumerate() {
+            *count = count.saturating_add(metrics.latency.counts[idx].load(Ordering::Relaxed));
+        }
+        latency_sum += f64::from_bits(metrics.latency.sum_bits.load(Ordering::Relaxed));
+        latency_total = latency_total.saturating_add(metrics.latency.count.load(Ordering::Relaxed));
+    }
+
+    output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events accepted by the exporter.\n");
+    output.push_str("# TYPE chargeback_sink_events_enqueued_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_events_enqueued_total {}\n",
+        events_enqueued
+    ));
+    output.push_str("# HELP chargeback_sink_events_exported_total Chargeback sink events successfully exported to ClickHouse.\n");
+    output.push_str("# TYPE chargeback_sink_events_exported_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_events_exported_total {}\n",
+        events_exported
+    ));
+    output.push_str("# HELP chargeback_sink_export_failures_total Chargeback sink export failures by bounded reason.\n");
+    output.push_str("# TYPE chargeback_sink_export_failures_total counter\n");
+    for (reason, value) in [
+        ("network", failure_network),
+        ("http_4xx", failure_http_4xx),
+        ("http_5xx", failure_http_5xx),
+        ("serialize", failure_serialize),
+        ("tls", failure_tls),
+        ("timeout", failure_timeout),
+    ] {
+        output.push_str(&format!(
+            "chargeback_sink_export_failures_total{{reason=\"{}\"}} {}\n",
+            reason, value
+        ));
+    }
+    output.push_str(
+        "# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
+    output.push_str(&format!("chargeback_sink_queue_depth {}\n", queue_depth));
+    output.push_str(
+        "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).\n",
+    );
+    output.push_str("# TYPE chargeback_sink_spool_bytes gauge\n");
+    output.push_str(&format!("chargeback_sink_spool_bytes {}\n", spool_bytes));
+    output.push_str(
+        "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files).\n",
+    );
+    output.push_str("# TYPE chargeback_sink_spool_files gauge\n");
+    output.push_str(&format!("chargeback_sink_spool_files {}\n", spool_files));
+    output.push_str("# HELP chargeback_sink_spool_drops_total Chargeback sink spool files dropped to enforce max_bytes.\n");
+    output.push_str("# TYPE chargeback_sink_spool_drops_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_drops_total {}\n",
+        spool_drops
+    ));
+    output.push_str("# HELP chargeback_sink_spool_available Whether committed spool storage is currently writable (1) or unavailable (0). Aggregate is 1 only when every spool-enabled live instance is available.\n");
+    output.push_str("# TYPE chargeback_sink_spool_available gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_available {}\n",
+        if spool_enabled_any && spool_all_available {
+            1
+        } else {
+            0
+        }
+    ));
+    output.push_str("# HELP chargeback_sink_spool_prepare_failures_total Chargeback sink committed spool storage preparation failures.\n");
+    output.push_str("# TYPE chargeback_sink_spool_prepare_failures_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_prepare_failures_total {}\n",
+        spool_prepare_failures
+    ));
+    output.push_str("# HELP chargeback_sink_export_latency_seconds Chargeback sink ClickHouse export latency in seconds.\n");
+    output.push_str("# TYPE chargeback_sink_export_latency_seconds histogram\n");
+    for (idx, bucket) in latency_buckets.iter().enumerate() {
+        let cumulative = latency_counts.get(idx).copied().unwrap_or(0);
+        output.push_str(&format!(
+            "chargeback_sink_export_latency_seconds_bucket{{le=\"{}\"}} {}\n",
+            bucket, cumulative
+        ));
+    }
+    output.push_str(&format!(
+        "chargeback_sink_export_latency_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        latency_total
+    ));
+    output.push_str(&format!(
+        "chargeback_sink_export_latency_seconds_sum {:.6}\n",
+        latency_sum
+    ));
+    output.push_str(&format!(
+        "chargeback_sink_export_latency_seconds_count {}\n",
+        latency_total
+    ));
+    if any_snapshot {
+        output.push_str("# HELP chargeback_sink_snapshot_emits_total Chargeback sink snapshot delta events emitted.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_emits_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_emits_total {}\n",
+            snapshot_emits
+        ));
+    }
+
+    for runtime in sinks.values() {
+        runtime.append_prometheus_instance(&mut output);
+    }
+    output
 }
 
 /// Structured ClickHouse delivery result.

@@ -368,12 +368,29 @@ node and time window.
 
 ## Status And Metrics
 
-`GET /charges/sink/status` is JWT-authenticated and returns the effective batch
-size, flush interval, and retry settings (`max_attempts`, `initial_delay_ms`,
-`max_delay_ms`, `jitter`), queue depth, spool size, replay timestamps, and
-export counters. While the sink is disabled the response keeps the same object
-shape with zeroed batch/retry numerics and `retry.jitter: false`. `/metrics`
-includes:
+`GET /charges/sink/status` is JWT-authenticated and returns accepted-generation
+observability for every live `api_chargeback_sink` instance. Validation-only
+construction and uncommitted staged reloads never publish into this view.
+
+Response contract:
+
+- `enabled` is `true` when at least one accepted instance is live.
+- `instance_count` is the number of published instances.
+- `totals` aggregates queue depth/capacity/high-water hits, spool files/bytes/
+  drops/prepare failures, and export counters across every live instance.
+  `totals.spool.available` is `true` only when every spool-enabled live instance
+  is currently writable.
+- `instances` lists each accepted sink in ascending
+  `(plugin_config_id, generation)` order. Each entry includes that identity plus
+  mode, pricing version, sanitized ClickHouse endpoint metadata, batch/retry
+  settings, per-instance queue/spool/export counters, and timestamps.
+
+Cardinality is bounded by the number of accepted live plugin-config instances
+(config-bounded). Dropping an instance removes only that exact
+`plugin_config_id` + `generation` pair and leaves siblings untouched.
+
+`/metrics` includes unlabeled process-wide aggregates plus the same series
+labeled with `plugin_config_id` and `generation` for each live instance:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`
@@ -382,10 +399,14 @@ includes:
 - `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
-- `chargeback_sink_spool_available` (1 only while committed storage is writable)
+- `chargeback_sink_spool_available` (aggregate is `1` only while every spool-enabled live instance is writable)
 - `chargeback_sink_spool_prepare_failures_total`
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
+
+Unlabeled series are the sum across live instances. Labeled series use fixed
+`plugin_config_id` / `generation` identity labels only (no request-path or
+high-cardinality dimensions).
 
 ## Security Notes
 

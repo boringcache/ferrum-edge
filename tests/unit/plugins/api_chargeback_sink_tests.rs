@@ -1366,7 +1366,7 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
     let corrupt_bytes = 256u64;
     let byte_line = format!("chargeback_sink_spool_bytes {corrupt_bytes}\n");
 
-    // ACTIVE_SINK is process-global; retry briefly if a parallel sink test races
+    // ACTIVE_SINKS is process-global; retry briefly if a parallel sink test races
     // the published runtime between construction and scrape.
     let mut matched_prom = None;
     let mut held_plugin = None;
@@ -1413,7 +1413,7 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
     }
 
     let prom = matched_prom.expect(
-        "ACTIVE_SINK never observed this sink's quarantined owned bytes in prometheus output",
+        "ACTIVE_SINKS never observed this sink's quarantined owned bytes in prometheus output",
     );
     assert!(
         prom.contains(
@@ -1464,7 +1464,7 @@ async fn committed_unusable_spool_latches_status_and_metric_failure() {
     let mut status = Value::Null;
     for _ in 0..200 {
         status = serde_json::from_str(&render_status_json()).expect("status json");
-        if status["spool"]["prepare_failures_total"]
+        if status["instances"][0]["spool"]["prepare_failures_total"]
             .as_u64()
             .is_some_and(|failures| failures > 0)
         {
@@ -1473,13 +1473,21 @@ async fn committed_unusable_spool_latches_status_and_metric_failure() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    assert_eq!(status["spool"]["enabled"], true);
-    assert_eq!(status["spool"]["available"], false);
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["instance_count"], 1);
+    assert_eq!(status["instances"][0]["spool"]["enabled"], true);
+    assert_eq!(status["instances"][0]["spool"]["available"], false);
     assert!(
-        status["spool"]["prepare_failures_total"]
+        status["instances"][0]["spool"]["prepare_failures_total"]
             .as_u64()
             .is_some_and(|failures| failures > 0),
         "committed unusable spool must retain operational failure evidence: {status}"
+    );
+    assert_eq!(status["totals"]["spool"]["available"], false);
+    assert!(
+        status["totals"]["spool"]["prepare_failures_total"]
+            .as_u64()
+            .is_some_and(|failures| failures > 0)
     );
 
     let prometheus = render_prometheus();
