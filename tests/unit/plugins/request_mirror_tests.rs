@@ -1572,7 +1572,7 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
                     },
                     "rewrite": {
                         "uri": "/exact-shadow",
-                        "authority": "exact.internal:9443"
+                        "authority": "exact.internal"
                     }
                 },
                 {
@@ -1647,7 +1647,7 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
     );
     assert_eq!(
         exact_ctx.route_override_authority.as_deref(),
-        Some("exact.internal:9443")
+        Some("exact.internal")
     );
     plugin_utils::assert_continue(
         route_mirror
@@ -1685,9 +1685,10 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
             request.starts_with("POST /exact-shadow?page=1 HTTP/1.1\r\n")
                 && request
                     .lines()
-                    .any(|line| line.eq_ignore_ascii_case("host: exact.internal-shadow:9443"))
+                    .any(|line| line.eq_ignore_ascii_case("host: exact.internal-shadow"))
         }),
-        "exact route rewrite must replace the whole path and shadow its authority: {requests:?}"
+        "exact route rewrite must replace the whole path and shadow its bare authority: \
+         {requests:?}"
     );
     assert!(
         requests
