@@ -1977,11 +1977,8 @@ fn fields_to_schema_object(
             && let Some(property_encoding) = property_encoding
         {
             if property_encoding.style == EncodingStyle::Form && property_encoding.explode {
-                let object = exploded_form_object_to_value(
-                    &fields,
-                    property_schema,
-                    &mut consumed_keys,
-                )?;
+                let object =
+                    exploded_form_object_to_value(&fields, property_schema, &mut consumed_keys)?;
                 if object.as_object().is_some_and(|object| !object.is_empty()) {
                     out.insert(property.clone(), object);
                 }
@@ -2065,7 +2062,9 @@ fn serialized_object_to_value(
     style: EncodingStyle,
 ) -> Result<Value, String> {
     if values.len() != 1 {
-        return Err("Serialized object property must occur exactly once when explode=false".to_string());
+        return Err(
+            "Serialized object property must occur exactly once when explode=false".to_string(),
+        );
     }
     let tokens = match raw_values {
         Some(raw_values) if raw_values.len() == 1 => split_raw_form_tokens(&raw_values[0], style)?
@@ -2079,7 +2078,9 @@ fn serialized_object_to_value(
 
 fn object_tokens_to_value(tokens: Vec<String>, schema: &Value) -> Result<Value, String> {
     if tokens.len() % 2 != 0 {
-        return Err("Serialized object property must contain alternating key/value items".to_string());
+        return Err(
+            "Serialized object property must contain alternating key/value items".to_string(),
+        );
     }
     let properties = merged_object_properties(schema);
     let mut out = serde_json::Map::new();
@@ -2089,13 +2090,12 @@ fn object_tokens_to_value(tokens: Vec<String>, schema: &Value) -> Result<Value, 
             return Err("Serialized object property contains an empty key".to_string());
         }
         if out.contains_key(&key) {
-            return Err(format!("Serialized object property contains duplicate key '{key}'"));
+            return Err(format!(
+                "Serialized object property contains duplicate key '{key}'"
+            ));
         }
         let child_schema = properties.get(&key).unwrap_or(&Value::Null);
-        out.insert(
-            key,
-            scalar_to_schema_value(pair[1].as_str(), child_schema)?,
-        );
+        out.insert(key, scalar_to_schema_value(pair[1].as_str(), child_schema)?);
     }
     Ok(Value::Object(out))
 }
@@ -2167,7 +2167,11 @@ fn split_raw_form_tokens(value: &str, style: EncodingStyle) -> Result<Vec<&str>,
                             && candidate[2].eq_ignore_ascii_case(&b'c')
                     }) =>
             {
-                if bytes[index] == b'|' { 1 } else { 3 }
+                if bytes[index] == b'|' {
+                    1
+                } else {
+                    3
+                }
             }
             _ => 0,
         };
@@ -2443,15 +2447,13 @@ fn serialized_multipart_object_to_value(
     style: EncodingStyle,
 ) -> Result<Value, String> {
     if values.len() != 1 {
-        return Err("Serialized multipart object property must occur exactly once when explode=false"
-            .to_string());
+        return Err(
+            "Serialized multipart object property must occur exactly once when explode=false"
+                .to_string(),
+        );
     }
-    let text = std::str::from_utf8(&values[0].body).map_err(|error| {
-        format!(
-            "Multipart field '{}' is not UTF-8: {error}",
-            values[0].name
-        )
-    })?;
+    let text = std::str::from_utf8(&values[0].body)
+        .map_err(|error| format!("Multipart field '{}' is not UTF-8: {error}", values[0].name))?;
     object_tokens_to_value(split_decoded_style_value(text, style), schema)
 }
 
@@ -2614,12 +2616,7 @@ fn values_to_schema_value(
             };
             values
                 .iter()
-                .flat_map(|value| {
-                    value
-                        .split(delimiter)
-                        .map(str::trim)
-                        .map(str::to_string)
-                })
+                .flat_map(|value| value.split(delimiter).map(str::trim).map(str::to_string))
                 .collect()
         } else {
             values.to_vec()

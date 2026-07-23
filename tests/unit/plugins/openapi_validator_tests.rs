@@ -1588,10 +1588,7 @@ async fn urlencoded_deep_object_encoding_rebuilds_objects() {
 
 #[tokio::test]
 async fn urlencoded_form_object_encoding_honors_explode_modes() {
-    for (explode, body) in [
-        (true, "R=100&G=200"),
-        (false, "color=R,100,G,200"),
-    ] {
+    for (explode, body) in [(true, "R=100&G=200"), (false, "color=R,100,G,200")] {
         let plugin = OpenapiValidator::new(&json!({
             "operations": [{
                 "method": "POST",
@@ -1671,11 +1668,7 @@ async fn urlencoded_explode_false_splits_before_percent_decoding() {
     ctx.headers = headers.clone();
     assert_continue(
         plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &headers,
-                b"tags=red%2Cgreen,blue",
-            )
+            .on_final_request_body_with_context(&mut ctx, &headers, b"tags=red%2Cgreen,blue")
             .await,
     );
 }
