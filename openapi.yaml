@@ -18198,13 +18198,13 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
           enum: [metadata_only, redacted_body, full_body, hash_only]
           default: redacted_body
-          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts — SSE captures whose frames are all parseable OpenAI chat.completion.chunk frames export a reassembled per-choice completion-text excerpt (annotated sse_reassembled) so PII split across streaming deltas cannot evade per-frame redaction; other SSE shapes keep the per-frame-redacted raw frames. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256 (a mostly-predictable payload around one secret would make an unkeyed digest an offline brute-force oracle)."
+          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Other or malformed SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
         allow_full_body:
           type: boolean
           default: false
@@ -18249,6 +18249,7 @@ components:
             always_capture_on_guardrail:
               type: boolean
               default: true
+              description: "Override a losing sampling roll for a fired guardrail. A non-empty ai_tool_governor.decision other than allow (deny, dry_run, require_approval, or redact_args) fires this override on request, buffered-response, and terminal-stream paths; ordinary allow does not. Exported guardrails include bounded ai_tool_governor.enabled, mode, decision, tool_names, risk, policy_ids, approval_id, arguments_hashes, and redacted_tools fields."
             always_capture_on_error:
               type: boolean
               default: true
@@ -18260,7 +18261,7 @@ components:
         redaction:
           type: [object, "null"]
           additionalProperties: false
-          description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
+          description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt). redacted_body also replaces values beneath normalized sensitive parent keys and recursively redacts JSON-encoded object/array strings before applying regex patterns."
           properties:
             builtins:
               type: array
@@ -18312,7 +18313,7 @@ components:
           type: object
           required: [endpoint_url]
           additionalProperties: false
-          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Unknown sink keys are rejected; custom_headers remains an open string map."
+          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map."
           properties:
             type:
               type: string
@@ -18321,7 +18322,11 @@ components:
             endpoint_url:
               type: string
               format: uri
-              description: "http(s) collector URL."
+              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true."
+            allow_insecure_loopback:
+              type: boolean
+              default: false
+              description: "Allow an http:// collector only when endpoint_url uses localhost or a loopback IP. This never permits remote cleartext delivery."
             custom_headers:
               type: object
               additionalProperties:
@@ -18357,12 +18362,12 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue is full (never block). reject: fail selected buffered or streaming audit records with 503 before response commit when a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
+              description: "drop: silently drop when the queue or 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail selected buffered or streaming audit records with 503 before response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
           type: [object, "null"]
           additionalProperties: false

@@ -102,10 +102,14 @@ pub async fn run_response_stream_termination_hooks(
     // Reusing the client deadline here would make timed-out traffic vanish
     // from exactly the cleanup/observability path meant to record it.
     crate::plugins::wait_for_response_stream_inspector(ctx).await;
-    for plugin in plugins {
-        plugin
-            .on_response_stream_terminated(ctx, response_status, outcome)
-            .await;
+    for deferred in [false, true] {
+        for plugin in plugins.iter().filter(|plugin| {
+            plugin.defers_response_stream_termination_until_after_peers() == deferred
+        }) {
+            plugin
+                .on_response_stream_terminated(ctx, response_status, outcome)
+                .await;
+        }
     }
     crate::plugins::clear_response_stream_inspector_state(ctx);
 }
