@@ -1709,6 +1709,7 @@ fn clickhouse_status_classification_distinguishes_permanent_and_retryable() {
     assert_eq!(classify_clickhouse_http_status_for_tests(429), "retryable");
     assert_eq!(classify_clickhouse_http_status_for_tests(500), "retryable");
     assert_eq!(classify_clickhouse_http_status_for_tests(503), "retryable");
+    assert_eq!(classify_clickhouse_http_status_for_tests(302), "retryable");
 }
 
 fn test_spool(temp: &tempfile::TempDir) -> SpoolManager {
@@ -1870,8 +1871,8 @@ async fn replay_dead_letters_permanent_401_and_403() {
 }
 
 #[tokio::test]
-async fn replay_stops_on_retryable_408_429_and_5xx_without_removing_file() {
-    for status in [408u16, 429u16, 500u16, 503u16] {
+async fn replay_stops_on_retryable_redirect_408_429_and_5xx_without_removing_file() {
+    for status in [302u16, 408u16, 429u16, 500u16, 503u16] {
         let server = MockServer::start().await;
         mount_status_sequence(&server, &[status]).await;
 
