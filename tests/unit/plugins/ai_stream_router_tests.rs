@@ -1418,11 +1418,13 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
     assert!(text.contains("oversized"), "{text}");
     assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
 
-    // After termination the inspector is inert.
+    // After termination the inspector keeps the stream closed without
+    // emitting the terminal payload a second time.
     let after = inspector.on_chunk(b"data: {}\n\n").await;
     match after {
-        ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
-        ResponseStreamAction::Terminate(_) => panic!("must not terminate twice"),
+        ResponseStreamAction::Terminate(None) => {}
+        ResponseStreamAction::Terminate(Some(_)) => panic!("must not emit terminal bytes twice"),
+        ResponseStreamAction::Forward(_) => panic!("terminated inspector must remain closed"),
     }
 }
 
