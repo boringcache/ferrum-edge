@@ -9,7 +9,10 @@
 //! nonce replay protection.
 //!
 //! Runs in `before_proxy` with request body buffering. Priority 1500 places
-//! it in the AuthN band after HMAC auth.
+//! it in the AuthN band after HMAC auth. When a co-located `compression`
+//! plugin enables `decompress_request`, configured gzip/Brotli decoding runs
+//! in the shared pre-`before_proxy` normalization phase so this plugin
+//! validates the same size-bounded plaintext the backend receives.
 //!
 //! ## Request body character encoding
 //!

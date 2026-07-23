@@ -2,6 +2,7 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
+//! `normalize_buffered_request_body_before_before_proxy` →
 //! `before_proxy` → backend-path policy enforcement →
 //! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
@@ -5620,6 +5621,38 @@ pub trait Plugin: Send + Sync {
     /// `before_proxy`.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         false
+    }
+
+    /// Returns `true` when this plugin rewrites the prebuffered request body
+    /// after the pre-`before_proxy` buffer is stored and before any
+    /// `before_proxy` hook runs.
+    ///
+    /// Use this for gateway-owned request-body normalization that later
+    /// `before_proxy` consumers must observe (for example configured gzip/Brotli
+    /// request decompression so `soap_ws_security` validates plaintext XML).
+    /// Ordinary body transforms that only need to affect the backend-visible
+    /// bytes should keep using `transform_request_body` instead.
+    fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        false
+    }
+
+    /// Optionally rewrite `body` (and related request headers) before the
+    /// `before_proxy` phase.
+    ///
+    /// The proxy invokes this only for plugins that return `true` from
+    /// [`normalizes_buffered_request_body_before_before_proxy`] after the
+    /// pre-`before_proxy` buffer is stored on H1/H2 and native H3. Successful
+    /// rewrites must leave `body` as the authoritative plaintext that later
+    /// `before_proxy` hooks and the eventual backend forward path observe.
+    /// Reject to fail closed on malformed or over-limit input before header
+    /// normalization commits.
+    async fn normalize_buffered_request_body_before_before_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &mut HashMap<String, String>,
+        _body: &mut Vec<u8>,
+    ) -> PluginResult {
+        PluginResult::Continue
     }
 
     /// Returns `true` if this plugin needs the raw request body to be available

@@ -1,6 +1,6 @@
 //! Unit tests for the `ai_stream_router` plugin.
 
-use super::plugin_utils::create_test_proxy;
+use super::plugin_utils::{create_test_proxy, normalize_compressed_request_for_plugin_test};
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::ai_federation::AiFederation;
 use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
@@ -659,6 +659,53 @@ async fn test_route_override_and_metadata_set_for_openai() {
             .map(String::as_str),
         Some("0")
     );
+}
+
+#[tokio::test]
+async fn configured_decompression_routes_compressed_streaming_requests() {
+    let plugin = build(openai_and_anthropic_config());
+    let request = serde_json::to_vec(&json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "route compressed request"}]
+    }))
+    .unwrap();
+
+    for encoding in ["gzip", "br"] {
+        let (mut ctx, mut headers, normalized) = normalize_compressed_request_for_plugin_test(
+            "application/json",
+            "/v1/chat/completions",
+            encoding,
+            &request,
+        )
+        .await;
+        assert_eq!(normalized, request);
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata
+                .get("ai_stream_router_claimed")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_stream_router.provider")
+                .map(String::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            ctx.route_override_backend_host.as_deref(),
+            Some("api.anthropic.com")
+        );
+        assert_eq!(
+            headers.get("x-api-key").map(String::as_str),
+            Some("sk-ant-secret")
+        );
+        assert!(!headers.contains_key("content-encoding"));
+    }
 }
 
 #[tokio::test]

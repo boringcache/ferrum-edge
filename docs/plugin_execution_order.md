@@ -66,6 +66,11 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
+│ 3b. normalize body      │  Opt-in buffered request decompression before before_proxy
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
 │ 4. before_proxy         │  Route/header preparation before backend-path policy
 └────────────┬────────────┘
              │
@@ -604,7 +609,7 @@ Given all built-in plugins enabled, the execution order is:
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 57 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
 | 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 59 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 59 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 61 | `ai_federation` | 4060 | final request body (HTTP only) |
 | 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body |
@@ -759,7 +764,7 @@ Request transformers run after authentication and authorization, so they only mo
 
 ### Compression runs after response transformation (4050)
 
-The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
+The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, before `ai_prompt_compressor` (4055) so opt-in request decompression exposes plaintext prompt JSON before prompt compression, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200). Gateway-owned compression therefore presents normalized bytes to the later AI hooks. If an origin nevertheless returns an encoded JSON/SSE body, `ai_token_metrics` performs its own bounded inspection-only decoding without normalizing the client-visible bytes or headers. Configured request decompression (`decompress_request`) additionally runs in the shared pre-`before_proxy` body-normalization phase on H1/H2 and native H3 so earlier `before_proxy` body consumers (including `soap_ws_security` at priority 1500) observe the same size-bounded plaintext that is forwarded upstream. In `before_proxy`, compression can strip `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
 
 ### Logging runs last (9000+)
 

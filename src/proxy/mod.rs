@@ -2702,6 +2702,84 @@ pub(crate) fn store_request_body_metadata(
     }
 }
 
+/// Refresh body-derived request views after an early normalization rewrite.
+///
+/// Digests are intentionally left untouched: authenticate may already have
+/// verified integrity over the original wire bytes. Size/text/bytes views must
+/// track the normalized plaintext so later `before_proxy` consumers (SOAP,
+/// mirrors, etc.) inspect the same bytes the backend will receive.
+pub(crate) fn refresh_request_body_views_after_normalization(
+    ctx: &mut RequestContext,
+    body: &[u8],
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+) {
+    ctx.metadata.insert(
+        "request_body_size_bytes".to_string(),
+        body.len().to_string(),
+    );
+    if needs_body_bytes || ctx.request_body_bytes.is_some() {
+        ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    }
+    if needs_body_text || ctx.metadata.contains_key("request_body") {
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            ctx.metadata
+                .insert("request_body".to_string(), body_str.to_string());
+        } else {
+            ctx.metadata.remove("request_body");
+        }
+    }
+}
+
+/// Run opt-in buffered-body normalizers after the pre-`before_proxy` buffer is
+/// stored and before any `before_proxy` hook.
+///
+/// Configured request decompression lives here so earlier body consumers see
+/// validated plaintext without each plugin reimplementing gzip/Brotli decode.
+pub(crate) async fn apply_buffered_request_body_normalization_before_before_proxy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: &mut Vec<u8>,
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+) -> PluginResult {
+    let was_decoded = ctx
+        .metadata
+        .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    for plugin in plugins {
+        if !plugin.normalizes_buffered_request_body_before_before_proxy() {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.normalize_buffered_request_body_before_before_proxy(ctx, headers, body),
+        )
+        .await
+        .into_plugin_result(ctx)
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
+        }
+    }
+    let body_was_rewritten = !was_decoded
+        && ctx
+            .metadata
+            .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    if body_was_rewritten {
+        refresh_request_body_views_after_normalization(
+            ctx,
+            body,
+            needs_body_text,
+            needs_body_bytes,
+        );
+    }
+    PluginResult::Continue
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RequestBodyPhaseRequirements {
     pub required: bool,
@@ -19450,6 +19528,74 @@ async fn handle_proxy_request_inner(
                 ClientRequestBody::Buffered(body)
             }
         };
+    }
+
+    // Opt-in buffered-body normalization (configured request decompression)
+    // runs after the pre-`before_proxy` buffer is stored and before any
+    // `before_proxy` hook, so earlier body consumers see validated plaintext.
+    if capabilities.has(PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
+        && let ClientRequestBody::Buffered(body) = &mut client_request_body
+    {
+        let phase_start = Instant::now();
+        let mut tmp_headers = std::mem::take(&mut ctx.headers);
+        let normalize_result = apply_buffered_request_body_normalization_before_before_proxy(
+            &plugins,
+            &mut ctx,
+            &mut tmp_headers,
+            body,
+            before_proxy_body_requirements.needs_text,
+            before_proxy_body_requirements.needs_bytes,
+        )
+        .await;
+        ctx.headers = tmp_headers;
+        match normalize_result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!("request-body normalization rejection could not be normalized");
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status_code = plugin_reject.status_code;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "normalize_buffered_request_body",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
