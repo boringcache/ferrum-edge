@@ -17500,8 +17500,11 @@ components:
         request-only markers, and proxy-owned X-Forwarded-* identity); these
         forwarding fields are stripped rather than regenerated, so mirrors do
         not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
-        the mirror URL. Native gRPC mirrors require HTTP/2 and re-synthesise te:
-        trailers. The mirror request-target preserves the raw query (after the
+        the mirror URL. Native gRPC mirrors re-synthesise te: trailers and dial
+        via the shared PluginHttpClient HTTP/2 companion (h2c prior knowledge for
+        cleartext http targets; ALPN h2 for https). Ordinary HTTP mirrors keep
+        the default all-version client so HTTP/1.1 destinations continue to work.
+        The mirror request-target preserves the raw query (after the
         same auth credential strips as primary) including repeated pairs,
         order, flags, empty values, +, percent escapes, and non-ASCII encoded
         bytes.
@@ -17521,7 +17524,11 @@ components:
           type: string
           enum: [http, https]
           default: http
-          description: "Transport protocol used for the mirror request."
+          description: >
+            Transport scheme for the mirror URL. For native gRPC content-types,
+            http uses cleartext HTTP/2 prior knowledge (h2c) and https negotiates
+            ALPN h2 via the shared plugin HTTP/2 companion. Ordinary HTTP mirrors
+            retain the default all-version client (HTTP/1.1 capable).
         mirror_path:
           type: string
           pattern: '^$|^/[^?#]*$'

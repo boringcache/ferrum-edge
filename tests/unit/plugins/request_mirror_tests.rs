@@ -621,6 +621,14 @@ fn max_in_flight_is_documented_across_source_guide_and_example() {
         "request_mirror YAML example must include max_in_flight"
     );
     assert!(section.contains("without affecting the primary request"));
+    assert!(
+        section.contains("h2c prior knowledge") && section.contains("ALPN `h2`"),
+        "public guide must document gRPC mirror HTTP/2 transport selection"
+    );
+    assert!(
+        source.contains("get_http2") && source.contains("is_native_grpc"),
+        "source must select the HTTP/2 companion for native gRPC mirrors"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1973,7 +1981,7 @@ async fn test_mirror_h2_h3_parity_and_grpc_te_resynthesis() {
     );
     headers.insert("x-keep".to_string(), "ok".to_string());
 
-    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    let observed = capture_mirror_request_headers_h2c(&mut ctx, &mut headers).await;
     for stripped in [
         "trailer",
         "transfer-encoding",
@@ -1991,6 +1999,112 @@ async fn test_mirror_h2_h3_parity_and_grpc_te_resynthesis() {
         "gRPC mirror must re-synthesise te: trailers after generic strip: {observed:?}"
     );
     assert_eq!(observed.get("x-keep").map(String::as_str), Some("ok"));
+}
+
+/// Capture outbound mirror request headers on an h2c (prior-knowledge) sink.
+///
+/// Native gRPC mirrors dial the HTTP/2 companion client, so an HTTP/1.1
+/// capture server cannot observe them.
+async fn capture_mirror_request_headers_h2c(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> HashMap<String, String> {
+    use bytes::Bytes;
+    use h2::server as h2_server;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<HashMap<String, String>>();
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok((mut connection, mut h2)) = h2_server::handshake(tcp).await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        if let Some(Ok((request, mut respond))) = h2.accept().await {
+            let mut captured = HashMap::new();
+            for (name, value) in request.headers().iter() {
+                if let Ok(v) = value.to_str() {
+                    captured.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+                }
+            }
+            let response = http::Response::builder()
+                .status(200)
+                .body(())
+                .expect("empty response");
+            if let Ok(mut send) = respond.send_response(response, false) {
+                let _ = send.send_data(Bytes::new(), true);
+            }
+            let _ = tx.send(captured);
+        }
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "percentage": 100.0
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let _ = plugin.before_proxy(ctx, headers).await;
+    let _ = ctx.collect_mirror_result().await;
+    rx.await.expect("h2c mirror sink should capture headers")
+}
+
+#[tokio::test]
+async fn test_native_grpc_mirror_uses_h2c_prior_knowledge() {
+    // Issue #2472: cleartext gRPC mirrors must speak h2c, not HTTP/1.1.
+    let mut ctx = make_ctx_with_proxy();
+    ctx.path = "/pkg.Service/Method".to_string();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("te".to_string(), "trailers".to_string());
+    headers.insert("grpc-timeout".to_string(), "1S".to_string());
+
+    let observed = capture_mirror_request_headers_h2c(&mut ctx, &mut headers).await;
+    assert_eq!(
+        observed.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        observed.get("te").map(String::as_str),
+        Some("trailers"),
+        "h2c gRPC mirror must carry synthesised te: trailers: {observed:?}"
+    );
+    assert_eq!(
+        observed.get("grpc-timeout").map(String::as_str),
+        Some("1S"),
+        "gRPC metadata must survive the mirror path: {observed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_ordinary_http_mirror_still_uses_http1() {
+    // Non-gRPC mirrors must remain HTTP/1.1-capable against plain H1 sinks.
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("x-custom".to_string(), "keep".to_string());
+
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert_eq!(
+        observed.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(observed.get("x-custom").map(String::as_str), Some("keep"));
+    assert!(
+        !observed.contains_key("te"),
+        "ordinary HTTP mirrors must not inject te: trailers: {observed:?}"
+    );
 }
 
 async fn capture_mirror_request_line(ctx: &mut RequestContext) -> String {
@@ -2137,9 +2251,79 @@ async fn test_mirror_rejects_grpc_prefix_smuggling_for_te_resynthesis() {
     );
     headers.insert("te".to_string(), "gzip".to_string());
 
+    // Prefix-smuggled types are not native gRPC, so the mirror stays on the
+    // default HTTP client and an H1 capture sink observes the strip.
     let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
     assert!(
         !observed.contains_key("te"),
         "prefix-smuggled content-type must not re-synthesise te: {observed:?}"
     );
+}
+
+#[tokio::test]
+async fn test_grpc_mirror_preserves_binary_body_over_h2c() {
+    use bytes::Bytes;
+    use h2::server as h2_server;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok((mut connection, mut h2)) = h2_server::handshake(tcp).await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        if let Some(Ok((request, mut respond))) = h2.accept().await {
+            let mut body = request.into_body();
+            let mut buf = Vec::new();
+            while let Some(chunk) = body.data().await {
+                if let Ok(bytes) = chunk {
+                    let _ = body.flow_control().release_capacity(bytes.len());
+                    buf.extend_from_slice(&bytes);
+                }
+            }
+            let response = http::Response::builder()
+                .status(200)
+                .body(())
+                .expect("empty response");
+            if let Ok(mut send) = respond.send_response(response, false) {
+                let _ = send.send_data(Bytes::new(), true);
+            }
+            let _ = tx.send(buf);
+        }
+    });
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.path = "/pkg.Service/Echo".to_string();
+    // Length-prefixed gRPC frame: flag=0, length=4, payload=deadbeef
+    let grpc_frame = vec![0, 0, 0, 0, 4, 0xde, 0xad, 0xbe, 0xef];
+    ctx.request_body_bytes = Some(bytes::Bytes::from(grpc_frame.clone()));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": true,
+            "percentage": 100.0
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let meta = ctx.collect_mirror_result().await.expect("mirror result");
+    assert!(
+        meta.mirror_error.is_none(),
+        "h2c gRPC mirror with binary body failed: {meta:?}"
+    );
+    let body = rx.await.expect("h2c sink should capture body");
+    assert_eq!(body, grpc_frame, "binary gRPC frame must be preserved byte-for-byte");
 }

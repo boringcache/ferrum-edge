@@ -431,3 +431,101 @@ async fn test_shared_client_does_not_follow_redirects() {
         "the redirect target must not have been fetched"
     );
 }
+
+#[tokio::test]
+async fn get_http2_companion_speaks_h2c_prior_knowledge() {
+    use bytes::Bytes;
+    use h2::server as h2_server;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<http::Version>();
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok((mut connection, mut h2)) = h2_server::handshake(tcp).await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        if let Some(Ok((request, mut respond))) = h2.accept().await {
+            let version = request.version();
+            let response = http::Response::builder()
+                .status(200)
+                .body(())
+                .expect("empty response");
+            if let Ok(mut send) = respond.send_response(response, false) {
+                let _ = send.send_data(Bytes::new(), true);
+            }
+            let _ = tx.send(version);
+        }
+    });
+
+    let client = default_client();
+    let url = format!("http://{addr}/grpc");
+    let req = client
+        .get_http2()
+        .post(&url)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Bytes::from_static(b"\x00\x00\x00\x00\x00"));
+    let resp = client
+        .execute_redacted(req, "http2_companion", &url)
+        .await
+        .expect("h2c prior-knowledge request");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        rx.await.expect("h2c sink"),
+        http::Version::HTTP_2,
+        "get_http2 must force h2c prior knowledge"
+    );
+}
+
+#[tokio::test]
+async fn default_get_client_still_speaks_http1_to_plain_sinks() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = tx.send(head);
+        }
+    });
+
+    let client = default_client();
+    let url = format!("http://{addr}/plain");
+    let req = client.get().get(&url);
+    let resp = client.execute(req, "http1_default").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let head = rx.await.expect("http1 sink");
+    assert!(
+        head.starts_with("GET /plain HTTP/1.1"),
+        "default client must remain HTTP/1.1 capable: {head}"
+    );
+}
