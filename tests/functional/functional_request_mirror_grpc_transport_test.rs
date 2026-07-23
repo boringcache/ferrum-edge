@@ -66,11 +66,11 @@ fn grpc_mirror_yaml(
         "version": "1",
         "proxies": [{
             "id": "grpc-mirror-transport",
-            "listen_path": "/grpc",
+            "listen_path": "/",
             "backend_scheme": "http",
             "backend_host": "127.0.0.1",
             "backend_port": primary_port,
-            "strip_listen_path": true,
+            "strip_listen_path": false,
             "backend_connect_timeout_ms": 2000,
             "backend_read_timeout_ms": backend_read_timeout_ms,
             "backend_write_timeout_ms": 5000,
@@ -299,10 +299,7 @@ async fn request_mirror_grpc_h2c_prior_knowledge_carries_te_trailers() {
 
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
     let response = client
-        .unary(
-            &format!("/grpc{UNARY_PATH}"),
-            Bytes::from_static(UNARY_BODY),
-        )
+        .unary(UNARY_PATH, Bytes::from_static(UNARY_BODY))
         .await
         .expect("unary rpc");
     assert_eq!(response.grpc_status(), Some(0), "response={response:?}");
@@ -339,10 +336,7 @@ async fn request_mirror_grpc_tls_alpn_h2_carries_te_trailers() {
 
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
     let response = client
-        .unary(
-            &format!("/grpc{UNARY_PATH}"),
-            Bytes::from_static(UNARY_BODY),
-        )
+        .unary(UNARY_PATH, Bytes::from_static(UNARY_BODY))
         .await
         .expect("unary rpc");
     assert_eq!(response.grpc_status(), Some(0), "response={response:?}");
@@ -440,7 +434,7 @@ async fn request_mirror_grpc_h2c_streaming_shapes_and_multiframe_body() {
 
     let client_stream = h2c_grpc_request(
         &gw,
-        &format!("/grpc{CLIENT_STREAM_PATH}"),
+        CLIENT_STREAM_PATH,
         multi_frame.clone(),
         &[],
         true,
@@ -454,10 +448,7 @@ async fn request_mirror_grpc_h2c_streaming_shapes_and_multiframe_body() {
     );
 
     let server_stream = client
-        .unary(
-            &format!("/grpc{SERVER_STREAM_PATH}"),
-            Bytes::from_static(b"bbox"),
-        )
+        .unary(SERVER_STREAM_PATH, Bytes::from_static(b"bbox"))
         .await
         .expect("server-stream rpc");
     assert_eq!(
@@ -471,11 +462,7 @@ async fn request_mirror_grpc_h2c_streaming_shapes_and_multiframe_body() {
     );
 
     let bidi = client
-        .bidi_with_headers(
-            &format!("/grpc{BIDI_PATH}"),
-            Bytes::from_static(b"note-1"),
-            &[],
-        )
+        .bidi_with_headers(BIDI_PATH, Bytes::from_static(b"note-1"), &[])
         .await
         .expect("bidi rpc");
     assert_eq!(bidi.grpc_status(), Some(0), "response={bidi:?}");
@@ -581,7 +568,7 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
 
     let client_stream = h2c_grpc_request(
         &gw,
-        &format!("/grpc{CLIENT_STREAM_PATH}"),
+        CLIENT_STREAM_PATH,
         multi_frame.clone(),
         &[],
         true,
@@ -595,10 +582,7 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
     );
 
     let server_stream = client
-        .unary(
-            &format!("/grpc{SERVER_STREAM_PATH}"),
-            Bytes::from_static(b"bbox"),
-        )
+        .unary(SERVER_STREAM_PATH, Bytes::from_static(b"bbox"))
         .await
         .expect("tls server-stream rpc");
     assert_eq!(
@@ -608,11 +592,7 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
     );
 
     let bidi = client
-        .bidi_with_headers(
-            &format!("/grpc{BIDI_PATH}"),
-            Bytes::from_static(b"note-1"),
-            &[],
-        )
+        .bidi_with_headers(BIDI_PATH, Bytes::from_static(b"note-1"), &[])
         .await
         .expect("tls bidi rpc");
     assert_eq!(bidi.grpc_status(), Some(0), "response={bidi:?}");
@@ -671,7 +651,7 @@ async fn request_mirror_grpc_h2c_missing_and_client_supplied_te() {
 
     let missing_te = h2c_grpc_request(
         &gw,
-        &format!("/grpc{UNARY_PATH}"),
+        UNARY_PATH,
         body.clone(),
         &[],
         /* include_default_te */ false,
@@ -685,7 +665,7 @@ async fn request_mirror_grpc_h2c_missing_and_client_supplied_te() {
     // unit suite covers that strip → `te: trailers` re-synthesis directly.
     let client_te = h2c_grpc_request(
         &gw,
-        &format!("/grpc{UNARY_PATH}"),
+        UNARY_PATH,
         body,
         &[("te", "trailers")],
         /* include_default_te */ false,
@@ -736,10 +716,7 @@ async fn request_mirror_grpc_h2c_mirror_error_status_does_not_affect_primary() {
 
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
     let response = client
-        .unary(
-            &format!("/grpc{UNARY_PATH}"),
-            Bytes::from_static(UNARY_BODY),
-        )
+        .unary(UNARY_PATH, Bytes::from_static(UNARY_BODY))
         .await
         .expect("unary rpc");
     assert_eq!(
@@ -793,10 +770,7 @@ async fn request_mirror_grpc_h2c_reuses_http2_connection_across_mirrors() {
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
     for _ in 0..2 {
         let response = client
-            .unary(
-                &format!("/grpc{UNARY_PATH}"),
-                Bytes::from_static(UNARY_BODY),
-            )
+            .unary(UNARY_PATH, Bytes::from_static(UNARY_BODY))
             .await
             .expect("unary rpc");
         assert_eq!(response.grpc_status(), Some(0), "response={response:?}");
