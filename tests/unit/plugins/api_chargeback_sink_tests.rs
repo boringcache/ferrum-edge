@@ -1854,9 +1854,9 @@ fn snapshot_preserves_display_name_changes_as_separate_identities() {
     assert_eq!(events[1].proxy_name, "Payments v2");
     assert_eq!(events[1].call_count, 1);
     assert!(
-        events
-            .iter()
-            .all(|event| event.route_id.as_deref() == Some("route-a") && event.proxy_id == "proxy-a")
+        events.iter().all(
+            |event| event.route_id.as_deref() == Some("route-a") && event.proxy_id == "proxy-a"
+        )
     );
 
     // Additional traffic under the new names must delta only that identity.
@@ -1892,14 +1892,7 @@ fn snapshot_keeps_supported_protocols_that_share_proxy_status_separate() {
     // omitted from the snapshot identity (issue #2583).
     for protocol in ["http", "http2", "http3"] {
         accumulator.record_http_for_test(
-            &http_summary_with_dims(
-                "proxy-a",
-                "Payments",
-                Some("route-a"),
-                None,
-                protocol,
-                200,
-            ),
+            &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, protocol, 200),
             "alice",
             charge,
         );
