@@ -2493,6 +2493,68 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
 }
 
 #[test]
+fn transcript_audit_must_precede_every_request_deduplication_instance() {
+    let audit_config = || {
+        make_plugin_config_with_json(
+            "audit",
+            "ai_transcript_audit",
+            json!({
+                "capture": {
+                    "request": true,
+                    "response": true
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+    let dedup_config = || {
+        make_plugin_config(
+            "dedup",
+            "request_deduplication",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )
+    };
+
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec!["audit", "dedup"])],
+        vec![audit_config(), dedup_config()],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&valid, None)
+        .expect("default audit priority must stage before deduplication");
+    PluginCache::new(&valid).expect("runtime cache must accept the safe order");
+
+    for invalid_priority in [2750, 2800] {
+        let mut audit = audit_config();
+        audit.priority_override = Some(invalid_priority);
+        let invalid = make_config(
+            vec![make_proxy("p1", "/api", vec!["audit", "dedup"])],
+            vec![audit, dedup_config()],
+        );
+        let candidate_error =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&invalid, None)
+                .expect_err("candidate write must reject audit after/equal to deduplication");
+        assert!(
+            candidate_error.contains("must run before every request_deduplication"),
+            "priority={invalid_priority}, got: {candidate_error}"
+        );
+        let runtime_error = PluginCache::new(&invalid)
+            .err()
+            .expect("runtime cache must repeat the fail-closed ordering check");
+        assert!(
+            runtime_error.contains("must run before every request_deduplication"),
+            "priority={invalid_priority}, got: {runtime_error}"
+        );
+    }
+}
+
+#[test]
 fn candidate_serverless_composition_uses_pure_capabilities_not_runtime_credentials() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["dedup", "function"])],
@@ -6223,6 +6285,10 @@ async fn test_priority_override_delegates_deadline_rejection_replacement_capabil
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
     assert!(plugins[0].may_replace_rejection_response());
+    assert!(
+        plugins[0].defers_response_stream_termination_until_after_peers(),
+        "priority override wrappers must preserve audit terminal-observer ordering"
+    );
 }
 
 #[test]

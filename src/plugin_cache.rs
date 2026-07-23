@@ -317,6 +317,26 @@ fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(
                 ));
             }
         }
+
+        for audit in plugins.iter().filter(|plugin| {
+            plugin.supported_protocols().contains(&protocol)
+                && plugin.name() == "ai_transcript_audit"
+        }) {
+            if let Some(deduplication) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() == "request_deduplication"
+                    && plugin.priority() <= audit.priority()
+            }) {
+                return Err(format!(
+                    "ai_transcript_audit at effective priority {} must run before every \
+                     request_deduplication instance for protocol {:?}; request_deduplication \
+                     priority {} could return a cached response before audit staging",
+                    audit.priority(),
+                    protocol,
+                    deduplication.priority(),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -905,6 +925,10 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn requires_response_stream_hooks(&self) -> bool {
         self.inner.requires_response_stream_hooks()
+    }
+    fn defers_response_stream_termination_until_after_peers(&self) -> bool {
+        self.inner
+            .defers_response_stream_termination_until_after_peers()
     }
     fn on_response_stream_selected(
         &self,
@@ -2514,6 +2538,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "request_transformer",
     "compression",
     "grpc_web",
+    "ai_transcript_audit",
     "ai_prompt_shield",
     "ai_stream_router",
     "mcp_gateway",
