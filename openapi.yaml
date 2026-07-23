@@ -17066,14 +17066,22 @@ components:
             content:
               type: object
               additionalProperties:
-                $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
-              description: Media type to JSON Schema map (object or boolean schemas).
+                $ref: "#/components/schemas/OpenapiValidatorMediaTypeContent"
+              description: >
+                Media type to schema map. Each entry is either a bare JSON Schema
+                (object or boolean) or, when encoding metadata is present, a Media
+                Type Object with required `schema` and `encoding` fields.
             content_type:
               type: string
               description: Alternate single-schema form.
             schema:
               $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
               description: Alternate single-schema form (object or boolean schema).
+            encoding:
+              $ref: "#/components/schemas/OpenapiValidatorEncodingMap"
+              description: >
+                Alternate single-schema form encoding map. Only valid with
+                application/x-www-form-urlencoded or multipart/form-data.
           description: Request body schemas by media type.
         responses:
           type: object
@@ -17085,6 +17093,80 @@ components:
             Status code to media type to JSON Schema map (object or boolean schemas).
             Exact status codes are checked first, OpenAPI wildcard ranges such as `4XX`
             are checked next, and `default` is used as the final fallback.
+
+    OpenapiValidatorMediaTypeContent:
+      description: >
+        Request-body content entry. A bare JSON Schema is canonical when no
+        Encoding Object is present. An entry with `encoding` must use the strict
+        Media Type Object shape, preventing ambiguous schema/wrapper parsing.
+      oneOf:
+        - allOf:
+            - $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+            - not:
+                type: object
+                required: [encoding]
+        - type: object
+          required: [schema, encoding]
+          additionalProperties: false
+          properties:
+            schema:
+              $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+            encoding:
+              $ref: "#/components/schemas/OpenapiValidatorEncodingMap"
+
+    OpenapiValidatorEncodingMap:
+      type: object
+      additionalProperties:
+        $ref: "#/components/schemas/OpenapiValidatorEncodingObject"
+      description: >
+        OpenAPI Encoding Object map keyed by schema property name. Supported for
+        application/x-www-form-urlencoded and multipart/form-data. Unsupported
+        style/explode combinations are rejected at admission.
+
+    OpenapiValidatorEncodingObject:
+      type: object
+      additionalProperties: false
+      properties:
+        style:
+          type: string
+          enum: [form, spaceDelimited, pipeDelimited, deepObject]
+          default: form
+          description: >
+            Serialization style. `form` (default), `spaceDelimited`,
+            `pipeDelimited`, and `deepObject` are supported. Path/header styles
+            such as `matrix`, `label`, and `simple` are rejected.
+        explode:
+          type: boolean
+          description: >
+            Defaults to true for `form`, false otherwise. `spaceDelimited` and
+            `pipeDelimited` require explode=false; `deepObject` requires
+            explode=true.
+        allowReserved:
+          type: boolean
+          default: false
+          description: >
+            OpenAPI allowReserved flag. When false, literal RFC 3986 reserved
+            bytes in form values are rejected and must be percent-encoded
+            (serialization delimiters such as the form explode=false comma remain valid).
+        contentType:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: >
+            Expected multipart part Content-Type (comma-separated list allowed).
+            Only valid for multipart/form-data.
+        headers:
+          type: object
+          maxProperties: 32
+          propertyNames:
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          additionalProperties: true
+          description: >
+            Additional multipart part Header Objects. Present values are validated
+            against their schemas; an absent header fails only when its Header Object
+            sets required=true (the OpenAPI default is false). Only valid for
+            multipart/form-data. Must not redefine Content-Type, Content-Disposition,
+            or Content-Transfer-Encoding.
 
     RequestTerminationConfig:
       type: object
