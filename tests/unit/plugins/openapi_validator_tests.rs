@@ -944,10 +944,7 @@ async fn multipart_file_part_with_structured_content_type_validates_actual_metad
         Some(400),
     );
 
-    let extended_filename_body = body.replace(
-        "filename=\"evil.svg\"",
-        "filename*=UTF-8''evil.svg",
-    );
+    let extended_filename_body = body.replace("filename=\"evil.svg\"", "filename*=UTF-8''evil.svg");
     let mut ctx = post_ctx("/upload");
     ctx.headers = headers.clone();
     assert_reject(
