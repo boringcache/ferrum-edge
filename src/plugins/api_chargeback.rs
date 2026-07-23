@@ -498,21 +498,43 @@ fn effective_api_chargeback_plugins_by_proxy(
 /// shared render/cleanup tunables (issue #2564).
 ///
 /// Rules:
-/// 1. After scope merging, each proxy may have at most one effective
+/// 1. The process may have at most one enabled global `api_chargeback`
+///    instance. Although a local instance shadows globals on a configured
+///    proxy, unmatched/fallback transaction paths retain the global chain, so
+///    multiple globals would still double-count.
+/// 2. After scope merging, each proxy may have at most one effective
 ///    `api_chargeback` instance. Multiple proxy-scoped, proxy-group-scoped, or
 ///    mixed attachments on one proxy are rejected — the process-global registry
 ///    has no ledger/instance dimension, so every retained hook would double-count
 ///    the same client transaction.
-/// 2. Across the whole process, every enabled `api_chargeback` instance must
+/// 3. Across the whole process, every enabled `api_chargeback` instance must
 ///    resolve to identical shared tunables
 ///    (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
-///    `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`). The
-///    lexicographically first enabled plugin-config id is the documented owner;
-///    siblings must match it. Pricing and currency may still differ per proxy.
+///    `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`). Since every
+///    constructor applies the same values, construction order cannot change
+///    registry behavior. Pricing and currency may still differ per proxy.
 pub fn validate_composition(
     config: &crate::config::types::GatewayConfig,
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+
+    let global_ids: Vec<&str> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.plugin_name == "api_chargeback"
+                && plugin.scope == crate::config::types::PluginScope::Global
+        })
+        .map(|plugin| plugin.id.as_str())
+        .collect();
+    if global_ids.len() > 1 {
+        errors.push(format!(
+            "api_chargeback permits at most one enabled global instance \
+             (shared /charges registry is exactly-once); found: {}",
+            global_ids.join(", ")
+        ));
+    }
 
     for (proxy, effective) in effective_api_chargeback_plugins_by_proxy(config) {
         if effective.len() > 1 {
@@ -533,29 +555,29 @@ pub fn validate_composition(
         .collect();
     enabled.sort_by(|a, b| a.id.cmp(&b.id));
 
-    if let Some(owner) = enabled.first() {
-        let owner_tunables = match SharedRegistryTunables::from_config(&owner.config) {
+    if let Some(reference) = enabled.first() {
+        let reference_tunables = match SharedRegistryTunables::from_config(&reference.config) {
             Ok(tunables) => tunables,
             Err(error) => {
                 errors.push(format!(
-                    "api_chargeback shared-tunable owner '{}': {error}",
-                    owner.id
+                    "api_chargeback shared tunables in '{}': {error}",
+                    reference.id
                 ));
                 return Err(errors);
             }
         };
         for sibling in enabled.iter().skip(1) {
             match SharedRegistryTunables::from_config(&sibling.config) {
-                Ok(tunables) if tunables == owner_tunables => {}
+                Ok(tunables) if tunables == reference_tunables => {}
                 Ok(_) => errors.push(format!(
                     "api_chargeback shared render/cleanup tunables must match across all enabled \
-                     instances; owner '{}' (lexicographically first id) disagrees with '{}'. \
+                     instances; '{}' disagrees with '{}'. \
                      Align render_cache_ttl_seconds, stale_entry_ttl_seconds, \
                      cache_invalidation_min_age_ms, and cleanup_interval_seconds",
-                    owner.id, sibling.id
+                    reference.id, sibling.id
                 )),
                 Err(error) => errors.push(format!(
-                    "api_chargeback shared-tunable sibling '{}': {error}",
+                    "api_chargeback shared tunables in '{}': {error}",
                     sibling.id
                 )),
             }

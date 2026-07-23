@@ -1338,6 +1338,37 @@ fn test_api_chargeback_rejects_duplicate_proxy_scoped_instances() {
 }
 
 #[test]
+fn test_api_chargeback_rejects_duplicate_global_instances_without_proxies() {
+    let config = make_config(
+        vec![],
+        vec![
+            make_plugin_config(
+                "charge-global-a",
+                "api_chargeback",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config(
+                "charge-global-b",
+                "api_chargeback",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("two process-global chargeback instances must be rejected");
+    assert!(
+        error.contains("at most one enabled global instance"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("charge-global-a") && error.contains("charge-global-b"));
+}
+
+#[test]
 fn test_api_chargeback_rejects_duplicate_proxy_group_instances() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["group-a", "group-b"])],

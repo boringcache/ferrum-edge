@@ -113,13 +113,15 @@ most one** instance per proxy. The in-memory `/charges` registry is a
 process-global singleton with no ledger/instance dimension, so two retained
 hooks would double-count one client transaction. Attach one global, one
 proxy-scoped, or one proxy-group-scoped instance per proxy — not two scoped
-attachments on the same chain. Shared render/cleanup tunables
+attachments on the same chain. At most one enabled global instance is permitted
+per process because unmatched/fallback transaction paths retain the global
+chain even where configured proxies use local overrides. Shared render/cleanup tunables
 (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
 `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`) are likewise
 process-global: when multiple instances exist on **different** proxies they
-must resolve to identical values (the lexicographically first enabled
-plugin-config id is the documented owner). Pricing and `currency` may still
-differ per proxy. See [`api_chargeback`](#api_chargeback).
+must resolve to identical values so construction order cannot alter registry
+behavior. Pricing and `currency` may still differ per proxy. See
+[`api_chargeback`](#api_chargeback).
 
 **Examples:**
 
@@ -1336,10 +1338,10 @@ proxy-group configs, or a mix of proxy and proxy-group attachments on the same
 proxy are rejected at admission/reload with a clear validation error — they
 would otherwise each receive the same transaction summary and inflate
 `total_calls` and charges. Distinct proxies may each attach their own instance
-(including different `currency` / pricing). The four shared render/cleanup
-tunables must agree across every enabled instance in the process; the
-lexicographically first enabled plugin-config id is the documented owner of
-those knobs.
+(including different `currency` / pricing). Only one enabled global instance is
+allowed process-wide because unmatched/fallback paths retain the global chain.
+The four shared render/cleanup tunables must agree across every enabled instance
+in the process, making registry behavior independent of construction order.
 
 **`proxy_name` contract:** exported `proxy_name` is live display metadata for the
 stable `proxy_id`. It is omitted from the in-memory registry key, so a name-only
