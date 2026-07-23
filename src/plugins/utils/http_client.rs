@@ -732,9 +732,9 @@ impl PluginHttpClient {
     /// Cleartext destinations use h2c; TLS destinations negotiate ALPN `h2`
     /// only. Shares DNS, TLS posture, pool/keepalive, redirect, and no-proxy
     /// invariants with [`get`]. Pass builders from this client through
-    /// [`execute`] / [`execute_redacted`] so redaction and egress screening
-    /// still run — those helpers execute on the builder's embedded client via
-    /// `RequestBuilder::build_split`.
+    /// [`execute_http2_redacted`] so redaction and egress screening still run.
+    /// The ordinary execute helpers deliberately remain pinned to the default
+    /// shared client.
     pub fn get_http2(&self) -> &reqwest::Client {
         &self.http2_client
     }
@@ -756,10 +756,8 @@ impl PluginHttpClient {
         request: reqwest::RequestBuilder,
         label: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let (client, request) = request.build_split();
-        let request = request?;
-        self.execute_request(&client, request, label, None, None)
-            .await
+        let request = request.build()?;
+        self.execute_request(request, label, None, None).await
     }
 
     /// Send a pre-built request while logging only a caller-supplied redacted
@@ -775,17 +773,47 @@ impl PluginHttpClient {
         label: &str,
         redacted_url: &str,
     ) -> Result<reqwest::Response, String> {
-        let (client, request) = request.build_split();
-        let request = request.map_err(|e| {
+        let request = request.build().map_err(|e| {
             let error_class = classify_reqwest_error(&e);
             format!("{error_class} building request to {redacted_url}")
         })?;
-        self.execute_request(&client, request, label, None, Some(redacted_url))
+        self.execute_request(request, label, None, Some(redacted_url))
             .await
             .map_err(|e| {
                 let error_class = classify_reqwest_error(&e);
                 format!("{error_class} calling {redacted_url}")
             })
+    }
+
+    /// Send a request through the trusted HTTP/2-prior-knowledge companion
+    /// while logging only a caller-supplied redacted URL.
+    ///
+    /// This is intentionally separate from [`execute_redacted`]: ordinary
+    /// plugin calls remain pinned to the default shared client, and callers
+    /// cannot choose an arbitrary embedded `reqwest::Client` through their
+    /// request builder.
+    pub async fn execute_http2_redacted(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+    ) -> Result<reqwest::Response, String> {
+        let request = request.build().map_err(|e| {
+            let error_class = classify_reqwest_error(&e);
+            format!("{error_class} building request to {redacted_url}")
+        })?;
+        self.execute_request_with_client(
+            &self.http2_client,
+            request,
+            label,
+            None,
+            Some(redacted_url),
+        )
+        .await
+        .map_err(|e| {
+            let error_class = classify_reqwest_error(&e);
+            format!("{error_class} calling {redacted_url}")
+        })
     }
 
     /// Send a request and accumulate the elapsed time into a shared counter.
@@ -801,9 +829,8 @@ impl PluginHttpClient {
         label: &str,
         accumulator: &AtomicU64,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let (client, request) = request.build_split();
-        let request = request?;
-        self.execute_request(&client, request, label, Some(accumulator), None)
+        let request = request.build()?;
+        self.execute_request(request, label, Some(accumulator), None)
             .await
     }
 
@@ -822,12 +849,11 @@ impl PluginHttpClient {
         redacted_url: &str,
         accumulator: &AtomicU64,
     ) -> Result<reqwest::Response, String> {
-        let (client, request) = request.build_split();
-        let request = request.map_err(|e| {
+        let request = request.build().map_err(|e| {
             let error_class = classify_reqwest_error(&e);
             format!("{error_class} building request to {redacted_url}")
         })?;
-        self.execute_request(&client, request, label, Some(accumulator), Some(redacted_url))
+        self.execute_request(request, label, Some(accumulator), Some(redacted_url))
             .await
             .map_err(|e| {
                 let error_class = classify_reqwest_error(&e);
@@ -844,8 +870,7 @@ impl PluginHttpClient {
         redacted_url: &str,
         accumulator: &AtomicU64,
     ) -> Result<reqwest::Response, PluginHttpFailure> {
-        let (client, request) = request.build_split();
-        let request = request.map_err(|error| PluginHttpFailure {
+        let request = request.build().map_err(|error| PluginHttpFailure {
             error_class: classify_reqwest_error(&error),
             request_reached_wire: false,
         })?;
@@ -861,7 +886,7 @@ impl PluginHttpClient {
                 request_reached_wire: false,
             });
         }
-        self.execute_request(&client, request, label, Some(accumulator), Some(redacted_url))
+        self.execute_request(request, label, Some(accumulator), Some(redacted_url))
             .await
             .map_err(|error| {
                 let error_class = classify_reqwest_error(&error);
@@ -882,6 +907,23 @@ impl PluginHttpClient {
     }
 
     async fn execute_request(
+        &self,
+        request: reqwest::Request,
+        label: &str,
+        accumulator: Option<&AtomicU64>,
+        log_url_override: Option<&str>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        self.execute_request_with_client(
+            &self.client,
+            request,
+            label,
+            accumulator,
+            log_url_override,
+        )
+        .await
+    }
+
+    async fn execute_request_with_client(
         &self,
         client: &reqwest::Client,
         request: reqwest::Request,

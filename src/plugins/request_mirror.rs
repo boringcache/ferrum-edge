@@ -700,10 +700,16 @@ impl Plugin for RequestMirror {
             // output, so stringifying it into `mirror_error` would leak those
             // secrets to every logging sink. `execute_redacted` reduces the
             // transport error to an `ErrorClass` plus the stripped URL.
-            let (status_code, response_size, error_msg) = match http_client
-                .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
-                .await
-            {
+            let response = if is_native_grpc {
+                http_client
+                    .execute_http2_redacted(req_builder, "request_mirror", &mirror_url_for_log)
+                    .await
+            } else {
+                http_client
+                    .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
+                    .await
+            };
+            let (status_code, response_size, error_msg) = match response {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     // Derive response size from content-length when available (avoids

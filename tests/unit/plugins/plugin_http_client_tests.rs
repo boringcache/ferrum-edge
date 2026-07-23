@@ -417,7 +417,10 @@ async fn test_shared_client_does_not_follow_redirects() {
         .await;
 
     let client = default_client();
-    let req = client.get().get(format!("{}/redirect", mock_server.uri()));
+    // Deliberately build with an unrelated reqwest client, whose default
+    // policy follows redirects. PluginHttpClient::execute must discard that
+    // client choice and retain the gateway-owned execution posture.
+    let req = reqwest::Client::new().get(format!("{}/redirect", mock_server.uri()));
     let resp = client.execute(req, "redirect_test").await.unwrap();
 
     assert_eq!(
@@ -474,7 +477,7 @@ async fn get_http2_companion_speaks_h2c_prior_knowledge() {
         .header("te", "trailers")
         .body(Bytes::from_static(b"\x00\x00\x00\x00\x00"));
     let resp = client
-        .execute_redacted(req, "http2_companion", &url)
+        .execute_http2_redacted(req, "http2_companion", &url)
         .await
         .expect("h2c prior-knowledge request");
     assert_eq!(resp.status(), 200);
