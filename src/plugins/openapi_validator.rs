@@ -1268,7 +1268,8 @@ fn parse_property_encoding(
             } else {
                 false
             };
-            if is_header_object && header_object.is_some_and(|object| object.contains_key("content"))
+            if is_header_object
+                && header_object.is_some_and(|object| object.contains_key("content"))
             {
                 return Err(format!(
                     "encoding['{property}'].headers['{header_name}'].content is not supported; use a schema Header Object"
