@@ -3267,7 +3267,19 @@ async fn cohere_chat_history_exact_hit_and_preamble_isolation() {
         "chat_history": [{"role": "USER", "message": "Hi"}],
         "message": "What is 2 + 2?"
     });
-    assert_exact_miss_for_variant(body, other_preamble, br#""4""#).await;
+    assert_exact_miss_for_variant(body.clone(), other_preamble, br#""4""#).await;
+
+    let stateful = json!({
+        "model": "command-r",
+        "conversation_id": "victim",
+        "message": "summarize this"
+    });
+    let other_conversation = json!({
+        "model": "command-r",
+        "conversation_id": "attacker",
+        "message": "summarize this"
+    });
+    assert_exact_miss_for_variant(stateful, other_conversation, br#""victim summary""#).await;
 }
 
 #[tokio::test]
@@ -3658,7 +3670,9 @@ async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
 #[tokio::test]
 async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
     let mock_server = MockServer::start().await;
-    mount_embedding_mock(&mock_server, 9).await;
+    // Three embedding requests per original provider family, plus the staged
+    // and lookup requests for the cross-conversation Cohere isolation case.
+    mount_embedding_mock(&mock_server, 11).await;
     let plugin = make_plugin(semantic_config(&mock_server));
 
     let cohere1 = json!({
@@ -3693,6 +3707,33 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
             None
         )
         .await
+    );
+
+    let cohere_stateful = json!({
+        "model": "command-r",
+        "conversation_id": "victim",
+        "message": "summarize this"
+    });
+    let cohere_other_conversation = json!({
+        "model": "command-r",
+        "conversation_id": "attacker",
+        "message": "summarize this another way"
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&cohere_stateful).unwrap(),
+        None,
+        br#""victim summary""#,
+    )
+    .await;
+    assert!(
+        !run_before_proxy_get_status(
+            &plugin,
+            &serde_json::to_string(&cohere_other_conversation).unwrap(),
+            None
+        )
+        .await,
+        "Cohere semantic cache must not cross conversation_id scopes"
     );
 
     let tgi1 = json!({
