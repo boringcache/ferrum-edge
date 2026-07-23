@@ -948,10 +948,15 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
 async fn chargeback_snapshot_staged_admission_covers_cache_publish_commit_gap() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool_dir = tmp.path().join("publish-gap-spool");
-    let plugin =
-        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
-            .expect("snapshot sink");
-    plugin.start_background_tasks().expect("stage snapshot sink");
+    let plugin = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&spool_dir),
+        client(),
+        "default",
+    )
+    .expect("snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("stage snapshot sink");
 
     // PluginCache publishes the staged graph immediately before invoking
     // commit_background_tasks. A concurrent reader may call the hook in that
@@ -980,24 +985,16 @@ async fn chargeback_snapshot_reload_before_first_tick_spools_old_generation_delt
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool_dir = tmp.path().join("reload-spool");
     let cfg = chargeback_snapshot_sink_config(&spool_dir);
-    let old = ApiChargebackSink::new_with_config_id(
-        &cfg,
-        client(),
-        "default",
-        Some("snapshot-reload"),
-    )
-    .expect("old generation");
+    let old =
+        ApiChargebackSink::new_with_config_id(&cfg, client(), "default", Some("snapshot-reload"))
+            .expect("old generation");
     old.start_background_tasks().expect("start old generation");
     old.commit_background_tasks();
     old.log(&create_test_transaction_summary()).await;
 
-    let replacement = ApiChargebackSink::new_with_config_id(
-        &cfg,
-        client(),
-        "default",
-        Some("snapshot-reload"),
-    )
-    .expect("replacement generation");
+    let replacement =
+        ApiChargebackSink::new_with_config_id(&cfg, client(), "default", Some("snapshot-reload"))
+            .expect("replacement generation");
     replacement
         .start_background_tasks()
         .expect("start replacement generation");
@@ -1026,10 +1023,15 @@ async fn chargeback_snapshot_reload_before_first_tick_spools_old_generation_delt
 async fn chargeback_snapshot_graceful_shutdown_is_durable_idempotent_and_stops_admission() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool_dir = tmp.path().join("shutdown-spool");
-    let plugin =
-        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
-            .expect("snapshot sink");
-    plugin.start_background_tasks().expect("start snapshot sink");
+    let plugin = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&spool_dir),
+        client(),
+        "default",
+    )
+    .expect("snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
     plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
 
@@ -1061,10 +1063,15 @@ async fn chargeback_snapshot_graceful_shutdown_is_durable_idempotent_and_stops_a
 async fn chargeback_snapshot_finalization_deadline_bounds_in_flight_admission() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool_dir = tmp.path().join("bounded-finalization-spool");
-    let plugin =
-        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
-            .expect("snapshot sink");
-    plugin.start_background_tasks().expect("start snapshot sink");
+    let plugin = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&spool_dir),
+        client(),
+        "default",
+    )
+    .expect("snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
     plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
 
@@ -1104,9 +1111,12 @@ async fn chargeback_snapshot_finalization_deadline_bounds_in_flight_admission() 
 async fn chargeback_snapshot_tick_racing_finalization_advances_exactly_one_path() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool_dir = tmp.path().join("tick-first-spool");
-    let tick_first =
-        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
-            .expect("tick-first sink");
+    let tick_first = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&spool_dir),
+        client(),
+        "default",
+    )
+    .expect("tick-first sink");
     tick_first
         .start_background_tasks()
         .expect("start tick-first sink");
@@ -1129,9 +1139,12 @@ async fn chargeback_snapshot_tick_racing_finalization_advances_exactly_one_path(
     drop(tick_first);
 
     let spool_dir = tmp.path().join("final-first-spool");
-    let final_first =
-        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
-            .expect("final-first sink");
+    let final_first = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&spool_dir),
+        client(),
+        "default",
+    )
+    .expect("final-first sink");
     final_first
         .start_background_tasks()
         .expect("start final-first sink");
@@ -1158,10 +1171,15 @@ async fn chargeback_snapshot_tick_racing_finalization_advances_exactly_one_path(
 async fn chargeback_snapshot_final_handoff_bypasses_full_queue_and_clickhouse_outage() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool_dir = tmp.path().join("queue-pressure-spool");
-    let plugin =
-        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
-            .expect("snapshot sink");
-    plugin.start_background_tasks().expect("start snapshot sink");
+    let plugin = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&spool_dir),
+        client(),
+        "default",
+    )
+    .expect("snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
     plugin.commit_background_tasks();
 
     for index in 0..8 {
@@ -1202,10 +1220,15 @@ async fn chargeback_snapshot_spool_failure_retains_generation_for_bounded_retry(
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool_dir = tmp.path().join("blocked-spool");
     std::fs::write(&spool_dir, b"not a directory").expect("plant blocking file");
-    let plugin =
-        ApiChargebackSink::new(&chargeback_snapshot_sink_config(&spool_dir), client(), "default")
-            .expect("snapshot sink");
-    plugin.start_background_tasks().expect("start snapshot sink");
+    let plugin = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&spool_dir),
+        client(),
+        "default",
+    )
+    .expect("snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
     plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
 

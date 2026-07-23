@@ -118,9 +118,7 @@ fn register_snapshot_generation(lifecycle: Arc<SnapshotLifecycle>) {
         Ok(generations) => generations,
         Err(poisoned) => poisoned.into_inner(),
     };
-    generations
-        .entry(lifecycle.generation)
-        .or_insert(lifecycle);
+    generations.entry(lifecycle.generation).or_insert(lifecycle);
 }
 
 fn unregister_snapshot_generation(generation: u64) {
@@ -1393,11 +1391,7 @@ impl ApiChargebackSink {
     ) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         let _admission = lifecycle.admit()?;
-        Some(
-            lifecycle
-                .finalize_attempt(Instant::now() + timeout)
-                .await,
-        )
+        Some(lifecycle.finalize_attempt(Instant::now() + timeout).await)
     }
 
     #[allow(dead_code)]
@@ -1445,9 +1439,7 @@ impl Drop for ApiChargebackSink {
                 let lifecycle = Arc::clone(lifecycle);
                 tokio::task::block_in_place(|| {
                     handle.block_on(async move {
-                        lifecycle
-                            .finalize_within(SNAPSHOT_FINALIZE_TIMEOUT)
-                            .await;
+                        lifecycle.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT).await;
                     });
                 });
             } else {
@@ -4271,21 +4263,20 @@ fn emit_periodic_snapshot(
     };
     let snapshot_id = new_ulid();
     let received_at = unix_timestamp_nanos();
-    let events =
-        match accumulator.compute_deltas(config, node_id, received_at, &snapshot_id) {
-            Ok(events) => events,
-            Err(error) => {
-                runtime
-                    .metrics
-                    .record_failure(FailureReason::Serialize, error.clone());
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    error = %error,
-                    "Chargeback sink snapshot arithmetic failed; no delta was advanced"
-                );
-                return Err(error);
-            }
-        };
+    let events = match accumulator.compute_deltas(config, node_id, received_at, &snapshot_id) {
+        Ok(events) => events,
+        Err(error) => {
+            runtime
+                .metrics
+                .record_failure(FailureReason::Serialize, error.clone());
+            warn!(
+                plugin = PLUGIN_NAME,
+                error = %error,
+                "Chargeback sink snapshot arithmetic failed; no delta was advanced"
+            );
+            return Err(error);
+        }
+    };
     let event_count = events.len();
     if event_count == 0 {
         return Ok(0);
@@ -4326,22 +4317,21 @@ fn emit_final_snapshot_to_spool(
     };
     let snapshot_id = new_ulid();
     let received_at = unix_timestamp_nanos();
-    let prepared =
-        match accumulator.prepare_deltas(config, node_id, received_at, &snapshot_id) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                runtime
-                    .metrics
-                    .record_failure(FailureReason::Serialize, error.clone());
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    generation = runtime.generation,
-                    error = %error,
-                    "Chargeback sink final snapshot arithmetic failed; generation state retained"
-                );
-                return false;
-            }
-        };
+    let prepared = match accumulator.prepare_deltas(config, node_id, received_at, &snapshot_id) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            runtime
+                .metrics
+                .record_failure(FailureReason::Serialize, error.clone());
+            warn!(
+                plugin = PLUGIN_NAME,
+                generation = runtime.generation,
+                error = %error,
+                "Chargeback sink final snapshot arithmetic failed; generation state retained"
+            );
+            return false;
+        }
+    };
     if prepared.events.is_empty() {
         return true;
     }
