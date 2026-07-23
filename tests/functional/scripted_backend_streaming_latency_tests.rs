@@ -101,8 +101,10 @@ fn logging_proxy_config(
         "backend_port": backend_port,
         "strip_listen_path": true,
         "backend_connect_timeout_ms": 2000,
-        "backend_read_timeout_ms": 15000,
-        "backend_write_timeout_ms": 15000,
+        // Slow-client completion intentionally stalls then drains multi-MiB
+        // bodies; keep these above the stall+drain window used by the fixtures.
+        "backend_read_timeout_ms": 60000,
+        "backend_write_timeout_ms": 60000,
         "response_body_mode": "stream",
     });
     if let Some(obj) = extra_proxy_fields.as_object() {
@@ -357,14 +359,23 @@ fn spawn_http1_scripted(
                 .step(HttpStep::RespondBodyEnd);
         }
         Pace::SlowClient => {
+            // Emit many bounded chunks instead of one giant write_all. A single
+            // 16 MiB write blocks the scripted backend for the whole pipe fill
+            // and interacts badly with gateway read timeouts under an 8 KiB
+            // client SO_RCVBUF; chunked writes resume cleanly once the client
+            // drains after the intentional stall.
+            const CHUNK_BYTES: usize = 256 * 1024;
             let body = large_payload(slow_client_payload_bytes);
-            let chunk_header = format!("{:x}\r\n", body.len());
-            let mut framed = Vec::with_capacity(chunk_header.len() + body.len() + 7);
-            framed.extend_from_slice(chunk_header.as_bytes());
-            framed.extend_from_slice(&body);
-            framed.extend_from_slice(b"\r\n0\r\n\r\n");
+            for chunk in body.chunks(CHUNK_BYTES) {
+                let chunk_header = format!("{:x}\r\n", chunk.len());
+                let mut framed = Vec::with_capacity(chunk_header.len() + chunk.len() + 2);
+                framed.extend_from_slice(chunk_header.as_bytes());
+                framed.extend_from_slice(chunk);
+                framed.extend_from_slice(b"\r\n");
+                builder = builder.step(HttpStep::RespondBodyChunk(framed));
+            }
             builder = builder
-                .step(HttpStep::RespondBodyChunk(framed))
+                .step(HttpStep::RespondBodyChunk(b"0\r\n\r\n".to_vec()))
                 .step(HttpStep::RespondBodyEnd);
         }
     }
@@ -400,14 +411,21 @@ fn spawn_grpc_scripted(
             // Multiple bounded messages exhaust H2 flow-control credit; a
             // single oversized message previously failed completion drains
             // with "unexpected internal error encountered".
+            //
+            // Keep the scripted H2 connection driver alive across the client
+            // stall: queueing DATA+trailers and returning lets run_h2_connection
+            // Stop/abort the driver after 500ms while WINDOW_UPDATE is still
+            // withheld, which surfaces as INTERNAL_ERROR on completion.
             let message = Bytes::from(large_payload(GRPC_SLOW_CLIENT_MESSAGE_BYTES));
             for _ in 0..GRPC_SLOW_CLIENT_MESSAGE_COUNT {
                 builder = builder.step(GrpcStep::RespondMessage(message.clone()));
             }
-            builder = builder.step(GrpcStep::RespondStatus {
-                code: 0,
-                message: "",
-            });
+            builder = builder
+                .step(GrpcStep::Sleep(BODY_DELAY + Duration::from_millis(800)))
+                .step(GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                });
         }
     }
 
@@ -476,6 +494,12 @@ async fn h1_slow_client_raw(url: &str, outcome: Outcome) {
             drop(stream);
         }
         Outcome::Complete => {
+            // Restore a normal receive buffer before draining. Keeping the 8 KiB
+            // SO_RCVBUF for the full 16 MiB body made hosted CI truncate around
+            // ~3.6 MiB under the 15s backend read timeout.
+            socket2::SockRef::from(&stream)
+                .set_recv_buffer_size(1024 * 1024)
+                .expect("restore slow-client receive buffer for drain");
             loop {
                 let n = stream.read(&mut buf).await.expect("drain");
                 if n == 0 {
