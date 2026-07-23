@@ -11,7 +11,10 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -104,11 +107,19 @@ fn forwarded(action: ResponseStreamAction) -> Vec<u8> {
 /// Test guardrail that cuts if provider-native Anthropic framing reaches it.
 /// Its default stage is `Inspect`, so the chain must move a normalizer supplied
 /// later in the vector ahead of it.
-struct RejectProviderNative;
+struct RejectProviderNative {
+    saw_normalized: Arc<AtomicBool>,
+}
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for RejectProviderNative {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if chunk
+            .windows(b"chat.completion.chunk".len())
+            .any(|window| window == b"chat.completion.chunk")
+        {
+            self.saw_normalized.store(true, Ordering::SeqCst);
+        }
         if chunk
             .windows(b"content_block_delta".len())
             .any(|window| window == b"content_block_delta")
@@ -925,9 +936,14 @@ async fn test_stream_normalizer_stage_precedes_policy_inspection() {
     // Deliberately supply the policy inspector first. Stage ordering must still
     // normalize before it, without hard-coding plugin names or changing
     // request-side priority semantics.
-    let mut chain =
-        chain_response_stream_inspectors(vec![Box::new(RejectProviderNative), normalizer])
-            .expect("chained inspectors");
+    let saw_normalized = Arc::new(AtomicBool::new(false));
+    let mut chain = chain_response_stream_inspectors(vec![
+        Box::new(RejectProviderNative {
+            saw_normalized: Arc::clone(&saw_normalized),
+        }),
+        normalizer,
+    ])
+    .expect("chained inspectors");
     let output = match chain.on_chunk(ANTHROPIC_SSE.as_bytes()).await {
         ResponseStreamAction::Forward(output) | ResponseStreamAction::Terminate(Some(output)) => {
             output
@@ -939,6 +955,10 @@ async fn test_stream_normalizer_stage_precedes_policy_inspection() {
     let output = String::from_utf8(output.to_vec()).expect("normalized UTF-8 SSE");
     assert!(output.contains("chat.completion.chunk"));
     assert!(!output.contains("content_block_delta"));
+    assert!(
+        saw_normalized.load(Ordering::SeqCst),
+        "the downstream policy inspector must receive the normalizer's terminal window"
+    );
 }
 
 const ANTHROPIC_SSE: &str = concat!(
@@ -1674,18 +1694,23 @@ async fn test_message_stop_terminates_without_waiting_for_extra_eof_bytes() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_normalized_claim_strips_accept_encoding() {
+async fn test_normalized_claim_requests_identity_encoding() {
     let plugin = build(openai_and_anthropic_config());
     let body = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
     let mut ctx = post_ctx(&body);
     let mut headers = json_headers();
     headers.insert("accept-encoding".to_string(), "gzip, br".to_string());
+    headers.insert("Accept-Encoding".to_string(), "deflate".to_string());
     plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(
-        !headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("accept-encoding")),
-        "normalized Anthropic claims must strip Accept-Encoding"
+    let values: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(
+        values,
+        vec!["identity"],
+        "normalized Anthropic claims must replace every client variant with identity"
     );
 }
 
@@ -1841,7 +1866,25 @@ async fn test_unsupported_content_encoding_is_rejected() {
 }
 
 #[tokio::test]
-async fn test_identity_provider_content_encoding_passes_through() {
+async fn test_case_variant_duplicate_content_encoding_is_rejected() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
+    let mut ctx = post_ctx(&claude);
+    let mut req_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    resp_headers.insert("content-encoding".to_string(), "identity".to_string());
+    resp_headers.insert("Content-Encoding".to_string(), "gzip".to_string());
+    assert_eq!(
+        reject_status(&plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await),
+        Some(502)
+    );
+}
+
+#[tokio::test]
+async fn test_identity_provider_content_encoding_repairs_rewritten_representation_headers() {
     let plugin = build(openai_and_anthropic_config());
     let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
 
@@ -1852,8 +1895,16 @@ async fn test_identity_provider_content_encoding_passes_through() {
 
         let mut resp_headers = HashMap::new();
         resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        resp_headers.insert("Content-Length".to_string(), "999".to_string());
+        resp_headers.insert("ETag".to_string(), "\"provider\"".to_string());
+        resp_headers.insert("Digest".to_string(), "sha-256=provider".to_string());
+        resp_headers.insert(
+            "vary".to_string(),
+            "Accept-Encoding, Origin".to_string(),
+        );
+        resp_headers.insert("Vary".to_string(), "origin, X-Trace".to_string());
         if let Some(encoding) = encoding {
-            resp_headers.insert("content-encoding".to_string(), encoding.to_string());
+            resp_headers.insert("Content-Encoding".to_string(), encoding.to_string());
         }
         assert!(matches!(
             plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
@@ -1863,6 +1914,27 @@ async fn test_identity_provider_content_encoding_passes_through() {
             !ctx.metadata
                 .contains_key("ai_stream_router.provider_content_encoding")
         );
+        for invalidated in ["content-encoding", "content-length", "etag", "digest"] {
+            assert!(
+                !resp_headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(invalidated)),
+                "{invalidated} must be removed after identity SSE normalization"
+            );
+        }
+        let vary_values: Vec<_> = resp_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(vary_values.len(), 1);
+        let vary_tokens: Vec<_> = vary_values[0]
+            .split(',')
+            .map(|token| token.trim().to_ascii_lowercase())
+            .collect();
+        assert_eq!(vary_tokens.len(), 2);
+        assert!(vary_tokens.iter().any(|token| token == "origin"));
+        assert!(vary_tokens.iter().any(|token| token == "x-trace"));
     }
 }
 
@@ -1964,6 +2036,39 @@ async fn test_anthropic_parallel_tool_calls_and_results_preserve_order() {
     assert_eq!(results[0]["tool_use_id"], json!("call_a"));
     assert_eq!(results[1]["tool_use_id"], json!("call_b"));
     assert_eq!(results[1]["is_error"], json!(true));
+}
+
+#[tokio::test]
+async fn test_null_tool_call_fields_are_treated_as_absent() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": null,
+                "function_call": null
+            }
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let raw = serde_json::to_vec(&body).unwrap();
+    let translated: Value = serde_json::from_slice(
+        &plugin
+            .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+            .await
+            .expect("translated"),
+    )
+    .unwrap();
+    assert_eq!(translated["messages"][1]["content"], json!("done"));
 }
 
 #[tokio::test]
@@ -2081,6 +2186,10 @@ async fn test_anthropic_translation_rejects_each_malformed_tool_history_shape() 
         (
             "non-text user content",
             json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "user", "content": 42}]}),
+        ),
+        (
+            "legacy function call",
+            json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": "calling", "function_call": {"name": "run", "arguments": "{}"}}]}),
         ),
         (
             "empty tool call list",

@@ -809,6 +809,9 @@ fn parse_openai_tool_calls(
     let Some(tool_calls_value) = message.get("tool_calls") else {
         return Ok(Vec::new());
     };
+    if tool_calls_value.is_null() {
+        return Ok(Vec::new());
+    }
     let tool_calls = tool_calls_value
         .as_array()
         .ok_or_else(|| format!("messages[{message_index}].tool_calls must be an array"))?;
@@ -926,7 +929,17 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
             return Err(format!("messages[{index}] has unsupported role '{role}'"));
         }
 
-        let has_tool_calls = message_object.get("tool_calls").is_some();
+        if message_object
+            .get("function_call")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(format!(
+                "messages[{index}].function_call uses the unsupported legacy tool-call shape"
+            ));
+        }
+        let has_tool_calls = message_object
+            .get("tool_calls")
+            .is_some_and(|value| !value.is_null());
         if role != "tool" && !pending_tool_results.is_empty() {
             return Err(format!(
                 "messages[{index}] appears before results for every preceding assistant tool call"
@@ -945,7 +958,16 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
         }
 
         if role == "assistant" {
-            for call in parse_openai_tool_calls(message, index)? {
+            let tool_calls = parse_openai_tool_calls(message, index)?;
+            if tool_calls.is_empty()
+                && flatten_content_text(message_object.get("content").unwrap_or(&Value::Null))
+                    .is_empty()
+            {
+                return Err(format!(
+                    "messages[{index}] has no Anthropic-representable content"
+                ));
+            }
+            for call in tool_calls {
                 if !tool_call_ids.insert(call.id.clone()) {
                     return Err(format!("messages[{index}] repeats a tool-call id"));
                 }
@@ -978,6 +1000,14 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
+    let messages = openai_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "request missing 'messages' array".to_string())?;
+    validate_openai_tool_history(messages)
+}
+
 /// Translate an OpenAI Chat Completions streaming request into an Anthropic
 /// Messages API streaming request body. Preserves assistant `tool_calls` and
 /// matching `role: "tool"` results; rejects malformed history instead of
@@ -987,7 +1017,7 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
-    validate_openai_tool_history(messages)?;
+    validate_anthropic_translation(openai_body)?;
 
     let system_parts: Vec<String> = messages
         .iter()
@@ -1335,7 +1365,7 @@ impl Plugin for AiStreamRouter {
         // Fail closed on Anthropic tool-history shapes that cannot be
         // represented safely before the route override commits.
         if provider.provider_type == ProviderType::Anthropic
-            && let Err(message) = translate_to_anthropic(&openai_body, &model)
+            && let Err(message) = validate_anthropic_translation(&openai_body)
         {
             return openai_error_response(
                 400,
@@ -1431,11 +1461,13 @@ impl Plugin for AiStreamRouter {
         // --- Metadata (observability + downstream-hook coordination). ---
         let normalizes = provider.normalizes_response(self.normalize_response_stream);
         // Normalization parses line-delimited SSE. Strip client content-coding
-        // negotiation so the provider does not return gzip/br octets that the
-        // normalizer would misread as plaintext events. Residual encodings are
-        // still handled fail-safe in `after_proxy` / the normalizer.
+        // negotiation and explicitly request identity so the provider does not
+        // return gzip/br octets that the normalizer would misread as plaintext
+        // events. Residual encodings are still handled fail-safe in
+        // `after_proxy` / the normalizer.
         if normalizes {
             remove_header_ci(headers, "accept-encoding");
+            headers.insert("accept-encoding".to_string(), "identity".to_string());
         }
 
         ctx.metadata
@@ -1603,11 +1635,15 @@ impl Plugin for AiStreamRouter {
             .get(META_MODEL)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
+        let header_encoding = match content_encoding_value(response_headers) {
+            Ok(encoding) => encoding,
+            Err(message) => return Some(upstream_sse_error_body(&message)),
+        };
         let encoding = ctx
             .metadata
             .get(META_PROVIDER_ENCODING)
             .map(String::as_str)
-            .or_else(|| content_encoding_value(response_headers));
+            .or(header_encoding);
         let plaintext = match prepare_sse_bytes_for_normalization(body, encoding) {
             Ok(bytes) => bytes,
             Err(message) => {
@@ -1635,7 +1671,10 @@ impl Plugin for AiStreamRouter {
         }
 
         match classify_provider_content_encoding(response_headers) {
-            ProviderContentEncoding::Identity => PluginResult::Continue,
+            ProviderContentEncoding::Identity => {
+                repair_normalized_representation_headers(response_headers);
+                PluginResult::Continue
+            }
             ProviderContentEncoding::Supported(coding) => {
                 ctx.metadata
                     .insert(META_PROVIDER_ENCODING.to_string(), coding.to_string());
@@ -1686,13 +1725,19 @@ fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
     headers.retain(|k, _| !k.eq_ignore_ascii_case(name));
 }
 
-fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
-    headers
+fn content_encoding_value(headers: &HashMap<String, String>) -> Result<Option<&str>, String> {
+    let mut values = headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
-        .map(|(_, value)| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, value)| value.as_str());
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("multiple case-variant Content-Encoding headers".to_string());
+    }
+    let value = value.trim();
+    Ok((!value.is_empty()).then_some(value))
 }
 
 enum ProviderContentEncoding {
@@ -1704,8 +1749,10 @@ enum ProviderContentEncoding {
 fn classify_provider_content_encoding(
     headers: &HashMap<String, String>,
 ) -> ProviderContentEncoding {
-    let Some(raw) = content_encoding_value(headers) else {
-        return ProviderContentEncoding::Identity;
+    let raw = match content_encoding_value(headers) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return ProviderContentEncoding::Identity,
+        Err(message) => return ProviderContentEncoding::Unsupported(message),
     };
     let mut codings = Vec::new();
     for part in raw.split(',') {
@@ -1759,28 +1806,38 @@ fn repair_normalized_representation_headers(headers: &mut HashMap<String, String
 }
 
 fn scrub_accept_encoding_from_vary(headers: &mut HashMap<String, String>) {
-    let Some((name, value)) = headers
+    let variants: Vec<_> = headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
         .map(|(name, value)| (name.clone(), value.clone()))
-    else {
+        .collect();
+    if variants.is_empty() {
         return;
-    };
-    if value.trim() == "*" {
+    }
+    for (name, _) in &variants {
+        headers.remove(name);
+    }
+    if variants.iter().any(|(_, value)| value.trim() == "*") {
+        headers.insert("vary".to_string(), "*".to_string());
         return;
     }
     let mut kept = Vec::new();
-    for token in value.split(',') {
-        let token = token.trim();
-        if token.is_empty() || token.eq_ignore_ascii_case("accept-encoding") {
-            continue;
+    for (_, value) in variants {
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty()
+                || token.eq_ignore_ascii_case("accept-encoding")
+                || kept
+                    .iter()
+                    .any(|kept: &String| kept.eq_ignore_ascii_case(token))
+            {
+                continue;
+            }
+            kept.push(token.to_string());
         }
-        kept.push(token.to_string());
     }
-    if kept.is_empty() {
-        headers.remove(&name);
-    } else {
-        headers.insert(name, kept.join(", "));
+    if !kept.is_empty() {
+        headers.insert("vary".to_string(), kept.join(", "));
     }
 }
 
