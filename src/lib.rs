@@ -3032,6 +3032,27 @@ pub mod _test_support {
         body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
     }
 
+    pub fn proxy_body_into_grpc_web_streaming_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata)
+    }
+
+    pub fn take_streaming_initial_terminal_metadata_for_test(
+        response_headers: &mut HashMap<String, String>,
+        body_ended: bool,
+        pristine_terminal_names: &HashSet<String>,
+    ) -> HashMap<String, String> {
+        crate::plugins::grpc_web::take_streaming_initial_terminal_metadata(
+            response_headers,
+            body_ended,
+            Some(pristine_terminal_names),
+        )
+    }
+
     pub async fn finalized_upload_deadline_response_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,

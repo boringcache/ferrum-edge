@@ -6186,6 +6186,21 @@ pub trait Plugin: Send + Sync {
         true
     }
 
+    /// Returns `true` when a translated gRPC-Web response must retain the
+    /// buffered compatibility view so this plugin can enforce policy against
+    /// terminal backend metadata.
+    ///
+    /// Native gRPC trailers arrive after `after_proxy`. The gRPC-Web buffered
+    /// path merges those trailers into the hook-visible response map and then
+    /// reconciles policy changes back into the body-framed terminal block.
+    /// Plugins that enforce header policy over that compatibility view should
+    /// opt in here. The shared response decision consults this only for a
+    /// request already claimed by `grpc_web`, so ordinary HTTP and native gRPC
+    /// streaming are unaffected.
+    fn requires_buffered_grpc_web_trailer_policy(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs the entire response body buffered
     /// in memory before forwarding to the client. When any active plugin
     /// returns `true`, the gateway forces buffered mode for that proxy
