@@ -1268,6 +1268,10 @@ pub mod _test_support {
         ctx.response_cache_hit()
     }
 
+    pub fn finalized_response_replay_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.finalized_response_replay
+    }
+
     pub fn response_caching_current_total_size_for_test(
         plugin: &crate::plugins::response_caching::ResponseCaching,
     ) -> usize {

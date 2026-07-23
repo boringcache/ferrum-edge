@@ -15084,9 +15084,9 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     ) {
         let mut mandatory_replay_transform_failed = None;
         for plugin in plugins.iter() {
-            let mandatory_replay_transform = ctx.deduplication_replay_response_finalized
+            let mandatory_replay_transform = ctx.finalized_response_replay
                 && plugin.requires_replay_response_body_transform(ctx);
-            if ctx.deduplication_replay_response_finalized && !mandatory_replay_transform {
+            if ctx.finalized_response_replay && !mandatory_replay_transform {
                 continue;
             }
             let deadline = ctx.grpc_deadline_at();

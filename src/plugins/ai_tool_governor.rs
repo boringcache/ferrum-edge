@@ -2952,7 +2952,7 @@ impl Plugin for AiToolGovernor {
                 .remove(&self.instance_id);
             return self.reject(&batch);
         }
-        if ctx.deduplication_replay_response_finalized
+        if ctx.finalized_response_replay
             && self.engine.mode == Mode::Enforce
             && batch
                 .per_call
