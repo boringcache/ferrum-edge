@@ -8572,8 +8572,9 @@ components:
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -8645,8 +8646,9 @@ components:
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -16105,8 +16107,9 @@ components:
           description: Key prefix for all Redis keys (namespace isolation)
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL-based authentication (Redis 6+)
@@ -18517,12 +18520,17 @@ components:
       additionalProperties: false
       description: >-
         Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized
-        prompts. Exact-match normalization is enabled by default; optional
-        semantic similarity uses a configured embedding provider and a local
-        HNSW vector index. Supports local DashMap and Redis exact-response
-        storage. Unknown root, semantic-policy, and Redis sync keys are
-        rejected at admission with path-qualified diagnostics (registration
-        policy KeepLastKnownGood). There are no intentionally open maps.
+        prompts across Ferrum's recognized request families (OpenAI Chat
+        messages, Anthropic messages/system, OpenAI Responses
+        input/instructions, Gemini/Vertex contents/systemInstruction, Cohere
+        chat_history/message, legacy prompt, TGI inputs, and Titan inputText).
+        Unknown or ambiguous JSON shapes bypass caching. Exact-match
+        normalization is enabled by default; optional semantic similarity uses
+        a configured embedding provider and a local HNSW vector index.
+        Supports local DashMap and Redis exact-response storage. Unknown root,
+        semantic-policy, and Redis sync keys are rejected at admission with
+        path-qualified diagnostics (registration policy KeepLastKnownGood).
+        There are no intentionally open maps.
       properties:
         ttl_seconds:
           type: integer
@@ -18642,8 +18650,9 @@ components:
         redis_pool_size:
           type: integer
           format: uint64
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_connect_timeout_seconds:
           type: integer
           format: uint64
@@ -18884,8 +18893,9 @@ components:
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -19287,7 +19297,7 @@ components:
             mcp_tool_calls:
               type: boolean
               default: false
-              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays. When params.arguments is omitted, the governor normalizes it to {} before required-arg / regex / hash / approval / JSON Schema evaluation (MCP zero-argument calls). Provider response shapes that omit function.arguments are not normalized."
+              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays. When params.arguments is omitted, the governor normalizes it to {} before required-arg / regex / hash / approval / JSON Schema evaluation (MCP zero-argument calls). Provider response shapes that omit function.arguments are not normalized. With mcp_gateway aggregate_router on the same proxy, policy identity stays the public namespaced tool name across the gateway's trusted upstream-name rewrite; final arguments are still rechecked and unrelated name changes fail closed."
             a2a_methods:
               type: boolean
               default: false
@@ -19296,7 +19306,7 @@ components:
           type: object
           propertyNames:
             minLength: 1
-          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name). The tool-name map is intentionally free-form; each policy object is closed."
+          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name). When composed with mcp_gateway aggregate_router, keys remain the public namespaced names: a trusted public-to-upstream rewrite is remapped for the final-body recheck only when the final wire name exactly matches that staged upstream alias; final arguments are still re-evaluated and unrelated name changes fail closed. The tool-name map is intentionally free-form; each policy object is closed."
           additionalProperties:
             type: object
             additionalProperties: false
@@ -19891,7 +19901,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins."
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -20863,7 +20873,7 @@ components:
                 const: redis
           then:
             required: [redis_url]
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Explicitly supplied Redis fields are validated even in local mode so latent configuration cannot become invalid only when the mode is changed."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Per-request completion ownership (logical key, fingerprint, local owner token, and optional Redis lock token) is held in an instance-keyed private structure rather than shared public metadata, so multiple scoped instances with distinct headers mark and token-release independently on the same request. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Explicitly supplied Redis fields are validated even in local mode so latent configuration cannot become invalid only when the mode is changed."
       properties:
         header_name:
           type: string
