@@ -359,6 +359,8 @@ where
     fallback: LocalLimiter<K, A>,
     redis_healthy: Arc<AtomicBool>,
     fallback_warned: Arc<AtomicBool>,
+    /// Abort handle for the failover health observer; aborted on Drop.
+    health_observer_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl<K, A> FailoverLimiter<K, A>
@@ -374,12 +376,13 @@ where
         let redis_healthy = Arc::new(AtomicBool::new(true));
         let fallback_warned = Arc::new(AtomicBool::new(false));
 
-        let limiter = Self {
+        let mut limiter = Self {
             plugin_name,
             primary,
             fallback,
             redis_healthy,
             fallback_warned,
+            health_observer_abort: None,
         };
         limiter.spawn_health_observer();
         limiter
@@ -472,11 +475,25 @@ where
         self.primary.warmup_hostname()
     }
 
-    fn spawn_health_observer(&self) {
+    /// Shared Redis client Arc for lifecycle tests (strong-count / Weak proofs).
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn redis_client_arc_for_test(&self) -> Arc<RedisRateLimitClient> {
+        Arc::clone(&self.primary.redis_client)
+    }
+
+    /// Abort handle for the failover observer, when started (tests).
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn health_observer_abort_for_test(&self) -> Option<tokio::task::AbortHandle> {
+        self.health_observer_abort.clone()
+    }
+
+    fn spawn_health_observer(&mut self) {
         let plugin_name = self.plugin_name;
         let redis_healthy = Arc::clone(&self.redis_healthy);
         let fallback_warned = Arc::clone(&self.fallback_warned);
-        let redis_client = Arc::clone(&self.primary.redis_client);
+        // Observe availability without retaining the full Redis client (and its
+        // cached connections / credentials) after this limiter is dropped.
+        let available = self.primary.redis_client.availability_flag();
         let interval = self.primary.health_check_interval();
 
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -487,12 +504,12 @@ where
             return;
         };
 
-        handle.spawn(async move {
+        let join = handle.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let available = redis_client.is_available();
-                let was_healthy = redis_healthy.swap(available, Ordering::Relaxed);
-                if available && !was_healthy {
+                let is_available = available.load(Ordering::Relaxed);
+                let was_healthy = redis_healthy.swap(is_available, Ordering::Relaxed);
+                if is_available && !was_healthy {
                     fallback_warned.store(false, Ordering::Relaxed);
                     info!(
                         plugin = plugin_name,
@@ -501,6 +518,19 @@ where
                 }
             }
         });
+        self.health_observer_abort = Some(join.abort_handle());
+    }
+}
+
+impl<K, A> Drop for FailoverLimiter<K, A>
+where
+    K: Eq + Hash,
+    A: RateLimitAlgorithm,
+{
+    fn drop(&mut self) {
+        if let Some(abort) = self.health_observer_abort.take() {
+            abort.abort();
+        }
     }
 }
 
@@ -691,6 +721,24 @@ where
         match self {
             Self::Local(_) => None,
             Self::Failover(failover) => Some(failover.primary.redis_client.pool_size_for_test()),
+        }
+    }
+
+    /// Shared Redis client Arc for lifecycle tests (issue #2305).
+    #[allow(dead_code)] // used by the external unit-test target
+    pub fn redis_client_arc_for_test(&self) -> Option<Arc<RedisRateLimitClient>> {
+        match self {
+            Self::Local(_) => None,
+            Self::Failover(failover) => Some(failover.redis_client_arc_for_test()),
+        }
+    }
+
+    /// Failover health-observer abort handle for lifecycle tests (issue #2305).
+    #[allow(dead_code)] // used by the external unit-test target
+    pub fn health_observer_abort_for_test(&self) -> Option<tokio::task::AbortHandle> {
+        match self {
+            Self::Local(_) => None,
+            Self::Failover(failover) => failover.health_observer_abort_for_test(),
         }
     }
 }
@@ -1009,9 +1057,10 @@ async fn check_http_windows_redis(
     // — a conservative over-count, never an over-admit.
     for spec in specs {
         let window = FixedWindow::new(spec.limit, spec.duration.as_secs());
-        let curr_idx = RedisRateLimitClient::window_index(window.window_seconds);
+        let progress = RedisRateLimitClient::window_progress(window.window_seconds);
+        let curr_idx = progress.index;
         let prev_idx = curr_idx.saturating_sub(1);
-        let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(window.window_seconds);
+        let elapsed_fraction = progress.elapsed_fraction;
         let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
         let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
         let ttl = window.window_seconds * 2 + 1;
@@ -1545,9 +1594,10 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
     ) -> Result<RateLimitOutcome, ()> {
         match *op {
             AiRateLimitOp::CheckBudget => {
-                let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
+                let progress = RedisRateLimitClient::window_progress(self.window_seconds);
+                let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
-                let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(self.window_seconds);
+                let elapsed_fraction = progress.elapsed_fraction;
                 let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
                 let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
                 let (prev_count, curr_count) = redis.get_two_counters(&prev_key, &curr_key).await?;
@@ -1566,9 +1616,10 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     .with_remaining(remaining))
             }
             AiRateLimitOp::Reserve { tokens } => {
-                let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
+                let progress = RedisRateLimitClient::window_progress(self.window_seconds);
+                let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
-                let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(self.window_seconds);
+                let elapsed_fraction = progress.elapsed_fraction;
                 let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
                 let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
                 let ttl = self.window_seconds * 2 + 1;
@@ -1629,9 +1680,10 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 // has not been changed. A post-mutation telemetry read could
                 // fail after the correction landed and then replay the same
                 // operation against the local fallback.
-                let curr_idx = RedisRateLimitClient::window_index(self.window_seconds);
+                let progress = RedisRateLimitClient::window_progress(self.window_seconds);
+                let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
-                let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(self.window_seconds);
+                let elapsed_fraction = progress.elapsed_fraction;
                 let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
                 let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
                 let (mut prev_count, mut curr_count) =
@@ -1794,9 +1846,10 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         // than the configured sustained rate.
         let (window_seconds, limit) = self.redis_window_derivation();
 
-        let curr_idx = RedisRateLimitClient::window_index(window_seconds);
+        let progress = RedisRateLimitClient::window_progress(window_seconds);
+        let curr_idx = progress.index;
         let prev_idx = curr_idx.saturating_sub(1);
-        let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(window_seconds);
+        let elapsed_fraction = progress.elapsed_fraction;
         let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
         let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
         let ttl = window_seconds * 2 + 1;

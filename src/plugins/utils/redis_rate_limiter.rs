@@ -15,7 +15,10 @@
 //!
 //! 1. Two fixed windows are maintained: the current window and the previous window.
 //! 2. The effective count = `prev_count * (1 - elapsed_fraction) + current_count`.
-//! 3. This provides smooth rate limiting without boundary bursts.
+//! 3. Window index and `elapsed_fraction` are derived from **one** epoch timestamp
+//!    with subsecond precision, so even a one-second window decays continuously
+//!    through `[0, 1)` instead of staying stuck at `0.0`.
+//! 4. This provides smooth rate limiting without boundary bursts.
 //!
 //! This is the same approach used by Cloudflare, Kong, and Nginx — no Lua scripts,
 //! just native Redis `INCR`/`GET`/`EXPIRE` commands pipelined for efficiency.
@@ -44,7 +47,9 @@
 //!
 //! If Redis becomes unreachable, the client marks itself unavailable and the
 //! plugin falls back to local in-memory rate limiting. A background task
-//! periodically pings Redis to detect recovery.
+//! periodically pings Redis to detect recovery. That task is owned by this
+//! client: dropping the client aborts it so retired plugin generations do not
+//! retain connections or keep pinging obsolete endpoints.
 //!
 //! # Connection pool
 //!
@@ -58,10 +63,22 @@ use crate::dns::DnsCache;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::AbortHandle;
 use tracing::{info, warn};
 use url::{Host, Url};
+
+/// Redis sliding-window index and elapsed fraction from a single epoch timestamp.
+///
+/// `elapsed_fraction` is always in `[0, 1)`: at an exact window boundary the
+/// index advances and the fraction resets to `0.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RedisWindowProgress {
+    pub index: u64,
+    pub elapsed_fraction: f64,
+}
 
 /// Redis sync fields read from a plugin's root JSON object.
 ///
@@ -504,6 +521,8 @@ pub struct RedisRateLimitClient {
     available: Arc<AtomicBool>,
     /// Whether the background health checker has been started.
     health_checker_started: AtomicBool,
+    /// Abort handle for the background recovery checker (set once on start).
+    health_checker_abort: Mutex<Option<AbortHandle>>,
     /// Gateway-level TLS no-verify setting (`FERRUM_TLS_NO_VERIFY`).
     tls_no_verify: bool,
     /// Pre-read CA bundle PEM bytes from `FERRUM_TLS_CA_BUNDLE_PATH`.
@@ -586,6 +605,7 @@ impl RedisRateLimitClient {
             dns_cache,
             available: Arc::new(AtomicBool::new(true)),
             health_checker_started: AtomicBool::new(false),
+            health_checker_abort: Mutex::new(None),
             tls_no_verify,
             tls_ca_bundle_pem,
         }
@@ -596,6 +616,34 @@ impl RedisRateLimitClient {
     /// This is an O(1) atomic load — safe to call on every request.
     pub fn is_available(&self) -> bool {
         self.available.load(Ordering::Relaxed)
+    }
+
+    /// Shared availability flag for failover observers that must not retain the
+    /// full client (and its cached connections / credentials) after Drop.
+    pub(crate) fn availability_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.available)
+    }
+
+    /// Mark Redis unavailable and start the recovery checker (test support).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn mark_unavailable_for_test(&self) {
+        self.mark_unavailable();
+        self.start_health_checker_if_needed();
+    }
+
+    /// Whether the background recovery checker has been started (test support).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn health_checker_started_for_test(&self) -> bool {
+        self.health_checker_started.load(Ordering::Relaxed)
+    }
+
+    /// Abort handle for the background recovery checker, when started (tests).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn health_checker_abort_for_test(&self) -> Option<AbortHandle> {
+        self.health_checker_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Configured pool cardinality (`redis_pool_size`).
@@ -999,6 +1047,9 @@ impl RedisRateLimitClient {
     }
 
     /// Start a background task that periodically pings Redis to detect recovery.
+    ///
+    /// The task is aborted when this client is dropped so retired plugin
+    /// generations cannot keep dialing obsolete Redis endpoints.
     fn start_health_checker_if_needed(&self) {
         if self.health_checker_started.swap(true, Ordering::Relaxed) {
             return; // Already started
@@ -1012,7 +1063,7 @@ impl RedisRateLimitClient {
         let tls_no_verify = self.tls_no_verify;
         let tls_ca_bundle_pem = self.tls_ca_bundle_pem.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
 
@@ -1108,6 +1159,11 @@ impl RedisRateLimitClient {
                 }
             }
         });
+
+        *self
+            .health_checker_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle.abort_handle());
     }
 
     /// Increment a counter and set expiry. Returns the new count.
@@ -1560,34 +1616,67 @@ impl RedisRateLimitClient {
         key
     }
 
+    /// Compute window index and elapsed fraction from the current wall clock.
+    ///
+    /// Both values come from **one** `SystemTime` sample so a boundary straddle
+    /// cannot pair an index from one instant with a fraction from another.
+    pub fn window_progress(window_seconds: u64) -> RedisWindowProgress {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self::window_progress_at(now, window_seconds)
+    }
+
+    /// Deterministic window index / elapsed fraction for a captured epoch offset.
+    ///
+    /// `elapsed_fraction` preserves subsecond precision and stays in `[0, 1)`.
+    pub fn window_progress_at(now: Duration, window_seconds: u64) -> RedisWindowProgress {
+        let window = window_seconds.max(1);
+        let total_nanos = now.as_nanos();
+        let window_nanos = (window as u128).saturating_mul(1_000_000_000);
+        // `window` is at least 1, so `window_nanos` is at least 1e9.
+        let index = (total_nanos / window_nanos) as u64;
+        let elapsed_nanos = total_nanos % window_nanos;
+        let elapsed_fraction = elapsed_nanos as f64 / window_nanos as f64;
+        RedisWindowProgress {
+            index,
+            elapsed_fraction,
+        }
+    }
+
     /// Compute the window index for a given epoch time and window duration.
     ///
-    /// Window index = `epoch_seconds / window_seconds`. All gateway instances
+    /// Window index = `floor(epoch_nanos / window_nanos)`. All gateway instances
     /// sharing the same Redis will use the same window boundaries since they
     /// share the system epoch clock.
     pub fn window_index(window_seconds: u64) -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now / window_seconds.max(1)
+        Self::window_progress(window_seconds).index
     }
 
-    /// Compute the elapsed fraction within the current window (0.0 to 1.0).
+    /// Compute the elapsed fraction within the current window (`[0, 1)`).
     ///
-    /// Used for the sliding window weighted approximation.
+    /// Used for the sliding window weighted approximation. Prefer
+    /// [`Self::window_progress`] when both index and fraction are needed so they
+    /// share one timestamp.
     pub fn elapsed_fraction(window_seconds: u64) -> f64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let window = window_seconds.max(1);
-        (now % window) as f64 / window as f64
+        Self::window_progress(window_seconds).elapsed_fraction
     }
 
     /// Return the Redis hostname for DNS pre-warming, if applicable.
     pub fn warmup_hostname(&self) -> Option<String> {
         self.config.hostname()
+    }
+}
+
+impl Drop for RedisRateLimitClient {
+    fn drop(&mut self) {
+        let abort = match self.health_checker_abort.get_mut() {
+            Ok(slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(abort) = abort {
+            abort.abort();
+        }
     }
 }
 
