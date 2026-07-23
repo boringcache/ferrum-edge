@@ -3146,3 +3146,189 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
     assert_eq!(stream.protocol_family, ProtocolFamily::Stream);
     assert_eq!(stream.call_count.load(Ordering::Relaxed), 1);
 }
+
+/// Issue #2564: one effective `api_chargeback` on a proxy records HTTP,
+/// WebSocket-disconnect, TCP, UDP, and DTLS activity exactly once through the
+/// PluginCache trait hooks (no silent multiplication).
+#[tokio::test]
+async fn test_effective_chain_records_each_protocol_path_exactly_once() {
+    const CONSUMER: &str = "issue-2564-protocol-consumer";
+    const HTTP_PROXY: &str = "issue-2564-http";
+    const WS_PROXY: &str = "issue-2564-ws";
+    const TCP_PROXY: &str = "issue-2564-tcp";
+    const UDP_PROXY: &str = "issue-2564-udp";
+    const DTLS_PROXY: &str = "issue-2564-dtls";
+
+    let call_and_stream = json!({
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 1.0 }],
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.01,
+            "price_per_byte_received": 0.02
+        },
+        "stream_connection_pricing": { "price_per_connection": 0.5 }
+    });
+    let stream_only = json!({
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.01,
+            "price_per_byte_received": 0.02
+        },
+        "stream_connection_pricing": { "price_per_connection": 0.5 }
+    });
+    let ws_only = json!({
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.01,
+            "price_per_byte_received": 0.02
+        }
+    });
+
+    fn stream_proxy(id: &str, plugin_config_id: &str, scheme: &str, listen_port: u16) -> Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": id,
+            "namespace": "ferrum",
+            "backend_scheme": scheme,
+            "backend_host": "backend.invalid",
+            "backend_port": 9000,
+            "listen_port": listen_port,
+            "frontend_tls": scheme == "dtls",
+            "plugins": [{ "plugin_config_id": plugin_config_id }]
+        }))
+        .expect("test stream proxy config")
+    }
+
+    let plugin_configs = vec![
+        chargeback_chain_plugin("charge-http", HTTP_PROXY, "USD", call_and_stream),
+        chargeback_chain_plugin("charge-ws", WS_PROXY, "USD", ws_only),
+        chargeback_chain_plugin("charge-tcp", TCP_PROXY, "USD", stream_only.clone()),
+        chargeback_chain_plugin("charge-udp", UDP_PROXY, "USD", stream_only.clone()),
+        chargeback_chain_plugin("charge-dtls", DTLS_PROXY, "USD", stream_only),
+    ];
+    let config = GatewayConfig {
+        proxies: vec![
+            chargeback_chain_proxy(HTTP_PROXY, "/issue-2564-http", "charge-http"),
+            chargeback_chain_proxy(WS_PROXY, "/issue-2564-ws", "charge-ws"),
+            stream_proxy(TCP_PROXY, "charge-tcp", "tcp", 65011),
+            stream_proxy(UDP_PROXY, "charge-udp", "udp", 65012),
+            stream_proxy(DTLS_PROXY, "charge-dtls", "dtls", 65013),
+        ],
+        plugin_configs,
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&config).expect("single chargeback per proxy");
+
+    let http_plugin = cache
+        .get_plugins(HTTP_PROXY)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("HTTP chargeback");
+    http_plugin
+        .log(&make_summary(HTTP_PROXY, "HTTP API", Some(CONSUMER), 200))
+        .await;
+
+    let ws_plugin = cache
+        .get_plugins(WS_PROXY)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("WS chargeback");
+    ws_plugin
+        .on_ws_disconnect(&WsDisconnectContext {
+            namespace: "ferrum".to_string(),
+            proxy_id: WS_PROXY.to_string(),
+            proxy_name: Some("WS API".to_string()),
+            client_ip: "127.0.0.1".to_string(),
+            backend_target: "http://127.0.0.1:9000".to_string(),
+            listen_port: 8080,
+            connection_id: 1,
+            duration_ms: 10.0,
+            frames_client_to_backend: 1,
+            frames_backend_to_client: 1,
+            bytes_client_to_backend: 10,
+            bytes_backend_to_client: 20,
+            timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
+            timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
+            direction: None,
+            io_side: None,
+            error_class: None,
+            consumer_username: Some(CONSUMER.to_string()),
+            auth_method: None,
+            metadata: HashMap::new(),
+            proxy_lifecycle_generation: None,
+        })
+        .await;
+
+    for (proxy_id, protocol) in [
+        (TCP_PROXY, "tcp"),
+        (UDP_PROXY, "udp"),
+        (DTLS_PROXY, "dtls"),
+    ] {
+        let plugin = cache
+            .get_plugins(proxy_id)
+            .iter()
+            .find(|plugin| plugin.name() == "api_chargeback")
+            .cloned()
+            .unwrap_or_else(|| panic!("{protocol} chargeback"));
+        plugin
+            .on_stream_disconnect(&make_stream_summary(
+                proxy_id,
+                &format!("{protocol} API"),
+                Some(CONSUMER),
+                protocol,
+                10,
+                20,
+            ))
+            .await;
+    }
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    let consumer = &rendered["consumers"][CONSUMER];
+    // HTTP call + three stream sessions (WS has no call_count).
+    assert_eq!(consumer["total_calls"], 4);
+    let proxies = consumer["proxies"].as_object().expect("proxies object");
+    assert_eq!(proxies[HTTP_PROXY]["by_status"]["200"]["calls"], 1);
+    assert_eq!(proxies[TCP_PROXY]["stream"]["connections"], 1);
+    assert_eq!(proxies[UDP_PROXY]["stream"]["connections"], 1);
+    assert_eq!(proxies[DTLS_PROXY]["stream"]["connections"], 1);
+    assert_eq!(proxies[WS_PROXY]["bandwidth"]["bytes_sent"], 10);
+    assert_eq!(proxies[WS_PROXY]["bandwidth"]["bytes_received"], 20);
+}
+
+/// Direct trait dispatch through two constructed instances still multiplies —
+/// proving why the PluginCache uniqueness rule is required. The production
+/// path rejects this composition; this documents the pre-fix failure mode.
+#[tokio::test]
+async fn test_two_direct_instances_would_double_count_one_http_transaction() {
+    const CONSUMER: &str = "issue-2564-double-consumer";
+    const PROXY: &str = "issue-2564-double-proxy";
+
+    let a = ApiChargeback::new(
+        &json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }],
+            "cleanup_interval_seconds": 0
+        }),
+        "ferrum",
+    )
+    .expect("instance a");
+    let b = ApiChargeback::new(
+        &json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }],
+            "cleanup_interval_seconds": 0
+        }),
+        "ferrum",
+    )
+    .expect("instance b");
+
+    let summary = make_summary(PROXY, "Double", Some(CONSUMER), 200);
+    a.log(&summary).await;
+    b.log(&summary).await;
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    assert_eq!(
+        rendered["consumers"][CONSUMER]["proxies"][PROXY]["by_status"]["200"]["calls"],
+        2,
+        "two hooks on one shared registry key inflate calls — uniqueness must reject this"
+    );
+}

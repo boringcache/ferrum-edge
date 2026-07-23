@@ -107,6 +107,20 @@ Each proxy's effective plugin list is built by merging global, proxy-scoped, and
 3. Multiple scoped instances of the same `plugin_name` all coexist — only the global is replaced
 4. Sort by effective priority (built-in priority or `priority_override`)
 
+**Chargeback exception:** `api_chargeback` follows the same merge steps above, but
+admission and reload then require the resulting effective list to contain **at
+most one** instance per proxy. The in-memory `/charges` registry is a
+process-global singleton with no ledger/instance dimension, so two retained
+hooks would double-count one client transaction. Attach one global, one
+proxy-scoped, or one proxy-group-scoped instance per proxy — not two scoped
+attachments on the same chain. Shared render/cleanup tunables
+(`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
+`cache_invalidation_min_age_ms`, `cleanup_interval_seconds`) are likewise
+process-global: when multiple instances exist on **different** proxies they
+must resolve to identical values (the lexicographically first enabled
+plugin-config id is the documented owner). Pricing and `currency` may still
+differ per proxy. See [`api_chargeback`](#api_chargeback).
+
 **Examples:**
 
 | Global plugins | Scoped plugins | Effective list for proxy |
@@ -1315,6 +1329,18 @@ Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
 in both Prometheus text and JSON formats for external billing system
 integration.
 
+**Exactly-once accounting (issue #2564):** the `/charges` registry is one
+process-global accumulator. After ordinary scope merging, each proxy may retain
+at most one effective `api_chargeback` instance. Two proxy-scoped configs, two
+proxy-group configs, or a mix of proxy and proxy-group attachments on the same
+proxy are rejected at admission/reload with a clear validation error — they
+would otherwise each receive the same transaction summary and inflate
+`total_calls` and charges. Distinct proxies may each attach their own instance
+(including different `currency` / pricing). The four shared render/cleanup
+tunables must agree across every enabled instance in the process; the
+lexicographically first enabled plugin-config id is the documented owner of
+those knobs.
+
 **`proxy_name` contract:** exported `proxy_name` is live display metadata for the
 stable `proxy_id`. It is omitted from the in-memory registry key, so a name-only
 reload preserves the accumulated counter values. After an accepted
@@ -1354,7 +1380,7 @@ available in transaction logs.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance (global/proxy/proxy_group scope) stamps its own currency onto the charges it records and emits it per row, so instances with different currencies do not overwrite one another |
+| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance on a distinct proxy stamps its own currency onto the charges it records and emits it per row. Multiple effective instances on one proxy are rejected (exactly-once `/charges` accounting) |
 | `pricing_tiers` | Array | _(optional)_ | Per-call HTTP-family pricing. Each tier maps ordinary HTTP status codes or canonical effective gRPC status mappings to a per-call price |
 | `pricing_tiers[].status_codes` | Array\<Integer\> | _(required inside a tier)_ | Billable status codes that trigger this tier's charge. Native gRPC and gRPC-Web terminal codes use the documented effective-HTTP mapping. A status code must appear in exactly one tier |
 | `pricing_tiers[].price_per_call` | Number | _(required inside a tier)_ | Charge per HTTP call (e.g. `0.00001`). Must be finite, non-negative, and ≤ `1e288` so `u64` counter × price stays finite in IEEE-754 binary64 |
@@ -1363,10 +1389,10 @@ available in transaction logs.
 | `bandwidth_pricing.price_per_byte_received` | Number | `0.0` | Per-byte charge for bytes flowed backend→client. Finite, non-negative, ≤ `1e288` |
 | `stream_connection_pricing` | Object | _(optional)_ | Per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS) |
 | `stream_connection_pricing.price_per_connection` | Number | _(required when block is set)_ | Per-session charge applied at stream disconnect. Finite, non-negative, ≤ `1e288` |
-| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding |
-| `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction |
-| `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it |
-| `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task |
+| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding. Process-global: every enabled instance must use the same value |
+| `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction. Process-global: every enabled instance must use the same value |
+| `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Process-global: every enabled instance must use the same value |
+| `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
 `Authorization: Bearer <token>`. Chargeback output can contain customer and

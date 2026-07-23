@@ -1307,6 +1307,194 @@ fn test_prometheus_metrics_requires_global_and_unique_registry_owner() {
 }
 
 #[test]
+fn test_api_chargeback_rejects_duplicate_proxy_scoped_instances() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["charge-a", "charge-b"])],
+        vec![
+            make_plugin_config(
+                "charge-a",
+                "api_chargeback",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "charge-b",
+                "api_chargeback",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("two proxy-scoped chargeback instances must be rejected");
+    assert!(
+        error.contains("at most one effective instance per proxy"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("charge-a") && error.contains("charge-b"));
+}
+
+#[test]
+fn test_api_chargeback_rejects_duplicate_proxy_group_instances() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["group-a", "group-b"])],
+        vec![
+            make_plugin_config(
+                "group-a",
+                "api_chargeback",
+                PluginScope::ProxyGroup,
+                None,
+                true,
+            ),
+            make_plugin_config(
+                "group-b",
+                "api_chargeback",
+                PluginScope::ProxyGroup,
+                None,
+                true,
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("two proxy-group chargeback instances must be rejected");
+    assert!(
+        error.contains("at most one effective instance per proxy"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("group-a") && error.contains("group-b"));
+}
+
+#[test]
+fn test_api_chargeback_rejects_mixed_proxy_and_proxy_group_instances() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["charge-proxy", "charge-group"])],
+        vec![
+            make_plugin_config(
+                "charge-proxy",
+                "api_chargeback",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "charge-group",
+                "api_chargeback",
+                PluginScope::ProxyGroup,
+                None,
+                true,
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("mixed scoped chargeback instances must be rejected");
+    assert!(
+        error.contains("at most one effective instance per proxy"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn test_api_chargeback_rejects_conflicting_shared_tunables_across_proxies() {
+    let mut owner = make_plugin_config(
+        "charge-owner",
+        "api_chargeback",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    owner.config = json!({
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "render_cache_ttl_seconds": 5,
+        "cleanup_interval_seconds": 0
+    });
+    let mut sibling = make_plugin_config(
+        "charge-sibling",
+        "api_chargeback",
+        PluginScope::Proxy,
+        Some("p2"),
+        true,
+    );
+    sibling.config = json!({
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.02}],
+        "currency": "EUR",
+        "render_cache_ttl_seconds": 30,
+        "cleanup_interval_seconds": 0
+    });
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["charge-owner"]),
+            make_proxy("p2", "/web", vec!["charge-sibling"]),
+        ],
+        vec![owner, sibling],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("disagreeing shared tunables must be rejected");
+    assert!(
+        error.contains("shared render/cleanup tunables must match"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("charge-owner") && error.contains("charge-sibling"));
+}
+
+#[test]
+fn test_api_chargeback_allows_one_instance_per_proxy_with_mixed_currency() {
+    let mut usd = make_plugin_config(
+        "charge-usd",
+        "api_chargeback",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    usd.config = json!({
+        "currency": "USD",
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "cleanup_interval_seconds": 0
+    });
+    let mut eur = make_plugin_config(
+        "charge-eur",
+        "api_chargeback",
+        PluginScope::Proxy,
+        Some("p2"),
+        true,
+    );
+    eur.config = json!({
+        "currency": "EUR",
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.02}],
+        "cleanup_interval_seconds": 0
+    });
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["charge-usd"]),
+            make_proxy("p2", "/web", vec!["charge-eur"]),
+        ],
+        vec![usd, eur],
+    );
+    let cache = PluginCache::new(&config).expect("one chargeback per proxy is valid");
+    assert_eq!(
+        cache
+            .get_plugins("p1")
+            .iter()
+            .filter(|plugin| plugin.name() == "api_chargeback")
+            .count(),
+        1
+    );
+    assert_eq!(
+        cache
+            .get_plugins("p2")
+            .iter()
+            .filter(|plugin| plugin.name() == "api_chargeback")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn test_single_prometheus_metrics_instance_is_shared_once_across_protocols() {
     let config = make_config(
         vec![

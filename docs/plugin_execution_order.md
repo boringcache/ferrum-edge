@@ -519,6 +519,8 @@ Within each lifecycle phase, plugins are sorted by **priority** (lower number ru
 
 Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for different log destinations). When merging global, proxy-scoped, and proxy-group-scoped plugins, a scoped plugin replaces only the **global** plugin of the same name — other scoped instances of the same type are preserved. See [Plugin Scope](plugins.md#plugin-scope-merging) for the full merging rules and examples.
 
+**Exception — `api_chargeback`:** merge still preserves scoped same-name instances, but admission then rejects any proxy whose effective list retains more than one `api_chargeback`. The shared `/charges` registry has no instance/ledger dimension, so multiple hooks would double-count one client transaction. Shared render/cleanup tunables must also agree across every enabled instance in the process. See [api_chargeback](plugins.md#api_chargeback).
+
 Priority bands are spaced with gaps so future plugins can slot in without renumbering:
 
 | Band | Priority Range | Purpose | Plugins |

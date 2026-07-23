@@ -20312,6 +20312,15 @@ components:
         Unknown top-level keys and unknown `pricing_tiers[]` keys are
         rejected so a misspelled pricing dimension cannot silently bill
         at zero.
+        Exactly-once accounting: after scope merging, each proxy may retain
+        at most one effective `api_chargeback` instance. Multiple proxy-scoped,
+        proxy-group-scoped, or mixed attachments on one proxy are rejected
+        because the process-global `/charges` registry has no ledger/instance
+        dimension. Distinct proxies may each attach one instance (including
+        different currencies/pricing). Shared render/cleanup tunables
+        (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
+        `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`) must
+        agree across every enabled instance in the process.
       properties:
         currency:
           type: string
@@ -20396,19 +20405,32 @@ components:
         render_cache_ttl_seconds:
           type: integer
           default: 5
-          description: How long the cached /charges response is served before rebuilding.
+          description: |
+            How long the cached /charges response is served before rebuilding.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
         stale_entry_ttl_seconds:
           type: integer
           default: 3600
-          description: How long idle chargeback entries live before eviction.
+          description: |
+            How long idle chargeback entries live before eviction.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
         cache_invalidation_min_age_ms:
           type: integer
           default: 500
-          description: Minimum age (ms) of the render cache before record() will invalidate it.
+          description: |
+            Minimum age (ms) of the render cache before record() will invalidate
+            it. Process-global: every enabled api_chargeback instance must use
+            the same value.
         cleanup_interval_seconds:
           type: integer
           default: 300
-          description: How often (seconds) the background task evicts entries that have been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
+          description: |
+            How often (seconds) the background task evicts entries that have
+            been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
 
     ApiChargebackSinkConfig:
       type: object
