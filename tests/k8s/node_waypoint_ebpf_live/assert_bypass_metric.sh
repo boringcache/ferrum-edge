@@ -9,8 +9,6 @@ set -euo pipefail
 MESH_NS="${FERRUM_LIVE_MESH_NAMESPACE:-ferrum}"
 WORKLOAD_NS="${FERRUM_LIVE_WORKLOAD_NAMESPACE:-ferrum-ebpf-live}"
 AMBIENT_ADMIN_PORT="${FERRUM_LIVE_AMBIENT_ADMIN_PORT:-19010}"
-ADMIN_JWT_SECRET="${FERRUM_LIVE_ADMIN_JWT_SECRET:-ferrum-edge-node-waypoint-live-admin-secret}"
-ADMIN_JWT_ISSUER="${FERRUM_LIVE_ADMIN_JWT_ISSUER:-ferrum-edge}"
 RESULTS_DIR="${FERRUM_LIVE_RESULTS_DIR:-target/node-waypoint-ebpf-live}/mesh-bpf-metrics"
 LOCAL_PORT="${FERRUM_LIVE_BPF_METRICS_LOCAL_PORT:-19450}"
 
@@ -36,39 +34,6 @@ if [[ -z "$source_pod" || -z "$source_node" || -z "$ambient_pod" ]]; then
   exit 1
 fi
 
-token="$(
-  python3 - "$ADMIN_JWT_SECRET" "$ADMIN_JWT_ISSUER" <<'PY'
-import base64
-import hashlib
-import hmac
-import json
-import sys
-import time
-import uuid
-
-secret, issuer = sys.argv[1], sys.argv[2]
-now = int(time.time())
-
-def b64url(value):
-    raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-header = {"alg": "HS256", "typ": "JWT"}
-claims = {
-    "iss": issuer,
-    "sub": "node-waypoint-ebpf-live",
-    "iat": now,
-    "nbf": now - 1,
-    "exp": now + 600,
-    "jti": str(uuid.uuid4()),
-    "role": "admin",
-}
-signing_input = f"{b64url(header)}.{b64url(claims)}"
-signature = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
-print(f"{signing_input}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}")
-PY
-)"
-
 port_forward_log="$RESULTS_DIR/port-forward.log"
 kubectl -n "$MESH_NS" port-forward \
   "pod/$ambient_pod" "$LOCAL_PORT:$AMBIENT_ADMIN_PORT" \
@@ -82,8 +47,10 @@ trap cleanup EXIT
 
 scrape_metrics() {
   local destination="$1"
-  curl -fsS -H "Authorization: Bearer $token" \
-    "http://127.0.0.1:$LOCAL_PORT/metrics" >"$destination"
+  # The live chart restricts metric access to 127.0.0.1/32. kubectl
+  # port-forward reaches the pod's admin listener from loopback, exercising
+  # that explicit metrics policy without putting a token into diagnostics.
+  curl -fsS "http://127.0.0.1:$LOCAL_PORT/metrics" >"$destination"
 }
 
 before_file="$RESULTS_DIR/before.prom"
