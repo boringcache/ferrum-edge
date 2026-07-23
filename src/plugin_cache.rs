@@ -1138,7 +1138,7 @@ fn try_create_plugin(
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if matches!(
         pc.plugin_name.as_str(),
-        "request_deduplication" | "api_chargeback_sink"
+        "request_deduplication" | "request_mirror" | "api_chargeback_sink"
     ) {
         // Pass the stable plugin-config resource id through the production
         // factory so identity-aware plugins partition or attribute sibling
