@@ -3980,6 +3980,9 @@ impl SnapshotAccumulator {
         entry.totals.add(charge);
     }
 
+    // External integration tests exercise the public accumulator contract;
+    // the separately compiled binary cannot observe those call sites.
+    #[allow(dead_code)]
     pub fn compute_deltas(
         &self,
         config: &ApiChargebackSinkConfig,
