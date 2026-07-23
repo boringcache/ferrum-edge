@@ -78,6 +78,12 @@ struct ProtobufConfig {
     dependency_unavailable: bool,
 }
 
+struct ResolvedProtobufShape {
+    request_descriptor: Option<MessageDescriptor>,
+    response_descriptor: Option<MessageDescriptor>,
+    method_messages: HashMap<String, ProtobufMethodEntry>,
+}
+
 #[derive(Clone, Copy)]
 enum DescriptorLoadMode {
     Runtime,
@@ -1601,14 +1607,7 @@ pub(crate) fn load_protobuf_descriptor_pool(
 fn resolve_protobuf_shape(
     shape: &ProtobufShape,
     pool: &DescriptorPool,
-) -> Result<
-    (
-        Option<MessageDescriptor>,
-        Option<MessageDescriptor>,
-        HashMap<String, ProtobufMethodEntry>,
-    ),
-    String,
-> {
+) -> Result<ResolvedProtobufShape, String> {
     let request_descriptor = shape
         .request_type
         .as_deref()
@@ -1656,7 +1655,11 @@ fn resolve_protobuf_shape(
             ProtobufMethodEntry { request, response },
         );
     }
-    Ok((request_descriptor, response_descriptor, method_messages))
+    Ok(ResolvedProtobufShape {
+        request_descriptor,
+        response_descriptor,
+        method_messages,
+    })
 }
 
 pub(crate) fn validate_protobuf_descriptor_config(
@@ -1716,8 +1719,11 @@ fn load_protobuf_config(
         }
         Err(error) => return Err(error.into_message()),
     };
-    let (request_descriptor, response_descriptor, method_messages) =
-        resolve_protobuf_shape(&shape, &pool)?;
+    let ResolvedProtobufShape {
+        request_descriptor,
+        response_descriptor,
+        method_messages,
+    } = resolve_protobuf_shape(&shape, &pool)?;
     Ok(ProtobufConfig {
         pool: Some(pool),
         request_descriptor,
