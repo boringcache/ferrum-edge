@@ -21040,7 +21040,7 @@ components:
         ID plus process-wide totals. Instances are ordered by ascending
         `plugin_config_id`. Validation throwaways, uncommitted staged reloads,
         and superseded generations are excluded.
-      required: [enabled, instance_count, totals, instances]
+      required: [enabled, instance_count, snapshot_finalizations_pending, totals, instances]
       properties:
         enabled:
           type: boolean
@@ -21049,6 +21049,10 @@ components:
           type: integer
           minimum: 0
           description: Number of current accepted plugin-config IDs in `instances`.
+        snapshot_finalizations_pending:
+          type: integer
+          minimum: 0
+          description: Retired snapshot generations retaining an unspooled terminal delta for bounded retry.
         totals:
           type: object
           description: Aggregates across every accepted live instance.

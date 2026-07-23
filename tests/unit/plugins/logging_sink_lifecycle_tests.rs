@@ -1280,6 +1280,55 @@ async fn chargeback_snapshot_spool_failure_retains_generation_for_bounded_retry(
     drop(plugin);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_snapshot_later_reload_retries_older_retained_generation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let retained_spool = tmp.path().join("retained-spool");
+    std::fs::write(&retained_spool, b"not a directory").expect("plant blocking file");
+    let retained = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&retained_spool),
+        client(),
+        "default",
+    )
+    .expect("retained snapshot sink");
+    retained
+        .start_background_tasks()
+        .expect("start retained snapshot sink");
+    retained.commit_background_tasks();
+    retained.log(&create_test_transaction_summary()).await;
+    assert_eq!(
+        api_chargeback_sink_finalize_snapshot_for_test(&retained).await,
+        Some(false)
+    );
+
+    std::fs::remove_file(&retained_spool).expect("restore retained spool path");
+    let replacement_spool = tmp.path().join("replacement-spool");
+    let replacement = ApiChargebackSink::new(
+        &chargeback_snapshot_sink_config(&replacement_spool),
+        client(),
+        "default",
+    )
+    .expect("replacement snapshot sink");
+    replacement
+        .start_background_tasks()
+        .expect("start replacement snapshot sink");
+    replacement.commit_background_tasks();
+
+    // Production reload disposal runs on the multi-threaded gateway runtime.
+    // Retiring the replacement must retry all older closed generations within
+    // the same bounded drain instead of leaving them parked until shutdown.
+    drop(replacement);
+    assert_eq!(
+        api_chargeback_sink_snapshot_generation_registered_for_test(&retained),
+        Some(false)
+    );
+    let rows = chargeback_spool_rows(&retained_spool);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["call_count"], 1);
+    drop(retained);
+}
+
 fn test_ws_disconnect_context() -> WsDisconnectContext {
     WsDisconnectContext {
         namespace: "ferrum".to_string(),

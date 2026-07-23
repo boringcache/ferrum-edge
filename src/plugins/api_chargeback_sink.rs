@@ -164,6 +164,37 @@ pub async fn finalize_all_snapshot_generations() {
     .await;
 }
 
+/// Finalize the generation being retired and retry every older generation
+/// whose bounded handoff previously failed. Retrying the retained set on each
+/// later reload prevents a persistent spool outage from accumulating
+/// never-revisited generations until process shutdown.
+async fn finalize_snapshot_generation_and_pending(current: Arc<SnapshotLifecycle>) {
+    let mut generations = vec![Arc::clone(&current)];
+    {
+        let registered = match active_snapshot_generations().lock() {
+            Ok(generations) => generations,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        generations.extend(
+            registered
+                .values()
+                .filter(|lifecycle| {
+                    lifecycle.generation != current.generation
+                        && lifecycle.committed.load(Ordering::Acquire)
+                        && !lifecycle.accepting.load(Ordering::Acquire)
+                        && !lifecycle.finalized.load(Ordering::Acquire)
+                })
+                .cloned(),
+        );
+    }
+    futures_util::future::join_all(
+        generations
+            .iter()
+            .map(|generation| generation.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT)),
+    )
+    .await;
+}
+
 fn register_active_sink(runtime: Arc<SinkRuntime>) {
     let key = runtime.plugin_config_id.to_string();
     active_sinks().rcu(|map| {
@@ -1444,7 +1475,7 @@ impl Drop for ApiChargebackSink {
                 let lifecycle = Arc::clone(lifecycle);
                 tokio::task::block_in_place(|| {
                     handle.block_on(async move {
-                        lifecycle.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT).await;
+                        finalize_snapshot_generation_and_pending(lifecycle).await;
                     });
                 });
             } else {
@@ -4183,13 +4214,14 @@ fn start_snapshot_task(
     tokio::spawn(async move {
         if *shutdown_rx.borrow() {
             return if *commit_rx.borrow() {
-                emit_final_snapshot_to_spool(
-                    &accumulator,
-                    &runtime,
-                    &config,
-                    &node_id,
-                    &emission_lock,
+                emit_final_snapshot_to_spool_off_thread(
+                    Arc::clone(&accumulator),
+                    Arc::clone(&runtime),
+                    Arc::clone(&config),
+                    Arc::clone(&node_id),
+                    Arc::clone(&emission_lock),
                 )
+                .await
             } else {
                 true
             };
@@ -4199,13 +4231,14 @@ fn start_snapshot_task(
             committed = wait_until_committed(commit_rx) => committed,
             _ = wait_for_snapshot_shutdown(&mut shutdown_rx) => {
                 if *commit_observer.borrow() {
-                    return emit_final_snapshot_to_spool(
-                        &accumulator,
-                        &runtime,
-                        &config,
-                        &node_id,
-                        &emission_lock,
-                    );
+                    return emit_final_snapshot_to_spool_off_thread(
+                        Arc::clone(&accumulator),
+                        Arc::clone(&runtime),
+                        Arc::clone(&config),
+                        Arc::clone(&node_id),
+                        Arc::clone(&emission_lock),
+                    )
+                    .await;
                 }
                 false
             },
@@ -4226,22 +4259,24 @@ fn start_snapshot_task(
             tokio::select! {
                 biased;
                 _ = wait_for_snapshot_shutdown(&mut shutdown_rx) => {
-                    return emit_final_snapshot_to_spool(
-                        &accumulator,
-                        &runtime,
-                        &config,
-                        &node_id,
-                        &emission_lock,
-                    );
+                    return emit_final_snapshot_to_spool_off_thread(
+                        Arc::clone(&accumulator),
+                        Arc::clone(&runtime),
+                        Arc::clone(&config),
+                        Arc::clone(&node_id),
+                        Arc::clone(&emission_lock),
+                    )
+                    .await;
                 }
                 _ = snapshot_timer.tick() => {
-                    let _ = emit_periodic_snapshot(
-                        &accumulator,
-                        &runtime,
-                        &config,
-                        &node_id,
-                        &emission_lock,
-                    );
+                    let _ = emit_periodic_snapshot_off_thread(
+                        Arc::clone(&accumulator),
+                        Arc::clone(&runtime),
+                        Arc::clone(&config),
+                        Arc::clone(&node_id),
+                        Arc::clone(&emission_lock),
+                    )
+                    .await;
                 }
                 _ = cleanup_timer.tick() => {
                     let removed = accumulator.cleanup_stale(
@@ -4255,6 +4290,78 @@ fn start_snapshot_task(
             }
         }
     })
+}
+
+async fn emit_periodic_snapshot_off_thread(
+    accumulator: Arc<SnapshotAccumulator>,
+    runtime: Arc<SinkRuntime>,
+    config: Arc<ApiChargebackSinkConfig>,
+    node_id: Arc<str>,
+    emission_lock: Arc<Mutex<()>>,
+) -> Result<usize, String> {
+    let metrics = Arc::clone(&runtime.metrics);
+    let generation = runtime.generation;
+    match tokio::task::spawn_blocking(move || {
+        emit_periodic_snapshot(
+            &accumulator,
+            &runtime,
+            &config,
+            &node_id,
+            &emission_lock,
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let error = format!("periodic snapshot worker did not complete: {error}");
+            metrics.record_failure(FailureReason::Serialize, error.clone());
+            warn!(
+                plugin = PLUGIN_NAME,
+                generation,
+                error = %error,
+                "Chargeback sink periodic snapshot worker failed"
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn emit_final_snapshot_to_spool_off_thread(
+    accumulator: Arc<SnapshotAccumulator>,
+    runtime: Arc<SinkRuntime>,
+    config: Arc<ApiChargebackSinkConfig>,
+    node_id: Arc<str>,
+    emission_lock: Arc<Mutex<()>>,
+) -> bool {
+    let metrics = Arc::clone(&runtime.metrics);
+    let generation = runtime.generation;
+    match tokio::task::spawn_blocking(move || {
+        emit_final_snapshot_to_spool(
+            &accumulator,
+            &runtime,
+            &config,
+            &node_id,
+            &emission_lock,
+        )
+    })
+    .await
+    {
+        Ok(durable) => durable,
+        Err(error) => {
+            metrics.record_failure(
+                FailureReason::Serialize,
+                format!("final snapshot worker did not complete: {error}"),
+            );
+            warn!(
+                plugin = PLUGIN_NAME,
+                generation,
+                error = %error,
+                "Chargeback sink final snapshot worker failed; generation state retained"
+            );
+            false
+        }
+    }
 }
 
 fn emit_periodic_snapshot(

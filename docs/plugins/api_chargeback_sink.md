@@ -122,11 +122,13 @@ finalization is idempotent, and record hooks arriving after admission closes
 are ignored.
 
 Spool write failure leaves the generation unfinalized and retains its
-accumulator in the process-wide lifecycle registry for a later bounded retry.
-The failure is reported through the sink failure/spool-availability metrics and
-status. Because snapshot mode requires the spool, operators should treat an
-unwritable or exhausted spool as a billing-durability incident and restore it
-before terminating the process.
+accumulator in the process-wide lifecycle registry. Every later multi-threaded
+reload retries all older retained generations concurrently with the generation
+being retired, and graceful shutdown retries the complete registry. Each retry
+is bounded. The failure is reported through the sink
+failure/spool-availability metrics and status. Because snapshot mode requires
+the spool, operators should treat an unwritable or exhausted spool as a
+billing-durability incident and restore it before terminating the process.
 
 Both modes use the same pricing fields as `api_chargeback`. At least one
 nonempty pricing dimension is mandatory and matches
@@ -416,6 +418,8 @@ Response contract:
 
 - `enabled` is `true` when at least one accepted instance is live.
 - `instance_count` is the number of published instances.
+- `snapshot_finalizations_pending` is the number of retired snapshot
+  generations retaining an unspooled terminal delta for bounded retry.
 - `totals` aggregates queue depth/capacity/high-water hits, spool files/bytes/
   drops/prepare failures, and export counters across every current accepted
   instance.
@@ -438,6 +442,7 @@ across the current accepted sink generation for every stable plugin-config ID:
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
+- `chargeback_sink_snapshot_finalizations_pending`
 - `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
