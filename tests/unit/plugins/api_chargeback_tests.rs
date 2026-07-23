@@ -3258,11 +3258,7 @@ async fn test_effective_chain_records_each_protocol_path_exactly_once() {
         })
         .await;
 
-    for (proxy_id, protocol) in [
-        (TCP_PROXY, "tcp"),
-        (UDP_PROXY, "udp"),
-        (DTLS_PROXY, "dtls"),
-    ] {
+    for (proxy_id, protocol) in [(TCP_PROXY, "tcp"), (UDP_PROXY, "udp"), (DTLS_PROXY, "dtls")] {
         let plugin = cache
             .get_plugins(proxy_id)
             .iter()
@@ -3327,8 +3323,7 @@ async fn test_two_direct_instances_would_double_count_one_http_transaction() {
     let rendered: serde_json::Value =
         serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
     assert_eq!(
-        rendered["consumers"][CONSUMER]["proxies"][PROXY]["by_status"]["200"]["calls"],
-        2,
+        rendered["consumers"][CONSUMER]["proxies"][PROXY]["by_status"]["200"]["calls"], 2,
         "two hooks on one shared registry key inflate calls — uniqueness must reject this"
     );
 }

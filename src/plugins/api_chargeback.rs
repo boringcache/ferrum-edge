@@ -472,16 +472,12 @@ fn effective_api_chargeback_plugins_by_proxy(
                 .filter_map(|association| {
                     let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
                     let scope_applies = match plugin.scope {
-                        PluginScope::Proxy => {
-                            plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
-                        }
+                        PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
                         PluginScope::ProxyGroup => plugin.proxy_id.is_none(),
                         PluginScope::Global => false,
                     };
-                    (plugin.enabled
-                        && plugin.plugin_name == "api_chargeback"
-                        && scope_applies)
-                    .then_some(plugin)
+                    (plugin.enabled && plugin.plugin_name == "api_chargeback" && scope_applies)
+                        .then_some(plugin)
                 })
                 .collect();
             let effective = if local_chargeback.is_empty() {

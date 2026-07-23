@@ -1402,7 +1402,11 @@ fn test_api_chargeback_rejects_duplicate_proxy_group_instances() {
 #[test]
 fn test_api_chargeback_rejects_mixed_proxy_and_proxy_group_instances() {
     let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["charge-proxy", "charge-group"])],
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["charge-proxy", "charge-group"],
+        )],
         vec![
             make_plugin_config(
                 "charge-proxy",
