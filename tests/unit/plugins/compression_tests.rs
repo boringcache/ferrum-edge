@@ -3123,7 +3123,7 @@ async fn test_normalize_buffered_request_body_decodes_before_before_proxy() {
 async fn test_buffered_normalizer_noop_preserves_existing_views_without_content_encoding() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(json!({
         "decompress_request": true
-    }))];
+    })))];
     let mut ctx = make_ctx(None);
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -3162,7 +3162,7 @@ async fn test_binary_only_normalization_refreshes_bytes_without_materializing_te
 
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(json!({
         "decompress_request": true
-    }))];
+    })))];
     let plaintext = b"binary consumer plaintext";
     let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(plaintext).unwrap();
