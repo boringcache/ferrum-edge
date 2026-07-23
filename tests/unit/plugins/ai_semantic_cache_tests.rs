@@ -3552,7 +3552,9 @@ async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
 #[tokio::test]
 async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
     let mock_server = MockServer::start().await;
-    mount_embedding_mock(&mock_server, 9).await;
+    // Three embedding requests per original provider family, plus the staged
+    // and lookup requests for the cross-conversation Cohere isolation case.
+    mount_embedding_mock(&mock_server, 11).await;
     let plugin = make_plugin(semantic_config(&mock_server));
 
     let cohere1 = json!({
