@@ -892,6 +892,7 @@ jobs:
               functional_router_cache_test
               functional_secrets_test
               functional_ai_plugins_test
+              functional_ai_stream_router_test
               functional_ai_semantic_firewall_streaming_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
