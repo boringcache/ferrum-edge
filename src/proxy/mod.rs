@@ -25083,13 +25083,12 @@ async fn handle_proxy_request_inner(
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
     let plugin_external_io_ms =
         ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-    let (gateway_processing_ms, gateway_overhead_ms) =
-        TransactionSummary::derive_gateway_latencies(
-            total_ms,
-            backend_total_ms,
-            plugin_execution_ms,
-            is_streaming_response,
-        );
+    let (gateway_processing_ms, gateway_overhead_ms) = TransactionSummary::derive_gateway_latencies(
+        total_ms,
+        backend_total_ms,
+        plugin_execution_ms,
+        is_streaming_response,
+    );
 
     // Log/runtime-metrics phase. Keep the no-plugin, non-streaming success
     // path lightweight, but still construct a summary when runtime metrics need

@@ -8889,7 +8889,10 @@ async fn dispatch_grpc_native_h3(
                 Some(h3_error_class),
                 None,
                 start_time,
-                backend_admission_start.elapsed().as_secs_f64() * 1000.0,
+                // No response headers / first byte were observed on this
+                // pre-headers failure path, so TTFB is unknown rather than
+                // admission elapsed time.
+                crate::plugins::LATENCY_UNKNOWN_MS,
                 *plugin_execution_ns,
             )
             .await;
@@ -8988,7 +8991,7 @@ async fn dispatch_grpc_native_h3(
             Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             None,
             start_time,
-                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
+            backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9092,7 +9095,7 @@ async fn dispatch_grpc_native_h3(
             None,
             None,
             start_time,
-                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
+            backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9239,7 +9242,7 @@ async fn dispatch_grpc_native_h3(
             response_header_client_disconnected
                 .then_some(crate::retry::ErrorClass::ClientDisconnect),
             start_time,
-                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
+            backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9850,7 +9853,7 @@ async fn dispatch_grpc_native_h3(
         None,
         body_error_class,
         start_time,
-                backend_admission_response_elapsed.as_secs_f64() * 1000.0,
+        backend_admission_response_elapsed.as_secs_f64() * 1000.0,
         *plugin_execution_ns,
     )
     .await;
@@ -9891,13 +9894,12 @@ async fn log_h3_grpc_transaction(
         .plugin_http_call_ns
         .load(std::sync::atomic::Ordering::Relaxed) as f64
         / 1_000_000.0;
-    let (gateway_processing_ms, gateway_overhead_ms) =
-        TransactionSummary::derive_gateway_latencies(
-            total_ms,
-            backend_total_ms,
-            plugin_execution_ms,
-            true,
-        );
+    let (gateway_processing_ms, gateway_overhead_ms) = TransactionSummary::derive_gateway_latencies(
+        total_ms,
+        backend_total_ms,
+        plugin_execution_ms,
+        true,
+    );
     let summary = TransactionSummary {
         namespace: proxy.namespace.clone(),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
