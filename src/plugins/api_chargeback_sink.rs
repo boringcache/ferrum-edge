@@ -3462,8 +3462,9 @@ impl SnapshotAccumulator {
                 // Drop the baseline only for the generation that was actually
                 // evicted. A concurrent reinsert+emit for a newer generation
                 // must keep its last_emitted row.
-                self.last_emitted
-                    .remove_if(&key, |_, baseline| baseline.generation == evicted.generation);
+                self.last_emitted.remove_if(&key, |_, baseline| {
+                    baseline.generation == evicted.generation
+                });
                 removed += 1;
             }
         }

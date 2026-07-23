@@ -1754,13 +1754,7 @@ fn snapshot_cleanup_loses_race_to_same_key_refresh_after_stale_check() {
     let charge = unit_call_charge(0.01);
 
     accumulator.record_for_test(
-        "ferrum",
-        "alice",
-        "proxy-a",
-        "Payments",
-        200,
-        "http",
-        charge,
+        "ferrum", "alice", "proxy-a", "Payments", 200, "http", charge,
     );
     assert_eq!(
         accumulator
@@ -1837,23 +1831,9 @@ fn snapshot_cleanup_preserves_unrelated_key_and_new_generation_baseline() {
     let charge = unit_call_charge(0.01);
 
     accumulator.record_for_test(
-        "ferrum",
-        "alice",
-        "proxy-a",
-        "Payments",
-        200,
-        "http",
-        charge,
+        "ferrum", "alice", "proxy-a", "Payments", 200, "http", charge,
     );
-    accumulator.record_for_test(
-        "ferrum",
-        "bob",
-        "proxy-b",
-        "Billing",
-        200,
-        "http",
-        charge,
-    );
+    accumulator.record_for_test("ferrum", "bob", "proxy-b", "Billing", 200, "http", charge);
     assert_eq!(
         accumulator
             .compute_deltas(&config, "node-a", 100, "snap-1")
@@ -1871,13 +1851,7 @@ fn snapshot_cleanup_preserves_unrelated_key_and_new_generation_baseline() {
     assert_eq!(accumulator.last_emitted_count_for_tests(), 0);
 
     accumulator.record_for_test(
-        "ferrum",
-        "alice",
-        "proxy-a",
-        "Payments",
-        200,
-        "http",
-        charge,
+        "ferrum", "alice", "proxy-a", "Payments", 200, "http", charge,
     );
     let restarted = accumulator
         .compute_deltas(&config, "node-a", 200, "snap-2")
