@@ -23,9 +23,7 @@ use ferrum_edge::plugins::{
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
     chain_response_stream_inspectors, plugin_failure_policy, priority, validate_plugin_config,
 };
-use ferrum_edge::proxy::deferred_log::{
-    BodyOutcome, run_response_stream_termination_hooks,
-};
+use ferrum_edge::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -3798,10 +3796,8 @@ async fn tool_governor_request_decision_forces_request_only_capture_and_is_harve
         "ai_tool_governor.tool_names".to_string(),
         "lookup_customer".to_string(),
     );
-    ctx.metadata.insert(
-        "ai_tool_governor.risk".to_string(),
-        "high".to_string(),
-    );
+    ctx.metadata
+        .insert("ai_tool_governor.risk".to_string(), "high".to_string());
     let mut summary = create_test_transaction_summary();
     summary.response_status_code = 200;
     summary.metadata = ctx.metadata.clone();
@@ -3819,10 +3815,7 @@ async fn tool_governor_request_decision_forces_request_only_capture_and_is_harve
         records[0]["guardrails"]["ai_tool_governor.tool_names"],
         "lookup_customer"
     );
-    assert_eq!(
-        records[0]["guardrails"]["ai_tool_governor.risk"],
-        "high"
-    );
+    assert_eq!(records[0]["guardrails"]["ai_tool_governor.risk"], "high");
 }
 
 struct TerminalToolGovernorDecision;
@@ -3877,11 +3870,7 @@ async fn tool_governor_buffered_and_terminal_stream_decisions_force_capture_but_
     let headers = json_headers();
     let mut buffered_ctx = make_ctx();
     buffered
-        .on_final_request_body_with_context(
-            &mut buffered_ctx,
-            &headers,
-            ai_request_body(),
-        )
+        .on_final_request_body_with_context(&mut buffered_ctx, &headers, ai_request_body())
         .await;
     buffered_ctx.metadata.insert(
         "ai_tool_governor.decision".to_string(),
@@ -3892,12 +3881,7 @@ async fn tool_governor_buffered_and_terminal_stream_decisions_force_capture_but_
         "sensitive-tools".to_string(),
     );
     buffered
-        .capture_final_response_body(
-            &mut buffered_ctx,
-            200,
-            &headers,
-            br#"{"ok":true}"#,
-        )
+        .capture_final_response_body(&mut buffered_ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let buffered_records = wait_for_records(&buffered_server).await;
     assert_eq!(buffered_records.len(), 1);
@@ -3929,10 +3913,8 @@ async fn tool_governor_buffered_and_terminal_stream_decisions_force_capture_but_
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
-    let termination_plugins: Vec<Arc<dyn Plugin>> = vec![
-        streaming.clone(),
-        Arc::new(TerminalToolGovernorDecision),
-    ];
+    let termination_plugins: Vec<Arc<dyn Plugin>> =
+        vec![streaming.clone(), Arc::new(TerminalToolGovernorDecision)];
     run_response_stream_termination_hooks(
         &termination_plugins,
         &mut stream_ctx,
@@ -3970,10 +3952,9 @@ async fn tool_governor_buffered_and_terminal_stream_decisions_force_capture_but_
     allow
         .on_final_request_body_with_context(&mut allow_ctx, &headers, ai_request_body())
         .await;
-    allow_ctx.metadata.insert(
-        "ai_tool_governor.decision".to_string(),
-        "allow".to_string(),
-    );
+    allow_ctx
+        .metadata
+        .insert("ai_tool_governor.decision".to_string(), "allow".to_string());
     allow
         .capture_final_response_body(&mut allow_ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
@@ -4036,9 +4017,11 @@ async fn local_dedup_replay_is_staged_first_and_emits_exactly_one_marked_record(
     .unwrap();
     audit.start_background_tasks().expect("live start");
     audit.commit_background_tasks();
-    let dedup =
-        RequestDeduplication::new(&json!({ "scope_by_consumer": false }), loopback_http_client())
-            .unwrap();
+    let dedup = RequestDeduplication::new(
+        &json!({ "scope_by_consumer": false }),
+        loopback_http_client(),
+    )
+    .unwrap();
     assert!(
         audit.priority() < dedup.priority(),
         "audit staging must run before a replay can terminate the chain"
@@ -4115,9 +4098,7 @@ async fn local_dedup_replay_is_staged_first_and_emits_exactly_one_marked_record(
     );
     let replay_records: Vec<&Value> = records
         .iter()
-        .filter(|record| {
-            record["cache"]["request_deduplication.replayed"].as_str() == Some("true")
-        })
+        .filter(|record| record["cache"]["request_deduplication.replayed"].as_str() == Some("true"))
         .collect();
     assert_eq!(replay_records.len(), 1);
     assert_eq!(replay_records[0]["status_code"], 200);
@@ -4597,14 +4578,14 @@ async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted(
 
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
-    let excerpt: Value =
-        serde_json::from_str(records[0]["response_body"].as_str().expect("response excerpt"))
-            .expect("reassembled excerpt JSON");
+    let excerpt: Value = serde_json::from_str(
+        records[0]["response_body"]
+            .as_str()
+            .expect("response excerpt"),
+    )
+    .expect("reassembled excerpt JSON");
     assert_eq!(excerpt["sse_reassembled"], true);
-    assert_eq!(
-        excerpt["completion_text"]["0"],
-        "I will look that up."
-    );
+    assert_eq!(excerpt["completion_text"]["0"], "I will look that up.");
     assert_eq!(excerpt["finish_reason"]["0"], "tool_calls");
     let calls = excerpt["tool_calls"]["0"]
         .as_array()
@@ -4614,16 +4595,22 @@ async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted(
     assert_eq!(calls[0]["id"], "call_a");
     assert_eq!(calls[0]["type"], "function");
     assert_eq!(calls[0]["function"]["name"], "lookup_customer");
-    let first_args: Value =
-        serde_json::from_str(calls[0]["function"]["arguments"].as_str().expect("arguments"))
-            .expect("reassembled first arguments");
+    let first_args: Value = serde_json::from_str(
+        calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("reassembled first arguments");
     assert_eq!(first_args["password"], "[REDACTED]");
     assert_eq!(calls[1]["index"], 1);
     assert_eq!(calls[1]["id"], "call_b");
     assert_eq!(calls[1]["function"]["name"], "notify");
-    let second_args: Value =
-        serde_json::from_str(calls[1]["function"]["arguments"].as_str().expect("arguments"))
-            .expect("reassembled second arguments");
+    let second_args: Value = serde_json::from_str(
+        calls[1]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("reassembled second arguments");
     assert_eq!(second_args["token"], "[REDACTED]");
     let raw_excerpt = records[0]["response_body"].as_str().unwrap();
     assert!(!raw_excerpt.contains("secret-one"), "{raw_excerpt}");
@@ -4659,9 +4646,12 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
         .await;
 
     let records = wait_for_records(&server).await;
-    let excerpt: Value =
-        serde_json::from_str(records[0]["response_body"].as_str().expect("response excerpt"))
-            .expect("reassembled excerpt JSON");
+    let excerpt: Value = serde_json::from_str(
+        records[0]["response_body"]
+            .as_str()
+            .expect("response excerpt"),
+    )
+    .expect("reassembled excerpt JSON");
     assert_eq!(excerpt["sse_reassembled"], true);
     assert!(excerpt.get("completion_text").is_none());
     assert_eq!(excerpt["tool_calls"]["2"][0]["id"], "call_only");

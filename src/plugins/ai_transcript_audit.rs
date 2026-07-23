@@ -647,18 +647,15 @@ impl AiTranscriptAudit {
             "ai_transcript_audit",
             http_client.backend_allow_ips(),
         )?;
-        let allow_insecure_loopback =
-            cfg_bool(sink_obj, "allow_insecure_loopback", false, "sink")?;
+        let allow_insecure_loopback = cfg_bool(sink_obj, "allow_insecure_loopback", false, "sink")?;
         if endpoint_url
             .get(..7)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
         {
             if !allow_insecure_loopback {
-                return Err(
-                    "ai_transcript_audit: sink.endpoint_url must use https://; \
+                return Err("ai_transcript_audit: sink.endpoint_url must use https://; \
                      local cleartext collectors require sink.allow_insecure_loopback: true"
-                        .to_string(),
-                );
+                    .to_string());
             }
             let loopback = endpoint_hostname.eq_ignore_ascii_case("localhost")
                 || endpoint_hostname
@@ -1222,9 +1219,7 @@ impl AiTranscriptAudit {
                     harvest.tokens.insert(key.clone(), safe(value));
                 }
                 _ => {
-                    if key.starts_with("ai_cache")
-                        || key.starts_with("request_deduplication.")
-                    {
+                    if key.starts_with("ai_cache") || key.starts_with("request_deduplication.") {
                         harvest.cache.insert(key.clone(), safe(value));
                     } else if is_guardrail_key(key) {
                         harvest.guardrails.insert(key.clone(), safe(value));
@@ -2181,10 +2176,7 @@ pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String
 
 fn process_monotonic_seconds() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
-    START
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_secs()
+    START.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 fn reject_audit_unavailable() -> PluginResult {
@@ -2378,10 +2370,7 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                         function.insert("name".to_string(), Value::String(call.name));
                     }
                     if !call.arguments.is_empty() {
-                        function.insert(
-                            "arguments".to_string(),
-                            Value::String(call.arguments),
-                        );
+                        function.insert("arguments".to_string(), Value::String(call.arguments));
                     }
                     call_json.insert("function".to_string(), Value::Object(function));
                 }
@@ -2406,16 +2395,10 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
         );
     }
     if !response_tool_calls.is_empty() {
-        annotated.insert(
-            "tool_calls".to_string(),
-            Value::Object(response_tool_calls),
-        );
+        annotated.insert("tool_calls".to_string(), Value::Object(response_tool_calls));
     }
     if !finish_reasons.is_empty() {
-        annotated.insert(
-            "finish_reason".to_string(),
-            Value::Object(finish_reasons),
-        );
+        annotated.insert("finish_reason".to_string(), Value::Object(finish_reasons));
     }
     Some(Value::Object(annotated))
 }
@@ -2426,11 +2409,7 @@ fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
     redact_json_value_strings_at_depth(redactor, value, 0);
 }
 
-fn redact_json_value_strings_at_depth(
-    redactor: &PiiRedactor,
-    value: &mut Value,
-    depth: usize,
-) {
+fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value, depth: usize) {
     if depth >= MAX_JSON_REDACTION_DEPTH {
         *value = Value::String(REDACTED_PLACEHOLDER.to_string());
         return;

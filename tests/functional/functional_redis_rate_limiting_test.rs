@@ -553,8 +553,7 @@ async fn start_audit_collector_on(
                 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
                 loop {
                     let mut request_line = String::new();
-                    if reader.read_line(&mut request_line).await.is_err()
-                        || request_line.is_empty()
+                    if reader.read_line(&mut request_line).await.is_err() || request_line.is_empty()
                     {
                         return;
                     }
@@ -2012,10 +2011,9 @@ async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
     let audit_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let audit_port = audit_listener.local_addr().unwrap().port();
     let audit_records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let _audit_collector =
-        start_audit_collector_on(audit_listener, Arc::clone(&audit_records))
-            .await
-            .unwrap();
+    let _audit_collector = start_audit_collector_on(audit_listener, Arc::clone(&audit_records))
+        .await
+        .unwrap();
 
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
@@ -2272,9 +2270,7 @@ plugin_configs:
     );
     let replay_records: Vec<&serde_json::Value> = records
         .iter()
-        .filter(|record| {
-            record["cache"]["request_deduplication.replayed"].as_str() == Some("true")
-        })
+        .filter(|record| record["cache"]["request_deduplication.replayed"].as_str() == Some("true"))
         .collect();
     assert_eq!(
         replay_records.len(),
