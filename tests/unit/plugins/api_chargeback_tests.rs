@@ -1898,6 +1898,26 @@ fn prometheus_proxy_name(line: &str) -> Option<&str> {
     Some(&line[start..end])
 }
 
+fn record_payment(
+    registry: &ChargebackRegistry,
+    scope: &InstanceScope,
+    proxy_name: &str,
+    price: f64,
+) {
+    registry.record_http(
+        scope,
+        "alice",
+        "payments",
+        proxy_name,
+        200,
+        price,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+}
+
 /// Assert JSON and Prometheus expose the same authoritative `proxy_name` for a
 /// consumer/proxy HTTP status row, and that repeated renders stay stable.
 fn assert_json_and_prometheus_proxy_name_agree(
@@ -1937,9 +1957,7 @@ fn assert_json_and_prometheus_proxy_name_agree(
                     && l.contains(&format!("proxy_id=\"{proxy_id}\""))
                     && l.contains(&format!("status_code=\"{status_code}\""))
             })
-            .unwrap_or_else(|| {
-                panic!("{order_label} pass {pass}: missing charges row\n{prom}")
-            });
+            .unwrap_or_else(|| panic!("{order_label} pass {pass}: missing charges row\n{prom}"));
         assert_eq!(
             prometheus_proxy_name(charge_line),
             Some(expected_name),
@@ -1978,9 +1996,7 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
     let price = 0.001;
 
     for _ in 0..10 {
-        registry.record_http(
-            &s, "alice", "payments", "Payments v1", 200, price, 0, 0, 0.0, 0.0,
-        );
+        record_payment(&registry, &s, "Payments v1", price);
     }
 
     let key = make_key_with_prices(
@@ -2019,9 +2035,7 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
         "metadata publication must invalidate the cached old label immediately"
     );
     for _ in 0..5 {
-        registry.record_http(
-            &s, "alice", "payments", "Payments v2", 200, price, 0, 0, 0.0, 0.0,
-        );
+        record_payment(&registry, &s, "Payments v2", price);
     }
 
     assert_eq!(
@@ -2139,26 +2153,16 @@ fn test_rename_plus_price_change_old_then_new_selects_authoritative_name() {
     )]));
 
     // Old generation under the retired display name.
-    registry.record_http(
-        &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
-    );
-    registry.record_http(
-        &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
-    );
+    record_payment(&registry, &s, "Payments v1", 0.001);
+    record_payment(&registry, &s, "Payments v1", 0.001);
     // Publish the accepted rename, then record the new price generation.
     registry.set_active_proxy_names(HashMap::from([(
         "payments".to_string(),
         "Payments v2".to_string(),
     )]));
-    registry.record_http(
-        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
-    );
-    registry.record_http(
-        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
-    );
-    registry.record_http(
-        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
-    );
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v2", 0.002);
 
     assert_rename_plus_price_overlap(&registry, "Payments v2", 5, "old-then-new");
 }
@@ -2175,21 +2179,11 @@ fn test_rename_plus_price_change_new_then_old_selects_authoritative_name() {
 
     // Reverse insertion order: new pricing generation first, then overlapping
     // old-generation traffic (in-flight after reload) recorded last.
-    registry.record_http(
-        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
-    );
-    registry.record_http(
-        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
-    );
-    registry.record_http(
-        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
-    );
-    registry.record_http(
-        &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
-    );
-    registry.record_http(
-        &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
-    );
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v1", 0.001);
+    record_payment(&registry, &s, "Payments v1", 0.001);
 
     // The retired request completes last, but cannot restore its old name.
     assert_rename_plus_price_overlap(&registry, "Payments v2", 5, "new-then-old");

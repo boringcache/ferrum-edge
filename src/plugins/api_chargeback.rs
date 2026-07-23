@@ -85,10 +85,7 @@ pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayC
         .map(|proxy| {
             (
                 proxy.id.clone(),
-                proxy
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
+                proxy.name.clone().unwrap_or_else(|| "unknown".to_string()),
             )
         })
         .collect();
