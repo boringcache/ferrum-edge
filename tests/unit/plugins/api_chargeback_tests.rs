@@ -651,7 +651,7 @@ fn test_registry_records_charge() {
     // Verify render metadata is stored correctly
     assert_eq!(&*entry.consumer, "user-1");
     assert_eq!(&*entry.proxy_id, "proxy-a");
-    assert_eq!(&*entry.proxy_name, "My API");
+    assert_eq!(&*entry.proxy_name.load(), "My API");
     assert_eq!(entry.status_code, 200);
     assert_eq!(entry.protocol_family, ProtocolFamily::Http);
 }
@@ -1886,6 +1886,276 @@ fn test_websocket_then_bandwidth_only_stream_keeps_families_distinct() {
     registry.record_websocket_bandwidth(&s, "alice", "edge", "Edge", 50, 75, 0.001, 0.001);
     registry.record_stream(&s, "alice", "edge", "Edge", 0.0, 100, 200, 0.001, 0.001);
     assert_bandwidth_only_stream_and_websocket_reconcile(&registry, "websocket-then-stream");
+}
+
+// --- Issue #2572: proxy_name is live metadata; aggregation is deterministic ---
+
+/// Extract the `proxy_name="..."` label from a Prometheus sample line.
+fn prometheus_proxy_name(line: &str) -> Option<&str> {
+    let key = "proxy_name=\"";
+    let start = line.find(key)? + key.len();
+    let end = line[start..].find('"')? + start;
+    Some(&line[start..end])
+}
+
+/// Assert JSON and Prometheus expose the same authoritative `proxy_name` for a
+/// consumer/proxy HTTP status row, and that repeated renders stay stable.
+fn assert_json_and_prometheus_proxy_name_agree(
+    registry: &ChargebackRegistry,
+    consumer: &str,
+    proxy_id: &str,
+    status_code: u16,
+    expected_name: &str,
+    order_label: &str,
+) {
+    for pass in 0..8 {
+        let prom = registry.render_prometheus_uncached().unwrap();
+        let call_line = prom
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_api_chargeable_calls_total{")
+                    && l.contains(&format!("consumer=\"{consumer}\""))
+                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
+                    && l.contains(&format!("status_code=\"{status_code}\""))
+            })
+            .unwrap_or_else(|| {
+                panic!("{order_label} pass {pass}: missing chargeable_calls row\n{prom}")
+            });
+        let prom_name = prometheus_proxy_name(call_line).unwrap_or_else(|| {
+            panic!("{order_label} pass {pass}: missing proxy_name label\n{call_line}")
+        });
+        assert_eq!(
+            prom_name, expected_name,
+            "{order_label} pass {pass}: prometheus name mismatch\n{call_line}"
+        );
+
+        let charge_line = prom
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_api_charges_total{")
+                    && l.contains(&format!("consumer=\"{consumer}\""))
+                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
+                    && l.contains(&format!("status_code=\"{status_code}\""))
+            })
+            .unwrap_or_else(|| {
+                panic!("{order_label} pass {pass}: missing charges row\n{prom}")
+            });
+        assert_eq!(
+            prometheus_proxy_name(charge_line),
+            Some(expected_name),
+            "{order_label} pass {pass}: charges label must match calls\n{charge_line}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+        let json_name = json["consumers"][consumer]["proxies"][proxy_id]["proxy_name"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("{order_label} pass {pass}: missing json proxy_name: {json}")
+            });
+        assert_eq!(
+            json_name, expected_name,
+            "{order_label} pass {pass}: json/prometheus name disagreement"
+        );
+        assert_eq!(
+            json_name, prom_name,
+            "{order_label} pass {pass}: json and prometheus must agree"
+        );
+    }
+}
+
+/// Name-only reload under continuous traffic must refresh the live display name
+/// on the existing key without splitting counter continuity.
+#[test]
+fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+    let price = 0.001;
+
+    for _ in 0..10 {
+        registry.record_http(
+            &s, "alice", "payments", "Payments v1", 200, price, 0, 0, 0.0, 0.0,
+        );
+    }
+
+    let key = make_key_with_prices(
+        "alice",
+        "payments",
+        200,
+        ProtocolFamily::Http,
+        price,
+        0.0,
+        0.0,
+    );
+    assert_eq!(registry.entries.len(), 1);
+    {
+        let entry = registry.entries.get(&key).unwrap();
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 10);
+        assert_eq!(&*entry.proxy_name.load(), "Payments v1");
+    }
+
+    // Continuous traffic after a name-only reload hits the same key.
+    for _ in 0..5 {
+        registry.record_http(
+            &s, "alice", "payments", "Payments v2", 200, price, 0, 0, 0.0, 0.0,
+        );
+    }
+
+    assert_eq!(
+        registry.entries.len(),
+        1,
+        "name-only reload must not create a second pricing-generation entry"
+    );
+    let entry = registry.entries.get(&key).unwrap();
+    assert_eq!(
+        entry.call_count.load(Ordering::Relaxed),
+        15,
+        "counters must remain continuous across the rename"
+    );
+    assert_eq!(&*entry.proxy_name.load(), "Payments v2");
+    drop(entry);
+
+    let prom = registry.render_prometheus_uncached().unwrap();
+    let call_rows = prom
+        .lines()
+        .filter(|l| {
+            l.starts_with("ferrum_api_chargeable_calls_total{")
+                && l.contains("proxy_id=\"payments\"")
+        })
+        .count();
+    assert_eq!(
+        call_rows, 1,
+        "proxy_name must not be a series-splitting label\n{prom}"
+    );
+    assert!(
+        prom.lines().any(|l| {
+            l.starts_with("ferrum_api_chargeable_calls_total{")
+                && l.contains("proxy_name=\"Payments v2\"")
+                && l.ends_with(" 15")
+        }),
+        "expected continuous counter under the live name\n{prom}"
+    );
+
+    assert_json_and_prometheus_proxy_name_agree(
+        &registry,
+        "alice",
+        "payments",
+        200,
+        "Payments v2",
+        "name-only-rename",
+    );
+}
+
+/// Shared assertions for rename + price-change overlap under a fixed insertion
+/// order. The authoritative export name is the name from the most recently
+/// updated pricing-generation entry (ties break lexicographically).
+fn assert_rename_plus_price_overlap(
+    registry: &ChargebackRegistry,
+    expected_name: &str,
+    expected_calls: u64,
+    order_label: &str,
+) {
+    assert_eq!(
+        registry.entries.len(),
+        2,
+        "{order_label}: expected two pricing-generation entries"
+    );
+
+    let prom = registry.render_prometheus_uncached().unwrap();
+    let call_rows: Vec<_> = prom
+        .lines()
+        .filter(|l| {
+            l.starts_with("ferrum_api_chargeable_calls_total{")
+                && l.contains("proxy_id=\"payments\"")
+        })
+        .collect();
+    assert_eq!(
+        call_rows.len(),
+        1,
+        "{order_label}: overlapping generations must collapse to one series\n{prom}"
+    );
+    assert!(
+        call_rows[0].ends_with(&format!(" {expected_calls}")),
+        "{order_label}: aggregated call count mismatch\n{}",
+        call_rows[0]
+    );
+    assert_eq!(
+        prometheus_proxy_name(call_rows[0]),
+        Some(expected_name),
+        "{order_label}: unexpected prometheus name\n{}",
+        call_rows[0]
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    let proxy = &json["consumers"]["alice"]["proxies"]["payments"];
+    assert_eq!(proxy["proxy_name"], expected_name);
+    assert_eq!(proxy["by_status"]["200"]["calls"], expected_calls);
+
+    assert_json_and_prometheus_proxy_name_agree(
+        registry,
+        "alice",
+        "payments",
+        200,
+        expected_name,
+        order_label,
+    );
+}
+
+#[test]
+fn test_rename_plus_price_change_old_then_new_selects_authoritative_name() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+
+    // Old generation under the retired display name.
+    registry.record_http(
+        &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
+    );
+    registry.record_http(
+        &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
+    );
+    // New generation (price bits differ) under the live name — recorded last.
+    registry.record_http(
+        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
+    );
+    registry.record_http(
+        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
+    );
+    registry.record_http(
+        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
+    );
+
+    assert_rename_plus_price_overlap(&registry, "Payments v2", 5, "old-then-new");
+}
+
+#[test]
+fn test_rename_plus_price_change_new_then_old_selects_authoritative_name() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+
+    // Reverse insertion order: new pricing generation first, then overlapping
+    // old-generation traffic (in-flight after reload) recorded last.
+    registry.record_http(
+        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
+    );
+    registry.record_http(
+        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
+    );
+    registry.record_http(
+        &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
+    );
+    registry.record_http(
+        &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
+    );
+    registry.record_http(
+        &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
+    );
+
+    // Most recently updated generation supplies the authoritative name.
+    assert_rename_plus_price_overlap(&registry, "Payments v1", 5, "new-then-old");
 }
 
 // --- Finding #76: monetary totals do not drift over high volume ---

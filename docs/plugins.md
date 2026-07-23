@@ -1315,6 +1315,15 @@ Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
 in both Prometheus text and JSON formats for external billing system
 integration.
 
+**`proxy_name` contract:** exported `proxy_name` is live display metadata for the
+stable `proxy_id`. It is omitted from the in-memory registry key and is not a
+Prometheus series-splitting dimension, so a name-only reload preserves counter
+continuity while record hits refresh the stored name from current proxy
+metadata. Pricing changes still create distinct pricing-generation entries.
+When overlapping generations collapse into one export row, JSON and Prometheus
+select the same authoritative name (most recently updated generation;
+lexicographic tie-break), independent of map iteration or insertion order.
+
 **Arithmetic and export semantics:** every unit price is IEEE-754 binary64,
 finite, non-negative, and at most `1e288`. In-memory entries store exact `u64`
 call/byte counters, convert them to binary64, and derive monetary values once

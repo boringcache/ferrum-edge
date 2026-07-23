@@ -1441,6 +1441,12 @@ paths:
         still overflows, this endpoint returns HTTP 500 with an explicit error
         object instead of JSON `null` or Prometheus `inf`.
 
+        `proxy_name` is live display metadata for the stable `proxy_id` (not a
+        registry key or series-splitting label). Name-only reloads keep counter
+        continuity; overlapping pricing generations collapse to one row and
+        both formats pick the same authoritative name (most recently updated
+        generation, lexicographic tie-break).
+
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
       tags: [Metrics]
@@ -20875,6 +20881,15 @@ components:
                   properties:
                     proxy_name:
                       type: string
+                      description: |
+                        Live display name for the stable `proxy_id`. Not part of
+                        the in-memory chargeback key and not a Prometheus
+                        series-splitting label, so a name-only reload preserves
+                        counter continuity while record hits refresh this field
+                        from current proxy metadata. When overlapping pricing
+                        generations collapse into one export row, JSON and
+                        Prometheus select the same authoritative name (most
+                        recently updated generation; lexicographic tie-break).
                     currency:
                       type: string
                       description: |
