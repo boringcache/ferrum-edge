@@ -3077,10 +3077,10 @@ fn finalize_replayed_spool_file(
 
 /// Immutable categorical dimensions for one snapshot accumulator identity.
 ///
-/// These fields are part of [`snapshot_key`] and are copied into emitted
-/// `ChargeEvent`s. They must not be treated as first-writer-wins decoration on
-/// a coarser key.
-#[derive(Clone)]
+/// The complete value is the typed accumulator key and is also copied into
+/// emitted `ChargeEvent`s. It must not be treated as first-writer-wins
+/// decoration on a coarser or delimiter-encoded identity.
+#[derive(Clone, Eq, Hash, PartialEq)]
 struct SnapshotMetadata {
     namespace: String,
     consumer_id: String,
@@ -3200,8 +3200,8 @@ struct SnapshotEntry {
 }
 
 pub struct SnapshotAccumulator {
-    entries: DashMap<String, SnapshotEntry>,
-    last_emitted: DashMap<String, SnapshotTotals>,
+    entries: DashMap<SnapshotMetadata, SnapshotEntry>,
+    last_emitted: DashMap<SnapshotMetadata, SnapshotTotals>,
 }
 
 impl SnapshotAccumulator {
@@ -3285,9 +3285,10 @@ impl SnapshotAccumulator {
     }
 
     fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) {
-        // Snapshot identity must include every exported categorical field so
-        // first-record metadata cannot silently label a mixed aggregate.
-        let key = snapshot_key(&meta);
+        // Use the typed metadata value itself as the key. A delimiter-encoded
+        // string would allow hostile or ordinary `|` characters in route/name
+        // dimensions to collide and recreate mixed attribution.
+        let key = meta.clone();
         let now = unix_timestamp_seconds();
         let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
             meta,
@@ -3341,7 +3342,7 @@ impl SnapshotAccumulator {
 
     fn cleanup_stale(&self, now: i64, stale_entry_ttl_secs: u64) -> usize {
         let cutoff = now.saturating_sub(stale_entry_ttl_secs.min(i64::MAX as u64) as i64);
-        let keys: Vec<String> = self
+        let keys: Vec<SnapshotMetadata> = self
             .entries
             .iter()
             .filter(|entry| entry.value().last_seen_at.load(Ordering::Relaxed) <= cutoff)
@@ -3719,34 +3720,6 @@ fn bound_string(value: &str, max_len: usize) -> String {
         end -= 1;
     }
     value[..end].to_string()
-}
-
-/// Truthful snapshot dimension contract.
-///
-/// Every categorical field exported on a snapshot `ChargeEvent` is part of the
-/// accumulator identity shared by `record`, `compute_deltas`, and
-/// `cleanup_stale`. Absent optional dimensions use an empty segment so keys stay
-/// stable and comparable:
-///
-/// `namespace|consumer_id|consumer_name|proxy_id|proxy_name|route_id|status_code|http_status_code|grpc_status|protocol`
-fn snapshot_key(meta: &SnapshotMetadata) -> String {
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        meta.namespace,
-        meta.consumer_id,
-        meta.consumer_name.as_deref().unwrap_or(""),
-        meta.proxy_id,
-        meta.proxy_name,
-        meta.route_id.as_deref().unwrap_or(""),
-        meta.status_code,
-        meta.http_status_code
-            .map(|status| status.to_string())
-            .unwrap_or_default(),
-        meta.grpc_status
-            .map(|status| status.to_string())
-            .unwrap_or_default(),
-        meta.protocol,
-    )
 }
 
 fn normalize_snapshot_grpc_status(status: u32) -> u32 {

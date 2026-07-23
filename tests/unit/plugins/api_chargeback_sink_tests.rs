@@ -1774,6 +1774,35 @@ fn snapshot_keeps_distinct_routes_that_share_consumer_proxy_status() {
 }
 
 #[test]
+fn snapshot_identity_is_not_ambiguous_when_dimensions_contain_delimiters() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy", "name|route", Some("tail"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy", "name", Some("route|tail"), None, "http", 200),
+        "alice",
+        charge,
+    );
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-delimiters")
+        .unwrap();
+    events.sort_by(|left, right| left.proxy_name.cmp(&right.proxy_name));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].proxy_name, "name");
+    assert_eq!(events[0].route_id.as_deref(), Some("route|tail"));
+    assert_eq!(events[1].proxy_name, "name|route");
+    assert_eq!(events[1].route_id.as_deref(), Some("tail"));
+    assert!(events.iter().all(|event| event.call_count == 1));
+}
+
+#[test]
 fn snapshot_preserves_display_name_changes_as_separate_identities() {
     let config = snapshot_test_config();
     let accumulator = SnapshotAccumulator::new();
