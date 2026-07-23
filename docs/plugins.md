@@ -827,7 +827,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `body_completed` | bool | `true` when the final body frame flushed to the client; `false` if streaming aborted before completion. Always `true` for buffered responses |
 | `bytes_sent` | u64 | Bytes the gateway **relayed from the client to the backend** (request body size). Same JSON key as `StreamTransactionSummary.bytes_sent`. Omitted from JSON when zero (empty / `GET` / `HEAD`) |
 | `bytes_received` | u64 | Bytes the gateway **relayed from the backend to the client** (response body size, unified buffered + streaming counter). Same JSON key as `StreamTransactionSummary.bytes_received`. May be less than the backend's advertised `Content-Length` when streaming was interrupted. Omitted from JSON when zero |
-| `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction |
+| `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction. Shadow summaries remain available to logging/observability plugins; `api_chargeback` and `api_chargeback_sink` never treat them as consumer-billable |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
 Mirror entries add `metadata.mirror_plugin_id` (the stable plugin-config ID)
@@ -1383,6 +1383,13 @@ client request metadata. The mapped status is the `status_code` label and
 `by_status` key in charge output; the wire HTTP status remains separately
 available in transaction logs.
 
+**Mirror accounting.** `request_mirror` shadow summaries (`mirror: true`) still
+flow through the chargeback log hook so operators can correlate them with other
+logging/observability plugins, but they are never consumer-billable. Per-call
+and bandwidth charges come only from the primary client-facing summary.
+WebSocket disconnect and stream disconnect accounting are unchanged (mirrors
+are HTTP/gRPC only).
+
 **Priority:** 9350
 
 | Parameter | Type | Default | Description |
@@ -1492,6 +1499,9 @@ persistent storage. Ordinary HTTP is priced by wire status. Native gRPC and
 translated gRPC-Web use the same canonical effective-status mapping documented
 for `api_chargeback`; durable events retain the billable `status_code`, raw
 `http_status_code`, and normalized final `grpc_status` as separate fields.
+As with in-memory chargeback, `request_mirror` shadow summaries (`mirror: true`)
+remain available to logging/observability plugins but are never consumer-billable
+in per-event or snapshot export.
 
 **Priority:** 9351
 
@@ -3855,7 +3865,7 @@ Duplicates live proxy traffic to a secondary destination for shadow testing, val
 **Priority:** 3075
 **Protocols:** HTTP, gRPC
 
-Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger). Every dispatched `request_mirror` instance owns an independent result receiver and emits its own entry, identified by `metadata.mirror_plugin_id` plus the query-stripped target URL. A later instance never replaces an earlier result, and collectors run independently so mixed completion order or one slow destination does not suppress another. An instance sampled out by `percentage` emits no entry because it sent no shadow request; a selected instance rejected by its own `max_in_flight` limit emits an attributable failure entry. Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the proxy's `backend_read_timeout_ms` is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream failure, and `max_in_flight` drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. The gateway runtime cancels outstanding detached mirror/logging tasks during shutdown; they never delay the client response or extend shutdown. The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
+Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger, `api_chargeback`, `api_chargeback_sink`). Shadow summaries remain available for observability and correlation, but chargeback plugins never treat them as consumer-billable per-call or bandwidth charges — only the primary client-facing summary is priced. Every dispatched `request_mirror` instance owns an independent result receiver and emits its own entry, identified by `metadata.mirror_plugin_id` plus the query-stripped target URL. A later instance never replaces an earlier result, and collectors run independently so mixed completion order or one slow destination does not suppress another. An instance sampled out by `percentage` emits no entry because it sent no shadow request; a selected instance rejected by its own `max_in_flight` limit emits an attributable failure entry. Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the proxy's `backend_read_timeout_ms` is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream failure, and `max_in_flight` drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. The gateway runtime cancels outstanding detached mirror/logging tasks during shutdown; they never delay the client response or extend shutdown. The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

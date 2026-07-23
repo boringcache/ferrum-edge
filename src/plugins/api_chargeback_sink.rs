@@ -1058,6 +1058,14 @@ impl ApiChargebackSink {
     pub fn plugin_config_id(&self) -> &str {
         &self.plugin_config_id
     }
+
+    /// Snapshot accumulator after activation, for unit tests that drive
+    /// [`crate::plugins::log_with_mirror`] through the real HTTP log hook.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn snapshot_accumulator_for_tests(&self) -> Option<Arc<SnapshotAccumulator>> {
+        self.snapshot_accumulator.get().cloned()
+    }
 }
 
 impl Drop for ApiChargebackSink {
@@ -1125,6 +1133,13 @@ impl Plugin for ApiChargebackSink {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
+        // Shadow/mirror summaries retain the primary consumer identity for
+        // logging correlation, but they are internal backend probes — never
+        // consumer-billable per-call or bandwidth charges (issue #2437).
+        if summary.mirror {
+            return;
+        }
+
         let consumer = match summary.consumer_username.as_deref() {
             Some(c) if !c.is_empty() => c,
             _ => return,

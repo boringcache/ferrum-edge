@@ -1760,6 +1760,13 @@ impl Plugin for ApiChargeback {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
+        // Shadow/mirror summaries retain the primary consumer identity for
+        // logging correlation, but they are internal backend probes — never
+        // consumer-billable per-call or bandwidth charges (issue #2437).
+        if summary.mirror {
+            return;
+        }
+
         let consumer = match summary.consumer_username.as_deref() {
             Some(c) if !c.is_empty() => c,
             _ => return,

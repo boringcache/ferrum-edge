@@ -101,6 +101,12 @@ nonempty pricing dimension is mandatory and matches
 pricing with at least one strictly positive per-byte rate, or
 `stream_connection_pricing` with a strictly positive `price_per_connection`.
 
+`request_mirror` shadow summaries (`mirror: true`) still reach the sink log
+hook for observability/correlation with other logging plugins, but they are
+never consumer-billable. Per-event and snapshot exports charge only the
+primary client-facing HTTP summary; WebSocket and stream accounting are
+unchanged.
+
 Every unit price is an IEEE-754 binary64 value that must be finite,
 non-negative, and at most `1e288`. Per-event mode multiplies each transaction's
 `u64` quantities by those binary64 prices; snapshot mode accumulates the same
