@@ -1316,15 +1316,18 @@ in both Prometheus text and JSON formats for external billing system
 integration.
 
 **`proxy_name` contract:** exported `proxy_name` is live display metadata for the
-stable `proxy_id`. It is omitted from the in-memory registry key and is not a
-Prometheus series-splitting dimension, so a name-only reload preserves counter
-continuity. After an accepted configuration is published, JSON and Prometheus
-resolve active proxy IDs through the same lock-free snapshot of that
-configuration's names. Request completion order cannot change the exported
-label, so late traffic admitted under a retired generation cannot restore an
-old name. Pricing changes still create distinct pricing-generation entries;
-overlapping entries collapse under the current published name. Retained rows
-for a deleted proxy use a deterministic recorded-name fallback.
+stable `proxy_id`. It is omitted from the in-memory registry key, so a name-only
+reload preserves the accumulated counter values. After an accepted
+configuration is published, JSON and Prometheus resolve active proxy IDs through
+the same lock-free snapshot of that configuration's names. Request completion
+order cannot change the exported label, so late traffic admitted under a retired
+generation cannot restore an old name. Because `proxy_name` remains a Prometheus
+label, a rename creates a controlled label transition at the accepted reload
+boundary; the new label carries the existing cumulative counter rather than
+restarting its in-memory value. Pricing changes still create distinct
+pricing-generation entries; overlapping entries collapse under the current
+published name. Retained rows for a deleted proxy use a deterministic
+recorded-name fallback.
 
 **Arithmetic and export semantics:** every unit price is IEEE-754 binary64,
 finite, non-negative, and at most `1e288`. In-memory entries store exact `u64`

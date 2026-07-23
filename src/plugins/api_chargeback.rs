@@ -812,8 +812,8 @@ impl ChargebackRegistry {
 
         // Entries are keyed by pricing bits so config reloads do not reuse
         // stale prices, but Prometheus label sets intentionally omit those
-        // bits (and omit `proxy_name` as a series key) so a name-only reload
-        // preserves counter continuity. Aggregate by the exposed billing
+        // bits (and omit `proxy_name` from the aggregation key) so a name-only
+        // reload preserves registry counter continuity. Aggregate by the billing
         // identity before rendering and take live display metadata from the
         // published configuration snapshot (issue #2572).
         let mut http_aggregates: HashMap<HttpChargeAggregateKey, ChargeAggregate> = HashMap::new();

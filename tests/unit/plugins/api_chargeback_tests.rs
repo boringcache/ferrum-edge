@@ -2065,7 +2065,7 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
         .count();
     assert_eq!(
         call_rows, 1,
-        "proxy_name must not be a series-splitting label\n{prom}"
+        "one render must emit one row under the authoritative current name\n{prom}"
     );
     assert!(
         prom.lines().any(|l| {
