@@ -18711,10 +18711,15 @@ components:
         Unknown or ambiguous JSON shapes bypass caching. Exact-match
         normalization is enabled by default; optional semantic similarity uses
         a configured embedding provider and a local HNSW vector index.
-        Supports local DashMap and Redis exact-response storage. Unknown root,
-        semantic-policy, and Redis sync keys are rejected at admission with
-        path-qualified diagnostics (registration policy KeepLastKnownGood).
-        There are no intentionally open maps.
+        Supports local DashMap and Redis exact-response storage. Multiple
+        instances on one proxy namespace request staging metadata under
+        ai_semantic_cache.<instance_id>.* and keep embedding/scope vectors in
+        per-instance RequestContext maps so differing key policies and
+        semantic/non-semantic combinations remain independent across priority
+        order and reload generations. Unknown root, semantic-policy, and Redis
+        sync keys are rejected at admission with path-qualified diagnostics
+        (registration policy KeepLastKnownGood). There are no intentionally
+        open maps.
       properties:
         ttl_seconds:
           type: integer
