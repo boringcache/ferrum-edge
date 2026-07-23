@@ -14,8 +14,8 @@ use ferrum_edge::plugins::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Default per-instance scope used by registry tests (USD / "ferrum").
 fn scope() -> InstanceScope {
