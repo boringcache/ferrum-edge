@@ -1885,8 +1885,12 @@ fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
         record_start.wait();
         let mut i = 0u64;
         while !record_stop.load(Ordering::Relaxed) {
-            let consumer = if i % 2 == 0 { "alice" } else { "bob" };
-            let seen_at = if i % 3 == 0 { STALE_SEEN } else { FRESH_SEEN };
+            let consumer = if i.is_multiple_of(2) { "alice" } else { "bob" };
+            let seen_at = if i.is_multiple_of(3) {
+                STALE_SEEN
+            } else {
+                FRESH_SEEN
+            };
             record_acc.record_for_test_at(
                 "ferrum",
                 consumer,
