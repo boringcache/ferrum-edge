@@ -1653,15 +1653,6 @@ impl RedisRateLimitClient {
         Self::window_progress(window_seconds).index
     }
 
-    /// Compute the elapsed fraction within the current window (`[0, 1)`).
-    ///
-    /// Used for the sliding window weighted approximation. Prefer
-    /// [`Self::window_progress`] when both index and fraction are needed so they
-    /// share one timestamp.
-    pub fn elapsed_fraction(window_seconds: u64) -> f64 {
-        Self::window_progress(window_seconds).elapsed_fraction
-    }
-
     /// Return the Redis hostname for DNS pre-warming, if applicable.
     pub fn warmup_hostname(&self) -> Option<String> {
         self.config.hostname()
