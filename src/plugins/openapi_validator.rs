@@ -2489,6 +2489,7 @@ fn multipart_parts_to_schema_object(
         if schema_accepts_object(property_schema)
             && let Some(values) = parts.get(property)
             && values.len() == 1
+            && values[0].filename.is_none()
             && is_structured_multipart_object_part(&values[0])
         {
             consumed_keys.insert(property.clone());
@@ -2819,10 +2820,11 @@ fn multipart_part_to_schema_value(
     }
 
     if schema_accepts_object(schema) || schema.get("properties").is_some() {
-        if let Some(media_type) = part
-            .content_type
-            .as_deref()
-            .and_then(|value| content_type_base(Some(value)).map(str::to_ascii_lowercase))
+        if part.filename.is_none()
+            && let Some(media_type) = part
+                .content_type
+                .as_deref()
+                .and_then(|value| content_type_base(Some(value)).map(str::to_ascii_lowercase))
         {
             if is_json_media_type(&media_type) {
                 return serde_json::from_slice(&part.body).map_err(|error| {
