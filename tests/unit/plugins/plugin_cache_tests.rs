@@ -2640,15 +2640,13 @@ async fn chargeback_sink_cache_construction_preserves_plugin_config_id() {
         )],
     );
     let cache = PluginCache::new(&config).expect("chargeback sink cache");
-    let status: serde_json::Value = serde_json::from_str(
-        &ferrum_edge::plugins::api_chargeback_sink::render_status_json(),
-    )
-    .expect("chargeback status");
+    let status: serde_json::Value =
+        serde_json::from_str(&ferrum_edge::plugins::api_chargeback_sink::render_status_json())
+            .expect("chargeback status");
 
     assert_eq!(status["instance_count"], 1);
     assert_eq!(
-        status["instances"][0]["plugin_config_id"],
-        "chargeback-stable-id",
+        status["instances"][0]["plugin_config_id"], "chargeback-stable-id",
         "production PluginCache must pass the stable resource id"
     );
 

@@ -1298,8 +1298,7 @@ async fn chargeback_replacement_generation_is_current_and_exact_drop_safe() {
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
     assert_eq!(after_old_drop["instance_count"], 1);
     assert_eq!(
-        after_old_drop["instances"][0]["generation"],
-        new_generation,
+        after_old_drop["instances"][0]["generation"], new_generation,
         "dropping the superseded runtime must not clear the accepted replacement"
     );
 
