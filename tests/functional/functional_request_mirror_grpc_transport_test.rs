@@ -128,7 +128,10 @@ fn encode_grpc_frames(messages: &[&[u8]]) -> Bytes {
     buf.freeze()
 }
 
-async fn wait_for_mirror_streams(mirror: &ScriptedGrpcBackend, count: usize) -> Vec<ReceivedStream> {
+async fn wait_for_mirror_streams(
+    mirror: &ScriptedGrpcBackend,
+    count: usize,
+) -> Vec<ReceivedStream> {
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let streams = mirror.received_streams().await;
@@ -218,12 +221,8 @@ async fn h2c_grpc_request(
     let joined = joined.freeze();
     let mut i = 0;
     while i + 5 <= joined.len() {
-        let len = u32::from_be_bytes([
-            joined[i + 1],
-            joined[i + 2],
-            joined[i + 3],
-            joined[i + 4],
-        ]) as usize;
+        let len = u32::from_be_bytes([joined[i + 1], joined[i + 2], joined[i + 3], joined[i + 4]])
+            as usize;
         if i + 5 + len > joined.len() {
             break;
         }
@@ -269,11 +268,12 @@ async fn spawn_tls_backend(steps: Vec<GrpcStep>) -> (u16, ScriptedGrpcBackend, T
     let (cert_pem, key_pem) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("port");
     let port = reservation.port;
-    let backend = ScriptedGrpcBackend::builder_tls(reservation.into_listener(), &cert_pem, &key_pem)
-        .expect("tls builder")
-        .steps(steps)
-        .spawn()
-        .expect("spawn tls grpc backend");
+    let backend =
+        ScriptedGrpcBackend::builder_tls(reservation.into_listener(), &cert_pem, &key_pem)
+            .expect("tls builder")
+            .steps(steps)
+            .spawn()
+            .expect("spawn tls grpc backend");
     (port, backend, ca)
 }
 
@@ -299,7 +299,10 @@ async fn request_mirror_grpc_h2c_prior_knowledge_carries_te_trailers() {
 
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
     let response = client
-        .unary(&format!("/grpc{UNARY_PATH}"), Bytes::from_static(UNARY_BODY))
+        .unary(
+            &format!("/grpc{UNARY_PATH}"),
+            Bytes::from_static(UNARY_BODY),
+        )
         .await
         .expect("unary rpc");
     assert_eq!(response.grpc_status(), Some(0), "response={response:?}");
@@ -336,7 +339,10 @@ async fn request_mirror_grpc_tls_alpn_h2_carries_te_trailers() {
 
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
     let response = client
-        .unary(&format!("/grpc{UNARY_PATH}"), Bytes::from_static(UNARY_BODY))
+        .unary(
+            &format!("/grpc{UNARY_PATH}"),
+            Bytes::from_static(UNARY_BODY),
+        )
         .await
         .expect("unary rpc");
     assert_eq!(response.grpc_status(), Some(0), "response={response:?}");
@@ -626,11 +632,8 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn request_mirror_grpc_h2c_missing_and_client_supplied_te() {
-    let (primary_port, _primary) = spawn_plain_backend_connections(vec![
-        unary_ok_script(),
-        unary_ok_script(),
-    ])
-    .await;
+    let (primary_port, _primary) =
+        spawn_plain_backend_connections(vec![unary_ok_script(), unary_ok_script()]).await;
     let (mirror_port, mirror) = spawn_plain_backend(vec![
         GrpcStep::AcceptRpc(MatchRpc::any()),
         GrpcStep::SendInitialHeaders,
@@ -733,7 +736,10 @@ async fn request_mirror_grpc_h2c_mirror_error_status_does_not_affect_primary() {
 
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
     let response = client
-        .unary(&format!("/grpc{UNARY_PATH}"), Bytes::from_static(UNARY_BODY))
+        .unary(
+            &format!("/grpc{UNARY_PATH}"),
+            Bytes::from_static(UNARY_BODY),
+        )
         .await
         .expect("unary rpc");
     assert_eq!(
@@ -750,11 +756,8 @@ async fn request_mirror_grpc_h2c_mirror_error_status_does_not_affect_primary() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn request_mirror_grpc_h2c_reuses_http2_connection_across_mirrors() {
-    let (primary_port, _primary) = spawn_plain_backend_connections(vec![
-        unary_ok_script(),
-        unary_ok_script(),
-    ])
-    .await;
+    let (primary_port, _primary) =
+        spawn_plain_backend_connections(vec![unary_ok_script(), unary_ok_script()]).await;
     let (mirror_port, mirror) = spawn_plain_backend(vec![
         GrpcStep::AcceptRpc(MatchRpc::method(UNARY_PATH)),
         GrpcStep::SendInitialHeaders,
@@ -790,7 +793,10 @@ async fn request_mirror_grpc_h2c_reuses_http2_connection_across_mirrors() {
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_http_port(&harness)));
     for _ in 0..2 {
         let response = client
-            .unary(&format!("/grpc{UNARY_PATH}"), Bytes::from_static(UNARY_BODY))
+            .unary(
+                &format!("/grpc{UNARY_PATH}"),
+                Bytes::from_static(UNARY_BODY),
+            )
             .await
             .expect("unary rpc");
         assert_eq!(response.grpc_status(), Some(0), "response={response:?}");

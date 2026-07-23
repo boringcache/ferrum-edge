@@ -179,10 +179,7 @@ impl ScriptedGrpcBackendBuilder {
     /// Each inner script is lowered independently before delegating to the H2
     /// fixture. This is useful when a test client intentionally opens a fresh
     /// connection per RPC.
-    pub fn connection_scripts(
-        mut self,
-        scripts: impl IntoIterator<Item = Vec<GrpcStep>>,
-    ) -> Self {
+    pub fn connection_scripts(mut self, scripts: impl IntoIterator<Item = Vec<GrpcStep>>) -> Self {
         let scripts = scripts.into_iter().map(|script| {
             script
                 .into_iter()
