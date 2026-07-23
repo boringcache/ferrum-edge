@@ -449,12 +449,9 @@ async fn get_http2_companion_speaks_h2c_prior_knowledge() {
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
-        let Ok((mut connection, mut h2)) = h2_server::handshake(tcp).await else {
+        let Ok(mut h2) = h2_server::handshake(tcp).await else {
             return;
         };
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
         if let Some(Ok((request, mut respond))) = h2.accept().await {
             let version = request.version();
             let response = http::Response::builder()

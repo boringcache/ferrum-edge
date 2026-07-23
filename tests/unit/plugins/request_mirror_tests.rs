@@ -2027,12 +2027,9 @@ async fn capture_mirror_request_headers_h2c(
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
-        let Ok((mut connection, mut h2)) = h2_server::handshake(tcp).await else {
+        let Ok(mut h2) = h2_server::handshake(tcp).await else {
             return;
         };
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
         if let Some(Ok((request, mut respond))) = h2.accept().await {
             let mut captured = HashMap::new();
             for (name, value) in request.headers().iter() {
@@ -2297,12 +2294,9 @@ async fn test_grpc_mirror_preserves_binary_body_over_h2c() {
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
-        let Ok((mut connection, mut h2)) = h2_server::handshake(tcp).await else {
+        let Ok(mut h2) = h2_server::handshake(tcp).await else {
             return;
         };
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
         if let Some(Ok((request, mut respond))) = h2.accept().await {
             let mut body = request.into_body();
             let mut buf = Vec::new();
@@ -2370,12 +2364,9 @@ async fn test_grpc_mirror_preserves_multiframe_client_stream_body_over_h2c() {
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
-        let Ok((mut connection, mut h2)) = h2_server::handshake(tcp).await else {
+        let Ok(mut h2) = h2_server::handshake(tcp).await else {
             return;
         };
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
         if let Some(Ok((request, mut respond))) = h2.accept().await {
             let mut body = request.into_body();
             let mut buf = Vec::new();
