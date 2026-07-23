@@ -432,15 +432,9 @@ async fn request_mirror_grpc_h2c_streaming_shapes_and_multiframe_body() {
     let client = GrpcClient::h2c(gw.clone());
     let multi_frame = encode_grpc_frames(&[b"point-a", b"point-b", b"point-c"]);
 
-    let client_stream = h2c_grpc_request(
-        &gw,
-        CLIENT_STREAM_PATH,
-        multi_frame.clone(),
-        &[],
-        true,
-    )
-    .await
-    .expect("client-stream rpc");
+    let client_stream = h2c_grpc_request(&gw, CLIENT_STREAM_PATH, multi_frame.clone(), &[], true)
+        .await
+        .expect("client-stream rpc");
     assert_eq!(
         client_stream.grpc_status(),
         Some(0),
@@ -566,15 +560,9 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
     let client = GrpcClient::h2c(gw.clone());
     let multi_frame = encode_grpc_frames(&[b"tls-a", b"tls-b"]);
 
-    let client_stream = h2c_grpc_request(
-        &gw,
-        CLIENT_STREAM_PATH,
-        multi_frame.clone(),
-        &[],
-        true,
-    )
-    .await
-    .expect("tls client-stream rpc");
+    let client_stream = h2c_grpc_request(&gw, CLIENT_STREAM_PATH, multi_frame.clone(), &[], true)
+        .await
+        .expect("tls client-stream rpc");
     assert_eq!(
         client_stream.grpc_status(),
         Some(0),
