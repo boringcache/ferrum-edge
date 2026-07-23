@@ -992,12 +992,12 @@ fn disk_owned_bytes(root: &Path) -> u64 {
             };
             let owned = name.ends_with(".ndjson.tmp")
                 || name.ends_with(".ndjson.zst.tmp")
+                || name.ends_with(".ndjson.rejected.meta.tmp")
+                || name.ends_with(".ndjson.zst.rejected.meta.tmp")
                 || name.ends_with(".ndjson.corrupt")
                 || name.ends_with(".ndjson.zst.corrupt")
                 || name.ends_with(".ndjson.rejected.meta")
                 || name.ends_with(".ndjson.zst.rejected.meta")
-                || name.ends_with(".ndjson.rejected")
-                || name.ends_with(".ndjson.zst.rejected")
                 || ((name.ends_with(".ndjson.zst") || name.ends_with(".ndjson"))
                     && !name.ends_with(".tmp")
                     && !name.ends_with(".corrupt")
@@ -1736,21 +1736,43 @@ async fn mount_status_sequence(server: &MockServer, statuses: &[u16]) {
         .await;
 }
 
-fn assert_rejected_sidecar(path: &Path, expected_status: u16, expected_reason: &str) {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap();
-    let meta_path = path.with_file_name(format!("{name}.meta"));
-    assert!(path.exists(), "dead-letter payload missing: {}", path.display());
+fn dead_letter_meta_path(source_path: &Path) -> std::path::PathBuf {
+    let name = source_path.file_name().and_then(|n| n.to_str()).unwrap();
+    source_path.with_file_name(format!("{name}.rejected.meta"))
+}
+
+fn assert_rejected_sidecar(source_path: &Path, expected_status: u16, expected_reason: &str) {
+    let meta_path = dead_letter_meta_path(source_path);
     assert!(
         meta_path.exists(),
         "dead-letter meta missing: {}",
         meta_path.display()
     );
+    assert!(
+        !source_path.exists(),
+        "rejected payload must leave the replay set: {}",
+        source_path.display()
+    );
+    let rejected_payload = source_path.with_file_name(format!(
+        "{}.rejected",
+        source_path.file_name().and_then(|n| n.to_str()).unwrap()
+    ));
+    assert!(
+        !rejected_payload.exists(),
+        "dead-letter state must not retain charge-record PII: {}",
+        rejected_payload.display()
+    );
     let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-    assert_eq!(meta["http_status"], expected_status);
-    assert_eq!(meta["reason"], expected_reason);
-    assert!(meta["row_count"].as_u64().unwrap() >= 1);
+    assert!(meta["rejected_rows"].as_u64().unwrap() >= 1);
     assert!(meta["quarantined_at_unix"].as_i64().unwrap() > 0);
+    let outcomes = meta["outcomes"].as_array().unwrap();
+    assert!(outcomes.iter().any(|outcome| {
+        outcome["http_status"] == expected_status
+            && outcome["reason"] == expected_reason
+            && outcome["row_count"].as_u64().is_some_and(|count| count >= 1)
+    }));
     // Safe metadata only — no charge-record fields.
+    let serialized = serde_json::to_string(&meta).unwrap();
     for forbidden in [
         "consumer_id",
         "event_id",
@@ -1760,7 +1782,7 @@ fn assert_rejected_sidecar(path: &Path, expected_status: u16, expected_reason: &
         "charge_total",
     ] {
         assert!(
-            meta.get(forbidden).is_none(),
+            !serialized.contains(forbidden),
             "dead-letter meta must not include {forbidden}: {meta}"
         );
     }
@@ -1780,12 +1802,7 @@ async fn replay_dead_letters_permanent_400_and_continues_to_newer_file() {
         .await
         .unwrap();
 
-    let rejected = poison.with_file_name(format!(
-        "{}.rejected",
-        poison.file_name().and_then(|n| n.to_str()).unwrap()
-    ));
-    assert!(!poison.exists(), "poison file should leave the replay set");
-    assert_rejected_sidecar(&rejected, 400, "permanent_http");
+    assert_rejected_sidecar(&poison, 400, "permanent_http");
     assert!(!newer.exists(), "newer valid file must still replay");
     let requests = wait_for_requests(&server, 2).await;
     assert_eq!(requests.len(), 2);
@@ -1795,6 +1812,30 @@ async fn replay_dead_letters_permanent_400_and_continues_to_newer_file() {
         .collect();
     assert!(bodies.iter().any(|body| body.contains("evt-good")));
     assert!(bodies.iter().any(|body| body.contains("evt-poison")));
+}
+
+#[tokio::test]
+async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool.write_events(&[sample_event("evt-retained")]).unwrap();
+    let meta_path = dead_letter_meta_path(&source);
+    let tmp_path = meta_path.with_file_name(format!(
+        "{}.tmp",
+        meta_path.file_name().and_then(|name| name.to_str()).unwrap()
+    ));
+    fs::create_dir(&tmp_path).unwrap();
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("dead-letter metadata failure must stop the replay tick");
+
+    assert!(error.contains("failed to create spool temp file"));
+    assert!(source.exists(), "source must remain replayable on metadata failure");
+    assert!(!meta_path.exists(), "partial metadata must not be published");
 }
 
 #[tokio::test]
@@ -1813,12 +1854,7 @@ async fn replay_dead_letters_permanent_401_and_403() {
             .await
             .unwrap();
 
-        let rejected = path.with_file_name(format!(
-            "{}.rejected",
-            path.file_name().and_then(|n| n.to_str()).unwrap()
-        ));
-        assert!(!path.exists());
-        assert_rejected_sidecar(&rejected, status, "permanent_http");
+        assert_rejected_sidecar(&path, status, "permanent_http");
     }
 }
 
@@ -1842,7 +1878,10 @@ async fn replay_stops_on_retryable_408_429_and_5xx_without_removing_file() {
             err.contains(&format!("clickhouse returned HTTP {status}")),
             "unexpected error: {err}"
         );
-        assert!(oldest.exists(), "retryable failure must retain the oldest file");
+        assert!(
+            oldest.exists(),
+            "retryable failure must retain the oldest file"
+        );
         assert!(
             newer.exists(),
             "retryable failure must not advance past the oldest file"
@@ -1890,7 +1929,10 @@ async fn replay_splits_413_payload_and_preserves_event_ids() {
         .await
         .unwrap();
 
-    assert!(!path.exists(), "split replay should consume the original file");
+    assert!(
+        !path.exists(),
+        "split replay should consume the original file"
+    );
     let requests = wait_for_requests(&server, 3).await;
     assert_eq!(requests.len(), 3);
     let bodies: Vec<String> = requests
@@ -1915,18 +1957,19 @@ async fn replay_dead_letters_single_row_413_then_replays_newer_file() {
     let temp = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
     let oversized = spool.write_events(&[sample_event("evt-too-big")]).unwrap();
-    let newer = spool.write_events(&[sample_event("evt-after-413")]).unwrap();
+    let newer = spool
+        .write_events(&[sample_event("evt-after-413")])
+        .unwrap();
 
     replay_spool_once_for_tests(&spool, &server.uri())
         .await
         .unwrap();
 
-    let rejected = oversized.with_file_name(format!(
-        "{}.rejected",
-        oversized.file_name().and_then(|n| n.to_str()).unwrap()
-    ));
-    assert_rejected_sidecar(&rejected, 413, "payload_too_large");
-    assert!(!newer.exists(), "newer file must replay after single-row 413 dead-letter");
+    assert_rejected_sidecar(&oversized, 413, "payload_too_large");
+    assert!(
+        !newer.exists(),
+        "newer file must replay after single-row 413 dead-letter"
+    );
     let requests = wait_for_requests(&server, 2).await;
     let last = String::from_utf8(requests.last().unwrap().body.clone()).unwrap();
     assert!(last.contains("evt-after-413"));
@@ -1948,29 +1991,14 @@ async fn replay_partial_split_dead_letters_only_poison_row() {
         .await
         .unwrap();
 
-    assert!(!path.exists(), "original file should be consumed after partial split");
-    let node_root = temp.path().join("node-a");
-    let mut rejected = Vec::new();
-    let mut stack = vec![node_root];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.ends_with(".ndjson.rejected") {
-                rejected.push(path);
-            }
-        }
-    }
-    assert_eq!(rejected.len(), 1, "exactly one dead-lettered row expected");
-    let rejected_body = decode_spool_file_for_tests(&rejected[0]).unwrap();
-    assert!(rejected_body.contains("evt-bad-row"));
-    assert!(!rejected_body.contains("evt-good-row"));
-    assert_rejected_sidecar(&rejected[0], 400, "permanent_http");
+    assert!(
+        !path.exists(),
+        "original file should be consumed after partial split"
+    );
+    assert_rejected_sidecar(&path, 400, "permanent_http");
+    let meta: Value =
+        serde_json::from_str(&fs::read_to_string(dead_letter_meta_path(&path)).unwrap()).unwrap();
+    assert_eq!(meta["rejected_rows"], 1);
 
     let requests = wait_for_requests(&server, 3).await;
     let delivered = String::from_utf8(requests[2].body.clone()).unwrap();

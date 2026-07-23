@@ -1463,7 +1463,10 @@ fn classify_clickhouse_status(
     if status.is_client_error() {
         cfg.metrics
             .record_failure(FailureReason::Http4xx, message.clone());
-        return DeliveryOutcome::Permanent { status: code, message };
+        return DeliveryOutcome::Permanent {
+            status: code,
+            message,
+        };
     }
     cfg.metrics
         .record_failure(FailureReason::Network, message.clone());
@@ -2024,7 +2027,7 @@ impl SpoolManager {
     /// Drop oldest owned spool files until `owned_bytes + incoming_len <= max_bytes`.
     ///
     /// Owned bytes include active data files, crash-left temps, corrupt
-    /// quarantine, and dead-letter (`.rejected` / `.rejected.meta`) files.
+    /// quarantine, and metadata-only dead-letter (`.rejected.meta`) files.
     /// When a single encoded batch cannot fit even after emptying the spool,
     /// the write is rejected (never silently over-admitted).
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
@@ -2147,8 +2150,8 @@ fn warn_on_sibling_spool_dirs(root: &Path, node_id: &str) {
 
 #[derive(Clone, Copy)]
 enum SpoolFileClass {
-    /// Active data, crash-left temps, corrupt quarantine, and dead-letter files —
-    /// quota/status.
+    /// Active data, crash-left temps, corrupt quarantine, and metadata-only
+    /// dead-letter files — quota/status.
     Owned,
     /// Only durable replay candidates (`*.ndjson` / `*.ndjson.zst`).
     Replayable,
@@ -2225,103 +2228,72 @@ impl DeadLetterReason {
     }
 }
 
-/// Safe dead-letter metadata only: no response bodies, credentials, or charge PII.
+/// One aggregated safe outcome within a metadata-only dead-letter record.
 #[derive(Debug, Clone, Serialize)]
-struct DeadLetterMeta {
+struct DeadLetterOutcomeMeta {
     reason: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     http_status: Option<u16>,
     row_count: usize,
+}
+
+/// Safe dead-letter metadata only: no response bodies, credentials, or charge PII.
+#[derive(Debug, Clone, Serialize)]
+struct DeadLetterMeta {
+    rejected_rows: usize,
+    outcomes: Vec<DeadLetterOutcomeMeta>,
     quarantined_at_unix: i64,
 }
 
-fn dead_letter_spool_file(
-    path: &Path,
-    reason: DeadLetterReason,
-    http_status: Option<u16>,
-    row_count: usize,
-) -> Result<PathBuf, String> {
+fn dead_letter_meta_paths(path: &Path) -> Result<(PathBuf, PathBuf), String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
-    let rejected_path = path.with_file_name(format!("{name}.rejected"));
-    fs::rename(path, &rejected_path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to dead-letter spool file '{}' to '{}': {error}",
-            path.display(),
-            rejected_path.display()
-        )
-    })?;
-    write_dead_letter_meta(
-        &rejected_path,
-        DeadLetterMeta {
-            reason: reason.as_str(),
-            http_status,
-            row_count,
-            quarantined_at_unix: unix_timestamp_seconds(),
-        },
-    )?;
-    Ok(rejected_path)
+    let meta_path = path.with_file_name(format!("{name}.rejected.meta"));
+    let tmp_path = path.with_file_name(format!("{name}.rejected.meta.tmp"));
+    Ok((tmp_path, meta_path))
 }
 
-fn write_dead_letter_rows(
-    dir: &Path,
-    compression: SpoolCompression,
-    lines: &[String],
-    reason: DeadLetterReason,
-    http_status: Option<u16>,
+fn write_dead_letter_meta(
+    spool: &SpoolManager,
+    source_path: &Path,
+    meta: &DeadLetterMeta,
 ) -> Result<PathBuf, String> {
-    if lines.is_empty() {
-        return Err(format!("{PLUGIN_NAME}: refusing to dead-letter empty row set"));
-    }
-    ensure_private_dir(dir)?;
-    let id = new_ulid();
-    let final_path = dir.join(format!("{id}.{}.rejected", compression.extension()));
-    let tmp_path = final_path.with_file_name(format!(
-        "{}.tmp",
-        final_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("{PLUGIN_NAME}: invalid dead-letter file path"))?
-    ));
-    let body = lines.join("\n");
-    let bytes = encode_spool_bytes(body.as_bytes(), compression)?;
-    write_private_file_atomically(&tmp_path, &final_path, &bytes)?;
-    write_dead_letter_meta(
-        &final_path,
-        DeadLetterMeta {
-            reason: reason.as_str(),
-            http_status,
-            row_count: lines.len(),
-            quarantined_at_unix: unix_timestamp_seconds(),
-        },
-    )?;
-    Ok(final_path)
-}
-
-fn write_dead_letter_meta(rejected_path: &Path, meta: DeadLetterMeta) -> Result<(), String> {
-    let name = rejected_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("{PLUGIN_NAME}: invalid dead-letter file path"))?;
-    let meta_path = rejected_path.with_file_name(format!("{name}.meta"));
-    let tmp_path = rejected_path.with_file_name(format!("{name}.meta.tmp"));
+    let (tmp_path, meta_path) = dead_letter_meta_paths(source_path)?;
     let bytes = serde_json::to_vec(&meta).map_err(|error| {
         format!("{PLUGIN_NAME}: failed to serialize dead-letter metadata: {error}")
     })?;
-    write_private_file_atomically(&tmp_path, &meta_path, &bytes)
-}
-
-fn spool_compression_for_path(path: &Path) -> SpoolCompression {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return SpoolCompression::None;
-    };
-    if name.contains(".ndjson.zst") {
-        SpoolCompression::Zstd
-    } else {
-        SpoolCompression::None
+    let _guard = spool
+        .write_lock
+        .lock()
+        .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+    match fs::remove_file(&meta_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "{PLUGIN_NAME}: failed to replace dead-letter metadata '{}': {error}",
+                meta_path.display()
+            ));
+        }
     }
+    write_private_file_atomically(&tmp_path, &meta_path, &bytes)?;
+    if let Err(error) = fs::remove_file(source_path) {
+        let cleanup_error = fs::remove_file(&meta_path).err();
+        return Err(format!(
+            "{PLUGIN_NAME}: failed to remove permanently rejected spool file '{}': {error}; dead-letter metadata cleanup: {}",
+            source_path.display(),
+            cleanup_error
+                .map(|cleanup| cleanup.to_string())
+                .unwrap_or_else(|| "ok".to_string())
+        ));
+    }
+    // Reuse the spool's owned-byte eviction policy after replacing the source
+    // payload with its much smaller safe metadata record. This also handles an
+    // operator-configured max_bytes too small to retain even the metadata.
+    spool.evict_until_can_admit(0)?;
+    Ok(meta_path)
 }
 
 fn spool_file_matches(path: &Path, class: SpoolFileClass) -> bool {
@@ -2346,7 +2318,10 @@ fn is_spool_temp_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    name.ends_with(".ndjson.tmp") || name.ends_with(".ndjson.zst.tmp")
+    name.ends_with(".ndjson.tmp")
+        || name.ends_with(".ndjson.zst.tmp")
+        || name.ends_with(".ndjson.rejected.meta.tmp")
+        || name.ends_with(".ndjson.zst.rejected.meta.tmp")
 }
 
 fn is_spool_corrupt_file(path: &Path) -> bool {
@@ -2354,14 +2329,6 @@ fn is_spool_corrupt_file(path: &Path) -> bool {
         return false;
     };
     name.ends_with(".ndjson.corrupt") || name.ends_with(".ndjson.zst.corrupt")
-}
-
-fn is_spool_rejected_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    (name.ends_with(".ndjson.rejected") || name.ends_with(".ndjson.zst.rejected"))
-        && !name.ends_with(".meta")
 }
 
 fn is_spool_rejected_meta_file(path: &Path) -> bool {
@@ -2375,7 +2342,6 @@ fn is_spool_owned_file(path: &Path) -> bool {
     is_spool_data_file(path)
         || is_spool_temp_file(path)
         || is_spool_corrupt_file(path)
-        || is_spool_rejected_file(path)
         || is_spool_rejected_meta_file(path)
 }
 
@@ -2690,7 +2656,7 @@ async fn replay_spool_once(
 
         match replay_spool_lines(flush_config, &lines, batch_size).await {
             Ok(dead_letters) => {
-                finalize_replayed_spool_file(&file, &lines, dead_letters)?;
+                finalize_replayed_spool_file(spool, &file, lines.len(), dead_letters)?;
                 spool
                     .metrics
                     .last_replay_at
@@ -2709,7 +2675,7 @@ async fn replay_spool_once(
 }
 
 struct DeadLetterChunk {
-    lines: Vec<String>,
+    row_count: usize,
     reason: DeadLetterReason,
     http_status: Option<u16>,
 }
@@ -2738,7 +2704,7 @@ async fn replay_spool_lines(
             DeliveryOutcome::PayloadTooLarge { .. } => {
                 if chunk.len() == 1 {
                     dead_letters.push(DeadLetterChunk {
-                        lines: chunk,
+                        row_count: 1,
                         reason: DeadLetterReason::PayloadTooLarge,
                         http_status: Some(413),
                     });
@@ -2753,7 +2719,7 @@ async fn replay_spool_lines(
             }
             DeliveryOutcome::Permanent { status, .. } => {
                 dead_letters.push(DeadLetterChunk {
-                    lines: chunk,
+                    row_count: chunk.len(),
                     reason: DeadLetterReason::PermanentHttp,
                     http_status: Some(status),
                 });
@@ -2764,11 +2730,11 @@ async fn replay_spool_lines(
 }
 
 fn finalize_replayed_spool_file(
+    spool: &SpoolManager,
     file: &Path,
-    original_lines: &[String],
+    original_row_count: usize,
     dead_letters: Vec<DeadLetterChunk>,
 ) -> Result<(), String> {
-    let dead_row_count: usize = dead_letters.iter().map(|chunk| chunk.lines.len()).sum();
     if dead_letters.is_empty() {
         fs::remove_file(file).map_err(|error| {
             format!(
@@ -2779,84 +2745,41 @@ fn finalize_replayed_spool_file(
         return Ok(());
     }
 
-    let whole_file_rejected =
-        dead_letters.len() == 1 && dead_row_count == original_lines.len() && file.exists();
-    if whole_file_rejected {
-        let chunk = &dead_letters[0];
-        match dead_letter_spool_file(file, chunk.reason, chunk.http_status, chunk.lines.len()) {
-            Ok(rejected_path) => {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    reason = chunk.reason.as_str(),
-                    http_status = ?chunk.http_status,
-                    row_count = chunk.lines.len(),
-                    path = %file.display(),
-                    rejected_path = %rejected_path.display(),
-                    "Chargeback sink dead-lettered a permanently rejected spool file and will continue replay"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    error = %error,
-                    reason = chunk.reason.as_str(),
-                    http_status = ?chunk.http_status,
-                    row_count = chunk.lines.len(),
-                    path = %file.display(),
-                    "Chargeback sink could not dead-letter a rejected spool file; replay will continue"
-                );
-            }
-        }
-        return Ok(());
+    let rejected_rows: usize = dead_letters.iter().map(|chunk| chunk.row_count).sum();
+    if rejected_rows > original_row_count {
+        return Err(format!(
+            "{PLUGIN_NAME}: dead-letter row count ({rejected_rows}) exceeds source row count ({original_row_count})"
+        ));
     }
-
-    let parent = file.parent().ok_or_else(|| {
-        format!(
-            "{PLUGIN_NAME}: spool file '{}' has no parent directory",
-            file.display()
-        )
-    })?;
-    let compression = spool_compression_for_path(file);
-    for chunk in &dead_letters {
-        match write_dead_letter_rows(
-            parent,
-            compression,
-            &chunk.lines,
-            chunk.reason,
-            chunk.http_status,
-        ) {
-            Ok(rejected_path) => {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    reason = chunk.reason.as_str(),
-                    http_status = ?chunk.http_status,
-                    row_count = chunk.lines.len(),
-                    path = %file.display(),
-                    rejected_path = %rejected_path.display(),
-                    "Chargeback sink dead-lettered permanently rejected spool rows and will continue replay"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    error = %error,
-                    reason = chunk.reason.as_str(),
-                    http_status = ?chunk.http_status,
-                    row_count = chunk.lines.len(),
-                    path = %file.display(),
-                    "Chargeback sink could not write dead-letter rows; replay will continue"
-                );
-            }
+    let mut outcomes: Vec<DeadLetterOutcomeMeta> = Vec::new();
+    for chunk in dead_letters {
+        if let Some(existing) = outcomes.iter_mut().find(|outcome| {
+            outcome.reason == chunk.reason.as_str() && outcome.http_status == chunk.http_status
+        }) {
+            existing.row_count = existing.row_count.saturating_add(chunk.row_count);
+        } else {
+            outcomes.push(DeadLetterOutcomeMeta {
+                reason: chunk.reason.as_str(),
+                http_status: chunk.http_status,
+                row_count: chunk.row_count,
+            });
         }
     }
-    if file.exists() {
-        fs::remove_file(file).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to remove partially replayed spool file '{}': {error}",
-                file.display()
-            )
-        })?;
-    }
+    let meta = DeadLetterMeta {
+        rejected_rows,
+        outcomes,
+        quarantined_at_unix: unix_timestamp_seconds(),
+    };
+    let meta_path = write_dead_letter_meta(spool, file, &meta)?;
+    warn!(
+        plugin = PLUGIN_NAME,
+        rejected_rows,
+        source_rows = original_row_count,
+        outcome_count = meta.outcomes.len(),
+        path = %file.display(),
+        meta_path = %meta_path.display(),
+        "Chargeback sink recorded safe dead-letter metadata for permanently rejected spool rows and will continue replay"
+    );
     Ok(())
 }
 
