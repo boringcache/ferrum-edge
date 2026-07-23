@@ -15,6 +15,229 @@ fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+#[tokio::test]
+async fn urlencoded_exploded_free_form_object_collects_unprefixed_children() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/labels",
+            "path_regex": "^/labels$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["kind", "labels"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "kind": {"const": "fixed"},
+                                "labels": {
+                                    "type": "object",
+                                    "required": ["red", "blue"],
+                                    "additionalProperties": {"type": "integer"}
+                                }
+                            }
+                        },
+                        "encoding": {
+                            "labels": {"style": "form", "explode": true}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/x-www-form-urlencoded");
+    let mut ctx = post_ctx("/labels");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                b"kind=fixed&red=1&blue=2",
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn nested_composed_array_items_are_converted_before_form_validation() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/numbers",
+            "path_regex": "^/numbers$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "type": "object",
+                        "required": ["values"],
+                        "properties": {
+                            "values": {
+                                "allOf": [{
+                                    "anyOf": [
+                                        {"type": "array", "items": {"type": "integer"}},
+                                        {"type": "null"}
+                                    ]
+                                }]
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/x-www-form-urlencoded");
+    let mut ctx = post_ctx("/numbers");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, b"values=1&values=2")
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn multipart_structured_object_uses_declared_json_content_type() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/profile",
+            "path_regex": "^/profile$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["profile"],
+                            "properties": {
+                                "profile": {
+                                    "type": "object",
+                                    "required": ["name", "age"],
+                                    "properties": {
+                                        "name": {"const": "alice"},
+                                        "age": {"type": "integer", "const": 42}
+                                    }
+                                }
+                            }
+                        },
+                        "encoding": {
+                            "profile": {"contentType": "application/json"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"profile\"\r\n",
+        "Content-Type: application/json\r\n\r\n",
+        "{\"name\":\"alice\",\"age\":42}\r\n",
+        "--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/profile");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn multipart_exploded_free_form_object_and_nested_array_are_converted() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/mixed",
+            "path_regex": "^/mixed$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["kind", "labels", "values"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "kind": {"const": "fixed"},
+                                "labels": {
+                                    "type": "object",
+                                    "required": ["red", "blue"],
+                                    "additionalProperties": {"type": "integer"}
+                                },
+                                "values": {
+                                    "oneOf": [
+                                        {"type": "array", "items": {"type": "integer"}},
+                                        {"type": "null"}
+                                    ]
+                                }
+                            }
+                        },
+                        "encoding": {
+                            "labels": {"style": "form", "explode": true}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let body = concat!(
+        "--abc\r\nContent-Disposition: form-data; name=\"kind\"\r\n\r\nfixed\r\n",
+        "--abc\r\nContent-Disposition: form-data; name=\"red\"\r\n\r\n1\r\n",
+        "--abc\r\nContent-Disposition: form-data; name=\"blue\"\r\n\r\n2\r\n",
+        "--abc\r\nContent-Disposition: form-data; name=\"values\"\r\n\r\n3\r\n",
+        "--abc\r\nContent-Disposition: form-data; name=\"values\"\r\n\r\n4\r\n",
+        "--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/mixed");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+}
+
+#[test]
+fn multiple_exploded_free_form_objects_are_rejected_as_ambiguous() {
+    let result = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/ambiguous",
+            "path_regex": "^/ambiguous$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "left": {"type": "object"},
+                                "right": {"type": "object"}
+                            }
+                        },
+                        "encoding": {
+                            "left": {"style": "form", "explode": true},
+                            "right": {"style": "form", "explode": true}
+                        }
+                    }
+                }
+            }
+        }]
+    }));
+    let error = match result {
+        Ok(_) => panic!("unprefixed dynamic keys cannot be assigned to two free-form objects"),
+        Err(error) => error,
+    };
+    assert!(error.contains("multiple explode=true free-form object properties"));
+}
+
 fn brotli_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::new();
     let mut input = body;

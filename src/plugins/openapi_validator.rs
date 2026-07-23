@@ -1098,6 +1098,23 @@ fn parse_encoding_map(
         let parsed = parse_property_encoding(property, value, &normalized, schema, schema_draft)?;
         out.insert(property.clone(), parsed);
     }
+    let free_form_exploded_objects: Vec<&str> = out
+        .iter()
+        .filter_map(|(property, encoding)| {
+            let property_schema = property_schema_from_object(schema, property)?;
+            (encoding.style == EncodingStyle::Form
+                && encoding.explode
+                && schema_accepts_object(property_schema)
+                && additional_property_schema_for_conversion(property_schema).is_some())
+            .then_some(property.as_str())
+        })
+        .collect();
+    if free_form_exploded_objects.len() > 1 {
+        return Err(format!(
+            "encoding contains multiple explode=true free-form object properties ({}) whose unprefixed child keys are ambiguous",
+            free_form_exploded_objects.join(", ")
+        ));
+    }
     Ok(out)
 }
 
@@ -1466,16 +1483,16 @@ fn xml_body_to_value(body: &str, schema: &Value) -> Result<Value, String> {
 }
 
 fn xml_node_to_value(node: roxmltree::Node<'_, '_>, schema: &Value) -> Result<Value, String> {
-    let object_schema = object_schema_for_conversion(schema);
-    if schema_accepts_array(object_schema.as_ref()) {
-        let item_schema = object_schema.get("items").unwrap_or(&Value::Null);
+    if schema_accepts_array(schema) {
+        let item_schema = array_item_schema_for_conversion(schema);
         let values = node
             .children()
             .filter(roxmltree::Node::is_element)
-            .map(|child| xml_node_to_value(child, item_schema))
+            .map(|child| xml_node_to_value(child, item_schema.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(Value::Array(values));
     }
+    let object_schema = object_schema_for_conversion(schema);
     if schema_accepts_object(object_schema.as_ref()) || object_schema.get("properties").is_some() {
         let properties = merged_object_properties(object_schema.as_ref());
         if properties.is_empty() {
@@ -1543,8 +1560,8 @@ fn xml_array_values(
     property_name: &str,
     property_schema: &Value,
 ) -> Result<Vec<Value>, String> {
-    let item_schema = property_schema.get("items").unwrap_or(&Value::Null);
-    let item_name = xml_name(item_schema, None)
+    let item_schema = array_item_schema_for_conversion(property_schema);
+    let item_name = xml_name(item_schema.as_ref(), None)
         .or_else(|| xml_name(property_schema, Some(property_name)))
         .unwrap_or(property_name);
     let mut values = Vec::new();
@@ -1552,12 +1569,12 @@ fn xml_array_values(
         let wrapper_name = xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
         for wrapper in child_elements(node, wrapper_name) {
             for child in child_elements(wrapper, item_name) {
-                values.push(xml_node_to_value(child, item_schema)?);
+                values.push(xml_node_to_value(child, item_schema.as_ref())?);
             }
         }
     } else {
         for child in child_elements(node, item_name) {
-            values.push(xml_node_to_value(child, item_schema)?);
+            values.push(xml_node_to_value(child, item_schema.as_ref())?);
         }
     }
     Ok(values)
@@ -1977,8 +1994,12 @@ fn fields_to_schema_object(
             && let Some(property_encoding) = property_encoding
         {
             if property_encoding.style == EncodingStyle::Form && property_encoding.explode {
-                let object =
-                    exploded_form_object_to_value(&fields, property_schema, &mut consumed_keys)?;
+                let object = exploded_form_object_to_value(
+                    &fields,
+                    property_schema,
+                    &properties,
+                    &mut consumed_keys,
+                )?;
                 if object.as_object().is_some_and(|object| !object.is_empty()) {
                     out.insert(property.clone(), object);
                 }
@@ -2038,6 +2059,7 @@ fn fields_to_schema_object(
 fn exploded_form_object_to_value(
     fields: &HashMap<String, Vec<String>>,
     schema: &Value,
+    root_properties: &serde_json::Map<String, Value>,
     consumed: &mut HashSet<String>,
 ) -> Result<Value, String> {
     let properties = merged_object_properties(schema);
@@ -2051,6 +2073,21 @@ fn exploded_form_object_to_value(
             child.clone(),
             values_to_schema_value(values, child_schema, None)?,
         );
+    }
+    if let Some(additional_schema) = additional_property_schema_for_conversion(schema) {
+        for (child, values) in fields {
+            if consumed.contains(child) || root_properties.contains_key(child) {
+                continue;
+            }
+            consumed.insert(child.clone());
+            let value = match additional_schema {
+                Some(additional_schema) => {
+                    values_to_schema_value(values, additional_schema, None)?
+                }
+                None => values_to_schema_value(values, &Value::Null, None)?,
+            };
+            out.insert(child.clone(), value);
+        }
     }
     Ok(Value::Object(out))
 }
@@ -2115,12 +2152,12 @@ fn form_values_to_schema_value(
     let Some(raw_values) = raw_values else {
         return values_to_schema_value(values, schema, Some(encoding));
     };
-    let item_schema = schema.get("items").unwrap_or(&Value::Null);
+    let item_schema = array_item_schema_for_conversion(schema);
     let mut converted = Vec::new();
     for raw in raw_values {
         for token in split_raw_form_tokens(raw, encoding.style)? {
             let value = decode_raw_form_component(token);
-            converted.push(scalar_to_schema_value(&value, item_schema)?);
+            converted.push(scalar_to_schema_value(&value, item_schema.as_ref())?);
         }
     }
     Ok(Value::Array(converted))
@@ -2290,6 +2327,18 @@ fn multipart_parts_to_schema_object(
     for (property, property_schema) in &properties {
         let property_encoding = encoding.get(property.as_str());
         if schema_accepts_object(property_schema)
+            && let Some(values) = parts.get(property)
+            && values.len() == 1
+            && is_structured_multipart_object_part(&values[0])
+        {
+            consumed_keys.insert(property.clone());
+            out.insert(
+                property.clone(),
+                multipart_part_to_schema_value(&values[0], property_schema, property_encoding)?,
+            );
+            continue;
+        }
+        if schema_accepts_object(property_schema)
             && let Some(property_encoding) = property_encoding
         {
             if property_encoding.style == EncodingStyle::DeepObject {
@@ -2309,6 +2358,7 @@ fn multipart_parts_to_schema_object(
                 let object = exploded_multipart_object_to_value(
                     &parts,
                     property_schema,
+                    &properties,
                     property_encoding,
                     &mut consumed_keys,
                 )?;
@@ -2338,10 +2388,16 @@ fn multipart_parts_to_schema_object(
         consumed_keys.insert(property.clone());
         let explode = property_encoding.map(|enc| enc.explode).unwrap_or(true);
         if schema_accepts_array(property_schema) && explode {
-            let item_schema = property_schema.get("items").unwrap_or(&Value::Null);
+            let item_schema = array_item_schema_for_conversion(property_schema);
             let array = values
                 .iter()
-                .map(|part| multipart_part_to_schema_value(part, item_schema, property_encoding))
+                .map(|part| {
+                    multipart_part_to_schema_value(
+                        part,
+                        item_schema.as_ref(),
+                        property_encoding,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             out.insert(property.clone(), Value::Array(array));
             continue;
@@ -2397,6 +2453,7 @@ fn multipart_parts_to_schema_object(
 fn exploded_multipart_object_to_value(
     parts: &HashMap<String, Vec<MultipartPart>>,
     schema: &Value,
+    root_properties: &serde_json::Map<String, Value>,
     encoding: &PropertyEncoding,
     consumed: &mut HashSet<String>,
 ) -> Result<Value, String> {
@@ -2411,6 +2468,21 @@ fn exploded_multipart_object_to_value(
             child.clone(),
             multipart_values_to_schema_value(values, child_schema, Some(encoding))?,
         );
+    }
+    if let Some(additional_schema) = additional_property_schema_for_conversion(schema) {
+        for (child, values) in parts {
+            if consumed.contains(child) || root_properties.contains_key(child) {
+                continue;
+            }
+            consumed.insert(child.clone());
+            let value = match additional_schema {
+                Some(additional_schema) => {
+                    multipart_values_to_schema_value(values, additional_schema, Some(encoding))?
+                }
+                None => multipart_values_to_schema_value(values, &Value::Null, Some(encoding))?,
+            };
+            out.insert(child.clone(), value);
+        }
     }
     Ok(Value::Object(out))
 }
@@ -2464,10 +2536,10 @@ fn multipart_values_to_schema_value(
 ) -> Result<Value, String> {
     let explode = encoding.map(|enc| enc.explode).unwrap_or(true);
     if schema_accepts_array(schema) && explode {
-        let item_schema = schema.get("items").unwrap_or(&Value::Null);
+        let item_schema = array_item_schema_for_conversion(schema);
         return values
             .iter()
-            .map(|part| multipart_part_to_schema_value(part, item_schema, encoding))
+            .map(|part| multipart_part_to_schema_value(part, item_schema.as_ref(), encoding))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array);
     }
@@ -2537,6 +2609,24 @@ fn multipart_part_to_schema_value(
     }
 
     if schema_accepts_object(schema) || schema.get("properties").is_some() {
+        if let Some(media_type) = part.content_type.as_deref().and_then(|value| {
+            content_type_base(Some(value)).map(str::to_ascii_lowercase)
+        }) {
+            if is_json_media_type(&media_type) {
+                return serde_json::from_slice(&part.body).map_err(|error| {
+                    format!(
+                        "Multipart field '{}' contains invalid JSON: {error}",
+                        part.name
+                    )
+                });
+            }
+            if is_xml_media_type(&media_type) {
+                let text = std::str::from_utf8(&part.body).map_err(|error| {
+                    format!("Multipart field '{}' is not UTF-8 XML: {error}", part.name)
+                })?;
+                return xml_body_to_value(text, schema);
+            }
+        }
         let mut out = serde_json::Map::new();
         if let Some(filename) = &part.filename {
             out.insert("filename".to_string(), Value::String(filename.clone()));
@@ -2574,6 +2664,16 @@ fn multipart_part_to_schema_value(
     scalar_to_schema_value(text, schema)
 }
 
+fn is_structured_multipart_object_part(part: &MultipartPart) -> bool {
+    part.content_type
+        .as_deref()
+        .and_then(|value| content_type_base(Some(value)))
+        .is_some_and(|media_type| {
+            let media_type = media_type.to_ascii_lowercase();
+            is_json_media_type(&media_type) || is_xml_media_type(&media_type)
+        })
+}
+
 fn content_type_matches_encoding(actual: &str, expected: &str) -> bool {
     let actual_base = content_type_base(Some(actual))
         .unwrap_or(actual)
@@ -2602,7 +2702,7 @@ fn values_to_schema_value(
     encoding: Option<&PropertyEncoding>,
 ) -> Result<Value, String> {
     if schema_accepts_array(schema) {
-        let item_schema = schema.get("items").unwrap_or(&Value::Null);
+        let item_schema = array_item_schema_for_conversion(schema);
         let explode = encoding.map(|enc| enc.explode).unwrap_or(true);
         let style = encoding.map(|enc| enc.style).unwrap_or(EncodingStyle::Form);
         let items: Vec<String> = if !explode {
@@ -2623,7 +2723,7 @@ fn values_to_schema_value(
         };
         return items
             .iter()
-            .map(|value| scalar_to_schema_value(value, item_schema))
+            .map(|value| scalar_to_schema_value(value, item_schema.as_ref()))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array);
     }
@@ -2838,6 +2938,68 @@ fn schema_accepts_object(schema: &Value) -> bool {
 
 fn schema_accepts_array(schema: &Value) -> bool {
     collect_scalar_types(schema).contains(&ScalarType::Array) || schema.get("items").is_some()
+}
+
+/// Resolve the item schema used to deserialize textual array members without
+/// choosing a `oneOf`/`anyOf` branch by array order. The original parent schema
+/// remains authoritative for final validation.
+fn array_item_schema_for_conversion(schema: &Value) -> Cow<'_, Value> {
+    if !schema_is_composed(schema) {
+        return match schema.get("items") {
+            Some(items) => Cow::Borrowed(items),
+            None => Cow::Owned(Value::Null),
+        };
+    }
+    match composed_array_item_schema(schema, 0) {
+        Some(items) => Cow::Owned(items),
+        None => Cow::Owned(Value::Null),
+    }
+}
+
+fn composed_array_item_schema(schema: &Value, depth: usize) -> Option<Value> {
+    if depth > 32 {
+        return None;
+    }
+    let mut constraints = Vec::new();
+    if let Some(items) = schema.get("items") {
+        constraints.push(items.clone());
+    }
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if let Some(items) = composed_array_item_schema(branch, depth + 1) {
+                constraints.push(items);
+            }
+        }
+    }
+    for keyword in ["oneOf", "anyOf"] {
+        let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        let alternatives: Vec<Value> = branches
+            .iter()
+            .filter_map(|branch| composed_array_item_schema(branch, depth + 1))
+            .collect();
+        if !alternatives.is_empty() {
+            let mut composition = serde_json::Map::new();
+            composition.insert(keyword.to_string(), Value::Array(alternatives));
+            constraints.push(Value::Object(composition));
+        }
+    }
+    match constraints.len() {
+        0 => None,
+        1 => constraints.pop(),
+        _ => Some(serde_json::json!({"allOf": constraints})),
+    }
+}
+
+/// `None` means additional properties are forbidden. `Some(None)` means they
+/// are allowed without a child schema; `Some(Some(schema))` carries the schema.
+fn additional_property_schema_for_conversion(schema: &Value) -> Option<Option<&Value>> {
+    match schema.get("additionalProperties") {
+        Some(Value::Bool(false)) => None,
+        Some(Value::Object(_)) => Some(schema.get("additionalProperties")),
+        _ => Some(None),
+    }
 }
 
 /// Build a conversion-time object schema that merges `allOf` property maps and
