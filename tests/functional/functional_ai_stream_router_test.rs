@@ -134,6 +134,8 @@ proxies:
     plugins:
       - plugin_config_id: "asr"
 
+consumers: []
+
 plugin_configs:
   - id: "asr"
     proxy_id: "stream-router"
