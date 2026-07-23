@@ -1898,10 +1898,7 @@ async fn test_identity_provider_content_encoding_repairs_rewritten_representatio
         resp_headers.insert("Content-Length".to_string(), "999".to_string());
         resp_headers.insert("ETag".to_string(), "\"provider\"".to_string());
         resp_headers.insert("Digest".to_string(), "sha-256=provider".to_string());
-        resp_headers.insert(
-            "vary".to_string(),
-            "Accept-Encoding, Origin".to_string(),
-        );
+        resp_headers.insert("vary".to_string(), "Accept-Encoding, Origin".to_string());
         resp_headers.insert("Vary".to_string(), "origin, X-Trace".to_string());
         if let Some(encoding) = encoding {
             resp_headers.insert("Content-Encoding".to_string(), encoding.to_string());
