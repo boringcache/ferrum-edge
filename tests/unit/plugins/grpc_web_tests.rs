@@ -1064,7 +1064,7 @@ async fn test_after_proxy_rewrites_content_type_text() {
 }
 
 #[tokio::test]
-async fn test_preserved_statuses_keep_native_headers_and_release_buffering() {
+async fn test_preserved_statuses_keep_native_headers_without_buffering_transition() {
     let plugin = create_plugin_default();
 
     for status in [206, 226] {
@@ -1082,11 +1082,13 @@ async fn test_preserved_statuses_keep_native_headers_and_release_buffering() {
             &response_headers
         ));
         assert!(
-            plugin.should_release_response_body_before_content_type_rewrite(
+            !plugin.should_release_response_body_before_content_type_rewrite(
                 &ctx,
                 status,
                 &response_headers
-            )
+            ),
+            "streaming gRPC-Web never entered response buffering, so preserved statuses \
+             have no buffering transition to release"
         );
         assert!(matches!(
             plugin
