@@ -1237,6 +1237,8 @@ async fn h3_grpc_web_server_streaming_reaches_client_before_backend_eof() {
             "auth_mode": "single",
             "plugins": [{"plugin_config_id": "grpc-web-cadence"}],
         }],
+        "consumers": [],
+        "upstreams": [],
         "plugin_configs": [{
             "id": "grpc-web-cadence",
             "plugin_name": "grpc_web",
