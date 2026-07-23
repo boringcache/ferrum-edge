@@ -184,8 +184,12 @@ const GEMINI_SHAPE_FIELDS: &[&str] = &[
     "safety_settings",
 ];
 
-/// Provider-native tool / response-shape fields for Cohere v1 chat requests.
+/// Provider-native state, tool, and response-shape fields for Cohere v1 chat requests.
 const COHERE_SHAPE_FIELDS: &[&str] = &[
+    // Cohere v1 can bind requests to backend-side conversation state. Include
+    // the identifier in exact keys and semantic scopes so stateful responses
+    // never cross persisted conversations with the same current message.
+    "conversation_id",
     "tools",
     "tool_choice",
     "tool_results",
