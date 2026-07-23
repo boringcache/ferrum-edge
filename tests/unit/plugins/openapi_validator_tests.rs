@@ -52,11 +52,7 @@ async fn urlencoded_exploded_free_form_object_collects_unprefixed_children() {
     ctx.headers = headers.clone();
     assert_continue(
         plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &headers,
-                b"kind=fixed&red=1&blue=2",
-            )
+            .on_final_request_body_with_context(&mut ctx, &headers, b"kind=fixed&red=1&blue=2")
             .await,
     );
 }
