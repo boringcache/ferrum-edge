@@ -15,9 +15,9 @@ use flate2::read::GzDecoder;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{Plugin, PluginResult, RequestContext};
@@ -28,12 +28,67 @@ struct ProtobufMethodEntry {
     response: Option<MessageDescriptor>,
 }
 
-type ProtobufConfig = (
-    Option<DescriptorPool>,
-    Option<MessageDescriptor>,
-    Option<MessageDescriptor>,
-    HashMap<String, ProtobufMethodEntry>,
-);
+#[derive(Default)]
+struct ProtobufTargets {
+    default_request: bool,
+    default_response: bool,
+    method_requests: HashSet<String>,
+    method_responses: HashSet<String>,
+}
+
+impl ProtobufTargets {
+    fn has_request(&self) -> bool {
+        self.default_request || !self.method_requests.is_empty()
+    }
+
+    fn has_response(&self) -> bool {
+        self.default_response || !self.method_responses.is_empty()
+    }
+
+    fn request_applies(&self, grpc_path: &str) -> bool {
+        self.default_request || self.method_requests.contains(grpc_path)
+    }
+
+    fn response_applies(&self, grpc_path: &str) -> bool {
+        self.default_response || self.method_responses.contains(grpc_path)
+    }
+}
+
+#[derive(Default)]
+struct ProtobufMethodShape {
+    request: Option<String>,
+    response: Option<String>,
+}
+
+#[derive(Default)]
+struct ProtobufShape {
+    descriptor_path: Option<String>,
+    request_type: Option<String>,
+    response_type: Option<String>,
+    methods: HashMap<String, ProtobufMethodShape>,
+    targets: ProtobufTargets,
+}
+
+struct ProtobufConfig {
+    pool: Option<DescriptorPool>,
+    request_descriptor: Option<MessageDescriptor>,
+    response_descriptor: Option<MessageDescriptor>,
+    method_messages: HashMap<String, ProtobufMethodEntry>,
+    targets: ProtobufTargets,
+    dependency_unavailable: bool,
+}
+
+struct ResolvedProtobufShape {
+    request_descriptor: Option<MessageDescriptor>,
+    response_descriptor: Option<MessageDescriptor>,
+    method_messages: HashMap<String, ProtobufMethodEntry>,
+}
+
+#[derive(Clone, Copy)]
+enum DescriptorLoadMode {
+    Runtime,
+    ShapeOnly,
+}
 
 pub struct BodyValidator {
     // ── Request validation config ──
@@ -77,6 +132,12 @@ pub struct BodyValidator {
     protobuf_response_descriptor: Option<MessageDescriptor>,
     /// Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`).
     protobuf_method_messages: HashMap<String, ProtobufMethodEntry>,
+    /// Configured request/response targets, retained even when the node-local
+    /// descriptor dependency is temporarily unavailable.
+    protobuf_targets: ProtobufTargets,
+    /// Missing or unreadable descriptor files fail closed for applicable gRPC
+    /// traffic instead of silently disabling configured validation.
+    protobuf_dependency_unavailable: bool,
     /// Whether to reject messages with unknown field numbers.
     protobuf_reject_unknown_fields: bool,
     /// Maximum decompressed gRPC payload size; 0 disables the decompressed cap.
@@ -101,6 +162,18 @@ pub struct BodyValidator {
 
 impl BodyValidator {
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_inner(config, DescriptorLoadMode::Runtime)
+    }
+
+    /// Validate configuration shape without opening node-local descriptor files.
+    ///
+    /// Mode-aware file dependency validation is performed separately by
+    /// `GatewayConfig::validate_plugin_file_dependencies`.
+    pub fn validate_config(config: &Value) -> Result<(), String> {
+        Self::new_inner(config, DescriptorLoadMode::ShapeOnly).map(|_| ())
+    }
+
+    fn new_inner(config: &Value, descriptor_mode: DescriptorLoadMode) -> Result<Self, String> {
         if !config.is_object() {
             return Err("body_validator: config must be an object".to_string());
         }
@@ -128,26 +201,23 @@ impl BodyValidator {
             .unwrap_or_else(default_content_types);
 
         // ── Protobuf validation config ──
-        let (
-            protobuf_pool,
-            protobuf_request_descriptor,
-            protobuf_response_descriptor,
-            protobuf_method_messages,
-        ) = load_protobuf_config(config)?;
+        let protobuf_config = load_protobuf_config(config, descriptor_mode)?;
+        let ProtobufConfig {
+            pool: protobuf_pool,
+            request_descriptor: protobuf_request_descriptor,
+            response_descriptor: protobuf_response_descriptor,
+            method_messages: protobuf_method_messages,
+            targets: protobuf_targets,
+            dependency_unavailable: protobuf_dependency_unavailable,
+        } = protobuf_config;
         let protobuf_reject_unknown_fields =
             optional_bool(config, "protobuf_reject_unknown_fields")?.unwrap_or(false);
         let grpc_max_decompressed_size_bytes =
             optional_usize(config, "grpc_max_decompressed_size_bytes")?
                 .unwrap_or_else(default_grpc_max_decompressed_size_bytes);
 
-        let has_protobuf_request_validation = protobuf_request_descriptor.is_some()
-            || protobuf_method_messages
-                .values()
-                .any(|e| e.request.is_some());
-        let has_protobuf_response_validation = protobuf_response_descriptor.is_some()
-            || protobuf_method_messages
-                .values()
-                .any(|e| e.response.is_some());
+        let has_protobuf_request_validation = protobuf_targets.has_request();
+        let has_protobuf_response_validation = protobuf_targets.has_response();
 
         let has_xml_request_validation = validate_xml || !required_xml_elements.is_empty();
         let has_xml_response_validation =
@@ -200,6 +270,8 @@ impl BodyValidator {
             protobuf_request_descriptor,
             protobuf_response_descriptor,
             protobuf_method_messages,
+            protobuf_targets,
+            protobuf_dependency_unavailable,
             protobuf_reject_unknown_fields,
             grpc_max_decompressed_size_bytes,
             has_request_validation,
@@ -700,6 +772,77 @@ impl BodyValidator {
             .get(grpc_path)
             .and_then(|e| e.response.as_ref())
             .or(self.protobuf_response_descriptor.as_ref())
+    }
+
+    /// Whether JSON response validation rules are configured.
+    fn has_json_response_validation(&self) -> bool {
+        self.response_json_schema.is_some() || !self.response_required_fields.is_empty()
+    }
+
+    /// Resolve the gRPC method path used for response descriptor lookup.
+    ///
+    /// Prefer `grpc_full_method` set by `grpc_method_router` when available;
+    /// otherwise fall back to `ctx.path`.
+    fn grpc_method_path_for_response(ctx: &RequestContext) -> String {
+        ctx.metadata
+            .get("grpc_full_method")
+            .map(|method| {
+                if method.starts_with('/') {
+                    method.clone()
+                } else {
+                    let mut path = String::with_capacity(method.len() + 1);
+                    path.push('/');
+                    path.push_str(method);
+                    path
+                }
+            })
+            .unwrap_or_else(|| ctx.path.clone())
+    }
+
+    /// Whether protobuf response validation applies to this request/response.
+    fn applicable_protobuf_response_validation(&self, ctx: &RequestContext) -> bool {
+        self.has_protobuf_response_validation
+            && self
+                .protobuf_targets
+                .response_applies(&Self::grpc_method_path_for_response(ctx))
+    }
+
+    /// Whether the final response-body hook would inspect this media type.
+    ///
+    /// Used by the post-header buffering refinement so irrelevant downloads
+    /// (and other non-matching types) can stream instead of being collected
+    /// only to be skipped. A missing type stays buffered conservatively;
+    /// malformed or ambiguous values cannot match a configured JSON/XML rule
+    /// and are released. Genuine `text/event-stream` is released so
+    /// `after_proxy` can fail closed before header commit.
+    fn response_body_requires_buffering_for_media_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+    ) -> bool {
+        if !self.has_response_validation {
+            return false;
+        }
+        let Some(content_type) = content_type else {
+            return true;
+        };
+        if is_text_event_stream_media_type(content_type) {
+            return false;
+        }
+        if is_grpc_content_type(content_type) {
+            return self.applicable_protobuf_response_validation(ctx);
+        }
+        if !content_type_matches(&self.response_content_types, content_type) {
+            return false;
+        }
+        // Claim only representations the configured JSON/XML rules can
+        // actually inspect. A JSON-only config must not pin XML (or other
+        // allowlisted neighbors) onto the buffered path when the final hook
+        // would no-op.
+        if is_json_like_content_type(content_type) && self.has_json_response_validation() {
+            return true;
+        }
+        is_xml_like_content_type(content_type) && self.has_xml_response_validation
     }
 }
 
@@ -1358,54 +1501,30 @@ fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
-/// Load protobuf validation config from the plugin config JSON.
-///
-/// Reads `protobuf_descriptor_path`, resolves message types from
-/// `protobuf_request_type`, `protobuf_response_type`, and `protobuf_method_messages`.
-fn load_protobuf_config(config: &Value) -> Result<ProtobufConfig, String> {
-    let descriptor_path = match optional_string(config, "protobuf_descriptor_path")? {
-        Some(p) => p,
-        None => {
-            if config.get("protobuf_request_type").is_some()
-                || config.get("protobuf_response_type").is_some()
-                || config.get("protobuf_method_messages").is_some()
-            {
-                return Err(
-                    "body_validator: 'protobuf_descriptor_path' is required when configuring protobuf validation"
-                        .to_string(),
-                );
-            }
-            return Ok((None, None, None, HashMap::new()));
-        }
+/// Parse protobuf configuration shape without touching the local filesystem.
+fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
+    let descriptor_path = optional_string(config, "protobuf_descriptor_path")?.map(str::to_string);
+    if descriptor_path.is_none()
+        && (config.get("protobuf_request_type").is_some()
+            || config.get("protobuf_response_type").is_some()
+            || config.get("protobuf_method_messages").is_some())
+    {
+        return Err(
+            "body_validator: 'protobuf_descriptor_path' is required when configuring protobuf validation"
+                .to_string(),
+        );
+    }
+
+    let request_type = optional_string(config, "protobuf_request_type")?.map(str::to_string);
+    let response_type = optional_string(config, "protobuf_response_type")?.map(str::to_string);
+    let mut targets = ProtobufTargets {
+        default_request: request_type.is_some(),
+        default_response: response_type.is_some(),
+        ..Default::default()
     };
-
-    let descriptor_bytes = std::fs::read(descriptor_path).map_err(|e| {
-        format!("body_validator: failed to read protobuf descriptor file '{descriptor_path}': {e}")
-    })?;
-
-    let pool = DescriptorPool::decode(descriptor_bytes.as_slice()).map_err(|e| {
-        format!("body_validator: failed to parse protobuf descriptor '{descriptor_path}': {e}")
-    })?;
-
-    let request_desc = optional_string(config, "protobuf_request_type")?
-        .map(|name| {
-            pool.get_message_by_name(name).ok_or_else(|| {
-                format!("body_validator: protobuf_request_type '{name}' not found in descriptor")
-            })
-        })
-        .transpose()?;
-
-    let response_desc = optional_string(config, "protobuf_response_type")?
-        .map(|name| {
-            pool.get_message_by_name(name).ok_or_else(|| {
-                format!("body_validator: protobuf_response_type '{name}' not found in descriptor")
-            })
-        })
-        .transpose()?;
-
-    let mut method_map = HashMap::new();
-    if let Some(methods) = optional_object(config, "protobuf_method_messages")? {
-        for (method_path, method_config) in methods {
+    let mut methods = HashMap::new();
+    if let Some(method_configs) = optional_object(config, "protobuf_method_messages")? {
+        for (method_path, method_config) in method_configs {
             if method_path.is_empty() {
                 return Err(
                     "body_validator: protobuf_method_messages method paths must not be empty"
@@ -1417,42 +1536,202 @@ fn load_protobuf_config(config: &Value) -> Result<ProtobufConfig, String> {
                     "body_validator: protobuf_method_messages['{method_path}'] must be an object"
                 ));
             }
-
-            let req = optional_string(method_config, "request")?
-                .map(|name| {
-                    pool.get_message_by_name(name).ok_or_else(|| {
-                        format!(
-                            "body_validator: method '{method_path}' request type '{name}' not found in descriptor"
-                        )
-                    })
-                })
-                .transpose()?;
-            let resp = optional_string(method_config, "response")?
-                .map(|name| {
-                    pool.get_message_by_name(name).ok_or_else(|| {
-                        format!(
-                            "body_validator: method '{method_path}' response type '{name}' not found in descriptor"
-                        )
-                    })
-                })
-                .transpose()?;
-
-            if req.is_none() && resp.is_none() {
+            let request = optional_string(method_config, "request")?.map(str::to_string);
+            let response = optional_string(method_config, "response")?.map(str::to_string);
+            if request.is_none() && response.is_none() {
                 return Err(format!(
                     "body_validator: protobuf_method_messages['{method_path}'] must configure 'request' or 'response'"
                 ));
             }
-            method_map.insert(
+            if request.is_some() {
+                targets.method_requests.insert(method_path.clone());
+            }
+            if response.is_some() {
+                targets.method_responses.insert(method_path.clone());
+            }
+            methods.insert(
                 method_path.clone(),
-                ProtobufMethodEntry {
-                    request: req,
-                    response: resp,
-                },
+                ProtobufMethodShape { request, response },
             );
         }
     }
 
-    Ok((Some(pool), request_desc, response_desc, method_map))
+    Ok(ProtobufShape {
+        descriptor_path,
+        request_type,
+        response_type,
+        methods,
+        targets,
+    })
+}
+
+pub(crate) fn protobuf_descriptor_path(config: &Value) -> Result<Option<&str>, String> {
+    optional_string(config, "protobuf_descriptor_path")
+}
+
+enum ProtobufDescriptorLoadError {
+    Unavailable(String),
+    Invalid(String),
+}
+
+impl ProtobufDescriptorLoadError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Unavailable(message) | Self::Invalid(message) => message,
+        }
+    }
+}
+
+fn load_protobuf_descriptor_pool_inner(
+    descriptor_path: &str,
+) -> Result<DescriptorPool, ProtobufDescriptorLoadError> {
+    let descriptor_bytes = std::fs::read(descriptor_path).map_err(|error| {
+        ProtobufDescriptorLoadError::Unavailable(format!(
+            "body_validator: failed to read protobuf descriptor file '{descriptor_path}': {error}"
+        ))
+    })?;
+    DescriptorPool::decode(descriptor_bytes.as_slice()).map_err(|error| {
+        ProtobufDescriptorLoadError::Invalid(format!(
+            "body_validator: failed to parse protobuf descriptor '{descriptor_path}': {error}"
+        ))
+    })
+}
+
+pub(crate) fn load_protobuf_descriptor_pool(
+    descriptor_path: &str,
+) -> Result<DescriptorPool, String> {
+    load_protobuf_descriptor_pool_inner(descriptor_path)
+        .map_err(ProtobufDescriptorLoadError::into_message)
+}
+
+fn resolve_protobuf_shape(
+    shape: &ProtobufShape,
+    pool: &DescriptorPool,
+) -> Result<ResolvedProtobufShape, String> {
+    let request_descriptor = shape
+        .request_type
+        .as_deref()
+        .map(|name| {
+            pool.get_message_by_name(name).ok_or_else(|| {
+                format!("body_validator: protobuf_request_type '{name}' not found in descriptor")
+            })
+        })
+        .transpose()?;
+    let response_descriptor = shape
+        .response_type
+        .as_deref()
+        .map(|name| {
+            pool.get_message_by_name(name).ok_or_else(|| {
+                format!("body_validator: protobuf_response_type '{name}' not found in descriptor")
+            })
+        })
+        .transpose()?;
+    let mut method_messages = HashMap::new();
+    for (method_path, method) in &shape.methods {
+        let request = method
+            .request
+            .as_deref()
+            .map(|name| {
+                pool.get_message_by_name(name).ok_or_else(|| {
+                    format!(
+                        "body_validator: method '{method_path}' request type '{name}' not found in descriptor"
+                    )
+                })
+            })
+            .transpose()?;
+        let response = method
+            .response
+            .as_deref()
+            .map(|name| {
+                pool.get_message_by_name(name).ok_or_else(|| {
+                    format!(
+                        "body_validator: method '{method_path}' response type '{name}' not found in descriptor"
+                    )
+                })
+            })
+            .transpose()?;
+        method_messages.insert(
+            method_path.clone(),
+            ProtobufMethodEntry { request, response },
+        );
+    }
+    Ok(ResolvedProtobufShape {
+        request_descriptor,
+        response_descriptor,
+        method_messages,
+    })
+}
+
+pub(crate) fn validate_protobuf_descriptor_config(
+    config: &Value,
+    pool: &DescriptorPool,
+) -> Result<(), String> {
+    let shape = parse_protobuf_shape(config)?;
+    resolve_protobuf_shape(&shape, pool).map(|_| ())
+}
+
+/// Load protobuf validation config for a runtime instance, or validate shape
+/// only for CP/admin admission.
+fn load_protobuf_config(
+    config: &Value,
+    mode: DescriptorLoadMode,
+) -> Result<ProtobufConfig, String> {
+    let shape = parse_protobuf_shape(config)?;
+    let Some(descriptor_path) = shape.descriptor_path.as_deref() else {
+        return Ok(ProtobufConfig {
+            pool: None,
+            request_descriptor: None,
+            response_descriptor: None,
+            method_messages: HashMap::new(),
+            targets: shape.targets,
+            dependency_unavailable: false,
+        });
+    };
+
+    if matches!(mode, DescriptorLoadMode::ShapeOnly) {
+        return Ok(ProtobufConfig {
+            pool: None,
+            request_descriptor: None,
+            response_descriptor: None,
+            method_messages: HashMap::new(),
+            targets: shape.targets,
+            dependency_unavailable: true,
+        });
+    }
+
+    let pool = match load_protobuf_descriptor_pool_inner(descriptor_path) {
+        Ok(pool) => pool,
+        Err(ProtobufDescriptorLoadError::Unavailable(error)) => {
+            warn!(
+                plugin = "body_validator",
+                path = descriptor_path,
+                error = %error,
+                "Protobuf descriptor dependency is unavailable; applicable gRPC validation will fail closed"
+            );
+            return Ok(ProtobufConfig {
+                pool: None,
+                request_descriptor: None,
+                response_descriptor: None,
+                method_messages: HashMap::new(),
+                targets: shape.targets,
+                dependency_unavailable: true,
+            });
+        }
+        Err(error) => return Err(error.into_message()),
+    };
+    let ResolvedProtobufShape {
+        request_descriptor,
+        response_descriptor,
+        method_messages,
+    } = resolve_protobuf_shape(&shape, &pool)?;
+    Ok(ProtobufConfig {
+        pool: Some(pool),
+        request_descriptor,
+        response_descriptor,
+        method_messages,
+        targets: shape.targets,
+        dependency_unavailable: false,
+    })
 }
 
 /// Recursively walk a JSON Schema and pre-compile all `pattern` regex strings.
@@ -1943,6 +2222,14 @@ impl Plugin for BodyValidator {
 
         // Resolve gRPC method path from headers (injected by the proxy handler)
         let grpc_path = headers.get(":path").map(|s| s.as_str()).unwrap_or("");
+        if self.protobuf_dependency_unavailable && self.protobuf_targets.request_applies(grpc_path)
+        {
+            return protobuf_reject(
+                400,
+                "request",
+                "configured protobuf descriptor dependency is unavailable",
+            );
+        }
         let descriptor = match self.get_request_descriptor(grpc_path) {
             Some(d) => d,
             None => {
@@ -1982,8 +2269,14 @@ impl Plugin for BodyValidator {
         _response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
+        // Once headers prove the representation is outside JSON/XML/gRPC
+        // validation scope (or is an unbounded event stream), retries must not
+        // keep pinning it on the buffered path. Matching types stay buffered.
         self.should_buffer_response_body(ctx)
-            && original_response_is_event_stream(ctx, response_headers)
+            && !self.response_body_requires_buffering_for_media_type(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+            )
     }
 
     fn should_release_response_body_before_content_type_rewrite(
@@ -1992,6 +2285,10 @@ impl Plugin for BodyValidator {
         _response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
+        // Only genuine SSE is safe to release before the Content-Type relabel
+        // guard: `after_proxy` fails closed on it. Non-matching downloads still
+        // go through the ordinary content-type refinement, which refuses
+        // release when a later hook may rewrite Content-Type.
         self.should_buffer_response_body(ctx)
             && original_response_is_event_stream(ctx, response_headers)
     }
@@ -2003,8 +2300,12 @@ impl Plugin for BodyValidator {
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
+        // Narrow the pre-flight vote after backend headers arrive: release
+        // media types the final hook would skip (binary downloads, etc.) while
+        // keeping matching JSON/XML and applicable gRPC protobuf responses
+        // buffered for validation.
         self.should_buffer_response_body(ctx)
-            && !content_type.is_some_and(is_text_event_stream_media_type)
+            && self.response_body_requires_buffering_for_media_type(ctx, content_type)
     }
 
     async fn after_proxy(
@@ -2054,24 +2355,16 @@ impl Plugin for BodyValidator {
             // Resolve the gRPC method path from the request, NOT response headers.
             // Backends never echo `:path` in responses, so reading response_headers
             // would always miss per-method `protobuf_method_messages` overrides.
-            // Prefer `grpc_full_method` set by `grpc_method_router` when available
-            // (already validated as a well-formed `Service/Method`); otherwise fall
-            // back to `ctx.path` which is the inbound request path including the
-            // leading `/`. Both forms are accepted as keys in the descriptor map.
-            let grpc_path: String = ctx
-                .metadata
-                .get("grpc_full_method")
-                .map(|m| {
-                    if m.starts_with('/') {
-                        m.clone()
-                    } else {
-                        let mut path = String::with_capacity(m.len() + 1);
-                        path.push('/');
-                        path.push_str(m);
-                        path
-                    }
-                })
-                .unwrap_or_else(|| ctx.path.clone());
+            let grpc_path = Self::grpc_method_path_for_response(ctx);
+            if self.protobuf_dependency_unavailable
+                && self.protobuf_targets.response_applies(&grpc_path)
+            {
+                return protobuf_reject(
+                    502,
+                    "response",
+                    "configured protobuf descriptor dependency is unavailable",
+                );
+            }
             let descriptor = match self.get_response_descriptor(&grpc_path) {
                 Some(d) => d,
                 None => return PluginResult::Continue,

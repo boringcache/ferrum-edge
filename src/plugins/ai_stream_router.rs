@@ -2230,10 +2230,42 @@ impl AnthropicSseNormalizer {
     }
 
     fn ingest_complete_event(&mut self, raw: &[u8], out: &mut String) -> bool {
-        match extract_sse_data_result(raw) {
-            Ok(None) => false,
-            Ok(Some(data)) => match serde_json::from_str::<Value>(&data) {
-                Ok(event) => self.transcode_event(&event, out),
+        match extract_sse_event_result(raw) {
+            Ok((event_name, None)) => {
+                if event_name.is_some_and(is_known_anthropic_event) {
+                    self.emit_upstream_error(
+                        "upstream provider sent a known Anthropic SSE event without valid data framing; stream terminated",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    true
+                } else {
+                    false
+                }
+            }
+            Ok((event_name, Some(data))) => match serde_json::from_str::<Value>(&data) {
+                Ok(event) => {
+                    let Some(payload_type) = event.get("type").and_then(Value::as_str) else {
+                        self.emit_upstream_error(
+                            "upstream provider sent an Anthropic SSE JSON event without a string type; stream terminated",
+                            out,
+                        );
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        return true;
+                    };
+                    if let Some(event_name) = event_name
+                        && is_known_anthropic_event(event_name)
+                        && event_name != payload_type
+                    {
+                        self.emit_upstream_error(
+                            "upstream provider sent mismatched Anthropic SSE event and payload types; stream terminated",
+                            out,
+                        );
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        return true;
+                    }
+                    self.transcode_event(&event, out)
+                }
                 Err(_) => {
                     self.emit_upstream_error(
                         "upstream provider sent a malformed SSE JSON event; stream terminated",
@@ -2529,14 +2561,31 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+fn is_known_anthropic_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "message_start"
+            | "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_delta"
+            | "message_stop"
+            | "error"
+            | "ping"
+    )
+}
+
 /// Extract and concatenate the `data:` payload lines of one raw SSE event.
 ///
-/// Returns `Ok(None)` when the event carries no `data:` line (e.g. a comment or
-/// a lone `event:` line). Returns `Err` for invalid UTF-8 framing.
-fn extract_sse_data_result(raw: &[u8]) -> Result<Option<String>, ()> {
+/// The optional SSE `event:` name is retained so known Anthropic protocol
+/// events cannot disguise malformed/missing `data:` framing as a harmless
+/// comment or forward-compatible unknown event. Returns `Err` for invalid
+/// UTF-8 framing.
+fn extract_sse_event_result(raw: &[u8]) -> Result<(Option<&str>, Option<String>), ()> {
     let text = std::str::from_utf8(raw).map_err(|_| ())?;
     let mut data = String::new();
     let mut found = false;
+    let mut event_name = None;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("data:") {
             found = true;
@@ -2545,7 +2594,10 @@ fn extract_sse_data_result(raw: &[u8]) -> Result<Option<String>, ()> {
                 data.push('\n');
             }
             data.push_str(rest);
+        } else if let Some(rest) = line.strip_prefix("event:") {
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            event_name = (!rest.is_empty()).then_some(rest);
         }
     }
-    Ok(if found { Some(data) } else { None })
+    Ok((event_name, found.then_some(data)))
 }

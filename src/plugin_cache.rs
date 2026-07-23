@@ -482,6 +482,20 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.inner.requires_request_body_before_before_proxy()
     }
+    fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        self.inner
+            .normalizes_buffered_request_body_before_before_proxy()
+    }
+    async fn normalize_buffered_request_body_before_before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+        body: &mut Vec<u8>,
+    ) -> PluginResult {
+        self.inner
+            .normalize_buffered_request_body_before_before_proxy(ctx, headers, body)
+            .await
+    }
     fn requires_request_body_before_authenticate(&self) -> bool {
         self.inner.requires_request_body_before_authenticate()
     }
@@ -923,6 +937,22 @@ impl Plugin for PriorityOverridePlugin {
             .on_ws_frame(proxy_id, connection_id, direction, message)
             .await
     }
+    fn prepare_ws_frame_delivery(
+        &self,
+        message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<crate::plugins::WsFrameDeliveryObservation> {
+        self.inner.prepare_ws_frame_delivery(message)
+    }
+    fn emit_ws_frame_delivery(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        observation: crate::plugins::WsFrameDeliveryObservation,
+    ) {
+        self.inner
+            .emit_ws_frame_delivery(proxy_id, connection_id, direction, observation)
+    }
     fn requires_response_stream_hooks(&self) -> bool {
         self.inner.requires_response_stream_hooks()
     }
@@ -1285,6 +1315,64 @@ fn country_mmdb_preload_required_for_scope(
                 proxy_ids_to_rebuild,
                 rebuild_globals,
             )
+    })
+}
+
+fn body_validator_descriptor_is_active(
+    config: &GatewayConfig,
+    plugin_config: &PluginConfig,
+) -> bool {
+    if !plugin_config.enabled
+        || plugin_config.plugin_name != "body_validator"
+        || plugin_config
+            .config
+            .get("protobuf_descriptor_path")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    match &plugin_config.scope {
+        PluginScope::Global => true,
+        PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
+            config.proxies.iter().any(|proxy| {
+                &proxy.id == proxy_id
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == plugin_config.id)
+            })
+        }),
+        PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == plugin_config.id)
+        }),
+    }
+}
+
+fn body_validator_descriptor_preload_required_for_scope(
+    config: &GatewayConfig,
+    proxy_ids_to_rebuild: &HashSet<String>,
+    rebuild_globals: bool,
+) -> bool {
+    config.plugin_configs.iter().any(|plugin_config| {
+        body_validator_descriptor_is_active(config, plugin_config)
+            && match &plugin_config.scope {
+                PluginScope::Global => rebuild_globals,
+                PluginScope::Proxy => plugin_config
+                    .proxy_id
+                    .as_ref()
+                    .is_some_and(|proxy_id| proxy_ids_to_rebuild.contains(proxy_id)),
+                PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+                    proxy_ids_to_rebuild.contains(&proxy.id)
+                        && proxy
+                            .plugins
+                            .iter()
+                            .any(|association| association.plugin_config_id == plugin_config.id)
+                }),
+            }
     })
 }
 
@@ -2741,6 +2829,7 @@ impl PluginCapabilities {
     pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
     pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
+    pub const NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY: u16 = 1 << 14;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2832,6 +2921,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_request_body_before_before_proxy() {
             caps |= PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY;
+        }
+        if p.normalizes_buffered_request_body_before_before_proxy() {
+            caps |= PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY;
         }
         if p.requires_request_body_before_authenticate() {
             caps |= PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE;
@@ -3949,14 +4041,12 @@ impl PluginCache {
         Ok(())
     }
 
-    /// Whether the exact delta-build scope, including adaptive-concurrency
-    /// route-definition expansion, reconstructs an active geo plugin.
-    pub(crate) fn country_mmdb_preload_required(
+    fn expanded_file_dependency_rebuild_scope(
         &self,
         config: &GatewayConfig,
         proxy_ids_to_rebuild: &HashSet<String>,
         rebuild_globals: bool,
-    ) -> bool {
+    ) -> (HashSet<String>, bool) {
         let current = self.inner.load();
         let mut expanded_proxy_ids = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -3966,10 +4056,46 @@ impl PluginCache {
             &mut expanded_proxy_ids,
             &mut rebuild_adaptive_globals,
         );
-        country_mmdb_preload_required_for_scope(
+        (
+            expanded_proxy_ids,
+            rebuild_globals || rebuild_adaptive_globals,
+        )
+    }
+
+    /// Whether the exact delta-build scope, including adaptive-concurrency
+    /// route-definition expansion, reconstructs an active geo plugin.
+    pub(crate) fn country_mmdb_preload_required(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        rebuild_globals: bool,
+    ) -> bool {
+        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
+            config,
+            proxy_ids_to_rebuild,
+            rebuild_globals,
+        );
+        country_mmdb_preload_required_for_scope(config, &expanded_proxy_ids, rebuild_globals)
+    }
+
+    /// Whether the exact delta-build scope, including adaptive-concurrency
+    /// route-definition expansion, reconstructs an active body_validator with
+    /// a node-local protobuf descriptor dependency.
+    pub(crate) fn body_validator_descriptor_preload_required(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        rebuild_globals: bool,
+    ) -> bool {
+        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
+            config,
+            proxy_ids_to_rebuild,
+            rebuild_globals,
+        );
+        body_validator_descriptor_preload_required_for_scope(
             config,
             &expanded_proxy_ids,
-            rebuild_globals || rebuild_adaptive_globals,
+            rebuild_globals,
         )
     }
 

@@ -317,8 +317,11 @@ This means every WebSocket plugin works on H3 sessions unchanged:
 
 - parser-level actual-frame/message limits (`ws_message_size_limiting`) and
   `on_ws_frame` inspection/transformation after continuation reassembly
-  (`ws_rate_limiting`, `ws_frame_logging`)
-- `on_ws_disconnect` (end-of-session bookkeeping with frame counts and direction attribution)
+  (`ws_rate_limiting`), plus delivery-accurate frame observation
+  (`ws_frame_logging` via post-send `prepare_ws_frame_delivery` /
+  `emit_ws_frame_delivery`, including peer Close)
+- `on_ws_disconnect` (end-of-session bookkeeping with success-only frame/byte
+  counts, direction, and `io_side` attribution)
 - `prometheus_metrics` WebSocket session count/duration and directional
   byte/frame totals (the shared disconnect hook gives H1 Upgrade, H2 Extended
   CONNECT, and H3 Extended CONNECT identical completion accounting)

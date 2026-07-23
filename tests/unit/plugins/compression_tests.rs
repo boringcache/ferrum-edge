@@ -1,5 +1,7 @@
 use super::plugin_utils::create_test_proxy;
 use ferrum_edge::_test_support::{
+    apply_buffered_request_body_normalization_before_before_proxy_for_test,
+    apply_buffered_request_body_normalization_with_requirements_for_test,
     apply_synthetic_response_body_hooks_for_test,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
     finalize_plugin_rejection_parts_for_test, run_after_proxy_hooks_reject_for_test,
@@ -3071,10 +3073,134 @@ async fn test_custom_content_types() {
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
 }
 
-// ────────────────────── before_proxy: request decompression header cleanup ─
+/// #2329: early normalization replaces the buffered body with plaintext and
+/// strips encoding headers only after successful decode.
+#[tokio::test]
+async fn test_normalize_buffered_request_body_decodes_before_before_proxy() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"early normalize plaintext";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+    let mut body = compressed.clone();
+
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body.as_slice(), original.as_slice());
+    assert!(!headers.contains_key("content-encoding"));
+    assert!(!headers.contains_key("content-length"));
+    assert_eq!(
+        ctx.metadata
+            .get("compression:request_decoded")
+            .map(String::as_str),
+        Some("gzip")
+    );
+
+    // before_proxy must not re-claim; transform must not decode again.
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_request_body_with_context(&mut ctx, &body, None, &headers)
+            .await
+            .is_none()
+    );
+}
 
 #[tokio::test]
-async fn test_before_proxy_strips_content_encoding_for_decompression() {
+async fn test_buffered_normalizer_noop_preserves_existing_views_without_content_encoding() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(json!({
+        "decompress_request": true
+    })))];
+    let mut ctx = make_ctx(None);
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        "preexisting body view".to_string(),
+    );
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"preexisting byte view"));
+    let original_bytes_ptr = ctx.request_body_bytes.as_ref().unwrap().as_ptr();
+    let mut headers = HashMap::new();
+    let mut body = b"ordinary uncompressed request".to_vec();
+
+    let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body, b"ordinary uncompressed request");
+    assert_eq!(
+        ctx.metadata.get("request_body").map(String::as_str),
+        Some("preexisting body view")
+    );
+    assert_eq!(
+        ctx.request_body_bytes.as_ref().unwrap().as_ptr(),
+        original_bytes_ptr,
+        "a capability-only no-op must not copy an unchanged body view"
+    );
+}
+
+#[tokio::test]
+async fn test_binary_only_normalization_refreshes_bytes_without_materializing_text() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(json!({
+        "decompress_request": true
+    })))];
+    let plaintext = b"binary consumer plaintext";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(plaintext).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut ctx = make_ctx(None);
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(&compressed));
+    ctx.request_body_sha256 = Some([0x25; 32]);
+    ctx.request_body_sha512 = Some([0x51; 64]);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+    let mut body = compressed;
+
+    let result = apply_buffered_request_body_normalization_with_requirements_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+        false,
+        true,
+    )
+    .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body, plaintext);
+    assert_eq!(
+        ctx.request_body_bytes.as_deref(),
+        Some(plaintext.as_slice())
+    );
+    assert!(!ctx.metadata.contains_key("request_body"));
+    assert_eq!(ctx.request_body_sha256, Some([0x25; 32]));
+    assert_eq!(ctx.request_body_sha512, Some([0x51; 64]));
+}
+
+// ────────────────────── before_proxy: request decompression header safety ─
+
+#[tokio::test]
+async fn test_before_proxy_preserves_encoded_headers_without_body_view() {
     let plugin = make_plugin(json!({"decompress_request": true}));
     let mut ctx = make_ctx(Some("gzip"));
     let mut headers = HashMap::new();
@@ -3083,12 +3209,15 @@ async fn test_before_proxy_strips_content_encoding_for_decompression() {
 
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert!(!headers.contains_key("content-encoding"));
-    assert!(!headers.contains_key("content-length"));
     assert_eq!(
-        ctx.metadata.get("compression:request_encoding").unwrap(),
-        "gzip"
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
     );
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some("42")
+    );
+    assert!(!ctx.metadata.contains_key("compression:request_encoding"));
 }
 
 // ────────────────────── End-to-end: full lifecycle ──────────────────────
@@ -3706,10 +3835,10 @@ async fn test_decompressed_payload_that_is_itself_gzip_is_accepted() {
 
 /// #59: when the request body was NOT buffered before `before_proxy`
 /// (`request_body_bytes` is None — e.g. an HBONE CONNECT tunnel), `before_proxy`
-/// cannot validate, so it falls back to the prior behaviour: continue and strip
-/// headers (no spurious reject).
+/// cannot validate. It must preserve both the encoded bytes and representation
+/// headers rather than forwarding encoded bytes mislabeled as plaintext.
 #[tokio::test]
-async fn test_before_proxy_without_buffered_body_falls_back_to_strip() {
+async fn test_before_proxy_without_buffered_body_preserves_encoded_representation() {
     let plugin = make_plugin(json!({"decompress_request": true}));
     let mut ctx = make_ctx(None); // no request_body_bytes set
     let mut headers = HashMap::new();
@@ -3718,8 +3847,21 @@ async fn test_before_proxy_without_buffered_body_falls_back_to_strip() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(!headers.contains_key("content-encoding"));
-    assert!(!headers.contains_key("content-length"));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some("42")
+    );
+    assert!(
+        plugin
+            .transform_request_body_with_context(&mut ctx, b"encoded", None, &headers)
+            .await
+            .is_none(),
+        "an unvalidated unbuffered body must pass through without rewrite"
+    );
 }
 
 // ────────────── #2357: exact media-type content-type matching ──────────────
@@ -4828,13 +4970,15 @@ fn test_h1_h2_h3_paths_share_multi_instance_body_transform_loops() {
         h1_h2.contains("apply_request_body_plugins_with_context(")
             && h1_h2.contains("transform_request_body_with_context(")
             && h1_h2.contains("transform_buffered_response_body_with_deadline(")
-            && h1_h2.contains("transform_response_body_with_context("),
-        "H1/H2 must use the shared request/response body transform loops"
+            && h1_h2.contains("transform_response_body_with_context(")
+            && h1_h2.contains("apply_buffered_request_body_normalization_before_before_proxy("),
+        "H1/H2 must use the shared request/response body transform loops and pre-before_proxy normalization"
     );
     assert!(
         h3.contains("apply_request_body_plugins_with_context(")
-            && h3.contains("transform_buffered_response_body_with_deadline("),
-        "native H3 must use the shared body transform helpers"
+            && h3.contains("transform_buffered_response_body_with_deadline(")
+            && h3.contains("apply_buffered_request_body_normalization_before_before_proxy("),
+        "native H3 must use the shared body transform helpers and pre-before_proxy normalization"
     );
     assert!(
         h3_cross.contains("apply_request_body_plugins_with_context("),

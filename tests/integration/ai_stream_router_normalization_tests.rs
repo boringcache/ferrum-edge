@@ -81,10 +81,13 @@ const SSE: &str = concat!(
 );
 
 #[tokio::test]
-async fn claim_strips_accept_encoding_and_preserves_tool_history() {
+async fn claim_requests_identity_encoding_and_preserves_tool_history() {
     let plugin = plugin();
     let (mut ctx, headers) = claim(&plugin).await;
-    assert!(!headers.contains_key("accept-encoding"));
+    assert_eq!(
+        headers.get("accept-encoding").map(String::as_str),
+        Some("identity")
+    );
 
     let body = ctx.metadata.get("request_body").unwrap().clone();
     let translated = plugin

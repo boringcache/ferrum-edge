@@ -2474,7 +2474,18 @@ pub(crate) const BACKEND_TLS_SNI_REQUIRES_DIRECT_H2_REASON: &str =
 
 enum ClientRequestBody {
     Streaming(Box<Request<Incoming>>),
-    Buffered(Vec<u8>),
+    Buffered(BufferedClientRequestBody),
+}
+
+/// A request body collected before backend dispatch together with the pristine
+/// request-line metadata needed by transports that do not dispatch through
+/// reqwest. Keeping the original `HeaderMap` is important for native gRPC:
+/// binary metadata and repeated field lines cannot be reconstructed from the
+/// plugin-facing `HashMap<String, String>` without losing information.
+struct BufferedClientRequestBody {
+    method: hyper::Method,
+    headers: hyper::HeaderMap,
+    body: Vec<u8>,
 }
 
 enum RequestBodyBufferError {
@@ -2625,7 +2636,7 @@ async fn buffer_request_body_for_before_proxy(
         return Err(RequestBodyBufferError::TooLarge);
     }
 
-    let (_parts, body) = request.into_parts();
+    let (parts, body) = request.into_parts();
     let body_bytes = if max_request_body_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_request_body_size_bytes);
         let collected = collect_request_body_with_deadline(
@@ -2665,7 +2676,11 @@ async fn buffer_request_body_for_before_proxy(
             .to_vec()
     };
 
-    Ok(ClientRequestBody::Buffered(body_bytes))
+    Ok(ClientRequestBody::Buffered(BufferedClientRequestBody {
+        method: parts.method,
+        headers: parts.headers,
+        body: body_bytes,
+    }))
 }
 
 pub(crate) fn store_request_body_metadata(
@@ -2700,6 +2715,84 @@ pub(crate) fn store_request_body_metadata(
         ctx.request_body_sha256 = Some(Sha256::digest(body).into());
         ctx.request_body_sha512 = Some(Sha512::digest(body).into());
     }
+}
+
+/// Refresh body-derived request views after an early normalization rewrite.
+///
+/// Digests are intentionally left untouched: authenticate may already have
+/// verified integrity over the original wire bytes. Size/text/bytes views must
+/// track the normalized plaintext so later `before_proxy` consumers (SOAP,
+/// mirrors, etc.) inspect the same bytes the backend will receive.
+pub(crate) fn refresh_request_body_views_after_normalization(
+    ctx: &mut RequestContext,
+    body: &[u8],
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+) {
+    ctx.metadata.insert(
+        "request_body_size_bytes".to_string(),
+        body.len().to_string(),
+    );
+    if needs_body_bytes || ctx.request_body_bytes.is_some() {
+        ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    }
+    if needs_body_text || ctx.metadata.contains_key("request_body") {
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            ctx.metadata
+                .insert("request_body".to_string(), body_str.to_string());
+        } else {
+            ctx.metadata.remove("request_body");
+        }
+    }
+}
+
+/// Run opt-in buffered-body normalizers after the pre-`before_proxy` buffer is
+/// stored and before any `before_proxy` hook.
+///
+/// Configured request decompression lives here so earlier body consumers see
+/// validated plaintext without each plugin reimplementing gzip/Brotli decode.
+pub(crate) async fn apply_buffered_request_body_normalization_before_before_proxy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: &mut Vec<u8>,
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+) -> PluginResult {
+    let was_decoded = ctx
+        .metadata
+        .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    for plugin in plugins {
+        if !plugin.normalizes_buffered_request_body_before_before_proxy() {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.normalize_buffered_request_body_before_before_proxy(ctx, headers, body),
+        )
+        .await
+        .into_plugin_result(ctx)
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
+        }
+    }
+    let body_was_rewritten = !was_decoded
+        && ctx
+            .metadata
+            .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
+    if body_was_rewritten {
+        refresh_request_body_views_after_normalization(
+            ctx,
+            body,
+            needs_body_text,
+            needs_body_bytes,
+        );
+    }
+    PluginResult::Continue
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2838,6 +2931,26 @@ pub(crate) fn effective_request_body_limit(
         (global_limit, Some(plugin_limit)) => global_limit.min(plugin_limit),
         (global_limit, None) => global_limit,
     }
+}
+
+/// Select the protocol receive ceiling before composing a plugin-local body
+/// cap. Native gRPC must use `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` in every early
+/// buffering phase; applying only the ordinary HTTP body ceiling would let an
+/// auth or before-proxy prebuffer bypass the gRPC limit before dispatch.
+pub(crate) fn effective_request_body_limit_for_protocol(
+    is_grpc_request: bool,
+    http_limit: usize,
+    grpc_limit: usize,
+    plugin_limit: Option<usize>,
+) -> usize {
+    effective_request_body_limit(
+        if is_grpc_request {
+            grpc_limit
+        } else {
+            http_limit
+        },
+        plugin_limit,
+    )
 }
 
 pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
@@ -8336,17 +8449,25 @@ impl ProxyState {
         // Incremental database and CP/DP deltas stage plugin caches directly
         // on this async call path. Expand the prospective rebuild scope using
         // the same adaptive-concurrency route-definition logic as cache
-        // staging, preload every MMDB that exact scope reconstructs on the
-        // blocking pool, then require the cache stage to claim the handoff
-        // without synchronous file work.
+        // staging, validate every MMDB or body-validator descriptor that exact
+        // scope reconstructs on the blocking pool, then require MMDB cache
+        // staging to claim its validated handoff without synchronous file work.
         let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
         let prospective_proxy_rebuilds =
             prospective_delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
-        if self.plugin_cache.country_mmdb_preload_required(
+        let country_mmdb_preload_required = self.plugin_cache.country_mmdb_preload_required(
             &new_config,
             &prospective_proxy_rebuilds,
             prospective_delta.global_plugin_configs_changed,
-        ) {
+        );
+        let body_validator_descriptor_preload_required = self
+            .plugin_cache
+            .body_validator_descriptor_preload_required(
+                &new_config,
+                &prospective_proxy_rebuilds,
+                prospective_delta.global_plugin_configs_changed,
+            );
+        if country_mmdb_preload_required || body_validator_descriptor_preload_required {
             new_config = match crate::config::validation_pipeline::validate_plugin_file_dependencies_off_thread(
                 new_config,
                 crate::config::validation_pipeline::ValidationAction::Warn,
@@ -11607,11 +11728,82 @@ fn ws_message_payload_bytes(msg: &Message) -> u64 {
         Message::Text(t) => t.len() as u64,
         Message::Binary(b) => b.len() as u64,
         Message::Ping(b) | Message::Pong(b) => b.len() as u64,
-        Message::Close(opt) => opt
-            .as_ref()
-            .map(|frame| frame.reason.len() as u64)
-            .unwrap_or(0),
+        // Close with a status code: 2 status bytes + UTF-8 reason length.
+        // Matches `ws_frame_logging` `size_bytes` so success-only byte totals
+        // reconcile with delivered Close frame events. Raw reason text is never
+        // retained here.
+        Message::Close(Some(frame)) => 2u64.saturating_add(frame.reason.len() as u64),
+        Message::Close(None) => 0,
         Message::Frame(_) => 0,
+    }
+}
+
+/// Prepare deferred delivery observations from the final post-plugin message
+/// before `send()` moves it. Empty when no plugin wants a delivery record.
+pub(crate) enum WsFrameDeliveryBatch {
+    None,
+    One(usize, crate::plugins::WsFrameDeliveryObservation),
+    Many(Vec<(usize, crate::plugins::WsFrameDeliveryObservation)>),
+}
+
+impl WsFrameDeliveryBatch {
+    fn push(&mut self, index: usize, observation: crate::plugins::WsFrameDeliveryObservation) {
+        let previous = std::mem::replace(self, Self::None);
+        *self = match previous {
+            Self::None => Self::One(index, observation),
+            Self::One(first_index, first_observation) => {
+                Self::Many(vec![(first_index, first_observation), (index, observation)])
+            }
+            Self::Many(mut entries) => {
+                entries.push((index, observation));
+                Self::Many(entries)
+            }
+        };
+    }
+}
+
+pub(crate) fn prepare_ws_frame_deliveries(
+    plugins: &[Arc<dyn Plugin>],
+    message: &Message,
+) -> WsFrameDeliveryBatch {
+    if plugins.is_empty() {
+        return WsFrameDeliveryBatch::None;
+    }
+    // The normal deployment has one ws_frame_logging instance. Keep that path
+    // stack-only; allocate only when multiple delivery observers are configured.
+    let mut out = WsFrameDeliveryBatch::None;
+    for (index, plugin) in plugins.iter().enumerate() {
+        if let Some(observation) = plugin.prepare_ws_frame_delivery(message) {
+            out.push(index, observation);
+        }
+    }
+    out
+}
+
+/// Emit previously prepared delivery observations after the destination sink
+/// accepted the frame. Discarded observations (cancel / write failure) must
+/// never reach this helper — that keeps frame logs on the same success boundary
+/// as `frames_*` / `bytes_*` counters.
+pub(crate) fn emit_ws_frame_deliveries(
+    plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
+    prepared: WsFrameDeliveryBatch,
+) {
+    let emit = |index: usize, observation: crate::plugins::WsFrameDeliveryObservation| {
+        if let Some(plugin) = plugins.get(index) {
+            plugin.emit_ws_frame_delivery(proxy_id, connection_id, direction, observation);
+        }
+    };
+    match prepared {
+        WsFrameDeliveryBatch::None => {}
+        WsFrameDeliveryBatch::One(index, observation) => emit(index, observation),
+        WsFrameDeliveryBatch::Many(entries) => {
+            for (index, observation) in entries {
+                emit(index, observation);
+            }
+        }
     }
 }
 
@@ -11629,7 +11821,7 @@ fn ws_control_kind(message: &Message) -> Option<WsControlKind> {
     }
 }
 
-fn guard_ws_control_transform(
+pub(crate) fn guard_ws_control_transform(
     original: &Message,
     transformed: Message,
     direction: WebSocketFrameDirection,
@@ -11653,7 +11845,13 @@ fn guard_ws_control_transform(
 /// later mutating plugins are skipped so they cannot charge budget or replace
 /// the Close, while observational hooks
 /// ([`Plugin::observes_ws_frame_decisions`]) still receive the final decision.
+/// The control-frame guard runs after the chain so Ping/Pong type flips are
+/// restored before any post-send delivery observation sees the message.
 /// Both relay directions and all H1/H2/H3 frontends share this helper.
+///
+/// Delivery-accurate frame logging uses [`prepare_ws_frame_deliveries`] /
+/// [`emit_ws_frame_deliveries`] after a successful sink accept — not this
+/// mutating chain — so cancelled or failed writes never appear as delivered.
 pub(crate) async fn apply_ws_frame_plugins(
     plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
@@ -12252,11 +12450,14 @@ where
                             // check); the send future is polled first on wakeup so successful
                             // sends pay no extra latency. No heap allocation, no timer wheel.
                             //
-                            // Snapshot the payload byte count before `send(outgoing)` moves
-                            // the frame into the future so the success-arm accounting still
-                            // has a usable value. `ws_message_payload_bytes` reads
-                            // `Message::len()`, no allocation.
+                            // Snapshot payload bytes and prepare delivery observations
+                            // before `send(outgoing)` moves the frame. Prepared logs are
+                            // emitted only on the success arm so they share the
+                            // success-only boundary with frame/byte counters; cancel and
+                            // write failure discard them (no "attempted" frame event).
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&ctb_plugins, &outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_ctb.cancelled() => {
@@ -12282,11 +12483,27 @@ where
                                         outgoing_payload_bytes,
                                         Ordering::Relaxed,
                                     );
+                                    emit_ws_frame_deliveries(
+                                        &ctb_plugins,
+                                        &proxy_id_ctb,
+                                        connection_id,
+                                        WebSocketFrameDirection::ClientToBackend,
+                                        delivery,
+                                    );
                                 }
                             }
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Client sent close frame");
+                            // Peer Close bypasses mutating admission hooks so a later
+                            // plugin cannot replace the peer's code/reason. Observational
+                            // delivery logging still records the forwarded Close after a
+                            // successful sink accept (exactly once; not double-counted
+                            // with policy_close records from plugin rejection).
+                            let close_msg = Message::Close(close_frame);
+                            let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&ctb_plugins, &close_msg);
                             // Race cancel in case the opposite direction already exited while
                             // we were decoding this Close frame. The send future is polled
                             // first after the cancel check so the happy path does not block.
@@ -12295,9 +12512,30 @@ where
                                 _ = cancel_ctb.cancelled() => {
                                     debug!("Client->backend: cancel fired during client-close forward");
                                 }
-                                res = backend_sink.send(Message::Close(close_frame)) => {
-                                    if let Err(e) = res {
-                                        error!("Failed to send close to backend: {}", e);
+                                res = backend_sink.send(close_msg) => {
+                                    match res {
+                                        Err(e) => {
+                                            error!("Failed to send close to backend: {}", e);
+                                            let _ = first_failure_ctb.set((
+                                                crate::plugins::Direction::ClientToBackend,
+                                                retry::classify_boxed_error(&e),
+                                                Some(tcp_proxy::StreamIoSide::Write),
+                                            ));
+                                        }
+                                        Ok(()) => {
+                                            frames_c2b_task.fetch_add(1, Ordering::Relaxed);
+                                            bytes_c2b_task.fetch_add(
+                                                outgoing_payload_bytes,
+                                                Ordering::Relaxed,
+                                            );
+                                            emit_ws_frame_deliveries(
+                                                &ctb_plugins,
+                                                &proxy_id_ctb,
+                                                connection_id,
+                                                WebSocketFrameDirection::ClientToBackend,
+                                                delivery,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -12439,10 +12677,11 @@ where
                             // otherwise block indefinitely. One atomic load per frame; send
                             // polled first so successful frames pay no extra latency.
                             //
-                            // Snapshot the payload byte count before `send(outgoing)` moves
-                            // the frame into the future so the success-arm accounting still
-                            // has a usable value.
+                            // Snapshot payload bytes and prepare delivery observations
+                            // before `send(outgoing)` moves the frame (mirror of c2b).
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&btc_plugins, &outgoing);
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
@@ -12468,20 +12707,54 @@ where
                                         outgoing_payload_bytes,
                                         Ordering::Relaxed,
                                     );
+                                    emit_ws_frame_deliveries(
+                                        &btc_plugins,
+                                        &proxy_id_btc,
+                                        connection_id,
+                                        WebSocketFrameDirection::BackendToClient,
+                                        delivery,
+                                    );
                                 }
                             }
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Backend sent close frame");
+                            // Peer Close bypasses mutating hooks; observational delivery
+                            // logging records the forwarded Close after sink accept.
+                            let close_msg = Message::Close(close_frame);
+                            let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
+                            let delivery =
+                                prepare_ws_frame_deliveries(&btc_plugins, &close_msg);
                             // Race cancel in case c2b has already exited.
                             tokio::select! {
                                 biased;
                                 _ = cancel_btc.cancelled() => {
                                     debug!("Backend->client: cancel fired during backend-close forward");
                                 }
-                                res = ws_sink.send(Message::Close(close_frame)) => {
-                                    if let Err(e) = res {
-                                        error!("Failed to send close to client: {}", e);
+                                res = ws_sink.send(close_msg) => {
+                                    match res {
+                                        Err(e) => {
+                                            error!("Failed to send close to client: {}", e);
+                                            let _ = first_failure_btc.set((
+                                                crate::plugins::Direction::BackendToClient,
+                                                retry::classify_boxed_error(&e),
+                                                Some(tcp_proxy::StreamIoSide::Write),
+                                            ));
+                                        }
+                                        Ok(()) => {
+                                            frames_b2c_task.fetch_add(1, Ordering::Relaxed);
+                                            bytes_b2c_task.fetch_add(
+                                                outgoing_payload_bytes,
+                                                Ordering::Relaxed,
+                                            );
+                                            emit_ws_frame_deliveries(
+                                                &btc_plugins,
+                                                &proxy_id_btc,
+                                                connection_id,
+                                                WebSocketFrameDirection::BackendToClient,
+                                                delivery,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -14933,9 +15206,9 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     ) {
         let mut mandatory_replay_transform_failed = None;
         for plugin in plugins.iter() {
-            let mandatory_replay_transform = ctx.deduplication_replay_response_finalized
+            let mandatory_replay_transform = ctx.finalized_response_replay
                 && plugin.requires_replay_response_body_transform(ctx);
-            if ctx.deduplication_replay_response_finalized && !mandatory_replay_transform {
+            if ctx.finalized_response_replay && !mandatory_replay_transform {
                 continue;
             }
             let deadline = ctx.grpc_deadline_at();
@@ -18852,8 +19125,10 @@ async fn handle_proxy_request_inner(
                     *request,
                     &method,
                     &ctx.headers,
-                    effective_request_body_limit(
+                    effective_request_body_limit_for_protocol(
+                        is_grpc_request,
                         state.max_request_body_size_bytes,
+                        state.max_grpc_recv_size_bytes,
                         authenticate_body_requirements.plugin_limit,
                     ),
                     proxy.backend_read_timeout_ms,
@@ -18863,16 +19138,16 @@ async fn handle_proxy_request_inner(
                 {
                     Ok(buffered) => {
                         match &buffered {
-                            ClientRequestBody::Buffered(body) => {
+                            ClientRequestBody::Buffered(buffered) => {
                                 store_request_body_metadata(
                                     &mut ctx,
-                                    body,
+                                    &buffered.body,
                                     authenticate_body_requirements.needs_text,
                                     authenticate_body_requirements.needs_bytes,
                                     authenticate_body_requirements.needs_digests,
                                 );
                                 ctx.bytes_sent_observed.fetch_max(
-                                    body.len() as u64,
+                                    buffered.body.len() as u64,
                                     std::sync::atomic::Ordering::Release,
                                 );
                             }
@@ -18894,11 +19169,21 @@ async fn handle_proxy_request_inner(
                         buffered
                     }
                     Err(RequestBodyBufferError::TooLarge) => {
-                        record_request(&state, 413);
-                        return Ok(build_response(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            r#"{"error":"Request body exceeds maximum size"}"#,
-                        ));
+                        let response = build_request_body_too_large_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            effective_request_body_limit_for_protocol(
+                                is_grpc_request,
+                                state.max_request_body_size_bytes,
+                                state.max_grpc_recv_size_bytes,
+                                authenticate_body_requirements.plugin_limit,
+                            ),
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                     Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
                         error!(
@@ -19009,8 +19294,10 @@ async fn handle_proxy_request_inner(
         && !is_hbone_connect_any
         && allows_request_body_buffering
     {
-        let body_limit = effective_request_body_limit(
+        let body_limit = effective_request_body_limit_for_protocol(
+            is_grpc_request,
             state.max_request_body_size_bytes,
+            state.max_grpc_recv_size_bytes,
             authorize_body_requirements.plugin_limit,
         );
         client_request_body = match client_request_body {
@@ -19026,25 +19313,32 @@ async fn handle_proxy_request_inner(
                 .await
                 {
                     Ok(buffered) => {
-                        if let ClientRequestBody::Buffered(body) = &buffered {
+                        if let ClientRequestBody::Buffered(buffered) = &buffered {
                             store_request_body_metadata(
                                 &mut ctx,
-                                body,
+                                &buffered.body,
                                 authorize_body_requirements.needs_text,
                                 authorize_body_requirements.needs_bytes,
                                 authorize_body_requirements.needs_digests,
                             );
-                            ctx.bytes_sent_observed
-                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                            ctx.bytes_sent_observed.fetch_max(
+                                buffered.body.len() as u64,
+                                std::sync::atomic::Ordering::Release,
+                            );
                         }
                         buffered
                     }
                     Err(RequestBodyBufferError::TooLarge) => {
-                        record_request(&state, 413);
-                        return Ok(build_response(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            r#"{"error":"Request body exceeds maximum size"}"#,
-                        ));
+                        let response = build_request_body_too_large_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            body_limit,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                     Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
                         error!(
@@ -19087,22 +19381,27 @@ async fn handle_proxy_request_inner(
                     }
                 }
             }
-            ClientRequestBody::Buffered(body) => {
-                if body_limit > 0 && body.len() > body_limit {
-                    record_request(&state, 413);
-                    return Ok(build_response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
-                    ));
+            ClientRequestBody::Buffered(buffered) => {
+                if body_limit > 0 && buffered.body.len() > body_limit {
+                    let response = build_request_body_too_large_response(
+                        is_grpc_request,
+                        grpc_web_response_content_type,
+                        body_limit,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    );
+                    record_request(&state, response.status().as_u16());
+                    return Ok(response);
                 }
                 store_request_body_metadata(
                     &mut ctx,
-                    &body,
+                    &buffered.body,
                     authorize_body_requirements.needs_text,
                     authorize_body_requirements.needs_bytes,
                     authorize_body_requirements.needs_digests,
                 );
-                ClientRequestBody::Buffered(body)
+                ClientRequestBody::Buffered(buffered)
             }
         };
     }
@@ -19197,8 +19496,10 @@ async fn handle_proxy_request_inner(
     };
 
     if before_proxy_body_requirements.required {
-        let body_limit = effective_request_body_limit(
+        let body_limit = effective_request_body_limit_for_protocol(
+            is_grpc_request,
             state.max_request_body_size_bytes,
+            state.max_grpc_recv_size_bytes,
             before_proxy_body_requirements.plugin_limit,
         );
         client_request_body = match client_request_body {
@@ -19214,10 +19515,10 @@ async fn handle_proxy_request_inner(
                 .await
                 {
                     Ok(buffered) => {
-                        if let ClientRequestBody::Buffered(body) = &buffered {
+                        if let ClientRequestBody::Buffered(buffered) = &buffered {
                             store_request_body_metadata(
                                 &mut ctx,
-                                body,
+                                &buffered.body,
                                 before_proxy_body_requirements.needs_text,
                                 before_proxy_body_requirements.needs_bytes,
                                 before_proxy_body_requirements.needs_digests,
@@ -19228,17 +19529,24 @@ async fn handle_proxy_request_inner(
                             // size instead of 0. `fetch_max` is safe against
                             // later proxy_to_backend updates — the largest
                             // observed value always wins.
-                            ctx.bytes_sent_observed
-                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                            ctx.bytes_sent_observed.fetch_max(
+                                buffered.body.len() as u64,
+                                std::sync::atomic::Ordering::Release,
+                            );
                         }
                         buffered
                     }
                     Err(RequestBodyBufferError::TooLarge) => {
-                        record_request(&state, 413);
-                        return Ok(build_response(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            r#"{"error":"Request body exceeds maximum size"}"#,
-                        ));
+                        let response = build_request_body_too_large_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            body_limit,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                     Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
                         error!(
@@ -19281,24 +19589,97 @@ async fn handle_proxy_request_inner(
                     }
                 }
             }
-            ClientRequestBody::Buffered(body) => {
-                if body_limit > 0 && body.len() > body_limit {
-                    record_request(&state, 413);
-                    return Ok(build_response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
-                    ));
+            ClientRequestBody::Buffered(buffered) => {
+                if body_limit > 0 && buffered.body.len() > body_limit {
+                    let response = build_request_body_too_large_response(
+                        is_grpc_request,
+                        grpc_web_response_content_type,
+                        body_limit,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    );
+                    record_request(&state, response.status().as_u16());
+                    return Ok(response);
                 }
                 store_request_body_metadata(
                     &mut ctx,
-                    &body,
+                    &buffered.body,
                     before_proxy_body_requirements.needs_text,
                     before_proxy_body_requirements.needs_bytes,
                     before_proxy_body_requirements.needs_digests,
                 );
-                ClientRequestBody::Buffered(body)
+                ClientRequestBody::Buffered(buffered)
             }
         };
+    }
+
+    // Opt-in buffered-body normalization (configured request decompression)
+    // runs after the pre-`before_proxy` buffer is stored and before any
+    // `before_proxy` hook, so earlier body consumers see validated plaintext.
+    if capabilities.has(PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
+        && let ClientRequestBody::Buffered(buffered) = &mut client_request_body
+    {
+        let phase_start = Instant::now();
+        let mut tmp_headers = std::mem::take(&mut ctx.headers);
+        let normalize_result = apply_buffered_request_body_normalization_before_before_proxy(
+            &plugins,
+            &mut ctx,
+            &mut tmp_headers,
+            &mut buffered.body,
+            before_proxy_body_requirements.needs_text,
+            before_proxy_body_requirements.needs_bytes,
+        )
+        .await;
+        ctx.headers = tmp_headers;
+        match normalize_result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!("request-body normalization rejection could not be normalized");
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status_code = plugin_reject.status_code;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "normalize_buffered_request_body",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
@@ -19905,9 +20286,11 @@ async fn handle_proxy_request_inner(
         };
 
         client_request_body = match client_request_body {
-            ClientRequestBody::Buffered(body) => {
-                ctx.bytes_sent_observed
-                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+            ClientRequestBody::Buffered(mut buffered) => {
+                ctx.bytes_sent_observed.fetch_max(
+                    buffered.body.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
                 let mut body_hook_ctx = needs_final_request_body_context
                     .then(|| ctx.clone_for_final_request_body_hooks());
                 let terminal_hook_start = Instant::now();
@@ -19917,7 +20300,7 @@ async fn handle_proxy_request_inner(
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
                     &hook_headers,
-                    body,
+                    buffered.body,
                 )
                 .await;
                 let final_body_result = run_final_request_body_hooks(
@@ -19942,7 +20325,8 @@ async fn handle_proxy_request_inner(
                 match final_body_result {
                     PluginResult::Continue => {
                         request_body_prepared = true;
-                        ClientRequestBody::Buffered(transformed)
+                        buffered.body = transformed;
+                        ClientRequestBody::Buffered(buffered)
                     }
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -20209,9 +20593,11 @@ async fn handle_proxy_request_inner(
         };
 
         client_request_body = match client_request_body {
-            ClientRequestBody::Buffered(body) => {
-                ctx.bytes_sent_observed
-                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+            ClientRequestBody::Buffered(mut buffered) => {
+                ctx.bytes_sent_observed.fetch_max(
+                    buffered.body.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
                 let grpc_deadline_at = ctx.grpc_deadline_at();
                 let mut body_hook_ctx = needs_final_request_body_context
                     .then(|| ctx.clone_for_final_request_body_hooks());
@@ -20220,7 +20606,7 @@ async fn handle_proxy_request_inner(
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
                     &hook_headers,
-                    body,
+                    buffered.body,
                 )
                 .await;
                 let final_body_result = run_final_request_body_hooks(
@@ -20248,7 +20634,8 @@ async fn handle_proxy_request_inner(
                 match final_body_result {
                     PluginResult::Continue => {
                         request_body_prepared = true;
-                        ClientRequestBody::Buffered(transformed)
+                        buffered.body = transformed;
+                        ClientRequestBody::Buffered(buffered)
                     }
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -20699,7 +21086,11 @@ async fn handle_proxy_request_inner(
         // When plugins need request body access (e.g., protobuf validation),
         // collect the body first, run hooks, then dispatch to backend.
         // Otherwise, use the fast combined collect+dispatch path.
-        let grpc_needs_request_body_hooks = requires_request_body_buffering;
+        // An earlier terminal preparation already ran transforms and final
+        // hooks. Reusing that buffer must not invoke either phase a second
+        // time merely because the selected transport is native gRPC.
+        let grpc_needs_request_body_hooks =
+            requires_request_body_buffering && !request_body_prepared;
         // `proxy_grpc_request_streaming` streams BOTH the request AND the
         // response, which means the request body is consumed on the wire
         // and cannot be replayed — incompatible with retry. Gate it on
@@ -20723,72 +21114,94 @@ async fn handle_proxy_request_inner(
         let mut held_frontend_grpc_upload: Option<grpc_proxy::GrpcBody> = None;
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
-            let request = match client_request_body {
-                ClientRequestBody::Streaming(request) => *request,
-                ClientRequestBody::Buffered(_) => {
-                    record_request(&state, 500);
-                    return Ok(build_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        r#"{"error":"Internal error"}"#,
-                    ));
+            let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
+                ClientRequestBody::Streaming(request) => {
+                    match grpc_proxy::collect_grpc_request_body(
+                        *request,
+                        state.max_grpc_recv_size_bytes,
+                        proxy.backend_read_timeout_ms,
+                        ctx.grpc_deadline_at(),
+                    )
+                    .await
+                    {
+                        Ok(parts) => parts,
+                        Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
+                            // `grpc_probe_guard` remains armed: returning drops it and
+                            // releases the admitted HALF_OPEN slot exactly once,
+                            // neutrally, before the response is written by hyper.
+                            record_request(&state, StatusCode::OK.as_u16());
+                            return Ok(build_request_body_timeout_response(
+                                true,
+                                grpc_web_response_content_type,
+                                plugin_cache_view
+                                    .initial_response_header_policy_plugins()
+                                    .as_ref(),
+                            ));
+                        }
+                        Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
+                            // Rejection decorators/logging may await external sinks.
+                            // Release the admitted HALF_OPEN probe and any body-phase
+                            // preacquisition before entering that cleanup pipeline.
+                            grpc_probe_guard.disarm();
+                            release_circuit_breaker_probe_on_admission_reject(
+                                &state,
+                                &proxy,
+                                cb_target_key.as_deref(),
+                                grpc_cb_probe_slot,
+                            );
+                            drop(preacquired_backend_admission.take_if_acquired());
+                            return Ok(finalize_upload_deadline_rejection(
+                                &plugins,
+                                &mut ctx,
+                                &state,
+                                start_time,
+                                "grpc_deadline_buffered_grpc_upload",
+                                plugin_execution_ns,
+                                Some(&original_request_path),
+                                grpc_web_response_content_type,
+                            )
+                            .await);
+                        }
+                        Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
+                            let (grpc_status, message) = match e {
+                                GrpcProxyError::ResourceExhausted(message) => {
+                                    (grpc_proxy::grpc_status::RESOURCE_EXHAUSTED, message)
+                                }
+                                other => (
+                                    grpc_proxy::grpc_status::INTERNAL,
+                                    format!("Failed to read gRPC request body: {other:?}"),
+                                ),
+                            };
+                            record_request(&state, StatusCode::OK.as_u16());
+                            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                                grpc_status,
+                                &message,
+                                initial_response_header_policy_plugins.as_ref(),
+                            ));
+                        }
+                    }
                 }
-            };
-            let (grpc_method, grpc_headers, grpc_req_body) =
-                match grpc_proxy::collect_grpc_request_body(
-                    request,
-                    state.max_grpc_recv_size_bytes,
-                    proxy.backend_read_timeout_ms,
-                    ctx.grpc_deadline_at(),
-                )
-                .await
-                {
-                    Ok(parts) => parts,
-                    Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
-                        // `grpc_probe_guard` remains armed: returning drops it and
-                        // releases the admitted HALF_OPEN slot exactly once,
-                        // neutrally, before the response is written by hyper.
+                ClientRequestBody::Buffered(buffered) => {
+                    if state.max_grpc_recv_size_bytes > 0
+                        && buffered.body.len() > state.max_grpc_recv_size_bytes
+                    {
                         record_request(&state, StatusCode::OK.as_u16());
-                        return Ok(build_request_body_timeout_response(
-                            true,
-                            grpc_web_response_content_type,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        ));
-                    }
-                    Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
-                        // Rejection decorators/logging may await external sinks.
-                        // Release the admitted HALF_OPEN probe and any body-phase
-                        // preacquisition before entering that cleanup pipeline.
-                        grpc_probe_guard.disarm();
-                        release_circuit_breaker_probe_on_admission_reject(
-                            &state,
-                            &proxy,
-                            cb_target_key.as_deref(),
-                            grpc_cb_probe_slot,
-                        );
-                        drop(preacquired_backend_admission.take_if_acquired());
-                        return Ok(finalize_upload_deadline_rejection(
-                            &plugins,
-                            &mut ctx,
-                            &state,
-                            start_time,
-                            "grpc_deadline_buffered_grpc_upload",
-                            plugin_execution_ns,
-                            Some(&original_request_path),
-                            grpc_web_response_content_type,
-                        )
-                        .await);
-                    }
-                    Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
-                        record_request(&state, 500);
                         return Ok(grpc_proxy::build_grpc_error_response_with_policy(
-                            13, // INTERNAL
-                            &format!("Failed to read gRPC request body: {:?}", e),
+                            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                            &format!(
+                                "gRPC request payload size exceeds maximum of {} bytes",
+                                state.max_grpc_recv_size_bytes
+                            ),
                             initial_response_header_policy_plugins.as_ref(),
                         ));
                     }
-                };
+                    (
+                        buffered.method,
+                        buffered.headers,
+                        Bytes::from(buffered.body),
+                    )
+                }
+            };
 
             // Store body metadata for plugins that read via ctx.metadata
             let request_body_size_bytes = grpc_req_body.len().to_string();
@@ -20968,17 +21381,20 @@ async fn handle_proxy_request_inner(
             (result, grpc_req_body)
         } else {
             // Fast path: no plugin body hooks needed
-            let request = match client_request_body {
-                ClientRequestBody::Streaming(request) => *request,
-                ClientRequestBody::Buffered(_) => {
-                    record_request(&state, 500);
-                    return Ok(build_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        r#"{"error":"Internal error"}"#,
-                    ));
-                }
-            };
-            if grpc_can_use_streaming_fast_path {
+            let grpc_request_was_buffered =
+                matches!(&client_request_body, ClientRequestBody::Buffered(_));
+            if grpc_can_use_streaming_fast_path && !grpc_request_was_buffered {
+                let request = match client_request_body {
+                    ClientRequestBody::Streaming(request) => *request,
+                    ClientRequestBody::Buffered(_) => {
+                        debug_assert!(false, "buffered gRPC body entered streaming fast path");
+                        record_request(&state, 500);
+                        return Ok(build_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"Internal error"}"#,
+                        ));
+                    }
+                };
                 // Reject an oversized declared Content-Length BEFORE admission, so
                 // a capacity rejection cannot mask the size violation as a
                 // concurrency reject instead of the deterministic RESOURCE_EXHAUSTED
@@ -21122,17 +21538,39 @@ async fn handle_proxy_request_inner(
                 (result, Bytes::new())
             } else {
                 // Mixed path: collect request body up-front (required for
-                // retry replay) but propagate the streaming decision to the
-                // response so trailers reach the client immediately when
-                // the response path is safe to stream.
-                match grpc_proxy::collect_grpc_request_body(
-                    request,
-                    state.max_grpc_recv_size_bytes,
-                    proxy.backend_read_timeout_ms,
-                    ctx.grpc_deadline_at(),
-                )
-                .await
-                {
+                // retry replay), or reuse an earlier bounded prebuffer, but
+                // propagate the streaming decision to the response so
+                // trailers reach the client immediately when safe.
+                let collected = match client_request_body {
+                    ClientRequestBody::Streaming(request) => {
+                        grpc_proxy::collect_grpc_request_body(
+                            *request,
+                            state.max_grpc_recv_size_bytes,
+                            proxy.backend_read_timeout_ms,
+                            ctx.grpc_deadline_at(),
+                        )
+                        .await
+                    }
+                    ClientRequestBody::Buffered(buffered) => {
+                        if state.max_grpc_recv_size_bytes > 0
+                            && buffered.body.len() > state.max_grpc_recv_size_bytes
+                        {
+                            Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(
+                                GrpcProxyError::ResourceExhausted(format!(
+                                    "gRPC request payload size exceeds maximum of {} bytes",
+                                    state.max_grpc_recv_size_bytes
+                                )),
+                            ))
+                        } else {
+                            Ok((
+                                buffered.method,
+                                buffered.headers,
+                                Bytes::from(buffered.body),
+                            ))
+                        }
+                    }
+                };
+                match collected {
                     Ok((grpc_method, grpc_headers, grpc_req_body)) => {
                         ctx.bytes_sent_observed.fetch_max(
                             grpc_req_body.len() as u64,
@@ -27415,7 +27853,7 @@ async fn proxy_to_backend(
         }
 
         match client_request_body {
-            ClientRequestBody::Buffered(body_bytes) => {
+            ClientRequestBody::Buffered(buffered) => {
                 // Record pre-transform body length (bytes as received from the
                 // client — already buffered by an earlier phase such as
                 // request_mirror prebuffering) BEFORE running plugin transforms
@@ -27433,19 +27871,19 @@ async fn proxy_to_backend(
                 // on-wire count here.
                 if !request_body_prepared {
                     ctx_bytes_sent_observed.fetch_max(
-                        body_bytes.len() as u64,
+                        buffered.body.len() as u64,
                         std::sync::atomic::Ordering::Release,
                     );
                 }
                 let body_bytes = if request_body_prepared {
-                    body_bytes
+                    buffered.body
                 } else {
                     let body_bytes = apply_request_body_plugins_with_context(
                         plugins,
                         ctx.as_deref_mut(),
                         request_ctx.grpc_deadline_at(),
                         headers,
-                        body_bytes,
+                        buffered.body,
                     )
                     .await;
                     match run_final_request_body_hooks(
@@ -28778,6 +29216,34 @@ fn build_request_body_timeout_response(
     build_response(
         StatusCode::REQUEST_TIMEOUT,
         r#"{"error":"Request body read timed out"}"#,
+    )
+}
+
+fn build_request_body_too_large_response(
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
+    limit: usize,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    let message = format!("Request body exceeds maximum size of {limit} bytes");
+    if let Some(content_type) = grpc_web_response_content_type {
+        return build_grpc_web_error_response(
+            content_type,
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            &message,
+            initial_response_header_policy_plugins,
+        );
+    }
+    if is_grpc_request {
+        return grpc_proxy::build_grpc_error_response_with_policy(
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            &message,
+            initial_response_header_policy_plugins,
+        );
+    }
+    build_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        r#"{"error":"Request body exceeds maximum size"}"#,
     )
 }
 
@@ -31846,7 +32312,7 @@ async fn proxy_to_backend_http3(
     };
 
     let request_body = match client_request_body {
-        ClientRequestBody::Buffered(body) => body,
+        ClientRequestBody::Buffered(buffered) => buffered.body,
         ClientRequestBody::Streaming(original_req) => {
             let (_parts, body) = (*original_req).into_parts();
             if state.max_request_body_size_bytes > 0 {
@@ -36264,7 +36730,11 @@ mod tests {
                 backend_url,
                 "GET",
                 &HashMap::new(),
-                ClientRequestBody::Buffered(Vec::new()),
+                ClientRequestBody::Buffered(BufferedClientRequestBody {
+                    method: hyper::Method::GET,
+                    headers: hyper::HeaderMap::new(),
+                    body: Vec::new(),
+                }),
                 None,
                 plugins,
                 &[],
@@ -36350,6 +36820,152 @@ mod tests {
         );
     }
 
+    /// body_validator must release large non-matching responses on the
+    /// reqwest (HTTP/1.1 / H2) path while keeping matching JSON buffered for
+    /// validation. Mirrors the WAF wiring guard for #2323.
+    #[tokio::test]
+    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response() {
+        async fn dispatch_body(
+            state: &ProxyState,
+            proxy: &Proxy,
+            plugins: &[Arc<dyn Plugin>],
+            backend_url: &str,
+        ) -> ResponseBody {
+            let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+            let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let dispatch = proxy_to_backend(
+                state,
+                proxy,
+                backend_url,
+                "GET",
+                &HashMap::new(),
+                ClientRequestBody::Buffered(BufferedClientRequestBody {
+                    method: hyper::Method::GET,
+                    headers: hyper::HeaderMap::new(),
+                    body: Vec::new(),
+                }),
+                None,
+                plugins,
+                &[],
+                PreacquiredBackendAdmission::default(),
+                None,
+                &ctx,
+                false, // stream_response: validator requested buffering pre-flight
+                false,
+                true,
+                false, // retain_request_body (non-retry -> downgrade active)
+                false,
+                "127.0.0.1",
+                "127.0.0.1",
+                false,
+                false,
+                false,
+                false,
+                &bytes_sent,
+                hyper::Version::HTTP_11,
+                &mut std::time::Instant::now(),
+            )
+            .await;
+            let resp = match dispatch {
+                BackendDispatchResult::Response { response, .. } => *response,
+                BackendDispatchResult::AdmissionRejected(_) => {
+                    panic!("test does not configure backend admission plugins")
+                }
+            };
+            resp.body
+        }
+
+        let server = wiremock::MockServer::start().await;
+        // Larger than the eager-buffer cutoff but below the global response
+        // ceiling, so the body type proves whether refinement selected stream.
+        let large_body = vec![0u8; 1_500_000];
+        wiremock::Mock::given(wiremock::matchers::path("/binary"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(large_body.clone()),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(br#"{"id":"ok"}"#.to_vec()),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/grpc"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/grpc")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .mount(&server)
+            .await;
+
+        let mut state = make_test_proxy_state(GatewayConfig::default());
+        state.max_response_body_size_bytes = 2_000_000;
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = server.address().ip().to_string();
+        proxy.backend_port = server.address().port();
+
+        let json_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            crate::plugins::body_validator::BodyValidator::new(&json!({
+                "response_required_fields": ["id"]
+            }))
+            .unwrap(),
+        )];
+
+        let binary = dispatch_body(
+            &state,
+            &proxy,
+            &json_plugins,
+            &format!("{}/binary", server.uri()),
+        )
+        .await;
+        assert!(
+            matches!(binary, ResponseBody::Streaming { .. }),
+            "non-matching image/png above the eager cutoff must stream"
+        );
+
+        let json_body = dispatch_body(
+            &state,
+            &proxy,
+            &json_plugins,
+            &format!("{}/json", server.uri()),
+        )
+        .await;
+        assert!(
+            matches!(json_body, ResponseBody::Buffered(_)),
+            "matching JSON must stay buffered for body_validator"
+        );
+
+        let descriptor = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/test_validator.bin");
+        if descriptor.is_file() {
+            let grpc_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+                crate::plugins::body_validator::BodyValidator::new(&json!({
+                    "protobuf_descriptor_path": descriptor.to_string_lossy(),
+                    "protobuf_response_type": "test.HelloResponse"
+                }))
+                .unwrap(),
+            )];
+            let grpc_body = dispatch_body(
+                &state,
+                &proxy,
+                &grpc_plugins,
+                &format!("{}/grpc", server.uri()),
+            )
+            .await;
+            assert!(
+                matches!(grpc_body, ResponseBody::Buffered(_)),
+                "configured gRPC protobuf responses must stay buffered"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
         let server = wiremock::MockServer::start().await;
@@ -36377,7 +36993,11 @@ mod tests {
             &format!("{}/events", server.uri()),
             "GET",
             &HashMap::new(),
-            ClientRequestBody::Buffered(Vec::new()),
+            ClientRequestBody::Buffered(BufferedClientRequestBody {
+                method: hyper::Method::GET,
+                headers: hyper::HeaderMap::new(),
+                body: Vec::new(),
+            }),
             None,
             &plugins,
             &[],
@@ -38460,6 +39080,93 @@ mod tests {
             Some(&retry_ctx),
             200,
             &sse_headers,
+        ));
+    }
+
+    #[test]
+    fn refine_stream_response_releases_irrelevant_body_validator_media_types() {
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/download".into());
+        let proxy = test_proxy(ResponseBodyMode::Stream);
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            crate::plugins::body_validator::BodyValidator::new(&json!({
+                "response_required_fields": ["id"]
+            }))
+            .unwrap(),
+        )];
+
+        let png_headers = HashMap::from([("content-type".to_string(), "image/png".to_string())]);
+        let json_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        assert!(
+            refine_stream_response_for_content_type(
+                false,
+                &proxy,
+                &plugins,
+                Some(&ctx),
+                200,
+                &png_headers,
+            ),
+            "body_validator must release non-matching image/png"
+        );
+        assert!(
+            !refine_stream_response_for_content_type(
+                false,
+                &proxy,
+                &plugins,
+                Some(&ctx),
+                200,
+                &json_headers,
+            ),
+            "matching JSON must remain buffered"
+        );
+
+        // Under retries, irrelevant types still release once headers are known.
+        let retry_ctx = retry_response_decision_context(&ctx);
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            Some(&retry_ctx),
+            200,
+            &png_headers,
+        ));
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            Some(&retry_ctx),
+            200,
+            &json_headers,
+        ));
+
+        // A later Content-Type rewrite keeps the original buffered decision.
+        let rewrite_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                crate::plugins::body_validator::BodyValidator::new(&json!({
+                    "response_required_fields": ["id"]
+                }))
+                .unwrap(),
+            ),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "operation": "update",
+                        "target": "header",
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }]
+                }))
+                .expect("response transformer config should be valid"),
+            ),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &rewrite_plugins,
+            Some(&ctx),
+            200,
+            &png_headers,
         ));
     }
 

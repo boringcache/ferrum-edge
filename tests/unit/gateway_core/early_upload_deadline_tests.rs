@@ -15,6 +15,7 @@ use ferrum_edge::_test_support::{
     EarlyUploadBoundKind, EarlyUploadWaitError, collect_h1h2_request_body_with_deadline_for_test,
     collect_h3_request_body_with_deadline_for_test, compose_early_upload_bound_for_test,
     early_upload_phase_needs_fresh_drain_for_test,
+    effective_request_body_limit_for_protocol_for_test,
 };
 
 #[test]
@@ -83,6 +84,30 @@ fn later_early_phases_reuse_one_prebuffer_instead_of_a_second_drain() {
     assert!(
         !early_upload_phase_needs_fresh_drain_for_test(&prebuffered),
         "must not deduct a second fresh operator timeout after prebuffering"
+    );
+}
+
+#[test]
+fn early_prebuffers_compose_plugin_caps_with_the_protocol_receive_limit() {
+    assert_eq!(
+        effective_request_body_limit_for_protocol_for_test(true, 64, 32, None),
+        32,
+        "native gRPC must use its receive ceiling, not the HTTP body ceiling"
+    );
+    assert_eq!(
+        effective_request_body_limit_for_protocol_for_test(true, 64, 32, Some(16)),
+        16,
+        "a stricter plugin-local prebuffer ceiling still wins"
+    );
+    assert_eq!(
+        effective_request_body_limit_for_protocol_for_test(false, 64, 32, Some(128)),
+        64,
+        "plain HTTP keeps the ordinary request-body ceiling"
+    );
+    assert_eq!(
+        effective_request_body_limit_for_protocol_for_test(true, 64, 0, None),
+        0,
+        "zero retains the native gRPC unlimited semantics"
     );
 }
 
@@ -312,6 +337,10 @@ fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
     assert!(
         source.contains("early_upload_phase_needs_fresh_drain(&prebuffered_body_data)"),
         "authorize/before_proxy must gate fresh drains via the shared prebuffer helper"
+    );
+    assert!(
+        source.contains("state.max_grpc_recv_size_bytes"),
+        "native H3 early prebuffers must select the gRPC receive ceiling"
     );
     assert!(
         source.contains("if !body_was_prebuffered"),

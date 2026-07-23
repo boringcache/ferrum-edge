@@ -1,5 +1,7 @@
 //! Tests for body_validator plugin — XML CDATA, comments, processing instructions
 
+use chrono::Utc;
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::{
     HTTP_GRPC_PROTOCOLS, Plugin, RequestContext, body_validator::BodyValidator, priority,
 };
@@ -7,6 +9,26 @@ use serde_json::json;
 use std::collections::HashMap;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+
+fn body_validator_plugin_config(
+    id: &str,
+    enabled: bool,
+    config: serde_json::Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: "ferrum".to_string(),
+        plugin_name: "body_validator".to_string(),
+        config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
 
 fn make_xml_ctx(body: &str) -> RequestContext {
     let mut ctx = RequestContext::new(
@@ -2669,18 +2691,75 @@ async fn test_protobuf_invalid_response() {
 
 // ─── Invalid Config Graceful Handling ───────────���───────────────────
 
-#[test]
-fn test_protobuf_invalid_descriptor_path_degrades_gracefully() {
-    let result = BodyValidator::new(&serde_json::json!({
+#[tokio::test]
+async fn test_protobuf_missing_descriptor_fails_closed_for_applicable_request_and_response() {
+    let config = serde_json::json!({
         "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
-        "protobuf_request_type": "test.HelloRequest"
-    }));
-    let err = result
-        .err()
-        .expect("expected error for invalid descriptor path");
+        "protobuf_request_type": "test.HelloRequest",
+        "protobuf_response_type": "test.HelloResponse"
+    });
+    let plugin = BodyValidator::new(&config)
+        .expect("runtime construction must tolerate a missing node-local descriptor");
     assert!(
-        err.contains("failed to read protobuf descriptor file"),
-        "got: {err}"
+        ferrum_edge::plugins::validate_plugin_config("body_validator", &config).is_ok(),
+        "shape-only admission must not open a DP-local descriptor"
+    );
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_response_body_buffering());
+
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (":path".to_string(), "/test.Greeter/SayHello".to_string()),
+    ]);
+    assert_reject(
+        plugin
+            .on_final_request_body(&headers, &[0, 0, 0, 0, 0])
+            .await,
+        Some(400),
+    );
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &[0, 0, 0, 0, 0])
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_missing_descriptor_only_rejects_configured_method_targets() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
+        "protobuf_method_messages": {
+            "/test.Greeter/SayHello": {
+                "request": "test.HelloRequest"
+            }
+        }
+    }))
+    .expect("missing node-local descriptor must produce a fail-closed runtime");
+    let unmatched = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (":path".to_string(), "/test.Greeter/Health".to_string()),
+    ]);
+    assert_continue(
+        plugin
+            .on_final_request_body(&unmatched, &[0, 0, 0, 0, 0])
+            .await,
+    );
+    let matched = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        (":path".to_string(), "/test.Greeter/SayHello".to_string()),
+    ]);
+    assert_reject(
+        plugin
+            .on_final_request_body(&matched, &[0, 0, 0, 0, 0])
+            .await,
+        Some(400),
     );
 }
 
@@ -2697,6 +2776,96 @@ fn test_protobuf_invalid_message_type_degrades_gracefully() {
         err.contains("protobuf_request_type 'nonexistent.MessageType' not found"),
         "got: {err}"
     );
+}
+
+#[test]
+fn test_protobuf_readable_malformed_descriptor_rejects_runtime_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("invalid.pb");
+    std::fs::write(&path, b"not-a-file-descriptor-set").unwrap();
+    let config = json!({
+        "protobuf_descriptor_path": path.to_string_lossy(),
+        "protobuf_request_type": "test.HelloRequest"
+    });
+    let error = BodyValidator::new(&config)
+        .err()
+        .expect("a readable malformed descriptor must reject the runtime candidate");
+    assert!(error.contains("failed to parse protobuf descriptor"));
+
+    let gateway = GatewayConfig {
+        plugin_configs: vec![body_validator_plugin_config("body-validator", true, config)],
+        ..Default::default()
+    };
+    let errors = gateway.validate_plugin_file_dependencies();
+    assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
+    assert!(errors[0].contains("failed to parse protobuf descriptor"));
+}
+
+#[test]
+fn test_protobuf_descriptor_file_dependency_reports_missing_path_once() {
+    let missing = "/nonexistent/path/shared-descriptor.bin";
+    let gateway = GatewayConfig {
+        plugin_configs: vec![
+            body_validator_plugin_config(
+                "body-validator-a",
+                true,
+                json!({
+                    "protobuf_descriptor_path": missing,
+                    "protobuf_request_type": "test.HelloRequest"
+                }),
+            ),
+            body_validator_plugin_config(
+                "body-validator-b",
+                true,
+                json!({
+                    "protobuf_descriptor_path": missing,
+                    "protobuf_response_type": "test.HelloResponse"
+                }),
+            ),
+        ],
+        ..Default::default()
+    };
+    let errors = gateway.validate_plugin_file_dependencies();
+    assert_eq!(
+        errors.len(),
+        1,
+        "shared descriptor paths must be read and reported once: {errors:?}"
+    );
+    assert!(errors[0].contains("failed to read protobuf descriptor file"));
+}
+
+#[test]
+fn test_protobuf_descriptor_file_dependency_validates_message_references() {
+    let gateway = GatewayConfig {
+        plugin_configs: vec![body_validator_plugin_config(
+            "body-validator",
+            true,
+            json!({
+                "protobuf_descriptor_path": test_descriptor_path(),
+                "protobuf_request_type": "missing.Request"
+            }),
+        )],
+        ..Default::default()
+    };
+    let errors = gateway.validate_plugin_file_dependencies();
+    assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
+    assert!(errors[0].contains("protobuf_request_type 'missing.Request' not found"));
+}
+
+#[test]
+fn test_protobuf_descriptor_file_dependency_skips_disabled_plugins() {
+    let gateway = GatewayConfig {
+        plugin_configs: vec![body_validator_plugin_config(
+            "body-validator",
+            false,
+            json!({
+                "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
+                "protobuf_request_type": "test.HelloRequest"
+            }),
+        )],
+        ..Default::default()
+    };
+    assert!(gateway.validate_plugin_file_dependencies().is_empty());
 }
 
 // ─── gRPC before_proxy is skipped (uses on_final_request_body instead) ──
@@ -2856,6 +3025,171 @@ fn test_non_sse_request_still_validates_response() {
         .insert("accept".to_string(), "application/json".to_string());
 
     assert!(plugin.should_buffer_response_body(&ctx));
+}
+
+#[test]
+fn test_response_content_type_refinement_releases_irrelevant_media_types() {
+    let plugin = BodyValidator::new(&json!({
+        "response_required_fields": ["id"]
+    }))
+    .unwrap();
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/download".to_string(),
+    );
+
+    let png_headers = HashMap::from([("content-type".to_string(), "image/png".to_string())]);
+    let octet_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    )]);
+    let json_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let xml_headers = HashMap::from([("content-type".to_string(), "application/xml".to_string())]);
+
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &png_headers,
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/octet-stream"),
+        200,
+        &octet_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; charset=utf-8"),
+        200,
+        &json_headers,
+    ));
+    // Default response_content_types include XML, but this config has no XML
+    // response rules — only JSON required fields — so XML is not inspected.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/xml"),
+        200,
+        &xml_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new(),));
+
+    // Retry-aware release must stream irrelevant types once headers are known.
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &png_headers));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &octet_headers));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_headers));
+    // Content-Type rewrite safety: only SSE uses the pre-rewrite release hook.
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &png_headers,)
+    );
+}
+
+#[test]
+fn test_response_content_type_refinement_keeps_xml_when_xml_validation_configured() {
+    let plugin = BodyValidator::new(&json!({
+        "response_validate_xml": true
+    }))
+    .unwrap();
+    let ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/xml".to_string(),
+    );
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/xml"),
+        200,
+        &HashMap::new(),
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &HashMap::new(),
+    ));
+}
+
+#[test]
+fn test_protobuf_response_refinement_retains_applicable_grpc_and_releases_others() {
+    let plugin = BodyValidator::new(&json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_response_type": "test.HelloResponse"
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    let grpc_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let png_headers = HashMap::from([("content-type".to_string(), "image/png".to_string())]);
+    let json_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &grpc_headers,
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc+proto"),
+        200,
+        &grpc_headers,
+    ));
+    // Protobuf-only config does not claim ordinary JSON/XML responses.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &png_headers,
+    ));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &grpc_headers));
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &png_headers));
+
+    // Method-scoped descriptors: non-applicable gRPC methods are released.
+    let method_plugin = protobuf_plugin_with_method_messages();
+    ctx.path = "/test.Greeter/OtherMethod".to_string();
+    assert!(!method_plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &grpc_headers,
+    ));
+    ctx.path = "/test.Greeter/SayHello".to_string();
+    assert!(method_plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &grpc_headers,
+    ));
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    assert!(method_plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc"),
+        200,
+        &grpc_headers,
+    ));
 }
 
 #[test]

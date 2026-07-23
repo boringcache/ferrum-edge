@@ -516,6 +516,11 @@ struct LiveGrpcStream {
     status: u16,
     first_frame: Bytes,
     body: Incoming,
+    // Keep the request sender alive for the lifetime of the response. Dropping
+    // the last sender can let Hyper begin connection shutdown while the test
+    // still expects the server-streaming body (and its gateway request guard)
+    // to remain open.
+    _sender: hyper::client::conn::http2::SendRequest<Full<Bytes>>,
     conn_task: tokio::task::JoinHandle<()>,
 }
 
@@ -588,6 +593,7 @@ async fn open_grpc_stream(
         status,
         first_frame,
         body: incoming,
+        _sender: sender,
         conn_task,
     })
 }

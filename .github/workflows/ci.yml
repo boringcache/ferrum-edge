@@ -894,6 +894,7 @@ jobs:
               functional_ai_plugins_test
               functional_ai_stream_router_test
               functional_ai_semantic_firewall_streaming_test
+              functional_body_validator_response_stream_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
               functional_logging_plugins_test
@@ -1202,6 +1203,7 @@ jobs:
             -j 1 \
             test_request_deduplication_redis_blocks_concurrent_cross_instance \
             test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict \
+            test_request_deduplication_redis_distinct_header_instances_complete_independently \
             test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks
         env:
           FERRUM_SKIP_GATEWAY_BUILD: "1"
@@ -1215,6 +1217,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict" >> $GITHUB_STEP_SUMMARY
+          echo "- test_request_deduplication_redis_distinct_header_instances_complete_independently" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_finalized_empty_synthetic_successes_release_locks" >> $GITHUB_STEP_SUMMARY
 
   mesh-multicluster-federation:

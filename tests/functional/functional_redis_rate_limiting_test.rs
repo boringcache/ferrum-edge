@@ -25,7 +25,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -177,6 +177,36 @@ async fn redis_sum_counters_by_prefix(prefix: &str) -> i64 {
         .and_then(|value| value.split("\r\n").next())
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0)
+}
+
+async fn set_redis_counter(key: &str, value: u64, ttl_seconds: u64) {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    let result: String = redis::cmd("SET")
+        .arg(key)
+        .arg(value)
+        .arg("EX")
+        .arg(ttl_seconds)
+        .query_async(&mut connection)
+        .await
+        .expect("seed Redis rate-limit counter");
+    assert_eq!(result, "OK");
+}
+
+async fn redis_counter_value(key: &str) -> Option<u64> {
+    let client = redis::Client::open(REDIS_URL).expect("valid Redis test URL");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to Redis test instance");
+    redis::cmd("GET")
+        .arg(key)
+        .query_async(&mut connection)
+        .await
+        .expect("read Redis rate-limit counter")
 }
 
 // ============================================================================
@@ -899,6 +929,113 @@ async fn test_rate_limiting_redis_centralized() {
     );
 
     println!("test_rate_limiting_redis_centralized PASSED");
+}
+
+/// A full previous one-second Redis bucket must decay during the current
+/// bucket. The old whole-second fraction stayed at zero and rejected this
+/// candidate for the entire second.
+#[tokio::test]
+#[ignore]
+async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
+    if !redis_is_available().await {
+        return;
+    }
+
+    let harness = RedisRateLimitHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+    let unique_prefix = format!("ferrum:test:rl-decay:{}", Uuid::new_v4().simple());
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-redis-rl-decay",
+        "/redis-rl-decay",
+        backend_port,
+        "http",
+        vec![json!({
+            "id": "plugin-redis-rl-decay",
+            "plugin_name": "rate_limiting",
+            "scope": "proxy",
+            "proxy_id": "proxy-redis-rl-decay",
+            "enabled": true,
+            "config": {
+                "expose_headers": true,
+                "limits": [{"scope": "default", "window_seconds": 1, "max_requests": 10}],
+                "sync_mode": "redis",
+                "redis_url": REDIS_URL,
+                "redis_key_prefix": unique_prefix
+            }
+        })],
+    )
+    .await
+    .unwrap();
+    harness
+        .wait_for_response_header("/redis-rl-decay/test", "x-ratelimit-limit")
+        .await;
+
+    let url = format!("{}/redis-rl-decay/test", harness.proxy_base_url);
+    let mut verified_without_boundary_cross = false;
+    for _ in 0..3 {
+        delete_redis_keys_by_prefix(&unique_prefix).await;
+
+        // Leave at least ~450ms before the next boundary so the Redis seed and
+        // HTTP request use the same current bucket even on a busy hosted runner.
+        let current_index = loop {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch");
+            let fraction_nanos = now.subsec_nanos();
+            if (300_000_000..=500_000_000).contains(&fraction_nanos) {
+                break now.as_secs();
+            }
+            sleep(Duration::from_millis(5)).await;
+        };
+
+        let previous_key = format!(
+            "{unique_prefix}:ip:127.0.0.1:{}",
+            current_index.saturating_sub(1)
+        );
+        let current_key = format!("{unique_prefix}:ip:127.0.0.1:{current_index}");
+        set_redis_counter(&previous_key, 10, 3).await;
+
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .expect("one-second Redis decay request");
+        let finished_index = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_secs();
+        if finished_index != current_index {
+            continue;
+        }
+
+        assert_eq!(
+            redis_counter_value(&current_key).await,
+            Some(1),
+            "request must increment the expected current Redis identity bucket"
+        );
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "a full prior bucket must decay enough to admit a mid-window candidate"
+        );
+        verified_without_boundary_cross = true;
+        break;
+    }
+
+    assert!(
+        verified_without_boundary_cross,
+        "could not complete the Redis decay assertion without crossing a one-second boundary"
+    );
+    delete_redis_keys_by_prefix(&unique_prefix).await;
 }
 
 // ============================================================================
@@ -2504,6 +2641,187 @@ plugin_configs:
         "test_request_deduplication_redis_same_proxy_sibling_instances_do_not_self_conflict PASSED"
     );
 }
+
+/// Two same-proxy Redis instances with distinct headers and unique prefixes must
+/// each complete/release independently (#2378).
+///
+/// Before instance-scoped completion ownership, both plugins wrote one shared
+/// metadata slot; the earlier instance then attempted token-delete with the
+/// later instance's key/token under the wrong prefix and left its lock until
+/// TTL. Distinct prefixes keep this case independent of shared-prefix
+/// self-conflict (#2379).
+#[tokio::test]
+#[ignore]
+async fn test_request_deduplication_redis_distinct_header_instances_complete_independently() {
+    if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!(
+                "Redis is required for the request deduplication distinct-header lifecycle CI gate"
+            );
+        }
+        return;
+    }
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let _backend = start_counting_backend_on(backend_listener, Arc::clone(&backend_hits))
+        .await
+        .unwrap();
+
+    let run_id = Uuid::new_v4().simple().to_string();
+    let prefix_a = format!("orders:dedup:a:{run_id}");
+    let prefix_b = format!("orders:dedup:b:{run_id}");
+    delete_redis_keys_by_prefix(&prefix_a).await;
+    delete_redis_keys_by_prefix(&prefix_b).await;
+
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "orders"
+    listen_path: "/orders"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "dedup-a"
+      - plugin_config_id: "dedup-b"
+
+consumers: []
+
+plugin_configs:
+  - id: "dedup-a"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "orders"
+    enabled: true
+    config:
+      header_name: "Idempotency-Key"
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix_a}"
+      ttl_seconds: 60
+      inflight_ttl_seconds: 30
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+  - id: "dedup-b"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    proxy_id: "orders"
+    enabled: true
+    config:
+      header_name: "X-Operation-Key"
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix_b}"
+      ttl_seconds: 60
+      inflight_ttl_seconds: 30
+      scope_by_consumer: false
+      applicable_methods: ["POST"]
+"#
+    );
+
+    let port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let mut gw = spawn_file_gateway(
+        config,
+        port,
+        vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
+    )
+    .await;
+
+    sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let body = r#"{"order":1}"#;
+    let authority = "orders.example";
+    let url = format!("http://127.0.0.1:{port}/orders");
+
+    let response = client
+        .post(&url)
+        .header("Idempotency-Key", "key-a")
+        .header("X-Operation-Key", "key-b")
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("dual-header request failed");
+    let status = response.status().as_u16();
+    let response_body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "distinct-header Redis instances must both acquire ownership without self-409; body={response_body}"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "fresh dual-header request must reach the backend exactly once"
+    );
+
+    // Both instances must have published completed values and released locks.
+    assert_eq!(
+        redis_key_count_by_prefix(&format!("{prefix_a}:inflight:")).await,
+        0,
+        "instance A must token-release its Redis in-flight lock after buffered completion"
+    );
+    assert_eq!(
+        redis_key_count_by_prefix(&format!("{prefix_b}:inflight:")).await,
+        0,
+        "instance B must token-release its Redis in-flight lock after buffered completion"
+    );
+    assert!(
+        redis_key_count_by_prefix(&format!("{prefix_a}:v3:")).await >= 1,
+        "instance A must publish a completed Redis value under its unique prefix"
+    );
+    assert!(
+        redis_key_count_by_prefix(&format!("{prefix_b}:v3:")).await >= 1,
+        "instance B must publish a completed Redis value under its unique prefix"
+    );
+
+    // A retry must preserve the complete original request fingerprint. Each
+    // deduplication instance excludes only its own idempotency header, so the
+    // sibling header remains a semantic request header for that instance.
+    let replay = client
+        .post(&url)
+        .header("Idempotency-Key", "key-a")
+        .header("X-Operation-Key", "key-b")
+        .header("Host", authority)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("dual-header replay failed");
+    assert_eq!(replay.status().as_u16(), 200);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "an identical dual-header request must replay rather than encounter either stale in-flight lock"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "completed independent instances must not re-execute the backend on replay"
+    );
+
+    delete_redis_keys_by_prefix(&prefix_a).await;
+    delete_redis_keys_by_prefix(&prefix_b).await;
+    gw.shutdown();
+    println!(
+        "test_request_deduplication_redis_distinct_header_instances_complete_independently PASSED"
+    );
+}
+
 /// Namespace-based Redis key prefix isolation.
 ///
 /// Two gateways share the same Redis server with identical `rate_limiting`

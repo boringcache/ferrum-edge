@@ -15,7 +15,10 @@
 //!
 //! 1. Two fixed windows are maintained: the current window and the previous window.
 //! 2. The effective count = `prev_count * (1 - elapsed_fraction) + current_count`.
-//! 3. This provides smooth rate limiting without boundary bursts.
+//! 3. Window index and `elapsed_fraction` are derived from **one** epoch timestamp
+//!    with subsecond precision, so even a one-second window decays continuously
+//!    through `[0, 1)` instead of staying stuck at `0.0`.
+//! 4. This provides smooth rate limiting without boundary bursts.
 //!
 //! This is the same approach used by Cloudflare, Kong, and Nginx — no Lua scripts,
 //! just native Redis `INCR`/`GET`/`EXPIRE` commands pipelined for efficiency.
@@ -44,16 +47,38 @@
 //!
 //! If Redis becomes unreachable, the client marks itself unavailable and the
 //! plugin falls back to local in-memory rate limiting. A background task
-//! periodically pings Redis to detect recovery.
+//! periodically pings Redis to detect recovery. That task is owned by this
+//! client: dropping the client aborts it so retired plugin generations do not
+//! retain connections or keep pinging obsolete endpoints.
+//!
+//! # Connection pool
+//!
+//! `redis_pool_size` sizes a bounded set of multiplexed
+//! [`redis::aio::ConnectionManager`] instances. Slots are established lazily on
+//! first use, selected round-robin on the hot path (lock-free atomic counter),
+//! and cleared together on reconnect failure so TLS/DNS screening and
+//! availability state stay coherent across the pool.
 
 use crate::dns::DnsCache;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::AbortHandle;
 use tracing::{info, warn};
 use url::{Host, Url};
+
+/// Redis sliding-window index and elapsed fraction from a single epoch timestamp.
+///
+/// `elapsed_fraction` is always in `[0, 1)`: at an exact window boundary the
+/// index advances and the fraction resets to `0.0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RedisWindowProgress {
+    pub index: u64,
+    pub elapsed_fraction: f64,
+}
 
 /// Redis sync fields read from a plugin's root JSON object.
 ///
@@ -82,7 +107,6 @@ pub const REDIS_PLUGIN_CONFIG_KEYS: &[&str] = &[
 /// `FERRUM_TLS_NO_VERIFY`) rather than per-plugin overrides, ensuring all outbound
 /// connections share a single CA trust chain.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // pool_size, connect_timeout_seconds reserved for connection tuning
 pub struct RedisConfig {
     /// Redis connection URL (e.g., `redis://host:6379/0` or `rediss://host:6380/0` for TLS).
     pub url: String,
@@ -91,7 +115,8 @@ pub struct RedisConfig {
     pub tls: bool,
     /// Key prefix for all Redis keys (e.g., `"ferrum:rate_limiting"`).
     pub key_prefix: String,
-    /// Connection pool size (number of multiplexed connections).
+    /// Bounded pool size: number of multiplexed [`redis::aio::ConnectionManager`]
+    /// instances established lazily and selected round-robin on the hot path.
     pub pool_size: usize,
     /// Effective Redis connection-attempt timeout in seconds.
     ///
@@ -469,15 +494,25 @@ async fn screen_redis_endpoint(
     RedisEndpoint::Url(config.effective_url())
 }
 
-/// gateway's shared DNS cache. On connection failure, the connection is cleared
+/// One lazily-established multiplexed ConnectionManager slot in the pool.
+///
+/// Hot-path reads are lock-free via [`ArcSwap`]. Slow-path establishment is
+/// serialized per slot so distinct slots can connect in parallel without a
+/// global mutex, while same-slot racers still double-check under the lock.
+struct ConnectionSlot {
+    connection: ArcSwap<Option<redis::aio::ConnectionManager>>,
+    connect_mutex: tokio::sync::Mutex<()>,
+}
+
+/// gateway's shared DNS cache. On connection failure, every pool slot is cleared
 /// so the next attempt re-resolves DNS (handling IP changes gracefully).
 pub struct RedisRateLimitClient {
-    /// The Redis connection manager (auto-reconnecting, multiplexed).
-    /// Uses ArcSwap for lock-free reads on the hot path. The connect_mutex
-    /// serializes connection establishment on the slow path only.
-    connection: ArcSwap<Option<redis::aio::ConnectionManager>>,
-    /// Mutex for serializing connection establishment (slow path only).
-    connect_mutex: tokio::sync::Mutex<()>,
+    /// Bounded pool of multiplexed ConnectionManagers (`redis_pool_size`).
+    /// Each slot is established lazily on first selection.
+    pool: Box<[ConnectionSlot]>,
+    /// Round-robin counter for deterministic, low-overhead slot selection.
+    /// `fetch_add` + `% pool.len()` — no locks, no hashing on the hot path.
+    next_slot: AtomicUsize,
     /// Configuration for connecting to Redis.
     config: RedisConfig,
     /// The gateway's shared DNS cache for resolving Redis hostnames.
@@ -486,6 +521,8 @@ pub struct RedisRateLimitClient {
     available: Arc<AtomicBool>,
     /// Whether the background health checker has been started.
     health_checker_started: AtomicBool,
+    /// Abort handle for the background recovery checker (set once on start).
+    health_checker_abort: Mutex<Option<AbortHandle>>,
     /// Gateway-level TLS no-verify setting (`FERRUM_TLS_NO_VERIFY`).
     tls_no_verify: bool,
     /// Pre-read CA bundle PEM bytes from `FERRUM_TLS_CA_BUNDLE_PATH`.
@@ -556,12 +593,19 @@ impl RedisRateLimitClient {
         };
 
         Self {
-            connection: ArcSwap::from_pointee(None),
-            connect_mutex: tokio::sync::Mutex::new(()),
+            pool: (0..config.pool_size.max(1))
+                .map(|_| ConnectionSlot {
+                    connection: ArcSwap::from_pointee(None),
+                    connect_mutex: tokio::sync::Mutex::new(()),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            next_slot: AtomicUsize::new(0),
             config,
             dns_cache,
             available: Arc::new(AtomicBool::new(true)),
             health_checker_started: AtomicBool::new(false),
+            health_checker_abort: Mutex::new(None),
             tls_no_verify,
             tls_ca_bundle_pem,
         }
@@ -574,7 +618,74 @@ impl RedisRateLimitClient {
         self.available.load(Ordering::Relaxed)
     }
 
-    /// Establish (or reuse) the cached ConnectionManager for tests.
+    /// Shared availability flag for failover observers that must not retain the
+    /// full client (and its cached connections / credentials) after Drop.
+    pub(crate) fn availability_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.available)
+    }
+
+    /// Mark Redis unavailable and start the recovery checker (test support).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn mark_unavailable_for_test(&self) {
+        self.mark_unavailable();
+        self.start_health_checker_if_needed();
+    }
+
+    /// Whether the background recovery checker has been started (test support).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn health_checker_started_for_test(&self) -> bool {
+        self.health_checker_started.load(Ordering::Relaxed)
+    }
+
+    /// Abort handle for the background recovery checker, when started (tests).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn health_checker_abort_for_test(&self) -> Option<AbortHandle> {
+        self.health_checker_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Configured pool cardinality (`redis_pool_size`).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn pool_size_for_test(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// Number of pool slots that currently hold an established ConnectionManager.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn cached_pool_cardinality_for_test(&self) -> usize {
+        self.pool
+            .iter()
+            .filter(|slot| slot.connection.load().is_some())
+            .count()
+    }
+
+    /// Round-robin slot indexes that the next `count` hot-path selections would use.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn select_slot_indexes_for_test(&self, count: usize) -> Vec<usize> {
+        (0..count).map(|_| self.select_slot_index()).collect()
+    }
+
+    /// Lazily establish every pool slot. Returns how many slots connected.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub async fn warm_pool_for_test(&self) -> usize {
+        let mut established = 0usize;
+        for idx in 0..self.pool.len() {
+            if self.get_or_connect_slot(idx).await.is_some() {
+                established += 1;
+            }
+        }
+        established
+    }
+
+    /// Clear every cached pool slot (same path as reconnect clearing).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn clear_pool_for_test(&self) {
+        self.clear_connection();
+    }
+
+    /// Establish (or reuse) one round-robin ConnectionManager for tests.
     #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_cached_for_test(&self) -> bool {
         self.get_connection().await.is_some()
@@ -628,6 +739,14 @@ impl RedisRateLimitClient {
     #[allow(dead_code)] // public support used by the external integration-test target
     pub fn connection_manager_timeout_for_test(&self) -> Option<Duration> {
         self.connection_manager_config().connection_timeout()
+    }
+
+    /// Deterministic round-robin index into the connection pool.
+    fn select_slot_index(&self) -> usize {
+        let len = self.pool.len();
+        // pool.len() is always >= 1 (constructor uses pool_size.max(1); admission
+        // rejects zero). Wrapping fetch_add keeps selection lock-free.
+        self.next_slot.fetch_add(1, Ordering::Relaxed) % len
     }
 
     /// Resolve the Redis hostname via the gateway's DNS cache and build the
@@ -746,23 +865,31 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Get or create the Redis connection, establishing it lazily.
+    /// Get or create a Redis connection from the pool, establishing it lazily.
     ///
-    /// Fast path (hot): lock-free `ArcSwap::load()` — O(1) atomic load.
-    /// Slow path (cold): `Mutex`-guarded connection establishment with double-check.
+    /// Fast path (hot): round-robin slot pick + lock-free `ArcSwap::load()`.
+    /// Slow path (cold): per-slot `Mutex`-guarded establishment with double-check.
     async fn get_connection(&self) -> Option<redis::aio::ConnectionManager> {
+        let idx = self.select_slot_index();
+        self.get_or_connect_slot(idx).await
+    }
+
+    /// Establish (or reuse) the ConnectionManager for a specific pool slot.
+    async fn get_or_connect_slot(&self, idx: usize) -> Option<redis::aio::ConnectionManager> {
+        let slot = &self.pool[idx];
+
         // Fast path: lock-free read via ArcSwap
-        let guard = self.connection.load();
+        let guard = slot.connection.load();
         if let Some(ref conn) = **guard {
             return Some(conn.clone());
         }
         drop(guard);
 
-        // Slow path: serialize connection establishment
-        let _lock = self.connect_mutex.lock().await;
+        // Slow path: serialize connection establishment for this slot only
+        let _lock = slot.connect_mutex.lock().await;
 
         // Double-check after acquiring mutex
-        let guard = self.connection.load();
+        let guard = slot.connection.load();
         if let Some(ref conn) = **guard {
             return Some(conn.clone());
         }
@@ -790,6 +917,7 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     redis_url = %self.config.url,
+                    pool_slot = idx,
                     error = %e,
                     "Failed to create Redis client for rate limiting"
                 );
@@ -805,15 +933,18 @@ impl RedisRateLimitClient {
                 info!(
                     redis_url = %self.config.url,
                     key_prefix = %self.config.key_prefix,
+                    pool_slot = idx,
+                    pool_size = self.pool.len(),
                     "Redis rate limiting connected"
                 );
                 self.start_health_checker_if_needed();
-                self.connection.store(Arc::new(Some(manager.clone())));
+                slot.connection.store(Arc::new(Some(manager.clone())));
                 Some(manager)
             }
             Err(ConnectAttemptError::Redis(e)) => {
                 warn!(
                     redis_url = %self.config.url,
+                    pool_slot = idx,
                     error = %e,
                     "Failed to connect to Redis for rate limiting — falling back to local"
                 );
@@ -824,6 +955,7 @@ impl RedisRateLimitClient {
             Err(ConnectAttemptError::Timeout) => {
                 warn!(
                     redis_url = %self.config.url,
+                    pool_slot = idx,
                     timeout_seconds = self.config.connect_timeout_seconds,
                     "Timed out connecting to Redis for rate limiting — falling back to local"
                 );
@@ -837,7 +969,7 @@ impl RedisRateLimitClient {
     /// Create a one-off connection manager that is not stored in the shared hot-path cache.
     ///
     /// Redis transactions that rely on connection-local state (`WATCH`/`MULTI`/`EXEC`)
-    /// must not share the cached multiplexed manager with unrelated concurrent commands,
+    /// must not share the cached multiplexed managers with unrelated concurrent commands,
     /// because another command sequence on that same manager can interleave `UNWATCH` or
     /// `EXEC` and break the optimistic transaction boundary.
     async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager> {
@@ -900,10 +1032,12 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Clear the cached connection so the next `get_connection()` call
-    /// re-resolves DNS and creates a fresh connection.
+    /// Clear every cached pool slot so the next `get_connection()` call
+    /// re-resolves DNS and creates fresh connections.
     fn clear_connection(&self) {
-        self.connection.store(Arc::new(None));
+        for slot in self.pool.iter() {
+            slot.connection.store(Arc::new(None));
+        }
     }
 
     /// Mark Redis as unavailable and clear the connection for re-resolution.
@@ -913,6 +1047,9 @@ impl RedisRateLimitClient {
     }
 
     /// Start a background task that periodically pings Redis to detect recovery.
+    ///
+    /// The task is aborted when this client is dropped so retired plugin
+    /// generations cannot keep dialing obsolete Redis endpoints.
     fn start_health_checker_if_needed(&self) {
         if self.health_checker_started.swap(true, Ordering::Relaxed) {
             return; // Already started
@@ -926,7 +1063,7 @@ impl RedisRateLimitClient {
         let tls_no_verify = self.tls_no_verify;
         let tls_ca_bundle_pem = self.tls_ca_bundle_pem.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
 
@@ -1022,6 +1159,11 @@ impl RedisRateLimitClient {
                 }
             }
         });
+
+        *self
+            .health_checker_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle.abort_handle());
     }
 
     /// Increment a counter and set expiry. Returns the new count.
@@ -1474,29 +1616,41 @@ impl RedisRateLimitClient {
         key
     }
 
+    /// Compute window index and elapsed fraction from the current wall clock.
+    ///
+    /// Both values come from **one** `SystemTime` sample so a boundary straddle
+    /// cannot pair an index from one instant with a fraction from another.
+    pub fn window_progress(window_seconds: u64) -> RedisWindowProgress {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self::window_progress_at(now, window_seconds)
+    }
+
+    /// Deterministic window index / elapsed fraction for a captured epoch offset.
+    ///
+    /// `elapsed_fraction` preserves subsecond precision and stays in `[0, 1)`.
+    pub fn window_progress_at(now: Duration, window_seconds: u64) -> RedisWindowProgress {
+        let window = window_seconds.max(1);
+        let total_nanos = now.as_nanos();
+        let window_nanos = (window as u128).saturating_mul(1_000_000_000);
+        // `window` is at least 1, so `window_nanos` is at least 1e9.
+        let index = (total_nanos / window_nanos) as u64;
+        let elapsed_nanos = total_nanos % window_nanos;
+        let elapsed_fraction = elapsed_nanos as f64 / window_nanos as f64;
+        RedisWindowProgress {
+            index,
+            elapsed_fraction,
+        }
+    }
+
     /// Compute the window index for a given epoch time and window duration.
     ///
-    /// Window index = `epoch_seconds / window_seconds`. All gateway instances
+    /// Window index = `floor(epoch_nanos / window_nanos)`. All gateway instances
     /// sharing the same Redis will use the same window boundaries since they
     /// share the system epoch clock.
     pub fn window_index(window_seconds: u64) -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now / window_seconds.max(1)
-    }
-
-    /// Compute the elapsed fraction within the current window (0.0 to 1.0).
-    ///
-    /// Used for the sliding window weighted approximation.
-    pub fn elapsed_fraction(window_seconds: u64) -> f64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let window = window_seconds.max(1);
-        (now % window) as f64 / window as f64
+        Self::window_progress(window_seconds).index
     }
 
     /// Return the Redis hostname for DNS pre-warming, if applicable.
@@ -1505,10 +1659,23 @@ impl RedisRateLimitClient {
     }
 }
 
+impl Drop for RedisRateLimitClient {
+    fn drop(&mut self) {
+        let abort = match self.health_checker_abort.get_mut() {
+            Ok(slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(abort) = abort {
+            abort.abort();
+        }
+    }
+}
+
 impl std::fmt::Debug for RedisRateLimitClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisRateLimitClient")
             .field("key_prefix", &self.config.key_prefix)
+            .field("pool_size", &self.pool.len())
             .field("available", &self.available.load(Ordering::Relaxed))
             .finish()
     }

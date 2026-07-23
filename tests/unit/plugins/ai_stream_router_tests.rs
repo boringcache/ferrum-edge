@@ -1,6 +1,6 @@
 //! Unit tests for the `ai_stream_router` plugin.
 
-use super::plugin_utils::create_test_proxy;
+use super::plugin_utils::{create_test_proxy, normalize_compressed_request_for_plugin_test};
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::ai_federation::AiFederation;
 use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
@@ -671,6 +671,53 @@ async fn test_route_override_and_metadata_set_for_openai() {
             .map(String::as_str),
         Some("0")
     );
+}
+
+#[tokio::test]
+async fn configured_decompression_routes_compressed_streaming_requests() {
+    let plugin = build(openai_and_anthropic_config());
+    let request = serde_json::to_vec(&json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "route compressed request"}]
+    }))
+    .unwrap();
+
+    for encoding in ["gzip", "br"] {
+        let (mut ctx, mut headers, normalized) = normalize_compressed_request_for_plugin_test(
+            "application/json",
+            "/v1/chat/completions",
+            encoding,
+            &request,
+        )
+        .await;
+        assert_eq!(normalized, request);
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata
+                .get("ai_stream_router_claimed")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_stream_router.provider")
+                .map(String::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            ctx.route_override_backend_host.as_deref(),
+            Some("api.anthropic.com")
+        );
+        assert_eq!(
+            headers.get("x-api-key").map(String::as_str),
+            Some("sk-ant-secret")
+        );
+        assert!(!headers.contains_key("content-encoding"));
+    }
 }
 
 #[tokio::test]
@@ -1559,7 +1606,7 @@ const ANTHROPIC_PARTIAL_SSE: &str = concat!(
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut short\"}}\n\n",
 );
 
-async fn run_sse(body: &str) -> (String, bool) {
+async fn run_sse_bytes(body: &[u8]) -> (String, bool) {
     let plugin = build(openai_and_anthropic_config());
     let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role":"user","content":"hi"}]});
     let mut ctx = post_ctx(&claude);
@@ -1570,7 +1617,7 @@ async fn run_sse(body: &str) -> (String, bool) {
         .expect("inspector");
     let mut collected = Vec::new();
     let mut terminated = false;
-    match inspector.on_chunk(body.as_bytes()).await {
+    match inspector.on_chunk(body).await {
         ResponseStreamAction::Forward(bytes) => collected.extend_from_slice(&bytes),
         ResponseStreamAction::Terminate(bytes) => {
             terminated = true;
@@ -1591,6 +1638,10 @@ async fn run_sse(body: &str) -> (String, bool) {
         }
     }
     (String::from_utf8(collected).unwrap(), terminated)
+}
+
+async fn run_sse(body: &str) -> (String, bool) {
+    run_sse_bytes(body.as_bytes()).await
 }
 
 #[tokio::test]
@@ -1626,6 +1677,50 @@ async fn test_malformed_complete_sse_event_fails_closed() {
     assert!(terminated);
     assert!(out.contains("\"type\":\"upstream_error\""));
     assert!(out.contains("malformed SSE JSON"));
+    assert_eq!(out.matches("data: [DONE]").count(), 1);
+}
+
+#[tokio::test]
+async fn test_known_anthropic_events_cannot_hide_malformed_protocol_data() {
+    let malformed_events = [
+        concat!(
+            "event: content_block_delta\n",
+            "data : {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lost\"}}\n\n",
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lost\"}}\n\n",
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ),
+    ];
+
+    for malformed_event in malformed_events {
+        let body = format!(
+            "{}{}{}",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_bad_protocol\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            malformed_event,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (out, terminated) = run_sse(&body).await;
+        assert!(terminated);
+        assert!(out.contains("\"type\":\"upstream_error\""), "{out}");
+        assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+        assert!(!out.contains("\"content\":\"lost\""), "{out}");
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_utf8_anthropic_event_fails_closed() {
+    let mut body = b"event: content_block_delta\ndata: {".to_vec();
+    body.push(0xff);
+    body.extend_from_slice(b"}\n\n");
+
+    let (out, terminated) = run_sse_bytes(&body).await;
+    assert!(terminated);
+    assert!(out.contains("\"type\":\"upstream_error\""));
     assert_eq!(out.matches("data: [DONE]").count(), 1);
 }
 
@@ -2007,7 +2102,7 @@ async fn test_anthropic_parallel_tool_calls_and_results_preserve_order() {
                     {"id": "call_b", "type": "function", "function": {"name": "beta", "arguments": "{\"x\":1}"}}
                 ]
             },
-            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_a", "content": null},
             {"role": "tool", "tool_call_id": "call_b", "content": "B", "is_error": true}
         ]
     });
@@ -2031,6 +2126,7 @@ async fn test_anthropic_parallel_tool_calls_and_results_preserve_order() {
     let results = parsed["messages"][2]["content"].as_array().unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0]["tool_use_id"], json!("call_a"));
+    assert_eq!(results[0]["content"], json!(""));
     assert_eq!(results[1]["tool_use_id"], json!("call_b"));
     assert_eq!(results[1]["is_error"], json!(true));
 }
