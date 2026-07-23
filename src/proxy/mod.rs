@@ -36501,6 +36501,148 @@ mod tests {
         );
     }
 
+    /// body_validator must release large non-matching responses on the
+    /// reqwest (HTTP/1.1 / H2) path while keeping matching JSON buffered for
+    /// validation. Mirrors the WAF wiring guard for #2323.
+    #[tokio::test]
+    async fn proxy_to_backend_downgrades_irrelevant_body_validator_response() {
+        async fn dispatch_body(
+            state: &ProxyState,
+            proxy: &Proxy,
+            plugins: &[Arc<dyn Plugin>],
+            backend_url: &str,
+        ) -> ResponseBody {
+            let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+            let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let dispatch = proxy_to_backend(
+                state,
+                proxy,
+                backend_url,
+                "GET",
+                &HashMap::new(),
+                ClientRequestBody::Buffered(Vec::new()),
+                None,
+                plugins,
+                &[],
+                PreacquiredBackendAdmission::default(),
+                None,
+                &ctx,
+                false, // stream_response: validator requested buffering pre-flight
+                false,
+                true,
+                false, // retain_request_body (non-retry -> downgrade active)
+                false,
+                "127.0.0.1",
+                "127.0.0.1",
+                false,
+                false,
+                false,
+                false,
+                &bytes_sent,
+                hyper::Version::HTTP_11,
+                &mut std::time::Instant::now(),
+            )
+            .await;
+            let resp = match dispatch {
+                BackendDispatchResult::Response { response, .. } => *response,
+                BackendDispatchResult::AdmissionRejected(_) => {
+                    panic!("test does not configure backend admission plugins")
+                }
+            };
+            resp.body
+        }
+
+        let server = wiremock::MockServer::start().await;
+        // Larger than the eager-buffer cutoff but below the global response
+        // ceiling, so the body type proves whether refinement selected stream.
+        let large_body = vec![0u8; 1_500_000];
+        wiremock::Mock::given(wiremock::matchers::path("/binary"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(large_body.clone()),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(br#"{"id":"ok"}"#.to_vec()),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/grpc"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/grpc")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .mount(&server)
+            .await;
+
+        let mut state = make_test_proxy_state(GatewayConfig::default());
+        state.max_response_body_size_bytes = 2_000_000;
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = server.address().ip().to_string();
+        proxy.backend_port = server.address().port();
+
+        let json_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            crate::plugins::body_validator::BodyValidator::new(&json!({
+                "response_required_fields": ["id"]
+            }))
+            .unwrap(),
+        )];
+
+        let binary = dispatch_body(
+            &state,
+            &proxy,
+            &json_plugins,
+            &format!("{}/binary", server.uri()),
+        )
+        .await;
+        assert!(
+            matches!(binary, ResponseBody::Streaming { .. }),
+            "non-matching image/png above the eager cutoff must stream"
+        );
+
+        let json_body = dispatch_body(
+            &state,
+            &proxy,
+            &json_plugins,
+            &format!("{}/json", server.uri()),
+        )
+        .await;
+        assert!(
+            matches!(json_body, ResponseBody::Buffered(_)),
+            "matching JSON must stay buffered for body_validator"
+        );
+
+        let descriptor = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/test_validator.bin");
+        if descriptor.is_file() {
+            let grpc_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+                crate::plugins::body_validator::BodyValidator::new(&json!({
+                    "protobuf_descriptor_path": descriptor.to_string_lossy(),
+                    "protobuf_response_type": "test.HelloResponse"
+                }))
+                .unwrap(),
+            )];
+            let grpc_body = dispatch_body(
+                &state,
+                &proxy,
+                &grpc_plugins,
+                &format!("{}/grpc", server.uri()),
+            )
+            .await;
+            assert!(
+                matches!(grpc_body, ResponseBody::Buffered(_)),
+                "configured gRPC protobuf responses must stay buffered"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
         let server = wiremock::MockServer::start().await;
@@ -38611,6 +38753,93 @@ mod tests {
             Some(&retry_ctx),
             200,
             &sse_headers,
+        ));
+    }
+
+    #[test]
+    fn refine_stream_response_releases_irrelevant_body_validator_media_types() {
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/download".into());
+        let proxy = test_proxy(ResponseBodyMode::Stream);
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            crate::plugins::body_validator::BodyValidator::new(&json!({
+                "response_required_fields": ["id"]
+            }))
+            .unwrap(),
+        )];
+
+        let png_headers = HashMap::from([("content-type".to_string(), "image/png".to_string())]);
+        let json_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        assert!(
+            refine_stream_response_for_content_type(
+                false,
+                &proxy,
+                &plugins,
+                Some(&ctx),
+                200,
+                &png_headers,
+            ),
+            "body_validator must release non-matching image/png"
+        );
+        assert!(
+            !refine_stream_response_for_content_type(
+                false,
+                &proxy,
+                &plugins,
+                Some(&ctx),
+                200,
+                &json_headers,
+            ),
+            "matching JSON must remain buffered"
+        );
+
+        // Under retries, irrelevant types still release once headers are known.
+        let retry_ctx = retry_response_decision_context(&ctx);
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            Some(&retry_ctx),
+            200,
+            &png_headers,
+        ));
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &plugins,
+            Some(&retry_ctx),
+            200,
+            &json_headers,
+        ));
+
+        // A later Content-Type rewrite keeps the original buffered decision.
+        let rewrite_plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(
+                crate::plugins::body_validator::BodyValidator::new(&json!({
+                    "response_required_fields": ["id"]
+                }))
+                .unwrap(),
+            ),
+            Arc::new(
+                crate::plugins::response_transformer::ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "operation": "update",
+                        "target": "header",
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }]
+                }))
+                .expect("response transformer config should be valid"),
+            ),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &rewrite_plugins,
+            Some(&ctx),
+            200,
+            &png_headers,
         ));
     }
 

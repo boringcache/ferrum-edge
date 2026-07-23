@@ -3434,8 +3434,15 @@ When response validation is configured, request `Accept` and internal streaming
 markers cannot waive it. The plugin buffers conservatively until pristine
 backend headers are known and rejects a genuine `text/event-stream` response
 with HTTP 502 before committing headers, because it has no bounded streaming
-JSON/XML/protobuf validator. Missing, ambiguous, or later-relabeled content
-types remain on the ordinary validation path.
+JSON/XML/protobuf validator. After headers arrive, media types outside the
+configured JSON/XML `response_content_types` (and gRPC responses without
+applicable protobuf response validation) are released to the streaming path so
+large irrelevant downloads are not collected against the response-body limit.
+Matching JSON/XML types and applicable gRPC protobuf responses remain buffered.
+A missing content type stays on the conservative buffered path. Malformed or
+ambiguous values cannot match a configured JSON/XML rule and are released;
+the shared refinement still refuses release when another active plugin may
+rewrite `Content-Type`.
 
 **Supported JSON Schema `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
 
