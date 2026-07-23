@@ -923,6 +923,18 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             .map(String::as_str),
         Some("false")
     );
+    let overflow_log_metadata = clone_log_metadata(&overflow);
+    assert_eq!(
+        overflow_log_metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected"),
+        "staging saturation must remain visible in transaction logs"
+    );
+    assert!(
+        !overflow_log_metadata.contains_key("ai_transcript_audit.candidate"),
+        "internal candidate state must still be removed"
+    );
 
     let peer = AiTranscriptAudit::new(
         &config_with_sink(
@@ -4595,10 +4607,11 @@ async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted(
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
-    let chunks: [&[u8]; 5] = [
+    let chunks: [&[u8]; 6] = [
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will look that up.\"}}]}\n\n",
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_\",\"type\":\"function\",\"function\":{\"name\":\"lookup_\",\"arguments\":\"{\\\"pass\"}},{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"notify\",\"arguments\":\"{\\\"token\\\":\\\"abc\"}}]}}]}\n\n",
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"123\\\"}\"}},{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"customer\",\"arguments\":\"word\\\":\\\"secret-one\\\"}\"}}]}}]}\n\n",
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup_customer\",\"arguments\":\"\"}},{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"notify\",\"arguments\":\"\"}}]}}]}\n\n",
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         b"data: [DONE]\n\n",
     ];
@@ -4692,6 +4705,48 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
     assert!(excerpt.get("completion_text").is_none());
     assert_eq!(excerpt["tool_calls"]["2"][0]["id"], "call_only");
     assert_eq!(excerpt["finish_reason"]["2"], "tool_calls");
+}
+
+#[tokio::test]
+async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"42}\"}}]}}]}\n\ndata: [DONE]\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+
+    let records = wait_for_records(&server).await;
+    let excerpt = records[0]["response_body"]
+        .as_str()
+        .expect("response excerpt");
+    assert!(
+        !excerpt.contains("sse_reassembled"),
+        "ambiguous indexless continuations must not be guessed: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("chat.completion.chunk"),
+        "raw-frame fallback must retain the captured OpenAI frames: {excerpt}"
+    );
 }
 
 #[tokio::test]

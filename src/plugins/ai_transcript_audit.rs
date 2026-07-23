@@ -25,7 +25,7 @@
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
 //! `ai_semantic_firewall` for enforcement.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1618,14 +1618,12 @@ impl Plugin for AiTranscriptAudit {
             // Stream admission above is selective: unsampled successful
             // streams must not consume buffered-response capacity.
             PluginResult::Continue
-        } else if self.buffered_response_capture_wanted(ctx) {
+        } else {
             // Streaming and buffered capture are independent policies. A
             // response that remains JSON still needs the buffered path's
             // admission even when streaming capture is also configured. Both
             // checks reuse the same per-record permit when they select the
             // same eventual audit record.
-            self.ensure_commit_admission(ctx)
-        } else {
             self.ensure_commit_admission(ctx)
         }
     }
@@ -2176,6 +2174,9 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
 
 pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
     let candidate = flag(metadata, MD_CANDIDATE);
+    let saturation_outcome = metadata
+        .get(MD_SINK_STATUS)
+        .is_some_and(|status| matches!(status.as_str(), "dropped" | "rejected"));
     metadata.remove(MD_CANDIDATE);
     metadata.remove(MD_SAMPLE_HIT);
     metadata.remove(MD_STREAM_REQUEST);
@@ -2186,7 +2187,9 @@ pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String
         metadata.remove(MD_SAMPLED);
         metadata.remove(MD_REQUEST_HASH);
         metadata.remove(MD_RESPONSE_HASH);
-        metadata.remove(MD_SINK_STATUS);
+        if !saturation_outcome {
+            metadata.remove(MD_SINK_STATUS);
+        }
     }
 }
 
@@ -2282,6 +2285,7 @@ struct ReassembledChoice {
 fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
     let mut per_choice: BTreeMap<u64, ReassembledChoice> = BTreeMap::new();
+    let mut indexless_tool_call_choices = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
@@ -2319,6 +2323,16 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             }
             if let Some(tool_calls) = delta.get("tool_calls") {
                 let tool_calls = tool_calls.as_array()?;
+                let has_indexless_call = tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.get("index").is_none());
+                if has_indexless_call && !indexless_tool_call_choices.insert(index) {
+                    // Position is only an unambiguous fallback within one
+                    // frame. A later indexless frame could continue any prior
+                    // call, so keep the raw-frame redaction path rather than
+                    // joining potentially unrelated tool calls.
+                    return None;
+                }
                 for (position, tool_call) in tool_calls.iter().enumerate() {
                     let tool_call = tool_call.as_object()?;
                     let tool_index = match tool_call.get("index") {
@@ -2329,12 +2343,12 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                     if let Some(id) = tool_call.get("id")
                         && !id.is_null()
                     {
-                        call.id.push_str(id.as_str()?);
+                        merge_sse_scalar_fragment(&mut call.id, id.as_str()?);
                     }
                     if let Some(call_type) = tool_call.get("type")
                         && !call_type.is_null()
                     {
-                        call.call_type.push_str(call_type.as_str()?);
+                        merge_sse_scalar_fragment(&mut call.call_type, call_type.as_str()?);
                     }
                     if let Some(function) = tool_call.get("function")
                         && !function.is_null()
@@ -2343,7 +2357,7 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                         if let Some(name) = function.get("name")
                             && !name.is_null()
                         {
-                            call.name.push_str(name.as_str()?);
+                            merge_sse_scalar_fragment(&mut call.name, name.as_str()?);
                         }
                         if let Some(arguments) = function.get("arguments")
                             && !arguments.is_null()
@@ -2417,6 +2431,18 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
         annotated.insert("finish_reason".to_string(), Value::Object(finish_reasons));
     }
     Some(Value::Object(annotated))
+}
+
+fn merge_sse_scalar_fragment(target: &mut String, fragment: &str) {
+    if fragment.is_empty() || fragment == target.as_str() || target.ends_with(fragment) {
+        return;
+    }
+    if fragment.starts_with(target.as_str()) {
+        target.clear();
+        target.push_str(fragment);
+    } else {
+        target.push_str(fragment);
+    }
 }
 
 const MAX_JSON_REDACTION_DEPTH: usize = 64;
