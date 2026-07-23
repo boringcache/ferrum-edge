@@ -212,7 +212,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             "tools": { "github.create_pr": { "action": "allow" } }
         }),
         "ai_transcript_audit" => json!({
-            "sink": {"endpoint_url": "http://localhost:9200/audit"}
+            "sink": {"endpoint_url": "https://localhost:9200/audit"}
         }),
         "ldap_auth" => json!({
             "ldap_url": "ldaps://ldap.example.com:636",
@@ -2492,8 +2492,8 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
 }
 
-#[test]
-fn transcript_audit_must_precede_every_request_deduplication_instance() {
+#[tokio::test]
+async fn transcript_audit_must_precede_every_request_deduplication_instance() {
     let audit_config = || {
         make_plugin_config_with_json(
             "audit",

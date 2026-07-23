@@ -1528,7 +1528,7 @@ impl Plugin for AiTranscriptAudit {
         // Staged in `before_proxy`: request transforms may have changed the
         // body since, so refresh the captured hash/excerpt with the final
         // backend-visible bytes.
-        if let Some("true") = ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
+        if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
             self.refresh_staged_request(ctx, body);
             return PluginResult::Continue;
         }
@@ -1594,7 +1594,17 @@ impl Plugin for AiTranscriptAudit {
         {
             // Proxy core cannot apply a fresh reject while replaying hooks over
             // an already-fixed response. Only the explicitly replaceable pass
-            // may perform fail-closed admission here.
+            // may perform fail-closed admission here. Do not retain a
+            // provisional "rejected" status from an earlier admission hook:
+            // that 503 was ignored and the existing response remains selected.
+            if ctx
+                .metadata
+                .get(MD_SINK_STATUS)
+                .is_some_and(|status| status == "rejected")
+            {
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
+            }
             return PluginResult::Continue;
         }
         if self.capture.streaming != StreamingCapture::Off {
