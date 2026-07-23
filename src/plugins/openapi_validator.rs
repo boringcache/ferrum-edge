@@ -1945,6 +1945,16 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
         let Some(name) = params.get("name").filter(|value| !value.is_empty()) else {
             return Err("Malformed multipart part: missing form-data name".to_string());
         };
+        // RFC 7578 form-data uses `filename`; silently treating RFC 2231/5987
+        // extended filename parameters as an ordinary non-file field would
+        // re-enable structured JSON/XML body spoofing. Reject unsupported
+        // extended/continued forms instead of dropping their file semantics.
+        if params.keys().any(|key| key.starts_with("filename*")) {
+            return Err(
+                "Malformed multipart part: extended filename parameters are unsupported"
+                    .to_string(),
+            );
+        }
         if name.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err("Multipart form-data name exceeds size limit".to_string());
         }
