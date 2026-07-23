@@ -7215,6 +7215,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
     if name == "geo_restriction" {
         return geo_restriction::GeoRestriction::validate_config(config);
     }
+    if name == "body_validator" {
+        // Shape-only: CP/admin admission must not require descriptor files
+        // installed on data-plane nodes. Mode-aware dependency validation and
+        // runtime construction handle the local FileDescriptorSet.
+        return body_validator::BodyValidator::validate_config(config);
+    }
     if name == "udp_logging" {
         // Shape-only: shared Admin / CP validation must not open node-local
         // DTLS paths. Mode-aware dependency validation and construction do.

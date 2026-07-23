@@ -8948,16 +8948,18 @@ impl GatewayConfig {
     }
 
     /// Validate file dependencies for plugins that reference external files
-    /// (e.g., geo_restriction `.mmdb` databases, `udp_logging` DTLS sources).
+    /// (e.g., geo_restriction `.mmdb` databases, body_validator protobuf
+    /// descriptors, and `udp_logging` DTLS sources).
     ///
     /// This is separate from `validate_all_fields_with_ip_policy()` so that
     /// each mode can handle missing files independently:
     /// - **File mode**: fatal (bail)
     /// - **DB mode**: warn (data already in DB)
-    /// - **DP mode**: skip (callers omit this phase; node-local material is
-    ///   still checked when the DP constructs the plugin instance)
+    /// - **DP mode**: validate full snapshots and affected incremental rebuilds
+    ///   off the runtime worker; reject invalid updates and retain the live
+    ///   generation
     ///
-    /// Deduplicates paths so each file is checked at most once. Enabled
+    /// Deduplicates paths so each file is read at most once. Enabled
     /// `udp_logging` DTLS validation caches by the full validation-input tuple
     /// (host / no_verify / source paths) so identical rows share one
     /// materialization while still attaching errors per PluginConfig id.
@@ -8994,6 +8996,9 @@ impl GatewayConfig {
     ) -> Vec<String> {
         let mut errors = Vec::new();
         let mut validated_paths = std::collections::HashSet::new();
+        let mut protobuf_descriptor_cache =
+            std::collections::HashMap::<String, Result<prost_reflect::DescriptorPool, String>>::new();
+        let mut reported_protobuf_path_errors = std::collections::HashSet::new();
         // Identical enabled UDP DTLS validation inputs share one materialization
         // (provider/file read) per pass; cached errors are still attached to
         // each affected PluginConfig id.
@@ -9017,6 +9022,35 @@ impl GatewayConfig {
                 }
             {
                 errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+            }
+            if pc.plugin_name == "body_validator" {
+                match crate::plugins::body_validator::protobuf_descriptor_path(&pc.config) {
+                    Ok(Some(path)) => {
+                        let cached = protobuf_descriptor_cache.entry(path.to_string()).or_insert_with(
+                            || crate::plugins::body_validator::load_protobuf_descriptor_pool(path),
+                        );
+                        match cached {
+                            Ok(pool) => {
+                                if let Err(error) =
+                                    crate::plugins::body_validator::validate_protobuf_descriptor_config(
+                                        &pc.config,
+                                        pool,
+                                    )
+                                {
+                                    errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                }
+                            }
+                            Err(error) if reported_protobuf_path_errors.insert(path.to_string()) => {
+                                errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                    }
+                }
             }
             if pc.plugin_name == "mesh_route_dispatch"
                 && let Some(rules) = pc.config.get("rules").and_then(serde_json::Value::as_array)

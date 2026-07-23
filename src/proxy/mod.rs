@@ -8335,17 +8335,25 @@ impl ProxyState {
         // Incremental database and CP/DP deltas stage plugin caches directly
         // on this async call path. Expand the prospective rebuild scope using
         // the same adaptive-concurrency route-definition logic as cache
-        // staging, preload every MMDB that exact scope reconstructs on the
-        // blocking pool, then require the cache stage to claim the handoff
-        // without synchronous file work.
+        // staging, validate every MMDB or body-validator descriptor that exact
+        // scope reconstructs on the blocking pool, then require MMDB cache
+        // staging to claim its validated handoff without synchronous file work.
         let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
         let prospective_proxy_rebuilds =
             prospective_delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
-        if self.plugin_cache.country_mmdb_preload_required(
+        let country_mmdb_preload_required = self.plugin_cache.country_mmdb_preload_required(
             &new_config,
             &prospective_proxy_rebuilds,
             prospective_delta.global_plugin_configs_changed,
-        ) {
+        );
+        let body_validator_descriptor_preload_required = self
+            .plugin_cache
+            .body_validator_descriptor_preload_required(
+                &new_config,
+                &prospective_proxy_rebuilds,
+                prospective_delta.global_plugin_configs_changed,
+            );
+        if country_mmdb_preload_required || body_validator_descriptor_preload_required {
             new_config = match crate::config::validation_pipeline::validate_plugin_file_dependencies_off_thread(
                 new_config,
                 crate::config::validation_pipeline::ValidationAction::Warn,
