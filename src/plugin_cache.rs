@@ -3954,6 +3954,12 @@ impl PluginCache {
         inner: &PluginCacheInner,
         config: &GatewayConfig,
     ) {
+        // Publish chargeback display metadata only after this configuration has
+        // committed. Renderers use this snapshot instead of request completion
+        // order, so a late retired-generation request cannot restore an old
+        // proxy name (issue #2572).
+        crate::plugins::api_chargeback::publish_active_proxy_names(config);
+
         let active_proxy_generations: HashMap<&str, u64> = inner
             .proxy_lifecycle_generations
             .iter()
