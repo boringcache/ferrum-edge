@@ -904,14 +904,23 @@ impl AiTranscriptAudit {
     }
 
     fn discard_staged_candidate(&self, ctx: &mut RequestContext) {
-        if let Some(record_id) = ctx.metadata.get(MD_RECORD_ID) {
-            self.staging.remove(record_id);
-            self.pending_streams.remove(record_id);
+        let removed_staging = ctx
+            .metadata
+            .get(MD_RECORD_ID)
+            .is_some_and(|record_id| {
+                let removed = self.staging.remove(record_id).is_some();
+                self.pending_streams.remove(record_id);
+                removed
+            });
+        // The marker is shared by co-located instances. A saturated instance
+        // that never staged this request must not erase a peer instance's live
+        // candidate and cause its record id to be stripped before logging.
+        if removed_staging || !flag(&ctx.metadata, MD_CANDIDATE) {
+            ctx.metadata
+                .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            ctx.metadata.remove(MD_REQUEST_HASH);
+            ctx.metadata.remove(MD_STREAM_REQUEST);
         }
-        ctx.metadata
-            .insert(MD_CANDIDATE.to_string(), "false".to_string());
-        ctx.metadata.remove(MD_REQUEST_HASH);
-        ctx.metadata.remove(MD_STREAM_REQUEST);
     }
 
     fn shape_body(&self, raw: &[u8], max_bytes: usize) -> (Option<String>, bool) {

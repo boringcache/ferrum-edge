@@ -923,6 +923,46 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             .map(String::as_str),
         Some("false")
     );
+
+    let peer = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut peer_overflow = make_ctx();
+    assert!(matches!(
+        peer.on_final_request_body_with_context(
+            &mut peer_overflow,
+            &headers,
+            ai_request_body(),
+        )
+        .await,
+        PluginResult::Continue
+    ));
+    assert!(peer.forces_reqwest_dispatch(&peer_overflow));
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut peer_overflow, &headers, ai_request_body())
+        .await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert_eq!(
+        peer_overflow
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a saturated instance must not erase a peer instance's staged candidate"
+    );
+    assert!(peer.forces_reqwest_dispatch(&peer_overflow));
 }
 
 // ---------------------------------------------------------------------------
