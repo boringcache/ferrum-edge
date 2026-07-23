@@ -437,6 +437,7 @@ async fn test_shared_client_does_not_follow_redirects() {
 
 #[tokio::test]
 async fn get_http2_companion_speaks_h2c_prior_knowledge() {
+    use bytes::Bytes;
     use h2::server as h2_server;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
