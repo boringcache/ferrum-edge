@@ -264,6 +264,7 @@ pub struct RequestMirror {
 }
 
 impl RequestMirror {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
     }
