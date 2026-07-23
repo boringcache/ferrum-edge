@@ -3188,7 +3188,10 @@ async fn test_binary_only_normalization_refreshes_bytes_without_materializing_te
 
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(body, plaintext);
-    assert_eq!(ctx.request_body_bytes.as_deref(), Some(plaintext.as_slice()));
+    assert_eq!(
+        ctx.request_body_bytes.as_deref(),
+        Some(plaintext.as_slice())
+    );
     assert!(!ctx.metadata.contains_key("request_body"));
     assert_eq!(ctx.request_body_sha256, Some([0x25; 32]));
     assert_eq!(ctx.request_body_sha512, Some([0x51; 64]));
@@ -3841,8 +3844,14 @@ async fn test_before_proxy_without_buffered_body_preserves_encoded_representatio
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(headers.get("content-encoding").map(String::as_str), Some("gzip"));
-    assert_eq!(headers.get("content-length").map(String::as_str), Some("42"));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some("42")
+    );
     assert!(
         plugin
             .transform_request_body_with_context(&mut ctx, b"encoded", None, &headers)
