@@ -3197,10 +3197,10 @@ async fn test_binary_only_normalization_refreshes_bytes_without_materializing_te
     assert_eq!(ctx.request_body_sha512, Some([0x51; 64]));
 }
 
-// ────────────────────── before_proxy: request decompression header cleanup ─
+// ────────────────────── before_proxy: request decompression header safety ─
 
 #[tokio::test]
-async fn test_before_proxy_strips_content_encoding_for_decompression() {
+async fn test_before_proxy_preserves_encoded_headers_without_body_view() {
     let plugin = make_plugin(json!({"decompress_request": true}));
     let mut ctx = make_ctx(Some("gzip"));
     let mut headers = HashMap::new();
@@ -3209,12 +3209,9 @@ async fn test_before_proxy_strips_content_encoding_for_decompression() {
 
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert!(!headers.contains_key("content-encoding"));
-    assert!(!headers.contains_key("content-length"));
-    assert_eq!(
-        ctx.metadata.get("compression:request_encoding").unwrap(),
-        "gzip"
-    );
+    assert_eq!(headers.get("content-encoding").map(String::as_str), Some("gzip"));
+    assert_eq!(headers.get("content-length").map(String::as_str), Some("42"));
+    assert!(!ctx.metadata.contains_key("compression:request_encoding"));
 }
 
 // ────────────────────── End-to-end: full lifecycle ──────────────────────
