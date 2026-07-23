@@ -904,14 +904,11 @@ impl AiTranscriptAudit {
     }
 
     fn discard_staged_candidate(&self, ctx: &mut RequestContext) {
-        let removed_staging = ctx
-            .metadata
-            .get(MD_RECORD_ID)
-            .is_some_and(|record_id| {
-                let removed = self.staging.remove(record_id).is_some();
-                self.pending_streams.remove(record_id);
-                removed
-            });
+        let removed_staging = ctx.metadata.get(MD_RECORD_ID).is_some_and(|record_id| {
+            let removed = self.staging.remove(record_id).is_some();
+            self.pending_streams.remove(record_id);
+            removed
+        });
         // The marker is shared by co-located instances. A saturated instance
         // that never staged this request must not erase a peer instance's live
         // candidate and cause its record id to be stripped before logging.

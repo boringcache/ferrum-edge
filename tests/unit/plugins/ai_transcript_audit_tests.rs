@@ -934,12 +934,8 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
     .unwrap();
     let mut peer_overflow = make_ctx();
     assert!(matches!(
-        peer.on_final_request_body_with_context(
-            &mut peer_overflow,
-            &headers,
-            ai_request_body(),
-        )
-        .await,
+        peer.on_final_request_body_with_context(&mut peer_overflow, &headers, ai_request_body(),)
+            .await,
         PluginResult::Continue
     ));
     assert!(peer.forces_reqwest_dispatch(&peer_overflow));
