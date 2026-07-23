@@ -447,7 +447,10 @@ async fn sink_snapshot_records_exactly_one_charge_across_mirror_outcomes() {
         .unwrap(),
     );
     plugin.start_background_tasks().expect("stage sink");
-    plugin.commit_background_tasks();
+    // Keep the staged snapshot worker behind its commit gate while this test
+    // inspects the accumulator directly. Tokio intervals tick immediately on
+    // first poll, so committing here would race the worker's own delta export
+    // against the deterministic assertion below.
     let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
     let accumulator = api_chargeback_sink_snapshot_accumulator_for_test(&plugin)
         .expect("snapshot mode must activate an accumulator");
