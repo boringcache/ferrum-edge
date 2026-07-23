@@ -20433,7 +20433,9 @@ components:
         must not exceed 600000 ms;
         nonempty `password_ref` must name a set `FERRUM_*` process environment
         variable; spool directory privacy/permissions
-        (`ensure_private_dir`); ClickHouse URL egress IP screening; and
+        (`ensure_private_dir`); ClickHouse URL egress IP screening;
+        `wait_for_async_insert` falsy values require
+        `clickhouse.allow_lossy_async_insert=true`; and
         whitespace-only trimming for `currency` / `pricing_version` /
         `password_ref`. File, Admin, and CP-DP admission all invoke the same
         plugin constructor validation path.
@@ -20672,7 +20674,25 @@ components:
               additionalProperties:
                 type: string
               default: {}
-              description: Extra query parameters appended to the ClickHouse INSERT request, such as async_insert.
+              description: |
+                Extra query parameters appended to the ClickHouse INSERT request.
+                Durable mode rejects `wait_for_async_insert` values that disable
+                persistence waits (`0`, `false`, `no`, `off`) unless
+                `allow_lossy_async_insert` is true. Recommended durable settings
+                use `async_insert=1` with `wait_for_async_insert=1`. When
+                `async_insert` is enabled and the wait setting is omitted, the
+                sink pins `wait_for_async_insert=1` rather than inheriting the
+                ClickHouse user/profile default.
+            allow_lossy_async_insert:
+              type: boolean
+              default: false
+              description: |
+                Explicit fire-and-forget opt-in. When true, permits
+                `insert_query_params.wait_for_async_insert=0` (and equivalent
+                falsy values). ClickHouse may acknowledge buffered inserts before
+                persistence; spool deletion still follows a complete
+                exception-free HTTP acknowledgement, which is not a durability
+                proof in this mode. Default false keeps the durable contract.
             timeout_ms:
               type: integer
               minimum: 1
