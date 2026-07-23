@@ -5,7 +5,8 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
     HTTP_GRPC_PROTOCOLS, MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult,
-    RequestContext, TransactionSummary, create_plugin, log_with_mirror, priority,
+    RequestContext, TransactionSummary, create_plugin,
+    create_plugin_with_http_client_and_config_id, log_with_mirror, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -73,7 +74,7 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![logger.clone()];
     let mut ctx = make_ctx();
     let (tx, rx) = tokio::sync::watch::channel(None);
-    ctx.mirror_result_rx = Some(rx);
+    ctx.push_mirror_result_rx(rx);
     let summary = TransactionSummary {
         response_status_code: 200,
         ..TransactionSummary::default()
@@ -88,6 +89,7 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
     assert_eq!(logger.summaries.lock().unwrap().len(), 1);
 
     tx.send(Some(MirrorResponseMeta {
+        mirror_plugin_id: Some("mirror-a".to_string()),
         mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
         mirror_response_status_code: Some(204),
         mirror_response_size_bytes: Some(0),
@@ -113,6 +115,93 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
     assert_eq!(summaries[1].response_status_code, 204);
 }
 
+#[tokio::test]
+async fn multiple_mirror_results_log_independently_in_completion_order() {
+    let logger = Arc::new(CapturingMirrorLogger {
+        summaries: Mutex::new(Vec::new()),
+    });
+    let plugins: Vec<Arc<dyn Plugin>> = vec![logger.clone()];
+    let mut ctx = make_ctx();
+    let mut publishers = Vec::new();
+    for id in ["mirror-a", "mirror-b", "mirror-c"] {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        ctx.push_mirror_result_rx(rx);
+        publishers.push((id, tx));
+    }
+    assert_eq!(ctx.mirror_result_rxs.len(), 3);
+    assert_eq!(
+        ctx.clone().mirror_result_rxs.len(),
+        3,
+        "detached deadline logging clones must preserve mirror receivers"
+    );
+
+    let summary = TransactionSummary {
+        response_status_code: 200,
+        ..TransactionSummary::default()
+    };
+    log_with_mirror(&plugins, &summary, &ctx).await;
+    assert_eq!(logger.summaries.lock().unwrap().len(), 1);
+
+    for (index, status, error) in [
+        (2usize, None, Some("connection refused")),
+        (0usize, Some(204u16), None),
+        (1usize, Some(201u16), None),
+    ] {
+        let (id, tx) = &publishers[index];
+        tx.send(Some(MirrorResponseMeta {
+            mirror_plugin_id: Some((*id).to_string()),
+            mirror_target_url: format!("http://{id}.example/shadow"),
+            mirror_response_status_code: status,
+            mirror_response_size_bytes: status.map(|_| 0),
+            mirror_latency_ms: 1.0,
+            mirror_error: error.map(str::to_string),
+        }))
+        .expect("detached collector must retain every receiver");
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if logger.summaries.lock().unwrap().len() == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all three mirror summaries must be logged");
+
+    let summaries = logger.summaries.lock().unwrap();
+    let mut outcomes = summaries
+        .iter()
+        .filter(|entry| entry.mirror)
+        .map(|entry| {
+            (
+                entry
+                    .metadata
+                    .get("mirror_plugin_id")
+                    .cloned()
+                    .expect("mirror instance id"),
+                entry.response_status_code,
+                entry.metadata.get("mirror_error").cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    outcomes.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        outcomes,
+        vec![
+            ("mirror-a".to_string(), 204, None),
+            ("mirror-b".to_string(), 201, None),
+            (
+                "mirror-c".to_string(),
+                0,
+                Some("connection refused".to_string())
+            ),
+        ]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn mirror_results_before_at_and_after_five_seconds_remain_observable() {
     let logger = Arc::new(CapturingMirrorLogger {
@@ -130,11 +219,12 @@ async fn mirror_results_before_at_and_after_five_seconds_remain_observable() {
     {
         let mut ctx = make_ctx_with_proxy_timeout(proxy_timeout_ms);
         let (tx, rx) = tokio::sync::watch::channel(None);
-        ctx.mirror_result_rx = Some(rx);
+        ctx.push_mirror_result_rx(rx);
         log_with_mirror(&plugins, &summary, &ctx).await;
         publishers.push(tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
             tx.send(Some(MirrorResponseMeta {
+                mirror_plugin_id: Some(format!("mirror-{status}")),
                 mirror_target_url: format!("http://mirror.local/result-{status}"),
                 mirror_response_status_code: Some(status),
                 mirror_response_size_bytes: Some(0),
@@ -203,7 +293,7 @@ async fn max_in_flight_drop_emits_explicit_mirror_result() {
         .mount(&server)
         .await;
     let server_url = url::Url::parse(&server.uri()).unwrap();
-    let plugin = RequestMirror::new(
+    let plugin = RequestMirror::new_with_config_id(
         &json!({
             "mirror_host": server_url.host_str().unwrap(),
             "mirror_port": server_url.port().unwrap(),
@@ -212,6 +302,7 @@ async fn max_in_flight_drop_emits_explicit_mirror_result() {
             "mirror_request_body": false
         }),
         PluginHttpClient::default(),
+        Some("saturated-mirror"),
     )
     .unwrap();
 
@@ -239,6 +330,65 @@ async fn max_in_flight_drop_emits_explicit_mirror_result() {
             .is_some_and(|error| error.contains("max_in_flight")),
         "unexpected drop metadata: {meta:?}"
     );
+    assert_eq!(
+        meta.mirror_plugin_id.as_deref(),
+        Some("saturated-mirror"),
+        "saturation outcomes must remain attributable to the selected instance"
+    );
+}
+
+#[tokio::test]
+async fn configured_instances_append_results_while_sampled_out_instance_adds_none() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let server_url = url::Url::parse(&server.uri()).unwrap();
+    let make_plugin = |id: &'static str, percentage: u64| {
+        create_plugin_with_http_client_and_config_id(
+            "request_mirror",
+            &json!({
+                "mirror_host": server_url.host_str().unwrap(),
+                "mirror_port": server_url.port().unwrap(),
+                "percentage": percentage,
+                "mirror_request_body": false
+            }),
+            PluginHttpClient::default(),
+            Some(id),
+        )
+        .unwrap()
+        .expect("request_mirror plugin")
+    };
+    let mirror_a = make_plugin("mirror-a", 100);
+    let sampled_out = make_plugin("mirror-sampled-out", 0);
+    let mirror_b = make_plugin("mirror-b", 100);
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+
+    plugin_utils::assert_continue(mirror_a.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(sampled_out.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(mirror_b.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.mirror_result_rxs.len(),
+        2,
+        "only the two dispatched instances should allocate result slots"
+    );
+
+    let mut ids = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ctx.collect_mirror_results(),
+    )
+    .await
+    .expect("both mirror requests must complete")
+    .into_iter()
+    .map(|result| result.mirror_plugin_id.expect("plugin config id"))
+    .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec!["mirror-a".to_string(), "mirror-b".to_string()]);
 }
 
 #[tokio::test]
@@ -247,6 +397,7 @@ async fn closed_task_channel_returns_seeded_failure_result() {
     // stays observable through the seeded watch-channel fallback.
     let mut ctx = make_ctx_with_proxy();
     let fallback = MirrorResponseMeta {
+        mirror_plugin_id: Some("cancelled-mirror".to_string()),
         mirror_target_url: "http://mirror.local/cancelled".to_string(),
         mirror_response_status_code: None,
         mirror_response_size_bytes: None,
@@ -254,7 +405,7 @@ async fn closed_task_channel_returns_seeded_failure_result() {
         mirror_error: Some("mirror task ended before publishing a result".to_string()),
     };
     let (tx, rx) = tokio::sync::watch::channel(Some(fallback));
-    ctx.mirror_result_rx = Some(rx);
+    ctx.push_mirror_result_rx(rx);
     drop(tx);
 
     let meta = ctx
@@ -332,6 +483,7 @@ fn test_mirror_summary_uses_its_own_terminal_outcome() {
         .insert("rejection_phase".to_string(), "primary".to_string());
 
     let successful_mirror = primary.as_mirror_entry(MirrorResponseMeta {
+        mirror_plugin_id: Some("mirror-success".to_string()),
         mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
         mirror_response_status_code: Some(204),
         mirror_response_size_bytes: Some(0),
@@ -342,6 +494,13 @@ fn test_mirror_summary_uses_its_own_terminal_outcome() {
     assert!(!successful_mirror.is_terminal_failure());
     assert!(!successful_mirror.metadata.contains_key("grpc_message"));
     assert!(!successful_mirror.metadata.contains_key("rejection_phase"));
+    assert_eq!(
+        successful_mirror
+            .metadata
+            .get("mirror_plugin_id")
+            .map(String::as_str),
+        Some("mirror-success")
+    );
     let successful_json = serde_json::to_value(&successful_mirror).unwrap();
     assert!(successful_json.get("grpc_status").is_none());
 
@@ -350,6 +509,7 @@ fn test_mirror_summary_uses_its_own_terminal_outcome() {
         .insert("grpc_status".to_string(), "0".to_string());
     primary.metadata.remove("rejection_phase");
     let failed_mirror = primary.as_mirror_entry(MirrorResponseMeta {
+        mirror_plugin_id: Some("mirror-failure".to_string()),
         mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
         mirror_response_status_code: None,
         mirror_response_size_bytes: None,
@@ -444,6 +604,21 @@ fn test_missing_mirror_host_is_error() {
     let result = RequestMirror::new(&json!({}), PluginHttpClient::default());
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("mirror_host"));
+}
+
+#[test]
+fn test_blank_plugin_config_id_is_error() {
+    let error = RequestMirror::new_with_config_id(
+        &json!({ "mirror_host": "mirror.local" }),
+        PluginHttpClient::default(),
+        Some("  "),
+    )
+    .err()
+    .expect("supplied plugin identity must fail closed when blank");
+    assert!(
+        error.contains("plugin_config_id"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -893,7 +1068,7 @@ async fn test_before_proxy_without_matched_proxy_uses_default_timeout() {
 //
 // Selection is a deterministic Bresenham phase accumulator at 0.1% granularity.
 // Tests below observe actual selection decisions via `should_mirror()` and via
-// `ctx.mirror_result_rx` (dispatch), never merely `PluginResult::Continue`.
+// `ctx.mirror_result_rxs` (dispatch), never merely `PluginResult::Continue`.
 
 const SAMPLE_PERIOD: u64 = 1000;
 
@@ -1146,14 +1321,14 @@ fn test_sampling_concurrent_calls_preserve_exact_cycle_count() {
 
 #[tokio::test]
 async fn test_sampling_dispatch_observes_selection_not_just_continue() {
-    // 0%: before_proxy always Continues and must NOT arm mirror_result_rx.
+    // 0%: before_proxy always Continues and must NOT arm a mirror result slot.
     let zero = mirror_plugin(0.0);
     for _ in 0..32 {
         let mut ctx = make_ctx();
         let mut headers = HashMap::new();
         plugin_utils::assert_continue(zero.before_proxy(&mut ctx, &mut headers).await);
         assert!(
-            ctx.mirror_result_rx.is_none(),
+            ctx.mirror_result_rxs.is_empty(),
             "0% must not dispatch a mirror"
         );
     }
@@ -1165,13 +1340,13 @@ async fn test_sampling_dispatch_observes_selection_not_just_continue() {
         let mut headers = HashMap::new();
         plugin_utils::assert_continue(full.before_proxy(&mut ctx, &mut headers).await);
         assert!(
-            ctx.mirror_result_rx.is_some(),
+            ctx.mirror_result_rxs.len() == 1,
             "100% must dispatch a mirror"
         );
     }
 
     // Sequence agreement: before_proxy dispatch must match should_mirror() for
-    // the same fresh phase, observed via mirror_result_rx (not merely Continue).
+    // the same fresh phase, observed via mirror_result_rxs (not merely Continue).
     // Use 1% over one cycle (10 dispatches) so the test stays light.
     let expected = collect_selections(&mirror_plugin(1.0), SAMPLE_PERIOD as usize);
     assert_eq!(selection_count(&expected), 10);
@@ -1186,7 +1361,7 @@ async fn test_sampling_dispatch_observes_selection_not_just_continue() {
         let mut ctx = make_ctx();
         let mut headers = HashMap::new();
         plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-        let did_dispatch = ctx.mirror_result_rx.is_some();
+        let did_dispatch = !ctx.mirror_result_rxs.is_empty();
         assert_eq!(
             did_dispatch, *expect,
             "before_proxy dispatch diverged from should_mirror at index {i}"
@@ -1347,6 +1522,209 @@ async fn test_backend_path_policy_mirror_uses_authorized_effective_path() {
     );
 }
 
+#[tokio::test]
+async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = mpsc::channel::<String>(3);
+    tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tx.send(String::from_utf8_lossy(&request).into_owned())
+                .await
+                .unwrap();
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    });
+
+    let route = create_plugin(
+        "mesh_route_dispatch",
+        &json!({
+            "rules": [
+                {
+                    "match": {
+                        "uri": {"exact": "/legacy"},
+                        "methods": ["POST"]
+                    },
+                    "destination": {
+                        "backend_host": "primary.internal",
+                        "backend_port": 8080
+                    },
+                    "rewrite": {
+                        "uri": "/exact-shadow",
+                        "authority": "exact.internal"
+                    }
+                },
+                {
+                    "match": {
+                        "uri": {"prefix": "/api"},
+                        "methods": ["POST"]
+                    },
+                    "destination": {
+                        "backend_host": "primary.internal",
+                        "backend_port": 8080
+                    },
+                    "rewrite": {
+                        "uri": "/mesh-rewritten",
+                        "match_prefix": "/api",
+                        "authority": "internal.example.com:8443"
+                    }
+                }
+            ]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let route_mirror = RequestMirror::new_with_config_id(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "percentage": 100,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+        Some("mesh-route-shadow"),
+    )
+    .unwrap();
+    let explicit_mirror = RequestMirror::new_with_config_id(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_path": "/operator-shadow",
+            "percentage": 100,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+        Some("explicit-path-shadow"),
+    )
+    .unwrap();
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::from([
+        ("host".to_string(), "public.example.com".to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+    ]);
+
+    plugin_utils::assert_continue(route.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.route_override_path.as_deref(),
+        Some("/mesh-rewritten/users")
+    );
+    assert_eq!(
+        ctx.route_override_authority.as_deref(),
+        Some("internal.example.com:8443")
+    );
+    plugin_utils::assert_continue(route_mirror.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(explicit_mirror.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(ctx.mirror_result_rxs.len(), 2);
+
+    let mut exact_ctx = make_ctx_with_proxy();
+    exact_ctx.path = "/legacy".to_string();
+    let mut exact_headers = HashMap::from([("host".to_string(), "public.example.com".to_string())]);
+    plugin_utils::assert_continue(route.before_proxy(&mut exact_ctx, &mut exact_headers).await);
+    assert_eq!(
+        exact_ctx.route_override_path.as_deref(),
+        Some("/exact-shadow")
+    );
+    assert_eq!(
+        exact_ctx.route_override_authority.as_deref(),
+        Some("exact.internal")
+    );
+    plugin_utils::assert_continue(
+        route_mirror
+            .before_proxy(&mut exact_ctx, &mut exact_headers)
+            .await,
+    );
+    assert_eq!(exact_ctx.mirror_result_rxs.len(), 1);
+
+    let requests = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut requests = Vec::new();
+        while let Some(request) = rx.recv().await {
+            requests.push(request);
+            if requests.len() == 3 {
+                break;
+            }
+        }
+        requests
+    })
+    .await
+    .expect("all three mirror requests must arrive");
+    assert!(
+        requests.iter().any(|request| {
+            request.starts_with("POST /mesh-rewritten/users?page=1 HTTP/1.1\r\n")
+        }),
+        "an unset mirror_path must use the selected mesh route URI: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("POST /operator-shadow?page=1 HTTP/1.1\r\n")),
+        "explicit mirror_path must win over the mesh route rewrite: {requests:?}"
+    );
+    assert!(
+        requests.iter().any(|request| {
+            request.starts_with("POST /exact-shadow?page=1 HTTP/1.1\r\n")
+                && request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("host: exact.internal-shadow"))
+        }),
+        "exact route rewrite must replace the whole path and shadow its bare authority: \
+         {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| !request.starts_with("POST /exact-shadow"))
+            .all(|request| {
+                request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("host: internal.example.com-shadow:8443"))
+            }),
+        "each prefix-route mirror must carry the rewritten shadow authority: {requests:?}"
+    );
+
+    let mut ids = ctx
+        .collect_mirror_results()
+        .await
+        .into_iter()
+        .map(|meta| meta.mirror_plugin_id.expect("mirror plugin id"))
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "explicit-path-shadow".to_string(),
+            "mesh-route-shadow".to_string()
+        ]
+    );
+    let exact_ids = exact_ctx
+        .collect_mirror_results()
+        .await
+        .into_iter()
+        .map(|meta| meta.mirror_plugin_id.expect("mirror plugin id"))
+        .collect::<Vec<_>>();
+    assert_eq!(exact_ids, vec!["mesh-route-shadow".to_string()]);
+}
+
 // ---------------------------------------------------------------------------
 // Mirror transaction summary serialization
 // ---------------------------------------------------------------------------
@@ -1411,7 +1789,7 @@ async fn test_mirror_uses_binary_body_bytes_over_metadata() {
 
     // Mirror result receiver should be set (mirror was dispatched)
     assert!(
-        ctx.mirror_result_rx.is_some(),
+        ctx.mirror_result_rxs.len() == 1,
         "Mirror should be dispatched even with binary body"
     );
 }
@@ -1442,7 +1820,7 @@ async fn test_mirror_falls_back_to_metadata_when_no_body_bytes() {
     plugin_utils::assert_continue(result);
 
     assert!(
-        ctx.mirror_result_rx.is_some(),
+        ctx.mirror_result_rxs.len() == 1,
         "Mirror should be dispatched using metadata fallback"
     );
 }

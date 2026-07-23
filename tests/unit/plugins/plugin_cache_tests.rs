@@ -2626,6 +2626,65 @@ async fn serverless_instances_keep_independent_transaction_metadata() {
     );
 }
 
+#[tokio::test]
+async fn request_mirror_cache_construction_preserves_plugin_config_id() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let server_url = url::Url::parse(&server.uri()).expect("mirror URL");
+    let proxy = make_proxy("p1", "/api", vec!["mirror-stable-id"]);
+    let config = make_config(
+        vec![proxy.clone()],
+        vec![make_plugin_config_with_json(
+            "mirror-stable-id",
+            "request_mirror",
+            json!({
+                "mirror_host": server_url.host_str().expect("mirror host"),
+                "mirror_port": server_url.port().expect("mirror port"),
+                "percentage": 100,
+                "mirror_request_body": false
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("request mirror cache");
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let mirror = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "request_mirror")
+        .expect("request mirror plugin");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/widgets".to_string(),
+    );
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    let mut headers = HashMap::new();
+
+    assert!(matches!(
+        mirror.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ctx.collect_mirror_result(),
+    )
+    .await
+    .expect("mirror completion")
+    .expect("mirror metadata");
+    assert_eq!(
+        result.mirror_plugin_id.as_deref(),
+        Some("mirror-stable-id"),
+        "production PluginCache must pass the stable resource id"
+    );
+}
+
 #[test]
 fn serverless_body_egress_rejects_request_body_transform_composition() {
     let mut transform_cases = vec![

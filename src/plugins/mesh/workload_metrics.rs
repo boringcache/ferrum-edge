@@ -2345,6 +2345,7 @@ mod tests {
         metrics
             .log(
                 &summary.as_mirror_entry(crate::plugins::MirrorResponseMeta {
+                    mirror_plugin_id: Some("request-mirror-test".to_string()),
                     mirror_target_url: "https://mirror.example".to_string(),
                     mirror_response_status_code: Some(200),
                     mirror_response_size_bytes: Some(0),
