@@ -551,8 +551,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
     assert_eq!(status_while_staged["instance_count"], 1);
     assert_eq!(
-        status_while_staged["instances"][0]["pricing_version"]
-            .as_str(),
+        status_while_staged["instances"][0]["pricing_version"].as_str(),
         Some("test-v1"),
         "uncommitted staged activation must not replace the live sink"
     );
@@ -561,8 +560,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
     assert_eq!(status_after_staged_drop["instance_count"], 1);
     assert_eq!(
-        status_after_staged_drop["instances"][0]["pricing_version"]
-            .as_str(),
+        status_after_staged_drop["instances"][0]["pricing_version"].as_str(),
         Some("test-v1"),
         "dropping a rejected staged sink must preserve live diagnostics"
     );
@@ -578,9 +576,11 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         "drop must clear ACTIVE_SINKS owned by this instance"
     );
     assert_eq!(status_after["instance_count"], 0);
-    assert!(status_after["instances"]
-        .as_array()
-        .is_some_and(|instances| instances.is_empty()));
+    assert!(
+        status_after["instances"]
+            .as_array()
+            .is_some_and(|instances| instances.is_empty())
+    );
     assert_eq!(status_after["totals"]["export"]["events_enqueued_total"], 0);
 }
 
@@ -1157,16 +1157,20 @@ async fn chargeback_two_accepted_instances_render_deterministically() {
     assert_eq!(status["instance_count"], 2);
     let ids = status_instance_ids(&status);
     assert_eq!(
-        ids.iter()
-            .map(|(id, _)| id.as_str())
-            .collect::<Vec<_>>(),
+        ids.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
         vec!["sink-alpha", "sink-bravo"],
         "instances must render in ascending plugin_config_id order: {ids:?}"
     );
     assert_eq!(status["instances"][0]["pricing_version"], "pricing-alpha");
     assert_eq!(status["instances"][1]["pricing_version"], "pricing-bravo");
-    assert_eq!(status["instances"][0]["clickhouse"]["table"], "charges_alpha");
-    assert_eq!(status["instances"][1]["clickhouse"]["table"], "charges_bravo");
+    assert_eq!(
+        status["instances"][0]["clickhouse"]["table"],
+        "charges_alpha"
+    );
+    assert_eq!(
+        status["instances"][1]["clickhouse"]["table"],
+        "charges_bravo"
+    );
 
     let gen_a = a.active_generation().expect("alpha generation");
     let gen_b = b.active_generation().expect("bravo generation");
@@ -1247,11 +1251,15 @@ async fn chargeback_removing_either_instance_preserves_sibling() {
     );
     let prom = api_chargeback_sink::render_prometheus();
     assert!(
-        !prom.contains(&format!("plugin_config_id=\"sink-one\",generation=\"{gen_one}\"")),
+        !prom.contains(&format!(
+            "plugin_config_id=\"sink-one\",generation=\"{gen_one}\""
+        )),
         "removed instance must leave no labeled series"
     );
     assert!(
-        prom.contains(&format!("plugin_config_id=\"sink-two\",generation=\"{gen_two}\"")),
+        prom.contains(&format!(
+            "plugin_config_id=\"sink-two\",generation=\"{gen_two}\""
+        )),
         "sibling labeled series must remain"
     );
 
@@ -1263,7 +1271,9 @@ async fn chargeback_removing_either_instance_preserves_sibling() {
         Some("sink-one"),
     )
     .expect("one again");
-    first_again.start_background_tasks().expect("start one again");
+    first_again
+        .start_background_tasks()
+        .expect("start one again");
     first_again.commit_background_tasks();
     let gen_one_again = first_again.active_generation().expect("gen one again");
     assert_ne!(gen_one_again, gen_one);
@@ -1322,7 +1332,10 @@ async fn chargeback_validation_while_live_sink_preserves_status() {
     let after_pipeline: Value =
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
     assert_eq!(after_pipeline["instance_count"], 1);
-    assert_eq!(after_pipeline["instances"][0]["plugin_config_id"], "sink-live");
+    assert_eq!(
+        after_pipeline["instances"][0]["plugin_config_id"],
+        "sink-live"
+    );
     assert_eq!(after_pipeline["instances"][0]["generation"], live_gen);
 
     drop(live);

@@ -1317,20 +1317,27 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>) 
                 .queue_high_water_hits_total
                 .load(Ordering::Relaxed),
         );
-        events_enqueued = events_enqueued
-            .saturating_add(runtime.metrics.events_enqueued_total.load(Ordering::Relaxed));
-        events_exported = events_exported
-            .saturating_add(runtime.metrics.events_exported_total.load(Ordering::Relaxed));
-        failures =
-            failures.saturating_add(runtime.metrics.failures_total.load(Ordering::Relaxed));
+        events_enqueued = events_enqueued.saturating_add(
+            runtime
+                .metrics
+                .events_enqueued_total
+                .load(Ordering::Relaxed),
+        );
+        events_exported = events_exported.saturating_add(
+            runtime
+                .metrics
+                .events_exported_total
+                .load(Ordering::Relaxed),
+        );
+        failures = failures.saturating_add(runtime.metrics.failures_total.load(Ordering::Relaxed));
         spool_prepare_failures = spool_prepare_failures.saturating_add(
             runtime
                 .metrics
                 .spool_prepare_failures_total
                 .load(Ordering::Relaxed),
         );
-        spool_drops = spool_drops
-            .saturating_add(runtime.metrics.spool_drops_total.load(Ordering::Relaxed));
+        spool_drops =
+            spool_drops.saturating_add(runtime.metrics.spool_drops_total.load(Ordering::Relaxed));
         if let Some(spool) = runtime.spool.as_ref() {
             spool_enabled_any = true;
             let stats = spool.scan_stats().unwrap_or_default();
@@ -1505,9 +1512,7 @@ impl SinkRuntime {
         ));
         output.push_str(&format!(
             "chargeback_sink_spool_prepare_failures_total{{{labels}}} {}\n",
-            metrics
-                .spool_prepare_failures_total
-                .load(Ordering::Relaxed)
+            metrics.spool_prepare_failures_total.load(Ordering::Relaxed)
         ));
         for (idx, bucket) in metrics.latency.buckets.iter().enumerate() {
             let cumulative = metrics.latency.counts[idx].load(Ordering::Relaxed);
@@ -1570,8 +1575,8 @@ fn render_prometheus_for_sinks(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>
             events_enqueued.saturating_add(metrics.events_enqueued_total.load(Ordering::Relaxed));
         events_exported =
             events_exported.saturating_add(metrics.events_exported_total.load(Ordering::Relaxed));
-        failure_network = failure_network
-            .saturating_add(metrics.failure_reasons.network.load(Ordering::Relaxed));
+        failure_network =
+            failure_network.saturating_add(metrics.failure_reasons.network.load(Ordering::Relaxed));
         failure_http_4xx = failure_http_4xx
             .saturating_add(metrics.failure_reasons.http_4xx.load(Ordering::Relaxed));
         failure_http_5xx = failure_http_5xx
@@ -1580,11 +1585,10 @@ fn render_prometheus_for_sinks(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>
             .saturating_add(metrics.failure_reasons.serialize.load(Ordering::Relaxed));
         failure_tls =
             failure_tls.saturating_add(metrics.failure_reasons.tls.load(Ordering::Relaxed));
-        failure_timeout = failure_timeout
-            .saturating_add(metrics.failure_reasons.timeout.load(Ordering::Relaxed));
+        failure_timeout =
+            failure_timeout.saturating_add(metrics.failure_reasons.timeout.load(Ordering::Relaxed));
         queue_depth = queue_depth.saturating_add(runtime.logger.queue_depth() as u64);
-        spool_drops =
-            spool_drops.saturating_add(metrics.spool_drops_total.load(Ordering::Relaxed));
+        spool_drops = spool_drops.saturating_add(metrics.spool_drops_total.load(Ordering::Relaxed));
         spool_prepare_failures = spool_prepare_failures
             .saturating_add(metrics.spool_prepare_failures_total.load(Ordering::Relaxed));
         let spool_stats = runtime
@@ -1643,9 +1647,7 @@ fn render_prometheus_for_sinks(sinks: &BTreeMap<ActiveSinkKey, Arc<SinkRuntime>>
             reason, value
         ));
     }
-    output.push_str(
-        "# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n",
-    );
+    output.push_str("# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n");
     output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
     output.push_str(&format!("chargeback_sink_queue_depth {}\n", queue_depth));
     output.push_str(
