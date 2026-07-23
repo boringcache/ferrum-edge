@@ -1443,9 +1443,10 @@ paths:
 
         `proxy_name` is live display metadata for the stable `proxy_id` (not a
         registry key or series-splitting label). Name-only reloads keep counter
-        continuity; overlapping pricing generations collapse to one row and
-        both formats pick the same authoritative name (most recently updated
-        generation, lexicographic tie-break).
+        continuity. Both formats resolve active IDs through the same snapshot of
+        the published configuration, so late retired-generation traffic cannot
+        restore an old name. Overlapping pricing generations collapse under
+        that authoritative current name.
 
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
@@ -20884,12 +20885,12 @@ components:
                       description: |
                         Live display name for the stable `proxy_id`. Not part of
                         the in-memory chargeback key and not a Prometheus
-                        series-splitting label, so a name-only reload preserves
-                        counter continuity while record hits refresh this field
-                        from current proxy metadata. When overlapping pricing
-                        generations collapse into one export row, JSON and
-                        Prometheus select the same authoritative name (most
-                        recently updated generation; lexicographic tie-break).
+                        series-splitting label, so name-only reloads preserve
+                        counter continuity. JSON and Prometheus resolve active
+                        IDs through the same snapshot of the published
+                        configuration; late retired-generation traffic cannot
+                        restore an old name. Overlapping pricing generations
+                        collapse under that authoritative current name.
                     currency:
                       type: string
                       description: |

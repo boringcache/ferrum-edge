@@ -651,7 +651,7 @@ fn test_registry_records_charge() {
     // Verify render metadata is stored correctly
     assert_eq!(&*entry.consumer, "user-1");
     assert_eq!(&*entry.proxy_id, "proxy-a");
-    assert_eq!(&*entry.proxy_name.load(), "My API");
+    assert_eq!(&*entry.proxy_name, "My API");
     assert_eq!(entry.status_code, 200);
     assert_eq!(entry.protocol_family, ProtocolFamily::Http);
 }
@@ -1970,6 +1970,10 @@ fn assert_json_and_prometheus_proxy_name_agree(
 fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500);
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v1".to_string(),
+    )]));
     let s = scope();
     let price = 0.001;
 
@@ -1992,10 +1996,28 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
     {
         let entry = registry.entries.get(&key).unwrap();
         assert_eq!(entry.call_count.load(Ordering::Relaxed), 10);
-        assert_eq!(&*entry.proxy_name.load(), "Payments v1");
+        assert_eq!(&*entry.proxy_name, "Payments v1");
     }
+    let cached_v1: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert_eq!(
+        cached_v1["consumers"]["alice"]["proxies"]["payments"]["proxy_name"],
+        "Payments v1"
+    );
 
-    // Continuous traffic after a name-only reload hits the same key.
+    // The accepted reload publishes the new name before new-generation
+    // traffic. Continuous traffic after the reload still hits the same key.
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v2".to_string(),
+    )]));
+    let cached_v2: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert_eq!(
+        cached_v2["consumers"]["alice"]["proxies"]["payments"]["proxy_name"],
+        "Payments v2",
+        "metadata publication must invalidate the cached old label immediately"
+    );
     for _ in 0..5 {
         registry.record_http(
             &s, "alice", "payments", "Payments v2", 200, price, 0, 0, 0.0, 0.0,
@@ -2013,7 +2035,10 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
         15,
         "counters must remain continuous across the rename"
     );
-    assert_eq!(&*entry.proxy_name.load(), "Payments v2");
+    assert_eq!(
+        &*entry.proxy_name, "Payments v1",
+        "entry fallback metadata remains immutable; exports use the published snapshot"
+    );
     drop(entry);
 
     let prom = registry.render_prometheus_uncached().unwrap();
@@ -2048,8 +2073,8 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
 }
 
 /// Shared assertions for rename + price-change overlap under a fixed insertion
-/// order. The authoritative export name is the name from the most recently
-/// updated pricing-generation entry (ties break lexicographically).
+/// order. The authoritative export name comes from the published configuration,
+/// never request completion order.
 fn assert_rename_plus_price_overlap(
     registry: &ChargebackRegistry,
     expected_name: &str,
@@ -2108,6 +2133,10 @@ fn test_rename_plus_price_change_old_then_new_selects_authoritative_name() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500);
     let s = scope();
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v1".to_string(),
+    )]));
 
     // Old generation under the retired display name.
     registry.record_http(
@@ -2116,7 +2145,11 @@ fn test_rename_plus_price_change_old_then_new_selects_authoritative_name() {
     registry.record_http(
         &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
     );
-    // New generation (price bits differ) under the live name — recorded last.
+    // Publish the accepted rename, then record the new price generation.
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v2".to_string(),
+    )]));
     registry.record_http(
         &s, "alice", "payments", "Payments v2", 200, 0.002, 0, 0, 0.0, 0.0,
     );
@@ -2135,6 +2168,10 @@ fn test_rename_plus_price_change_new_then_old_selects_authoritative_name() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500);
     let s = scope();
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v2".to_string(),
+    )]));
 
     // Reverse insertion order: new pricing generation first, then overlapping
     // old-generation traffic (in-flight after reload) recorded last.
@@ -2154,8 +2191,73 @@ fn test_rename_plus_price_change_new_then_old_selects_authoritative_name() {
         &s, "alice", "payments", "Payments v1", 200, 0.001, 0, 0, 0.0, 0.0,
     );
 
-    // Most recently updated generation supplies the authoritative name.
-    assert_rename_plus_price_overlap(&registry, "Payments v1", 5, "new-then-old");
+    // The retired request completes last, but cannot restore its old name.
+    assert_rename_plus_price_overlap(&registry, "Payments v2", 5, "new-then-old");
+}
+
+#[tokio::test]
+async fn test_plugin_cache_reload_publishes_name_before_late_old_completion() {
+    const CONSUMER: &str = "issue-2572-cache-reload-consumer";
+    const PROXY_ID: &str = "issue-2572-cache-reload-proxy";
+    const PLUGIN_ID: &str = "issue-2572-cache-reload-chargeback";
+
+    let mut old_proxy = chargeback_chain_proxy(PROXY_ID, "/issue-2572-v1", PLUGIN_ID);
+    old_proxy.name = Some("Payments v1".to_string());
+    let plugin_config = chargeback_chain_plugin(
+        PLUGIN_ID,
+        PROXY_ID,
+        "USD",
+        json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }]
+        }),
+    );
+    let old_config = GatewayConfig {
+        proxies: vec![old_proxy],
+        plugin_configs: vec![plugin_config.clone()],
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&old_config).expect("old chargeback cache");
+    let old_plugin = cache
+        .get_plugins(PROXY_ID)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("old chargeback plugin");
+    old_plugin
+        .log(&make_summary(PROXY_ID, "Payments v1", Some(CONSUMER), 200))
+        .await;
+
+    let mut new_proxy = chargeback_chain_proxy(PROXY_ID, "/issue-2572-v1", PLUGIN_ID);
+    new_proxy.name = Some("Payments v2".to_string());
+    let new_config = GatewayConfig {
+        proxies: vec![new_proxy],
+        plugin_configs: vec![plugin_config],
+        ..GatewayConfig::default()
+    };
+    cache
+        .rebuild(&new_config)
+        .expect("publish renamed chargeback cache");
+    let new_plugin = cache
+        .get_plugins(PROXY_ID)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("new chargeback plugin");
+    new_plugin
+        .log(&make_summary(PROXY_ID, "Payments v2", Some(CONSUMER), 200))
+        .await;
+
+    // A request admitted through the retained old chain completes after the
+    // rename. Its summary must not restore the retired display name.
+    old_plugin
+        .log(&make_summary(PROXY_ID, "Payments v1", Some(CONSUMER), 200))
+        .await;
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    let proxy = &rendered["consumers"][CONSUMER]["proxies"][PROXY_ID];
+    assert_eq!(proxy["proxy_name"], "Payments v2");
+    assert_eq!(proxy["by_status"]["200"]["calls"], 3);
 }
 
 // --- Finding #76: monetary totals do not drift over high volume ---

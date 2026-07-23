@@ -1318,11 +1318,13 @@ integration.
 **`proxy_name` contract:** exported `proxy_name` is live display metadata for the
 stable `proxy_id`. It is omitted from the in-memory registry key and is not a
 Prometheus series-splitting dimension, so a name-only reload preserves counter
-continuity while record hits refresh the stored name from current proxy
-metadata. Pricing changes still create distinct pricing-generation entries.
-When overlapping generations collapse into one export row, JSON and Prometheus
-select the same authoritative name (most recently updated generation;
-lexicographic tie-break), independent of map iteration or insertion order.
+continuity. After an accepted configuration is published, JSON and Prometheus
+resolve active proxy IDs through the same lock-free snapshot of that
+configuration's names. Request completion order cannot change the exported
+label, so late traffic admitted under a retired generation cannot restore an
+old name. Pricing changes still create distinct pricing-generation entries;
+overlapping entries collapse under the current published name. Retained rows
+for a deleted proxy use a deterministic recorded-name fallback.
 
 **Arithmetic and export semantics:** every unit price is IEEE-754 binary64,
 finite, non-negative, and at most `1e288`. In-memory entries store exact `u64`

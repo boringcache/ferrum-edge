@@ -22,16 +22,16 @@
 //!
 //! **Hot-path optimization**: The recording methods use a thread-local `String`
 //! buffer for the DashMap lookup key, achieving **zero heap allocation on cache
-//! hits** for the common same-name case (99%+ of requests). Only the first
+//! hits** (99%+ of requests). Only the first
 //! record per unique (consumer, proxy, status_code, scope, pricing) combination
 //! allocates — subsequent records reuse the existing DashMap entry via a
-//! read-lock `get()` on a borrowed `&str`. A proxy rename refreshes live
-//! `proxy_name` metadata on the existing entry (lock-free; allocates only when
-//! the display name actually changes) without altering the key, so counter
-//! continuity is preserved. Stream entries use a `status_code` sentinel of `0`
-//! to share the same key format and code path.
+//! read-lock `get()` on a borrowed `&str`. Published proxy names live in a
+//! separate lock-free snapshot used only while rendering, so a name-only reload
+//! preserves counter continuity without letting a late retired-generation
+//! request restore stale display metadata. Stream entries use a `status_code`
+//! sentinel of `0` to share the same key format and code path.
 
-use arc_swap::{ArcSwap, ArcSwapAny};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
@@ -73,6 +73,28 @@ pub fn global_registry() -> Arc<ChargebackRegistry> {
         .clone()
 }
 
+/// Publish authoritative proxy display names without instantiating the global
+/// registry when `api_chargeback` has never been configured.
+pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayConfig) {
+    let Some(registry) = CHARGEBACK_REGISTRY.get() else {
+        return;
+    };
+    let names = config
+        .proxies
+        .iter()
+        .map(|proxy| {
+            (
+                proxy.id.clone(),
+                proxy
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
+        })
+        .collect();
+    registry.set_active_proxy_names(names);
+}
+
 fn escape_label_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -86,33 +108,13 @@ fn escape_label_value(value: &str) -> String {
     escaped
 }
 
-/// Whether `candidate` should replace the currently selected export `proxy_name`.
-///
-/// Overlapping pricing-generation rows that share one exposed billing identity
-/// must collapse to a single deterministic display name, independent of DashMap
-/// or HashMap iteration order. Prefer the name from the most recently updated
-/// entry (live traffic carries current proxy metadata); on a `last_updated`
-/// tie, prefer the lexicographically greater name so JSON and Prometheus agree.
-fn should_prefer_proxy_name(
-    candidate_name: &str,
-    candidate_updated: u64,
-    current_name: &str,
-    current_updated: u64,
-) -> bool {
-    candidate_updated > current_updated
-        || (candidate_updated == current_updated && candidate_name > current_name)
-}
-
-fn apply_authoritative_proxy_name(
-    agg_name: &mut String,
-    agg_updated: &mut u64,
-    candidate_name: &str,
-    candidate_updated: u64,
-) {
-    if should_prefer_proxy_name(candidate_name, candidate_updated, agg_name, *agg_updated) {
+/// Keep a deterministic fallback for retained rows whose proxy is no longer in
+/// the published configuration. Active proxies always supply one identical
+/// candidate from the authoritative metadata snapshot.
+fn apply_export_proxy_name(agg_name: &mut String, candidate_name: &str) {
+    if candidate_name > agg_name.as_str() {
         agg_name.clear();
         agg_name.push_str(candidate_name);
-        *agg_updated = candidate_updated;
     }
 }
 
@@ -249,11 +251,10 @@ fn write_chargeback_key(
 ///
 /// **`proxy_name` is live display metadata (issue #2572)**: it is deliberately
 /// omitted from the registry key so a name-only reload keeps counter continuity
-/// under the stable `proxy_id`. The stored name is refreshed on every record hit
-/// from the recording transaction's current proxy metadata (lock-free
-/// [`ArcSwapAny`], allocate only when the name actually changes). When multiple
-/// pricing-generation entries collapse into one export row, JSON and Prometheus
-/// select the same authoritative name via [`should_prefer_proxy_name`].
+/// under the stable `proxy_id`. Entries retain their admission-time name for a
+/// deterministic fallback after deletion, while renderers use the separately
+/// published current-proxy metadata snapshot. Late completions from a retired
+/// cache generation therefore cannot restore an old exported name.
 ///
 /// For stream entries the `status_code` is `0` and there is exactly one entry
 /// per `(consumer, proxy_id, protocol_family=stream)` (streams have no HTTP
@@ -275,12 +276,12 @@ pub struct ChargebackEntry {
     pub bw_price_sent: f64,
     /// Per-byte price for backend→client bytes.
     pub bw_price_received: f64,
-    // --- Render metadata ---
+    // --- Render metadata (immutable after creation) ---
     pub consumer: Arc<str>,
     pub proxy_id: Arc<str>,
-    /// Live display name for `proxy_id`. Refreshed on record hits; not part of
-    /// the registry key (issue #2572).
-    pub proxy_name: ArcSwapAny<Arc<str>>,
+    /// Admission-time fallback name for `proxy_id`. Active exports use the
+    /// authoritative published metadata snapshot instead (issue #2572).
+    pub proxy_name: Arc<str>,
     pub status_code: u16,
     pub protocol_family: ProtocolFamily,
     /// Currency label (e.g., "USD", "EUR") of the instance that created the
@@ -318,24 +319,11 @@ impl ChargebackEntry {
             bw_price_received,
             consumer,
             proxy_id,
-            proxy_name: ArcSwapAny::new(proxy_name),
+            proxy_name,
             status_code,
             protocol_family,
             currency,
             namespace_label,
-        }
-    }
-
-    /// Refresh live display metadata from the recording transaction.
-    ///
-    /// Compares under an [`ArcSwapAny`] load (no lock). Allocates a new
-    /// `Arc<str>` only when the supplied name differs from the stored one, so
-    /// steady-state same-name hits stay allocation-free aside from the existing
-    /// atomic counter updates in [`Self::record`].
-    fn refresh_proxy_name(&self, proxy_name: &str) {
-        let current = self.proxy_name.load();
-        if current.as_ref() != proxy_name {
-            self.proxy_name.store(Arc::<str>::from(proxy_name));
         }
     }
 
@@ -411,18 +399,23 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 /// so immutable family attribution cannot be fixed by insertion order.
 /// `proxy_name` is live display metadata only — omitted from the key so a
 /// name-only reload preserves counter continuity under the stable `proxy_id`
-/// (issue #2572). This allows the hot-path recording methods to use
-/// `DashMap::get(&str)` with a thread-local buffer — zero allocation on cache
-/// hits (name refresh allocates only when the display name actually changes).
-/// Only the cold path (first record per unique billing/pricing combination)
-/// allocates a `String` key and `Arc<str>` metadata. This matches the
-/// connection pool key pattern in `connection_pool.rs`.
+/// (issue #2572). The render path substitutes the authoritative name snapshot
+/// from the published configuration. This allows the hot-path recording methods
+/// to use `DashMap::get(&str)` with a thread-local buffer — zero allocation on
+/// cache hits. Only the cold path (first record per unique billing/pricing
+/// combination) allocates a `String` key and `Arc<str>` metadata. This matches
+/// the connection pool key pattern in `connection_pool.rs`.
 pub struct ChargebackRegistry {
     epoch: Instant,
     pub entries: DashMap<String, ChargebackEntry>,
-    /// Cached render output with generation timestamp.
-    prometheus_cache: ArcSwap<Option<(Instant, String)>>,
-    json_cache: ArcSwap<Option<(Instant, String)>>,
+    /// Current display names from the published gateway configuration.
+    active_proxy_names: ArcSwap<HashMap<String, String>>,
+    /// Advances whenever `active_proxy_names` is replaced. Render caches carry
+    /// this generation so an overlapping reload cannot publish stale labels.
+    proxy_metadata_generation: AtomicU64,
+    /// Cached render output with timestamp and proxy-metadata generation.
+    prometheus_cache: ArcSwap<Option<(Instant, u64, String)>>,
+    json_cache: ArcSwap<Option<(Instant, u64, String)>>,
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
@@ -442,6 +435,8 @@ impl ChargebackRegistry {
         Self {
             epoch: Instant::now(),
             entries: DashMap::new(),
+            active_proxy_names: ArcSwap::from_pointee(HashMap::new()),
+            proxy_metadata_generation: AtomicU64::new(0),
             prometheus_cache: ArcSwap::from_pointee(None),
             json_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
@@ -457,6 +452,24 @@ impl ChargebackRegistry {
     pub fn set_configured_currency(&self, currency: &str) {
         self.configured_currency
             .store(Arc::new(currency.to_string()));
+    }
+
+    /// Replace live display metadata after a gateway configuration is
+    /// published. This is a reload cold-path operation.
+    #[doc(hidden)]
+    pub fn set_active_proxy_names(&self, names: HashMap<String, String>) {
+        let unchanged = {
+            let current = self.active_proxy_names.load();
+            current.as_ref().as_ref() == &names
+        };
+        if unchanged {
+            return;
+        }
+        self.active_proxy_names.store(Arc::new(names));
+        self.proxy_metadata_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.prometheus_cache.store(Arc::new(None));
+        self.json_cache.store(Arc::new(None));
     }
 
     /// Configure the process-global render/cleanup knobs that govern the SHARED
@@ -610,8 +623,7 @@ impl ChargebackRegistry {
     ///
     /// **Hot-path (cache hit)**: Uses `DashMap::get(&str)` with a thread-local
     /// buffer — one `write!` into a pre-allocated `String`, one DashMap read-lock,
-    /// atomic counter updates, and a lock-free `proxy_name` compare/refresh.
-    /// Zero heap allocation when the display name is unchanged.
+    /// and atomic counter updates. Zero heap allocation.
     ///
     /// **Cold-path (first record per unique combination)**: Clones the per-instance
     /// `Arc<str>` render metadata (consumer/proxy/currency/namespace) and allocates
@@ -666,9 +678,6 @@ impl ChargebackRegistry {
 
             if let Some(entry) = self.entries.get(buf.as_str()) {
                 entry.record(bytes_sent, bytes_received, count_call, self.epoch);
-                // Live metadata: refresh display name without touching the key
-                // so a name-only reload keeps counter continuity (issue #2572).
-                entry.refresh_proxy_name(proxy_name);
                 return true;
             }
             false
@@ -716,9 +725,6 @@ impl ChargebackRegistry {
                 )
             });
             entry.record(bytes_sent, bytes_received, count_call, self.epoch);
-            // If we lost the insert race, still refresh to the name this
-            // transaction observed (issue #2572).
-            entry.refresh_proxy_name(proxy_name);
         }
 
         self.maybe_invalidate_caches();
@@ -730,7 +736,7 @@ impl ChargebackRegistry {
             .load(Ordering::Relaxed);
 
         let cached = self.prometheus_cache.load();
-        if let Some((generated_at, _)) = **cached {
+        if let Some((generated_at, _, _)) = **cached {
             let age_nanos = generated_at.elapsed().as_nanos() as u64;
             if age_nanos < min_age_nanos {
                 return;
@@ -762,8 +768,10 @@ impl ChargebackRegistry {
     /// surface that as an explicit export failure rather than emitting `inf`.
     pub fn render_prometheus(&self) -> Result<String, String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
+        let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
         let cached = self.prometheus_cache.load();
-        if let Some((generated_at, ref output)) = **cached
+        if let Some((generated_at, cached_generation, ref output)) = **cached
+            && cached_generation == metadata_generation
             && generated_at.elapsed().as_secs() < ttl_secs
         {
             return Ok(output.clone());
@@ -772,22 +780,33 @@ impl ChargebackRegistry {
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
-        let output = self.render_prometheus_uncached()?;
-        self.prometheus_cache
-            .store(Arc::new(Some((Instant::now(), output.clone()))));
-        Ok(output)
+        loop {
+            let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
+            let output = self.render_prometheus_uncached()?;
+            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation {
+                continue;
+            }
+            self.prometheus_cache.store(Arc::new(Some((
+                Instant::now(),
+                metadata_generation,
+                output.clone(),
+            ))));
+            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
+                return Ok(output);
+            }
+            self.prometheus_cache.store(Arc::new(None));
+        }
     }
 
     pub fn render_prometheus_uncached(&self) -> Result<String, String> {
         // Multiple counter families × ~200 bytes per entry
         let estimated_cap = 1024 + self.entries.len() * 600;
         let mut output = String::with_capacity(estimated_cap);
+        let active_proxy_names = self.active_proxy_names.load();
 
         // --- Per-call metrics (HTTP entries only — streams have no status code) ---
         struct ChargeAggregate {
             proxy_name: String,
-            /// `last_updated` of the entry that supplied `proxy_name`.
-            name_updated: u64,
             currency: Arc<str>,
             namespace_label: Arc<str>,
             count: u64,
@@ -798,17 +817,18 @@ impl ChargebackRegistry {
         // stale prices, but Prometheus label sets intentionally omit those
         // bits (and omit `proxy_name` as a series key) so a name-only reload
         // preserves counter continuity. Aggregate by the exposed billing
-        // identity before rendering; when pricing generations overlap, pick
-        // one authoritative display name via [`should_prefer_proxy_name`]
-        // (issue #2572).
+        // identity before rendering and take live display metadata from the
+        // published configuration snapshot (issue #2572).
         let mut http_aggregates: HashMap<HttpChargeAggregateKey, ChargeAggregate> = HashMap::new();
         let mut stream_aggregates: HashMap<StreamChargeAggregateKey, ChargeAggregate> =
             HashMap::new();
 
         for entry in self.entries.iter() {
             let v = entry.value();
-            let proxy_name = v.proxy_name.load();
-            let name_updated = v.last_updated.load(Ordering::Relaxed);
+            let proxy_name = active_proxy_names
+                .get(v.proxy_id.as_ref())
+                .map(String::as_str)
+                .unwrap_or(v.proxy_name.as_ref());
             match v.protocol_family {
                 ProtocolFamily::Http => {
                     let agg = http_aggregates
@@ -821,18 +841,12 @@ impl ChargebackRegistry {
                         ))
                         .or_insert_with(|| ChargeAggregate {
                             proxy_name: proxy_name.to_string(),
-                            name_updated,
                             currency: Arc::clone(&v.currency),
                             namespace_label: Arc::clone(&v.namespace_label),
                             count: 0,
                             charges: 0.0,
                         });
-                    apply_authoritative_proxy_name(
-                        &mut agg.proxy_name,
-                        &mut agg.name_updated,
-                        proxy_name.as_ref(),
-                        name_updated,
-                    );
+                    apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
                     agg.count += v.call_count.load(Ordering::Relaxed);
                     agg.charges = checked_add_charge(agg.charges, v.call_charge()?)?;
                 }
@@ -846,18 +860,12 @@ impl ChargebackRegistry {
                         ))
                         .or_insert_with(|| ChargeAggregate {
                             proxy_name: proxy_name.to_string(),
-                            name_updated,
                             currency: Arc::clone(&v.currency),
                             namespace_label: Arc::clone(&v.namespace_label),
                             count: 0,
                             charges: 0.0,
                         });
-                    apply_authoritative_proxy_name(
-                        &mut agg.proxy_name,
-                        &mut agg.name_updated,
-                        proxy_name.as_ref(),
-                        name_updated,
-                    );
+                    apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
                     agg.count += v.call_count.load(Ordering::Relaxed);
                     agg.charges = checked_add_charge(agg.charges, v.call_charge()?)?;
                 }
@@ -942,7 +950,6 @@ impl ChargebackRegistry {
         //     stay on separate, deterministically labeled rows.
         struct BandwidthAggregate {
             proxy_name: String,
-            name_updated: u64,
             currency: Arc<str>,
             namespace_label: Arc<str>,
             bytes_sent: u64,
@@ -954,8 +961,10 @@ impl ChargebackRegistry {
         let mut bw_aggregates: HashMap<BandwidthAggregateKey, BandwidthAggregate> = HashMap::new();
         for entry in self.entries.iter() {
             let v = entry.value();
-            let proxy_name = v.proxy_name.load();
-            let name_updated = v.last_updated.load(Ordering::Relaxed);
+            let proxy_name = active_proxy_names
+                .get(v.proxy_id.as_ref())
+                .map(String::as_str)
+                .unwrap_or(v.proxy_name.as_ref());
             let agg = bw_aggregates
                 .entry((
                     v.consumer.to_string(),
@@ -966,7 +975,6 @@ impl ChargebackRegistry {
                 ))
                 .or_insert_with(|| BandwidthAggregate {
                     proxy_name: proxy_name.to_string(),
-                    name_updated,
                     currency: Arc::clone(&v.currency),
                     namespace_label: Arc::clone(&v.namespace_label),
                     bytes_sent: 0,
@@ -974,12 +982,7 @@ impl ChargebackRegistry {
                     charge_sent: 0.0,
                     charge_received: 0.0,
                 });
-            apply_authoritative_proxy_name(
-                &mut agg.proxy_name,
-                &mut agg.name_updated,
-                proxy_name.as_ref(),
-                name_updated,
-            );
+            apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
             agg.bytes_sent += v.bytes_sent_total.load(Ordering::Relaxed);
             agg.bytes_received += v.bytes_received_total.load(Ordering::Relaxed);
             agg.charge_sent = checked_add_charge(agg.charge_sent, v.bandwidth_charge_sent()?)?;
@@ -1061,8 +1064,10 @@ impl ChargebackRegistry {
     /// return an explicit error response rather than serializing JSON `null`.
     pub fn render_json(&self) -> Result<String, String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
+        let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
         let cached = self.json_cache.load();
-        if let Some((generated_at, ref output)) = **cached
+        if let Some((generated_at, cached_generation, ref output)) = **cached
+            && cached_generation == metadata_generation
             && generated_at.elapsed().as_secs() < ttl_secs
         {
             return Ok(output.clone());
@@ -1071,13 +1076,26 @@ impl ChargebackRegistry {
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
-        let output = self.render_json_uncached()?;
-        self.json_cache
-            .store(Arc::new(Some((Instant::now(), output.clone()))));
-        Ok(output)
+        loop {
+            let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
+            let output = self.render_json_uncached()?;
+            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation {
+                continue;
+            }
+            self.json_cache.store(Arc::new(Some((
+                Instant::now(),
+                metadata_generation,
+                output.clone(),
+            ))));
+            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
+                return Ok(output);
+            }
+            self.json_cache.store(Arc::new(None));
+        }
     }
 
     pub fn render_json_uncached(&self) -> Result<String, String> {
+        let active_proxy_names = self.active_proxy_names.load();
         // Nested structure: consumer -> proxy -> {protocol, by_status, stream, bandwidth}.
         //
         // Currency is carried per proxy (it is a property of the recording
@@ -1088,7 +1106,6 @@ impl ChargebackRegistry {
         // #75).
         struct ProxyAggregate {
             proxy_name: String,
-            name_updated: u64,
             currency: Arc<str>,
             has_http: bool,
             has_stream: bool,
@@ -1118,8 +1135,10 @@ impl ChargebackRegistry {
             let bytes_received = v.bytes_received_total.load(Ordering::Relaxed);
             let bw_sent = v.bandwidth_charge_sent()?;
             let bw_received = v.bandwidth_charge_received()?;
-            let proxy_name = v.proxy_name.load();
-            let name_updated = v.last_updated.load(Ordering::Relaxed);
+            let proxy_name = active_proxy_names
+                .get(v.proxy_id.as_ref())
+                .map(String::as_str)
+                .unwrap_or(v.proxy_name.as_ref());
 
             if !currency_mixed {
                 match overall_currency.as_ref() {
@@ -1140,7 +1159,6 @@ impl ChargebackRegistry {
                 ))
                 .or_insert_with(|| ProxyAggregate {
                     proxy_name: proxy_name.to_string(),
-                    name_updated,
                     currency: Arc::clone(&v.currency),
                     has_http: false,
                     has_stream: false,
@@ -1152,12 +1170,7 @@ impl ChargebackRegistry {
                     bandwidth_charge_sent: 0.0,
                     bandwidth_charge_received: 0.0,
                 });
-            apply_authoritative_proxy_name(
-                &mut proxy_entry.proxy_name,
-                &mut proxy_entry.name_updated,
-                proxy_name.as_ref(),
-                name_updated,
-            );
+            apply_export_proxy_name(&mut proxy_entry.proxy_name, proxy_name);
             proxy_entry.bytes_sent += bytes_sent;
             proxy_entry.bytes_received += bytes_received;
             proxy_entry.bandwidth_charge_sent =
