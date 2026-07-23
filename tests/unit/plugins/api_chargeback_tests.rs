@@ -728,7 +728,15 @@ fn test_registry_zero_alloc_hot_path() {
     );
 
     assert_eq!(registry.entries.len(), 1);
-    let key = make_key_with_prices("user-1", "proxy-a", 200, ProtocolFamily::Http, 0.001, 0.0, 0.0);
+    let key = make_key_with_prices(
+        "user-1",
+        "proxy-a",
+        200,
+        ProtocolFamily::Http,
+        0.001,
+        0.0,
+        0.0,
+    );
     let entry = registry.entries.get(&key).unwrap();
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 3);
 }
@@ -1143,7 +1151,15 @@ async fn test_log_charges_identified_consumer() {
     plugin.log(&summary).await;
 
     let registry = ferrum_edge::plugins::api_chargeback::global_registry();
-    let key = make_key_with_prices("alice", "proxy-1", 200, ProtocolFamily::Http, 0.001, 0.0, 0.0);
+    let key = make_key_with_prices(
+        "alice",
+        "proxy-1",
+        200,
+        ProtocolFamily::Http,
+        0.001,
+        0.0,
+        0.0,
+    );
     assert!(registry.entries.contains_key(&key));
 }
 
@@ -1712,15 +1728,8 @@ fn assert_bandwidth_only_stream_and_websocket_reconcile(
         "{order_label}: expected distinct HTTP and stream entries"
     );
 
-    let http_key = make_key_with_prices(
-        "alice",
-        "edge",
-        0,
-        ProtocolFamily::Http,
-        0.0,
-        0.001,
-        0.001,
-    );
+    let http_key =
+        make_key_with_prices("alice", "edge", 0, ProtocolFamily::Http, 0.0, 0.001, 0.001);
     let stream_key = make_key_with_prices(
         "alice",
         "edge",
