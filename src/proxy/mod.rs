@@ -22573,10 +22573,9 @@ async fn handle_proxy_request_inner(
                     &mut response_headers,
                     grpc_total_deadline,
                 );
-                let grpc_web_streaming_content_type = grpc_web_response_content_type
-                    .filter(|_| {
-                        crate::plugins::response_body_rewrite_allowed(grpc_streaming.status)
-                    });
+                let grpc_web_streaming_content_type = grpc_web_response_content_type.filter(|_| {
+                    crate::plugins::response_body_rewrite_allowed(grpc_streaming.status)
+                });
                 let grpc_web_streaming_initial_metadata =
                     grpc_web_streaming_content_type.map(|_| {
                         crate::plugins::grpc_web::take_streaming_initial_terminal_metadata(
