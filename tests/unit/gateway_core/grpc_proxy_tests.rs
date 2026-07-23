@@ -111,10 +111,10 @@ fn native_grpc_strips_raw_geo_assertion_before_authoritative_merge() {
 #[test]
 fn native_grpc_preserves_unchanged_repeated_metadata_field_lines() {
     let mut headers = hyper::HeaderMap::new();
-    headers.append("x-grpc-trace", hyper::HeaderValue::from_static("first"));
-    headers.append("x-grpc-trace", hyper::HeaderValue::from_static("second"));
-    headers.append("trace-proto-bin", hyper::HeaderValue::from_static("AQID"));
-    headers.append("trace-proto-bin", hyper::HeaderValue::from_static("BAUG"));
+    headers.append("x-grpc-trace", hyper::header::HeaderValue::from_static("first"));
+    headers.append("x-grpc-trace", hyper::header::HeaderValue::from_static("second"));
+    headers.append("trace-proto-bin", hyper::header::HeaderValue::from_static("AQID"));
+    headers.append("trace-proto-bin", hyper::header::HeaderValue::from_static("BAUG"));
 
     let proxy_headers = HashMap::from([
         ("x-grpc-trace".to_string(), "first, second".to_string()),
@@ -140,8 +140,8 @@ fn native_grpc_preserves_unchanged_repeated_metadata_field_lines() {
 #[test]
 fn native_grpc_replaces_repeated_metadata_after_plugin_mutation() {
     let mut headers = hyper::HeaderMap::new();
-    headers.append("x-grpc-trace", hyper::HeaderValue::from_static("first"));
-    headers.append("x-grpc-trace", hyper::HeaderValue::from_static("second"));
+    headers.append("x-grpc-trace", hyper::header::HeaderValue::from_static("first"));
+    headers.append("x-grpc-trace", hyper::header::HeaderValue::from_static("second"));
     let proxy_headers = HashMap::from([("x-grpc-trace".to_string(), "replacement".to_string())]);
 
     merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
