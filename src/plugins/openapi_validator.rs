@@ -2081,9 +2081,7 @@ fn exploded_form_object_to_value(
             }
             consumed.insert(child.clone());
             let value = match additional_schema {
-                Some(additional_schema) => {
-                    values_to_schema_value(values, additional_schema, None)?
-                }
+                Some(additional_schema) => values_to_schema_value(values, additional_schema, None)?,
                 None => values_to_schema_value(values, &Value::Null, None)?,
             };
             out.insert(child.clone(), value);
@@ -2392,11 +2390,7 @@ fn multipart_parts_to_schema_object(
             let array = values
                 .iter()
                 .map(|part| {
-                    multipart_part_to_schema_value(
-                        part,
-                        item_schema.as_ref(),
-                        property_encoding,
-                    )
+                    multipart_part_to_schema_value(part, item_schema.as_ref(), property_encoding)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             out.insert(property.clone(), Value::Array(array));
@@ -2609,9 +2603,11 @@ fn multipart_part_to_schema_value(
     }
 
     if schema_accepts_object(schema) || schema.get("properties").is_some() {
-        if let Some(media_type) = part.content_type.as_deref().and_then(|value| {
-            content_type_base(Some(value)).map(str::to_ascii_lowercase)
-        }) {
+        if let Some(media_type) = part
+            .content_type
+            .as_deref()
+            .and_then(|value| content_type_base(Some(value)).map(str::to_ascii_lowercase))
+        {
             if is_json_media_type(&media_type) {
                 return serde_json::from_slice(&part.body).map_err(|error| {
                     format!(
