@@ -279,8 +279,8 @@ fn compact_recovery_for_generation(generation: u64) -> Option<Arc<CompactSnapsho
     }
 }
 
-/// Retry compact recovery for a generation that already released Full state.
-fn try_finalize_compact_recovery(generation: u64) -> bool {
+/// Retry compact recovery synchronously from non-async disposal paths.
+fn try_finalize_compact_recovery_without_await(generation: u64) -> bool {
     let Some(recovery) = compact_recovery_for_generation(generation) else {
         // Compact already drained or never published.
         return true;
@@ -292,6 +292,25 @@ fn try_finalize_compact_recovery(generation: u64) -> bool {
     } else {
         false
     }
+}
+
+/// Retry compact recovery without blocking an async runtime worker on spool I/O.
+async fn try_finalize_compact_recovery(generation: u64) -> bool {
+    let Some(recovery) = compact_recovery_for_generation(generation) else {
+        // Compact already drained or never published.
+        return true;
+    };
+    let durable = tokio::task::spawn_blocking({
+        let recovery = Arc::clone(&recovery);
+        move || recovery.try_spool()
+    })
+    .await
+    .unwrap_or(false);
+    if durable {
+        unregister_compact_snapshot_generation(generation);
+        invalidate_status_cache();
+    }
+    durable
 }
 
 fn pending_snapshot_finalization_stats() -> (usize, u64, u64, usize, u64) {
@@ -386,7 +405,7 @@ async fn finalize_snapshot_generation_and_pending(current: Arc<SnapshotLifecycle
     if current.compacted.load(Ordering::Acquire)
         || compact_recovery_for_generation(current.generation).is_some()
     {
-        let _ = try_finalize_compact_recovery(current.generation);
+        let _ = try_finalize_compact_recovery(current.generation).await;
     }
 }
 
@@ -396,17 +415,7 @@ async fn finalize_pending_snapshot(pending: &PendingSnapshotFinalization) -> boo
             lifecycle.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT).await
         }
         PendingSnapshotFinalization::Compact(recovery) => {
-            let durable = tokio::task::spawn_blocking({
-                let recovery = Arc::clone(recovery);
-                move || recovery.try_spool()
-            })
-            .await
-            .unwrap_or(false);
-            if durable {
-                unregister_compact_snapshot_generation(recovery.generation);
-                invalidate_status_cache();
-            }
-            durable
+            try_finalize_compact_recovery(recovery.generation).await
         }
     }
 }
@@ -498,8 +507,9 @@ fn enforce_full_pending_finalization_bound(keep_generation: u64) {
         full.into_iter().take(remove_count).collect()
     };
     for lifecycle in overflow {
-        let events = lifecycle.prepare_compaction_events();
-        let _ = compact_snapshot_lifecycle(&lifecycle, events);
+        if let Some(events) = lifecycle.prepare_compaction_events() {
+            let _ = compact_snapshot_lifecycle(&lifecycle, events);
+        }
     }
 }
 
@@ -1246,7 +1256,7 @@ impl SnapshotLifecycle {
         self.accumulator.retained_bytes() as u64
     }
 
-    fn prepare_compaction_events(&self) -> Vec<ChargeEvent> {
+    fn prepare_compaction_events(&self) -> Option<Vec<ChargeEvent>> {
         let _emission_guard = match self.emission_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -1268,13 +1278,15 @@ impl SnapshotLifecycle {
                 if !self.accumulator.peek_overflow_pending().is_empty() {
                     let _ = self.accumulator.take_overflow_pending();
                 }
-                events
+                Some(events)
             }
             Err(error) => {
                 self.runtime
                     .metrics
                     .record_failure(FailureReason::Serialize, error);
-                events
+                // Keep the full generation intact: compacting only the staged
+                // overflow would clear accumulator totals that failed to serialize.
+                None
             }
         }
     }
@@ -1292,7 +1304,7 @@ impl SnapshotLifecycle {
             || compact_recovery_for_generation(self.generation).is_some()
         {
             self.compacted.store(true, Ordering::Release);
-            return try_finalize_compact_recovery(self.generation);
+            return try_finalize_compact_recovery(self.generation).await;
         }
         if self.finalized.load(Ordering::Acquire) {
             unregister_full_snapshot_generation(self.generation);
@@ -1374,7 +1386,7 @@ impl SnapshotLifecycle {
             if compact_recovery_for_generation(self.generation).is_some() {
                 self.compacted.store(true, Ordering::Release);
                 invalidate_status_cache();
-                return try_finalize_compact_recovery(self.generation);
+                return try_finalize_compact_recovery(self.generation).await;
             }
             self.finalized.store(true, Ordering::Release);
             unregister_full_snapshot_generation(self.generation);
@@ -1400,7 +1412,7 @@ impl SnapshotLifecycle {
                 self.compact_failed_finalization();
                 // Ownership may now be Compact; retry that recovery once here so
                 // a single finalize_within call does not leave Compact untouched.
-                return try_finalize_compact_recovery(self.generation);
+                return try_finalize_compact_recovery(self.generation).await;
             }
             tokio::time::sleep(remaining.min(SNAPSHOT_FINALIZE_RETRY_INTERVAL)).await;
         }
@@ -1427,12 +1439,15 @@ impl SnapshotLifecycle {
                 return;
             }
         }
-        let events = self.prepare_compaction_events();
-        if !events.is_empty() {
-            let _ = compact_snapshot_lifecycle(self, events);
-        } else {
-            enforce_full_pending_finalization_bound(self.generation);
-            invalidate_status_cache();
+        match self.prepare_compaction_events() {
+            Some(events) if !events.is_empty() => {
+                let _ = compact_snapshot_lifecycle(self, events);
+            }
+            Some(_) => {
+                enforce_full_pending_finalization_bound(self.generation);
+                invalidate_status_cache();
+            }
+            None => {}
         }
     }
 
@@ -1441,7 +1456,7 @@ impl SnapshotLifecycle {
             || compact_recovery_for_generation(self.generation).is_some()
         {
             self.compacted.store(true, Ordering::Release);
-            let _ = try_finalize_compact_recovery(self.generation);
+            let _ = try_finalize_compact_recovery_without_await(self.generation);
             return;
         }
         if self.finalized.load(Ordering::Acquire) {
@@ -1474,14 +1489,14 @@ impl SnapshotLifecycle {
         if durable {
             if compact_recovery_for_generation(self.generation).is_some() {
                 self.compacted.store(true, Ordering::Release);
-                let _ = try_finalize_compact_recovery(self.generation);
+                let _ = try_finalize_compact_recovery_without_await(self.generation);
             } else {
                 self.finalized.store(true, Ordering::Release);
                 unregister_full_snapshot_generation(self.generation);
             }
         } else if self.committed.load(Ordering::Acquire) {
             self.compact_failed_finalization();
-            let _ = try_finalize_compact_recovery(self.generation);
+            let _ = try_finalize_compact_recovery_without_await(self.generation);
         }
         invalidate_status_cache();
     }
@@ -1517,7 +1532,6 @@ struct SinkMetrics {
     snapshot_overflow_spooled_total: AtomicU64,
     snapshot_overflow_pending_total: AtomicU64,
     snapshot_cardinality_rejections_total: AtomicU64,
-    snapshot_call_count_overflow_total: AtomicU64,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
@@ -1546,7 +1560,6 @@ impl Default for SinkMetrics {
             snapshot_overflow_spooled_total: AtomicU64::new(0),
             snapshot_overflow_pending_total: AtomicU64::new(0),
             snapshot_cardinality_rejections_total: AtomicU64::new(0),
-            snapshot_call_count_overflow_total: AtomicU64::new(0),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
@@ -5094,13 +5107,14 @@ impl SnapshotAccumulator {
             entry.revision.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = entry.totals.try_add(charge) {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+                return SnapshotRecordOutcome::OverflowImmediate;
             }
             return SnapshotRecordOutcome::Accumulated;
         }
 
         let entry_bytes = snapshot_metadata_retained_bytes(&meta);
         let current_entries = self.entries.len();
-        let current_bytes = self.retained_bytes.load(Ordering::Acquire);
+        let current_bytes = self.retained_bytes();
         if current_entries >= self.max_entries
             || current_bytes.saturating_add(entry_bytes) > self.max_retained_bytes
         {
@@ -5131,7 +5145,12 @@ impl SnapshotAccumulator {
                     .retained_bytes
                     .fetch_add(entry_bytes, Ordering::AcqRel)
                     .saturating_add(entry_bytes);
-                if next_entries > self.max_entries || next_bytes > self.max_retained_bytes {
+                let next_total_bytes = next_bytes.saturating_add(
+                    self.overflow_pending_bytes.load(Ordering::Acquire),
+                );
+                if next_entries > self.max_entries
+                    || next_total_bytes > self.max_retained_bytes
+                {
                     let generation = entry.generation;
                     drop(entry);
                     if let Some((_, evicted)) = self.entries.remove_if(&key, |_, live| {
@@ -5149,6 +5168,7 @@ impl SnapshotAccumulator {
                     entry.revision.fetch_add(1, Ordering::Relaxed);
                     if let Err(error) = entry.totals.try_add(charge) {
                         warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+                        return SnapshotRecordOutcome::OverflowImmediate;
                     }
                     return SnapshotRecordOutcome::Accumulated;
                 }
@@ -5157,6 +5177,7 @@ impl SnapshotAccumulator {
                 entry.revision.fetch_add(1, Ordering::Relaxed);
                 if let Err(error) = entry.totals.try_add(charge) {
                     warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+                    return SnapshotRecordOutcome::OverflowImmediate;
                 }
                 return SnapshotRecordOutcome::Accumulated;
             }
@@ -5166,6 +5187,7 @@ impl SnapshotAccumulator {
             entry.revision.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = entry.totals.try_add(charge) {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+                return SnapshotRecordOutcome::OverflowImmediate;
             }
         }
         SnapshotRecordOutcome::Accumulated

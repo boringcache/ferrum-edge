@@ -20973,8 +20973,10 @@ components:
               description: |
                 Hard ceiling on distinct snapshot accumulator identities.
                 New identities beyond this budget are immediately spooled as
-                per-event rows (or staged for the next durable emission) rather
-                than dropped or merged into unrelated keys.
+                per-event rows, or staged within the retained-byte budget for
+                the next durable emission, rather than merged into unrelated
+                keys. Exhaustion of both paths increments the explicit
+                cardinality-rejection counter.
             max_retained_bytes:
               type: integer
               minimum: 1

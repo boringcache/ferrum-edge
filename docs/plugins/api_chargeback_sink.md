@@ -73,8 +73,10 @@ key whose current totals still exceed its last durable baseline. Pending or
 never-emitted charges therefore survive first-tick races and prolonged spool
 outages. Hard `snapshot.max_entries` and `snapshot.max_retained_bytes` budgets
 bound accumulator memory; new identities beyond those budgets are immediately
-spooled as per-event rows (or staged for the next durable emission) rather than
-dropped or merged into unrelated keys.
+spooled as per-event rows, or staged within the same retained-byte budget for
+the next durable emission, rather than merged into unrelated keys. If both
+durable spooling and bounded staging are exhausted, the sink records an
+explicit cardinality rejection counter instead of growing memory without bound.
 
 ### Snapshot concurrency contract
 
