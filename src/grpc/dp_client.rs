@@ -724,12 +724,16 @@ async fn wait_for_readiness_then_primary_retry(
     startup_ready: Option<Arc<AtomicBool>>,
     primary_retry_secs: u64,
 ) {
-    let Some(startup_ready) = startup_ready else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    while !startup_ready.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    // A startup-readiness gate only DELAYS the first primary retry so the DP does
+    // not flap back to the primary before it is serving; it must never disable the
+    // retry entirely. When no gate is supplied (`None`) there is nothing to wait
+    // for, so fire on the plain `primary_retry_secs` cadence — matching the
+    // pre-refactor `startup_ready.is_none_or(..)` race semantics. Returning a
+    // never-ready future here would strand the DP on a fallback CP forever.
+    if let Some(startup_ready) = startup_ready {
+        while !startup_ready.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     tokio::time::sleep(Duration::from_secs(primary_retry_secs)).await;
 }
