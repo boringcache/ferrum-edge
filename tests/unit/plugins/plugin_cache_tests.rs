@@ -9313,3 +9313,209 @@ async fn grpc_web_global_shadowed_by_two_scoped_instances_unions_expose_headers_
     assert_eq!(body.iter().filter(|b| **b == 0x80).count(), 1);
     assert!(body.len() >= 5);
 }
+
+// ---- Cross-namespace plugin identity ----
+//
+// Two tenants may legitimately reuse the same bare proxy id and the same bare
+// plugin config id. Every plugin-cache lookup, retained instance, and shared
+// ProxyGroup instance must therefore be keyed by `(namespace, id)`.
+
+fn namespaced_proxy(namespace: &str, id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
+    let mut proxy = make_proxy(id, listen_path, plugin_ids);
+    proxy.namespace = namespace.to_string();
+    proxy
+}
+
+fn namespaced_plugin_config(
+    namespace: &str,
+    id: &str,
+    plugin_name: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    let mut pc = make_plugin_config(id, plugin_name, scope, proxy_id, true);
+    pc.namespace = namespace.to_string();
+    pc
+}
+
+fn plugin_names(plugins: &[Arc<dyn Plugin>]) -> Vec<String> {
+    plugins.iter().map(|p| p.name().to_string()).collect()
+}
+
+fn has_plugin(plugins: &[Arc<dyn Plugin>], name: &str) -> bool {
+    plugins.iter().any(|plugin| plugin.name() == name)
+}
+
+/// `tenant-a` and `tenant-b` both own a proxy `p1`, a Proxy-scoped config
+/// `scoped`, and a ProxyGroup-scoped config `group1`. Only the plugin names of
+/// the Proxy-scoped configs differ, so any bare-id lookup leaks visibly.
+fn cross_namespace_config() -> GatewayConfig {
+    make_config(
+        vec![
+            namespaced_proxy("tenant-a", "p1", "/api", vec!["scoped", "group1"]),
+            namespaced_proxy("tenant-a", "p2", "/web", vec!["group1"]),
+            namespaced_proxy("tenant-b", "p1", "/api", vec!["scoped", "group1"]),
+        ],
+        vec![
+            namespaced_plugin_config(
+                "tenant-a",
+                "scoped",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            namespaced_plugin_config(
+                "tenant-b",
+                "scoped",
+                "ip_restriction",
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            namespaced_plugin_config(
+                "tenant-a",
+                "group1",
+                "rate_limiting",
+                PluginScope::ProxyGroup,
+                None,
+            ),
+            namespaced_plugin_config(
+                "tenant-b",
+                "group1",
+                "rate_limiting",
+                PluginScope::ProxyGroup,
+                None,
+            ),
+        ],
+    )
+}
+
+#[test]
+fn test_full_build_scopes_proxy_and_group_plugins_by_namespace() {
+    let config = cross_namespace_config();
+    let cache = PluginCache::new(&config).unwrap();
+
+    let a_p1 = cache.get_plugins("tenant-a", "p1");
+    let b_p1 = cache.get_plugins("tenant-b", "p1");
+    let a_names = plugin_names(&a_p1);
+    let b_names = plugin_names(&b_p1);
+
+    assert!(
+        has_plugin(&a_p1, "stdout_logging"),
+        "tenant-a/p1 must resolve its own Proxy-scoped config: {a_names:?}"
+    );
+    assert!(
+        !has_plugin(&a_p1, "ip_restriction"),
+        "tenant-a/p1 must not attach tenant-b's same-id config: {a_names:?}"
+    );
+    assert!(
+        has_plugin(&b_p1, "ip_restriction"),
+        "tenant-b/p1 must resolve its own Proxy-scoped config: {b_names:?}"
+    );
+    assert!(
+        !has_plugin(&b_p1, "stdout_logging"),
+        "tenant-b/p1 must not attach tenant-a's same-id config: {b_names:?}"
+    );
+
+    // Both tenants get a rate_limiting instance, but never the same one.
+    let a_group = plugin_ptr_by_name(&a_p1, "rate_limiting");
+    let b_group = plugin_ptr_by_name(&b_p1, "rate_limiting");
+    assert_ne!(
+        a_group, b_group,
+        "same-id ProxyGroup configs in two namespaces must not share state"
+    );
+
+    // Sharing inside one namespace is preserved.
+    let a_p2 = cache.get_plugins("tenant-a", "p2");
+    assert_eq!(
+        a_group,
+        plugin_ptr_by_name(&a_p2, "rate_limiting"),
+        "proxies in one namespace must still share their group instance"
+    );
+}
+
+#[test]
+fn test_incremental_rebuild_matches_full_build_across_namespaces() {
+    let config = cross_namespace_config();
+    let full = PluginCache::new(&config).unwrap();
+
+    let incremental = PluginCache::new(&config).unwrap();
+    let a_before = plugin_ptr_by_name(&incremental.get_plugins("tenant-a", "p1"), "rate_limiting");
+    let b_before = plugin_ptr_by_name(&incremental.get_plugins("tenant-b", "p1"), "rate_limiting");
+
+    // Rebuild only tenant-a/p1 on an otherwise identical config.
+    let mut proxy_ids = HashSet::new();
+    proxy_ids.insert(NamespacedResourceId::new("tenant-a", "p1"));
+    incremental
+        .apply_delta(&config, &proxy_ids, &[], false)
+        .unwrap();
+
+    for (namespace, proxy_id) in [("tenant-a", "p1"), ("tenant-a", "p2"), ("tenant-b", "p1")] {
+        let mut expected = plugin_names(&full.get_plugins(namespace, proxy_id));
+        let mut actual = plugin_names(&incremental.get_plugins(namespace, proxy_id));
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            expected, actual,
+            "incremental rebuild must match the full build for {namespace}/{proxy_id}"
+        );
+    }
+
+    let a_after = plugin_ptr_by_name(&incremental.get_plugins("tenant-a", "p1"), "rate_limiting");
+    let b_after = plugin_ptr_by_name(&incremental.get_plugins("tenant-b", "p1"), "rate_limiting");
+    assert_eq!(
+        a_before, a_after,
+        "unchanged same-namespace group config must keep its instance"
+    );
+    assert_eq!(
+        b_before, b_after,
+        "rebuilding one tenant must not rebuild another tenant's group instance"
+    );
+    assert_ne!(
+        a_after, b_after,
+        "incremental rebuild must not collapse two namespaces onto one instance"
+    );
+}
+
+#[test]
+fn test_association_to_another_namespaces_plugin_config_id_does_not_attach() {
+    // `tenant-b/p1` references `only-a`, which exists solely in `tenant-a`.
+    // The association must resolve to nothing rather than to tenant-a's config.
+    let config = make_config(
+        vec![
+            namespaced_proxy("tenant-a", "p1", "/api", vec!["only-a", "only-a-proxy"]),
+            namespaced_proxy("tenant-b", "p1", "/api", vec!["only-a", "only-a-proxy"]),
+        ],
+        vec![
+            namespaced_plugin_config(
+                "tenant-a",
+                "only-a",
+                "rate_limiting",
+                PluginScope::ProxyGroup,
+                None,
+            ),
+            namespaced_plugin_config(
+                "tenant-a",
+                "only-a-proxy",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let b_p1 = cache.get_plugins("tenant-b", "p1");
+    let b_names = plugin_names(&b_p1);
+    assert!(
+        !has_plugin(&b_p1, "rate_limiting"),
+        "cross-namespace ProxyGroup association must not attach: {b_names:?}"
+    );
+    assert!(
+        !has_plugin(&b_p1, "stdout_logging"),
+        "cross-namespace Proxy-scoped config must not attach: {b_names:?}"
+    );
+    assert!(
+        has_plugin(&cache.get_plugins("tenant-a", "p1"), "rate_limiting"),
+        "the owning namespace must still attach its own group plugin"
+    );
+}

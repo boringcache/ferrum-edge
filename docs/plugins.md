@@ -28,8 +28,9 @@ Custom plugins are auto-discovered from the `custom_plugins/` directory at build
 ## Scope
 
 - **Global** plugins (`scope: "global"`) apply to all proxies automatically. `proxy_id` must be null.
-- **Proxy-scoped** plugins (`scope: "proxy"`) apply only to a specific proxy. `proxy_id` is required.
+- **Proxy-scoped** plugins (`scope: "proxy"`) apply only to a specific proxy. `proxy_id` is required and is resolved within the plugin config's own namespace.
 - **Proxy-group-scoped** plugins (`scope: "proxy_group"`) apply to a subset of proxies that reference the plugin in their `plugins` association list. `proxy_id` must be null. A **single shared plugin instance** is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. When a proxy is deleted, only the association is removed — the proxy-group plugin config survives.
+- Proxy and proxy-group attachment identity is `(namespace, id)`. Two namespaces may reuse the same bare proxy id and the same bare plugin config id; a proxy only ever resolves plugin configs from its own namespace, and same-id proxy-group configs in two namespaces get independent instances with independent state.
 - A proxy may have **multiple instances** of the same plugin type (e.g., two `http_logging` configs shipping to different destinations). Each instance has its own `id`, `config`, and optional `priority_override` to control execution order
 
 **Example** (file mode YAML):

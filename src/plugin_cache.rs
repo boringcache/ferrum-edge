@@ -1246,8 +1246,17 @@ type RequestBufferingMap = HashMap<String, bool>;
 /// Map from namespace-qualified proxy key to whether any plugin requires parsed
 /// WebSocket framing.
 type WsFrameMap = HashMap<String, bool>;
-/// Map from proxy_group plugin_config_id to its shared plugin instance.
-type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
+/// Map from the namespace-qualified proxy_group plugin config identity
+/// (`(namespace, plugin_config_id)`) to its shared plugin instance. Keying on a
+/// bare config id would share one stateful group instance between two tenants
+/// that happen to reuse the same plugin config id.
+type ProxyGroupInstanceMap = HashMap<NamespacedResourceId, ProxyGroupPluginInstance>;
+/// Cold-build index of `Proxy`-scoped plugin configs, keyed by the borrowed
+/// `(namespace, proxy_id)` pair the owning proxy resolves with.
+type ProxyScopedConfigIndex<'a> = HashMap<(&'a str, &'a str), Vec<&'a PluginConfig>>;
+/// Cold-build index of `ProxyGroup`-scoped plugin configs, keyed by the
+/// `(namespace, plugin_config_id)` identity a proxy association resolves with.
+type ProxyGroupConfigIndex<'a> = HashMap<NamespacedResourceId, &'a PluginConfig>;
 type SecurityCompositionPluginMap<'a> =
     HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
 
@@ -1302,9 +1311,12 @@ fn country_mmdb_plugin_is_active(config: &GatewayConfig, plugin_config: &PluginC
     }
     match &plugin_config.scope {
         PluginScope::Global => true,
+        // Scoped configs only ever attach to proxies in their own namespace, so
+        // a bare id match in another tenant must not mark this config active.
         PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
             config.proxies.iter().any(|proxy| {
-                &proxy.id == proxy_id
+                proxy.namespace == plugin_config.namespace
+                    && &proxy.id == proxy_id
                     && proxy
                         .plugins
                         .iter()
@@ -1312,10 +1324,11 @@ fn country_mmdb_plugin_is_active(config: &GatewayConfig, plugin_config: &PluginC
             })
         }),
         PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
-            proxy
-                .plugins
-                .iter()
-                .any(|association| association.plugin_config_id == plugin_config.id)
+            proxy.namespace == plugin_config.namespace
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin_config.id)
         }),
     }
 }
@@ -1354,9 +1367,12 @@ fn body_validator_descriptor_is_active(
     }
     match &plugin_config.scope {
         PluginScope::Global => true,
+        // Same-namespace attachment only; a colliding bare proxy/config id in
+        // another tenant must not keep this descriptor alive.
         PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
             config.proxies.iter().any(|proxy| {
-                &proxy.id == proxy_id
+                proxy.namespace == plugin_config.namespace
+                    && &proxy.id == proxy_id
                     && proxy
                         .plugins
                         .iter()
@@ -1364,10 +1380,11 @@ fn body_validator_descriptor_is_active(
             })
         }),
         PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
-            proxy
-                .plugins
-                .iter()
-                .any(|association| association.plugin_config_id == plugin_config.id)
+            proxy.namespace == plugin_config.namespace
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin_config.id)
         }),
     }
 }
@@ -1388,7 +1405,8 @@ fn body_validator_descriptor_preload_required_for_scope(
                     ))
                 }),
                 PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
-                    proxy_ids_to_rebuild.contains(&proxy_namespaced_id(proxy))
+                    proxy.namespace == plugin_config.namespace
+                        && proxy_ids_to_rebuild.contains(&proxy_namespaced_id(proxy))
                         && proxy
                             .plugins
                             .iter()
@@ -1413,7 +1431,8 @@ fn country_mmdb_plugin_is_in_rebuild_scope(
             ))
         }),
         PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
-            proxy_ids_to_rebuild.contains(&proxy_namespaced_id(proxy))
+            proxy.namespace == plugin_config.namespace
+                && proxy_ids_to_rebuild.contains(&proxy_namespaced_id(proxy))
                 && proxy
                     .plugins
                     .iter()
@@ -1524,7 +1543,9 @@ struct AdaptiveConcurrencyRouteKey {
 
 #[derive(Clone, Debug, PartialEq)]
 struct AdaptiveConcurrencyRouteOverride {
-    proxy_id: String,
+    /// Namespace-qualified proxy runtime key (`namespace|id`), not a bare id:
+    /// two tenants may reuse the same proxy id under one global policy.
+    proxy_key: String,
     plugin_name: String,
     effective_priority: u16,
     destination_fingerprint: serde_json::Value,
@@ -1543,7 +1564,8 @@ struct AdaptiveConcurrencyUpstreamRoute {
 
 #[derive(Clone, Debug, PartialEq)]
 struct AdaptiveConcurrencyRouteDefinition {
-    protected_proxy_ids: Vec<String>,
+    /// Namespace-qualified proxy runtime keys (`namespace|id`).
+    protected_proxy_keys: Vec<String>,
     keys: Vec<AdaptiveConcurrencyRouteKey>,
     overrides: Vec<AdaptiveConcurrencyRouteOverride>,
     upstream_routes: Vec<AdaptiveConcurrencyUpstreamRoute>,
@@ -1604,10 +1626,18 @@ fn adaptive_definition_matches(
         && state.route_definition.eq(route_definition)
 }
 
+/// Whether a namespace-scoped (`Proxy`/`ProxyGroup`) plugin config attaches to
+/// `proxy`. Attachment identity is `(namespace, id)`: the plugin cache only ever
+/// resolves a proxy's association list against configs in the proxy's own
+/// namespace, so two tenants reusing the same bare proxy id or the same bare
+/// plugin config id must never see each other's configs here.
 fn scoped_plugin_config_applies_to_proxy(
     pc: &PluginConfig,
     proxy: &crate::config::types::Proxy,
 ) -> bool {
+    if pc.namespace != proxy.namespace {
+        return false;
+    }
     match &pc.scope {
         PluginScope::Global => false,
         PluginScope::Proxy => {
@@ -1887,6 +1917,7 @@ fn effective_route_override_configs_for_proxy<'a>(
     for association in &proxy.plugins {
         if let Some(pc) = config.plugin_configs.iter().find(|pc| {
             pc.id == association.plugin_config_id
+                && pc.namespace == proxy.namespace
                 && pc.scope == PluginScope::ProxyGroup
                 && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
                 && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
@@ -2270,7 +2301,7 @@ fn adaptive_concurrency_route_definition(
     key_by: AdaptiveConcurrencyKeyBy,
     config: &GatewayConfig,
 ) -> AdaptiveConcurrencyRouteDefinition {
-    let mut protected_proxy_ids = Vec::new();
+    let mut protected_proxy_keys = Vec::new();
     let mut keys = Vec::new();
     let mut overrides = Vec::new();
     let mut upstream_routes = Vec::new();
@@ -2278,7 +2309,7 @@ fn adaptive_concurrency_route_definition(
         if !plugin_config_effectively_applies_to_proxy(pc, proxy, config) {
             continue;
         }
-        protected_proxy_ids.push(proxy.id.clone());
+        protected_proxy_keys.push(proxy_runtime_key(proxy));
 
         for route_pc in effective_route_override_configs_for_proxy(proxy, config) {
             collect_route_override_destinations(
@@ -2290,7 +2321,7 @@ fn adaptive_concurrency_route_definition(
                 &mut upstream_routes,
             );
             overrides.push(AdaptiveConcurrencyRouteOverride {
-                proxy_id: proxy.id.clone(),
+                proxy_key: proxy_runtime_key(proxy),
                 plugin_name: route_pc.plugin_name.clone(),
                 effective_priority: route_override_priority(route_pc),
                 destination_fingerprint: route_override_destination_fingerprint(route_pc),
@@ -2326,13 +2357,13 @@ fn adaptive_concurrency_route_definition(
     // Proxy ordering in GatewayConfig is not execution ordering. Stable-sort
     // only by proxy ID so the effective route-plugin order within each proxy
     // remains visible to compatibility checks.
-    overrides.sort_by(|left, right| left.proxy_id.cmp(&right.proxy_id));
-    protected_proxy_ids.sort_unstable();
-    protected_proxy_ids.dedup();
+    overrides.sort_by(|left, right| left.proxy_key.cmp(&right.proxy_key));
+    protected_proxy_keys.sort_unstable();
+    protected_proxy_keys.dedup();
     upstream_routes.sort_unstable();
     upstream_routes.dedup();
     AdaptiveConcurrencyRouteDefinition {
-        protected_proxy_ids,
+        protected_proxy_keys,
         keys,
         overrides,
         upstream_routes,
@@ -2420,22 +2451,22 @@ fn adaptive_concurrency_route_definition_requires_reset(
     if current == replacement {
         return false;
     }
-    let existing_proxy_scopes_preserved = current.protected_proxy_ids.iter().all(|proxy_id| {
+    let existing_proxy_scopes_preserved = current.protected_proxy_keys.iter().all(|proxy_key| {
         replacement
-            .protected_proxy_ids
-            .binary_search(proxy_id)
+            .protected_proxy_keys
+            .binary_search(proxy_key)
             .is_ok()
     });
     let existing_override_semantics_preserved =
-        current.protected_proxy_ids.iter().all(|proxy_id| {
+        current.protected_proxy_keys.iter().all(|proxy_key| {
             current
                 .overrides
                 .iter()
-                .filter(|route| route.proxy_id.as_str() == proxy_id.as_str())
+                .filter(|route| route.proxy_key.as_str() == proxy_key.as_str())
                 .eq(replacement
                     .overrides
                     .iter()
-                    .filter(|route| route.proxy_id.as_str() == proxy_id.as_str()))
+                    .filter(|route| route.proxy_key.as_str() == proxy_key.as_str()))
         });
     if !existing_proxy_scopes_preserved
         || !existing_override_semantics_preserved
@@ -2489,9 +2520,12 @@ fn retained_adaptive_concurrency_states(
 fn adaptive_concurrency_policy_is_active(pc: &PluginConfig, config: &GatewayConfig) -> bool {
     match &pc.scope {
         PluginScope::Global => true,
+        // `(namespace, id)` attachment identity — a colliding bare proxy or
+        // plugin config id in another tenant never keeps this policy alive.
         PluginScope::Proxy => pc.proxy_id.as_deref().is_some_and(|proxy_id| {
             config.proxies.iter().any(|proxy| {
-                proxy.id == proxy_id
+                proxy.namespace == pc.namespace
+                    && proxy.id == proxy_id
                     && proxy
                         .plugins
                         .iter()
@@ -2499,10 +2533,11 @@ fn adaptive_concurrency_policy_is_active(pc: &PluginConfig, config: &GatewayConf
             })
         }),
         PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
-            proxy
-                .plugins
-                .iter()
-                .any(|association| association.plugin_config_id == pc.id)
+            proxy.namespace == pc.namespace
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == pc.id)
         }),
     }
 }
@@ -2547,10 +2582,11 @@ fn include_adaptive_concurrency_route_rebuilds(
                         .proxies
                         .iter()
                         .filter(|proxy| {
-                            proxy
-                                .plugins
-                                .iter()
-                                .any(|association| association.plugin_config_id == pc.id)
+                            proxy.namespace == pc.namespace
+                                && proxy
+                                    .plugins
+                                    .iter()
+                                    .any(|association| association.plugin_config_id == pc.id)
                         })
                         .map(proxy_namespaced_id),
                 );
@@ -4073,7 +4109,11 @@ impl PluginCache {
             plugin.retain_active_proxy_state(&active_proxy_generations);
         }
 
-        let mut group_members: HashMap<&str, HashMap<&str, u64>> = HashMap::new();
+        // Group membership is resolved by `(namespace, plugin_config_id)`, the
+        // same identity the group instance map is keyed by, so a proxy in one
+        // tenant never registers as a member of another tenant's group plugin
+        // that happens to reuse the config id.
+        let mut group_members: HashMap<&NamespacedResourceId, HashMap<&str, u64>> = HashMap::new();
         for proxy in &config.proxies {
             // Borrow the stored composite key so group members carry the same
             // namespace-qualified identity as `active_proxy_generations`.
@@ -4084,20 +4124,23 @@ impl PluginCache {
                 continue;
             };
             for assoc in &proxy.plugins {
-                if inner
-                    .proxy_group_plugins
-                    .contains_key(assoc.plugin_config_id.as_str())
+                let group_identity = NamespacedResourceId::new(
+                    proxy.namespace.as_str(),
+                    assoc.plugin_config_id.as_str(),
+                );
+                if let Some((stored_identity, _)) =
+                    inner.proxy_group_plugins.get_key_value(&group_identity)
                 {
                     group_members
-                        .entry(assoc.plugin_config_id.as_str())
+                        .entry(stored_identity)
                         .or_default()
                         .insert(owner_key.as_str(), generation);
                 }
             }
         }
-        for (group_id, instance) in &inner.proxy_group_plugins {
+        for (group_identity, instance) in &inner.proxy_group_plugins {
             let members = group_members
-                .get(group_id.as_str())
+                .get(group_identity)
                 .cloned()
                 .unwrap_or_default();
             instance.plugin.retain_active_proxy_state(&members);
@@ -4563,11 +4606,11 @@ impl PluginCache {
             global_plugins_changed |= changed;
         }
 
-        // Build index of proxy-scoped plugin configs for efficient lookup
-        let mut proxy_scoped_configs: HashMap<&str, Vec<&crate::config::types::PluginConfig>> =
-            HashMap::new();
-        let mut proxy_group_configs: HashMap<&str, &crate::config::types::PluginConfig> =
-            HashMap::new();
+        // Build index of proxy-scoped plugin configs for efficient lookup.
+        // Both indexes are keyed by `(namespace, id)` so a proxy only ever
+        // resolves plugin configs from its own tenant.
+        let mut proxy_scoped_configs: ProxyScopedConfigIndex = HashMap::new();
+        let mut proxy_group_configs: ProxyGroupConfigIndex = HashMap::new();
         for pc in &config.plugin_configs {
             if !pc.enabled {
                 continue;
@@ -4576,21 +4619,29 @@ impl PluginCache {
                 && let Some(ref proxy_id) = pc.proxy_id
             {
                 proxy_scoped_configs
-                    .entry(proxy_id.as_str())
+                    .entry((pc.namespace.as_str(), proxy_id.as_str()))
                     .or_default()
                     .push(pc);
             } else if pc.scope == PluginScope::ProxyGroup {
-                proxy_group_configs.insert(pc.id.as_str(), pc);
+                proxy_group_configs.insert(
+                    NamespacedResourceId::new(pc.namespace.as_str(), pc.id.as_str()),
+                    pc,
+                );
             }
         }
 
-        let active_proxy_group_ids: HashSet<&str> = config
-            .proxies
-            .iter()
-            .flat_map(|proxy| proxy.plugins.iter())
-            .map(|assoc| assoc.plugin_config_id.as_str())
-            .filter(|id| proxy_group_configs.contains_key(*id))
-            .collect();
+        let mut active_proxy_group_ids: HashSet<NamespacedResourceId> = HashSet::new();
+        for proxy in &config.proxies {
+            for assoc in &proxy.plugins {
+                let identity = NamespacedResourceId::new(
+                    proxy.namespace.as_str(),
+                    assoc.plugin_config_id.as_str(),
+                );
+                if proxy_group_configs.contains_key(&identity) {
+                    active_proxy_group_ids.insert(identity);
+                }
+            }
+        }
 
         // Shared ProxyGroup plugin instances. Start with unchanged current
         // instances that are still referenced in the post-delta config. This
@@ -4599,11 +4650,11 @@ impl PluginCache {
         let mut group_plugin_instances: ProxyGroupInstanceMap = current
             .proxy_group_plugins
             .iter()
-            .filter_map(|(id, existing)| {
-                if !active_proxy_group_ids.contains(id.as_str()) {
+            .filter_map(|(identity, existing)| {
+                if !active_proxy_group_ids.contains(identity) {
                     return None;
                 }
-                let pc = proxy_group_configs.get(id.as_str())?;
+                let pc = proxy_group_configs.get(identity)?;
                 if pc.plugin_name == "adaptive_concurrency"
                     && !adaptive_concurrency_instances
                         .contains_key(&adaptive_concurrency_policy_id(pc))
@@ -4617,7 +4668,7 @@ impl PluginCache {
                     return None;
                 }
                 if same_proxy_group_plugin_config(&existing.config, pc) {
-                    Some((id.clone(), existing.clone()))
+                    Some((identity.clone(), existing.clone()))
                 } else {
                     None
                 }
@@ -4630,7 +4681,10 @@ impl PluginCache {
                 }
                 if let Some(plugin) = forced.get(id) {
                     group_plugin_instances.insert(
-                        plugin_config.id.clone(),
+                        NamespacedResourceId::new(
+                            plugin_config.namespace.as_str(),
+                            plugin_config.id.as_str(),
+                        ),
                         ProxyGroupPluginInstance {
                             plugin: Arc::clone(plugin),
                             config: (*plugin_config).clone(),
@@ -4666,7 +4720,9 @@ impl PluginCache {
                 .map(|a| a.plugin_config_id.as_str())
                 .collect();
 
-            if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
+            if let Some(scoped_configs) =
+                proxy_scoped_configs.get(&(proxy.namespace.as_str(), proxy.id.as_str()))
+            {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin_for_cache(
@@ -4732,10 +4788,15 @@ impl PluginCache {
                 }
             }
 
-            // Resolve proxy_group-scoped plugins via the proxy's association list
+            // Resolve proxy_group-scoped plugins via the proxy's association
+            // list, resolved within the proxy's own namespace.
             for assoc in &proxy.plugins {
-                if let Some(pc) = proxy_group_configs.get(assoc.plugin_config_id.as_str()) {
-                    if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
+                let group_identity = NamespacedResourceId::new(
+                    proxy.namespace.as_str(),
+                    assoc.plugin_config_id.as_str(),
+                );
+                if let Some(pc) = proxy_group_configs.get(&group_identity) {
+                    if let Some(existing) = group_plugin_instances.get(&group_identity) {
                         let plugin = Arc::clone(&existing.plugin);
                         remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
                         merged.push(plugin);
@@ -4754,7 +4815,7 @@ impl PluginCache {
                         ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
-                                    pc.id.clone(),
+                                    group_identity.clone(),
                                     ProxyGroupPluginInstance {
                                         plugin: Arc::clone(&plugin),
                                         config: (*pc).clone(),
@@ -5308,20 +5369,21 @@ impl PluginCache {
         let mut tcp_connection_throttle_instances =
             retained_tcp_connection_throttle_states(current_tcp_throttle_states, config);
 
-        // Pre-index proxy-scoped plugin configs by proxy_id for O(1) lookup
-        // instead of scanning all plugin_configs for every proxy (O(P×C) → O(P+C)).
-        let mut proxy_scoped_configs: HashMap<&str, Vec<&crate::config::types::PluginConfig>> =
-            HashMap::new();
+        // Pre-index proxy-scoped plugin configs by `(namespace, proxy_id)` for
+        // O(1) lookup instead of scanning all plugin_configs for every proxy
+        // (O(P×C) → O(P+C)). The namespace is part of the key so two tenants
+        // reusing one bare proxy id never see each other's plugin configs.
+        let mut proxy_scoped_configs: ProxyScopedConfigIndex = HashMap::new();
 
         // Collect all enabled-plugin construction errors to report before bailing.
         let mut plugin_errors: Vec<String> = Vec::new();
 
-        // Pre-index proxy_group-scoped plugin configs by config ID for shared
-        // instance creation. A single ProxyGroup plugin instance is shared across
-        // all proxies that reference it, so stateful plugins (e.g., rate_limiting)
-        // share counters across the group.
-        let mut proxy_group_configs: HashMap<&str, &crate::config::types::PluginConfig> =
-            HashMap::new();
+        // Pre-index proxy_group-scoped plugin configs by `(namespace, config
+        // id)` for shared instance creation. A single ProxyGroup plugin instance
+        // is shared across all proxies in that namespace which reference it, so
+        // stateful plugins (e.g., rate_limiting) share counters across the group
+        // — but never across tenants that reuse one bare config id.
+        let mut proxy_group_configs: ProxyGroupConfigIndex = HashMap::new();
 
         // First pass: stage the named-schema registry from
         // `transaction_log_schema` global plugins so subsequent plugins
@@ -5390,11 +5452,14 @@ impl PluginCache {
                 && let Some(ref proxy_id) = pc.proxy_id
             {
                 proxy_scoped_configs
-                    .entry(proxy_id.as_str())
+                    .entry((pc.namespace.as_str(), proxy_id.as_str()))
                     .or_default()
                     .push(pc);
             } else if pc.scope == PluginScope::ProxyGroup {
-                proxy_group_configs.insert(pc.id.as_str(), pc);
+                proxy_group_configs.insert(
+                    NamespacedResourceId::new(pc.namespace.as_str(), pc.id.as_str()),
+                    pc,
+                );
             }
         }
 
@@ -5429,8 +5494,11 @@ impl PluginCache {
                 .map(|a| a.plugin_config_id.as_str())
                 .collect();
 
-            // Resolve proxy-scoped plugins indexed by proxy_id (O(plugins_per_proxy))
-            if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
+            // Resolve proxy-scoped plugins indexed by `(namespace, proxy_id)`
+            // (O(plugins_per_proxy))
+            if let Some(scoped_configs) =
+                proxy_scoped_configs.get(&(proxy.namespace.as_str(), proxy.id.as_str()))
+            {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin_for_cache(
@@ -5469,11 +5537,16 @@ impl PluginCache {
                 }
             }
 
-            // Resolve proxy_group-scoped plugins via the proxy's association list.
-            // Shared Arc instances are reused across all proxies in the group.
+            // Resolve proxy_group-scoped plugins via the proxy's association
+            // list, resolved within the proxy's own namespace. Shared Arc
+            // instances are reused across all proxies in the group.
             for assoc in &proxy.plugins {
-                if let Some(pc) = proxy_group_configs.get(assoc.plugin_config_id.as_str()) {
-                    if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
+                let group_identity = NamespacedResourceId::new(
+                    proxy.namespace.as_str(),
+                    assoc.plugin_config_id.as_str(),
+                );
+                if let Some(pc) = proxy_group_configs.get(&group_identity) {
+                    if let Some(existing) = group_plugin_instances.get(&group_identity) {
                         // Reuse the shared instance (Arc::clone is ~5ns)
                         let plugin = Arc::clone(&existing.plugin);
                         remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
@@ -5494,7 +5567,7 @@ impl PluginCache {
                         ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
-                                    pc.id.clone(),
+                                    group_identity.clone(),
                                     ProxyGroupPluginInstance {
                                         plugin: Arc::clone(&plugin),
                                         config: (*pc).clone(),
