@@ -27,16 +27,60 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 use wiremock::matchers::{body_string_contains, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 // Marker set by the proxy on `ctx.metadata` while the response-body hooks run
 // over a synthetic 2xx plugin short-circuit body (mirrors
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
 // therefore not reachable from this external test crate).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+struct SingleflightWaitOverrideGuard<'a> {
+    plugin: &'a AiSemanticCache,
+}
+
+impl<'a> SingleflightWaitOverrideGuard<'a> {
+    fn install(plugin: &'a AiSemanticCache, wait: Duration) -> Self {
+        ai_semantic_cache_set_singleflight_wait_override_for_test(plugin, Some(wait));
+        Self { plugin }
+    }
+}
+
+impl Drop for SingleflightWaitOverrideGuard<'_> {
+    fn drop(&mut self) {
+        ai_semantic_cache_set_singleflight_wait_override_for_test(self.plugin, None);
+    }
+}
+
+struct ConcurrencyTrackingEmbeddingResponder {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    response_delay: Duration,
+}
+
+impl Respond for ConcurrencyTrackingEmbeddingResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak.fetch_max(active, Ordering::AcqRel);
+
+        let active_counter = Arc::clone(&self.active);
+        let response_delay = self.response_delay;
+        tokio::spawn(async move {
+            tokio::time::sleep(response_delay).await;
+            active_counter.fetch_sub(1, Ordering::AcqRel);
+        });
+
+        ResponseTemplate::new(200)
+            .set_delay(response_delay)
+            .set_body_json(json!({
+                "data": [{"embedding": [1.0, 0.0, 0.0]}]
+            }))
+    }
+}
 
 fn plugin_http_client_with_ip_policy(policy: BackendAllowIps) -> PluginHttpClient {
     let policy = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(policy);
@@ -4873,8 +4917,8 @@ async fn leader_cancel_reelects_one_replacement_without_stampede() {
 }
 
 #[tokio::test]
+#[serial_test::serial(ai_semantic_cache_singleflight_wait)]
 async fn singleflight_timeout_bypasses_without_duplicating_live_leader() {
-    ai_semantic_cache_set_singleflight_wait_override_for_test(Some(Duration::from_millis(80)));
     let mock_server = MockServer::start().await;
     // The live leader runs past the follower wait bound. Followers must bypass
     // semantic lookup rather than evicting it and issuing a duplicate request.
@@ -4893,6 +4937,8 @@ async fn singleflight_timeout_bypasses_without_duplicating_live_leader() {
         .await;
 
     let plugin = Arc::new(make_plugin(semantic_config(&mock_server)));
+    let _wait_override =
+        SingleflightWaitOverrideGuard::install(plugin.as_ref(), Duration::from_millis(80));
     let body = json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "timeout reelect"}]
@@ -4922,13 +4968,24 @@ async fn singleflight_timeout_bypasses_without_duplicating_live_leader() {
         let result = task.await.expect("join");
         assert!(matches!(result, PluginResult::Continue));
     }
-    ai_semantic_cache_set_singleflight_wait_override_for_test(None);
 }
 
 #[tokio::test]
 async fn high_cardinality_distinct_misses_are_semaphore_bounded() {
     let mock_server = MockServer::start().await;
-    mount_embedding_mock(&mock_server, 16).await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ConcurrencyTrackingEmbeddingResponder {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+            response_delay: Duration::from_millis(100),
+        })
+        .expect(16)
+        .mount(&mock_server)
+        .await;
     let plugin = Arc::new(make_plugin(semantic_config(&mock_server)));
     let proxy = Arc::new(create_test_proxy());
 
@@ -4957,6 +5014,68 @@ async fn high_cardinality_distinct_misses_are_semaphore_bounded() {
     for task in tasks {
         assert!(matches!(task.await.expect("join"), PluginResult::Continue));
     }
+    let observed_peak = peak.load(Ordering::Acquire);
+    assert!(
+        (2..=8).contains(&observed_peak),
+        "embedding concurrency peak {observed_peak} must show overlap without exceeding the semaphore"
+    );
+}
+
+#[tokio::test]
+async fn embedding_semaphore_admission_wait_is_bounded() {
+    let mock_server = MockServer::start().await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ConcurrencyTrackingEmbeddingResponder {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+            response_delay: Duration::from_millis(500),
+        })
+        .expect(8)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = Arc::new(make_plugin(semantic_config(&mock_server)));
+    let _wait_override =
+        SingleflightWaitOverrideGuard::install(plugin.as_ref(), Duration::from_millis(80));
+    let proxy = Arc::new(create_test_proxy());
+
+    let mut tasks = Vec::new();
+    for index in 0..9 {
+        let plugin = Arc::clone(&plugin);
+        let proxy = Arc::clone(&proxy);
+        tasks.push(tokio::spawn(async move {
+            let body = json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": format!("saturated prompt {index}")
+                }]
+            });
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/v1/chat/completions".to_string(),
+            );
+            ctx.matched_proxy = Some(proxy);
+            ctx.metadata
+                .insert("request_body".to_string(), serde_json::to_string(&body).unwrap());
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            plugin.before_proxy(&mut ctx, &mut headers).await
+        }));
+    }
+
+    for task in tasks {
+        assert!(matches!(task.await.expect("join"), PluginResult::Continue));
+    }
+    assert!(
+        (2..=8).contains(&peak.load(Ordering::Acquire)),
+        "saturated embedding requests must overlap without exceeding the semaphore"
+    );
 }
 
 #[tokio::test]

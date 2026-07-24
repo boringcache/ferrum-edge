@@ -1504,11 +1504,11 @@ impl RedisRateLimitClient {
     ///
     /// A plain `GET` would allocate the full stored value regardless of size, so
     /// a compromised or oversized entry could force an unbounded allocation. This
-    /// reads `EXISTS`, `STRLEN`, and `GETRANGE key 0 max_bytes` atomically: the
-    /// true length gates the outcome while the range read caps the
-    /// transferred/allocated bytes at `max_bytes + 1`. The inclusive end index
-    /// is converted with [`redis_getrange_end_index`] so an oversized cap cannot
-    /// become Redis's "read to end" (`-1`) sentinel. Returned prefixes are
+    /// reads `EXISTS`, `STRLEN`, and `GETRANGE key 0 max_bytes` in one pipelined
+    /// round-trip: the true length gates the outcome while the range read caps
+    /// the transferred/allocated bytes at `max_bytes + 1`. The inclusive end
+    /// index is converted with [`redis_getrange_end_index`] so an oversized cap
+    /// cannot become Redis's "read to end" (`-1`) sentinel. Returned prefixes are
     /// independently verified against the bound before admission. Callers treat
     /// [`BoundedRedisValue::Oversized`] and [`BoundedRedisValue::Empty`] as
     /// invalid entries and quarantine them.

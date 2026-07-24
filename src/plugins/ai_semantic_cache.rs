@@ -221,9 +221,11 @@ const MIN_REDIS_INTEGRITY_KEY_BYTES: usize = 32;
 /// cross-version or foreign write) and quarantined rather than replayed. Bump
 /// this whenever the stored envelope shape or authenticity contract changes.
 /// v2 requires an HMAC authenticity tag; v3 length-frames every authenticated
-/// header name/value so embedded NUL bytes cannot repartition header fields.
-/// There is no legacy unauthenticated read path during build-out.
-const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 3;
+/// header name/value so embedded NUL bytes cannot repartition header fields;
+/// v4 authenticates the seal timestamp so Redis retention cannot extend replay
+/// beyond the configured cache TTL. There is no legacy unauthenticated read
+/// path during build-out.
+const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 4;
 
 /// Deployment-safe ceiling on concurrent outbound embedding requests per plugin
 /// instance. A burst of distinct concurrent misses (or an embedding outage that
@@ -243,19 +245,6 @@ const EMBEDDING_SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(30);
 /// pathological leader-cancellation storm cannot loop forever on the request
 /// task.
 const EMBEDDING_SINGLEFLIGHT_MAX_RETRIES: usize = 16;
-/// Test-only override for [`EMBEDDING_SINGLEFLIGHT_WAIT`] (milliseconds). `0`
-/// means use the production default.
-static SINGLEFLIGHT_WAIT_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
-
-fn embedding_singleflight_wait() -> Duration {
-    let override_ms = SINGLEFLIGHT_WAIT_OVERRIDE_MS.load(Ordering::Relaxed);
-    if override_ms > 0 {
-        Duration::from_millis(override_ms)
-    } else {
-        EMBEDDING_SINGLEFLIGHT_WAIT
-    }
-}
-
 const RESPONSE_SHAPE_FIELDS: &[&str] = &[
     "tools",
     "tool_choice",
@@ -671,6 +660,9 @@ pub struct AiSemanticCache {
     /// burst of distinct misses cannot fan out unboundedly. See
     /// [`MAX_CONCURRENT_EMBEDDINGS`].
     embedding_semaphore: Arc<Semaphore>,
+    /// Test-only per-instance follower/admission wait override in milliseconds.
+    /// Zero uses [`EMBEDDING_SINGLEFLIGHT_WAIT`].
+    embedding_singleflight_wait_override_ms: AtomicU64,
     /// Singleflight map keyed by embedding input hash. Identical concurrent
     /// misses coalesce onto one outbound computation; followers await the
     /// leader's shared result. Empty in normal operation (entries live only for
@@ -719,7 +711,8 @@ pub struct AiSemanticCache {
     /// until this is true so a rolled-back generation has no maintenance side
     /// effects.
     maintenance_committed: Arc<AtomicBool>,
-    /// Lifecycle-owned maintenance handles aborted on drop/reload.
+    /// Lifecycle-owned maintenance handles cancelled on drop/reload. Blocking
+    /// work already scheduled may complete before releasing its bounded lease.
     maintenance: Mutex<Option<MaintenanceHandles>>,
     /// Optional test-only callback after byte-budget admission succeeds and
     /// before `DashMap` insert. Production keeps this empty; the
@@ -750,6 +743,10 @@ struct StorePostAdmitHook {
 struct SerializableCacheEntry {
     #[serde(default)]
     version: u8,
+    /// Wall-clock seal time authenticated with the rest of the envelope.
+    /// Missing timestamps deserialize as zero and fail the freshness check.
+    #[serde(default)]
+    sealed_at_epoch_seconds: u64,
     status_code: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
@@ -908,6 +905,7 @@ impl AiSemanticCache {
             cache_multimodal,
             semantic,
             embedding_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EMBEDDINGS)),
+            embedding_singleflight_wait_override_ms: AtomicU64::new(0),
             embedding_flights: Arc::new(DashMap::new()),
             http_client,
             cache: Arc::new(DashMap::new()),
@@ -1118,21 +1116,18 @@ impl AiSemanticCache {
                         key: flight_key,
                         slot,
                     };
-                    // A closed semaphore is not expected while this plugin
-                    // instance is live, but it must still fail closed rather
-                    // than silently issuing an unadmitted outbound request.
-                    let _permit = self
-                        .embedding_semaphore
-                        .acquire()
-                        .await
-                        .map_err(|_| "embedding concurrency admission is closed".to_string())?;
-                    let shared = Arc::new(self.compute_embedding_inner(input).await);
+                    // Publish admission failures as well as provider outcomes so
+                    // followers never wait on a leader stuck behind saturation.
+                    let shared = match self.acquire_embedding_permit().await {
+                        Ok(_permit) => Arc::new(self.compute_embedding_inner(input).await),
+                        Err(error) => Arc::new(Err(error)),
+                    };
                     // Publish one shared success/failure to every waiter.
                     let _ = tx.send(Some(Arc::clone(&shared)));
                     return (*shared).clone();
                 }
                 EmbeddingFlightRole::Follower(mut rx) => {
-                    let wait_deadline = Instant::now() + embedding_singleflight_wait();
+                    let wait_deadline = Instant::now() + self.embedding_singleflight_wait();
                     loop {
                         // Bind the cloned value so the borrow guard drops before
                         // the wait below re-borrows `rx`.
@@ -1170,12 +1165,33 @@ impl AiSemanticCache {
 
         // Exhausted re-election budget under a leader-cancellation storm: still
         // honor the per-instance semaphore for one final bounded attempt.
-        let _permit = self
-            .embedding_semaphore
-            .acquire()
-            .await
-            .map_err(|_| "embedding concurrency admission is closed".to_string())?;
+        let _permit = self.acquire_embedding_permit().await?;
         self.compute_embedding_inner(input).await
+    }
+
+    /// Bound time spent waiting for embedding admission as well as provider I/O.
+    async fn acquire_embedding_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, String> {
+        match tokio::time::timeout(
+            self.embedding_singleflight_wait(),
+            self.embedding_semaphore.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err("embedding concurrency admission is closed".to_string()),
+            Err(_) => Err("embedding concurrency admission wait exceeded bound".to_string()),
+        }
+    }
+
+    fn embedding_singleflight_wait(&self) -> Duration {
+        let override_ms = self
+            .embedding_singleflight_wait_override_ms
+            .load(Ordering::Relaxed);
+        if override_ms > 0 {
+            Duration::from_millis(override_ms)
+        } else {
+            EMBEDDING_SINGLEFLIGHT_WAIT
+        }
     }
 
     async fn compute_embedding_inner(&self, input: &str) -> Result<EmbeddingPoint, String> {
@@ -1324,7 +1340,7 @@ impl AiSemanticCache {
     /// caller quarantines the entry.
     fn admit_redis_hit(
         &self,
-        entry: &SerializableCacheEntry,
+        entry: SerializableCacheEntry,
         redis_key: &str,
     ) -> Option<CachedResponse> {
         // Fail closed when Redis mode cannot authenticate.
@@ -1342,6 +1358,7 @@ impl AiSemanticCache {
             &RedisEnvelopeMacInput {
                 redis_key,
                 version: entry.version,
+                sealed_at_epoch_seconds: entry.sealed_at_epoch_seconds,
                 status_code: entry.status_code,
                 headers: &entry.headers,
                 body: &entry.body,
@@ -1350,6 +1367,10 @@ impl AiSemanticCache {
             },
         )?;
         if !constant_time_eq(&provided_mac, &expected_mac) {
+            return None;
+        }
+        let age_seconds = current_epoch_seconds().checked_sub(entry.sealed_at_epoch_seconds)?;
+        if age_seconds >= self.ttl.as_secs() {
             return None;
         }
         // Status: same 2xx contract as the store path (exclude 204/205, which
@@ -1383,7 +1404,7 @@ impl AiSemanticCache {
         Some(CachedResponse {
             status_code: entry.status_code,
             headers,
-            body: Bytes::from(entry.body.clone()),
+            body: Bytes::from(entry.body),
         })
     }
 
@@ -1853,11 +1874,13 @@ impl AiSemanticCache {
         body: &[u8],
     ) -> Option<SerializableCacheEntry> {
         let integrity_key = self.redis_integrity_key.as_ref()?;
+        let sealed_at_epoch_seconds = current_epoch_seconds();
         let mac = compute_redis_envelope_mac(
             integrity_key,
             &RedisEnvelopeMacInput {
                 redis_key,
                 version: SEMANTIC_CACHE_ENTRY_VERSION,
+                sealed_at_epoch_seconds,
                 status_code,
                 headers,
                 body,
@@ -1867,6 +1890,7 @@ impl AiSemanticCache {
         )?;
         Some(SerializableCacheEntry {
             version: SEMANTIC_CACHE_ENTRY_VERSION,
+            sealed_at_epoch_seconds,
             status_code,
             headers: headers.clone(),
             body: body.to_vec(),
@@ -1913,21 +1937,24 @@ impl AiSemanticCache {
         self.rebuild_signal.notify_one();
     }
 
-    /// Override the singleflight follower wait used by external timeout tests.
-    /// Pass `None` to restore the production default.
+    /// Override the singleflight follower/admission wait used by external
+    /// timeout tests. Pass `None` to restore the production default.
     #[allow(dead_code)]
-    pub(crate) fn set_singleflight_wait_override_for_tests(wait: Option<Duration>) {
+    pub(crate) fn set_singleflight_wait_override_for_tests(&self, wait: Option<Duration>) {
         let ms = wait
             .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
             .unwrap_or(0);
-        SINGLEFLIGHT_WAIT_OVERRIDE_MS.store(ms, Ordering::Relaxed);
+        self.embedding_singleflight_wait_override_ms
+            .store(ms, Ordering::Relaxed);
     }
 }
 
 impl Drop for AiSemanticCache {
     fn drop(&mut self) {
-        // Abort lifecycle-owned maintenance on plugin-generation drop/reload so
-        // uncommitted or retired instances cannot keep scanning/rebuilding.
+        // Cooperatively cancel lifecycle-owned maintenance on generation
+        // drop/reload. Aborting the async owner prevents new work; a
+        // spawn_blocking sweep/build already scheduled can run to completion,
+        // then releases its bounded workspace lease.
         self.maintenance_committed.store(false, Ordering::Release);
         let handles = match self.maintenance.get_mut() {
             Ok(slot) => slot.take(),
@@ -4114,7 +4141,7 @@ impl Plugin for AiSemanticCache {
                 Ok(BoundedRedisValue::Found(data)) => {
                     match serde_json::from_slice::<SerializableCacheEntry>(&data)
                         .ok()
-                        .and_then(|entry| self.admit_redis_hit(&entry, &redis_key))
+                        .and_then(|entry| self.admit_redis_hit(entry, &redis_key))
                     {
                         Some(cached) => {
                             debug!(
@@ -4492,6 +4519,7 @@ fn append_effective_destination_identity(
 struct RedisEnvelopeMacInput<'a> {
     redis_key: &'a str,
     version: u8,
+    sealed_at_epoch_seconds: u64,
     status_code: u16,
     headers: &'a HashMap<String, String>,
     body: &'a [u8],
@@ -4507,10 +4535,11 @@ struct RedisEnvelopeMacInput<'a> {
 /// to initialize (fail closed).
 fn compute_redis_envelope_mac(key: &[u8], envelope: &RedisEnvelopeMacInput<'_>) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).ok()?;
-    mac.update(b"ai_semantic_cache.v3\0");
+    mac.update(b"ai_semantic_cache.v4\0");
     mac.update(&(envelope.redis_key.len() as u64).to_le_bytes());
     mac.update(envelope.redis_key.as_bytes());
     mac.update(&[envelope.version]);
+    mac.update(&envelope.sealed_at_epoch_seconds.to_le_bytes());
     mac.update(&envelope.status_code.to_le_bytes());
     let mut header_pairs: Vec<(&str, &str)> = envelope
         .headers
@@ -5195,6 +5224,7 @@ mod tests {
     fn redis_serialized_cache_entry_omits_semantic_vector_fields_when_empty() {
         let entry = SerializableCacheEntry {
             version: SEMANTIC_CACHE_ENTRY_VERSION,
+            sealed_at_epoch_seconds: current_epoch_seconds(),
             status_code: 200,
             headers: HashMap::new(),
             body: b"cached".to_vec(),
@@ -5224,6 +5254,7 @@ mod tests {
         seal: bool,
     ) -> SerializableCacheEntry {
         let mut headers = HashMap::new();
+        let sealed_at_epoch_seconds = current_epoch_seconds();
         if let Some(ct) = content_type {
             headers.insert("content-type".to_string(), ct.to_string());
         }
@@ -5233,6 +5264,7 @@ mod tests {
                 &RedisEnvelopeMacInput {
                     redis_key: TEST_REDIS_KEY,
                     version,
+                    sealed_at_epoch_seconds,
                     status_code,
                     headers: &headers,
                     body,
@@ -5247,6 +5279,7 @@ mod tests {
         };
         SerializableCacheEntry {
             version,
+            sealed_at_epoch_seconds,
             status_code,
             headers,
             body: body.to_vec(),
@@ -5264,11 +5297,13 @@ mod tests {
         ]);
         // Intentional embedded NULs: `1` NUL `b` NUL `2` (not an octal `\02`).
         let fused_headers = HashMap::from([("a".to_string(), "1\0b\0\x32".to_string())]);
+        let framing_test_sealed_at = current_epoch_seconds();
         let split_mac = compute_redis_envelope_mac(
             TEST_INTEGRITY_KEY.as_bytes(),
             &RedisEnvelopeMacInput {
                 redis_key: TEST_REDIS_KEY,
                 version: SEMANTIC_CACHE_ENTRY_VERSION,
+                sealed_at_epoch_seconds: framing_test_sealed_at,
                 status_code: 200,
                 headers: &split_headers,
                 body: b"body",
@@ -5282,6 +5317,7 @@ mod tests {
             &RedisEnvelopeMacInput {
                 redis_key: TEST_REDIS_KEY,
                 version: SEMANTIC_CACHE_ENTRY_VERSION,
+                sealed_at_epoch_seconds: framing_test_sealed_at,
                 status_code: 200,
                 headers: &fused_headers,
                 body: b"body",
@@ -5323,6 +5359,7 @@ mod tests {
             &RedisEnvelopeMacInput {
                 redis_key: TEST_REDIS_KEY,
                 version: valid.version,
+                sealed_at_epoch_seconds: valid.sealed_at_epoch_seconds,
                 status_code: valid.status_code,
                 headers: &valid.headers,
                 body: &valid.body,
@@ -5333,7 +5370,7 @@ mod tests {
         .expect("test HMAC");
         valid.integrity = Some(hex::encode(mac));
         let admitted = plugin
-            .admit_redis_hit(&valid, TEST_REDIS_KEY)
+            .admit_redis_hit(valid, TEST_REDIS_KEY)
             .expect("a valid authenticated JSON 2xx entry must be admitted");
         assert_eq!(admitted.status_code, 200);
         assert_eq!(admitted.body, Bytes::from_static(br#"{"ok":true}"#));
@@ -5345,11 +5382,40 @@ mod tests {
             "foreign-injected Set-Cookie must be stripped on the hit path"
         );
 
+        // A valid MAC cannot extend an entry beyond the configured TTL.
+        let mut stale = redis_entry(
+            SEMANTIC_CACHE_ENTRY_VERSION,
+            200,
+            Some("application/json"),
+            br#"{"ok":true}"#,
+            false,
+        );
+        stale.sealed_at_epoch_seconds = current_epoch_seconds().saturating_sub(600);
+        let stale_mac = compute_redis_envelope_mac(
+            TEST_INTEGRITY_KEY.as_bytes(),
+            &RedisEnvelopeMacInput {
+                redis_key: TEST_REDIS_KEY,
+                version: stale.version,
+                sealed_at_epoch_seconds: stale.sealed_at_epoch_seconds,
+                status_code: stale.status_code,
+                headers: &stale.headers,
+                body: &stale.body,
+                semantic_scope_key: None,
+                embedding: None,
+            },
+        )
+        .expect("test HMAC");
+        stale.integrity = Some(hex::encode(stale_mac));
+        assert!(
+            plugin.admit_redis_hit(stale, TEST_REDIS_KEY).is_none(),
+            "an authenticated entry at the TTL boundary must be quarantined"
+        );
+
         // Missing MAC / cross-key MAC / cross-version envelopes are quarantined.
         assert!(
             plugin
                 .admit_redis_hit(
-                    &redis_entry(
+                    redis_entry(
                         SEMANTIC_CACHE_ENTRY_VERSION,
                         200,
                         Some("application/json"),
@@ -5364,7 +5430,7 @@ mod tests {
         assert!(
             plugin
                 .admit_redis_hit(
-                    &redis_entry(
+                    redis_entry(
                         SEMANTIC_CACHE_ENTRY_VERSION,
                         200,
                         Some("application/json"),
@@ -5379,7 +5445,7 @@ mod tests {
         assert!(
             plugin
                 .admit_redis_hit(
-                    &redis_entry(0, 200, Some("application/json"), br#"{"ok":true}"#, true),
+                    redis_entry(0, 200, Some("application/json"), br#"{"ok":true}"#, true),
                     TEST_REDIS_KEY,
                 )
                 .is_none(),
@@ -5391,7 +5457,7 @@ mod tests {
             assert!(
                 plugin
                     .admit_redis_hit(
-                        &redis_entry(
+                        redis_entry(
                             SEMANTIC_CACHE_ENTRY_VERSION,
                             status,
                             Some("application/json"),
@@ -5410,7 +5476,7 @@ mod tests {
         assert!(
             plugin
                 .admit_redis_hit(
-                    &redis_entry(
+                    redis_entry(
                         SEMANTIC_CACHE_ENTRY_VERSION,
                         200,
                         Some("application/json"),
@@ -5427,7 +5493,7 @@ mod tests {
         assert!(
             plugin
                 .admit_redis_hit(
-                    &redis_entry(
+                    redis_entry(
                         SEMANTIC_CACHE_ENTRY_VERSION,
                         200,
                         Some("text/html"),
@@ -5442,7 +5508,7 @@ mod tests {
         assert!(
             plugin
                 .admit_redis_hit(
-                    &redis_entry(
+                    redis_entry(
                         SEMANTIC_CACHE_ENTRY_VERSION,
                         200,
                         None,
@@ -5457,7 +5523,7 @@ mod tests {
         assert!(
             plugin
                 .admit_redis_hit(
-                    &redis_entry(
+                    redis_entry(
                         SEMANTIC_CACHE_ENTRY_VERSION,
                         200,
                         Some("application/json"),

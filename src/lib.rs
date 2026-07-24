@@ -1319,11 +1319,10 @@ pub mod _test_support {
     }
 
     pub fn ai_semantic_cache_set_singleflight_wait_override_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
         wait: Option<std::time::Duration>,
     ) {
-        crate::plugins::ai_semantic_cache::AiSemanticCache::set_singleflight_wait_override_for_tests(
-            wait,
-        );
+        plugin.set_singleflight_wait_override_for_tests(wait);
     }
 
     pub fn ai_semantic_cache_set_store_post_admit_hook_for_test(
