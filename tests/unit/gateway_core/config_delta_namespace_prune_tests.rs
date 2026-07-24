@@ -243,12 +243,16 @@ fn health_check_prune_removes_only_matching_namespace() {
 
     checker.prune_removed_proxies(&[NamespacedResourceId::new("staging", "shared")]);
 
-    assert!(!checker
-        .passive_health
-        .contains_key(&NamespacedResourceId::new("staging", "shared").runtime_key()));
-    assert!(checker
-        .passive_health
-        .contains_key(&NamespacedResourceId::new("prod", "shared").runtime_key()));
+    assert!(
+        !checker
+            .passive_health
+            .contains_key(&NamespacedResourceId::new("staging", "shared").runtime_key())
+    );
+    assert!(
+        checker
+            .passive_health
+            .contains_key(&NamespacedResourceId::new("prod", "shared").runtime_key())
+    );
 }
 
 #[test]
@@ -276,12 +280,14 @@ fn plugin_cache_delta_prunes_only_matching_namespace() {
         .apply_delta(&new, &rebuild, &delta.removed_proxy_ids, false)
         .expect("namespace-qualified prune must succeed");
 
-    assert!(ferrum_edge::_test_support::plugin_cache_contains_proxy_for_test(
-        &cache, "prod", "shared"
-    ));
-    assert!(!ferrum_edge::_test_support::plugin_cache_contains_proxy_for_test(
-        &cache, "staging", "shared"
-    ));
+    assert!(
+        ferrum_edge::_test_support::plugin_cache_contains_proxy_for_test(&cache, "prod", "shared")
+    );
+    assert!(
+        !ferrum_edge::_test_support::plugin_cache_contains_proxy_for_test(
+            &cache, "staging", "shared"
+        )
+    );
 }
 
 #[test]
@@ -483,8 +489,7 @@ fn discovery_passive_prune_targets_only_the_discovered_upstream_tenant() {
 
 #[test]
 fn service_discovery_task_ownership_is_namespace_qualified() {
-    let prod =
-        ferrum_edge::_test_support::service_discovery_task_key_for_test("prod", "shared");
+    let prod = ferrum_edge::_test_support::service_discovery_task_key_for_test("prod", "shared");
     let staging =
         ferrum_edge::_test_support::service_discovery_task_key_for_test("staging", "shared");
 

@@ -331,7 +331,9 @@ fn test_load_balancer_cache_update_targets() {
         make_target("host-b", 8080),
         make_target("host-d", 8080), // new discovered target
     ];
-    cache.update_targets("ferrum", "upstream-1",
+    cache.update_targets(
+        "ferrum",
+        "upstream-1",
         new_targets,
         LoadBalancerAlgorithm::RoundRobin,
         None,
@@ -359,22 +361,20 @@ fn test_load_balancer_cache_update_targets_selection_works() {
     let cache = LoadBalancerCache::new(&config);
 
     // Select from old targets
-    let sel = cache
-        .select_target("ferrum", "up", "key", None)
-        .unwrap();
+    let sel = cache.select_target("ferrum", "up", "key", None).unwrap();
     assert_eq!(sel.target.host, "old-host");
 
     // Update to new targets
-    cache.update_targets("ferrum", "up",
+    cache.update_targets(
+        "ferrum",
+        "up",
         vec![make_target("new-host", 9090)],
         LoadBalancerAlgorithm::RoundRobin,
         None,
     );
 
     // Select from new targets
-    let sel = cache
-        .select_target("ferrum", "up", "key", None)
-        .unwrap();
+    let sel = cache.select_target("ferrum", "up", "key", None).unwrap();
     assert_eq!(sel.target.host, "new-host");
     assert_eq!(sel.target.port, 9090);
 }
@@ -1572,7 +1572,9 @@ fn test_load_balancer_cache_update_targets_nonexistent_upstream() {
     let cache = LoadBalancerCache::new(&config);
 
     // Updating a non-existent upstream should not panic
-    cache.update_targets("ferrum", "does-not-exist",
+    cache.update_targets(
+        "ferrum",
+        "does-not-exist",
         vec![make_target("h2", 90)],
         LoadBalancerAlgorithm::RoundRobin,
         None,
@@ -1603,7 +1605,13 @@ fn test_load_balancer_cache_update_targets_to_empty() {
     let cache = LoadBalancerCache::new(&config);
 
     // Update to zero targets
-    cache.update_targets("ferrum", "up-1", vec![], LoadBalancerAlgorithm::RoundRobin, None);
+    cache.update_targets(
+        "ferrum",
+        "up-1",
+        vec![],
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+    );
 
     let u1 = cache.get_upstream("ferrum", "up-1").unwrap();
     assert!(u1.targets.is_empty());

@@ -1715,7 +1715,9 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
         Some(60)
     );
 
-    let request_view = state.plugin_cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    let request_view = state
+        .plugin_cache
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
     let request_plugins = request_view.plugins();
     let correlations: Vec<_> = request_plugins
         .iter()
@@ -1786,7 +1788,9 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
         serde_json::json!({"allow": ["10.0.0.0/8"]})
     );
 
-    let request_view = state.plugin_cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    let request_view = state
+        .plugin_cache
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
     let mut ctx = RequestContext::new(
         "198.51.100.44".to_string(),
         "GET".to_string(),

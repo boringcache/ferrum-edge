@@ -471,7 +471,11 @@ fn test_cache_prune_removes_stale() {
     ]);
 
     // proxy-2 should still exist, proxy-1 and proxy-3 should be gone
-    assert!(cache.can_execute("ferrum", "proxy-2", None, &config).is_ok());
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-2", None, &config)
+            .is_ok()
+    );
     // Creating proxy-1 again should give a fresh breaker
     let cb = cache.get_or_create("ferrum", "proxy-1", None, &config);
     assert_eq!(cb.state_name(), "closed");
@@ -520,10 +524,18 @@ fn test_per_target_independent_breakers() {
     // Target B should still be closed
     let cb_b = cache.get_or_create("ferrum", "proxy-1", Some(&tk_b), &config);
     assert_eq!(cb_b.state_name(), "closed");
-    assert!(cache.can_execute("ferrum", "proxy-1", Some(&tk_b), &config).is_ok());
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-1", Some(&tk_b), &config)
+            .is_ok()
+    );
 
     // Target A should be rejected
-    assert!(cache.can_execute("ferrum", "proxy-1", Some(&tk_a), &config).is_err());
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-1", Some(&tk_a), &config)
+            .is_err()
+    );
 }
 
 #[test]
@@ -576,14 +588,22 @@ fn test_prune_removes_all_targets_for_proxy() {
     cache.get_or_create("ferrum", "proxy-2", Some(&tk_a), &config);
 
     // Prune proxy-1 — should remove both target-scoped breakers
-    cache.prune(&[ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy-1")]);
+    cache.prune(
+        &[ferrum_edge::config::db_backend::NamespacedResourceId::new(
+            "ferrum", "proxy-1",
+        )],
+    );
 
     // proxy-1 targets should be gone (fresh breaker on re-create)
     let cb = cache.get_or_create("ferrum", "proxy-1", Some(&tk_a), &config);
     assert_eq!(cb.state_name(), "closed");
 
     // proxy-2 target should still exist
-    assert!(cache.can_execute("ferrum", "proxy-2", Some(&tk_a), &config).is_ok());
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-2", Some(&tk_a), &config)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -616,13 +636,19 @@ fn test_tcp_direct_backend_circuit_breaker_opens() {
     // Simulate two backend connect failures (no upstream → None target key).
     let cb = cache.get_or_create("ferrum", "tcp-proxy-1", None, &config);
     cb.record_failure(502, true, false);
-    assert!(cache.can_execute("ferrum", "tcp-proxy-1", None, &config).is_ok()); // Still closed after 1
+    assert!(
+        cache
+            .can_execute("ferrum", "tcp-proxy-1", None, &config)
+            .is_ok()
+    ); // Still closed after 1
 
     cb.record_failure(502, true, false);
     // After threshold, circuit should be open.
     assert_eq!(cb.state_name(), "open");
     assert!(
-        cache.can_execute("ferrum", "tcp-proxy-1", None, &config).is_err(),
+        cache
+            .can_execute("ferrum", "tcp-proxy-1", None, &config)
+            .is_err(),
         "Circuit breaker should reject after threshold failures"
     );
 }
@@ -650,7 +676,9 @@ fn test_tcp_upstream_backend_circuit_breaker_per_target() {
 
     // Proxy without this specific target should not be affected.
     assert!(
-        cache.can_execute("ferrum", "tcp-proxy-2", None, &config).is_ok(),
+        cache
+            .can_execute("ferrum", "tcp-proxy-2", None, &config)
+            .is_ok(),
         "Direct backend breaker should be independent of upstream-scoped breaker"
     );
 }
@@ -704,7 +732,9 @@ fn test_udp_session_failure_records_failure() {
 
     assert_eq!(cb.state_name(), "open");
     assert!(
-        cache.can_execute("ferrum", "udp-proxy-1", None, &config).is_err(),
+        cache
+            .can_execute("ferrum", "udp-proxy-1", None, &config)
+            .is_err(),
         "UDP circuit breaker should be open after repeated session creation failures"
     );
 }
@@ -1604,7 +1634,7 @@ fn test_concurrent_distinct_key_burst_respects_max_entries() {
             barrier.wait();
             let proxy = format!("proxy-{i}");
             let target = format!("host-{i}:8080");
-            cache.get_or_create(&proxy, Some(&target), &config)
+            cache.get_or_create("ferrum", &proxy, Some(&target), &config)
         }));
     }
 

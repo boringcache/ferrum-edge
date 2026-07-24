@@ -2240,9 +2240,10 @@ async fn handle_tcp_connection_inner(
         remote_addr.ip(),
     )?;
 
-    let plugins = epoch
-        .plugin_cache
-        .get_plugins_for_protocol(&proxy.namespace, proxy_id, ProxyProtocol::Tcp);
+    let plugins =
+        epoch
+            .plugin_cache
+            .get_plugins_for_protocol(&proxy.namespace, proxy_id, ProxyProtocol::Tcp);
 
     // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
     // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
@@ -2722,38 +2723,36 @@ async fn handle_tcp_connection_inner(
     };
 
     // Helper: record circuit breaker failure for the current target.
-    let record_cb_failure = |cb_cache: &CircuitBreakerCache,
-                             proxy_id: &str,
-                             cb_info: &TcpConnCbInfo| {
-        if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(
-                &proxy.namespace,
-                proxy_id,
-                cb_info.cb_target_key.as_deref(),
-                cb_config,
-            );
-            cb.record_failure(502, true, cb_info.is_half_open_probe);
-        }
-    };
+    let record_cb_failure =
+        |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = cb_cache.get_or_create(
+                    &proxy.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
+            }
+        };
 
     // Helper: release a half-open probe slot claimed by `can_execute` without
     // recording success or failure. Used when the gateway rejects the
     // connection locally (DestinationRule maxConnections cap), which is not a
     // backend outcome — `record_neutral` decrements `half_open_in_flight` only
     // when a probe was held and leaves breaker health untouched.
-    let record_cb_neutral = |cb_cache: &CircuitBreakerCache,
-                             proxy_id: &str,
-                             cb_info: &TcpConnCbInfo| {
-        if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(
-                &proxy.namespace,
-                proxy_id,
-                cb_info.cb_target_key.as_deref(),
-                cb_config,
-            );
-            cb.record_neutral(cb_info.is_half_open_probe);
-        }
-    };
+    let record_cb_neutral =
+        |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = cb_cache.get_or_create(
+                    &proxy.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_neutral(cb_info.is_half_open_probe);
+            }
+        };
 
     // Connection-phase retry loop. Retries DNS resolution + backend connect
     // with a different load-balanced target on each attempt. Once a backend

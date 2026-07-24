@@ -606,7 +606,10 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
     };
     let cache = PluginCache::new(&valid_gateway).expect("valid statsd config constructs");
     assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
-    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "statsd_logging");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1")[0].name(),
+        "statsd_logging"
+    );
 
     cache
         .rebuild(&bad_gateway)

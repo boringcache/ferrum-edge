@@ -82,8 +82,7 @@ impl ConfigDelta {
     /// removed, or modified.
     pub fn compute(old: &GatewayConfig, new: &GatewayConfig) -> Self {
         let added_plugin_configs = diff_added(&old.plugin_configs, &new.plugin_configs);
-        let removed_plugin_config_ids =
-            diff_removed_ids(&old.plugin_configs, &new.plugin_configs);
+        let removed_plugin_config_ids = diff_removed_ids(&old.plugin_configs, &new.plugin_configs);
         let modified_plugin_configs = diff_modified(&old.plugin_configs, &new.plugin_configs);
         let plugin_association_changed_proxy_ids =
             diff_plugin_association_changes(&old.proxies, &new.proxies);
@@ -215,17 +214,18 @@ impl ConfigDelta {
                 // timestamp, but the old cached chain still needs rebuilding.
                 // Association plugin_config_id values are namespace-local to
                 // the proxy (cross-namespace associations are rejected).
-                let references_changed_plugin = proxy.plugins.iter().any(|assoc| {
-                    changed_pc_keys
-                        .contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
-                }) || old_proxies_by_key.get(&proxy_key).is_some_and(|old_proxy| {
-                    old_proxy.plugins.iter().any(|assoc| {
-                        changed_pc_keys.contains(&(
-                            old_proxy.namespace.as_str(),
-                            assoc.plugin_config_id.as_str(),
-                        ))
-                    })
-                });
+                let references_changed_plugin =
+                    proxy.plugins.iter().any(|assoc| {
+                        changed_pc_keys
+                            .contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                    }) || old_proxies_by_key.get(&proxy_key).is_some_and(|old_proxy| {
+                        old_proxy.plugins.iter().any(|assoc| {
+                            changed_pc_keys.contains(&(
+                                old_proxy.namespace.as_str(),
+                                assoc.plugin_config_id.as_str(),
+                            ))
+                        })
+                    });
                 if references_changed_plugin
                     || old_changed_proxy_scoped.contains(&proxy_key)
                     || new_changed_proxy_scoped.contains(&proxy_key)
@@ -398,8 +398,10 @@ fn diff_removed_ids<T: HasNamespacedIdAndTimestamp>(
 /// predicate to fetch candidates in the first place, so this is a defensive
 /// diff guard rather than a substitute for monotonic database timestamps.
 fn diff_modified<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
-    let old_map: HashMap<ResourceKey<'_>, DateTime<Utc>> =
-        old.iter().map(|r| (resource_key(r), r.updated_at())).collect();
+    let old_map: HashMap<ResourceKey<'_>, DateTime<Utc>> = old
+        .iter()
+        .map(|r| (resource_key(r), r.updated_at()))
+        .collect();
     new.iter()
         .filter(|r| {
             old_map
@@ -417,8 +419,10 @@ fn diff_modified<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -
 /// cascade need not advance `Proxy.updated_at`. Association order is not part of
 /// placement identity; plugin execution order comes from effective priorities.
 fn diff_plugin_association_changes(old: &[Proxy], new: &[Proxy]) -> Vec<NamespacedResourceId> {
-    let old_by_key: HashMap<ResourceKey<'_>, &Proxy> =
-        old.iter().map(|proxy| (resource_key(proxy), proxy)).collect();
+    let old_by_key: HashMap<ResourceKey<'_>, &Proxy> = old
+        .iter()
+        .map(|proxy| (resource_key(proxy), proxy))
+        .collect();
 
     new.iter()
         .filter(|proxy| {
@@ -684,8 +688,7 @@ mod tests {
         assert_eq!(modified.modified_consumers.len(), 1);
         assert_eq!(modified.modified_consumers[0].namespace, "staging");
 
-        new.proxies
-            .retain(|proxy| proxy.namespace == "prod");
+        new.proxies.retain(|proxy| proxy.namespace == "prod");
         new.consumers
             .retain(|consumer| consumer.namespace == "prod");
         let removed = ConfigDelta::compute(&old, &new);

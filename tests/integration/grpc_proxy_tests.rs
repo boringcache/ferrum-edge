@@ -4307,7 +4307,7 @@ async fn grpc_streaming_late_upload_overflow_during_response_records_neutral() {
     let cb =
         inspect_state
             .circuit_breaker_cache
-            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+            .get_or_create("ferrum", &proxy_id, Some(&cb_key), &cb_config);
     cb.record_failure(500, false, false);
     assert_eq!(
         cb.state_name(),
@@ -4437,7 +4437,7 @@ async fn grpc_streaming_clean_probe_heals_breaker_at_body_completion() {
     let cb =
         inspect_state
             .circuit_breaker_cache
-            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+            .get_or_create("ferrum", &proxy_id, Some(&cb_key), &cb_config);
     cb.record_failure(500, false, false);
     assert_eq!(
         cb.state_name(),
@@ -4528,7 +4528,7 @@ async fn grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_tim
     let cb =
         inspect_state
             .circuit_breaker_cache
-            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+            .get_or_create("ferrum", &proxy_id, Some(&cb_key), &cb_config);
     assert_eq!(cb.state_name(), "closed", "breaker should start CLOSED");
 
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;

@@ -7056,8 +7056,9 @@ impl ProxyState {
             // sharing the dedup key — one reqwest-forcing proxy is enough
             // to keep the pool warm.
             let per_proxy_pool = pool_config.for_proxy(proxy);
-            let requires_request_body_buffering =
-                self.plugin_cache.requires_request_body_buffering(&proxy.namespace, &proxy.id);
+            let requires_request_body_buffering = self
+                .plugin_cache
+                .requires_request_body_buffering(&proxy.namespace, &proxy.id);
             let forces_reqwest = proxy_config_forces_reqwest_dispatch(
                 proxy,
                 per_proxy_pool.enable_http2,
@@ -8146,12 +8147,11 @@ impl ProxyState {
                     .iter()
                     .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
             {
-                self.health_checker
-                    .remove_stale_passive_targets_for_proxy(
-                        &proxy.namespace,
-                        &proxy.id,
-                        &upstream.targets,
-                    );
+                self.health_checker.remove_stale_passive_targets_for_proxy(
+                    &proxy.namespace,
+                    &proxy.id,
+                    &upstream.targets,
+                );
             }
         }
 
@@ -8619,12 +8619,11 @@ impl ProxyState {
                     .iter()
                     .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
             {
-                self.health_checker
-                    .remove_stale_passive_targets_for_proxy(
-                        &proxy.namespace,
-                        &proxy.id,
-                        &upstream.targets,
-                    );
+                self.health_checker.remove_stale_passive_targets_for_proxy(
+                    &proxy.namespace,
+                    &proxy.id,
+                    &upstream.targets,
+                );
             }
         }
 
@@ -8692,8 +8691,11 @@ impl ProxyState {
         // idempotent and only restarts listeners whose reload key actually
         // changed.
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
-            let removed_set: std::collections::HashSet<(&str, &str)> =
-                delta.removed_proxy_ids.iter().map(|key| key.as_key()).collect();
+            let removed_set: std::collections::HashSet<(&str, &str)> = delta
+                .removed_proxy_ids
+                .iter()
+                .map(|key| key.as_key())
+                .collect();
             old_config.proxies.iter().any(|p| {
                 removed_set.contains(&(p.namespace.as_str(), p.id.as_str()))
                     && p.dispatch_kind.is_stream()
@@ -17233,9 +17235,12 @@ fn release_circuit_breaker_probe_on_admission_reject(
         return;
     }
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.namespace, &proxy.id, target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
         cb.record_neutral(true);
     }
 }
@@ -19034,7 +19039,9 @@ async fn handle_proxy_request_inner(
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
     let plugin_cache_view =
-        epoch.plugin_cache.request_view(&proxy.namespace, &proxy.id, request_protocol);
+        epoch
+            .plugin_cache
+            .request_view(&proxy.namespace, &proxy.id, request_protocol);
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();

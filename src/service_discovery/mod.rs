@@ -377,8 +377,7 @@ impl ServiceDiscoveryManager {
         });
 
         let task_key = service_discovery_task_key(upstream_namespace, upstream_id);
-        self.tasks
-            .insert(task_key, TaskEntry { cancel_tx, handle });
+        self.tasks.insert(task_key, TaskEntry { cancel_tx, handle });
         info!(
             "Service discovery: started {} task for upstream {} (poll interval: {}s)",
             sd_config.provider.as_str(),

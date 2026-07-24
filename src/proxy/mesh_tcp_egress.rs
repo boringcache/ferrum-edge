@@ -109,7 +109,9 @@ pub(crate) async fn handle_mesh_tcp_egress(
     .then_some(override_port);
     if let Some(port) = port_lane {
         let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
-            lb, &proxy.namespace, &entry.upstream_id,
+            lb,
+            &proxy.namespace,
+            &entry.upstream_id,
             Some(port),
             None,
         );
@@ -133,14 +135,18 @@ pub(crate) async fn handle_mesh_tcp_egress(
     );
     let Some(selection) = (if let Some(port) = port_lane {
         LoadBalancerCache::select_target_for_port_from(
-            lb, &proxy.namespace, &entry.upstream_id,
+            lb,
+            &proxy.namespace,
+            &entry.upstream_id,
             &lb_hash_key,
             port,
             Some(&health_ctx),
         )
     } else {
         LoadBalancerCache::select_target_from(
-            lb, &proxy.namespace, &entry.upstream_id,
+            lb,
+            &proxy.namespace,
+            &entry.upstream_id,
             &lb_hash_key,
             Some(&health_ctx),
         )
@@ -576,7 +582,9 @@ listen_port: 15001
         let snapshot = cache.load();
         let override_port =
             crate::load_balancer::LoadBalancerCache::initial_dispatch_port_override_from(
-                &snapshot, &proxy.namespace, "orders",
+                &snapshot,
+                &proxy.namespace,
+                "orders",
             );
 
         let health_port_scope = super::backend_dispatch::stream_health_port_scope(

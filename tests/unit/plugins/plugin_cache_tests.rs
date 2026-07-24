@@ -9,11 +9,11 @@ use ferrum_edge::_test_support::{
     validate_correlation_id_composition_with_real_ip_header_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
 };
-use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
@@ -494,7 +494,7 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
         ],
     );
     let cache = PluginCache::new(&config).expect("composed CORS cache");
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     assert_eq!(
         plugins
             .iter()
@@ -502,7 +502,7 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
             .collect::<Vec<_>>(),
         vec!["cors", "cors", "__cors_finalizer"]
     );
-    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Grpc);
     assert_eq!(
         grpc_plugins
             .iter()
@@ -638,7 +638,7 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
     cache
         .rebuild(&reversed)
         .expect("rebuild reversed CORS cache");
-    let reversed_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let reversed_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let mut reversed_delete = RequestContext::new(
         "127.0.0.1".to_string(),
         "OPTIONS".to_string(),
@@ -722,7 +722,7 @@ async fn mixed_native_and_istio_empty_lists_apply_only_to_preflight() {
     let cache = PluginCache::new(&config).expect("mixed native/Istio CORS cache");
 
     for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
-        let plugins = cache.get_plugins_for_protocol("p1", protocol);
+        let plugins = cache.get_plugins_for_protocol("ferrum", "p1", protocol);
         let mut actual = RequestContext::new(
             "127.0.0.1".to_string(),
             "GET".to_string(),
@@ -828,7 +828,7 @@ fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
     for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
         assert_eq!(
             cache
-                .get_plugins_for_protocol("p1", protocol)
+                .get_plugins_for_protocol("ferrum", "p1", protocol)
                 .iter()
                 .map(|plugin| plugin.name())
                 .collect::<Vec<_>>(),
@@ -837,7 +837,7 @@ fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
     }
     assert_eq!(
         cache
-            .get_plugins_for_protocol("p1", ProxyProtocol::Udp)
+            .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Udp)
             .iter()
             .map(|plugin| plugin.name())
             .collect::<Vec<_>>(),
@@ -995,7 +995,7 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
     for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
         assert_eq!(
             cache
-                .get_plugins_for_protocol("p1", protocol)
+                .get_plugins_for_protocol("ferrum", "p1", protocol)
                 .iter()
                 .map(|plugin| plugin.name())
                 .collect::<Vec<_>>(),
@@ -1020,7 +1020,7 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
     for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
         assert_eq!(
             cache
-                .get_plugins_for_protocol("p1", protocol)
+                .get_plugins_for_protocol("ferrum", "p1", protocol)
                 .iter()
                 .map(|plugin| plugin.name())
                 .collect::<Vec<_>>(),
@@ -1064,7 +1064,7 @@ async fn mesh_route_dispatch_reject_unmatched_is_aggregated_across_instances() {
         ],
     );
     let cache = PluginCache::new(&config).expect("plugin cache");
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
 
     for (method, expected_upstream) in [("GET", "get-backend"), ("POST", "post-backend")] {
         let mut request = RequestContext::new(
@@ -1213,7 +1213,7 @@ fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
 
     let cache = PluginCache::new(&config)
         .expect("TCP-only plugins do not interleave the HTTP-family execution chain");
-    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let http_names: Vec<_> = http_plugins.iter().map(|plugin| plugin.name()).collect();
     assert_eq!(
         http_names,
@@ -1224,7 +1224,7 @@ fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
         ]
     );
 
-    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let tcp_names: Vec<_> = tcp_plugins.iter().map(|plugin| plugin.name()).collect();
     assert_eq!(tcp_names, ["tcp_connection_throttle"]);
 }
@@ -1546,9 +1546,9 @@ fn test_single_prometheus_metrics_instance_is_shared_once_across_protocols() {
         )],
     );
     let cache = PluginCache::new(&config).expect("one global registry owner is valid");
-    let p1_http = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
-    let p1_tcp = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
-    let p2_http = cache.get_plugins_for_protocol("p2", ProxyProtocol::Http);
+    let p1_http = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let p1_tcp = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
+    let p2_http = cache.get_plugins_for_protocol("ferrum", "p2", ProxyProtocol::Http);
 
     assert_eq!(
         p1_http
@@ -1635,7 +1635,10 @@ fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
         "failed proxy-scoped optional plugin must shadow the same-name global"
     );
     assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
-    assert_eq!(cache.get_plugins("ferrum", "p2")[0].name(), "stdout_logging");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p2")[0].name(),
+        "stdout_logging"
+    );
 }
 
 #[test]
@@ -2244,7 +2247,10 @@ fn test_rebuild_produces_updated_plugin_set() {
     let cache = PluginCache::new(&config1).unwrap();
 
     assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
-    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "stdout_logging");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1")[0].name(),
+        "stdout_logging"
+    );
 
     // Rebuild with different plugin
     let config2 = make_config(
@@ -2260,7 +2266,10 @@ fn test_rebuild_produces_updated_plugin_set() {
     cache.rebuild(&config2).unwrap();
 
     assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
-    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "transaction_debugger");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1")[0].name(),
+        "transaction_debugger"
+    );
 }
 
 #[test]
@@ -2317,7 +2326,7 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
             .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
     );
 
-    let current_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let current_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let current_names: Vec<&str> = current_plugins.iter().map(|p| p.name()).collect();
     assert!(current_names.contains(&"request_transformer"));
     assert!(current_names.contains(&"body_validator"));
@@ -2590,7 +2599,7 @@ async fn serverless_instances_keep_independent_transaction_metadata() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -2682,7 +2691,7 @@ async fn request_mirror_cache_construction_preserves_plugin_config_id() {
         )],
     );
     let cache = PluginCache::new(&config).expect("request mirror cache");
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let mirror = plugins
         .iter()
         .find(|plugin| plugin.name() == "request_mirror")
@@ -3735,7 +3744,8 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
                 Some("p1"),
             )],
         );
-        let proxy_ids = std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
+        let proxy_ids =
+            std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
         let error = match cache.apply_delta(&config2, &proxy_ids, &[], false) {
             Err(error) => error,
             Ok(()) => panic!("{label}: unknown ai_stream_router key must reject reload"),
@@ -3879,7 +3889,8 @@ fn test_apply_delta_rejects_unknown_mesh_route_nested_keys_and_keeps_last_known_
                 Some("p1"),
             )],
         );
-        let proxy_ids = std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
+        let proxy_ids =
+            std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
         let error = cache
             .apply_delta(&config2, &proxy_ids, &[], false)
             .expect_err("unknown nested mesh_route_dispatch keys must reject the reload");
@@ -4143,7 +4154,12 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
     let mut proxy_ids = HashSet::new();
     // p1 removed; p2 unchanged so the global instance is preserved.
     cache
-        .apply_delta(&config2, &proxy_ids, &[NamespacedResourceId::new("ferrum", "p1")], false)
+        .apply_delta(
+            &config2,
+            &proxy_ids,
+            &[NamespacedResourceId::new("ferrum", "p1")],
+            false,
+        )
         .unwrap();
 
     let global_after = cache.get_plugins("ferrum", "p2");
@@ -4271,7 +4287,12 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
     let mut proxy_ids = HashSet::new();
     proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1b"));
     cache
-        .apply_delta(&config2, &proxy_ids, &[NamespacedResourceId::new("ferrum", "p1")], false)
+        .apply_delta(
+            &config2,
+            &proxy_ids,
+            &[NamespacedResourceId::new("ferrum", "p1")],
+            false,
+        )
         .unwrap();
 
     let p2_after = cache.get_plugins("ferrum", "p2");
@@ -4335,7 +4356,12 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
         vec![group_alerts.clone()],
     );
     cache
-        .apply_delta(&config2, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
+        .apply_delta(
+            &config2,
+            &HashSet::new(),
+            &[NamespacedResourceId::new("ferrum", "p1")],
+            false,
+        )
         .unwrap();
 
     let config3 = make_config(
@@ -4664,7 +4690,12 @@ fn test_apply_delta_proxy_lifecycle_high_water_survives_empty_active_set() {
 
     let empty = make_config(vec![], vec![]);
     cache
-        .apply_delta(&empty, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
+        .apply_delta(
+            &empty,
+            &HashSet::new(),
+            &[NamespacedResourceId::new("ferrum", "p1")],
+            false,
+        )
         .unwrap();
     assert_eq!(cache.proxy_lifecycle_generation("ferrum", "p1"), None);
 
@@ -4710,7 +4741,12 @@ fn test_apply_delta_global_proxy_alerts_generation_keyed_race_isolation() {
     // Remove+recreate p1 while preserving the global instance.
     let config2 = make_config(vec![make_proxy("p2", "/web", vec![])], vec![alerts.clone()]);
     cache
-        .apply_delta(&config2, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
+        .apply_delta(
+            &config2,
+            &HashSet::new(),
+            &[NamespacedResourceId::new("ferrum", "p1")],
+            false,
+        )
         .unwrap();
     let config3 = make_config(
         vec![
@@ -4787,7 +4823,12 @@ fn test_apply_delta_proxy_group_proxy_alerts_generation_keyed_race_isolation() {
         vec![group_alerts.clone()],
     );
     cache
-        .apply_delta(&config2, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
+        .apply_delta(
+            &config2,
+            &HashSet::new(),
+            &[NamespacedResourceId::new("ferrum", "p1")],
+            false,
+        )
         .unwrap();
     let config3 = make_config(
         vec![
@@ -4961,7 +5002,10 @@ fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
     let p2 = make_proxy("p2", "/two", vec![]);
     let old_config = make_config(vec![p1.clone(), p2.clone()], vec![old_fault.clone()]);
     let cache = PluginCache::new(&old_config).expect("initial fault cache");
-    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "fault_injection");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1")[0].name(),
+        "fault_injection"
+    );
     assert!(cache.get_plugins("ferrum", "p2").is_empty());
 
     let mut moved_from = p1;
@@ -4984,12 +5028,18 @@ fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
             .iter()
             .cloned()
             .collect::<HashSet<_>>(),
-        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p2")])
+        HashSet::from([
+            NamespacedResourceId::new("ferrum", "p1"),
+            NamespacedResourceId::new("ferrum", "p2")
+        ])
     );
     let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
     assert_eq!(
         proxy_ids,
-        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p2")])
+        HashSet::from([
+            NamespacedResourceId::new("ferrum", "p1"),
+            NamespacedResourceId::new("ferrum", "p2")
+        ])
     );
 
     cache
@@ -5005,7 +5055,10 @@ fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
         cache.get_plugins("ferrum", "p1").is_empty(),
         "former proxy must not retain the moved fault plugin"
     );
-    assert_eq!(cache.get_plugins("ferrum", "p2")[0].name(), "fault_injection");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p2")[0].name(),
+        "fault_injection"
+    );
 }
 
 #[test]
@@ -5063,8 +5116,14 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
         )
         .expect("proxy-to-group scope move");
     assert!(cache.get_plugins("ferrum", "p1").is_empty());
-    assert_eq!(cache.get_plugins("ferrum", "p2")[0].name(), "fault_injection");
-    assert_eq!(cache.get_plugins("ferrum", "p3")[0].name(), "fault_injection");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p2")[0].name(),
+        "fault_injection"
+    );
+    assert_eq!(
+        cache.get_plugins("ferrum", "p3")[0].name(),
+        "fault_injection"
+    );
 
     let mut new_proxy = p1;
     new_proxy.plugins = vec![PluginAssociation {
@@ -5099,7 +5158,10 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
             from_group.global_plugin_configs_changed,
         )
         .expect("group-to-proxy scope move");
-    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "fault_injection");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1")[0].name(),
+        "fault_injection"
+    );
     assert!(cache.get_plugins("ferrum", "p2").is_empty());
     assert!(cache.get_plugins("ferrum", "p3").is_empty());
 }
@@ -5140,7 +5202,10 @@ fn fault_delta_group_membership_move_and_removal_invalidate_former_associations(
     let moved_ids = moved_delta.proxy_ids_needing_plugin_rebuild(&old_config, &moved_config);
     assert_eq!(
         moved_ids,
-        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p3")])
+        HashSet::from([
+            NamespacedResourceId::new("ferrum", "p1"),
+            NamespacedResourceId::new("ferrum", "p3")
+        ])
     );
     cache
         .apply_delta(
@@ -5151,8 +5216,14 @@ fn fault_delta_group_membership_move_and_removal_invalidate_former_associations(
         )
         .expect("group association move");
     assert!(cache.get_plugins("ferrum", "p1").is_empty());
-    assert!(Arc::ptr_eq(&unchanged_before, &cache.get_plugins("ferrum", "p2")));
-    assert_eq!(cache.get_plugins("ferrum", "p3")[0].name(), "fault_injection");
+    assert!(Arc::ptr_eq(
+        &unchanged_before,
+        &cache.get_plugins("ferrum", "p2")
+    ));
+    assert_eq!(
+        cache.get_plugins("ferrum", "p3")[0].name(),
+        "fault_injection"
+    );
 
     let mut removed_proxies = moved_config.proxies.clone();
     for proxy in &mut removed_proxies {
@@ -5208,7 +5279,10 @@ fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
     reprioritized.plugin_configs[0].updated_at += chrono::Duration::seconds(1);
     let delta = ConfigDelta::compute(&config, &reprioritized);
     let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config, &reprioritized);
-    assert_eq!(proxy_ids, HashSet::from([NamespacedResourceId::new("ferrum", "p1")]));
+    assert_eq!(
+        proxy_ids,
+        HashSet::from([NamespacedResourceId::new("ferrum", "p1")])
+    );
     cache
         .apply_delta(
             &reprioritized,
@@ -5547,7 +5621,7 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
         ProxyProtocol::Tcp,
         ProxyProtocol::Udp,
     ] {
-        assert!(cache.get_plugins_for_protocol("p1", protocol).is_empty());
+        assert!(cache.get_plugins_for_protocol("ferrum", "p1", protocol).is_empty());
     }
 }
 
@@ -5598,26 +5672,26 @@ fn test_get_plugins_for_protocol_filters_by_protocol() {
     let cache = PluginCache::new(&config).unwrap();
 
     // HTTP — both present
-    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let http_names: Vec<&str> = http_plugins.iter().map(|p| p.name()).collect();
     assert!(http_names.contains(&"ip_restriction"));
     assert!(http_names.contains(&"cors"));
     assert_eq!(http_names.len(), 2);
 
     // TCP — only ip_restriction (cors is HTTP_ONLY)
-    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let tcp_names: Vec<&str> = tcp_plugins.iter().map(|p| p.name()).collect();
     assert!(tcp_names.contains(&"ip_restriction"));
     assert!(!tcp_names.contains(&"cors"));
     assert_eq!(tcp_names.len(), 1);
 
     // UDP — only ip_restriction
-    let udp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Udp);
+    let udp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Udp);
     assert_eq!(udp_plugins.len(), 1);
     assert_eq!(udp_plugins[0].name(), "ip_restriction");
 
     // WebSocket — only ip_restriction (cors is HTTP_ONLY, not HTTP_FAMILY)
-    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let ws_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
     assert_eq!(ws_plugins.len(), 1);
     assert_eq!(ws_plugins[0].name(), "ip_restriction");
 }
@@ -5652,7 +5726,7 @@ fn test_get_plugins_for_protocol_tcp_excludes_http_family() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let tcp_names: Vec<&str> = tcp_plugins.iter().map(|p| p.name()).collect();
     assert!(tcp_names.contains(&"rate_limiting"));
     assert!(tcp_names.contains(&"stdout_logging"));
@@ -5682,12 +5756,12 @@ fn test_get_plugins_for_protocol_falls_back_to_globals() {
     let cache = PluginCache::new(&config).unwrap();
 
     // Proxy with no associations — should get global stdout_logging for TCP
-    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     assert_eq!(tcp_plugins.len(), 1);
     assert_eq!(tcp_plugins[0].name(), "stdout_logging");
 
     // Nonexistent proxy — falls back to global plugins
-    let fallback = cache.get_plugins_for_protocol("nonexistent", ProxyProtocol::Http);
+    let fallback = cache.get_plugins_for_protocol("ferrum", "nonexistent", ProxyProtocol::Http);
     assert_eq!(fallback.len(), 1);
     assert_eq!(fallback[0].name(), "stdout_logging");
 }
@@ -5706,7 +5780,7 @@ fn test_get_plugins_for_protocol_rebuild_updates_maps() {
     );
     let cache = PluginCache::new(&config1).unwrap();
 
-    let tcp_before = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_before = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     assert_eq!(tcp_before.len(), 1);
 
     // Rebuild with an additional plugin
@@ -5725,7 +5799,7 @@ fn test_get_plugins_for_protocol_rebuild_updates_maps() {
     );
     cache.rebuild(&config2).unwrap();
 
-    let tcp_after = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_after = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let names: Vec<&str> = tcp_after.iter().map(|p| p.name()).collect();
     assert!(names.contains(&"rate_limiting"));
     assert!(names.contains(&"ip_restriction"));
@@ -5750,7 +5824,7 @@ fn test_get_plugins_for_protocol_websocket_includes_auth_excludes_cors() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let ws_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
     let names: Vec<&str> = ws_plugins.iter().map(|p| p.name()).collect();
     assert!(names.contains(&"key_auth"), "WebSocket should include auth");
     assert!(
@@ -5778,7 +5852,7 @@ fn test_get_plugins_for_protocol_grpc_excludes_http_only() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Grpc);
     let names: Vec<&str> = grpc_plugins.iter().map(|p| p.name()).collect();
     assert!(names.contains(&"rate_limiting"));
     assert!(
@@ -5814,19 +5888,19 @@ fn response_mock_excluded_from_native_grpc_protocol_view() {
     );
     let cache = PluginCache::new(&config).expect("plugin cache");
 
-    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let http_names: Vec<&str> = http_plugins.iter().map(|p| p.name()).collect();
     assert!(http_names.contains(&"response_mock"));
     assert!(http_names.contains(&"rate_limiting"));
 
-    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let ws_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
     let ws_names: Vec<&str> = ws_plugins.iter().map(|p| p.name()).collect();
     assert!(
         ws_names.contains(&"response_mock"),
         "WebSocket handshake view must retain response_mock"
     );
 
-    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Grpc);
     let grpc_names: Vec<&str> = grpc_plugins.iter().map(|p| p.name()).collect();
     assert!(
         !grpc_names.contains(&"response_mock"),
@@ -5867,12 +5941,12 @@ fn ai_prompt_shield_excluded_from_native_grpc_but_retained_on_grpc_web_view() {
     );
     let cache = PluginCache::new(&config).expect("plugin cache");
 
-    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let http_names: Vec<&str> = http_plugins.iter().map(|p| p.name()).collect();
     assert!(http_names.contains(&"ai_prompt_shield"));
     assert!(http_names.contains(&"rate_limiting"));
 
-    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Grpc);
     let grpc_names: Vec<&str> = grpc_plugins.iter().map(|p| p.name()).collect();
     assert!(
         !grpc_names.contains(&"ai_prompt_shield"),
@@ -6117,7 +6191,7 @@ fn test_priority_override_preserves_ws_parser_policy_and_framing() {
         cache.requires_ws_frame_hooks("ferrum", "p1"),
         "parser size policy must select the framed relay"
     );
-    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let ws_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
     let limiter = ws_plugins
         .iter()
         .find(|plugin| plugin.name() == "ws_message_size_limiting")
@@ -6195,7 +6269,7 @@ fn test_plugin_cache_ws_plugins_filtered_to_websocket_protocol_only() {
     let cache = PluginCache::new(&config).unwrap();
 
     // HTTP protocol should only include rate_limiting, not ws_message_size_limiting
-    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     assert_eq!(
         http_plugins.len(),
         1,
@@ -6204,7 +6278,7 @@ fn test_plugin_cache_ws_plugins_filtered_to_websocket_protocol_only() {
     assert_eq!(http_plugins[0].name(), "rate_limiting");
 
     // WebSocket protocol should include both
-    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let ws_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
     let ws_names: Vec<&str> = ws_plugins.iter().map(|p| p.name()).collect();
     assert!(
         ws_names.contains(&"ws_message_size_limiting"),
@@ -6341,7 +6415,7 @@ async fn correlation_id_priority_overrides_select_canonical_without_collapsing_i
             vec![external, internal],
         );
         let cache = PluginCache::new(&config).expect("multi-instance correlation cache");
-        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+        let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
         assert_eq!(plugins.len(), 2);
         assert_eq!(
             plugins[0].priority(),
@@ -6842,7 +6916,7 @@ fn test_priority_override_delegates_stream_first_byte_requirements() {
         vec![plugin_config],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
@@ -7283,7 +7357,10 @@ fn test_invalid_optional_proxy_group_plugin_still_shadows_global() {
         "failed proxy-group optional plugin must shadow the same-name global"
     );
     assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
-    assert_eq!(cache.get_plugins("ferrum", "p2")[0].name(), "stdout_logging");
+    assert_eq!(
+        cache.get_plugins("ferrum", "p2")[0].name(),
+        "stdout_logging"
+    );
 }
 
 #[test]
@@ -7408,7 +7485,7 @@ fn test_tcp_only_plugin_excluded_from_http() {
     assert_eq!(all[0].name(), "tcp_connection_throttle");
 
     // HTTP should NOT include tcp_connection_throttle
-    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     assert_eq!(
         http_plugins.len(),
         0,
@@ -7416,7 +7493,7 @@ fn test_tcp_only_plugin_excluded_from_http() {
     );
 
     // gRPC should NOT include tcp_connection_throttle
-    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Grpc);
     assert_eq!(
         grpc_plugins.len(),
         0,
@@ -7424,7 +7501,7 @@ fn test_tcp_only_plugin_excluded_from_http() {
     );
 
     // WebSocket should NOT include tcp_connection_throttle
-    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let ws_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
     assert_eq!(
         ws_plugins.len(),
         0,
@@ -7432,7 +7509,7 @@ fn test_tcp_only_plugin_excluded_from_http() {
     );
 
     // UDP should NOT include tcp_connection_throttle
-    let udp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Udp);
+    let udp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Udp);
     assert_eq!(
         udp_plugins.len(),
         0,
@@ -7440,7 +7517,7 @@ fn test_tcp_only_plugin_excluded_from_http() {
     );
 
     // TCP SHOULD include tcp_connection_throttle
-    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     assert_eq!(tcp_plugins.len(), 1);
     assert_eq!(tcp_plugins[0].name(), "tcp_connection_throttle");
 }
@@ -7461,12 +7538,12 @@ fn test_udp_only_plugin_included_for_udp_excluded_from_others() {
     let cache = PluginCache::new(&config).unwrap();
 
     // UDP should include udp_rate_limiting
-    let udp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Udp);
+    let udp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Udp);
     assert_eq!(udp_plugins.len(), 1);
     assert_eq!(udp_plugins[0].name(), "udp_rate_limiting");
 
     // HTTP should NOT include udp_rate_limiting
-    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     assert_eq!(
         http_plugins.len(),
         0,
@@ -7474,7 +7551,7 @@ fn test_udp_only_plugin_included_for_udp_excluded_from_others() {
     );
 
     // TCP should NOT include udp_rate_limiting
-    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     assert_eq!(
         tcp_plugins.len(),
         0,
@@ -7482,7 +7559,7 @@ fn test_udp_only_plugin_included_for_udp_excluded_from_others() {
     );
 
     // gRPC should NOT include udp_rate_limiting
-    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Grpc);
     assert_eq!(
         grpc_plugins.len(),
         0,
@@ -7512,7 +7589,7 @@ fn test_all_protocols_plugin_included_for_all_protocol_types() {
         ProxyProtocol::Tcp,
         ProxyProtocol::Udp,
     ] {
-        let plugins = cache.get_plugins_for_protocol("p1", *protocol);
+        let plugins = cache.get_plugins_for_protocol("ferrum", "p1", *protocol);
         assert_eq!(
             plugins.len(),
             1,
@@ -7557,7 +7634,7 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     let cache = PluginCache::new(&config).unwrap();
 
     // HTTP: only cors + stdout_logging
-    let http = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let http_names: Vec<&str> = http.iter().map(|p| p.name()).collect();
     assert!(http_names.contains(&"cors"));
     assert!(http_names.contains(&"stdout_logging"));
@@ -7566,7 +7643,7 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     assert_eq!(http_names.len(), 2);
 
     // TCP: only tcp_connection_throttle + stdout_logging
-    let tcp = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let tcp_names: Vec<&str> = tcp.iter().map(|p| p.name()).collect();
     assert!(tcp_names.contains(&"tcp_connection_throttle"));
     assert!(tcp_names.contains(&"stdout_logging"));
@@ -7575,7 +7652,7 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     assert_eq!(tcp_names.len(), 2);
 
     // UDP: only udp_rate_limiting + stdout_logging
-    let udp = cache.get_plugins_for_protocol("p1", ProxyProtocol::Udp);
+    let udp = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Udp);
     let udp_names: Vec<&str> = udp.iter().map(|p| p.name()).collect();
     assert!(udp_names.contains(&"udp_rate_limiting"));
     assert!(udp_names.contains(&"stdout_logging"));
@@ -7653,7 +7730,7 @@ fn test_tcp_connection_throttle_accepts_tcp_and_tcp_tls_attachments() {
         );
         let cache = PluginCache::new(&config)
             .unwrap_or_else(|error| panic!("{scheme} attachment was rejected: {error}"));
-        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+        let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name(), "tcp_connection_throttle");
     }
@@ -7677,13 +7754,13 @@ fn test_tcp_connection_throttle_global_mixed_protocol_scope_protects_only_tcp() 
     let cache = PluginCache::new(&config).expect("mixed global scope has TCP coverage");
     assert_eq!(
         cache
-            .get_plugins_for_protocol("tcp", ProxyProtocol::Tcp)
+            .get_plugins_for_protocol("ferrum", "tcp", ProxyProtocol::Tcp)
             .len(),
         1
     );
     assert!(
         cache
-            .get_plugins_for_protocol("udp", ProxyProtocol::Udp)
+            .get_plugins_for_protocol("ferrum", "udp", ProxyProtocol::Udp)
             .is_empty()
     );
 }
@@ -7755,7 +7832,7 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
         vec![wide, strict],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     assert_eq!(plugins.len(), 2);
     assert_eq!(plugins[0].priority(), 1000);
     assert_eq!(plugins[1].priority(), 2000);
@@ -7786,7 +7863,7 @@ async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
         )],
     );
     let cache = PluginCache::new(&initial).unwrap();
-    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let old_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut old_connection = make_tcp_stream_context("10.0.0.2");
     assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
 
@@ -7794,7 +7871,7 @@ async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
     replacement.plugin_configs[0].priority_override = Some(1800);
     replacement.plugin_configs[0].updated_at = Utc::now();
     cache.rebuild(&replacement).unwrap();
-    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let new_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut blocked = make_tcp_stream_context("10.0.0.2");
     assert!(!run_tcp_connect_chain(&new_plugins, &mut blocked).await);
 
@@ -7818,7 +7895,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
         )],
     );
     let cache = PluginCache::new(&initial).unwrap();
-    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let old_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut old_connection = make_tcp_stream_context("10.0.0.3");
     assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
 
@@ -7827,9 +7904,14 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
         json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0});
     replacement.plugin_configs[0].updated_at = Utc::now();
     cache
-        .apply_delta(&replacement, &HashSet::from([NamespacedResourceId::new("ferrum", "p1")]), &[], false)
+        .apply_delta(
+            &replacement,
+            &HashSet::from([NamespacedResourceId::new("ferrum", "p1")]),
+            &[],
+            false,
+        )
         .unwrap();
-    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let new_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut second = make_tcp_stream_context("10.0.0.3");
     assert!(run_tcp_connect_chain(&new_plugins, &mut second).await);
     let mut third = make_tcp_stream_context("10.0.0.3");
@@ -7853,7 +7935,7 @@ async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_d
         )],
     );
     let cache = PluginCache::new(&initial).unwrap();
-    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let old_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut first = make_tcp_stream_context("10.0.0.5");
     let mut second = make_tcp_stream_context("10.0.0.5");
     assert!(run_tcp_connect_chain(&old_plugins, &mut first).await);
@@ -7863,7 +7945,7 @@ async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_d
     replacement.plugin_configs[0].config =
         json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0});
     cache.rebuild(&replacement).unwrap();
-    let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let new_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut blocked = make_tcp_stream_context("10.0.0.5");
     assert!(!run_tcp_connect_chain(&new_plugins, &mut blocked).await);
     first.release_admission_permits();
@@ -7886,7 +7968,7 @@ async fn test_tcp_connection_throttle_scope_move_keeps_same_proxy_accounting() {
         )],
     );
     let cache = PluginCache::new(&initial).unwrap();
-    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let old_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut old_connection = make_tcp_stream_context("10.0.0.6");
     assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
 
@@ -7894,7 +7976,7 @@ async fn test_tcp_connection_throttle_scope_move_keeps_same_proxy_accounting() {
     moved.plugin_configs[0].scope = PluginScope::ProxyGroup;
     moved.plugin_configs[0].proxy_id = None;
     cache.rebuild(&moved).unwrap();
-    let moved_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let moved_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut blocked = make_tcp_stream_context("10.0.0.6");
     assert!(!run_tcp_connect_chain(&moved_plugins, &mut blocked).await);
     old_connection.release_admission_permits();
@@ -7915,14 +7997,14 @@ async fn test_tcp_connection_throttle_rejected_reload_keeps_old_generation() {
         )],
     );
     let cache = PluginCache::new(&initial).unwrap();
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut existing = make_tcp_stream_context("10.0.0.7");
     assert!(run_tcp_connect_chain(&plugins, &mut existing).await);
 
     let mut invalid = initial.clone();
     invalid.plugin_configs[0].config = json!({"max_connections_per_key": 0});
     assert!(cache.rebuild(&invalid).is_err());
-    let still_current = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let still_current = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut blocked = make_tcp_stream_context("10.0.0.7");
     assert!(!run_tcp_connect_chain(&still_current, &mut blocked).await);
     existing.release_admission_permits();
@@ -7943,14 +8025,14 @@ async fn test_tcp_connection_throttle_removed_policy_is_generation_isolated() {
         )],
     );
     let cache = PluginCache::new(&initial).unwrap();
-    let old_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let old_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut old_connection = make_tcp_stream_context("10.0.0.4");
     assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
 
     let removed = make_config(vec![make_tcp_proxy("p1", vec![])], vec![]);
     cache.rebuild(&removed).unwrap();
     cache.rebuild(&initial).unwrap();
-    let recreated_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let recreated_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut recreated = make_tcp_stream_context("10.0.0.4");
     assert!(run_tcp_connect_chain(&recreated_plugins, &mut recreated).await);
 
@@ -8428,13 +8510,13 @@ fn test_custom_correlation_owners_on_disjoint_protocols_are_allowed() {
         .expect("disjoint protocol owners cannot contend for correlation ownership");
     assert_eq!(
         cache
-            .get_plugins_for_protocol("p1", ProxyProtocol::Http)
+            .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http)
             .len(),
         1
     );
     assert_eq!(
         cache
-            .get_plugins_for_protocol("p1", ProxyProtocol::Tcp)
+            .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp)
             .len(),
         1
     );
@@ -8557,7 +8639,7 @@ fn test_opa_body_buffering_is_deferred_until_after_authentication() {
         !caps.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE),
         "OPA must not force unauthenticated body buffering"
     );
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let opa = plugins
         .iter()
         .find(|plugin| plugin.name() == "opa")
@@ -9157,7 +9239,7 @@ async fn grpc_web_global_shadowed_by_two_scoped_instances_unions_expose_headers_
         vec![global, early, late],
     );
     let cache = PluginCache::new(&config).expect("multi-instance grpc_web cache");
-    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
     let grpc_web_plugins: Vec<_> = plugins
         .iter()
         .filter(|plugin| plugin.name() == "grpc_web")

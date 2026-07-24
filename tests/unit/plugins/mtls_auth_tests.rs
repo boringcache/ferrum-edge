@@ -1,6 +1,6 @@
 use base64::Engine;
-use ferrum_edge::config::types::Consumer;
 use ferrum_edge::config::db_backend::NamespacedResourceId;
+use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::mtls_auth::{MtlsAuth, MtlsAuthConnectionCache};
 use ferrum_edge::plugins::{

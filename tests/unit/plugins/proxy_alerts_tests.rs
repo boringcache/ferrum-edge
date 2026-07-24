@@ -1736,7 +1736,10 @@ async fn old_generation_sample_cannot_repopulate_after_removal() {
     // Lifecycle identity is namespace-qualified (`namespace|id`), so the
     // seed/publish/check keys carry the summary's namespace.
     let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
-    plugin.retain_proxies(&std::collections::HashMap::from([("ferrum|p1", 1), ("ferrum|p2", 1)]));
+    plugin.retain_proxies(&std::collections::HashMap::from([
+        ("ferrum|p1", 1),
+        ("ferrum|p2", 1),
+    ]));
     plugin.seed_lifecycle_state_for_test("ferrum|p1", 1);
     assert!(plugin.has_lifecycle_state_for_test("ferrum|p1"));
 

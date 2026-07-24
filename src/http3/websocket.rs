@@ -526,9 +526,12 @@ pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
         return;
     }
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.namespace, &proxy.id, target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
         cb.record_neutral(true);
     }
 }

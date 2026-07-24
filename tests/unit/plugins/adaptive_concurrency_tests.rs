@@ -7,10 +7,10 @@ use ferrum_edge::_test_support::{
     AdaptiveConcurrencyDecreaseHarness, AdaptiveConcurrencyTransitionHarness,
 };
 use ferrum_edge::PluginCache;
-use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
 };
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::{GatewayConfig, Proxy, UpstreamTarget};
 use ferrum_edge::plugins::adaptive_concurrency::AdaptiveConcurrency;
 use ferrum_edge::plugins::{
@@ -1099,7 +1099,12 @@ fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
         );
 
         cache
-            .apply_delta(&config, &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]), &[], false)
+            .apply_delta(
+                &config,
+                &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+                &[],
+                false,
+            )
             .expect("scoped policy should reattach");
         let fresh_generation = expect_admitted(acquire_from_cache(&cache, &config));
         drop(fresh_generation);

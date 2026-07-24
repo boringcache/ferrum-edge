@@ -3614,11 +3614,9 @@ impl PluginCacheInner {
                 grpc_deadline_plugins: self.get_grpc_deadline_plugins(proxy_key, protocol),
                 auth_plugins: self.get_auth_plugins(proxy_key, protocol),
                 authorize_plugins: self.get_authorize_plugins(proxy_key, protocol),
-                backend_admission_plugins: self
-                    .get_backend_admission_plugins(proxy_key, protocol),
+                backend_admission_plugins: self.get_backend_admission_plugins(proxy_key, protocol),
                 backend_path_plugins,
-                request_headers_to_redact: self
-                    .get_request_headers_to_redact(proxy_key, protocol),
+                request_headers_to_redact: self.get_request_headers_to_redact(proxy_key, protocol),
                 initial_response_header_policy_plugins: self
                     .get_initial_response_header_policy_plugins(proxy_key, protocol),
                 initial_response_header_policy_names: self
@@ -3626,8 +3624,7 @@ impl PluginCacheInner {
                 response_committed_plugins: self
                     .get_response_committed_plugins(proxy_key, protocol),
                 capabilities,
-                requires_response_body_buffering: self
-                    .requires_response_body_buffering(proxy_key),
+                requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
                 requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
                 requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
             }
@@ -5110,7 +5107,9 @@ impl PluginCache {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
-            self.inner.load().get_plugins_for_protocol(key.as_str(), protocol)
+            self.inner
+                .load()
+                .get_plugins_for_protocol(key.as_str(), protocol)
         })
     }
 
@@ -5166,7 +5165,9 @@ impl PluginCache {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
-            self.inner.load().requires_response_body_buffering(key.as_str())
+            self.inner
+                .load()
+                .requires_response_body_buffering(key.as_str())
         })
     }
 
@@ -5178,7 +5179,9 @@ impl PluginCache {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
-            self.inner.load().requires_request_body_buffering(key.as_str())
+            self.inner
+                .load()
+                .requires_request_body_buffering(key.as_str())
         })
     }
 

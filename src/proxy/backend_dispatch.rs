@@ -566,8 +566,7 @@ pub(crate) fn check_circuit_breaker(
                 &proxy.id,
                 cb_target_key.as_deref(),
                 cb_config,
-            )
-        {
+            ) {
             Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
                 return Ok((cb_target_key, is_half_open_probe, admission_open_epoch));
             }
@@ -974,10 +973,12 @@ fn record_backend_outcome_inner(
     // For retries, intermediate failures were already recorded per-target inside
     // the retry loop, so this only records the final attempt's outcome.
     if !skip_circuit_breaker_record && let Some(cb_config) = &proxy.circuit_breaker {
-        let cb =
-            state
-                .circuit_breaker_cache
-                .get_or_create(&proxy.namespace, &proxy.id, final_cb_target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            final_cb_target_key,
+            cb_config,
+        );
         apply_circuit_breaker_outcome(
             &cb,
             response_status,
@@ -1156,7 +1157,9 @@ pub(crate) fn select_next_retry_target(
 
     let health_ctx = HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
-        proxy_passive: state.health_checker.passive_state(&proxy.namespace, &proxy.id),
+        proxy_passive: state
+            .health_checker
+            .passive_state(&proxy.namespace, &proxy.id),
         // Same precedence as the steady-state path and `passive_health_for_target`
         // (per-port > per-subset > upstream). `retry_override_port` is already
         // `Some` only when a live per-port override covers the retried target.

@@ -1639,9 +1639,13 @@ async fn handle_h3_request(
             .await?;
         }
         let logging_view = if grpc_web_response_content_type.is_some() {
-            epoch.plugin_cache.grpc_web_request_view(&proxy.namespace, &proxy.id)
+            epoch
+                .plugin_cache
+                .grpc_web_request_view(&proxy.namespace, &proxy.id)
         } else {
-            epoch.plugin_cache.request_view(&proxy.namespace, &proxy.id, request_protocol)
+            epoch
+                .plugin_cache
+                .request_view(&proxy.namespace, &proxy.id, request_protocol)
         };
         let logging_plugins = logging_view.plugins();
         log_pre_backend_rejected_request(
@@ -1688,9 +1692,13 @@ async fn handle_h3_request(
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
     let plugin_cache_view = if grpc_web_response_content_type.is_some() {
-        epoch.plugin_cache.grpc_web_request_view(&proxy.namespace, &proxy.id)
+        epoch
+            .plugin_cache
+            .grpc_web_request_view(&proxy.namespace, &proxy.id)
     } else {
-        epoch.plugin_cache.request_view(&proxy.namespace, &proxy.id, request_protocol)
+        epoch
+            .plugin_cache
+            .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
@@ -7188,9 +7196,12 @@ fn release_h3_circuit_breaker_probe_on_admission_reject(
         return;
     }
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.namespace, &proxy.id, target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
         cb.record_neutral(true);
     }
 }

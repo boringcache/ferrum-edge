@@ -332,9 +332,12 @@ fn release_cross_protocol_circuit_breaker_probe_on_admission_reject(
         return;
     }
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.namespace, &proxy.id, target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
         cb.record_neutral(true);
     }
 }
@@ -454,9 +457,12 @@ fn record_cross_protocol_retry_failure(
     }
 
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.namespace, &proxy.id, cb_target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            cb_target_key,
+            cb_config,
+        );
         cb.record_failure(response_status, connection_error, is_half_open_probe);
     }
 }
@@ -8601,9 +8607,12 @@ mod tests {
         let config = test_circuit_breaker_config();
         proxy.circuit_breaker = Some(config.clone());
         let target_key = Some("backend.example:443");
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.namespace, &proxy.id, target_key, &config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            &config,
+        );
 
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");

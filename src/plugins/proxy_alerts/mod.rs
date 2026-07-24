@@ -1006,12 +1006,22 @@ mod tests {
             ]
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
-        plugin
-            .recovery
-            .observe(0, "ferrum|p1", true, 5_000, 1, UNARMED_PROXY_LIFECYCLE_GENERATION);
-        plugin
-            .recovery
-            .observe(0, "ferrum|p1", false, 5_000, 2, UNARMED_PROXY_LIFECYCLE_GENERATION);
+        plugin.recovery.observe(
+            0,
+            "ferrum|p1",
+            true,
+            5_000,
+            1,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+        );
+        plugin.recovery.observe(
+            0,
+            "ferrum|p1",
+            false,
+            5_000,
+            2,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+        );
         assert!(matches!(
             plugin
                 .recovery

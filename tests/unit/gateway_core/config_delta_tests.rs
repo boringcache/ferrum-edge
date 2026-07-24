@@ -1,8 +1,8 @@
 //! Tests for config delta module
 
 use chrono::{DateTime, Utc};
-use ferrum_edge::config::types::*;
 use ferrum_edge::config::db_backend::NamespacedResourceId;
+use ferrum_edge::config::types::*;
 use ferrum_edge::config_delta::ConfigDelta;
 use std::collections::HashMap;
 
@@ -189,7 +189,10 @@ fn test_detects_removed_proxy() {
     let new = GatewayConfig::default();
     let delta = ConfigDelta::compute(&old, &new);
     assert!(delta.added_proxies.is_empty());
-    assert_eq!(delta.removed_proxy_ids, vec![NamespacedResourceId::new(default_namespace(), "p1")]);
+    assert_eq!(
+        delta.removed_proxy_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "p1")]
+    );
     assert!(delta.modified_proxies.is_empty());
 }
 
@@ -590,7 +593,10 @@ fn test_full_mixed_delta_all_entity_types() {
     let delta = ConfigDelta::compute(&old, &new);
 
     assert_eq!(delta.added_proxies.len(), 1);
-    assert_eq!(delta.removed_proxy_ids, vec![NamespacedResourceId::new(default_namespace(), "p1")]);
+    assert_eq!(
+        delta.removed_proxy_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "p1")]
+    );
     assert!(delta.added_consumers.is_empty());
     assert_eq!(delta.modified_consumers.len(), 1);
     assert_eq!(

@@ -1230,7 +1230,9 @@ async fn run_udp_egress_session(
         .then_some(override_port);
         if let Some(port) = port_lane {
             let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
-                lb, &proxy.namespace, &entry.upstream_id,
+                lb,
+                &proxy.namespace,
+                &entry.upstream_id,
                 Some(port),
                 None,
             );
@@ -1254,14 +1256,18 @@ async fn run_udp_egress_session(
         );
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
-                lb, &proxy.namespace, &entry.upstream_id,
+                lb,
+                &proxy.namespace,
+                &entry.upstream_id,
                 &lb_hash_key,
                 port,
                 Some(&health_ctx),
             )
         } else {
             LoadBalancerCache::select_target_from(
-                lb, &proxy.namespace, &entry.upstream_id,
+                lb,
+                &proxy.namespace,
+                &entry.upstream_id,
                 &lb_hash_key,
                 Some(&health_ctx),
             )

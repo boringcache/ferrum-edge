@@ -310,7 +310,11 @@ fn test_apply_delta_simultaneous_add_remove_modify() {
     let c4 = make_consumer("c4", "dave", Some("key-d"), None);
     let c2_modified = make_consumer("c2", "bob", Some("key-b-new"), None);
 
-    index.apply_delta(&[c4], &[NamespacedResourceId::new("ferrum", "c1")], &[c2_modified]);
+    index.apply_delta(
+        &[c4],
+        &[NamespacedResourceId::new("ferrum", "c1")],
+        &[c2_modified],
+    );
 
     assert_eq!(index.consumer_count(), 3); // c2, c3, c4
     assert!(index.find_by_api_key("key-a").is_none()); // removed
@@ -1060,7 +1064,11 @@ fn test_apply_delta_remove_nonexistent_consumer() {
     let c1 = make_consumer("c1", "alice", Some("key-a"), None);
     let index = ConsumerIndex::new(&[c1]);
 
-    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "nonexistent-id")], &[]);
+    index.apply_delta(
+        &[],
+        &[NamespacedResourceId::new("ferrum", "nonexistent-id")],
+        &[],
+    );
 
     assert_eq!(index.consumer_count(), 1);
     assert!(index.find_by_api_key("key-a").is_some());
@@ -1147,7 +1155,10 @@ fn test_apply_delta_remove_all_consumers() {
 
     index.apply_delta(
         &[],
-        &[NamespacedResourceId::new("ferrum", "c1"), NamespacedResourceId::new("ferrum", "c2")],
+        &[
+            NamespacedResourceId::new("ferrum", "c1"),
+            NamespacedResourceId::new("ferrum", "c2"),
+        ],
         &[],
     );
 
@@ -1389,7 +1400,11 @@ fn test_sequential_deltas_accumulate() {
 
     // Third delta: modify c1, remove c2
     let c1_modified = make_consumer("c1", "alice", Some("key-a-new"), None);
-    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c2")], &[c1_modified]);
+    index.apply_delta(
+        &[],
+        &[NamespacedResourceId::new("ferrum", "c2")],
+        &[c1_modified],
+    );
     assert_eq!(index.consumer_count(), 1);
     assert!(index.find_by_api_key("key-a").is_none());
     assert!(index.find_by_api_key("key-a-new").is_some());
