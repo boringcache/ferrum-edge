@@ -2151,6 +2151,196 @@ async fn xml_cross_construct_members_cannot_fill_modeled_slot() {
 }
 
 #[tokio::test]
+async fn xml_renamed_local_cross_construct_collisions_fail_closed() {
+    // Namespace-less xml.name renames must reserve the wire local as well as the
+    // JSON key. Otherwise an opposite-construct member named like the rename
+    // (attribute `wireRole` vs element-modeled `role`/`wireRole`, or element
+    // `wireId` vs attribute-modeled `id`/`wireId`) materializes as an additional
+    // property under additionalProperties omitted/true/permissive and can fill
+    // or bypass the modeled slot contrary to #3020.
+    let headers = content_type_headers("application/xml");
+
+    for additional in [Value::Null, json!(true), json!({"type": "string"})] {
+        // Element-modeled rename: attribute named like the xml.name local fails.
+        let mut element_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "required": ["role"],
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "const": "user",
+                    "xml": {"name": "wireRole"}
+                }
+            }
+        });
+        if !additional.is_null() {
+            element_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/rename-element",
+                "path_regex": "^/rename-element$",
+                "request_body": {"content": {"application/xml": element_schema}}
+            }]
+        }))
+        .unwrap_or_else(|error| {
+            panic!(
+                "renamed element schema with additionalProperties={additional} must admit: {error}"
+            )
+        });
+
+        let mut ctx = post_ctx("/rename-element");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root wireRole="user"/>"#,
+                )
+                .await,
+            Some(400),
+        );
+        // Correct construct still validates.
+        let mut ctx = post_ctx("/rename-element");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root><wireRole>user</wireRole></root>"#,
+                )
+                .await,
+        );
+        // Opposite construct alongside the correct element still fails closed.
+        let mut ctx = post_ctx("/rename-element");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root wireRole="user"><wireRole>user</wireRole></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+
+        // Attribute-modeled rename: element named like the xml.name local fails.
+        let mut attribute_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "required": ["id"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "const": "A-1",
+                    "xml": {"name": "wireId", "attribute": true}
+                }
+            }
+        });
+        if !additional.is_null() {
+            attribute_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/rename-attribute",
+                "path_regex": "^/rename-attribute$",
+                "request_body": {"content": {"application/xml": attribute_schema}}
+            }]
+        }))
+        .unwrap_or_else(|error| {
+            panic!(
+                "renamed attribute schema with additionalProperties={additional} must admit: {error}"
+            )
+        });
+
+        let mut ctx = post_ctx("/rename-attribute");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root><wireId>A-1</wireId></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        let mut ctx = post_ctx("/rename-attribute");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root wireId="A-1"/>"#,
+                )
+                .await,
+        );
+        let mut ctx = post_ctx("/rename-attribute");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root wireId="A-1"><wireId>A-1</wireId></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+    }
+
+    // Unrelated additional names remain allowed under a permissive subschema.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/rename-additional",
+            "path_regex": "^/rename-additional$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "const": "user",
+                                "xml": {"name": "wireRole"}
+                            }
+                        },
+                        "additionalProperties": {"type": "string"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/rename-additional");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root note="ok"><wireRole>user</wireRole></root>"#,
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
 async fn urlencoded_request_validation_converts_fields_to_schema_types() {
     let plugin = OpenapiValidator::new(&json!({
         "operations": [{

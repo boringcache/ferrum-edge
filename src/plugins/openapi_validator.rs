@@ -3898,9 +3898,10 @@ struct ModeledXmlNames {
     exact_attributes: HashSet<(String, String)>,
     /// Unqualified attribute locals when the schema omits `xml.namespace`.
     unqualified_attributes: HashSet<String>,
-    /// JSON property keys / XML locals claimed by namespace-qualified modeled
-    /// properties. Wrong-namespace members with these locals are rejected
-    /// fail-closed rather than dropped or rematerialized as additional members.
+    /// JSON property keys and modeled XML locals claimed by modeled properties.
+    /// A member that shares one of these names but does not match the property's
+    /// modeled XML construct or namespace is rejected fail-closed rather than
+    /// dropped or rematerialized as an additional member.
     reserved_json_keys: HashSet<String>,
 }
 
@@ -3921,17 +3922,20 @@ impl ModeledXmlNames {
         // pass validation the backend would reject: a validator/backend
         // differential. Correct-construct members are consumed before the
         // reserved-key check, so this only rejects cross-construct collisions.
+        //
+        // Also reserve a differing xml.name local unconditionally (with or without
+        // xml.namespace). Otherwise a namespace-less rename such as JSON key `role`
+        // / xml.name `wireRole` would leave `wireRole` free for an opposite-
+        // construct additional member under additionalProperties omitted/true/
+        // permissive.
         self.reserve_json_key(json_key);
+        if local != json_key {
+            self.reserve_json_key(local);
+        }
         match namespace {
             Some(namespace) => {
                 self.exact_elements
                     .insert((namespace.to_string(), local.to_string()));
-                if local != json_key {
-                    // Also reserve the XML local when it differs so a non-matching
-                    // expanded name with the same local name fails closed rather
-                    // than rematerializing under the local as an additional member.
-                    self.reserve_json_key(local);
-                }
             }
             None => {
                 self.any_namespace_elements.insert(local.to_string());
@@ -3940,15 +3944,16 @@ impl ModeledXmlNames {
     }
 
     fn insert_attribute(&mut self, namespace: Option<&str>, local: &str, json_key: &str) {
-        // Reserve the modeled JSON key unconditionally (see insert_element).
+        // Reserve the modeled JSON key and a differing xml.name local
+        // unconditionally (see insert_element).
         self.reserve_json_key(json_key);
+        if local != json_key {
+            self.reserve_json_key(local);
+        }
         match namespace {
             Some(namespace) => {
                 self.exact_attributes
                     .insert((namespace.to_string(), local.to_string()));
-                if local != json_key {
-                    self.reserve_json_key(local);
-                }
             }
             None => {
                 self.unqualified_attributes.insert(local.to_string());
