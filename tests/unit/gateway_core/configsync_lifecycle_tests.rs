@@ -2,7 +2,8 @@
 //!
 //! Covers silent-partition/keepalive constants, multi-CP backoff continuity,
 //! FULL_SNAPSHOT fencing (including complete-payload trust equivalence for the
-//! older-cross-source identical-fallback exception), monotonic watermarks,
+//! older-cross-source identical-fallback exception, with Unknown trust remaining
+//! non-comparable until an explicit Clear/Replace), monotonic watermarks,
 //! version/`loaded_at` reconcile, subscription base gating, SemVer negotiation,
 //! delta-rejection divergence, connection-state staleness preservation, and
 //! namespace-qualified removal filtering surfaces exposed for deterministic
@@ -25,8 +26,9 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     evaluate_delta_against_subscription_base, evaluate_full_snapshot_authority,
     failure_backoff_sequence, full_snapshot_stream_disposition, gateway_config_content_matches,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, monotonic_watermark,
-    reconcile_snapshot_version, record_applied_gateway_trust, resource_delta_advances_authority,
-    silence_exceeds_liveness, snapshot_failure_stream_disposition, stale_reject_from_reconcile,
+    reconcile_snapshot_version, record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
+    resource_delta_advances_authority, silence_exceeds_liveness, snapshot_failure_stream_disposition,
+    stale_reject_from_reconcile,
 };
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, check_cp_version_compatibility, configure_configsync_endpoint,
@@ -575,7 +577,7 @@ fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
     let mut authority = Some(AppliedSnapshotAuthority {
         version: Some(t0),
         source_cp_url: "http://cp-a:50051".to_string(),
-        gateway_trust: GatewayTrustEquivalenceState::Absent,
+        gateway_trust: GatewayTrustEquivalenceState::Unknown,
     });
 
     assert!(resource_delta_advances_authority(true, false));
@@ -586,8 +588,8 @@ fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
     assert_eq!(authority.as_ref().unwrap().version, Some(t1));
     assert_eq!(
         authority.as_ref().unwrap().gateway_trust,
-        GatewayTrustEquivalenceState::Absent,
-        "resource-delta watermark advances must preserve trust equivalence state"
+        GatewayTrustEquivalenceState::Unknown,
+        "resource-delta watermark advances must preserve Unknown trust state"
     );
 
     // A later older stamp must not lower the watermark.
@@ -595,8 +597,158 @@ fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
     assert_eq!(authority.as_ref().unwrap().version, Some(t1));
     assert_eq!(
         authority.as_ref().unwrap().gateway_trust,
+        GatewayTrustEquivalenceState::Unknown
+    );
+
+    // Creating authority from a resource commit alone must not invent Absent.
+    let mut fresh = None;
+    advance_authority_from_committed(&mut fresh, "http://cp-b:50051", t0);
+    assert_eq!(
+        fresh.as_ref().unwrap().gateway_trust,
+        GatewayTrustEquivalenceState::Unknown,
+        "resource-delta-only authority construction must leave trust Unknown"
+    );
+}
+
+#[test]
+fn unchanged_full_snapshot_authority_trust_stays_unknown_not_absent() {
+    // Root follow-up: an empty/Unchanged trust side channel must not record
+    // Absent. Absent is established only by an accepted explicit Clear.
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+
+    let gateway_trust = resolve_authority_trust_after_snapshot(None, None);
+    assert_eq!(gateway_trust, GatewayTrustEquivalenceState::Unknown);
+    assert!(!gateway_trust.is_comparable());
+
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: gateway_trust.clone(),
+    };
+    let current = GatewayConfig {
+        loaded_at: applied,
+        ..GatewayConfig::default()
+    };
+    let incoming = GatewayConfig {
+        loaded_at: older,
+        ..current.clone()
+    };
+
+    // Unknown authority must not treat an older explicit Clear as equivalent.
+    assert!(
+        !authoritative_snapshot_payload_matches(
+            &current,
+            &authority.gateway_trust,
+            &incoming,
+            Some(&GatewayTrustEquivalenceState::Absent),
+        ),
+        "Unknown authority must not match explicit Clear"
+    );
+    // Unknown authority must not treat an older explicit Replace as equivalent.
+    let replace_trust = gateway_trust_equivalence_state(Some(&test_runtime_trust(
+        "cluster.local",
+        &[&[1, 2, 3, 4]],
+    )));
+    assert!(
+        !authoritative_snapshot_payload_matches(
+            &current,
+            &authority.gateway_trust,
+            &incoming,
+            Some(&replace_trust),
+        ),
+        "Unknown authority must not match explicit Replace"
+    );
+    // Unknown vs Unknown is also non-comparable.
+    assert!(
+        !authoritative_snapshot_payload_matches(
+            &current,
+            &GatewayTrustEquivalenceState::Unknown,
+            &incoming,
+            Some(&GatewayTrustEquivalenceState::Unknown),
+        ),
+        "Unknown vs Unknown must fail closed"
+    );
+    assert!(matches!(
+        evaluate_full_snapshot_authority(
+            Some(&authority),
+            older,
+            "http://cp-fallback:50051",
+            false,
+        ),
+        Err(StaleSnapshotReject::OlderThanApplied { .. })
+    ));
+
+    // A later Unchanged snapshot preserves Unknown rather than inventing Absent.
+    let preserved = resolve_authority_trust_after_snapshot(Some(&authority), None);
+    assert_eq!(preserved, GatewayTrustEquivalenceState::Unknown);
+}
+
+#[test]
+fn trust_only_clear_or_replace_establishes_comparability_from_unknown() {
+    let t0 = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let mut authority = Some(AppliedSnapshotAuthority {
+        version: Some(t0),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+        // First Unchanged full snapshot left trust unestablished.
+        gateway_trust: resolve_authority_trust_after_snapshot(None, None),
+    });
+    assert_eq!(
+        authority.as_ref().unwrap().gateway_trust,
+        GatewayTrustEquivalenceState::Unknown
+    );
+
+    let current = GatewayConfig {
+        loaded_at: t0,
+        ..GatewayConfig::default()
+    };
+    let incoming = GatewayConfig {
+        loaded_at: older,
+        ..current.clone()
+    };
+
+    // Accepted trust-only Clear establishes Absent and enables the safe base.
+    record_applied_gateway_trust(&mut authority, GatewayTrustEquivalenceState::Absent);
+    assert_eq!(
+        authority.as_ref().unwrap().gateway_trust,
         GatewayTrustEquivalenceState::Absent
     );
+    assert!(authoritative_snapshot_payload_matches(
+        &current,
+        &authority.as_ref().unwrap().gateway_trust,
+        &incoming,
+        Some(&GatewayTrustEquivalenceState::Absent),
+    ));
+    assert_eq!(
+        evaluate_full_snapshot_authority(
+            authority.as_ref(),
+            older,
+            "http://cp-fallback:50051",
+            true,
+        )
+        .expect("explicit Clear establishes comparable Absent for identical fallback"),
+        t0
+    );
+
+    // Accepted trust-only Replace establishes Present and enables the safe base.
+    let present = gateway_trust_equivalence_state(Some(&test_runtime_trust(
+        "cluster.local",
+        &[&[5, 6, 7, 8]],
+    )));
+    record_applied_gateway_trust(&mut authority, present.clone());
+    assert!(authoritative_snapshot_payload_matches(
+        &current,
+        &authority.as_ref().unwrap().gateway_trust,
+        &incoming,
+        Some(&present),
+    ));
+    assert!(!authoritative_snapshot_payload_matches(
+        &current,
+        &authority.as_ref().unwrap().gateway_trust,
+        &incoming,
+        Some(&GatewayTrustEquivalenceState::Absent),
+    ));
 }
 
 #[test]

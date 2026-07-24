@@ -36,12 +36,30 @@ pub const CONFIGSYNC_MAX_SILENCE_SECS: u64 = 150;
 ///
 /// Present fingerprints are SHA-256 digests of a canonical encoding; raw trust
 /// material is never retained here and must never be logged.
+///
+/// Comparability rules for the identical-fallback exception:
+/// - [`Self::Unknown`] is never comparable (including Unknown vs Unknown).
+/// - [`Self::Absent`] is established only by an accepted explicit Clear.
+/// - [`Self::Present`] is established only by an accepted explicit Replace.
+/// - Empty/Unchanged side channels leave trust Unknown (or preserve prior
+///   Unknown) and cannot establish complete-payload equivalence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayTrustEquivalenceState {
+    /// Trust state has not been established by an accepted explicit Clear or
+    /// Replace. Empty/Unchanged side channels and resource-delta-only authority
+    /// construction leave trust here. Never treat as equivalent to Absent.
+    Unknown,
     /// Explicit clear / absent CP-delivered gateway trust.
     Absent,
     /// Present CP-delivered gateway trust, compared by canonical fingerprint.
     Present { fingerprint: String },
+}
+
+impl GatewayTrustEquivalenceState {
+    /// True when this state can participate in complete-payload equivalence.
+    pub fn is_comparable(&self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
 }
 
 /// Authoritative freshness watermark already established by this DP.
@@ -53,9 +71,12 @@ pub enum GatewayTrustEquivalenceState {
 /// not arise for newly committed applies that always carry `loaded_at`).
 ///
 /// `gateway_trust` is the last accepted CP-authoritative trust equivalence view.
-/// It is updated on FULL_SNAPSHOT applies and on accepted trust Replace/Clear
-/// updates (including trust-only deltas) so the identical-fallback exception
-/// cannot compare against a stale trust view after a later trust change.
+/// It starts as [`GatewayTrustEquivalenceState::Unknown`] until an accepted
+/// explicit Clear or Replace establishes Absent/Present. It is refreshed on
+/// FULL_SNAPSHOT applies and on accepted trust Replace/Clear updates (including
+/// trust-only deltas) so the identical-fallback exception cannot compare against
+/// a stale trust view after a later trust change. Empty/Unchanged side channels
+/// never convert Unknown into Absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedSnapshotAuthority {
     pub version: Option<DateTime<Utc>>,
@@ -161,10 +182,12 @@ pub fn gateway_config_content_matches(current: &GatewayConfig, incoming: &Gatewa
     canonical_json_value(current) == canonical_json_value(incoming)
 }
 
-/// Build the bounded trust-equivalence view for an accepted CP trust state.
+/// Build the bounded trust-equivalence view for an accepted explicit CP trust
+/// material state.
 ///
-/// `None` means absent/cleared CP trust. Fingerprints are order-insensitive for
-/// federated domains and certificate/JWT authority membership.
+/// `None` means explicitly cleared/absent CP trust (Clear), not an unestablished
+/// Unknown side channel. Fingerprints are order-insensitive for federated
+/// domains and certificate/JWT authority membership.
 pub fn gateway_trust_equivalence_state(
     trust: Option<&RuntimeTrustBundleSet>,
 ) -> GatewayTrustEquivalenceState {
@@ -176,13 +199,31 @@ pub fn gateway_trust_equivalence_state(
     }
 }
 
+/// Resolve the trust equivalence state to record after an accepted FULL_SNAPSHOT.
+///
+/// `side_channel_trust` is `Some` for an accepted explicit Clear/Replace and
+/// `None` for an empty/Unchanged side channel. Unchanged preserves any prior
+/// remembered state; with no prior authority it remains
+/// [`GatewayTrustEquivalenceState::Unknown`] and must never default to Absent.
+pub fn resolve_authority_trust_after_snapshot(
+    prior: Option<&AppliedSnapshotAuthority>,
+    side_channel_trust: Option<GatewayTrustEquivalenceState>,
+) -> GatewayTrustEquivalenceState {
+    match side_channel_trust {
+        Some(trust) => trust,
+        None => prior
+            .map(|authority| authority.gateway_trust.clone())
+            .unwrap_or(GatewayTrustEquivalenceState::Unknown),
+    }
+}
+
 /// Compare the complete authoritative ConfigSync snapshot payload.
 ///
 /// Includes GatewayConfig content (excluding `loaded_at`) and the effective
-/// CP gateway-trust state from the side channel. `incoming_trust = None` means
-/// the incoming side channel did not establish a comparable trust state
-/// (empty/unchanged mixed-version channel, or comparison inputs unavailable)
-/// and therefore fails closed.
+/// CP gateway-trust state from the side channel. Fails closed when either side
+/// is [`GatewayTrustEquivalenceState::Unknown`], when `incoming_trust` is
+/// `None` (empty/unchanged mixed-version channel), or when comparison inputs
+/// are otherwise unavailable. Unknown vs Unknown is not equivalence.
 pub fn authoritative_snapshot_payload_matches(
     current_config: &GatewayConfig,
     current_trust: &GatewayTrustEquivalenceState,
@@ -192,6 +233,9 @@ pub fn authoritative_snapshot_payload_matches(
     let Some(incoming_trust) = incoming_trust else {
         return false;
     };
+    if !current_trust.is_comparable() || !incoming_trust.is_comparable() {
+        return false;
+    }
     gateway_config_content_matches(current_config, incoming_config)
         && current_trust == incoming_trust
 }
@@ -200,7 +244,9 @@ pub fn authoritative_snapshot_payload_matches(
 ///
 /// No-op when authority has not been established yet. Callers must invoke this
 /// after every accepted trust Replace/Clear (FULL_SNAPSHOT or trust-only DELTA)
-/// so later identical-fallback comparisons stay synchronized.
+/// so later identical-fallback comparisons stay synchronized. Pass only
+/// comparable states from explicit Clear/Replace — never invent Absent from an
+/// Unchanged side channel.
 pub fn record_applied_gateway_trust(
     authority: &mut Option<AppliedSnapshotAuthority>,
     trust: GatewayTrustEquivalenceState,
@@ -281,9 +327,10 @@ fn canonical_json_value(value: Value) -> Value {
 /// The watermark is monotonic: same-source recovery that intentionally applies
 /// an older body still keeps the highest known ordering for later cross-source
 /// fencing. Source URL is always updated to the committing CP. Gateway-trust
-/// equivalence state is preserved on existing authority (resource deltas do
-/// not clear trust); new authority starts with absent trust until a trust
-/// update is recorded.
+/// equivalence state is preserved on existing authority (resource deltas do not
+/// invent Clear/Absent); new authority starts with
+/// [`GatewayTrustEquivalenceState::Unknown`] until an accepted explicit trust
+/// Clear/Replace establishes a comparable state.
 pub fn advance_authority_from_committed(
     authority: &mut Option<AppliedSnapshotAuthority>,
     source_cp_url: &str,
@@ -298,7 +345,7 @@ pub fn advance_authority_from_committed(
             *authority = Some(AppliedSnapshotAuthority {
                 version: Some(committed),
                 source_cp_url: source_cp_url.to_string(),
-                gateway_trust: GatewayTrustEquivalenceState::Absent,
+                gateway_trust: GatewayTrustEquivalenceState::Unknown,
             });
         }
     }

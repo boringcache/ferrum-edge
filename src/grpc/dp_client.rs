@@ -47,7 +47,8 @@ use super::configsync_lifecycle::{
     connection_error_outcome, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, full_snapshot_stream_disposition,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep,
-    reconcile_snapshot_version, record_applied_gateway_trust, resource_delta_advances_authority,
+    reconcile_snapshot_version, record_applied_gateway_trust,
+    resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
     snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
@@ -897,10 +898,11 @@ fn parse_gateway_trust_bundle_update(
 
 /// Map an accepted trust side-channel update onto the bounded equivalence view.
 ///
-/// `Unchanged` returns `None` so callers can leave remembered trust state alone
+/// `Unchanged` returns `None` so callers leave remembered trust state alone
 /// (and so older-cross-source complete-payload matching fails closed when a
-/// FULL_SNAPSHOT cannot establish comparable trust state). `Clear` / `Replace`
-/// always produce a comparable state.
+/// FULL_SNAPSHOT cannot establish comparable trust state). `Clear` /
+/// `Replace` always produce a comparable Absent/Present state. Callers must
+/// never invent Absent from `None`.
 fn gateway_trust_equivalence_after_update(
     update: &GatewayTrustBundleUpdate,
 ) -> Option<GatewayTrustEquivalenceState> {
@@ -1600,15 +1602,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         received_config = true;
                         // Watermark is the monotonic value from fencing policy
                         // (max of prior authority and committed loaded_at).
-                        // Preserve prior trust equivalence when the side channel
-                        // is Unchanged (mixed-version); otherwise record the
-                        // accepted Clear/Replace view.
-                        let gateway_trust = next_trust.unwrap_or_else(|| {
-                            snapshot_authority
-                                .as_ref()
-                                .map(|authority| authority.gateway_trust.clone())
-                                .unwrap_or(GatewayTrustEquivalenceState::Absent)
-                        });
+                        // Explicit Clear/Replace establish comparable trust;
+                        // empty/Unchanged preserves prior state or remains
+                        // Unknown — never invent Absent from an unestablished
+                        // side channel.
+                        let gateway_trust = resolve_authority_trust_after_snapshot(
+                            snapshot_authority.as_ref(),
+                            next_trust,
+                        );
                         *snapshot_authority = Some(AppliedSnapshotAuthority {
                             version: Some(watermark),
                             source_cp_url: cp_url.to_string(),
