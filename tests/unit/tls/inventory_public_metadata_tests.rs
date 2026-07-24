@@ -18,10 +18,7 @@ fn generated_cert_pem() -> String {
     let key_pair =
         rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
-    params
-        .self_signed(&key_pair)
-        .expect("self-sign cert")
-        .pem()
+    params.self_signed(&key_pair).expect("self-sign cert").pem()
 }
 
 fn entry_of_kind<'a>(inventory: &'a TlsInventory, kind: &str) -> &'a TlsInventoryEntry {

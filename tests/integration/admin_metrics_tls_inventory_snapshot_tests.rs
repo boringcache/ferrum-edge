@@ -62,7 +62,8 @@ impl CountingInventoryCollector {
     }
 
     fn set_delay(&self, delay: Duration) {
-        self.delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+        self.delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 }
 
