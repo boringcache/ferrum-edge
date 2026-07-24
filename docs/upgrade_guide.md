@@ -249,12 +249,14 @@ rejects those reserved entries with a template-time error.
 
 ### Version Negotiation (Built-In Safety Net)
 
-Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version during gRPC handshake. The **major and minor** version components must match — patch-level differences (e.g., `0.9.0` vs `0.9.1`) are allowed.
+Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version during gRPC handshake. Versions are parsed as **SemVer**. The **major and minor** components must match — patch-level differences (e.g., `0.9.0` vs `0.9.1`) are allowed. **Prerelease policy:** prerelease (`-rc.1`) and build metadata (`+git`) are ignored for compatibility; only major.minor are compared, so `0.9.0-rc.1` is compatible with `0.9.0` and `0.9.3`. Empty or malformed versions are rejected on both CP admission (`FailedPrecondition`) and DP ConfigUpdate processing. Every non-heartbeat `FULL_SNAPSHOT` and `DELTA` must carry a valid compatible CP version.
 
 | CP Version | DP Version | Result |
 |------------|------------|--------|
 | `0.9.0` | `0.9.0` | Allowed |
 | `0.9.0` | `0.9.3` | Allowed (patch difference) |
+| `0.9.0` | `0.9.0-rc.1` | Allowed (prerelease ignored for major.minor gate) |
+| `0.9.0` | `1` / `garbage` / `` | **Rejected** — missing or malformed SemVer |
 | `0.9.0` | `0.10.0` | **Rejected** — DP Subscribe/GetFullConfig fails with `FAILED_PRECONDITION` |
 | `1.0.0` | `0.9.0` | **Rejected** — major version mismatch |
 

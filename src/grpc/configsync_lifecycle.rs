@@ -2,10 +2,14 @@
 //!
 //! Kept free of gRPC/runtime I/O so unit tests can exercise silent-partition
 //! thresholds, multi-CP backoff continuity, FULL_SNAPSHOT fencing, freshness
-//! watermark monotonicity, subscription base gating, and connection-state
-//! staleness preservation without standing up a CP.
+//! watermark monotonicity, subscription base gating, version negotiation,
+//! delta-rejection divergence, and connection-state staleness preservation
+//! without standing up a CP.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
+use semver::Version;
 
 use crate::util::backoff::{BACKOFF_INITIAL_SECS, BACKOFF_MAX_SECS, next_backoff_secs};
 
@@ -224,26 +228,49 @@ pub fn stale_reject_from_reconcile(err: VersionReconcileError) -> StaleSnapshotR
 }
 
 /// How the stream must react when a FULL_SNAPSHOT fails parse/validate/apply.
+///
+/// An unusable FULL_SNAPSHOT is treated as an authoritative reload that did not
+/// land. Keeping the stream open would let later deltas apply against a base
+/// that missed those changes, so the subscription always terminates while the
+/// last-known-good config keeps serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotFailureStreamDisposition {
-    /// No valid base yet on this subscription — terminate and fail over with
-    /// accumulating backoff so a later DELTA cannot apply against an unrelated
-    /// old base.
-    TerminateAndFailover,
-    /// A valid base was already committed on this subscription — keep serving
-    /// it and continue reading (e.g. a mid-stream recovery snapshot that fails
-    /// validation does not tear down the healthy stream).
-    ContinueKeepingBase,
+    /// Terminate and reconnect so the next subscription must establish a fresh
+    /// authoritative FULL_SNAPSHOT base before any DELTA can apply.
+    TerminateAndReconnect,
 }
 
 /// Decide stream reaction for a refused/invalid/unusable FULL_SNAPSHOT.
+///
+/// Independent of whether an earlier base was accepted on this subscription —
+/// mid-stream full-snapshot failures must not continue reading deltas.
 pub fn snapshot_failure_stream_disposition(
-    subscription_base_applied: bool,
+    _subscription_base_applied: bool,
 ) -> SnapshotFailureStreamDisposition {
-    if subscription_base_applied {
-        SnapshotFailureStreamDisposition::ContinueKeepingBase
-    } else {
-        SnapshotFailureStreamDisposition::TerminateAndFailover
+    SnapshotFailureStreamDisposition::TerminateAndReconnect
+}
+
+/// Per-subscription apply gating for FULL_SNAPSHOT vs DELTA.
+///
+/// Startup readiness (`startup_ready`) is intentionally separate: library/test
+/// callers may omit that flag and skip startup-only wait/capability work, but
+/// every new subscription still starts without a committed base and must accept
+/// a FULL_SNAPSHOT before any DELTA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SubscriptionApplyState {
+    /// True only after this subscription successfully accepted a FULL_SNAPSHOT.
+    pub base_applied: bool,
+}
+
+impl SubscriptionApplyState {
+    /// Every new ConfigSync subscription starts without a committed base.
+    pub fn new() -> Self {
+        Self { base_applied: false }
+    }
+
+    /// Record that a FULL_SNAPSHOT was successfully accepted on this stream.
+    pub fn note_full_snapshot_accepted(&mut self) {
+        self.base_applied = true;
     }
 }
 
@@ -264,6 +291,151 @@ pub fn evaluate_delta_against_subscription_base(
     } else {
         Err(DeltaRefuse::BeforeSnapshotBase)
     }
+}
+
+/// Why a non-empty DELTA must terminate the stream (issue #2394).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaRejectionKind {
+    /// JSON body could not be classified — fail closed.
+    ParseFailure,
+    /// Trust side-channel was invalid — resource deltas must not continue.
+    InvalidTrustSideChannel,
+    /// Resource validation/apply rejected a non-empty delta.
+    NonEmptyApplyRejected,
+}
+
+/// Stream reaction after a DELTA rejection. Always terminates so a later
+/// partial delta cannot apply against the wrong base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaRejectionStreamDisposition {
+    TerminateAndResync,
+}
+
+pub fn delta_rejection_stream_disposition(
+    _kind: DeltaRejectionKind,
+) -> DeltaRejectionStreamDisposition {
+    DeltaRejectionStreamDisposition::TerminateAndResync
+}
+
+/// Bounded observability for ConfigSync delta-rejection divergence.
+///
+/// Dimensions are fixed (no resource IDs) so `/metrics` cardinality stays
+/// bounded under hostile or malformed CP pushes.
+#[derive(Debug, Default)]
+pub struct ConfigSyncDivergenceMetrics {
+    rejected_nonempty_deltas_total: AtomicU64,
+    recoveries_total: AtomicU64,
+    diverged: AtomicBool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSyncDivergenceMetricsSnapshot {
+    pub rejected_nonempty_deltas_total: u64,
+    pub recoveries_total: u64,
+    pub diverged: bool,
+}
+
+impl ConfigSyncDivergenceMetrics {
+    pub fn record_rejection(&self) {
+        self.rejected_nonempty_deltas_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.diverged.store(true, Ordering::Release);
+    }
+
+    /// Clear sticky divergence only after an authoritative FULL_SNAPSHOT is
+    /// accepted. Increments the recovery counter when clearing an active
+    /// diverged state.
+    pub fn record_recovery_after_full_snapshot(&self) -> bool {
+        let was_diverged = self.diverged.swap(false, Ordering::AcqRel);
+        if was_diverged {
+            self.recoveries_total.fetch_add(1, Ordering::Relaxed);
+        }
+        was_diverged
+    }
+
+    pub fn is_diverged(&self) -> bool {
+        self.diverged.load(Ordering::Acquire)
+    }
+
+    pub fn snapshot(&self) -> ConfigSyncDivergenceMetricsSnapshot {
+        ConfigSyncDivergenceMetricsSnapshot {
+            rejected_nonempty_deltas_total: self
+                .rejected_nonempty_deltas_total
+                .load(Ordering::Relaxed),
+            recoveries_total: self.recoveries_total.load(Ordering::Relaxed),
+            diverged: self.is_diverged(),
+        }
+    }
+}
+
+/// Why peer Ferrum version negotiation failed (issue #2395).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionCompatError {
+    /// Peer omitted its version entirely.
+    Missing,
+    /// Peer (or local) version is not valid SemVer.
+    Malformed { peer: String },
+    /// Parsed SemVer major/minor do not match.
+    Incompatible { local: String, peer: String },
+}
+
+impl VersionCompatError {
+    pub fn message(&self, local_role: &str, peer_role: &str, local_version: &str) -> String {
+        match self {
+            VersionCompatError::Missing => format!(
+                "{peer_role} did not report its version. {local_role} is running Ferrum Edge v{local_version}. \
+                 Upgrade the {peer_role} to a version that supports version negotiation."
+            ),
+            VersionCompatError::Malformed { peer } => format!(
+                "Unable to parse {peer_role} version for compatibility check \
+                 ({local_role}={local_version}, {peer_role}={peer}). \
+                 Versions must be valid SemVer (major.minor.patch with optional prerelease/build)."
+            ),
+            VersionCompatError::Incompatible { local, peer } => format!(
+                "Version mismatch: {local_role} is v{local} but {peer_role} is v{peer}. \
+                 Major and minor versions must match. \
+                 Upgrade the CP first, then upgrade DPs to the same major.minor version."
+            ),
+        }
+    }
+}
+
+/// CP/DP version compatibility using SemVer.
+///
+/// # Prerelease policy
+///
+/// Compatibility compares **major and minor only**. Patch, prerelease
+/// (`-rc.1`), and build metadata (`+gitsha`) differences are allowed when
+/// major.minor match. Empty and unparseable versions are rejected on both
+/// CP admission and DP ConfigUpdate processing. Heartbeats are not checked
+/// by callers (they carry no config schema contract).
+pub fn check_peer_version_compatibility(
+    local_version: &str,
+    peer_version: &str,
+) -> Result<(), VersionCompatError> {
+    if peer_version.is_empty() {
+        return Err(VersionCompatError::Missing);
+    }
+
+    let Ok(local) = Version::parse(local_version) else {
+        return Err(VersionCompatError::Malformed {
+            peer: peer_version.to_string(),
+        });
+    };
+    let Ok(peer) = Version::parse(peer_version) else {
+        return Err(VersionCompatError::Malformed {
+            peer: peer_version.to_string(),
+        });
+    };
+
+    if local.major != peer.major || local.minor != peer.minor {
+        return Err(VersionCompatError::Incompatible {
+            local: local_version.to_string(),
+            peer: peer_version.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Multi-CP reconnect backoff state. Backoff follows the failure sequence and
@@ -294,8 +466,11 @@ impl Default for MultiCpBackoffState {
 /// Outcome of one ConfigSync stream attempt for backoff accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSyncAttemptOutcome {
-    /// Transport/RPC failure while connecting or reading.
+    /// Transport/RPC failure before this attempt accepted any config.
     ConnectionError,
+    /// Transport/RPC failure after this attempt already accepted config.
+    /// Counts as healthy progress for backoff reset while still failing over.
+    ConnectionErrorAfterConfig,
     /// Stream ended cleanly after delivering at least one config message.
     CleanCloseAfterConfig,
     /// Stream accepted Subscribe then ended without a config message.
@@ -312,6 +487,11 @@ pub enum ConfigSyncAttemptOutcome {
     /// inconsistent, rejected, or a pre-snapshot DELTA). Fail over with
     /// accumulating backoff; never treat as delivered config.
     InvalidSubscriptionBase,
+    /// An unusable FULL_SNAPSHOT arrived after a base was already accepted, or a
+    /// non-empty DELTA was rejected. Keep serving last-known-good config, reset
+    /// backoff, and reconnect to the same CP for a fresh authoritative snapshot
+    /// (issues #2394 / mid-stream snapshot failure).
+    ResyncAfterAcceptedConfig,
 }
 
 /// Advance multi-CP index/backoff after one attempt.
@@ -327,7 +507,11 @@ pub fn advance_multi_cp_backoff(
             state.backoff_secs = BACKOFF_INITIAL_SECS;
             false
         }
-        ConfigSyncAttemptOutcome::CleanCloseAfterConfig => {
+        ConfigSyncAttemptOutcome::CleanCloseAfterConfig
+        | ConfigSyncAttemptOutcome::ConnectionErrorAfterConfig
+        | ConfigSyncAttemptOutcome::ResyncAfterAcceptedConfig => {
+            // Healthy progress (or a resync after previously accepted config)
+            // resets delay to the initial value before the next attempt.
             state.backoff_secs = BACKOFF_INITIAL_SECS;
             true
         }
@@ -383,4 +567,14 @@ pub fn silence_exceeds_liveness(silence_secs: u64) -> bool {
 /// Cap used by tests/docs — exported so callers can assert the documented max.
 pub fn backoff_max_secs() -> u64 {
     BACKOFF_MAX_SECS
+}
+
+/// Map a transport/RPC failure onto the backoff outcome using whether this
+/// attempt already accepted config (issue #2968).
+pub fn connection_error_outcome(delivered_config: bool) -> ConfigSyncAttemptOutcome {
+    if delivered_config {
+        ConfigSyncAttemptOutcome::ConnectionErrorAfterConfig
+    } else {
+        ConfigSyncAttemptOutcome::ConnectionError
+    }
 }

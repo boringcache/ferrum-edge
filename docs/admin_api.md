@@ -555,14 +555,20 @@ Returns the connection status to the Control Plane:
     "status": "online",
     "is_primary": true,
     "connected_since": "2025-01-15T10:30:00Z",
-    "last_config_received_at": "2025-01-15T10:35:00Z"
+    "last_config_received_at": "2025-01-15T10:35:00Z",
+    "config_diverged": false,
+    "config_diverged_since": null,
+    "config_divergence_recoveries_total": 0
   }
 }
 ```
 
 - **`status`**: `online` when the gRPC stream to the CP is active, `offline` when disconnected (e.g., CP is down, DP is in backoff retry).
 - **`is_primary`**: `true` when connected to the primary (first) CP URL, `false` when connected to a fallback CP (multi-CP failover).
-- **`last_config_received_at`**: Timestamp of the last successfully applied config update (full snapshot or delta) from the CP. `null` if no config has been received yet on the current connection.
+- **`last_config_received_at`**: Timestamp of the last successfully *accepted* config update (full snapshot or delta) from the CP. Rejected resource deltas do not advance this stamp. `null` if no config has been accepted yet.
+- **`config_diverged`**: Sticky operator signal set when a non-empty ConfigSync DELTA is rejected. Cleared only after an authoritative FULL_SNAPSHOT is accepted. Last-known-good config continues to serve while `true`.
+- **`config_diverged_since`**: When sticky divergence was first raised (`null` when not diverged).
+- **`config_divergence_recoveries_total`**: Count of divergence → FULL_SNAPSHOT recovery transitions.
 
 ### Database/File Mode Response
 

@@ -2,26 +2,33 @@
 //!
 //! Covers silent-partition/keepalive constants, multi-CP backoff continuity,
 //! FULL_SNAPSHOT fencing, monotonic watermarks, version/`loaded_at` reconcile,
-//! subscription base gating, connection-state staleness preservation, and
-//! namespace-qualified removal filtering surfaces exposed for deterministic
-//! verification without standing up a live CP.
+//! subscription base gating, SemVer negotiation, delta-rejection divergence,
+//! connection-state staleness preservation, and namespace-qualified removal
+//! filtering surfaces exposed for deterministic verification without standing
+//! up a live CP.
 
 use chrono::{TimeZone, Utc};
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::grpc::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
-    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, DeltaRefuse,
+    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics,
+    DeltaRefuse, DeltaRejectionKind, DeltaRejectionStreamDisposition,
     FullSnapshotStreamDisposition, MultiCpBackoffState, SnapshotFailureStreamDisposition,
-    StaleSnapshotReject, VersionReconcileError, advance_authority_from_committed,
-    advance_multi_cp_backoff, backoff_max_secs, evaluate_delta_against_subscription_base,
+    StaleSnapshotReject, SubscriptionApplyState, VersionCompatError, VersionReconcileError,
+    advance_authority_from_committed, advance_multi_cp_backoff, backoff_max_secs,
+    check_peer_version_compatibility, connection_error_outcome,
+    delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
     evaluate_full_snapshot_authority, failure_backoff_sequence, full_snapshot_stream_disposition,
     grow_backoff_after_failure_sleep, monotonic_watermark, reconcile_snapshot_version,
     resource_delta_advances_authority, silence_exceeds_liveness,
     snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
-use ferrum_edge::grpc::dp_client::{DpCpConnectionState, configure_configsync_endpoint};
+use ferrum_edge::grpc::dp_client::{
+    DpCpConnectionState, check_cp_version_compatibility, configure_configsync_endpoint,
+};
 use ferrum_edge::util::backoff::BACKOFF_INITIAL_SECS;
+use ferrum_edge::FERRUM_VERSION;
 use tonic::transport::Channel;
 
 #[test]
@@ -86,6 +93,51 @@ fn zero_message_clean_close_grows_backoff_like_error() {
         ConfigSyncAttemptOutcome::CleanCloseAfterConfig
     ));
     assert_eq!(ok.backoff_secs, BACKOFF_INITIAL_SECS);
+}
+
+#[test]
+fn connection_error_after_accepted_config_resets_backoff() {
+    // Issue #2968 / root review: a transport failure after the attempt already
+    // delivered accepted config counts as healthy progress for backoff.
+    assert_eq!(
+        connection_error_outcome(false),
+        ConfigSyncAttemptOutcome::ConnectionError
+    );
+    assert_eq!(
+        connection_error_outcome(true),
+        ConfigSyncAttemptOutcome::ConnectionErrorAfterConfig
+    );
+
+    let mut before = MultiCpBackoffState {
+        backoff_secs: 16,
+        current_cp_index: 0,
+        full_cycle_count: 0,
+    };
+    assert!(advance_multi_cp_backoff(
+        &mut before,
+        2,
+        ConfigSyncAttemptOutcome::ConnectionError
+    ));
+    assert_eq!(before.current_cp_index, 1);
+    assert_eq!(before.backoff_secs, 16);
+    grow_backoff_after_failure_sleep(&mut before);
+    assert_eq!(before.backoff_secs, 32);
+
+    let mut after = MultiCpBackoffState {
+        backoff_secs: 16,
+        current_cp_index: 0,
+        full_cycle_count: 0,
+    };
+    assert!(advance_multi_cp_backoff(
+        &mut after,
+        2,
+        ConfigSyncAttemptOutcome::ConnectionErrorAfterConfig
+    ));
+    assert_eq!(
+        after.current_cp_index, 0,
+        "post-config transport failure must not fail over CP index"
+    );
+    assert_eq!(after.backoff_secs, BACKOFF_INITIAL_SECS);
 }
 
 #[test]
@@ -283,14 +335,126 @@ fn subscription_requires_valid_snapshot_base_before_delta() {
     );
     assert!(evaluate_delta_against_subscription_base(true).is_ok());
 
+    // Unusable FULL_SNAPSHOT always terminates — including after a prior base.
     assert_eq!(
         snapshot_failure_stream_disposition(false),
-        SnapshotFailureStreamDisposition::TerminateAndFailover
+        SnapshotFailureStreamDisposition::TerminateAndReconnect
     );
     assert_eq!(
         snapshot_failure_stream_disposition(true),
-        SnapshotFailureStreamDisposition::ContinueKeepingBase
+        SnapshotFailureStreamDisposition::TerminateAndReconnect
     );
+}
+
+#[test]
+fn no_startup_flag_still_requires_full_snapshot_before_delta() {
+    // Root review: `startup_ready = None` must not initialize the subscription
+    // base as already applied. Library/test callers skip startup-only work, but
+    // every new subscription still starts without a committed FULL_SNAPSHOT.
+    let mut subscription = SubscriptionApplyState::new();
+    assert!(
+        !subscription.base_applied,
+        "new subscriptions must start without a base even when startup_ready is absent"
+    );
+    assert_eq!(
+        evaluate_delta_against_subscription_base(subscription.base_applied),
+        Err(DeltaRefuse::BeforeSnapshotBase)
+    );
+    subscription.note_full_snapshot_accepted();
+    assert!(subscription.base_applied);
+    assert!(evaluate_delta_against_subscription_base(subscription.base_applied).is_ok());
+}
+
+#[test]
+fn mid_stream_unusable_snapshot_and_delta_rejection_force_resync() {
+    assert_eq!(
+        delta_rejection_stream_disposition(DeltaRejectionKind::ParseFailure),
+        DeltaRejectionStreamDisposition::TerminateAndResync
+    );
+    assert_eq!(
+        delta_rejection_stream_disposition(DeltaRejectionKind::InvalidTrustSideChannel),
+        DeltaRejectionStreamDisposition::TerminateAndResync
+    );
+    assert_eq!(
+        delta_rejection_stream_disposition(DeltaRejectionKind::NonEmptyApplyRejected),
+        DeltaRejectionStreamDisposition::TerminateAndResync
+    );
+
+    let mut state = MultiCpBackoffState {
+        backoff_secs: 8,
+        current_cp_index: 1,
+        full_cycle_count: 0,
+    };
+    assert!(advance_multi_cp_backoff(
+        &mut state,
+        2,
+        ConfigSyncAttemptOutcome::ResyncAfterAcceptedConfig
+    ));
+    assert_eq!(state.current_cp_index, 1, "resync retries the same CP");
+    assert_eq!(state.backoff_secs, BACKOFF_INITIAL_SECS);
+}
+
+#[test]
+fn rejected_delta_marks_divergence_until_full_snapshot_recovery() {
+    // Issue #2394: rejection terminates before a later delta can apply; sticky
+    // divergence clears only after an authoritative FULL_SNAPSHOT recovery.
+    let metrics = ConfigSyncDivergenceMetrics::default();
+    assert!(!metrics.is_diverged());
+    metrics.record_rejection();
+    assert!(metrics.is_diverged());
+    let snap = metrics.snapshot();
+    assert_eq!(snap.rejected_nonempty_deltas_total, 1);
+    assert_eq!(snap.recoveries_total, 0);
+
+    // A second rejection before recovery keeps the sticky flag and increments.
+    metrics.record_rejection();
+    assert!(metrics.is_diverged());
+    assert_eq!(metrics.snapshot().rejected_nonempty_deltas_total, 2);
+
+    assert!(metrics.record_recovery_after_full_snapshot());
+    assert!(!metrics.is_diverged());
+    assert_eq!(metrics.snapshot().recoveries_total, 1);
+    // Idempotent clear when already converged.
+    assert!(!metrics.record_recovery_after_full_snapshot());
+    assert_eq!(metrics.snapshot().recoveries_total, 1);
+}
+
+#[test]
+fn semver_version_negotiation_rejects_empty_malformed_and_incompatible() {
+    // Issue #2395: fail closed on missing/malformed; allow patch/prerelease.
+    assert!(matches!(
+        check_peer_version_compatibility(FERRUM_VERSION, ""),
+        Err(VersionCompatError::Missing)
+    ));
+    assert!(matches!(
+        check_peer_version_compatibility(FERRUM_VERSION, "1"),
+        Err(VersionCompatError::Malformed { .. })
+    ));
+    assert!(matches!(
+        check_peer_version_compatibility(FERRUM_VERSION, "garbage"),
+        Err(VersionCompatError::Malformed { .. })
+    ));
+    assert!(check_peer_version_compatibility(FERRUM_VERSION, FERRUM_VERSION).is_ok());
+
+    let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+    assert!(parts.len() >= 2);
+    let patch_ok = format!("{}.{}.99", parts[0], parts[1]);
+    assert!(check_peer_version_compatibility(FERRUM_VERSION, &patch_ok).is_ok());
+    let prerelease_ok = format!("{}.{}.0-rc.1", parts[0], parts[1]);
+    assert!(check_peer_version_compatibility(FERRUM_VERSION, &prerelease_ok).is_ok());
+    let minor_bad = format!("{}.{}.0", parts[0], parts[1].parse::<u64>().unwrap_or(0) + 1);
+    assert!(matches!(
+        check_peer_version_compatibility(FERRUM_VERSION, &minor_bad),
+        Err(VersionCompatError::Incompatible { .. })
+    ));
+
+    // DP helper surfaces the same policy.
+    assert!(check_cp_version_compatibility("").is_err());
+    assert!(check_cp_version_compatibility("1").is_err());
+    assert!(check_cp_version_compatibility("garbage").is_err());
+    assert!(check_cp_version_compatibility(FERRUM_VERSION).is_ok());
+    assert!(check_cp_version_compatibility(&patch_ok).is_ok());
+    assert!(check_cp_version_compatibility(&minor_bad).is_err());
 }
 
 #[test]
@@ -368,14 +532,18 @@ fn unknown_prior_authority_still_accepts_cross_source() {
 }
 
 #[test]
-fn reconnect_preserves_last_config_received_at() {
+fn reconnect_preserves_last_config_received_at_and_divergence() {
     let stamp = Utc.with_ymd_and_hms(2026, 7, 24, 1, 2, 3).unwrap();
+    let diverged_since = Utc.with_ymd_and_hms(2026, 7, 24, 1, 0, 0).unwrap();
     let prev = DpCpConnectionState {
         connected: false,
         cp_url: "http://cp-old:50051".to_string(),
         is_primary: true,
         last_config_received_at: Some(stamp),
         connected_since: None,
+        config_diverged: true,
+        config_diverged_since: Some(diverged_since),
+        config_divergence_recoveries_total: 2,
     };
     let connected = DpCpConnectionState {
         connected: true,
@@ -383,9 +551,15 @@ fn reconnect_preserves_last_config_received_at() {
         is_primary: false,
         last_config_received_at: prev.last_config_received_at,
         connected_since: Some(Utc::now()),
+        config_diverged: prev.config_diverged,
+        config_diverged_since: prev.config_diverged_since,
+        config_divergence_recoveries_total: prev.config_divergence_recoveries_total,
     };
     assert_eq!(connected.last_config_received_at, Some(stamp));
     assert!(connected.connected);
+    assert!(connected.config_diverged);
+    assert_eq!(connected.config_diverged_since, Some(diverged_since));
+    assert_eq!(connected.config_divergence_recoveries_total, 2);
 }
 
 #[test]

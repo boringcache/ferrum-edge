@@ -7422,6 +7422,9 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                             "is_primary": snap.is_primary,
                             "connected_since": snap.connected_since.map(|t| t.to_rfc3339()),
                             "last_config_received_at": snap.last_config_received_at.map(|t| t.to_rfc3339()),
+                            "config_diverged": snap.config_diverged,
+                            "config_diverged_since": snap.config_diverged_since.map(|t| t.to_rfc3339()),
+                            "config_divergence_recoveries_total": snap.config_divergence_recoveries_total,
                         },
                     }),
                 ))

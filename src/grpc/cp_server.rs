@@ -689,43 +689,29 @@ impl CpGrpcServer {
 
     /// Check whether the DP's reported version is compatible with this CP.
     ///
-    /// Compatibility rule: major and minor versions must match. Patch-level
-    /// differences are always allowed (bug-fix releases don't change the
-    /// config schema or gRPC wire format).
+    /// Compatibility uses SemVer parsing. Major and minor versions must match.
+    /// Patch-level and prerelease/build differences are allowed (see
+    /// [`crate::grpc::configsync_lifecycle::check_peer_version_compatibility`]).
+    /// Empty and malformed versions are rejected with `FailedPrecondition`
+    /// (issue #2395).
     #[allow(clippy::result_large_err)]
     pub(crate) fn check_version_compatibility(dp_version: &str) -> Result<(), Status> {
-        // Empty version means old DP that predates the version field — reject.
-        if dp_version.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "DP did not report its version. CP is running Ferrum Edge v{}. \
-                 Upgrade the DP to a version that supports version negotiation.",
-                FERRUM_VERSION
-            )));
-        }
+        use crate::grpc::configsync_lifecycle::check_peer_version_compatibility;
 
-        let cp_parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
-        let dp_parts: Vec<&str> = dp_version.split('.').collect();
+        check_peer_version_compatibility(FERRUM_VERSION, dp_version).map_err(|err| {
+            Status::failed_precondition(err.message("CP", "DP", FERRUM_VERSION))
+        })?;
 
-        if cp_parts.len() < 2 || dp_parts.len() < 2 {
-            warn!(
-                "Unable to parse version for compatibility check (CP={}, DP={}), allowing connection",
-                FERRUM_VERSION, dp_version
-            );
-            return Ok(());
-        }
-
-        if cp_parts[0] != dp_parts[0] || cp_parts[1] != dp_parts[1] {
-            return Err(Status::failed_precondition(format!(
-                "Version mismatch: CP is v{} but DP is v{}. \
-                 Major and minor versions must match. \
-                 Upgrade the CP first, then upgrade DPs to the same major.minor version.",
-                FERRUM_VERSION, dp_version
-            )));
-        }
-
-        if cp_parts.get(2) != dp_parts.get(2) {
+        // Log patch-only differences for operators (still compatible).
+        if let (Ok(local), Ok(peer)) = (
+            semver::Version::parse(FERRUM_VERSION),
+            semver::Version::parse(dp_version),
+        ) && (local.patch != peer.patch
+            || local.pre != peer.pre
+            || local.build != peer.build)
+        {
             info!(
-                "DP v{} connected to CP v{} (patch difference OK)",
+                "DP v{} connected to CP v{} (patch/prerelease difference OK)",
                 dp_version, FERRUM_VERSION
             );
         }
@@ -2007,9 +1993,40 @@ mod tests {
     }
 
     #[test]
-    fn version_check_unparseable_version_allowed() {
-        // Single-component version is unparseable (< 2 parts), so it's allowed
-        assert!(CpGrpcServer::check_version_compatibility("1").is_ok());
+    fn version_check_unparseable_version_rejected() {
+        let result = CpGrpcServer::check_version_compatibility("1");
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("Unable to parse"));
+    }
+
+    #[test]
+    fn version_check_garbage_version_rejected() {
+        let result = CpGrpcServer::check_version_compatibility("garbage");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn version_check_prerelease_same_major_minor_ok() {
+        let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        if parts.len() >= 2 {
+            let peer = format!("{}.{}.0-rc.1", parts[0], parts[1]);
+            assert!(CpGrpcServer::check_version_compatibility(&peer).is_ok());
+        }
+    }
+
+    #[test]
+    fn version_check_different_major_rejected() {
+        let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        if parts.len() >= 1 {
+            let major: u64 = parts[0].parse().unwrap_or(0);
+            let modified = format!("{}.0.0", major + 1);
+            let result = CpGrpcServer::check_version_compatibility(&modified);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        }
     }
 
     fn cp_with_namespace(namespace: &str) -> CpGrpcServer {
