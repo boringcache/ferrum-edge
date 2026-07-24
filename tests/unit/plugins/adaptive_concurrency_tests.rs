@@ -117,7 +117,7 @@ fn adaptive_plugin_from_cache(cache: &PluginCache) -> Arc<dyn Plugin> {
 
 fn adaptive_plugin_for_proxy(cache: &PluginCache, proxy_id: &str) -> Arc<dyn Plugin> {
     cache
-        .get_plugins(proxy_id)
+        .get_plugins("ferrum", proxy_id)
         .iter()
         .find(|plugin| plugin.name() == "adaptive_concurrency")
         .cloned()

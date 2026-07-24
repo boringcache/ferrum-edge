@@ -1797,7 +1797,7 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
         "invalid ws_frame_logging must be omitted from published cache"
     );
     assert!(
-        !cache.requires_ws_frame_hooks("p1"),
+        !cache.requires_ws_frame_hooks("ferrum", "p1"),
         "omitted logger must not force frame-hook selection"
     );
 
@@ -1820,7 +1820,7 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
             .collect::<Vec<_>>(),
         vec!["ws_frame_logging"]
     );
-    assert!(cache.requires_ws_frame_hooks("p1"));
+    assert!(cache.requires_ws_frame_hooks("ferrum", "p1"));
 
     let oversize = make_config(
         vec![make_proxy("p1", "/ws", vec!["ws-log"])],
@@ -1849,7 +1849,7 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
         cache.get_plugins("ferrum", "p1").is_empty(),
         "reload must omit oversized payload_preview_bytes rather than clamp"
     );
-    assert!(!cache.requires_ws_frame_hooks("p1"));
+    assert!(!cache.requires_ws_frame_hooks("ferrum", "p1"));
 }
 
 #[test]
@@ -2322,11 +2322,11 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
     assert!(current_names.contains(&"request_transformer"));
     assert!(current_names.contains(&"body_validator"));
     assert!(current_names.contains(&"response_size_limiting"));
-    assert!(cache.requires_request_body_buffering("p1"));
-    assert!(cache.requires_response_body_buffering("p1"));
+    assert!(cache.requires_request_body_buffering("ferrum", "p1"));
+    assert!(cache.requires_response_body_buffering("ferrum", "p1"));
     assert!(
         cache
-            .get_capabilities("p1", ProxyProtocol::Http)
+            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
             .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
     );
 }
@@ -3159,10 +3159,10 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
 
     let cache = PluginCache::new(&config).unwrap();
 
-    assert!(!cache.requires_request_body_buffering("cors-no-body"));
-    assert!(cache.requires_request_body_buffering("graphql-guarded"));
-    assert!(!cache.requires_request_body_buffering("response-only"));
-    assert!(cache.requires_request_body_buffering("request-xml"));
+    assert!(!cache.requires_request_body_buffering("ferrum", "cors-no-body"));
+    assert!(cache.requires_request_body_buffering("ferrum", "graphql-guarded"));
+    assert!(!cache.requires_request_body_buffering("ferrum", "response-only"));
+    assert!(cache.requires_request_body_buffering("ferrum", "request-xml"));
 }
 
 // ---- Plugin priority ordering ----
@@ -6003,17 +6003,17 @@ fn test_plugin_cache_requires_ws_frame_hooks_false_when_no_plugins_opt_in() {
 
     // Known proxy — no plugin opts in
     assert!(
-        !cache.requires_ws_frame_hooks("p1"),
+        !cache.requires_ws_frame_hooks("ferrum", "p1"),
         "requires_ws_frame_hooks should be false when no plugin opts in"
     );
     // Another proxy — no plugin opts in
     assert!(
-        !cache.requires_ws_frame_hooks("p2"),
+        !cache.requires_ws_frame_hooks("ferrum", "p2"),
         "requires_ws_frame_hooks should be false for proxy with no plugins"
     );
     // Unknown proxy — falls back to global, still false
     assert!(
-        !cache.requires_ws_frame_hooks("unknown"),
+        !cache.requires_ws_frame_hooks("ferrum", "unknown"),
         "requires_ws_frame_hooks should be false for unknown proxy (global fallback)"
     );
 }
@@ -6031,7 +6031,7 @@ fn test_plugin_cache_requires_ws_frame_hooks_rebuild_updates_flag() {
         )],
     );
     let cache = PluginCache::new(&config1).unwrap();
-    assert!(!cache.requires_ws_frame_hooks("p1"));
+    assert!(!cache.requires_ws_frame_hooks("ferrum", "p1"));
 
     // Rebuild with different config — flag should still be false (no plugin opts in)
     let config2 = make_config(
@@ -6045,7 +6045,7 @@ fn test_plugin_cache_requires_ws_frame_hooks_rebuild_updates_flag() {
         )],
     );
     cache.rebuild(&config2).unwrap();
-    assert!(!cache.requires_ws_frame_hooks("p1"));
+    assert!(!cache.requires_ws_frame_hooks("ferrum", "p1"));
 }
 
 #[test]
@@ -6061,7 +6061,7 @@ fn test_plugin_cache_requires_ws_frame_hooks_apply_delta_preserves_false() {
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
-    assert!(!cache.requires_ws_frame_hooks("p1"));
+    assert!(!cache.requires_ws_frame_hooks("ferrum", "p1"));
 
     // Delta adding a non-ws-frame plugin
     let config2 = make_config(
@@ -6077,7 +6077,7 @@ fn test_plugin_cache_requires_ws_frame_hooks_apply_delta_preserves_false() {
 
     // Still false — neither rate_limiting nor key_auth opt into ws_frame hooks
     assert!(
-        !cache.requires_ws_frame_hooks("p1"),
+        !cache.requires_ws_frame_hooks("ferrum", "p1"),
         "requires_ws_frame_hooks should remain false after delta with non-frame plugins"
     );
 }
@@ -6114,7 +6114,7 @@ fn test_priority_override_preserves_ws_parser_policy_and_framing() {
     let config = make_config(vec![make_proxy("p1", "/ws", vec!["ws1"])], vec![limiter]);
     let cache = PluginCache::new(&config).unwrap();
     assert!(
-        cache.requires_ws_frame_hooks("p1"),
+        cache.requires_ws_frame_hooks("ferrum", "p1"),
         "parser size policy must select the framed relay"
     );
     let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
@@ -6146,7 +6146,7 @@ fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_rate_plugin() {
     );
     let cache = PluginCache::new(&config).unwrap();
     assert!(
-        cache.requires_ws_frame_hooks("p1"),
+        cache.requires_ws_frame_hooks("ferrum", "p1"),
         "requires_ws_frame_hooks must be TRUE when ws_rate_limiting is attached"
     );
 }
@@ -6165,7 +6165,7 @@ fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_logging_plugin() {
     );
     let cache = PluginCache::new(&config).unwrap();
     assert!(
-        cache.requires_ws_frame_hooks("p1"),
+        cache.requires_ws_frame_hooks("ferrum", "p1"),
         "requires_ws_frame_hooks must be TRUE when ws_frame_logging is attached"
     );
 }
@@ -6230,7 +6230,7 @@ fn test_plugin_cache_rebuild_adds_ws_frame_hooks_flag() {
         )],
     );
     let cache = PluginCache::new(&config1).unwrap();
-    assert!(!cache.requires_ws_frame_hooks("p1"));
+    assert!(!cache.requires_ws_frame_hooks("ferrum", "p1"));
 
     // Rebuild with WS plugin → flag must become true
     let config2 = make_config(
@@ -6248,7 +6248,7 @@ fn test_plugin_cache_rebuild_adds_ws_frame_hooks_flag() {
     );
     cache.rebuild(&config2).unwrap();
     assert!(
-        cache.requires_ws_frame_hooks("p1"),
+        cache.requires_ws_frame_hooks("ferrum", "p1"),
         "requires_ws_frame_hooks must be TRUE after rebuild adds ws_frame_logging"
     );
 }
@@ -7335,9 +7335,9 @@ fn test_empty_config_produces_empty_cache() {
     // Unknown proxy falls back to globals, which are also empty
     let plugins = cache.get_plugins("ferrum", "nonexistent");
     assert_eq!(plugins.len(), 0);
-    assert!(!cache.requires_response_body_buffering("nonexistent"));
-    assert!(!cache.requires_request_body_buffering("nonexistent"));
-    assert!(!cache.requires_ws_frame_hooks("nonexistent"));
+    assert!(!cache.requires_response_body_buffering("ferrum", "nonexistent"));
+    assert!(!cache.requires_request_body_buffering("ferrum", "nonexistent"));
+    assert!(!cache.requires_ws_frame_hooks("ferrum", "nonexistent"));
 }
 
 #[test]
@@ -7979,11 +7979,11 @@ fn test_no_body_buffering_plugins_returns_false() {
     let cache = PluginCache::new(&config).unwrap();
 
     assert!(
-        !cache.requires_request_body_buffering("p1"),
+        !cache.requires_request_body_buffering("ferrum", "p1"),
         "stdout_logging should not require request body buffering"
     );
     assert!(
-        !cache.requires_response_body_buffering("p1"),
+        !cache.requires_response_body_buffering("ferrum", "p1"),
         "stdout_logging should not require response body buffering"
     );
 }
@@ -8003,7 +8003,7 @@ fn test_body_validator_requires_request_body_buffering() {
     let cache = PluginCache::new(&config).unwrap();
 
     assert!(
-        cache.requires_request_body_buffering("p1"),
+        cache.requires_request_body_buffering("ferrum", "p1"),
         "body_validator with request validation should require request body buffering"
     );
 }
@@ -8023,7 +8023,7 @@ fn test_response_caching_requires_response_body_buffering() {
     let cache = PluginCache::new(&config).unwrap();
 
     assert!(
-        cache.requires_response_body_buffering("p1"),
+        cache.requires_response_body_buffering("ferrum", "p1"),
         "response_caching should require response body buffering"
     );
 }
@@ -8045,7 +8045,7 @@ fn test_buffering_flags_use_global_fallback_for_unknown_proxy() {
 
     // Unknown proxy uses global fallback
     assert!(
-        cache.requires_response_body_buffering("unknown"),
+        cache.requires_response_body_buffering("ferrum", "unknown"),
         "unknown proxy should use global fallback for response buffering"
     );
 }
@@ -8067,7 +8067,7 @@ fn test_modifies_request_headers_flag_computed() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
         "request_transformer should set MODIFIES_REQUEST_HEADERS"
@@ -8455,7 +8455,7 @@ fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         !caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
         "stdout_logging should not set MODIFIES_REQUEST_HEADERS"
@@ -8483,7 +8483,7 @@ fn test_decoded_query_params_capability_preserved_with_priority_override() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
         "mesh_route_dispatch query-param rules must opt HTTP/3 into decoded query materialization"
@@ -8505,7 +8505,7 @@ fn test_key_auth_query_location_enables_decoded_h3_query_capability() {
     let query_cache = PluginCache::new(&query_config).unwrap();
     assert!(
         query_cache
-            .get_capabilities("p1", ProxyProtocol::Http)
+            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
             .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
     );
 
@@ -8522,7 +8522,7 @@ fn test_key_auth_query_location_enables_decoded_h3_query_capability() {
     let header_cache = PluginCache::new(&header_config).unwrap();
     assert!(
         !header_cache
-            .get_capabilities("p1", ProxyProtocol::Http)
+            .get_capabilities("ferrum", "p1", ProxyProtocol::Http)
             .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
     );
 }
@@ -8548,7 +8548,7 @@ fn test_opa_body_buffering_is_deferred_until_after_authentication() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         caps.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE),
         "OPA include_body must advertise post-authentication authorize buffering"
@@ -8588,7 +8588,7 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
         "WAF plugin must set NEEDS_FINAL_REQUEST_BODY_CONTEXT so the proxy \
@@ -8621,7 +8621,7 @@ fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         caps.has(PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH),
         "AI federation must finalize and dispatch before backend-only preflights and accounting"
@@ -8647,7 +8647,7 @@ fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
         "method/header-only route dispatch must preserve HTTP/3 raw query materialization"
@@ -8725,7 +8725,7 @@ fn test_auth_plugins_precomputed_for_protocol() {
     assert_eq!(auth.len(), 1);
     assert_eq!(auth[0].name(), "key_auth");
 
-    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         caps.has(PluginCapabilities::HAS_AUTH_PLUGINS),
         "key_auth should set HAS_AUTH_PLUGINS"

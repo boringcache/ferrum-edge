@@ -2225,7 +2225,7 @@ async fn test_plugin_cache_reload_publishes_name_before_late_old_completion() {
     };
     let cache = PluginCache::new(&old_config).expect("old chargeback cache");
     let old_plugin = cache
-        .get_plugins(PROXY_ID)
+        .get_plugins("ferrum", PROXY_ID)
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
         .cloned()
@@ -2245,7 +2245,7 @@ async fn test_plugin_cache_reload_publishes_name_before_late_old_completion() {
         .rebuild(&new_config)
         .expect("publish renamed chargeback cache");
     let new_plugin = cache
-        .get_plugins(PROXY_ID)
+        .get_plugins("ferrum", PROXY_ID)
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
         .cloned()
@@ -3010,7 +3010,7 @@ async fn test_effective_plugin_chain_partitions_multi_instance_currency_totals()
 
     let mut usd = make_summary_with_bytes(USD_PROXY, "USD API", Some(CONSUMER), 200, 100, 50);
     usd.namespace = "ferrum".to_string();
-    let usd_chain = cache.get_plugins(USD_PROXY);
+    let usd_chain = cache.get_plugins("ferrum", USD_PROXY);
     let usd_plugin = usd_chain
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
@@ -3019,7 +3019,7 @@ async fn test_effective_plugin_chain_partitions_multi_instance_currency_totals()
 
     let mut eur_http = make_summary(EUR_HTTP_PROXY, "EUR API", Some(CONSUMER), 200);
     eur_http.namespace = "ferrum".to_string();
-    let eur_http_chain = cache.get_plugins(EUR_HTTP_PROXY);
+    let eur_http_chain = cache.get_plugins("ferrum", EUR_HTTP_PROXY);
     let eur_http_plugin = eur_http_chain
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
@@ -3034,7 +3034,7 @@ async fn test_effective_plugin_chain_partitions_multi_instance_currency_totals()
         10,
         20,
     );
-    let eur_stream_chain = cache.get_plugins(EUR_STREAM_PROXY);
+    let eur_stream_chain = cache.get_plugins("ferrum", EUR_STREAM_PROXY);
     let eur_stream_plugin = eur_stream_chain
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
@@ -3077,7 +3077,7 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
     };
     let old_cache = PluginCache::new(&old_config).expect("old stream generation cache");
     let old_plugin = old_cache
-        .get_plugins(PROXY_ID)
+        .get_plugins("ferrum", PROXY_ID)
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
         .cloned()
@@ -3099,7 +3099,7 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
     };
     let new_cache = PluginCache::new(&new_config).expect("new HTTP generation cache");
     let new_plugin = new_cache
-        .get_plugins(PROXY_ID)
+        .get_plugins("ferrum", PROXY_ID)
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
         .cloned()
@@ -3240,7 +3240,7 @@ async fn test_effective_chain_records_each_protocol_path_exactly_once() {
     let cache = PluginCache::new(&config).expect("single chargeback per proxy");
 
     let http_plugin = cache
-        .get_plugins(HTTP_PROXY)
+        .get_plugins("ferrum", HTTP_PROXY)
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
         .cloned()
@@ -3250,7 +3250,7 @@ async fn test_effective_chain_records_each_protocol_path_exactly_once() {
         .await;
 
     let ws_plugin = cache
-        .get_plugins(WS_PROXY)
+        .get_plugins("ferrum", WS_PROXY)
         .iter()
         .find(|plugin| plugin.name() == "api_chargeback")
         .cloned()
@@ -3283,7 +3283,7 @@ async fn test_effective_chain_records_each_protocol_path_exactly_once() {
 
     for (proxy_id, protocol) in [(TCP_PROXY, "tcp"), (UDP_PROXY, "udp"), (DTLS_PROXY, "dtls")] {
         let plugin = cache
-            .get_plugins(proxy_id)
+            .get_plugins("ferrum", proxy_id)
             .iter()
             .find(|plugin| plugin.name() == "api_chargeback")
             .cloned()
