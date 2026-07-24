@@ -18786,14 +18786,15 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized
+        Plugin: ai_semantic_cache — Caches LLM responses keyed by family-correct
         prompts across Ferrum's recognized request families (OpenAI Chat
         messages, Anthropic messages/system, OpenAI Responses
         input/instructions, Gemini/Vertex contents/systemInstruction, Cohere
         chat_history/message, legacy prompt, TGI inputs, and Titan inputText).
-        Unknown or ambiguous JSON shapes bypass caching. Exact-match
-        normalization is enabled by default; optional semantic similarity uses
-        a configured embedding provider and a local HNSW vector index.
+        Unknown or ambiguous JSON shapes bypass caching. Exact keys preserve
+        LLM-significant prompt case and whitespace while applying structurally
+        safe canonicalization; optional semantic similarity uses a configured
+        embedding provider and a local HNSW vector index.
         Supports local DashMap and Redis exact-response storage. Multiple
         instances on one proxy namespace request staging metadata under
         ai_semantic_cache.<instance_id>.* and keep embedding/scope vectors in
@@ -18813,7 +18814,7 @@ components:
           type: integer
           format: uint64
           default: 10000
-          description: Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory also scales with this count outside max_total_size_bytes.
+          description: Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory scales with this count and is charged against max_total_size_bytes.
         max_entry_size_bytes:
           type: integer
           format: uint64
@@ -18824,15 +18825,14 @@ components:
           format: uint64
           default: 104857600
           description: >-
-            Maximum total response-entry cache size in bytes (100 MiB, local
-            mode). Includes response bodies, cached headers, semantic scope
-            keys, and retained embedding vectors; excludes the separate HNSW
-            snapshot copy and transient rebuild buffers. Concurrent stores of
-            distinct keys may briefly overshoot this soft ceiling (bounded by
-            concurrency × max_entry_size_bytes) until TTL/max-entries cleanup
-            reclaims space. Same-key replacement accounts for the displaced
-            DashMap entry so the retained-size counter never accumulates
-            phantom bytes for overwritten values.
+            Maximum retained local cache memory in bytes (100 MiB, local mode).
+            Includes response bodies, cached headers, semantic scope keys,
+            retained embedding vectors, published HNSW snapshot generations,
+            and in-flight rebuild workspace reservations. Concurrent stores and
+            rebuilds use lock-free byte leases so overlapping old/candidate
+            generations are charged at peak and failed/superseded rebuilds
+            release promptly. A store or rebuild that cannot reserve is
+            skipped.
         include_model_in_key:
           type: boolean
           default: true

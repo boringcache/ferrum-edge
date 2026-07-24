@@ -1,11 +1,14 @@
 use ferrum_edge::_test_support::{
-    ai_semantic_cache_clear_vector_index_dirty_for_test, ai_semantic_cache_embedding,
-    ai_semantic_cache_expire_all_entries_for_test, ai_semantic_cache_force_cleanup_for_test,
+    ai_semantic_cache_cache_budget_used_for_test, ai_semantic_cache_clear_vector_index_dirty_for_test,
+    ai_semantic_cache_embedding, ai_semantic_cache_expire_all_entries_for_test,
+    ai_semantic_cache_force_cleanup_for_test,
+    ai_semantic_cache_force_vector_rebuild_budget_failure_for_test,
     ai_semantic_cache_instance_id_for_test, ai_semantic_cache_scope_key,
     ai_semantic_cache_set_store_post_admit_hook_for_test,
     ai_semantic_cache_set_vector_index_rebuild_blocked_for_test,
     ai_semantic_cache_size_accounting_snapshot_for_test,
     ai_semantic_cache_staging_metadata_key_for_test, ai_semantic_cache_vector_index_dirty_for_test,
+    ai_semantic_cache_vector_snapshot_accounted_bytes_for_test,
     apply_buffered_request_body_normalization_before_before_proxy_for_test,
     rebuild_ai_semantic_cache_vector_index, set_ai_semantic_cache_embedding,
     set_ai_semantic_cache_scope_key,
@@ -1785,7 +1788,7 @@ async fn test_different_prompts_no_cache_hit() {
 }
 
 #[tokio::test]
-async fn test_whitespace_normalization_cache_hit() {
+async fn test_exact_key_preserves_case_and_whitespace() {
     let config = json!({"ttl_seconds": 300});
     let plugin = make_plugin(config);
 
@@ -1813,7 +1816,7 @@ async fn test_whitespace_normalization_cache_hit() {
         .on_final_response_body(&mut ctx1, 200, &response_headers, br#""Paris""#)
         .await;
 
-    // Same prompt with extra whitespace and case differences — should HIT
+    // Same words with extra whitespace and case differences — must MISS.
     let body2 = json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "  What  is  the  Capital  of  France?  "}]
@@ -1831,12 +1834,69 @@ async fn test_whitespace_normalization_cache_hit() {
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
-    match result {
-        PluginResult::RejectBinary { status_code, .. } => {
-            assert_eq!(status_code, 200);
-        }
-        _ => panic!("Expected cache HIT after whitespace normalization"),
-    }
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "exact keys must preserve LLM-significant case and whitespace"
+    );
+    assert_eq!(staged_status(&plugin, &ctx2).unwrap(), "MISS");
+}
+
+#[tokio::test]
+async fn test_exact_key_distinguishes_code_case_and_indentation() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300, "scope_by_consumer": false}));
+
+    let body_print_a = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "print(\"A\")"}]
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_print_a).unwrap(),
+        None,
+        br#""uppercase-A""#,
+    )
+    .await;
+
+    let body_print_a_lower = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "print(\"a\")"}]
+    });
+    let miss = run_before_proxy_get_status(
+        &plugin,
+        &serde_json::to_string(&body_print_a_lower).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        !miss,
+        "case-sensitive string literals must not collide on exact keys"
+    );
+
+    let body_indent_two = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "def f():\n  return 1"}]
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_indent_two).unwrap(),
+        None,
+        br#""indent-2""#,
+    )
+    .await;
+    let body_indent_four = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "def f():\n    return 1"}]
+    });
+    let miss_indent = run_before_proxy_get_status(
+        &plugin,
+        &serde_json::to_string(&body_indent_four).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        !miss_indent,
+        "Python/Markdown indentation must not collapse on exact keys"
+    );
 }
 
 #[tokio::test]
@@ -2719,7 +2779,8 @@ fn assert_size_accounting_exact(plugin: &AiSemanticCache) -> usize {
     assert_eq!(
         tracked,
         actual,
-        "tracked total_size must equal the sum of retained entry approx_size values \
+        "tracked cache_budget.used() must equal retained entry approx_size \
+         + published HNSW generation + in-flight rebuild reservation \
          (tracked={tracked}, actual={actual}, keys={:?})",
         plugin.tracked_keys_count()
     );
@@ -2926,13 +2987,13 @@ async fn test_expiry_after_same_key_race_reconciles_to_zero() {
     assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
-/// Different-key soft-cap overshoot remains allowed and stays reconcilable:
-/// concurrent distinct keys may briefly exceed `max_total_size_bytes`, but the
-/// counter still equals the retained-entry size sum.
+/// Different-key admits that cannot both fit under `max_total_size_bytes` are
+/// hard-capped by lock-free byte leases: at most one of two concurrent stores
+/// retains when each alone fits but together they would exceed the budget.
 #[tokio::test]
-async fn test_concurrent_different_key_soft_cap_overshoot_reconciles() {
+async fn test_concurrent_different_key_budget_rejects_overshoot() {
     // Each ~4 KiB body plus structural overhead fits under 6 KiB alone; two
-    // concurrent admits both observe an empty total and overshoot together.
+    // concurrent admits cannot both reserve against the shared budget.
     let max_total = 6_000usize;
     let plugin = Arc::new(make_plugin(json!({
         "ttl_seconds": 600,
@@ -2955,7 +3016,8 @@ async fn test_concurrent_different_key_soft_cap_overshoot_reconciles() {
 
     let body_a = json_pad_body("soft-a", 4_096);
     let body_b = json_pad_body("soft-b", 4_096);
-    let _barrier = install_post_admit_barrier(&plugin, 2);
+    // Do not use the post-admit barrier here: the losing admit fails inside
+    // try_acquire before the hook and would otherwise leave the winner parked.
     let mut tasks = Vec::with_capacity(2);
     for (cache_key, response_body) in [(key_a, body_a), (key_b, body_b)] {
         let plugin = Arc::clone(&plugin);
@@ -2970,19 +3032,18 @@ async fn test_concurrent_different_key_soft_cap_overshoot_reconciles() {
         }));
     }
     for task in tasks {
-        task.await.expect("soft-cap overshoot task panicked");
+        task.await.expect("budget race task panicked");
     }
-    clear_post_admit_hook(&plugin);
 
     assert_eq!(
         plugin.tracked_keys_count(),
-        Some(2),
-        "both different-key admits should land under the documented soft-cap race"
+        Some(1),
+        "hard byte budget must admit only one of two concurrent oversize-together stores"
     );
     let total = assert_size_accounting_exact(&plugin);
     assert!(
-        total > max_total,
-        "expected transient different-key soft-cap overshoot (total={total}, max={max_total})"
+        total <= max_total,
+        "retained bytes must stay within max_total_size_bytes (total={total}, max={max_total})"
     );
 }
 
@@ -4212,4 +4273,207 @@ async fn reject_bypass_clears_only_current_instance_staging() {
         "reject bypass must not clear a sibling instance's staged cache key"
     );
     assert_eq!(staged_status(&text_cache, &ctx), Some("MISS"));
+}
+
+// === Semantic cache byte-budget / embedding bounds (#3061/#3062/#3063) ===
+
+#[tokio::test]
+async fn test_hnsw_rebuild_peak_charges_old_and_candidate_generations() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "max_total_size_bytes": 1_048_576,
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+        "semantic_embedding_api_key": "test-key",
+        "semantic_similarity_threshold": 0.95
+    }));
+
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "vector seed for budget peak"}]
+    });
+    let cache_key = miss_cache_key(&plugin, &serde_json::to_string(&request).unwrap()).await;
+    store_with_cache_key(
+        &plugin,
+        &cache_key,
+        br#""seed""#,
+        Some(vec![1.0, 0.0, 0.0, 0.0]),
+        Some("scope-peak".to_string()),
+    )
+    .await;
+
+    let first_peak = rebuild_ai_semantic_cache_vector_index(&plugin).await;
+    let after_first = assert_size_accounting_exact(&plugin);
+    let first_snapshot = ai_semantic_cache_vector_snapshot_accounted_bytes_for_test(&plugin);
+    assert!(first_snapshot > 0, "first rebuild must publish an HNSW generation");
+    assert!(
+        after_first >= first_snapshot,
+        "published HNSW bytes must be charged against the shared budget"
+    );
+
+    // Second rebuild overlaps the published generation with a candidate lease.
+    let second_peak = rebuild_ai_semantic_cache_vector_index(&plugin).await;
+    let after_second = assert_size_accounting_exact(&plugin);
+    assert!(
+        second_peak >= after_second.saturating_add(first_snapshot),
+        "peak retained bytes during rebuild must cover old + candidate generations \
+         (peak={second_peak}, after={after_second}, prior_snapshot={first_snapshot}, first_peak={first_peak})"
+    );
+    assert_eq!(
+        ai_semantic_cache_cache_budget_used_for_test(&plugin),
+        after_second
+    );
+}
+
+#[tokio::test]
+async fn test_hnsw_rebuild_budget_failure_releases_candidate_lease() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "max_total_size_bytes": 65_536,
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+        "semantic_embedding_api_key": "test-key",
+        "semantic_similarity_threshold": 0.95
+    }));
+
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "vector seed for budget failure"}]
+    });
+    let cache_key = miss_cache_key(&plugin, &serde_json::to_string(&request).unwrap()).await;
+    store_with_cache_key(
+        &plugin,
+        &cache_key,
+        br#""seed""#,
+        Some(vec![1.0, 0.0, 0.0]),
+        Some("scope-fail".to_string()),
+    )
+    .await;
+    let _ = rebuild_ai_semantic_cache_vector_index(&plugin).await;
+    let before = assert_size_accounting_exact(&plugin);
+    assert!(ai_semantic_cache_vector_snapshot_accounted_bytes_for_test(&plugin) > 0);
+
+    let rejected = ai_semantic_cache_force_vector_rebuild_budget_failure_for_test(&plugin).await;
+    assert!(
+        rejected,
+        "saturated budget must reject the candidate rebuild reservation"
+    );
+    assert_eq!(assert_size_accounting_exact(&plugin), before);
+    assert!(
+        ai_semantic_cache_vector_index_dirty_for_test(&plugin),
+        "failed rebuild must leave the index dirty for retry"
+    );
+}
+
+#[tokio::test]
+async fn test_embedding_response_rejects_oversize_body() {
+    let mock_server = MockServer::start().await;
+    let huge = format!(
+        r#"{{"embedding":[{}]}}"#,
+        "0.0,".repeat(300_000) + "1.0"
+    );
+    assert!(
+        huge.len() > 1024 * 1024,
+        "fixture must exceed the embedding response byte cap"
+    );
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(huge))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "scope_by_consumer": false
+    }));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "oversize embedding body"}]
+    });
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
+    assert!(
+        ai_semantic_cache_embedding(&ctx, instance_id(&plugin)).is_none(),
+        "oversize embedding bodies must not stage a vector"
+    );
+}
+
+#[tokio::test]
+async fn test_embedding_response_rejects_oversize_dimension() {
+    let mock_server = MockServer::start().await;
+    let mut embedding = vec![0.0; 16_385];
+    embedding[0] = 1.0;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": embedding}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "scope_by_consumer": false
+    }));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "oversize embedding dimension"}]
+    });
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
+    assert!(
+        ai_semantic_cache_embedding(&ctx, instance_id(&plugin)).is_none(),
+        "adversarial embedding dimensions must not stage a vector"
+    );
+}
+
+#[tokio::test]
+async fn test_canonical_numeric_params_still_collapse_for_exact_keys() {
+    // Intentionally preserved structural canonicalization: 1 / 1.0 / 1e0 must
+    // still share an exact key when sampling params are included.
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "scope_by_consumer": false,
+        "include_params_in_key": true
+    }));
+    let body_int = json!({
+        "model": "gpt-4o",
+        "temperature": 1,
+        "messages": [{"role": "user", "content": "canonical params"}]
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_int).unwrap(),
+        None,
+        br#""ok""#,
+    )
+    .await;
+
+    let body_float = json!({
+        "model": "gpt-4o",
+        "temperature": 1.0,
+        "messages": [{"role": "user", "content": "canonical params"}]
+    });
+    let hit = run_before_proxy_get_status(
+        &plugin,
+        &serde_json::to_string(&body_float).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        hit,
+        "canonical numeric sampling-parameter forms remain exact-key equivalent"
+    );
 }

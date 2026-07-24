@@ -94,7 +94,7 @@ impl ByteBudget {
         if dropped == 1 || dropped.is_multiple_of(DROP_WARN_EVERY) {
             warn!(
                 plugin = self.plugin_name,
-                "{}: dropping observability record because {} ({} dropped total; logging every {} drops)",
+                "{}: dropping retained admission because {} ({} dropped total; logging every {} drops)",
                 self.plugin_name,
                 reason,
                 dropped,

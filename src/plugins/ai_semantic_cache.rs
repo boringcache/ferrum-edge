@@ -11,16 +11,17 @@
 //! Cohere v1, legacy completions, TGI, or Titan). Unknown or ambiguous shapes
 //! bypass caching rather than guessing.
 //!
-//! # v1 — Normalized Exact Match
+//! # v1 — Exact Match
 //!
-//! Prompts are normalized before hashing:
-//! - Message order is preserved while role/content text is normalized
-//! - Content text is lowercased and whitespace-collapsed
+//! Exact cache keys preserve LLM-significant prompt case and whitespace. Safe
+//! structural canonicalization still applies before hashing:
+//! - Message order is preserved; roles and content string bytes are kept as sent
+//! - JSON object key order is deterministic; sampling params use canonical numeric forms
 //! - Model name is included in the key (different models = different cache entries)
 //! - Temperature, top_p, and other sampling parameters are optionally included
 //!
-//! This catches the most common duplicate case: identical or trivially reformatted
-//! prompts from different users/requests.
+//! Semantic embedding input (optional v2 path) still lowercases and collapses
+//! whitespace so approximate matching is not unintentionally tightened.
 //!
 //! # v2 — Optional Semantic Similarity
 //!
@@ -50,16 +51,19 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::mem;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 use url::Host;
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::byte_budget::{ByteBudget, ByteLease};
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{
     REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
+use super::utils::response_body::read_response_body_bounded;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -160,6 +164,22 @@ pub const AI_SEMANTIC_CACHE_CONFIG_KEYS: &[&str] = &[
 ];
 
 const VECTOR_REBUILD_INTERVAL_SECONDS: u64 = 30;
+
+/// Embedding-provider responses are small JSON documents in normal operation.
+/// Bound the wire body before generic JSON deserialization so a compromised or
+/// faulty provider cannot force an unbounded allocation.
+const MAX_EMBEDDING_RESPONSE_BYTES: usize = 1024 * 1024;
+/// OpenAI-compatible and custom embedding models are normally at most a few
+/// thousand dimensions. This deliberately generous ceiling bounds scalar
+/// allocation and HNSW indexing work.
+const MAX_EMBEDDING_DIMENSIONS: usize = 16_384;
+/// Conservative per-point HNSW graph/metadata overhead charged against the
+/// shared cache byte budget (ZeroNode neighbors, layer bookkeeping, ids).
+const HNSW_GRAPH_OVERHEAD_PER_POINT: usize = 256;
+/// Peak retained embedding copies while `instant-distance` builds an HNSW map:
+/// rebuild scan clone + internal construction clone. The final published
+/// snapshot keeps one copy; `ByteLease::shrink_to` releases the temporary.
+const HNSW_BUILD_EMBEDDING_COPIES: usize = 2;
 
 /// Minimum interval between expired-entry cleanup passes, measured against a
 /// monotonic clock so the throttle is immune to wall-clock jumps.
@@ -266,6 +286,10 @@ struct CacheEntry {
     approx_size: usize,
     semantic_scope_key: Option<String>,
     embedding: Option<EmbeddingPoint>,
+    /// Retained-byte lease against [`AiSemanticCache::cache_budget`]. Cloning
+    /// shares the `Arc`; the budget releases when the last handle drops
+    /// (DashMap eviction, replacement, or plugin drop).
+    _budget_lease: Arc<ByteLease>,
 }
 
 struct CachedResponse {
@@ -391,6 +415,11 @@ impl EmbeddingPoint {
         if values.is_empty() {
             return Err("embedding vector must not be empty".to_string());
         }
+        if values.len() > MAX_EMBEDDING_DIMENSIONS {
+            return Err(format!(
+                "embedding vector exceeds the maximum dimension {MAX_EMBEDDING_DIMENSIONS}"
+            ));
+        }
 
         let mut norm_squared = 0.0_f32;
         for value in &values {
@@ -442,6 +471,20 @@ struct VectorEntry {
 
 struct VectorSnapshot {
     index: HnswMap<EmbeddingPoint, VectorEntry>,
+    /// Bytes reserved for this published generation (embeddings + values +
+    /// graph overhead). Dropping the snapshot releases the lease promptly.
+    accounted_bytes: usize,
+    _budget_lease: Arc<ByteLease>,
+}
+
+enum VectorRebuildOutcome {
+    Empty,
+    BudgetExhausted,
+    Built {
+        index: HnswMap<EmbeddingPoint, VectorEntry>,
+        lease: Arc<ByteLease>,
+        accounted_bytes: usize,
+    },
 }
 
 pub struct AiSemanticCache {
@@ -463,19 +506,20 @@ pub struct AiSemanticCache {
     max_entries: usize,
     /// Maximum size of a single cached response body in bytes.
     max_entry_size_bytes: usize,
-    /// Approximate (soft) ceiling on the total cache size in bytes for
-    /// **different-key** concurrent admits. The total is checked without a
-    /// lock before each insert, so concurrent stores of distinct keys may
-    /// briefly exceed the cap by up to
-    /// `(concurrent inserts) * max_entry_size_bytes` before periodic
-    /// `cleanup_expired` reconciliation (TTL expiry / max-entries eviction)
-    /// brings it back down. It is not a hard guarantee, but that overshoot is
-    /// bounded and self-healing.
-    ///
-    /// Same-key replacement is different: size-delta accounting uses the value
-    /// returned by the winning `DashMap::insert`, so `total_size` never retains
-    /// phantom bytes for an overwritten entry.
+    /// Hard ceiling on retained local cache memory: response entries (bodies,
+    /// headers, scope keys, embeddings) plus published and in-flight HNSW
+    /// generations. Admission uses lock-free `ByteBudget` leases so concurrent
+    /// distinct-key stores cannot permanently overshoot; a store that cannot
+    /// reserve is skipped. Same-key replacement drops the displaced entry's
+    /// lease so overwritten bytes are released promptly.
     max_total_size_bytes: usize,
+    /// Shared retained-byte budget backing `max_total_size_bytes`.
+    cache_budget: Arc<ByteBudget>,
+    /// Bytes currently reserved for an in-flight HNSW rebuild candidate.
+    /// Published snapshot leases live on [`VectorSnapshot`]; this atomic makes
+    /// peak (old + candidate) accounting observable to tests while the rebuild
+    /// task still holds the candidate lease.
+    rebuild_reserved_bytes: Arc<AtomicUsize>,
     /// Whether to include the model name in the cache key.
     include_model_in_key: bool,
     /// Whether to include sampling parameters (temperature, top_p) in the cache key.
@@ -492,8 +536,9 @@ pub struct AiSemanticCache {
     cache: Arc<DashMap<String, CacheEntry>>,
     /// Immutable HNSW snapshot for semantic lookup.
     vector_index: Arc<ArcSwapOption<VectorSnapshot>>,
-    /// Total approximate size of all cached entries.
-    total_size: Arc<AtomicUsize>,
+    /// First successfully admitted embedding dimension for this instance.
+    /// Later vectors must match so HNSW distance stays well-defined.
+    embedding_dimension: Arc<OnceLock<usize>>,
     /// Optional Redis client for centralized caching.
     redis_client: Option<Arc<RedisRateLimitClient>>,
     /// Monotonic reference instant captured at construction. Cleanup
@@ -510,8 +555,8 @@ pub struct AiSemanticCache {
     vector_index_dirty: Arc<AtomicBool>,
     /// Guards detached HNSW rebuild scheduling.
     vector_index_rebuild_running: Arc<AtomicBool>,
-    /// Optional test-only callback after soft-cap admission succeeds and before
-    /// size credit / `DashMap` insert. Production keeps this empty; the
+    /// Optional test-only callback after byte-budget admission succeeds and
+    /// before `DashMap` insert. Production keeps this empty; the
     /// `ArcSwap` load of `None` is lock-free on the store path.
     store_post_admit_hook: Arc<ArcSwapOption<StorePostAdmitHook>>,
 }
@@ -631,6 +676,11 @@ impl AiSemanticCache {
             max_entries,
             max_entry_size_bytes,
             max_total_size_bytes,
+            cache_budget: Arc::new(ByteBudget::new(
+                "ai_semantic_cache",
+                max_total_size_bytes,
+            )),
+            rebuild_reserved_bytes: Arc::new(AtomicUsize::new(0)),
             include_model_in_key,
             include_params_in_key,
             scope_by_consumer,
@@ -639,7 +689,7 @@ impl AiSemanticCache {
             http_client,
             cache: Arc::new(DashMap::new()),
             vector_index: Arc::new(ArcSwapOption::empty()),
-            total_size: Arc::new(AtomicUsize::new(0)),
+            embedding_dimension: Arc::new(OnceLock::new()),
             redis_client,
             created_at: Instant::now(),
             // Sentinel: never cleaned, so the first cleanup pass always runs.
@@ -827,12 +877,30 @@ impl AiSemanticCache {
             ));
         }
 
-        let body: Value = response
-            .json()
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_EMBEDDING_RESPONSE_BYTES as u64)
+        {
+            return Err(format!(
+                "embedding response invalid: declared body exceeds {MAX_EMBEDDING_RESPONSE_BYTES} bytes"
+            ));
+        }
+        let body = read_response_body_bounded(response, MAX_EMBEDDING_RESPONSE_BYTES)
             .await
+            .map_err(|err| format!("embedding response invalid: bounded read failed: {err}"))?;
+        let body: Value = serde_json::from_slice(&body)
             .map_err(|err| format!("embedding response parse failed: {err}"))?;
-        parse_embedding_response(&body)
-            .and_then(EmbeddingPoint::from_raw)
+        let values = parse_embedding_response(&body, semantic.output_dimension)
+            .map_err(|err| format!("embedding response invalid: {err}"))?;
+        let dimension = values.len();
+        let learned = self.embedding_dimension.get_or_init(|| dimension);
+        if *learned != dimension {
+            return Err(format!(
+                "embedding response invalid: dimension changed from {} to {dimension}",
+                *learned
+            ));
+        }
+        EmbeddingPoint::from_raw(values)
             .map_err(|err| format!("embedding response invalid: {err}"))
     }
 
@@ -888,16 +956,46 @@ impl AiSemanticCache {
         cache: Arc<DashMap<String, CacheEntry>>,
         ttl: Duration,
         max_candidates: usize,
-    ) -> Result<Option<HnswMap<EmbeddingPoint, VectorEntry>>, tokio::task::JoinError> {
+        cache_budget: Arc<ByteBudget>,
+        rebuild_reserved_bytes: Arc<AtomicUsize>,
+    ) -> Result<VectorRebuildOutcome, tokio::task::JoinError> {
         tokio::task::spawn_blocking(move || {
             // HnswMap is immutable, so local semantic inserts/removals are
             // made visible in batches. The dirty flag is cleared before this
             // snapshot; any concurrent insert that races this scan re-dirties
             // the index and schedules a later rebuild.
             let now = Instant::now();
-            let mut points = Vec::new();
-            let mut values = Vec::new();
+            let mut estimate = 0usize;
+            let mut point_count = 0usize;
+            for entry in cache.iter() {
+                if now.duration_since(entry.inserted_at) >= ttl {
+                    continue;
+                }
+                let (Some(scope_key), Some(embedding)) =
+                    (entry.semantic_scope_key.as_ref(), entry.embedding.as_ref())
+                else {
+                    continue;
+                };
+                point_count = point_count.saturating_add(1);
+                estimate = estimate.saturating_add(estimate_hnsw_point_peak_bytes(
+                    embedding,
+                    entry.key(),
+                    scope_key,
+                ));
+            }
 
+            if point_count == 0 {
+                return VectorRebuildOutcome::Empty;
+            }
+
+            let Some(lease) = cache_budget.try_acquire(estimate) else {
+                return VectorRebuildOutcome::BudgetExhausted;
+            };
+            rebuild_reserved_bytes.store(estimate, Ordering::Release);
+
+            let mut points = Vec::with_capacity(point_count);
+            let mut values = Vec::with_capacity(point_count);
+            let mut retained = 0usize;
             for entry in cache.iter() {
                 if now.duration_since(entry.inserted_at) >= ttl {
                     continue;
@@ -907,6 +1005,11 @@ impl AiSemanticCache {
                 else {
                     continue;
                 };
+                retained = retained.saturating_add(estimate_hnsw_point_retained_bytes(
+                    &embedding,
+                    entry.key(),
+                    &scope_key,
+                ));
                 points.push(embedding);
                 values.push(VectorEntry {
                     cache_key: entry.key().clone(),
@@ -915,33 +1018,66 @@ impl AiSemanticCache {
             }
 
             if points.is_empty() {
-                return None;
+                rebuild_reserved_bytes.store(0, Ordering::Release);
+                lease.release();
+                return VectorRebuildOutcome::Empty;
             }
 
-            Some(
-                HnswBuilder::default()
-                    .ef_search(max_candidates)
-                    .ef_construction(max_candidates.max(100))
-                    .seed(0)
-                    .build(points, values),
-            )
+            // Shrink provisional peak reservation down to the published
+            // generation footprint before construction completes; build may
+            // briefly allocate internal clones already covered by the peak
+            // estimate, then drops them when returning.
+            let retained = retained.min(estimate);
+            lease.shrink_to(retained);
+            rebuild_reserved_bytes.store(retained, Ordering::Release);
+
+            let index = HnswBuilder::default()
+                .ef_search(max_candidates)
+                .ef_construction(max_candidates.max(100))
+                .seed(0)
+                .build(points, values);
+            VectorRebuildOutcome::Built {
+                index,
+                lease,
+                accounted_bytes: retained,
+            }
         })
         .await
     }
 
     fn store_vector_snapshot_result(
-        build_result: Result<Option<HnswMap<EmbeddingPoint, VectorEntry>>, tokio::task::JoinError>,
+        build_result: Result<VectorRebuildOutcome, tokio::task::JoinError>,
         vector_index: &ArcSwapOption<VectorSnapshot>,
         dirty: &AtomicBool,
+        rebuild_reserved_bytes: &AtomicUsize,
     ) {
+        rebuild_reserved_bytes.store(0, Ordering::Release);
         match build_result {
-            Ok(Some(index)) => {
-                vector_index.store(Some(Arc::new(VectorSnapshot { index })));
+            Ok(VectorRebuildOutcome::Built {
+                index,
+                lease,
+                accounted_bytes,
+            }) => {
+                vector_index.store(Some(Arc::new(VectorSnapshot {
+                    index,
+                    accounted_bytes,
+                    _budget_lease: lease,
+                })));
             }
-            Ok(None) => {
+            Ok(VectorRebuildOutcome::Empty) => {
                 vector_index.store(None);
             }
+            Ok(VectorRebuildOutcome::BudgetExhausted) => {
+                // Keep the previous published generation; retry when space
+                // frees (TTL eviction / entry release).
+                dirty.store(true, Ordering::Release);
+                debug!(
+                    "ai_semantic_cache: semantic vector rebuild skipped; cache byte budget exhausted"
+                );
+            }
             Err(err) => {
+                // Join/cancellation drops any candidate lease held inside the
+                // aborted blocking task; re-dirty so a later pass retries.
                 dirty.store(true, Ordering::Release);
                 debug!(
                     error = %err,
@@ -957,10 +1093,14 @@ impl AiSemanticCache {
     /// integration-test crate), so it would otherwise flag this as dead code
     /// and fail `clippy -D warnings`; `allow(dead_code)` documents the real
     /// (external) use site.
+    ///
+    /// Returns the peak `cache_budget.used()` observed while the previous
+    /// published generation and the candidate rebuild lease overlapped (when
+    /// both were non-zero).
     #[allow(dead_code)]
-    pub(crate) async fn rebuild_vector_index_for_tests(&self) {
+    pub(crate) async fn rebuild_vector_index_for_tests(&self) -> usize {
         let Some(semantic) = self.semantic.as_ref() else {
-            return;
+            return self.cache_budget.used();
         };
 
         while self
@@ -972,31 +1112,113 @@ impl AiSemanticCache {
         }
 
         self.vector_index_dirty.store(false, Ordering::Release);
-        let build_result =
-            Self::build_vector_snapshot(Arc::clone(&self.cache), self.ttl, semantic.max_candidates)
-                .await;
+        // Keep the previous generation alive so peak (old + candidate) is
+        // observable while the rebuild lease is outstanding.
+        let previous = self.vector_index.load_full();
+        let build_result = Self::build_vector_snapshot(
+            Arc::clone(&self.cache),
+            self.ttl,
+            semantic.max_candidates,
+            Arc::clone(&self.cache_budget),
+            Arc::clone(&self.rebuild_reserved_bytes),
+        )
+        .await;
+        let peak_used = self.cache_budget.used();
         Self::store_vector_snapshot_result(
             build_result,
             self.vector_index.as_ref(),
             self.vector_index_dirty.as_ref(),
+            self.rebuild_reserved_bytes.as_ref(),
         );
+        drop(previous);
         self.last_vector_rebuild
             .store(current_epoch_seconds(), Ordering::Release);
         self.vector_index_rebuild_running
             .store(false, Ordering::Release);
+        peak_used
     }
 
-    /// Tracked `total_size` and the sum of retained entry `approx_size` values.
-    /// External tests assert these stay equal after concurrent same-key stores.
+    /// Tracked budget usage and the sum of retained entry + published vector
+    /// generation + in-flight rebuild reservation bytes. External tests assert
+    /// these stay equal after concurrent stores and rebuilds.
     #[allow(dead_code)]
     pub(crate) fn size_accounting_snapshot_for_tests(&self) -> (usize, usize) {
-        let tracked = self.total_size.load(Ordering::Relaxed);
-        let actual = self
+        let tracked = self.cache_budget.used();
+        let entries = self
             .cache
             .iter()
             .map(|entry| entry.approx_size)
             .fold(0usize, usize::saturating_add);
-        (tracked, actual)
+        let published = self
+            .vector_index
+            .load_full()
+            .map(|snapshot| snapshot.accounted_bytes)
+            .unwrap_or(0);
+        let rebuild = self.rebuild_reserved_bytes.load(Ordering::Acquire);
+        (
+            tracked,
+            entries
+                .saturating_add(published)
+                .saturating_add(rebuild),
+        )
+    }
+
+    /// Published HNSW generation bytes currently charged to `cache_budget`.
+    #[allow(dead_code)]
+    pub(crate) fn vector_snapshot_accounted_bytes_for_tests(&self) -> usize {
+        self.vector_index
+            .load_full()
+            .map(|snapshot| snapshot.accounted_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Aggregate retained-byte budget usage (entries + vector generations).
+    #[allow(dead_code)]
+    pub(crate) fn cache_budget_used_for_tests(&self) -> usize {
+        self.cache_budget.used()
+    }
+
+    /// Force a rebuild reservation attempt that cannot fit, then confirm the
+    /// candidate lease is not retained. Returns whether the budget rejected
+    /// the reservation (and dirty was re-armed).
+    #[allow(dead_code)]
+    pub(crate) async fn force_vector_rebuild_budget_failure_for_tests(&self) -> bool {
+        let Some(semantic) = self.semantic.as_ref() else {
+            return false;
+        };
+        while self
+            .vector_index_rebuild_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tokio::task::yield_now().await;
+        }
+        self.vector_index_dirty.store(false, Ordering::Release);
+        let before = self.cache_budget.used();
+        // Saturate remaining budget so the rebuild estimate cannot acquire.
+        let filler = self
+            .cache_budget
+            .try_acquire(self.max_total_size_bytes.saturating_sub(before).max(1));
+        let build_result = Self::build_vector_snapshot(
+            Arc::clone(&self.cache),
+            self.ttl,
+            semantic.max_candidates,
+            Arc::clone(&self.cache_budget),
+            Arc::clone(&self.rebuild_reserved_bytes),
+        )
+        .await;
+        let rejected = matches!(build_result, Ok(VectorRebuildOutcome::BudgetExhausted))
+            && self.rebuild_reserved_bytes.load(Ordering::Acquire) == 0;
+        Self::store_vector_snapshot_result(
+            build_result,
+            self.vector_index.as_ref(),
+            self.vector_index_dirty.as_ref(),
+            self.rebuild_reserved_bytes.as_ref(),
+        );
+        drop(filler);
+        self.vector_index_rebuild_running
+            .store(false, Ordering::Release);
+        rejected && self.cache_budget.used() == before
     }
 
     /// Whether the semantic vector snapshot is marked dirty. Used to prove
@@ -1040,9 +1262,9 @@ impl AiSemanticCache {
         self.cleanup_expired();
     }
 
-    /// Install (or clear) a callback that runs after soft-cap admission and
-    /// before size credit / insert. Used by external tests to park concurrent
-    /// stores so distinct-key soft-cap overshoot is deterministic.
+    /// Install (or clear) a callback that runs after byte-budget admission and
+    /// before insert. Used by external tests to park concurrent stores that
+    /// have already reserved leases.
     #[allow(dead_code)]
     pub(crate) fn set_store_post_admit_hook_for_tests(
         &self,
@@ -1092,12 +1314,26 @@ impl AiSemanticCache {
         let vector_index = Arc::clone(&self.vector_index);
         let dirty = Arc::clone(&self.vector_index_dirty);
         let rebuild_running = Arc::clone(&self.vector_index_rebuild_running);
+        let cache_budget = Arc::clone(&self.cache_budget);
+        let rebuild_reserved_bytes = Arc::clone(&self.rebuild_reserved_bytes);
         let ttl = self.ttl;
         let max_candidates = semantic.max_candidates;
 
         tokio::spawn(async move {
-            let build_result = Self::build_vector_snapshot(cache, ttl, max_candidates).await;
-            Self::store_vector_snapshot_result(build_result, vector_index.as_ref(), dirty.as_ref());
+            let build_result = Self::build_vector_snapshot(
+                cache,
+                ttl,
+                max_candidates,
+                cache_budget,
+                rebuild_reserved_bytes.clone(),
+            )
+            .await;
+            Self::store_vector_snapshot_result(
+                build_result,
+                vector_index.as_ref(),
+                dirty.as_ref(),
+                rebuild_reserved_bytes.as_ref(),
+            );
             rebuild_running.store(false, Ordering::Release);
         });
     }
@@ -1133,7 +1369,7 @@ impl AiSemanticCache {
         let mut removed_semantic_entry = false;
         self.cache.retain(|_, entry| {
             if now.duration_since(entry.inserted_at) >= self.ttl {
-                removed_size += entry.approx_size;
+                removed_size = removed_size.saturating_add(entry.approx_size);
                 removed_semantic_entry |= entry.embedding.is_some();
                 false
             } else {
@@ -1141,7 +1377,7 @@ impl AiSemanticCache {
             }
         });
         if removed_size > 0 {
-            self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
+            // Entry leases release on drop from retain; no separate counter.
             if removed_semantic_entry {
                 self.mark_vector_index_dirty();
             }
@@ -1170,8 +1406,7 @@ impl AiSemanticCache {
             for (key, _) in entries_with_time.into_iter().take(to_remove) {
                 if let Some((_, removed)) = self.cache.remove(&key) {
                     removed_semantic_entry |= removed.embedding.is_some();
-                    self.total_size
-                        .fetch_sub(removed.approx_size, Ordering::Relaxed);
+                    // Lease releases when `removed` drops.
                 }
             }
             if removed_semantic_entry {
@@ -1531,7 +1766,7 @@ fn append_value_shape(value: &Value, key_input: &mut String) {
     }
 }
 
-fn extract_message_content(msg: &Value) -> String {
+fn extract_message_content(msg: &Value, mode: PromptTextCanon) -> String {
     let raw = if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
         content.to_string()
     } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
@@ -1547,10 +1782,10 @@ fn extract_message_content(msg: &Value) -> String {
     } else {
         String::new()
     };
-    normalize_text(&raw)
+    canonicalize_prompt_text(&raw, mode)
 }
 
-fn extract_gemini_parts_text(parts: &[Value]) -> String {
+fn extract_gemini_parts_text(parts: &[Value], mode: PromptTextCanon) -> String {
     let mut texts = Vec::new();
     for part in parts {
         if is_gemini_text_part(part)
@@ -1559,23 +1794,23 @@ fn extract_gemini_parts_text(parts: &[Value]) -> String {
             texts.push(text);
         }
     }
-    normalize_text(&texts.join(" "))
+    canonicalize_prompt_text(&texts.join(" "), mode)
 }
 
-fn extract_responses_input_text(input: &Value) -> String {
+fn extract_responses_input_text(input: &Value, mode: PromptTextCanon) -> String {
     match input {
-        Value::String(text) => normalize_text(text),
+        Value::String(text) => canonicalize_prompt_text(text, mode),
         Value::Array(items) => {
             let mut texts = Vec::new();
             for item in items {
                 push_responses_item_text(item, &mut texts);
             }
-            normalize_text(&texts.join(" "))
+            canonicalize_prompt_text(&texts.join(" "), mode)
         }
         Value::Object(_) => {
             let mut texts = Vec::new();
             push_responses_item_text(input, &mut texts);
-            normalize_text(&texts.join(" "))
+            canonicalize_prompt_text(&texts.join(" "), mode)
         }
         _ => String::new(),
     }
@@ -1585,7 +1820,7 @@ fn append_responses_prompt_exact_key(input: &Value, key_input: &mut String) -> O
     match input {
         Value::String(text) => {
             key_input.push_str("string:");
-            append_len_prefixed(key_input, &normalize_text(text));
+            append_len_prefixed(key_input, text);
         }
         Value::Array(items) => {
             let _ = write!(key_input, "array:{}:", items.len());
@@ -1605,7 +1840,7 @@ fn append_responses_prompt_exact_key(input: &Value, key_input: &mut String) -> O
 fn append_responses_prompt_item(item: &Value, key_input: &mut String) -> Option<()> {
     if let Some(text) = item.as_str() {
         key_input.push_str("string:");
-        append_len_prefixed(key_input, &normalize_text(text));
+        append_len_prefixed(key_input, text);
         return Some(());
     }
     let object = item.as_object()?;
@@ -1617,7 +1852,10 @@ fn append_responses_prompt_item(item: &Value, key_input: &mut String) -> Option<
             .and_then(Value::as_str)
             .unwrap_or("input"),
     );
-    append_len_prefixed(key_input, &extract_responses_input_text(item));
+    append_len_prefixed(
+        key_input,
+        &extract_responses_input_text(item, PromptTextCanon::Exact),
+    );
     Some(())
 }
 
@@ -1667,7 +1905,7 @@ fn append_family_prompt_exact_key(
                     .get("role")
                     .and_then(|r| r.as_str())
                     .unwrap_or("unknown");
-                let content = extract_message_content(msg);
+                let content = extract_message_content(msg, PromptTextCanon::Exact);
                 append_len_prefixed(key_input, role);
                 append_len_prefixed(key_input, &content);
             }
@@ -1694,7 +1932,7 @@ fn append_family_prompt_exact_key(
                 let text = content
                     .get("parts")
                     .and_then(|p| p.as_array())
-                    .map(|parts| extract_gemini_parts_text(parts))
+                    .map(|parts| extract_gemini_parts_text(parts, PromptTextCanon::Exact))
                     .unwrap_or_default();
                 append_len_prefixed(key_input, role);
                 append_len_prefixed(key_input, &text);
@@ -1716,12 +1954,12 @@ fn append_family_prompt_exact_key(
                         .and_then(|c| c.as_str())
                         .unwrap_or("");
                     append_len_prefixed(key_input, role);
-                    append_len_prefixed(key_input, &normalize_text(content));
+                    append_len_prefixed(key_input, content);
                 }
             }
             if let Some(message) = body.get("message").and_then(|m| m.as_str()) {
                 append_len_prefixed(key_input, "user");
-                append_len_prefixed(key_input, &normalize_text(message));
+                append_len_prefixed(key_input, message);
             }
             Some(())
         }
@@ -1729,21 +1967,21 @@ fn append_family_prompt_exact_key(
             let prompt = body.get("prompt")?;
             start_key_part(key_input, has_part);
             key_input.push_str("prompt:");
-            key_input.push_str(&normalize_prompt_value(prompt));
+            key_input.push_str(&prompt_value_for_key(prompt, PromptTextCanon::Exact));
             Some(())
         }
         CacheRequestFamily::Tgi => {
             let inputs = body.get("inputs")?;
             start_key_part(key_input, has_part);
             key_input.push_str("inputs:");
-            key_input.push_str(&normalize_prompt_value(inputs));
+            key_input.push_str(&prompt_value_for_key(inputs, PromptTextCanon::Exact));
             Some(())
         }
         CacheRequestFamily::Titan => {
             let input_text = body.get("inputText").and_then(|v| v.as_str())?;
             start_key_part(key_input, has_part);
             key_input.push_str("inputText:");
-            key_input.push_str(&normalize_text(input_text));
+            key_input.push_str(input_text);
             Some(())
         }
     }
@@ -1760,19 +1998,19 @@ fn append_family_instruction_exact_key(
             if let Some(system) = body.get("system") {
                 start_key_part(key_input, has_part);
                 key_input.push_str("sys:");
-                key_input.push_str(&normalize_system_value(system));
+                key_input.push_str(&system_value_for_key(system, PromptTextCanon::Exact));
             }
             if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
                 key_input.push_str("preamble:");
-                key_input.push_str(&normalize_text(preamble));
+                key_input.push_str(preamble);
             }
         }
         CacheRequestFamily::Responses => {
             if let Some(instructions) = body.get("instructions") {
                 start_key_part(key_input, has_part);
                 key_input.push_str("instructions:");
-                key_input.push_str(&normalize_prompt_value(instructions));
+                key_input.push_str(&prompt_value_for_key(instructions, PromptTextCanon::Exact));
             }
             if let Some(previous) = body.get("previous_response_id").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
@@ -1786,7 +2024,7 @@ fn append_family_instruction_exact_key(
                     start_key_part(key_input, has_part);
                     key_input.push_str(field);
                     key_input.push(':');
-                    key_input.push_str(&normalize_gemini_instruction(system));
+                    key_input.push_str(&gemini_instruction_for_key(system, PromptTextCanon::Exact));
                 }
             }
         }
@@ -1794,7 +2032,7 @@ fn append_family_instruction_exact_key(
             if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
                 key_input.push_str("preamble:");
-                key_input.push_str(&normalize_text(preamble));
+                key_input.push_str(preamble);
             }
         }
         CacheRequestFamily::LegacyPrompt | CacheRequestFamily::Tgi | CacheRequestFamily::Titan => {}
@@ -1906,7 +2144,7 @@ fn append_family_instruction_scope(
                     if !matches!(role.to_ascii_lowercase().as_str(), "system" | "developer") {
                         continue;
                     }
-                    let content = extract_message_content(msg);
+                    let content = extract_message_content(msg, PromptTextCanon::Semantic);
                     if content.is_empty() {
                         continue;
                     }
@@ -1926,7 +2164,7 @@ fn append_family_instruction_scope(
             if let Some(system) = body.get("system") {
                 start_key_part(key_input, has_part);
                 key_input.push_str("sys:");
-                key_input.push_str(&normalize_system_value(system));
+                key_input.push_str(&system_value_for_key(system, PromptTextCanon::Semantic));
             }
             if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
@@ -1936,7 +2174,7 @@ fn append_family_instruction_scope(
         }
         CacheRequestFamily::Responses => {
             if let Some(instructions) = body.get("instructions") {
-                let normalized = normalize_prompt_value(instructions);
+                let normalized = prompt_value_for_key(instructions, PromptTextCanon::Semantic);
                 if !normalized.is_empty() {
                     start_key_part(key_input, has_part);
                     key_input.push_str("instructions:");
@@ -1953,7 +2191,8 @@ fn append_family_instruction_scope(
         CacheRequestFamily::Gemini => {
             for field in ["systemInstruction", "system_instruction"] {
                 if let Some(system) = body.get(field) {
-                    let normalized = normalize_gemini_instruction(system);
+                    let normalized =
+                        gemini_instruction_for_key(system, PromptTextCanon::Semantic);
                     if normalized.is_empty() {
                         continue;
                     }
@@ -1993,7 +2232,7 @@ fn build_family_semantic_input(family: CacheRequestFamily, body: &Value) -> Opti
                 if matches!(role.to_ascii_lowercase().as_str(), "system" | "developer") {
                     continue;
                 }
-                let content = extract_message_content(msg);
+                let content = extract_message_content(msg, PromptTextCanon::Semantic);
                 if content.is_empty() {
                     continue;
                 }
@@ -2005,7 +2244,7 @@ fn build_family_semantic_input(family: CacheRequestFamily, body: &Value) -> Opti
         }
         CacheRequestFamily::Responses => {
             if let Some(raw) = body.get("input") {
-                let text = extract_responses_input_text(raw);
+                let text = extract_responses_input_text(raw, PromptTextCanon::Semantic);
                 if !text.is_empty() {
                     input.push_str("input: ");
                     input.push_str(&text);
@@ -2023,7 +2262,7 @@ fn build_family_semantic_input(family: CacheRequestFamily, body: &Value) -> Opti
                 let text = content
                     .get("parts")
                     .and_then(|p| p.as_array())
-                    .map(|parts| extract_gemini_parts_text(parts))
+                    .map(|parts| extract_gemini_parts_text(parts, PromptTextCanon::Semantic))
                     .unwrap_or_default();
                 if text.is_empty() {
                     continue;
@@ -2069,7 +2308,7 @@ fn build_family_semantic_input(family: CacheRequestFamily, body: &Value) -> Opti
             }
         }
         CacheRequestFamily::LegacyPrompt => {
-            let prompt = normalize_prompt_value(body.get("prompt")?);
+            let prompt = prompt_value_for_key(body.get("prompt")?, PromptTextCanon::Semantic);
             if !prompt.is_empty() {
                 input.push_str("prompt: ");
                 input.push_str(&prompt);
@@ -2077,7 +2316,7 @@ fn build_family_semantic_input(family: CacheRequestFamily, body: &Value) -> Opti
             }
         }
         CacheRequestFamily::Tgi => {
-            let inputs = normalize_prompt_value(body.get("inputs")?);
+            let inputs = prompt_value_for_key(body.get("inputs")?, PromptTextCanon::Semantic);
             if !inputs.is_empty() {
                 input.push_str("inputs: ");
                 input.push_str(&inputs);
@@ -2102,36 +2341,54 @@ fn build_family_semantic_input(family: CacheRequestFamily, body: &Value) -> Opti
     }
 }
 
-fn normalize_prompt_value(value: &Value) -> String {
+fn prompt_value_for_key(value: &Value, mode: PromptTextCanon) -> String {
     match value {
-        Value::String(text) => normalize_text(text),
+        Value::String(text) => canonicalize_prompt_text(text, mode),
         Value::Array(items) => {
             let mut normalized = String::new();
             let _ = write!(normalized, "array:{}:", items.len());
             for item in items {
                 let text = match item {
-                    Value::String(text) => normalize_text(text),
-                    other => normalize_text(&other.to_string()),
+                    Value::String(text) => canonicalize_prompt_text(text, mode),
+                    other => canonicalize_prompt_text(&other.to_string(), mode),
                 };
                 append_len_prefixed(&mut normalized, &text);
             }
             normalized
         }
-        other => normalize_text(&other.to_string()),
+        other => canonicalize_prompt_text(&other.to_string(), mode),
     }
 }
 
-fn normalize_gemini_instruction(system: &Value) -> String {
+fn gemini_instruction_for_key(system: &Value, mode: PromptTextCanon) -> String {
     if let Some(text) = system.as_str() {
-        return normalize_text(text);
+        return canonicalize_prompt_text(text, mode);
     }
     if let Some(parts) = system.get("parts").and_then(|p| p.as_array()) {
-        return extract_gemini_parts_text(parts);
+        return extract_gemini_parts_text(parts, mode);
     }
     if let Some(parts) = system.as_array() {
-        return extract_gemini_parts_text(parts);
+        return extract_gemini_parts_text(parts, mode);
     }
-    normalize_text(&system.to_string())
+    canonicalize_prompt_text(&system.to_string(), mode)
+}
+
+fn system_value_for_key(system: &Value, mode: PromptTextCanon) -> String {
+    if let Some(s) = system.as_str() {
+        canonicalize_prompt_text(s, mode)
+    } else if let Some(parts) = system.as_array() {
+        let mut texts = Vec::with_capacity(parts.len());
+        for part in parts {
+            if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(text) = part.get("text").and_then(|t| t.as_str())
+            {
+                texts.push(text);
+            }
+        }
+        canonicalize_prompt_text(&texts.join(" "), mode)
+    } else {
+        canonicalize_prompt_text(&system.to_string(), mode)
+    }
 }
 
 fn current_epoch_seconds() -> u64 {
@@ -2196,13 +2453,45 @@ fn cache_entry_approx_size(
     let embedding_size = embedding.map(EmbeddingPoint::approx_size).unwrap_or(0);
 
     // This bounds retained response entries, including their semantic vector
-    // copy. The detached HNSW snapshot keeps a separate vector/graph copy and
-    // is documented as additional local memory outside this entry budget.
+    // copy. Published HNSW generations and in-flight rebuild workspace are
+    // charged separately against the same `max_total_size_bytes` budget.
     mem::size_of::<CacheEntry>()
         .saturating_add(body_len)
         .saturating_add(header_size)
         .saturating_add(scope_size)
         .saturating_add(embedding_size)
+}
+
+fn estimate_hnsw_point_retained_bytes(
+    embedding: &EmbeddingPoint,
+    cache_key: &str,
+    scope_key: &str,
+) -> usize {
+    embedding
+        .approx_size()
+        .saturating_add(mem::size_of::<VectorEntry>())
+        .saturating_add(cache_key.len())
+        .saturating_add(scope_key.len())
+        .saturating_add(HNSW_GRAPH_OVERHEAD_PER_POINT)
+}
+
+fn estimate_hnsw_point_peak_bytes(
+    embedding: &EmbeddingPoint,
+    cache_key: &str,
+    scope_key: &str,
+) -> usize {
+    // Peak during construction: rebuild scan clone + Hnsw internal clone, plus
+    // VectorEntry string clones while sorting values into the published map.
+    embedding
+        .approx_size()
+        .saturating_mul(HNSW_BUILD_EMBEDDING_COPIES)
+        .saturating_add(
+            mem::size_of::<VectorEntry>()
+                .saturating_add(cache_key.len())
+                .saturating_add(scope_key.len())
+                .saturating_mul(2),
+        )
+        .saturating_add(HNSW_GRAPH_OVERHEAD_PER_POINT)
 }
 
 /// Cheap structural check for whether `body` contains any non-text content
@@ -2759,24 +3048,6 @@ fn build_embedding_request_payload(semantic: &SemanticConfig, input: &str) -> Va
     }
 }
 
-fn normalize_system_value(system: &Value) -> String {
-    if let Some(s) = system.as_str() {
-        normalize_text(s)
-    } else if let Some(parts) = system.as_array() {
-        let mut texts = Vec::with_capacity(parts.len());
-        for part in parts {
-            if part.get("type").and_then(|t| t.as_str()) == Some("text")
-                && let Some(text) = part.get("text").and_then(|t| t.as_str())
-            {
-                texts.push(text);
-            }
-        }
-        normalize_text(&texts.join(" "))
-    } else {
-        normalize_text(&system.to_string())
-    }
-}
-
 fn embedding_array_candidate(value: &Value) -> Option<&Value> {
     let array = value.as_array()?;
     if let Some(first) = array.first()
@@ -2815,7 +3086,10 @@ fn first_embedding_array(body: &Value) -> Option<(&Value, &'static str)> {
     None
 }
 
-fn parse_embedding_response(body: &Value) -> Result<Vec<f32>, String> {
+fn parse_embedding_response(
+    body: &Value,
+    expected_dimension: Option<usize>,
+) -> Result<Vec<f32>, String> {
     let (embedding, label) = first_embedding_array(body).ok_or_else(|| {
         "missing embedding array at data[0].embedding, embedding, embedding.values, \
          embeddings[0], embeddings.float[0], predictions[0].embeddings.values, \
@@ -2826,6 +3100,22 @@ fn parse_embedding_response(body: &Value) -> Result<Vec<f32>, String> {
     let values = embedding
         .as_array()
         .ok_or_else(|| format!("embedding field at {label} must be an array"))?;
+    if values.is_empty() {
+        return Err(format!("embedding array at {label} must not be empty"));
+    }
+    if values.len() > MAX_EMBEDDING_DIMENSIONS {
+        return Err(format!(
+            "embedding array at {label} exceeds the maximum dimension {MAX_EMBEDDING_DIMENSIONS}"
+        ));
+    }
+    if let Some(expected) = expected_dimension
+        && values.len() != expected
+    {
+        return Err(format!(
+            "embedding array at {label} has dimension {}, expected {expected}",
+            values.len()
+        ));
+    }
     let mut result = Vec::with_capacity(values.len());
     for value in values {
         let Some(number) = value.as_f64() else {
@@ -2841,7 +3131,26 @@ fn parse_embedding_response(body: &Value) -> Result<Vec<f32>, String> {
     Ok(result)
 }
 
-/// Normalize text: lowercase, collapse whitespace to single spaces, trim.
+/// How prompt / instruction string bytes are folded into cache material.
+///
+/// Exact keys preserve LLM-significant case and whitespace. Semantic embedding
+/// input and semantic scope text keep the historical lowercase + whitespace
+/// collapse so approximate matching is not unintentionally changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptTextCanon {
+    Exact,
+    Semantic,
+}
+
+fn canonicalize_prompt_text(text: &str, mode: PromptTextCanon) -> String {
+    match mode {
+        PromptTextCanon::Exact => text.to_string(),
+        PromptTextCanon::Semantic => normalize_text(text),
+    }
+}
+
+/// Normalize text for semantic embedding/scope material: lowercase, collapse
+/// whitespace to single spaces, trim.
 ///
 /// Single-pass: previously called `to_ascii_lowercase()` first (one extra
 /// allocation) then iterated chars to collapse whitespace. The lowercase
@@ -3032,12 +3341,11 @@ impl Plugin for AiSemanticCache {
             // Expired — remove
             drop(entry);
             if let Some((_, removed)) = self.cache.remove(&cache_key) {
-                self.total_size
-                    .fetch_sub(removed.approx_size, Ordering::Relaxed);
                 if removed.embedding.is_some() {
                     self.mark_vector_index_dirty();
                     self.refresh_vector_index_if_due();
                 }
+                // Lease releases when `removed` drops.
             }
         }
 
@@ -3225,19 +3533,11 @@ impl Plugin for AiSemanticCache {
             embedding.as_ref(),
         );
 
-        // Soft total-size enforcement for different-key admits: this load is
-        // separate from the fetch_add/insert below, so concurrent inserts of
-        // distinct keys can each observe an under-limit total and overshoot
-        // the cap transiently. The overshoot is bounded (each entry is
-        // <= max_entry_size_bytes, checked above) and reclaimed by
-        // `cleanup_expired`, so `max_total_size_bytes` is an approximate
-        // ceiling rather than a hard guarantee — see its field doc.
-        //
-        // Same-key races must not leave permanent phantom bytes: accounting
-        // below credits the new size then subtracts whatever `DashMap::insert`
-        // actually displaced (including an entry inserted by a racing store).
-        let current_total = self.total_size.load(Ordering::Relaxed);
-        if current_total.saturating_add(approx_size) > self.max_total_size_bytes {
+        // Hard total-size enforcement via lock-free byte leases. Concurrent
+        // distinct-key admits race on `ByteBudget::try_acquire`; losers skip
+        // retention so published + in-flight HNSW generations and entries
+        // cannot permanently exceed `max_total_size_bytes`.
+        let Some(budget_lease) = self.cache_budget.try_acquire(approx_size) else {
             debug!(
                 cache_key = %cache_key,
                 entry_size = approx_size,
@@ -3245,11 +3545,11 @@ impl Plugin for AiSemanticCache {
                 "ai_semantic_cache: total cache size would exceed limit, skipping"
             );
             return PluginResult::Continue;
-        }
+        };
 
         // Optional test rendezvous: park here after admission so concurrent
-        // stores can all observe the same under-limit total before any size
-        // credit runs. Production keeps the hook empty (lock-free no-op).
+        // stores can observe lease ownership before insert. Production keeps
+        // the hook empty (lock-free no-op).
         self.run_store_post_admit_hook();
 
         let entry = CacheEntry {
@@ -3260,20 +3560,15 @@ impl Plugin for AiSemanticCache {
             approx_size,
             semantic_scope_key: semantic_scope_key.clone(),
             embedding: embedding.clone(),
+            _budget_lease: budget_lease,
         };
 
-        // Credit the new entry first, then insert. `DashMap::insert` is atomic
-        // per key and returns any displaced value; subtracting that size keeps
-        // `total_size` equal to the retained map even when two stores race on
-        // an empty key (both would previously remove-miss, both add, and the
-        // loser would be overwritten with its size left in the counter).
-        self.total_size
-            .fetch_add(entry.approx_size, Ordering::Relaxed);
+        // Insert. `DashMap::insert` is atomic per key and returns any
+        // displaced value; dropping that value releases its byte lease so
+        // same-key races never leave phantom retained bytes.
         let mut replaced_semantic_entry = false;
         if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
             replaced_semantic_entry = old.embedding.is_some();
-            self.total_size
-                .fetch_sub(old.approx_size, Ordering::Relaxed);
         }
         if replaced_semantic_entry || embedding.is_some() {
             self.mark_vector_index_dirty();
@@ -3431,6 +3726,13 @@ fn parse_semantic_config(
         .unwrap_or_else(|| provider.default_auth_scheme().to_string());
     let input_type = optional_non_empty_string(config, "semantic_embedding_input_type")?;
     let output_dimension = optional_positive_usize(config, "semantic_embedding_output_dimension")?;
+    if let Some(dimension) = output_dimension
+        && dimension > MAX_EMBEDDING_DIMENSIONS
+    {
+        return Err(format!(
+            "ai_semantic_cache: 'semantic_embedding_output_dimension' must be <= {MAX_EMBEDDING_DIMENSIONS}"
+        ));
+    }
     let similarity_threshold =
         optional_threshold(config, "semantic_similarity_threshold")?.unwrap_or(0.95);
     let max_candidates =
@@ -3523,18 +3825,21 @@ mod tests {
     /// Insert a synthetic cache entry directly so tests can populate the
     /// cache without driving the full request/response lifecycle.
     fn insert_synthetic(plugin: &AiSemanticCache, key: &str, inserted_at: Instant) {
+        let approx_size = 8usize;
+        let lease = plugin
+            .cache_budget
+            .try_acquire(approx_size)
+            .expect("synthetic entry must fit test budget");
         let entry = CacheEntry {
             status_code: 200,
             body: Bytes::from_static(b"\x00\x00\x00\x00\x00\x00\x00\x00"),
             headers: HashMap::new(),
             inserted_at,
-            approx_size: 8,
+            approx_size,
             semantic_scope_key: None,
             embedding: None,
+            _budget_lease: lease,
         };
-        plugin
-            .total_size
-            .fetch_add(entry.approx_size, Ordering::Relaxed);
         plugin.cache.insert(key.to_string(), entry);
     }
 
@@ -3920,10 +4225,50 @@ mod tests {
             json!({"results": [{"embedding": [1.0, 2.0, 3.0]}]}),
         ] {
             assert_eq!(
-                parse_embedding_response(&body).unwrap(),
+                parse_embedding_response(&body, None).unwrap(),
                 vec![1.0, 2.0, 3.0]
             );
         }
+    }
+
+    #[test]
+    fn embedding_response_parser_rejects_oversize_dimension() {
+        let values: Vec<f64> = (0..=MAX_EMBEDDING_DIMENSIONS)
+            .map(|i| if i == 0 { 1.0 } else { 0.0 })
+            .collect();
+        let body = json!({ "embedding": values });
+        let err = parse_embedding_response(&body, None).expect_err("oversize");
+        assert!(
+            err.contains("maximum dimension"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn embedding_response_parser_enforces_expected_dimension() {
+        let body = json!({ "embedding": [1.0, 0.0, 0.0] });
+        let err = parse_embedding_response(&body, Some(2)).expect_err("mismatch");
+        assert!(err.contains("expected 2"), "unexpected error: {err}");
+        assert_eq!(
+            parse_embedding_response(&body, Some(3)).unwrap(),
+            vec![1.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn exact_prompt_canon_preserves_case_and_whitespace() {
+        assert_eq!(
+            canonicalize_prompt_text("  Hello   World  ", PromptTextCanon::Exact),
+            "  Hello   World  "
+        );
+        assert_eq!(
+            canonicalize_prompt_text("print(\"A\")", PromptTextCanon::Exact),
+            "print(\"A\")"
+        );
+        assert_eq!(
+            canonicalize_prompt_text("  Hello   World  ", PromptTextCanon::Semantic),
+            "hello world"
+        );
     }
 
     #[test]
