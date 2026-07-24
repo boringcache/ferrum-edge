@@ -555,10 +555,11 @@ async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
         poll_timestamp: Utc::now(),
     };
     let trust_bundles = create_test_trust_bundles();
+    let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta_with_trust_bundles(
         &update_tx,
         &delta,
-        "trust-bundles-v2",
+        &version,
         Some(&trust_bundles),
     );
 
@@ -641,10 +642,11 @@ async fn test_dp_rejects_gateway_trust_bundles_from_rejected_delta() {
         poll_timestamp: Utc::now(),
     };
     let trust_bundles = create_test_trust_bundles();
+    let version = delta.poll_timestamp.to_rfc3339();
     CpGrpcServer::broadcast_delta_with_trust_bundles(
         &update_tx,
         &delta,
-        "trust-bundles-rejected-delta",
+        &version,
         Some(&trust_bundles),
     );
 
@@ -673,7 +675,8 @@ async fn test_dp_rejects_gateway_trust_bundles_from_rejected_delta() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &partial_fix, "partial-fix");
+    let partial_version = partial_fix.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &partial_fix, &partial_version);
 
     let resubscribed = timeout(Duration::from_secs(5), async {
         loop {
@@ -2402,7 +2405,8 @@ async fn test_dp_applies_delta_update_adding_proxy() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     // Wait for the delta to be applied
     let received_delta = timeout(Duration::from_secs(5), async {
@@ -2479,7 +2483,8 @@ async fn test_dp_applies_delta_update_removing_proxy() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     // Wait for delta to be applied
     let received_delta = timeout(Duration::from_secs(5), async {
@@ -2553,7 +2558,8 @@ async fn test_dp_applies_delta_then_full_snapshot() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     // Wait for delta
     let received_delta = timeout(Duration::from_secs(5), async {
@@ -2801,7 +2807,8 @@ async fn test_dp_applies_delta_modifying_proxy() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     // Wait for delta — proxy count stays 2 but backend_port changes
     let received_delta = timeout(Duration::from_secs(5), async {
@@ -2888,7 +2895,8 @@ async fn test_dp_applies_delta_with_mixed_operations() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     // Wait for delta — should go from 3 to 3 (remove 1, add 1, modify 1)
     let received_delta = timeout(Duration::from_secs(5), async {
@@ -3172,7 +3180,8 @@ async fn test_dp_applies_delta_adding_upstream() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     let applied = timeout(Duration::from_secs(5), async {
         loop {
@@ -3242,7 +3251,8 @@ async fn test_dp_applies_delta_removing_upstream() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     let applied = timeout(Duration::from_secs(5), async {
         loop {
@@ -3309,7 +3319,8 @@ async fn test_dp_applies_delta_modifying_upstream_targets() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     let applied = timeout(Duration::from_secs(5), async {
         loop {
@@ -3370,7 +3381,8 @@ async fn test_dp_applies_delta_adding_consumer() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     let applied = timeout(Duration::from_secs(5), async {
         loop {
@@ -3440,7 +3452,8 @@ async fn test_dp_applies_delta_removing_consumer() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     let applied = timeout(Duration::from_secs(5), async {
         loop {
@@ -3514,7 +3527,8 @@ async fn test_cp_broadcasts_delta_to_multiple_dps() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     // Both DPs should receive and apply the delta
     let both_applied = timeout(Duration::from_secs(5), async {
@@ -3599,7 +3613,8 @@ async fn test_dp_applies_delta_with_all_entity_types() {
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
 
     let applied = timeout(Duration::from_secs(5), async {
         loop {
