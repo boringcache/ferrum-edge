@@ -2470,6 +2470,47 @@ async fn multipart_encoding_headers_respect_header_object_required_default() {
     }
 }
 
+#[tokio::test]
+async fn multipart_encoding_bare_schema_headers_remain_required() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/bare-required-header",
+            "path_regex": "^/bare-required-header$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Token": {"type": "string", "minLength": 5}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let body =
+        "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--abc--\r\n";
+    let mut ctx = post_ctx("/bare-required-header");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
 #[test]
 fn multipart_encoding_header_bare_object_schema_is_not_a_header_object_wrapper() {
     OpenapiValidator::new(&json!({
