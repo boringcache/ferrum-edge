@@ -25,10 +25,6 @@ impl QueuedSummaryPayload {
     pub fn as_bytes(&self) -> &[u8] {
         self.json.as_bytes()
     }
-
-    pub fn len(&self) -> usize {
-        self.json.len()
-    }
 }
 
 /// Serialize `value` under `max_entry_bytes`, shrink the provisional lease, and
@@ -134,7 +130,7 @@ pub fn admit_stream_summary(
 /// Assemble a JSON array body from pre-serialized entries for HTTP/UDP sinks.
 pub fn assemble_json_array(batch: &[QueuedSummaryPayload]) -> String {
     let capacity = batch.iter().fold(2usize, |total, entry| {
-        total.saturating_add(entry.len().saturating_add(1))
+        total.saturating_add(entry.json.len().saturating_add(1))
     });
     let mut body = String::with_capacity(capacity);
     body.push('[');
@@ -153,7 +149,7 @@ pub fn assemble_ndjson(batch: &[QueuedSummaryPayload]) -> Vec<u8> {
     let mut body = Vec::with_capacity(
         batch
             .iter()
-            .map(|entry| entry.len().saturating_add(1))
+            .map(|entry| entry.json.len().saturating_add(1))
             .sum::<usize>(),
     );
     for entry in batch {
