@@ -1,9 +1,11 @@
 //! Issue #2986: DB/CP config poll-task exit classification and supervision.
 
-use ferrum_edge::modes::database::{DatabaseDeltaPollMetrics, PollCompletedGuard};
+use ferrum_edge::modes::database::{
+    DatabaseDeltaPollMetrics, run_poll_attempt_recording_completion,
+};
 use ferrum_edge::modes::db_poll_supervision::{
     DbPollTaskExitKind, classify_db_poll_task_exit, record_unexpected_cp_poll_task_exit,
-    supervise_control_plane_poll_task, supervise_database_mode_poll_task,
+    supervise_control_plane_poll_task, supervise_database_mode_poll_task_with_delay,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -129,17 +131,28 @@ async fn ordinary_cp_shutdown_does_not_degrade() {
     assert!(startup_ready.load(Ordering::Acquire));
 }
 
-#[tokio::test]
-async fn database_mode_supervisor_respawns_after_abort() {
+async fn yield_until(predicate: impl Fn() -> bool, label: &str) {
+    for _ in 0..10_000 {
+        if predicate() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("timed out waiting for {label}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn database_mode_supervisor_respawns_after_abort_with_delay() {
     let spawn_count = Arc::new(AtomicUsize::new(0));
     let first_abort = Arc::new(std::sync::Mutex::new(None));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let spawn_count_for_factory = spawn_count.clone();
     let first_abort_for_factory = first_abort.clone();
     let shutdown_tx_for_poll = shutdown_tx.clone();
+    let respawn_delay = Duration::from_secs(1);
 
     let supervisor = tokio::spawn(async move {
-        supervise_database_mode_poll_task(
+        supervise_database_mode_poll_task_with_delay(
             move || {
                 let n = spawn_count_for_factory.fetch_add(1, Ordering::AcqRel);
                 let mut shutdown_rx = shutdown_tx_for_poll.subscribe();
@@ -159,40 +172,44 @@ async fn database_mode_supervisor_respawns_after_abort() {
                 handle
             },
             shutdown_rx,
+            respawn_delay,
         )
         .await;
     });
 
-    // Wait for first generation abort handle.
-    let abort_handle = {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(handle) = first_abort
+    yield_until(
+        || {
+            first_abort
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clone()
-            {
-                break handle;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("timed out waiting for first poll generation");
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
+                .is_some()
+        },
+        "first poll generation",
+    )
+    .await;
+    let abort_handle = first_abort
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("abort handle");
     abort_handle.abort();
 
-    // Wait for respawn.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while spawn_count.load(Ordering::Acquire) < 2 {
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for respawn; spawn_count={}",
-                spawn_count.load(Ordering::Acquire)
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    // Supervisor observes abort and enters the respawn delay.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
     }
+    assert_eq!(
+        spawn_count.load(Ordering::Acquire),
+        1,
+        "respawn must wait for the bounded delay"
+    );
+
+    tokio::time::advance(respawn_delay).await;
+    yield_until(
+        || spawn_count.load(Ordering::Acquire) >= 2,
+        "respawn after delay",
+    )
+    .await;
 
     shutdown_tx.send(true).expect("shutdown");
     supervisor.await.expect("supervisor join");
@@ -202,16 +219,135 @@ async fn database_mode_supervisor_respawns_after_abort() {
     );
 }
 
-#[test]
-fn last_poll_completed_at_advances_on_empty_success_guard() {
+#[tokio::test(start_paused = true)]
+async fn database_mode_supervisor_rate_limits_repeated_unexpected_exits() {
+    let spawn_count = Arc::new(AtomicUsize::new(0));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let spawn_count_for_factory = spawn_count.clone();
+    let respawn_delay = Duration::from_millis(500);
+
+    let supervisor = tokio::spawn(async move {
+        supervise_database_mode_poll_task_with_delay(
+            move || {
+                spawn_count_for_factory.fetch_add(1, Ordering::AcqRel);
+                // Every generation exits immediately (unexpected completion).
+                tokio::spawn(async {})
+            },
+            shutdown_rx,
+            respawn_delay,
+        )
+        .await;
+    });
+
+    yield_until(
+        || spawn_count.load(Ordering::Acquire) >= 1,
+        "first spawn",
+    )
+    .await;
+    assert_eq!(spawn_count.load(Ordering::Acquire), 1);
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+
+    // Before the respawn delay elapses, no second generation.
+    tokio::time::advance(respawn_delay - Duration::from_millis(1)).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        spawn_count.load(Ordering::Acquire),
+        1,
+        "must not tight-loop respawn before delay elapses"
+    );
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    yield_until(
+        || spawn_count.load(Ordering::Acquire) >= 2,
+        "second spawn",
+    )
+    .await;
+    assert_eq!(spawn_count.load(Ordering::Acquire), 2);
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+
+    // Third generation also waits a full delay after the second unexpected exit.
+    tokio::time::advance(respawn_delay - Duration::from_millis(1)).await;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        spawn_count.load(Ordering::Acquire),
+        2,
+        "repeated failures must remain rate-limited"
+    );
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    yield_until(
+        || spawn_count.load(Ordering::Acquire) >= 3,
+        "third spawn",
+    )
+    .await;
+
+    shutdown_tx.send(true).expect("shutdown");
+    // Allow the supervisor to observe shutdown if it re-entered the delay sleep.
+    tokio::time::advance(respawn_delay).await;
+    supervisor.await.expect("supervisor join");
+    assert_eq!(
+        spawn_count.load(Ordering::Acquire),
+        3,
+        "shutdown after third spawn must not start another generation"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn database_mode_shutdown_interrupts_respawn_wait_without_another_generation() {
+    let spawn_count = Arc::new(AtomicUsize::new(0));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let spawn_count_for_factory = spawn_count.clone();
+    let respawn_delay = Duration::from_secs(5);
+
+    let supervisor = tokio::spawn(async move {
+        supervise_database_mode_poll_task_with_delay(
+            move || {
+                spawn_count_for_factory.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(async {})
+            },
+            shutdown_rx,
+            respawn_delay,
+        )
+        .await;
+    });
+
+    yield_until(
+        || spawn_count.load(Ordering::Acquire) >= 1,
+        "first spawn",
+    )
+    .await;
+    // Let the supervisor enter the respawn delay after unexpected completion.
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(spawn_count.load(Ordering::Acquire), 1);
+
+    shutdown_tx.send(true).expect("shutdown during respawn wait");
+    supervisor.await.expect("supervisor join");
+    assert_eq!(
+        spawn_count.load(Ordering::Acquire),
+        1,
+        "shutdown during respawn delay must not spawn another generation"
+    );
+}
+
+#[tokio::test]
+async fn last_poll_completed_at_advances_on_normal_empty_success() {
     let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
     assert_eq!(metrics.last_poll_completed_at_unix_ms(), 0);
-    assert!(metrics.snapshot().last_poll_completed_at.is_none());
 
-    {
-        let _guard = PollCompletedGuard::new(metrics.clone());
-        // Drop records completion — simulates an empty-but-successful poll tick.
-    }
+    run_poll_attempt_recording_completion(metrics.as_ref(), async {
+        // Empty-success poll tick body returns normally.
+    })
+    .await;
 
     let first = metrics.last_poll_completed_at_unix_ms();
     assert!(
@@ -221,12 +357,85 @@ fn last_poll_completed_at_advances_on_empty_success_guard() {
     assert!(metrics.snapshot().last_poll_completed_at.is_some());
 
     std::thread::sleep(Duration::from_millis(2));
-    {
-        let _guard = PollCompletedGuard::new(metrics.clone());
-    }
+    run_poll_attempt_recording_completion(metrics.as_ref(), async {
+        // Handled rejection/error path also returns normally.
+    })
+    .await;
     let second = metrics.last_poll_completed_at_unix_ms();
     assert!(
         second >= first,
-        "subsequent empty-success poll must advance or retain freshness"
+        "subsequent handled outcome must advance or retain freshness"
+    );
+}
+
+#[tokio::test]
+async fn mid_poll_abort_does_not_advance_freshness() {
+    let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+    // Seed a prior completed stamp so we can detect unwanted advancement.
+    run_poll_attempt_recording_completion(metrics.as_ref(), async {}).await;
+    let before = metrics.last_poll_completed_at_unix_ms();
+    assert!(before > 0);
+
+    let metrics_for_task = metrics.clone();
+    let handle = tokio::spawn(async move {
+        run_poll_attempt_recording_completion(metrics_for_task.as_ref(), async {
+            std::future::pending::<()>().await;
+        })
+        .await;
+    });
+    // Let the attempt future start, then abort mid-poll.
+    tokio::task::yield_now().await;
+    handle.abort();
+    let _ = handle.await;
+
+    assert_eq!(
+        metrics.last_poll_completed_at_unix_ms(),
+        before,
+        "JoinHandle abort mid-poll must leave last_poll_completed_at unchanged"
+    );
+}
+
+#[tokio::test]
+async fn mid_poll_panic_does_not_advance_freshness() {
+    let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+    run_poll_attempt_recording_completion(metrics.as_ref(), async {}).await;
+    let before = metrics.last_poll_completed_at_unix_ms();
+    assert!(before > 0);
+
+    let metrics_for_task = metrics.clone();
+    let handle = tokio::spawn(async move {
+        run_poll_attempt_recording_completion(metrics_for_task.as_ref(), async {
+            panic!("intentional mid-poll panic for freshness test");
+        })
+        .await;
+    });
+    let result = handle.await;
+    assert!(result.unwrap_err().is_panic());
+
+    assert_eq!(
+        metrics.last_poll_completed_at_unix_ms(),
+        before,
+        "panic mid-poll must leave last_poll_completed_at unchanged"
+    );
+}
+
+#[tokio::test]
+async fn dropping_in_flight_poll_attempt_future_does_not_advance_freshness() {
+    let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
+    run_poll_attempt_recording_completion(metrics.as_ref(), async {}).await;
+    let before = metrics.last_poll_completed_at_unix_ms();
+
+    {
+        let attempt = run_poll_attempt_recording_completion(metrics.as_ref(), async {
+            std::future::pending::<()>().await;
+        });
+        // Simulate select-cancellation / future drop during an in-flight poll.
+        drop(attempt);
+    }
+
+    assert_eq!(
+        metrics.last_poll_completed_at_unix_ms(),
+        before,
+        "dropping an in-flight poll attempt must not publish a fresh timestamp"
     );
 }

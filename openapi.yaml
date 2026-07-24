@@ -10501,8 +10501,9 @@ components:
         When `status` is `degraded` due to rejected incremental deltas, the
         gateway keeps serving the last known-good runtime config and leaves the
         accepted poll cursor unchanged. `last_poll_completed_at` advances on
-        every completed poll outcome (including empty success) so operators can
-        alert when the supervised poll task stops advancing.
+        every normally completed poll outcome (empty success, rejection, or
+        handled error — not panic/abort/cancel) so operators can alert when the
+        supervised poll task stops advancing.
       required: [status]
       properties:
         status:
@@ -10532,8 +10533,9 @@ components:
           type: string
           format: date-time
           description: |
-            RFC3339 timestamp of the most recently completed poll attempt,
-            including empty-success and rejection outcomes. Absent until the
+            RFC3339 timestamp of the most recently normally completed poll
+            attempt, including empty-success, rejection, and handled-error
+            outcomes. Panic/abort/cancellation do not advance it. Absent until the
             first poll tick finishes.
 
     DatabaseDeltaPollingMetrics:
@@ -10586,8 +10588,9 @@ components:
           type: string
           format: date-time
           description: |
-            RFC3339 timestamp of the most recently completed poll attempt,
-            including empty success. Absent until the first poll finishes.
+            RFC3339 timestamp of the most recently normally completed poll
+            attempt, including empty success. Panic/abort/cancellation do not
+            advance it. Absent until the first poll finishes.
           nullable: true
         degraded:
           anyOf:

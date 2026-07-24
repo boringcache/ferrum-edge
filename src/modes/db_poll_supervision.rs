@@ -15,17 +15,25 @@
 //!
 //! Mode policy on unexpected exit:
 //!
-//! * **database** — error-log and respawn a new poll generation (keep serving
-//!   last-known-good config).
+//! * **database** — error-log and respawn a new poll generation after a bounded,
+//!   shutdown-aware delay (keep serving last-known-good config). The delay
+//!   prevents a tight spawn/panic/log loop under deterministic regressions.
 //! * **cp** — sticky `serving_degraded` (mirrors listener-failure handling) so
 //!   `/health` becomes not-ready; do not respawn.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::error;
+
+/// Fixed delay before respawning a database-mode poll generation after an
+/// unexpected exit. Caps spawn/panic churn; interruptible by shutdown so drain
+/// stays prompt. Normal operation (healthy generations) is not delayed — the
+/// wait runs only after an unexpected exit, before the next `spawn_poll`.
+pub const DATABASE_POLL_RESPAWN_DELAY: Duration = Duration::from_secs(1);
 
 /// Classified outcome of awaiting a DB/CP config poll [`JoinHandle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,11 +104,34 @@ pub fn record_unexpected_cp_poll_task_exit(
 /// Supervise the database-mode poll task: respawn on unexpected exit until
 /// shutdown is requested.
 ///
+/// Uses [`DATABASE_POLL_RESPAWN_DELAY`] between unexpected exits and the next
+/// spawn. See [`supervise_database_mode_poll_task_with_delay`].
+pub async fn supervise_database_mode_poll_task<F>(
+    spawn_poll: F,
+    shutdown_rx: watch::Receiver<bool>,
+) where
+    F: FnMut() -> JoinHandle<()>,
+{
+    supervise_database_mode_poll_task_with_delay(
+        spawn_poll,
+        shutdown_rx,
+        DATABASE_POLL_RESPAWN_DELAY,
+    )
+    .await
+}
+
+/// Supervise the database-mode poll task with an explicit respawn delay.
+///
 /// `spawn_poll` must clone whatever state each generation needs. The supervisor
 /// owns shutdown observation and never leaves a finished handle unawaited.
-pub async fn supervise_database_mode_poll_task<F>(
+///
+/// After an unexpected exit, waits `respawn_delay` (via `tokio::time::sleep`)
+/// before the next spawn. Shutdown during that wait returns immediately without
+/// spawning another generation. A zero delay skips the wait (tests only).
+pub async fn supervise_database_mode_poll_task_with_delay<F>(
     mut spawn_poll: F,
     mut shutdown_rx: watch::Receiver<bool>,
+    respawn_delay: Duration,
 ) where
     F: FnMut() -> JoinHandle<()>,
 {
@@ -119,8 +150,13 @@ pub async fn supervise_database_mode_poll_task<F>(
                 }
                 error!(
                     exit = kind.as_str(),
-                    "Database-mode config poll task exited unexpectedly; respawning poll loop while continuing to serve last-known-good config"
+                    respawn_delay_ms = respawn_delay.as_millis() as u64,
+                    "Database-mode config poll task exited unexpectedly; respawning poll loop after bounded delay while continuing to serve last-known-good config"
                 );
+
+                if wait_for_respawn_delay_or_shutdown(&mut shutdown_rx, respawn_delay).await {
+                    return;
+                }
             }
             changed = shutdown_rx.changed() => {
                 // Poll task observes the same watch and should exit; await so
@@ -131,6 +167,29 @@ pub async fn supervise_database_mode_poll_task<F>(
                 let _ = classify_db_poll_task_exit(result, true);
                 return;
             }
+        }
+    }
+}
+
+/// Wait `delay` before respawn, or return `true` if shutdown was requested
+/// (including sender drop). Zero delay is a no-op success.
+async fn wait_for_respawn_delay_or_shutdown(
+    shutdown_rx: &mut watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    if *shutdown_rx.borrow() {
+        return true;
+    }
+    if delay.is_zero() {
+        return false;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {
+            *shutdown_rx.borrow()
+        }
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            true
         }
     }
 }
