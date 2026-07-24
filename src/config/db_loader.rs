@@ -341,10 +341,14 @@ pub struct DbPoolConfig {
     pub acquire_timeout_seconds: u64,
     pub idle_timeout_seconds: u64,
     pub max_lifetime_seconds: u64,
-    /// Maximum time (seconds) to wait for a new TCP connection to the database
-    /// server. Default: 10. Applies per connection attempt — separate from
-    /// `acquire_timeout_seconds` which covers the full pool checkout (wait +
-    /// connect). 0 = no explicit timeout (falls back to OS TCP timeout).
+    /// Maximum time (seconds) for each SQL pool *creation* attempt (initial
+    /// connect, failover, replica, reconnect, migrate). Default: 10.
+    ///
+    /// Enforced by [`await_pool_connect_with_timeout`] around sqlx
+    /// `AnyPoolOptions::connect` — sqlx 0.8's native PG/MySQL drivers ignore a
+    /// `connect_timeout` URL query parameter, so Ferrum must bound the future
+    /// itself. Separate from [`Self::acquire_timeout_seconds`], which still
+    /// covers in-pool checkout wait + connect. `0` disables the bound.
     pub connect_timeout_seconds: u64,
     /// Maximum execution time (seconds) for any single SQL statement. Default:
     /// 30, max 3600 (clamped at `EnvConfig` parse time). Set via
@@ -367,6 +371,45 @@ impl Default for DbPoolConfig {
             statement_timeout_seconds: 30,
         }
     }
+}
+
+/// Await a SQL pool-connect future with the configured per-attempt bound.
+///
+/// Centralized so initial, failover, replica, reconnect, and migrate paths
+/// cannot drift. `timeout_seconds == 0` leaves the future unbounded (OS /
+/// `acquire_timeout` still apply inside sqlx). On expiry the connect future is
+/// dropped — no detached attempt — and the error is a typed
+/// `sqlx::Error::Io(TimedOut)` with a non-secret message so failover / backup
+/// classification stays transient without embedding the DSN.
+pub(crate) async fn await_pool_connect_with_timeout<F, T>(
+    timeout_seconds: u64,
+    connect: F,
+) -> Result<T, sqlx::Error>
+where
+    F: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    if timeout_seconds == 0 {
+        return connect.await;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), connect).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("database pool connect timed out after {timeout_seconds}s"),
+        ))),
+    }
+}
+
+/// Connect an `AnyPool` under [`await_pool_connect_with_timeout`].
+///
+/// Does not mutate the URL: TLS / DSN query parameters are left untouched, and
+/// no ignored `connect_timeout=` query parameter is appended.
+pub(crate) async fn connect_any_pool_with_timeout(
+    options: AnyPoolOptions,
+    url: &str,
+    connect_timeout_seconds: u64,
+) -> Result<AnyPool, sqlx::Error> {
+    await_pool_connect_with_timeout(connect_timeout_seconds, options.connect(url)).await
 }
 
 /// Build the `SET` SQL for per-statement timeouts, or `None` when disabled.
@@ -1450,19 +1493,6 @@ impl DatabaseStore {
             })
     }
 
-    /// Append `connect_timeout` to a database URL for PostgreSQL and MySQL.
-    ///
-    /// This sets the driver-level TCP connect timeout — separate from
-    /// `acquire_timeout` which covers waiting for a pool slot + connecting.
-    /// SQLite is local I/O so connect timeout is not applicable.
-    pub(crate) fn append_connect_timeout(url: &str, db_type: &str, timeout_seconds: u64) -> String {
-        if timeout_seconds == 0 || db_type == "sqlite" {
-            return url.to_string();
-        }
-        let separator = if url.contains('?') { '&' } else { '?' };
-        format!("{}{}connect_timeout={}", url, separator, timeout_seconds)
-    }
-
     /// Connect to the database with the provided pool configuration and run migrations.
     pub async fn connect_with_pool_config(
         db_type: &str,
@@ -1472,12 +1502,12 @@ impl DatabaseStore {
         // Install all drivers
         sqlx::any::install_default_drivers();
 
-        let final_url =
-            Self::append_connect_timeout(db_url, db_type, pool_config.connect_timeout_seconds);
-
-        let pool = Self::build_pool_options_from_config(&pool_config, db_type)
-            .connect(&final_url)
-            .await?;
+        let pool = connect_any_pool_with_timeout(
+            Self::build_pool_options_from_config(&pool_config, db_type),
+            db_url,
+            pool_config.connect_timeout_seconds,
+        )
+        .await?;
 
         let store = Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
@@ -1527,15 +1557,13 @@ impl DatabaseStore {
     ) -> Result<Self, anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let final_url =
-            Self::append_connect_timeout(db_url, db_type, pool_config.connect_timeout_seconds);
-
         // `connect_lazy` does not attempt a connection — the pool is ready to
         // hand out connections on first query. Migrations are deferred until
         // the database becomes reachable and the polling loop drives a
-        // successful `reconnect()`.
+        // successful `reconnect()`. Eager reconnect/failover paths apply
+        // `connect_timeout_seconds` via [`connect_any_pool_with_timeout`].
         let pool =
-            Self::build_pool_options_from_config(&pool_config, db_type).connect_lazy(&final_url)?;
+            Self::build_pool_options_from_config(&pool_config, db_type).connect_lazy(db_url)?;
 
         Ok(Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
@@ -5954,13 +5982,12 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let final_url = Self::append_connect_timeout(
+        let new_pool = connect_any_pool_with_timeout(
+            self.build_pool_options(),
             db_url,
-            &self.db_type,
             self.pool_config.connect_timeout_seconds,
-        );
-
-        let new_pool = self.build_pool_options().connect(&final_url).await?;
+        )
+        .await?;
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
@@ -6102,13 +6129,12 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        let final_url = Self::append_connect_timeout(
+        let pool = connect_any_pool_with_timeout(
+            self.build_pool_options(),
             replica_url,
-            &self.db_type,
             self.pool_config.connect_timeout_seconds,
-        );
-
-        let pool = self.build_pool_options().connect(&final_url).await?;
+        )
+        .await?;
         sqlx::query("SELECT 1").fetch_one(&pool).await?;
 
         self.read_replica_pool.store(Some(Arc::new(pool)));
@@ -6207,18 +6233,17 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        let final_url = Self::append_connect_timeout(
-            replica_url,
-            &self.db_type,
-            self.pool_config.connect_timeout_seconds,
-        );
-
         info!(
             "Attempting read replica reconnect for admin reads (db_type={}, url={})",
             self.db_type,
             Self::redact_url(replica_url)
         );
-        let new_pool = self.build_pool_options().connect(&final_url).await?;
+        let new_pool = connect_any_pool_with_timeout(
+            self.build_pool_options(),
+            replica_url,
+            self.pool_config.connect_timeout_seconds,
+        )
+        .await?;
         sqlx::query("SELECT 1").fetch_one(&new_pool).await?;
 
         // Failover may have started while the connection was opening. Do not
