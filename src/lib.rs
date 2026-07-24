@@ -1288,6 +1288,44 @@ pub mod _test_support {
         plugin.force_cleanup_for_tests();
     }
 
+    pub fn ai_semantic_cache_maintenance_staged_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> bool {
+        plugin.maintenance_staged_for_tests()
+    }
+
+    pub fn ai_semantic_cache_maintenance_committed_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> bool {
+        plugin.maintenance_committed_for_tests()
+    }
+
+    pub fn ai_semantic_cache_maintenance_handle_count_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.maintenance_handle_count_for_tests()
+    }
+
+    pub fn ai_semantic_cache_notify_cleanup_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) {
+        plugin.notify_cleanup_for_tests();
+    }
+
+    pub fn ai_semantic_cache_notify_rebuild_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) {
+        plugin.notify_rebuild_for_tests();
+    }
+
+    pub fn ai_semantic_cache_set_singleflight_wait_override_for_test(
+        wait: Option<std::time::Duration>,
+    ) {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::set_singleflight_wait_override_for_tests(
+            wait,
+        );
+    }
+
     pub fn ai_semantic_cache_set_store_post_admit_hook_for_test(
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
         hook: Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>,

@@ -507,13 +507,30 @@ struct ConnectionSlot {
 /// Outcome of a size-bounded Redis fetch ([`RedisRateLimitClient::get_bytes_bounded`]).
 #[derive(Debug)]
 pub enum BoundedRedisValue {
-    /// Key absent, or the stored value is empty.
+    /// Key is absent.
     Missing,
+    /// Key exists but holds an empty value. Callers must quarantine rather than
+    /// treating this as a permanent miss that leaves the empty key in place.
+    Empty,
     /// Value present and within the requested byte cap.
     Found(Vec<u8>),
     /// Value present but its true length exceeds the cap; only a bounded prefix
     /// was transferred. Callers should treat it as invalid and quarantine it.
     Oversized { length: usize },
+}
+
+/// Convert a Redis `GETRANGE` inclusive end index from a byte cap.
+///
+/// Redis treats a negative end index as an offset from the end of the string
+/// (`-1` = last byte / whole value). Casting an unbounded `usize` cap with
+/// `as isize` can therefore saturate to `-1` and ask Redis for the entire
+/// attacker-controlled value. Fail closed before dispatch when the cap cannot
+/// be represented as a non-negative `isize`.
+pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, ()> {
+    if max_bytes == 0 {
+        return Err(());
+    }
+    isize::try_from(max_bytes).map_err(|_| ())
 }
 
 /// gateway's shared DNS cache. On connection failure, every pool slot is cleared
@@ -1474,26 +1491,34 @@ impl RedisRateLimitClient {
     ///
     /// A plain `GET` would allocate the full stored value regardless of size, so
     /// a compromised or oversized entry could force an unbounded allocation. This
-    /// reads `STRLEN` and `GETRANGE key 0 max_bytes` atomically: the true length
-    /// gates the outcome while the range read caps the transferred/allocated
-    /// bytes at `max_bytes + 1`. Callers treat [`BoundedRedisValue::Oversized`]
-    /// as an invalid entry and quarantine it.
+    /// reads `EXISTS`, `STRLEN`, and `GETRANGE key 0 max_bytes` atomically: the
+    /// true length gates the outcome while the range read caps the
+    /// transferred/allocated bytes at `max_bytes + 1`. The inclusive end index
+    /// is converted with [`redis_getrange_end_index`] so an oversized cap cannot
+    /// become Redis's "read to end" (`-1`) sentinel. Returned prefixes are
+    /// independently verified against the bound before admission. Callers treat
+    /// [`BoundedRedisValue::Oversized`] and [`BoundedRedisValue::Empty`] as
+    /// invalid entries and quarantine them.
     pub async fn get_bytes_bounded(
         &self,
         key: &str,
         max_bytes: usize,
     ) -> Result<BoundedRedisValue, ()> {
+        // Fail closed before any Redis dispatch when the cap cannot be expressed
+        // as a non-negative GETRANGE end index (for example `usize::MAX` → `-1`).
+        let end = redis_getrange_end_index(max_bytes)?;
         let mut conn = self.get_connection().await.ok_or(())?;
 
         // GETRANGE end index is inclusive, so `0..=max_bytes` reads at most
         // `max_bytes + 1` bytes — enough to confirm an over-cap value without
-        // materializing it. STRLEN reports the true length so the outcome is
-        // gated on the real size, not the (bounded) prefix. Pipelined in one
+        // materializing it. EXISTS distinguishes a missing key from an empty
+        // value so callers can quarantine empty poisoned keys. Pipelined in one
         // round-trip (non-transactional like `get_two_counters`); a concurrent
-        // rewrite between the two commands can only cause a benign spurious
+        // rewrite between the commands can only cause a benign spurious
         // quarantine/miss, never an unbounded allocation.
-        let end = max_bytes as isize;
-        let result: Result<(usize, Vec<u8>), redis::RedisError> = redis::pipe()
+        let result: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("EXISTS")
+            .arg(key)
             .cmd("STRLEN")
             .arg(key)
             .cmd("GETRANGE")
@@ -1504,12 +1529,39 @@ impl RedisRateLimitClient {
             .await;
 
         match result {
-            Ok((length, prefix)) => {
+            Ok((exists, length, prefix)) => {
                 self.available.store(true, Ordering::Relaxed);
+                if exists == 0 {
+                    return Ok(BoundedRedisValue::Missing);
+                }
                 if length == 0 {
-                    Ok(BoundedRedisValue::Missing)
-                } else if length > max_bytes {
+                    return Ok(BoundedRedisValue::Empty);
+                }
+                // Independently verify Redis honored the bound. An over-cap probe
+                // may return at most `max_bytes + 1` bytes; an in-cap value must
+                // never exceed `max_bytes`.
+                let max_prefix = if length > max_bytes {
+                    max_bytes.saturating_add(1)
+                } else {
+                    max_bytes
+                };
+                if prefix.len() > max_prefix {
+                    warn!(
+                        key = %key,
+                        prefix_len = prefix.len(),
+                        max_bytes,
+                        "Redis GETRANGE returned more bytes than the requested bound; failing closed"
+                    );
+                    return Err(());
+                }
+                if length > max_bytes {
                     Ok(BoundedRedisValue::Oversized { length })
+                } else if prefix.len() != length {
+                    // Length/prefix disagreement under the cap is treated as an
+                    // invalid entry so callers quarantine rather than replay.
+                    Ok(BoundedRedisValue::Oversized {
+                        length: prefix.len().max(length),
+                    })
                 } else {
                     Ok(BoundedRedisValue::Found(prefix))
                 }
@@ -1518,7 +1570,7 @@ impl RedisRateLimitClient {
                 warn!(
                     key = %key,
                     error = %e,
-                    "Redis STRLEN+GETRANGE failed"
+                    "Redis EXISTS+STRLEN+GETRANGE failed"
                 );
                 self.mark_unavailable();
                 Err(())
@@ -1777,7 +1829,15 @@ impl std::fmt::Debug for RedisRateLimitClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_floored_total, floor_zero_compensation};
+    use super::{clamp_floored_total, floor_zero_compensation, redis_getrange_end_index};
+
+    #[test]
+    fn redis_getrange_end_index_rejects_zero_and_platform_overflow() {
+        assert!(redis_getrange_end_index(0).is_err());
+        assert!(redis_getrange_end_index(usize::MAX).is_err());
+        assert_eq!(redis_getrange_end_index(1).expect("1 fits"), 1);
+        assert_eq!(redis_getrange_end_index(1024).expect("1 KiB fits"), 1024);
+    }
 
     #[test]
     fn floor_zero_compensation_skips_non_negative_totals() {

@@ -8246,6 +8246,7 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
         .iter()
         .chain(AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS.iter())
         .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+        .chain(std::iter::once(&"redis_integrity_key"))
         .copied()
         .collect();
     assert_eq!(
