@@ -13623,6 +13623,7 @@ pub use inner::MongoStore;
 // Narrow crate-internal test seams (exposed only through `_test_support`): the
 // timeout-precedence application and the identity reservation rollback/release
 // accounting. Everything else stays module-private in `inner`.
+#[allow(unused_imports)] // The binary target has no `_test_support` consumer.
 pub(crate) use inner::{
     apply_mongo_timeout_overrides, consumer_identity_adoption_failure_release_values,
     ordered_insert_newly_inserted_prefix,
