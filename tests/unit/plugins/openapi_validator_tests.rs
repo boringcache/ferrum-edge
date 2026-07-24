@@ -3624,3 +3624,146 @@ async fn non_overlapping_exploded_objects_convert_one_wire_key_to_one_property()
             .await,
     );
 }
+
+#[tokio::test]
+async fn multipart_earliest_separator_rejects_mixed_lf_crlf_blank_line() {
+    // Residual of #3015: a header block that ends with an LF line followed by a
+    // CRLF blank line (`...name"\n\r\n...`) matches neither `\n\n` nor
+    // `\r\n\r\n`. Recognizing only those two patterns lets a later `\r\n\r\n`
+    // win, promoting the intervening `X-Reclassified` line into part headers.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/payload",
+            "path_regex": "^/payload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["payload"],
+                        "properties": {
+                            "payload": {"type": "string", "const": "safe"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=b");
+
+    // The mixed `\n\r\n` blank line must be the header/body separator, so the
+    // `X-Reclassified` line stays body bytes and the const check sees the whole
+    // smuggled prefix rather than a bare "safe".
+    let body = b"--b\r\nContent-Disposition: form-data; name=\"payload\"\n\r\nX-Reclassified: attacker-controlled\r\n\r\nsafe\r\n--b--\r\n";
+    let mut ctx = post_ctx("/payload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await,
+        Some(400),
+    );
+    let err = request_error(&ctx).unwrap_or_default();
+    assert!(
+        !err.contains("duplicate header"),
+        "body prefix must remain body bytes, not reclassified headers: {err}"
+    );
+
+    // A part that legitimately uses the mixed `\n\r\n` blank line as its sole
+    // header/body separator still parses, with the body consumed correctly.
+    let body = b"--b\r\nContent-Disposition: form-data; name=\"payload\"\n\r\nsafe\r\n--b--\r\n";
+    let mut ctx = post_ctx("/payload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await,
+    );
+}
+
+#[test]
+fn exploded_free_form_object_cannot_coexist_with_declared_exploded_object() {
+    // Residual of #3019: admission rejects two free-form exploded objects and
+    // declared-child collisions, but a single free-form object coexisting with a
+    // declared exploded object was admitted. At runtime the free-form object
+    // absorbs the declared object's child keys, so one wire occurrence populates
+    // two logical properties depending on declaration order. Fail closed instead.
+    for media_type in ["application/x-www-form-urlencoded", "multipart/form-data"] {
+        let result = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/mix",
+                "path_regex": "^/mix$",
+                "request_body": {
+                    "content": {
+                        (media_type): {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "freeform": {
+                                        "type": "object",
+                                        "additionalProperties": {"type": "string"}
+                                    },
+                                    "declared": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"x": {"type": "string"}}
+                                    }
+                                }
+                            },
+                            "encoding": {
+                                "freeform": {"style": "form", "explode": true},
+                                "declared": {"style": "form", "explode": true}
+                            }
+                        }
+                    }
+                }
+            }]
+        }));
+        let error = match result {
+            Ok(_) => {
+                panic!("{media_type}: free-form + declared exploded objects must fail admission")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("free-form object") && error.contains("cannot coexist"),
+            "{media_type}: unexpected admission error: {error}"
+        );
+    }
+
+    // A lone free-form exploded object (no other exploded object) still admits.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/labels",
+            "path_regex": "^/labels$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["labels"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "labels": {
+                                    "type": "object",
+                                    "additionalProperties": {"type": "integer"}
+                                }
+                            }
+                        },
+                        "encoding": {
+                            "labels": {"style": "form", "explode": true}
+                        }
+                    }
+                }
+            }
+        }]
+    }));
+    assert!(
+        plugin.is_ok(),
+        "a lone free-form exploded object must remain valid: {:?}",
+        plugin.err()
+    );
+}

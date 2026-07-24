@@ -1232,13 +1232,15 @@ fn parse_encoding_map(
 }
 
 /// Fail closed when explode=true form objects would emit the same wire key into
-/// more than one logical JSON property (root sibling or sibling exploded object).
+/// more than one logical JSON property (root sibling, sibling exploded object,
+/// or a free-form object whose unbounded child key space overlaps another).
 fn reject_exploded_object_key_collisions(
     schema: &Value,
     encoding: &AHashMap<String, PropertyEncoding>,
 ) -> Result<(), String> {
     let root_names = declared_object_property_names(schema);
     let mut exploded_children: Vec<(&str, HashSet<String>)> = Vec::new();
+    let mut free_form: Vec<&str> = Vec::new();
     for (property, property_encoding) in encoding {
         if property_encoding.style != EncodingStyle::Form || !property_encoding.explode {
             continue;
@@ -1248,6 +1250,11 @@ fn reject_exploded_object_key_collisions(
         };
         if !schema_accepts_object(property_schema) {
             continue;
+        }
+        // A free-form object (additionalProperties not false) absorbs any wire
+        // key that is not a root sibling, so its emitted-key space is unbounded.
+        if additional_property_schema_for_conversion(property_schema).is_some() {
+            free_form.push(property.as_str());
         }
         let child_names = declared_object_property_names(property_schema);
         for child in &child_names {
@@ -1274,6 +1281,26 @@ fn reject_exploded_object_key_collisions(
                 overlap.join(", ")
             ));
         }
+    }
+    // An unbounded free-form key space intersects the declared child keys of
+    // every other exploded object (those keys are, by the root check above,
+    // non-root wire keys the free-form object would also absorb). One wire
+    // occurrence could then populate two logical properties depending on schema
+    // declaration order, so reject the coexistence fail-closed. (Two free-form
+    // objects are already rejected earlier as mutually ambiguous.)
+    if let Some(free) = free_form.first().copied()
+        && exploded_children.len() > 1
+    {
+        let mut others: Vec<&str> = exploded_children
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| *name != free)
+            .collect();
+        others.sort_unstable();
+        return Err(format!(
+            "encoding explode=true free-form object '{free}' cannot coexist with other explode=true object properties ({}); its unbounded child key space would populate more than one logical property",
+            others.join(", ")
+        ));
     }
     Ok(())
 }
@@ -3785,22 +3812,42 @@ fn parse_part_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, St
     Ok(out)
 }
 
-/// Choose the earliest syntactically valid header/body terminator.
+/// Choose the earliest header/body separator: the first blank line, i.e. the
+/// first CRLF/LF line terminator immediately followed by another CRLF/LF
+/// terminator.
 ///
-/// Preferring CRLF-CRLF whenever it exists anywhere in the part would let a
-/// later body occurrence reclassify an earlier LF-LF body prefix as headers.
+/// Matching only `\r\n\r\n` and `\n\n` (and taking the lower index) still misses
+/// mixed `\n\r\n` / `\r\n\n` blank lines. A part whose header block ends with an
+/// LF line but whose blank line is CRLF (`...name"\n\r\n...`) then has no early
+/// match, so a later separator wins and the intervening body prefix is
+/// reclassified as part headers. Scanning every terminator keeps the earliest
+/// blank line winning regardless of CRLF/LF mixing, so body bytes before a later
+/// separator can never be promoted into headers.
 fn split_header_body(segment: &[u8]) -> Option<(&[u8], &[u8])> {
-    let crlf = memchr::memmem::find(segment, b"\r\n\r\n");
-    let lf = memchr::memmem::find(segment, b"\n\n");
-    match (crlf, lf) {
-        (Some(crlf_at), Some(lf_at)) if crlf_at <= lf_at => {
-            Some((&segment[..crlf_at], &segment[crlf_at + 4..]))
+    let mut search = 0;
+    while let Some(rel) = memchr::memchr(b'\n', &segment[search..]) {
+        let lf = search + rel;
+        // The line terminator ending at `lf` starts at a preceding CR when present.
+        let term_start = if lf > 0 && segment[lf - 1] == b'\r' {
+            lf - 1
+        } else {
+            lf
+        };
+        // A blank line requires a second terminator immediately after the first.
+        let after = lf + 1;
+        let second_len = if segment[after..].starts_with(b"\r\n") {
+            Some(2)
+        } else if segment[after..].starts_with(b"\n") {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(second_len) = second_len {
+            return Some((&segment[..term_start], &segment[after + second_len..]));
         }
-        (Some(_), Some(lf_at)) => Some((&segment[..lf_at], &segment[lf_at + 2..])),
-        (Some(crlf_at), None) => Some((&segment[..crlf_at], &segment[crlf_at + 4..])),
-        (None, Some(lf_at)) => Some((&segment[..lf_at], &segment[lf_at + 2..])),
-        (None, None) => None,
+        search = lf + 1;
     }
+    None
 }
 
 fn trim_trailing_line_break(mut value: &[u8]) -> &[u8] {
