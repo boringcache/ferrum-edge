@@ -1451,7 +1451,7 @@ fn classify_clickhouse_status(
             .record_failure(FailureReason::Http4xx, message.clone());
         return DeliveryOutcome::PayloadTooLarge { message };
     }
-    if code == 408 || code == 429 || status.is_server_error() {
+    if code == 401 || code == 403 || code == 408 || code == 429 || status.is_server_error() {
         let reason = if status.is_server_error() {
             FailureReason::Http5xx
         } else {
