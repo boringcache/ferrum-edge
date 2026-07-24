@@ -1993,10 +1993,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                  before it can poison the freshness watermark"
                             );
                             if !was_empty {
-                                update_state_config_diverged(
-                                    connection_state,
-                                    divergence_metrics,
-                                );
+                                update_state_config_diverged(connection_state, divergence_metrics);
                             }
                             return Ok(DpStreamEnd::InvalidDeltaFreshness);
                         }
@@ -2014,8 +2011,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         let removed_proxy_count = result.removed_proxy_ids.len();
                         let removed_upstream_count = result.removed_upstream_ids.len();
                         let removed_consumer_count = result.removed_consumer_ids.len();
-                        let removed_plugin_config_count =
-                            result.removed_plugin_config_ids.len();
+                        let removed_plugin_config_count = result.removed_plugin_config_ids.len();
                         let cp_version = update.ferrum_version.clone();
                         let update_version = update.version;
 
