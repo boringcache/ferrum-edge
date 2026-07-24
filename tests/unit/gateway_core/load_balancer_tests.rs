@@ -253,10 +253,10 @@ fn test_load_balancer_cache() {
     };
 
     let cache = LoadBalancerCache::new(&config);
-    let t = cache.select_target("us1", "", None);
+    let t = cache.select_target("ferrum", "us1", "", None);
     assert!(t.is_some());
 
-    let t = cache.select_target("nonexistent", "", None);
+    let t = cache.select_target("ferrum", "nonexistent", "", None);
     assert!(t.is_none());
 }
 
@@ -638,12 +638,12 @@ fn test_least_latency_cache_record_and_select() {
 
     // Record latencies via the cache interface
     for _ in 0..10 {
-        cache.record_latency("us1", &targets[0], 10_000); // host0: 10ms
-        cache.record_latency("us1", &targets[1], 2_000); // host1: 2ms
+        cache.record_latency("ferrum", "us1", &targets[0], 10_000); // host0: 10ms
+        cache.record_latency("ferrum", "us1", &targets[1], 2_000); // host1: 2ms
     }
 
     // Should prefer host1 (lower latency)
-    let sel = cache.select_target("us1", "", None).unwrap();
+    let sel = cache.select_target("ferrum", "us1", "", None).unwrap();
     assert_eq!(
         sel.target.host, "host1",
         "Cache should route to lowest-latency target"
@@ -1077,12 +1077,12 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
 
     let cache = LoadBalancerCache::new(&config);
     assert_eq!(
-        cache.get_hash_on_strategy("us1"),
+        cache.get_hash_on_strategy("ferrum", "us1"),
         HashOnStrategy::Cookie("srv".to_string())
     );
     // Non-existent upstream returns Ip default
     assert_eq!(
-        cache.get_hash_on_strategy("nonexistent"),
+        cache.get_hash_on_strategy("ferrum", "nonexistent"),
         HashOnStrategy::Ip
     );
 }
@@ -1378,7 +1378,7 @@ fn test_apply_delta_add_upstream() {
     let cache = LoadBalancerCache::new(&config);
 
     // Initially no upstreams
-    assert!(cache.select_target("u1", "", None).is_none());
+    assert!(cache.select_target("ferrum", "u1", "", None).is_none());
 
     let added = vec![make_upstream("u1", make_targets(2))];
     let new_config = GatewayConfig {
@@ -1388,7 +1388,7 @@ fn test_apply_delta_add_upstream() {
     cache.apply_delta(&new_config, &added, &[], &[]);
 
     // Now u1 should be available
-    let sel = cache.select_target("u1", "", None);
+    let sel = cache.select_target("ferrum", "u1", "", None);
     assert!(sel.is_some(), "Upstream u1 should be selectable after add");
 }
 
@@ -1402,14 +1402,14 @@ fn test_apply_delta_remove_upstream() {
     let cache = LoadBalancerCache::new(&config);
 
     // u1 exists
-    assert!(cache.select_target("u1", "", None).is_some());
+    assert!(cache.select_target("ferrum", "u1", "", None).is_some());
 
     let new_config = GatewayConfig::default();
     cache.apply_delta(&new_config, &[], &[NamespacedResourceId::new("ferrum", "u1")], &[]);
 
     // u1 should be gone
     assert!(
-        cache.select_target("u1", "", None).is_none(),
+        cache.select_target("ferrum", "u1", "", None).is_none(),
         "Upstream u1 should be gone after removal"
     );
 }
@@ -1440,7 +1440,7 @@ fn test_apply_delta_modify_upstream_targets() {
     };
     cache.apply_delta(&new_config, &[], &[], &[modified_u1]);
 
-    let sel = cache.select_target("u1", "", None).unwrap();
+    let sel = cache.select_target("ferrum", "u1", "", None).unwrap();
     assert_eq!(sel.target.host, "new-backend");
     assert_eq!(sel.target.port, 9999);
 }
@@ -1456,8 +1456,8 @@ fn test_apply_delta_mixed_add_remove_modify() {
     let cache = LoadBalancerCache::new(&config);
 
     // Verify both exist
-    assert!(cache.select_target("u1", "", None).is_some());
-    assert!(cache.select_target("u2", "", None).is_some());
+    assert!(cache.select_target("ferrum", "u1", "", None).is_some());
+    assert!(cache.select_target("ferrum", "u2", "", None).is_some());
 
     // Add u3, remove u1, modify u2
     let u3 = make_upstream("u3", make_targets(3));
@@ -1472,15 +1472,15 @@ fn test_apply_delta_mixed_add_remove_modify() {
     cache.apply_delta(&new_config, &[u3], &[NamespacedResourceId::new("ferrum", "u1")], &[modified_u2]);
 
     assert!(
-        cache.select_target("u1", "", None).is_none(),
+        cache.select_target("ferrum", "u1", "", None).is_none(),
         "u1 should be removed"
     );
     assert!(
-        cache.select_target("u2", "", None).is_some(),
+        cache.select_target("ferrum", "u2", "", None).is_some(),
         "u2 should still exist (modified)"
     );
     assert!(
-        cache.select_target("u3", "", None).is_some(),
+        cache.select_target("ferrum", "u3", "", None).is_some(),
         "u3 should be added"
     );
 }
@@ -1498,7 +1498,7 @@ fn test_apply_delta_empty_is_noop() {
     cache.apply_delta(&config, &[], &[], &[]);
 
     assert!(
-        cache.select_target("u1", "", None).is_some(),
+        cache.select_target("ferrum", "u1", "", None).is_some(),
         "u1 should still exist after empty delta"
     );
 }
@@ -1525,9 +1525,9 @@ fn test_apply_delta_preserves_unaffected_upstreams() {
     };
     cache.apply_delta(&new_config, &[u3], &[], &[]);
 
-    assert!(cache.select_target("u1", "", None).is_some());
-    assert!(cache.select_target("u2", "", None).is_some());
-    assert!(cache.select_target("u3", "", None).is_some());
+    assert!(cache.select_target("ferrum", "u1", "", None).is_some());
+    assert!(cache.select_target("ferrum", "u2", "", None).is_some());
+    assert!(cache.select_target("ferrum", "u3", "", None).is_some());
 }
 
 // ─── Random Algorithm Tests ─────────────────────────────────────────────────

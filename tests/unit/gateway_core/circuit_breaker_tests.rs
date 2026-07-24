@@ -2108,14 +2108,14 @@ fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
 
     // CLOSED admission captures generation 0 and is not a probe.
     let (_cb, is_probe, epoch) = cache
-        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .can_execute_with_admission_epoch("ferrum", proxy_id, Some(&tk), &config)
         .expect("closed admits");
     assert!(!is_probe, "closed-state admission is not a half-open probe");
     assert_eq!(epoch, 0, "closed admission captures the current generation");
 
     // Trip the breaker (generation -> 1).
     let (cb, _, _) = cache
-        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .can_execute_with_admission_epoch("ferrum", proxy_id, Some(&tk), &config)
         .expect("still closed");
     cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
@@ -2123,7 +2123,7 @@ fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
     // The next admission (timeout=0) is a HALF_OPEN probe and captures generation 1
     // — the cycle it is probing — not the pre-trip generation 0.
     let (_cb, is_probe, epoch) = cache
-        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .can_execute_with_admission_epoch("ferrum", proxy_id, Some(&tk), &config)
         .expect("half-open admits a probe");
     assert!(is_probe, "open+timeout=0 admits a half-open probe");
     assert_eq!(

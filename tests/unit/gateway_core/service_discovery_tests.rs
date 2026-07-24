@@ -359,7 +359,9 @@ fn test_load_balancer_cache_update_targets_selection_works() {
     let cache = LoadBalancerCache::new(&config);
 
     // Select from old targets
-    let sel = cache.select_target("up", "key", None).unwrap();
+    let sel = cache
+        .select_target("ferrum", "up", "key", None)
+        .unwrap();
     assert_eq!(sel.target.host, "old-host");
 
     // Update to new targets
@@ -370,7 +372,9 @@ fn test_load_balancer_cache_update_targets_selection_works() {
     );
 
     // Select from new targets
-    let sel = cache.select_target("up", "key", None).unwrap();
+    let sel = cache
+        .select_target("ferrum", "up", "key", None)
+        .unwrap();
     assert_eq!(sel.target.host, "new-host");
     assert_eq!(sel.target.port, 9090);
 }
@@ -1581,7 +1585,11 @@ fn test_load_balancer_cache_update_targets_nonexistent_upstream() {
     // A stale service-discovery update must not create a selectable phantom
     // balancer after the upstream has been removed from config.
     assert!(cache.get_upstream("ferrum", "does-not-exist").is_none());
-    assert!(cache.select_target("does-not-exist", "key", None).is_none());
+    assert!(
+        cache
+            .select_target("ferrum", "does-not-exist", "key", None)
+            .is_none()
+    );
 }
 
 #[test]
