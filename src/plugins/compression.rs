@@ -20,6 +20,15 @@
 //! produced, shared H1/H2/H3 buffered transforms restore an identity response
 //! with matching headers rather than emitting a mislabeled body.
 //!
+//! Response compression reserves its codec admission in `before_proxy`, ahead of
+//! the response-buffer decision, so the same semaphore also bounds the
+//! population of response bodies collected for compression rather than only the
+//! codec workers. A request that negotiates a supported coding but cannot obtain
+//! a bounded permit streams identity instead of pinning a (possibly unbounded)
+//! body onto the compression-only buffered path; `after_proxy` consumes the
+//! reserved permit and never reacquires once a streaming/identity path is
+//! chosen, failing closed with 406 only when identity is prohibited.
+//!
 //! Multiple effective instances compose with first-wins ownership: one instance
 //! owns request decode and one owns response encode per request so Content-
 //! Encoding stays 1:1 with body coding layers across the shared H1/H2/H3
@@ -762,6 +771,64 @@ impl CompressionPlugin {
         }
     }
 
+    /// The client's negotiated `Accept-Encoding` for response compression.
+    ///
+    /// Prefers the snapshot saved in `before_proxy` (the live header may then be
+    /// stripped by `remove_accept_encoding`, and `ctx.headers` may be empty on
+    /// the zero-clone request fast path). Falls back to the live request header
+    /// for the rare paths where no snapshot was staged. Response-buffer,
+    /// reservation, and `after_proxy` negotiation all read through here so the
+    /// three decisions stay consistent for one request.
+    fn negotiated_accept_encoding(ctx: &RequestContext) -> Option<&str> {
+        ctx.metadata
+            .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
+            .map(String::as_str)
+            .or_else(|| ctx.headers.get("accept-encoding").map(String::as_str))
+    }
+
+    /// Reserve one response-compression codec permit for this request when this
+    /// instance can select a supported nonzero coding for the client's
+    /// `Accept-Encoding`. Runs in `before_proxy`, ahead of the response-buffer
+    /// decision, so the buffered population is bounded by the same codec
+    /// semaphore that bounds codec workers.
+    ///
+    /// `HEAD` carries no re-encodable wire body, so it never reserves. First
+    /// success across sibling instances wins, keeping this to one response
+    /// permit per request. On admission pressure the request is marked
+    /// declined so the response streams identity (or fails closed with 406 when
+    /// identity is prohibited) rather than buffering for a compression it cannot
+    /// run; `after_proxy` must not reacquire on that path.
+    fn reserve_response_compression_admission(&self, ctx: &mut RequestContext) {
+        if !self.has_response_codec()
+            || ctx.method.eq_ignore_ascii_case("HEAD")
+            || ctx.has_compression_response_admission_owner()
+        {
+            return;
+        }
+        let selects_coding = Self::negotiated_accept_encoding(ctx)
+            .is_some_and(|ae| matches!(self.select_algorithm(ae), CodingSelection::Compress(_)));
+        if !selects_coding {
+            return;
+        }
+        match try_acquire_codec_permit() {
+            Ok(permit) => {
+                let claimed = ctx.claim_compression_response_admission(self.instance_id);
+                debug_assert!(
+                    claimed,
+                    "response admission owner changed within a sequential hook chain"
+                );
+                ctx.set_compression_response_codec_permit(permit);
+            }
+            Err(()) => {
+                ctx.mark_compression_response_admission_declined();
+                warn!(
+                    "compression: codec admission saturated at reservation; \
+                     response will stream identity instead of buffering for compression"
+                );
+            }
+        }
+    }
+
     /// Whether this response can be gateway-compressed (content-type whitelist
     /// and optional Content-Length minimum). Protocol-hard skips (no-body
     /// statuses, ranges, already-encoded upstream) are checked separately.
@@ -1372,17 +1439,32 @@ impl Plugin for CompressionPlugin {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Skip response buffering when the client doesn't accept any encoding
-        // we support — there's nothing to compress. HEAD never carries a wire
-        // body the gateway can re-encode, so do not pin it onto the buffered
-        // path either (preserves backend representation metadata).
-        !self.config.algorithms.is_empty()
-            && !ctx.method.eq_ignore_ascii_case("HEAD")
-            && ctx.headers.contains_key("accept-encoding")
-            && !ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
-            && !ctx
+        // HEAD never carries a wire body the gateway can re-encode, and request
+        // no-transform opts out of gateway response compression; neither pins
+        // the body onto the buffered path (preserving backend representation
+        // metadata / RFC 9111).
+        if ctx.method.eq_ignore_ascii_case("HEAD")
+            || ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+            || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
+        {
+            return false;
+        }
+        // `before_proxy` negotiated a compressible coding but could not obtain a
+        // bounded codec permit: stream identity instead of buffering for a
+        // compression that cannot run (and never enter the buffered path on the
+        // strength of admission it does not hold).
+        if ctx.compression_response_admission_declined() {
+            return false;
+        }
+        // Negotiate the original client Accept-Encoding: buffer only when this
+        // instance can actually select a supported nonzero coding. Identity,
+        // unsupported-only, and `gzip;q=0, br;q=0` requests have nothing to
+        // compress, so they stream instead of forcing a full-body collection.
+        self.has_response_codec()
+            && Self::negotiated_accept_encoding(ctx)
+                .is_some_and(|ae| matches!(self.select_algorithm(ae), CodingSelection::Compress(_)))
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1542,6 +1624,17 @@ impl Plugin for CompressionPlugin {
             if self.config.remove_accept_encoding && self.has_response_codec() {
                 headers.remove("accept-encoding");
             }
+
+            // Reserve response-compression codec admission now, before the
+            // response-buffer decision, so a request that cannot obtain a
+            // bounded permit never pins a (potentially unbounded) response body
+            // onto the compression-only buffered path. Negotiate against the
+            // just-saved client Accept-Encoding: buffering only pays off when
+            // this instance can select a supported nonzero coding. First-wins
+            // across sibling instances keeps it to one response permit per
+            // request; `after_proxy` consumes this reserved permit instead of
+            // acquiring a fresh one on the hot path.
+            self.reserve_response_compression_admission(ctx);
         }
 
         // For request decompression: when the shared pre-`before_proxy`
@@ -1570,18 +1663,20 @@ impl Plugin for CompressionPlugin {
 
         // No-body statuses (`204`/`205`/`304`), HEAD, and already-coded
         // upstream responses are protocol-correct as-is; negotiation does not
-        // invent a 406 for them or rewrite representation metadata.
+        // invent a 406 for them or rewrite representation metadata. A permit
+        // reserved in `before_proxy` for such a response produces no coding, so
+        // release it promptly rather than idling the slot until request end.
         if Self::is_protocol_hard_skip(ctx, response_status, response_headers) {
+            ctx.release_compression_response_admission_if_owner(self.instance_id);
             return PluginResult::Continue;
         }
 
         let range_or_delta =
             Self::is_non_transformable_range_or_delta(ctx, response_status, response_headers);
 
-        let accept_encoding = ctx
-            .metadata
-            .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
-            .or_else(|| ctx.headers.get("accept-encoding"));
+        // Same source precedence as the buffer decision and the reservation:
+        // the saved snapshot wins over the (possibly stripped) live header.
+        let accept_encoding = Self::negotiated_accept_encoding(ctx);
 
         let selection = accept_encoding.map(|ae| self.select_algorithm(ae));
         match selection {
@@ -1608,17 +1703,58 @@ impl Plugin for CompressionPlugin {
                 PluginResult::Continue
             }
             Some(CodingSelection::Compress(algo)) => {
+                // Resolve identity acceptability into an owned flag before any
+                // mutable `ctx` access below so the `accept_encoding` borrow ends
+                // here (the reserved-permit take/set otherwise conflicts with it).
+                let identity_unacceptable =
+                    accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0);
+
                 let can_encode = !on_rejection
                     && !range_or_delta
                     && !ctx.has_compression_response_encode_owner()
                     && !Self::response_forbids_transform(ctx, response_headers)
                     && self.is_compression_eligible(response_headers);
                 if can_encode {
-                    let Ok(permit) = try_acquire_codec_permit() else {
-                        // Saturation: do not commit Content-Encoding. Fall through
-                        // to identity (or 406 when identity is unacceptable).
-                        warn!("compression: codec admission saturated; serving identity response");
-                        if accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0)
+                    // Obtain the codec permit for this coding. The reservation in
+                    // `before_proxy` is what bounded entry onto the buffered path,
+                    // so a request that chose to stream must never reacquire:
+                    //   * this instance reserved it -> consume the held permit
+                    //     (the common path; no reacquire on the hot path);
+                    //   * admission was declined under pressure -> do NOT
+                    //     reacquire; the request already chose to stream, so fall
+                    //     through to identity (or 406 when identity is barred);
+                    //   * a sibling still owns the reservation -> it owns the one
+                    //     coding layer; do not open a second permit for the same
+                    //     request;
+                    //   * otherwise acquire once. This is reachable when an
+                    //     earlier sibling reserved this request (so the body is
+                    //     already bounded/buffered) but declined to encode *this*
+                    //     representation and released its permit, leaving a later
+                    //     sibling with a broader config to compress the
+                    //     already-admitted body. The buffered population stays
+                    //     bounded because entry onto the buffered path still
+                    //     required a reservation at `before_proxy` time.
+                    let permit = if ctx.owns_compression_response_admission(self.instance_id) {
+                        ctx.take_compression_response_codec_permit()
+                    } else if ctx.compression_response_admission_declined()
+                        || ctx.has_compression_response_admission_owner()
+                    {
+                        None
+                    } else {
+                        try_acquire_codec_permit().ok()
+                    };
+
+                    let Some(permit) = permit else {
+                        // No bounded admission for the negotiated coding (declined
+                        // at reservation, or owned by a sibling). Do not commit
+                        // Content-Encoding: serve identity, or 406 when identity
+                        // is unacceptable. Saturation already warned at the
+                        // `before_proxy` reservation, so keep this at debug.
+                        debug!(
+                            "compression: no reserved codec admission for negotiated coding; \
+                             serving identity response"
+                        );
+                        if identity_unacceptable
                             && Self::should_fail_closed_not_acceptable(ctx, on_rejection)
                         {
                             return not_acceptable_reject();
@@ -1670,11 +1806,14 @@ impl Plugin for CompressionPlugin {
 
                 // Cannot produce the selected coded representation (range/delta,
                 // size / content-type eligibility, no-transform / strong ETag, or
-                // reject-path without body transforms). If identity is also
-                // unacceptable, fail closed rather than forwarding an excluded
-                // identity body — and never partially mutate compression headers.
-                // On the reject path, only `response_caching` HITs are replaced.
-                if accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0)
+                // reject-path without body transforms). Release any permit this
+                // instance reserved so it does not idle while the identity body
+                // streams. If identity is also unacceptable, fail closed rather
+                // than forwarding an excluded identity body — and never partially
+                // mutate compression headers. On the reject path, only
+                // `response_caching` HITs are replaced.
+                ctx.release_compression_response_admission_if_owner(self.instance_id);
+                if identity_unacceptable
                     && Self::should_fail_closed_not_acceptable(ctx, on_rejection)
                 {
                     return not_acceptable_reject();
