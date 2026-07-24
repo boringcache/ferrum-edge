@@ -184,7 +184,7 @@ impl ConfigDelta {
             let old_changed_proxy_scoped: HashSet<ResourceKey<'_>> = old_config
                 .plugin_configs
                 .iter()
-                .filter(|pc| changed_pc_keys.contains(&resource_key(pc)))
+                .filter(|pc| changed_pc_keys.contains(&resource_key(*pc)))
                 .filter_map(|pc| {
                     pc.proxy_id
                         .as_deref()
@@ -373,7 +373,7 @@ impl HasNamespacedIdAndTimestamp for Upstream {
 fn diff_added<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
     let old_keys: HashSet<ResourceKey<'_>> = old.iter().map(resource_key).collect();
     new.iter()
-        .filter(|r| !old_keys.contains(&resource_key(r)))
+        .filter(|r| !old_keys.contains(&resource_key(*r)))
         .cloned()
         .collect()
 }
@@ -385,7 +385,7 @@ fn diff_removed_ids<T: HasNamespacedIdAndTimestamp>(
 ) -> Vec<NamespacedResourceId> {
     let new_keys: HashSet<ResourceKey<'_>> = new.iter().map(resource_key).collect();
     old.iter()
-        .filter(|r| !new_keys.contains(&resource_key(r)))
+        .filter(|r| !new_keys.contains(&resource_key(*r)))
         .map(namespaced_id_of)
         .collect()
 }
@@ -405,7 +405,7 @@ fn diff_modified<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -
     new.iter()
         .filter(|r| {
             old_map
-                .get(&resource_key(r))
+                .get(&resource_key(*r))
                 .is_some_and(|&old_ts| r.updated_at() != old_ts)
         })
         .cloned()
@@ -427,7 +427,7 @@ fn diff_plugin_association_changes(old: &[Proxy], new: &[Proxy]) -> Vec<Namespac
     new.iter()
         .filter(|proxy| {
             old_by_key
-                .get(&resource_key(proxy))
+                .get(&resource_key(*proxy))
                 .is_some_and(|old_proxy| !same_plugin_associations(old_proxy, proxy))
         })
         .map(namespaced_id_of)

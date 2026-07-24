@@ -609,6 +609,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![target("a2.local", 81)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -624,6 +625,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u2",
                         vec![target("b2.local", 82)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -780,6 +782,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![target("b.local", 81)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -845,6 +848,7 @@ mod tests {
             |current| {
                 Some(LoadBalancerCache::build_update_targets_inner(
                     &current.load_balancer,
+                    "ferrum",
                     "u1",
                     vec![target("b.local", 81)],
                     LoadBalancerAlgorithm::RoundRobin,
@@ -909,7 +913,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("ferrum", "p1")
+                .get_plugins(&rk("p1"))
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -940,6 +944,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![blue.clone(), replacement_green],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1001,7 +1006,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("ferrum", "p1")
+                .get_plugins(&rk("p1"))
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1031,6 +1036,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![first.clone(), added.clone()],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1084,7 +1090,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("ferrum", "p1")
+                .get_plugins(&rk("p1"))
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1167,7 +1173,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("ferrum", "p1")
+                .get_plugins(&rk("p1"))
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1195,6 +1201,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![target("b.local", 81)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1259,6 +1266,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![target("c.local", 82)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1351,6 +1359,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u2",
                         vec![target("replacement-unrelated.local", 81)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1364,7 +1373,7 @@ mod tests {
 
         let plugin = pinned_epoch
             .plugin_cache
-            .get_plugins("ferrum", "p1")
+            .get_plugins(&rk("p1"))
             .iter()
             .find(|plugin| plugin.name() == "adaptive_concurrency")
             .cloned()

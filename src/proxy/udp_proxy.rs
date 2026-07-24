@@ -549,11 +549,10 @@ fn resolve_udp_session_epoch_view(
         .proxy_by_id(resolved_proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", resolved_proxy_id))?
         .clone();
-    let plugins = epoch.plugin_cache.get_plugins_for_protocol(
-        &proxy.namespace,
-        &proxy.id,
-        ProxyProtocol::Udp,
-    );
+    let proxy_key = crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &proxy.id);
+    let plugins = epoch
+        .plugin_cache
+        .get_plugins_for_protocol(&proxy_key, ProxyProtocol::Udp);
     let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
         .iter()
         .filter(|p| p.requires_udp_datagram_hooks())
@@ -2378,9 +2377,11 @@ async fn start_dtls_frontend_listener(
                     warn!(proxy_id = %proxy_id, "DTLS listener proxy no longer exists in request epoch");
                     continue;
                 };
+                let proxy_key =
+                    crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &proxy.id);
                 let plugins = epoch
                     .plugin_cache
-                    .get_plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Udp);
+                    .get_plugins_for_protocol(&proxy_key, ProxyProtocol::Udp);
                 let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
                     .iter()
                     .filter(|p| p.requires_udp_datagram_hooks())

@@ -3172,8 +3172,8 @@ fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin
     }
 }
 
-/// All plugin-cache state swapped as a single unit so a single load observes
-/// either the old generation or the new generation, never a partial rebuild.
+// All plugin-cache state swapped as a single unit so a single load observes
+// either the old generation or the new generation, never a partial rebuild.
 thread_local! {
     /// Reusable scratch buffer for `namespace|proxy_id` runtime keys used by the
     /// per-request plugin-cache accessors.

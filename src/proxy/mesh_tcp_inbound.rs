@@ -62,11 +62,10 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // TCP-protocol chain via its global fallback — which carries the
     // mesh-injected `__mesh_authz` global. A `Reject` closes the captured
     // connection (drop) instead of relaying to the app.
-    let plugins = epoch.plugin_cache.get_plugins_for_protocol(
-        &proxy.namespace,
-        &proxy.id,
-        ProxyProtocol::Tcp,
-    );
+    let proxy_key = crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &proxy.id);
+    let plugins = epoch
+        .plugin_cache
+        .get_plugins_for_protocol(&proxy_key, ProxyProtocol::Tcp);
 
     // No global TCP chain resolved: relay immediately. There is no plugin state
     // to track and no policy to evaluate, so the connect/disconnect lifecycle is

@@ -1216,6 +1216,7 @@ pub(crate) async fn handle_h3_websocket(
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = crate::load_balancer::LoadBalancerCache::get_upstream_from(
                 &epoch.load_balancer,
+                &proxy.namespace,
                 upstream_id,
             );
             let default_cc = crate::config::types::HashOnCookieConfig::default();

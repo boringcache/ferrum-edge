@@ -1466,13 +1466,13 @@ async fn run_tcp_accept_loop(
                     let proxy_namespace = final_proxy
                         .map(|p| p.namespace.clone())
                         .unwrap_or_else(crate::config::types::default_namespace);
+                    let proxy_key = crate::config::db_backend::namespaced_runtime_key(
+                        &proxy_namespace,
+                        &final_proxy_id,
+                    );
                     let plugins = epoch
                         .plugin_cache
-                        .get_plugins_for_protocol(
-                            &proxy_namespace,
-                            &final_proxy_id,
-                            ProxyProtocol::Tcp,
-                        );
+                        .get_plugins_for_protocol(&proxy_key, ProxyProtocol::Tcp);
                     let proxy_name = stream_ctx.proxy_name.clone();
                     let backend_scheme = final_proxy
                         .map(|p| p.effective_scheme())
@@ -2184,6 +2184,7 @@ async fn handle_tcp_connection_inner(
             .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
 
         let cb_info = TcpConnCbInfo {
+            namespace: proxy.namespace.clone(),
             cb_config: proxy.circuit_breaker.clone(),
             cb_target_key,
             is_half_open_probe: false,
@@ -2240,10 +2241,10 @@ async fn handle_tcp_connection_inner(
         remote_addr.ip(),
     )?;
 
-    let plugins =
-        epoch
-            .plugin_cache
-            .get_plugins_for_protocol(&proxy.namespace, proxy_id, ProxyProtocol::Tcp);
+    let proxy_key = crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, proxy_id);
+    let plugins = epoch
+        .plugin_cache
+        .get_plugins_for_protocol(&proxy_key, ProxyProtocol::Tcp);
 
     // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
     // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
@@ -2319,7 +2320,7 @@ async fn handle_tcp_connection_inner(
         // half-open probe flag for the matching record_success/failure call.
         if let Some(ref cb_config) = cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
-                &proxy.namespace,
+                &cb_info.namespace,
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2390,7 +2391,7 @@ async fn handle_tcp_connection_inner(
             Err(e) => {
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
+                        &cb_info.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
@@ -2441,7 +2442,7 @@ async fn handle_tcp_connection_inner(
                 // traffic cannot wedge HALF_OPEN.
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
+                        &cb_info.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
@@ -2468,7 +2469,7 @@ async fn handle_tcp_connection_inner(
                 .inspect_err(|_| {
                     if let Some(ref cb_config) = cb_info.cb_config {
                         let cb = circuit_breaker_cache.get_or_create(
-                            &proxy.namespace,
+                            &cb_info.namespace,
                             proxy_id,
                             cb_info.cb_target_key.as_deref(),
                             cb_config,
@@ -2548,7 +2549,7 @@ async fn handle_tcp_connection_inner(
         // Record circuit breaker outcome.
         if let Some(ref cb_config) = cb_info.cb_config {
             let cb = circuit_breaker_cache.get_or_create(
-                &proxy.namespace,
+                &cb_info.namespace,
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2727,7 +2728,7 @@ async fn handle_tcp_connection_inner(
         |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
             if let Some(ref cb_config) = cb_info.cb_config {
                 let cb = cb_cache.get_or_create(
-                    &proxy.namespace,
+                    &cb_info.namespace,
                     proxy_id,
                     cb_info.cb_target_key.as_deref(),
                     cb_config,
@@ -2745,7 +2746,7 @@ async fn handle_tcp_connection_inner(
         |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
             if let Some(ref cb_config) = cb_info.cb_config {
                 let cb = cb_cache.get_or_create(
-                    &proxy.namespace,
+                    &cb_info.namespace,
                     proxy_id,
                     cb_info.cb_target_key.as_deref(),
                     cb_config,
@@ -2777,7 +2778,7 @@ async fn handle_tcp_connection_inner(
         // for actual probe requests.
         if let Some(ref cb_config) = current_cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
-                &proxy.namespace,
+                &current_cb_info.namespace,
                 proxy_id,
                 current_cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2811,6 +2812,7 @@ async fn handle_tcp_connection_inner(
                             current_port = next.1;
                             current_policy_port = next.2;
                             current_cb_info = TcpConnCbInfo {
+                                namespace: current_cb_info.namespace.clone(),
                                 cb_config: current_cb_info.cb_config.clone(),
                                 cb_target_key: params.upstream_id.as_ref().map(|_| {
                                     crate::circuit_breaker::target_key(&current_host, current_port)
@@ -2886,6 +2888,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -2964,6 +2967,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -3059,6 +3063,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -3301,7 +3306,7 @@ async fn handle_tcp_connection_inner(
     // Record circuit breaker outcome based on copy result.
     if let Some(ref cb_config) = current_cb_info.cb_config {
         let cb = circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
+            &current_cb_info.namespace,
             proxy_id,
             current_cb_info.cb_target_key.as_deref(),
             cb_config,
@@ -4047,7 +4052,7 @@ mod backend_target_selection_tests {
             .find_map(|i| {
                 let key = format!("198.51.100.{i}");
                 let initial = LoadBalancerCache::select_target_for_port_from(
-                    &snapshot, "orders", &key, 5432, None,
+                    &snapshot, "ferrum", "orders", &key, 5432, None,
                 )?;
                 let exclude = UpstreamTarget {
                     host: initial.target.host.clone(),
@@ -4059,10 +4064,11 @@ mod backend_target_selection_tests {
                     locality: None,
                 };
                 let expected = LoadBalancerCache::select_next_target_for_port_from(
-                    &snapshot, "orders", &key, 5432, &exclude, None,
+                    &snapshot, "ferrum", "orders", &key, 5432, &exclude, None,
                 )?;
                 let failed_host_key = LoadBalancerCache::select_next_target_for_port_from(
                     &snapshot,
+                    "ferrum",
                     "orders",
                     &initial.target.host,
                     5432,
@@ -4101,7 +4107,13 @@ mod backend_target_selection_tests {
             locality: None,
         };
         let expected = LoadBalancerCache::select_next_target_for_port_from(
-            &snapshot, "orders", &flow_key, 5432, &exclude, None,
+            &snapshot,
+            "ferrum",
+            "orders",
+            &flow_key,
+            5432,
+            &exclude,
+            None,
         )
         .expect("expected retry target");
         assert_eq!(host, expected.host);
