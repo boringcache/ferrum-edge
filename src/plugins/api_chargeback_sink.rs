@@ -4302,13 +4302,7 @@ async fn emit_periodic_snapshot_off_thread(
     let metrics = Arc::clone(&runtime.metrics);
     let generation = runtime.generation;
     match tokio::task::spawn_blocking(move || {
-        emit_periodic_snapshot(
-            &accumulator,
-            &runtime,
-            &config,
-            &node_id,
-            &emission_lock,
-        )
+        emit_periodic_snapshot(&accumulator, &runtime, &config, &node_id, &emission_lock)
     })
     .await
     {
@@ -4337,13 +4331,7 @@ async fn emit_final_snapshot_to_spool_off_thread(
     let metrics = Arc::clone(&runtime.metrics);
     let generation = runtime.generation;
     match tokio::task::spawn_blocking(move || {
-        emit_final_snapshot_to_spool(
-            &accumulator,
-            &runtime,
-            &config,
-            &node_id,
-            &emission_lock,
-        )
+        emit_final_snapshot_to_spool(&accumulator, &runtime, &config, &node_id, &emission_lock)
     })
     .await
     {
