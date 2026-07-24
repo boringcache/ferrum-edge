@@ -1405,7 +1405,9 @@ fn test_pooled_h2_send_request_classifier_is_public_for_dispatch_sites() {
         "map_h2_err must use the canonical pooled-send classifier"
     );
     assert!(
-        !mod_src.contains("connection_error: true,\n                backend_resolved_ip: resolved_ip,\n                error_class: Some(retry::ErrorClass::ProtocolError)"),
+        !mod_src.contains(
+            "connection_error: true,\n                backend_resolved_ip: resolved_ip,\n                error_class: Some(retry::ErrorClass::ProtocolError)"
+        ),
         "must not hard-code connection_error=true with ProtocolError"
     );
 }

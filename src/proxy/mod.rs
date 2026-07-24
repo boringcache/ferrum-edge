@@ -21170,7 +21170,11 @@ async fn handle_proxy_request_inner(
         // coupling ownership to the response lifecycle is defense-in-depth,
         // while the raw client still handles the legal residual reset (#2057).
         let mut held_frontend_grpc_upload: Option<grpc_proxy::GrpcBody> = None;
-        let (mut grpc_result, grpc_body_bytes, grpc_replay_headers) = if grpc_needs_request_body_hooks {
+        let (
+            mut grpc_result,
+            grpc_body_bytes,
+            grpc_replay_headers,
+        ) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
             let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
                 ClientRequestBody::Streaming(request) => {
