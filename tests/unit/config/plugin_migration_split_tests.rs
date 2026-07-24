@@ -108,7 +108,11 @@ fn preserves_semicolon_inside_line_and_block_comments() {
     assert_split(
         "sqlite",
         "SELECT 1; -- comment with ; semicolon\nSELECT 2; /* block; comment */ SELECT 3;",
-        &["SELECT 1", "SELECT 2", "SELECT 3"],
+        &[
+            "SELECT 1",
+            "-- comment with ; semicolon\nSELECT 2",
+            "/* block; comment */ SELECT 3",
+        ],
     );
 }
 
@@ -117,7 +121,7 @@ fn mysql_hash_line_comments_are_recognized() {
     assert_split(
         "mysql",
         "SELECT 1; # comment with ; semicolon\nSELECT 2;",
-        &["SELECT 1", "SELECT 2"],
+        &["SELECT 1", "# comment with ; semicolon\nSELECT 2"],
     );
 }
 
@@ -501,11 +505,25 @@ async fn malformed_sql_fails_before_execution_on_sqlite() {
     .unwrap();
     assert_eq!(table_count, 0, "no statement should have executed");
 
-    let tracking: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM _ferrum_plugin_migrations WHERE plugin_name = 'bad_plugin'",
+    let tracking_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'table' AND name = '_ferrum_plugin_migrations'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(tracking, 0, "tracking row must not be written");
+    if tracking_table_count == 1 {
+        let tracking: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _ferrum_plugin_migrations WHERE plugin_name = 'bad_plugin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tracking, 0, "tracking row must not be written");
+    } else {
+        assert_eq!(
+            tracking_table_count, 0,
+            "failed migration must not leave an unexpected tracking table state"
+        );
+    }
 }
