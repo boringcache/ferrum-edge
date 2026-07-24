@@ -22,6 +22,7 @@ mod api_chargeback_sink_tests;
 mod api_chargeback_tests;
 mod basic_auth_tests;
 mod batching_logger_tests;
+mod byte_budget_tests;
 mod body_transform_tests;
 mod body_validator_tests;
 mod bot_detection_tests;

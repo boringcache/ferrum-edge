@@ -11353,6 +11353,24 @@ components:
           minimum: 1
           maximum: 1000000
           description: Channel capacity — new entries are dropped when full
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum serialized bytes for one admitted log record. Oversized
+            records are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1024
+          maximum: 268435456
+          description: >-
+            Aggregate retained serialized-content budget across queued and
+            retrying records. Admission reserves max_entry_bytes before
+            serialization and shrinks that lease to the exact retained size.
+            Must be at least max_entry_bytes.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -11441,6 +11459,22 @@ components:
           minimum: 1
           maximum: 1000000
           description: Channel capacity — new entries are dropped when full
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum serialized bytes for one admitted NDJSON record. Oversized
+            records are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1024
+          maximum: 268435456
+          description: >-
+            Aggregate retained serialized-content budget across queued and
+            retrying records. Must be at least max_entry_bytes.
         connect_timeout_ms:
           type: integer
           default: 5000
@@ -11585,6 +11619,22 @@ components:
           minimum: 1
           maximum: 1000000
           description: Channel capacity — new entries are dropped when full
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum serialized bytes for one admitted JSON record. Oversized
+            records are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1024
+          maximum: 268435456
+          description: >-
+            Aggregate retained serialized-content budget across queued and
+            retrying records. Must be at least max_entry_bytes.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -20779,6 +20829,14 @@ components:
               minimum: 1
               maximum: 1000000
               default: 50000
+            buffer_max_bytes:
+              type: integer
+              minimum: 1
+              maximum: 268435456
+              default: 16777216
+              description: >-
+                Aggregate retained-byte budget for queued ChargeEvent records
+                awaiting ClickHouse export.
         retry:
           type: object
           additionalProperties: false
@@ -20840,6 +20898,17 @@ components:
               type: integer
               minimum: 1
               default: 60
+            delivery_queue_capacity:
+              type: integer
+              minimum: 1
+              maximum: 1000000
+              default: 4096
+              description: >-
+                Bounded async handoff queue for overflow and failed-batch spool
+                writes. Request and body terminal hooks only enqueue here;
+                compression, directory work, writes, and fsync run on the owned
+                delivery worker. Saturation drops are counted without blocking
+                the proxy path.
             compression:
               type: string
               enum: [zstd, none]

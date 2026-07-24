@@ -226,13 +226,14 @@ bucket.
       "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "1" },
       "timeout_ms": 5000
     },
-    "batch": { "size": 500, "flush_interval_ms": 2000, "buffer_capacity": 50000 },
+    "batch": { "size": 500, "flush_interval_ms": 2000, "buffer_capacity": 50000, "buffer_max_bytes": 16777216 },
     "retry": { "max_attempts": 5, "initial_delay_ms": 250, "max_delay_ms": 10000, "jitter": true },
     "spool": {
       "enabled": true,
       "dir": "/var/lib/ferrum/chargeback-spool",
       "max_bytes": 10737418240,
       "replay_interval_secs": 60,
+      "delivery_queue_capacity": 4096,
       "compression": "zstd"
     },
     "snapshot": {
@@ -290,7 +291,12 @@ Spool files are written under:
 <spool.dir>/<node_id>/<YYYYMMDD>/<ULID>.ndjson.zst
 ```
 
-The sink writes failed batches and queue high-water overflow to disk. Files are
+The sink writes failed batches and queue high-water overflow to an async spool
+delivery worker (bounded by `spool.delivery_queue_capacity`). Request and body
+terminal hooks only enqueue to that worker; compression, directory scans, writes,
+and fsync never run inline on those hooks. Saturation of the delivery queue is
+counted (`chargeback_sink_spool_jobs_lost_total` /
+`chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
 created with private permissions, written as `*.tmp`, fsynced, and renamed into
 place. The background replayer scans durable data files (`*.ndjson` /
 `*.ndjson.zst`) in lexicographic order.

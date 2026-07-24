@@ -45,12 +45,15 @@ use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finit
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::utils::{
-    BatchConfig, BatchingLogger, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
+    BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
+    HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
     MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    RetryPolicy, wait_until_committed,
+    RetryPolicy, wait_until_committed, wait_until_committed_or_closed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
+use crate::observability_delivery::DeliveryWorkerControl;
+use tokio::sync::mpsc;
 
 const PLUGIN_NAME: &str = "api_chargeback_sink";
 const STREAM_STATUS_SENTINEL: u16 = 0;
@@ -62,8 +65,20 @@ const SNAPSHOT_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_FINALIZE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FIELD_LEN: usize = 512;
 const MAX_METADATA_FIELD_LEN: usize = 256;
+/// Conservative ceiling for one owned [`ChargeEvent`] after field bounding.
+const MAX_CHARGE_EVENT_BYTES: usize = 96 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
+const SPOOL_JOB_WARN_EVERY: u64 = 100;
 const GRPC_STATUS_OTHER_SENTINEL: u32 = u32::MAX;
+
+fn default_buffer_max_bytes() -> usize {
+    DEFAULT_BUFFER_MAX_BYTES
+}
+
+fn default_spool_delivery_queue_capacity() -> usize {
+    4_096
+}
+
 /// Deployment-safe ceiling for ClickHouse export attempt count (total attempts,
 /// including the initial try). Rejects the historical silent `.max(1)` rewrite
 /// of `0` and unbounded `u32::MAX` budgets that can pin the sole flush worker.
@@ -414,6 +429,9 @@ pub struct BatchSettings {
     pub flush_interval_ms: u64,
     #[serde(default = "default_buffer_capacity")]
     pub buffer_capacity: usize,
+    /// Aggregate retained-byte budget for queued charge events awaiting export.
+    #[serde(default = "default_buffer_max_bytes")]
+    pub buffer_max_bytes: usize,
 }
 
 impl Default for BatchSettings {
@@ -422,6 +440,7 @@ impl Default for BatchSettings {
             size: default_batch_size(),
             flush_interval_ms: default_flush_interval_ms(),
             buffer_capacity: default_buffer_capacity(),
+            buffer_max_bytes: default_buffer_max_bytes(),
         }
     }
 }
@@ -461,6 +480,11 @@ pub struct SpoolSettings {
     pub max_bytes: u64,
     #[serde(default = "default_spool_replay_interval_secs")]
     pub replay_interval_secs: u64,
+    /// Bounded async handoff queue for overflow/failed-batch spool writes.
+    /// Request-path hooks only enqueue here; compression/write/fsync run on the
+    /// dedicated delivery worker.
+    #[serde(default = "default_spool_delivery_queue_capacity")]
+    pub delivery_queue_capacity: usize,
     pub compression: SpoolCompression,
 }
 
@@ -471,6 +495,7 @@ impl Default for SpoolSettings {
             dir: default_spool_dir(),
             max_bytes: default_spool_max_bytes(),
             replay_interval_secs: default_spool_replay_interval_secs(),
+            delivery_queue_capacity: default_spool_delivery_queue_capacity(),
             compression: SpoolCompression::default(),
         }
     }
@@ -643,9 +668,164 @@ struct SinkRuntime {
     plugin_config_id: Arc<str>,
     generation: u64,
     summary: SinkSummary,
-    logger: BatchingLogger<ChargeEvent>,
+    logger: BatchingLogger<QueuedChargeEvent>,
+    byte_budget: Arc<ByteBudget>,
     metrics: Arc<SinkMetrics>,
     spool: Option<Arc<SpoolManager>>,
+    spool_delivery: Option<Arc<SpoolDelivery>>,
+}
+
+/// Charge event retained in the export queue under a byte lease.
+#[derive(Clone)]
+struct QueuedChargeEvent {
+    event: ChargeEvent,
+    lease: Arc<ByteLease>,
+}
+
+enum SpoolJob {
+    Events(Vec<ChargeEvent>),
+}
+
+/// Bounded async handoff for spool compression/write/fsync work.
+struct SpoolDelivery {
+    sender: mpsc::Sender<SpoolJob>,
+    worker: Arc<DeliveryWorkerControl>,
+    pending: Arc<AtomicUsize>,
+    metrics: Arc<SinkMetrics>,
+}
+
+impl SpoolDelivery {
+    fn try_enqueue(&self, events: Vec<ChargeEvent>, _reason: &'static str) -> bool {
+        if events.is_empty() {
+            return true;
+        }
+        let event_count = events.len() as u64;
+        let Some(_admission) = self.worker.try_admit() else {
+            self.metrics
+                .record_spool_job_loss(event_count, "worker unavailable during shutdown");
+            return false;
+        };
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        match self.sender.try_send(SpoolJob::Events(events)) {
+            Ok(()) => {
+                self.metrics
+                    .spool_jobs_enqueued_total
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+                self.metrics
+                    .record_spool_job_loss(event_count, "delivery queue full");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+                self.metrics
+                    .record_spool_job_loss(event_count, "delivery queue closed");
+                false
+            }
+        }
+    }
+
+    fn pending_jobs(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
+    }
+}
+
+fn start_spool_delivery(
+    spool: Arc<SpoolManager>,
+    metrics: Arc<SinkMetrics>,
+    capacity: usize,
+    commit_rx: watch::Receiver<bool>,
+) -> Arc<SpoolDelivery> {
+    let capacity = capacity.clamp(1, MAX_BUFFER_CAPACITY);
+    let (sender, mut receiver) = mpsc::channel(capacity);
+    let pending = Arc::new(AtomicUsize::new(0));
+    let pending_for_control = Arc::clone(&pending);
+    let pending_for_loop = Arc::clone(&pending);
+    let (worker_control, close_rx) = DeliveryWorkerControl::new(PLUGIN_NAME, move || {
+        pending_for_control.load(Ordering::Relaxed) as u64
+    });
+    let completion = worker_control.completion();
+    let worker_drain = Arc::clone(&worker_control);
+    let metrics_for_worker = Arc::clone(&metrics);
+    let task = tokio::spawn(async move {
+        let mut completion = completion;
+        if !wait_until_committed_or_closed(commit_rx, close_rx.clone()).await {
+            drop(receiver);
+            completion.complete();
+            return;
+        }
+        let mut closing = *close_rx.borrow();
+        if closing {
+            worker_drain.wait_for_admissions().await;
+            receiver.close();
+        }
+        let mut close_rx = close_rx;
+        loop {
+            tokio::select! {
+                biased;
+                _ = close_rx.changed(), if !closing => {
+                    closing = true;
+                    worker_drain.wait_for_admissions().await;
+                    receiver.close();
+                }
+                job = receiver.recv() => {
+                    match job {
+                        Some(SpoolJob::Events(events)) => {
+                            let event_count = events.len() as u64;
+                            let spool = Arc::clone(&spool);
+                            let metrics = Arc::clone(&metrics_for_worker);
+                            let write_result = tokio::task::spawn_blocking(move || {
+                                spool.write_events(&events)
+                            })
+                            .await;
+                            match write_result {
+                                Ok(Ok(_)) => {
+                                    metrics
+                                        .spool_jobs_written_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    invalidate_status_cache();
+                                }
+                                Ok(Err(error)) => {
+                                    warn!(
+                                        plugin = PLUGIN_NAME,
+                                        error = %error,
+                                        "Chargeback sink async spool write failed"
+                                    );
+                                    metrics.record_spool_job_loss(event_count, "spool write failed");
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        plugin = PLUGIN_NAME,
+                                        error = %error,
+                                        "Chargeback sink async spool write task failed"
+                                    );
+                                    metrics.record_spool_job_loss(event_count, "spool write task failed");
+                                }
+                            }
+                            pending_for_loop.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        completion.complete();
+    });
+    if let Err(error) = worker_control.install_abort_handle(task.abort_handle()) {
+        warn!(plugin = PLUGIN_NAME, "{PLUGIN_NAME}: {error}");
+        task.abort();
+    }
+    drop(task);
+    crate::observability_delivery::register_worker(Arc::clone(&worker_control));
+    Arc::new(SpoolDelivery {
+        sender,
+        worker: worker_control,
+        pending,
+        metrics,
+    })
 }
 
 struct SnapshotLifecycle {
@@ -858,14 +1038,20 @@ struct SinkMetrics {
     failures_total: AtomicU64,
     failure_reasons: FailureReasonCounters,
     queue_high_water_hits_total: AtomicU64,
+    queue_byte_budget_exhausted_total: AtomicU64,
     spool_drops_total: AtomicU64,
     spool_available: AtomicBool,
     spool_prepare_failures_total: AtomicU64,
+    spool_jobs_enqueued_total: AtomicU64,
+    spool_jobs_written_total: AtomicU64,
+    spool_jobs_lost_total: AtomicU64,
+    spool_events_lost_total: AtomicU64,
     snapshot_emits_total: AtomicU64,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
     last_failure_reason: RwLock<Option<String>>,
+    last_spool_job_warn_at: AtomicI64,
     latency: LatencyHistogram,
 }
 
@@ -877,16 +1063,49 @@ impl Default for SinkMetrics {
             failures_total: AtomicU64::new(0),
             failure_reasons: FailureReasonCounters::default(),
             queue_high_water_hits_total: AtomicU64::new(0),
+            queue_byte_budget_exhausted_total: AtomicU64::new(0),
             spool_drops_total: AtomicU64::new(0),
             spool_available: AtomicBool::new(false),
             spool_prepare_failures_total: AtomicU64::new(0),
+            spool_jobs_enqueued_total: AtomicU64::new(0),
+            spool_jobs_written_total: AtomicU64::new(0),
+            spool_jobs_lost_total: AtomicU64::new(0),
+            spool_events_lost_total: AtomicU64::new(0),
             snapshot_emits_total: AtomicU64::new(0),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
             last_failure_reason: RwLock::new(None),
+            last_spool_job_warn_at: AtomicI64::new(0),
             latency: LatencyHistogram::default(),
         }
+    }
+}
+
+impl SinkMetrics {
+    fn record_spool_job_loss(&self, events: u64, reason: &'static str) {
+        self.spool_jobs_lost_total.fetch_add(1, Ordering::Relaxed);
+        self.spool_events_lost_total
+            .fetch_add(events, Ordering::Relaxed);
+        let lost = self.spool_jobs_lost_total.load(Ordering::Relaxed);
+        let now = unix_timestamp_seconds();
+        let last = self.last_spool_job_warn_at.load(Ordering::Relaxed);
+        let should_warn = (lost == 1 || lost.is_multiple_of(SPOOL_JOB_WARN_EVERY))
+            && now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
+            && self
+                .last_spool_job_warn_at
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        if should_warn {
+            warn!(
+                plugin = PLUGIN_NAME,
+                reason,
+                jobs_lost_total = lost,
+                events_lost_total = self.spool_events_lost_total.load(Ordering::Relaxed),
+                "Chargeback sink spool delivery job was dropped (rate-limited)"
+            );
+        }
+        invalidate_status_cache();
     }
 }
 
@@ -1138,24 +1357,29 @@ impl ApiChargebackSink {
             metrics: Arc::clone(&metrics),
         };
 
-        let failed_spool = spool.clone();
-        let overflow_spool = spool.clone();
         let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
         let overflow_metrics = Arc::clone(&metrics);
+        let (commit_tx, commit_rx) = watch::channel(false);
+        let spool_enqueue = match spool.as_ref() {
+            Some(spool_manager) => Some(start_spool_delivery(
+                Arc::clone(spool_manager),
+                Arc::clone(&metrics),
+                self.config.spool.delivery_queue_capacity,
+                commit_tx.subscribe(),
+            )),
+            None => None,
+        };
+        let failed_enqueue = spool_enqueue.clone();
+        let overflow_enqueue = spool_enqueue.clone();
         let hooks = LoggerHooks {
-            on_failed_batch: Some(Arc::new(move |batch, error| {
+            on_failed_batch: Some(Arc::new(move |batch: Vec<QueuedChargeEvent>, error| {
                 if snapshot_events_are_pre_spooled {
                     return;
                 }
-                if let Some(spool) = failed_spool.as_ref() {
-                    if let Err(spool_error) = spool.write_events(&batch) {
-                        warn!(
-                            plugin = PLUGIN_NAME,
-                            error = %spool_error,
-                            original_error = %error,
-                            "Failed to spool chargeback sink batch after export failure"
-                        );
-                    }
+                let events: Vec<ChargeEvent> =
+                    batch.into_iter().map(|queued| queued.event).collect();
+                if let Some(enqueue) = failed_enqueue.as_ref() {
+                    let _ = enqueue.try_enqueue(events, "export failure");
                 } else {
                     warn!(
                         plugin = PLUGIN_NAME,
@@ -1164,7 +1388,7 @@ impl ApiChargebackSink {
                     );
                 }
             })),
-            on_overflow: Some(Arc::new(move |event, reason| {
+            on_overflow: Some(Arc::new(move |queued: QueuedChargeEvent, reason| {
                 overflow_metrics
                     .queue_high_water_hits_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -1172,15 +1396,8 @@ impl ApiChargebackSink {
                     invalidate_status_cache();
                     return;
                 }
-                if let Some(spool) = overflow_spool.as_ref() {
-                    if let Err(error) = spool.write_events(&[event]) {
-                        warn!(
-                            plugin = PLUGIN_NAME,
-                            overflow_reason = reason,
-                            error = %error,
-                            "Failed to spool chargeback sink overflow event"
-                        );
-                    }
+                if let Some(enqueue) = overflow_enqueue.as_ref() {
+                    let _ = enqueue.try_enqueue(vec![queued.event], reason);
                 } else {
                     warn!(
                         plugin = PLUGIN_NAME,
@@ -1196,7 +1413,6 @@ impl ApiChargebackSink {
             high_watermark_percent: 80,
         };
 
-        let (commit_tx, commit_rx) = watch::channel(false);
         let logger = BatchingLogger::spawn_with_hooks_on_commit_gate(
             BatchConfig {
                 batch_size: self.config.batch.size,
@@ -1218,13 +1434,23 @@ impl ApiChargebackSink {
             commit_rx,
             {
                 let flush_config = flush_config.clone();
-                move |batch| {
+                move |batch: Vec<QueuedChargeEvent>| {
                     let flush_config = flush_config.clone();
-                    async move { send_batch(&flush_config, batch).await }
+                    async move {
+                        let (events, _leases): (Vec<_>, Vec<_>) = batch
+                            .into_iter()
+                            .map(|queued| (queued.event, queued.lease))
+                            .unzip();
+                        send_batch(&flush_config, events).await
+                    }
                 }
             },
         );
 
+        let byte_budget = Arc::new(ByteBudget::new(
+            PLUGIN_NAME,
+            self.config.batch.buffer_max_bytes.max(MAX_CHARGE_EVENT_BYTES),
+        ));
         let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let runtime = Arc::new(SinkRuntime {
             plugin_config_id: Arc::clone(&self.plugin_config_id),
@@ -1243,8 +1469,10 @@ impl ApiChargebackSink {
                 retry_jitter: self.config.retry.jitter,
             },
             logger,
+            byte_budget,
             metrics,
             spool,
+            spool_delivery: spool_enqueue,
         });
 
         let mut background_tasks = Vec::new();
@@ -1368,12 +1596,7 @@ impl ApiChargebackSink {
         let Some(runtime) = self.runtime.get() else {
             return;
         };
-        runtime
-            .metrics
-            .events_enqueued_total
-            .fetch_add(1, Ordering::Relaxed);
-        runtime.logger.try_send(event);
-        invalidate_status_cache();
+        enqueue_charge_event(runtime, event);
     }
 
     /// Whether this instance currently owns a published slot in the
@@ -1849,6 +2072,12 @@ impl SinkRuntime {
                 "depth": self.logger.queue_depth(),
                 "capacity": self.logger.buffer_capacity(),
                 "high_water_hits_total": self.metrics.queue_high_water_hits_total.load(Ordering::Relaxed),
+                "retained_bytes": self.byte_budget.used(),
+                "buffer_max_bytes": self.byte_budget.max_bytes(),
+                "byte_budget_exhausted_total": self
+                    .metrics
+                    .queue_byte_budget_exhausted_total
+                    .load(Ordering::Relaxed),
             },
             "spool": {
                 "enabled": spool_enabled,
@@ -1857,6 +2086,15 @@ impl SinkRuntime {
                 "files": spool_files,
                 "bytes": spool_bytes,
                 "drops_total": self.metrics.spool_drops_total.load(Ordering::Relaxed),
+                "delivery_queue_depth": self
+                    .spool_delivery
+                    .as_ref()
+                    .map(SpoolDelivery::pending_jobs)
+                    .unwrap_or(0),
+                "jobs_enqueued_total": self.metrics.spool_jobs_enqueued_total.load(Ordering::Relaxed),
+                "jobs_written_total": self.metrics.spool_jobs_written_total.load(Ordering::Relaxed),
+                "jobs_lost_total": self.metrics.spool_jobs_lost_total.load(Ordering::Relaxed),
+                "events_lost_total": self.metrics.spool_events_lost_total.load(Ordering::Relaxed),
                 "last_replay_at": timestamp_json(self.metrics.last_replay_at.load(Ordering::Relaxed)),
             },
             "export": {
@@ -1895,8 +2133,14 @@ fn render_prometheus_for_sinks(
     let mut spool_files = 0u64;
     let mut spool_drops = 0u64;
     let mut spool_prepare_failures = 0u64;
+    let mut spool_jobs_enqueued = 0u64;
+    let mut spool_jobs_written = 0u64;
+    let mut spool_jobs_lost = 0u64;
+    let mut spool_events_lost = 0u64;
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
+    let mut queue_retained_bytes = 0u64;
+    let mut queue_byte_budget_exhausted = 0u64;
     let mut snapshot_emits = 0u64;
     let mut any_snapshot = false;
     let mut latency_counts: Vec<u64> = Vec::new();
@@ -1926,6 +2170,21 @@ fn render_prometheus_for_sinks(
         spool_drops = spool_drops.saturating_add(metrics.spool_drops_total.load(Ordering::Relaxed));
         spool_prepare_failures = spool_prepare_failures
             .saturating_add(metrics.spool_prepare_failures_total.load(Ordering::Relaxed));
+        spool_jobs_enqueued = spool_jobs_enqueued
+            .saturating_add(metrics.spool_jobs_enqueued_total.load(Ordering::Relaxed));
+        spool_jobs_written = spool_jobs_written
+            .saturating_add(metrics.spool_jobs_written_total.load(Ordering::Relaxed));
+        spool_jobs_lost =
+            spool_jobs_lost.saturating_add(metrics.spool_jobs_lost_total.load(Ordering::Relaxed));
+        spool_events_lost = spool_events_lost
+            .saturating_add(metrics.spool_events_lost_total.load(Ordering::Relaxed));
+        queue_retained_bytes =
+            queue_retained_bytes.saturating_add(runtime.byte_budget.used() as u64);
+        queue_byte_budget_exhausted = queue_byte_budget_exhausted.saturating_add(
+            metrics
+                .queue_byte_budget_exhausted_total
+                .load(Ordering::Relaxed),
+        );
         let spool_stats = runtime
             .spool
             .as_ref()
@@ -2022,6 +2281,54 @@ fn render_prometheus_for_sinks(
     output.push_str(&format!(
         "chargeback_sink_spool_prepare_failures_total {}\n",
         spool_prepare_failures
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_spool_jobs_enqueued_total Chargeback sink jobs accepted by the async spool delivery worker.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_spool_jobs_enqueued_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_jobs_enqueued_total {}\n",
+        spool_jobs_enqueued
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_spool_jobs_written_total Chargeback sink jobs successfully written by the async spool delivery worker.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_spool_jobs_written_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_jobs_written_total {}\n",
+        spool_jobs_written
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_spool_jobs_lost_total Chargeback sink spool delivery jobs dropped under saturation or write failure.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_spool_jobs_lost_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_jobs_lost_total {}\n",
+        spool_jobs_lost
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_spool_events_lost_total Chargeback sink events lost with dropped spool delivery jobs.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_spool_events_lost_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_events_lost_total {}\n",
+        spool_events_lost
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_queue_retained_bytes Chargeback sink retained export-queue bytes under the configured buffer_max_bytes budget.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_retained_bytes gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_retained_bytes {}\n",
+        queue_retained_bytes
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_queue_byte_budget_exhausted_total Chargeback sink export admissions rejected by the retained-byte budget.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_byte_budget_exhausted_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_byte_budget_exhausted_total {}\n",
+        queue_byte_budget_exhausted
     ));
     output.push_str("# HELP chargeback_sink_export_latency_seconds Chargeback sink ClickHouse export latency in seconds.\n");
     output.push_str("# TYPE chargeback_sink_export_latency_seconds histogram\n");
@@ -2422,6 +2729,13 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: batch.buffer_capacity must be between 1 and {MAX_BUFFER_CAPACITY}"
         ));
     }
+    if config.batch.buffer_max_bytes < MAX_CHARGE_EVENT_BYTES
+        || config.batch.buffer_max_bytes > HARD_MAX_BUFFER_MAX_BYTES
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: batch.buffer_max_bytes must be between {MAX_CHARGE_EVENT_BYTES} and {HARD_MAX_BUFFER_MAX_BYTES}"
+        ));
+    }
     if config.batch.flush_interval_ms == 0
         || config.batch.flush_interval_ms > MAX_BATCH_FLUSH_INTERVAL_MS
     {
@@ -2466,6 +2780,13 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         if config.spool.replay_interval_secs == 0 {
             return Err(format!(
                 "{PLUGIN_NAME}: spool.replay_interval_secs must be at least 1"
+            ));
+        }
+        if config.spool.delivery_queue_capacity == 0
+            || config.spool.delivery_queue_capacity > MAX_BUFFER_CAPACITY
+        {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool.delivery_queue_capacity must be between 1 and {MAX_BUFFER_CAPACITY}"
             ));
         }
         // Shape-only: do not mkdir/chmod/probe here. Live storage preparation
@@ -4418,11 +4739,7 @@ fn emit_periodic_snapshot(
         .snapshot_emits_total
         .fetch_add(event_count as u64, Ordering::Relaxed);
     for event in prepared.events {
-        runtime
-            .metrics
-            .events_enqueued_total
-            .fetch_add(1, Ordering::Relaxed);
-        runtime.logger.try_send(event);
+        enqueue_charge_event(runtime, event);
     }
     invalidate_status_cache();
     Ok(event_count)
@@ -4729,6 +5046,56 @@ fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<S
         .find_map(|key| metadata.get(*key))
         .map(|value| bound_string(value, MAX_METADATA_FIELD_LEN))
         .filter(|value| !value.is_empty())
+}
+
+fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
+    let mut total = 96usize;
+    total = total.saturating_add(event.event_id.len());
+    total = total.saturating_add(event.node_id.len());
+    total = total.saturating_add(event.namespace.len());
+    total = total.saturating_add(event.consumer_id.len());
+    total = total.saturating_add(
+        event
+            .consumer_name
+            .as_ref()
+            .map(String::len)
+            .unwrap_or(0),
+    );
+    total = total.saturating_add(event.proxy_id.len());
+    total = total.saturating_add(event.proxy_name.len());
+    total = total.saturating_add(event.route_id.as_ref().map(String::len).unwrap_or(0));
+    total = total.saturating_add(event.protocol.len());
+    total = total.saturating_add(event.currency.len());
+    total = total.saturating_add(event.pricing_version.len());
+    total = total.saturating_add(event.request_id.as_ref().map(String::len).unwrap_or(0));
+    total = total.saturating_add(event.trace_id.as_ref().map(String::len).unwrap_or(0));
+    total = total.saturating_add(event.snapshot_id.as_ref().map(String::len).unwrap_or(0));
+    total
+}
+
+fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
+    let retained = charge_event_retained_bytes(&event);
+    if retained > MAX_CHARGE_EVENT_BYTES {
+        runtime
+            .byte_budget
+            .record_drop("charge event exceeded max retained bytes");
+        invalidate_status_cache();
+        return;
+    }
+    let Some(lease) = runtime.byte_budget.try_acquire(retained) else {
+        runtime
+            .metrics
+            .queue_byte_budget_exhausted_total
+            .fetch_add(1, Ordering::Relaxed);
+        invalidate_status_cache();
+        return;
+    };
+    runtime
+        .metrics
+        .events_enqueued_total
+        .fetch_add(1, Ordering::Relaxed);
+    runtime.logger.try_send(QueuedChargeEvent { event, lease });
+    invalidate_status_cache();
 }
 
 fn bound_string(value: &str, max_len: usize) -> String {
