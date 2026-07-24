@@ -33,8 +33,10 @@ use super::utils::{
     BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
     QueuedSummaryPayload, admit_byte_limits, admit_http_summary, admit_stream_summary,
     assemble_ndjson, build_batch_config, parse_socket_host, resolve_tcp_endpoint,
-    serialize_under_byte_budget, validate_batch_config,
+    validate_batch_config,
 };
+#[cfg(test)]
+use super::utils::serialize_under_byte_budget;
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};

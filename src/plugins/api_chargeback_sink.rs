@@ -2117,7 +2117,7 @@ impl SinkRuntime {
                 "delivery_queue_depth": self
                     .spool_delivery
                     .as_ref()
-                    .map(SpoolDelivery::pending_jobs)
+                    .map(|delivery| delivery.pending_jobs())
                     .unwrap_or(0),
                 "jobs_enqueued_total": self.metrics.spool_jobs_enqueued_total.load(Ordering::Relaxed),
                 "jobs_written_total": self.metrics.spool_jobs_written_total.load(Ordering::Relaxed),
