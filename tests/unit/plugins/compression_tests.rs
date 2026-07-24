@@ -5439,7 +5439,12 @@ async fn test_before_proxy_does_not_reserve_for_unnegotiable_encodings() {
         compression_response_admission_reserved_for_test,
     };
     let plugin = make_plugin(json!({}));
-    for ae in [Some("identity"), Some("deflate"), Some("gzip;q=0, br;q=0"), None] {
+    for ae in [
+        Some("identity"),
+        Some("deflate"),
+        Some("gzip;q=0, br;q=0"),
+        None,
+    ] {
         let mut ctx = make_ctx(ae);
         before_proxy_with_accept_encoding(&plugin, &mut ctx, ae).await;
         assert!(
