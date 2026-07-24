@@ -1777,12 +1777,9 @@ fn xml_array_values(
             }
         }
     } else {
-        for child in child_elements_matching_fail_closed(
-            node,
-            item_namespace,
-            item_local,
-            "array item",
-        )? {
+        for child in
+            child_elements_matching_fail_closed(node, item_namespace, item_local, "array item")?
+        {
             values.push(xml_node_to_value(child, item_schema, conversion)?);
         }
     }
