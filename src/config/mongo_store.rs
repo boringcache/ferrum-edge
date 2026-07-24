@@ -209,17 +209,16 @@ mod inner {
             return true;
         }
         match err.kind.as_ref() {
-            mongodb::error::ErrorKind::Write(
-                mongodb::error::WriteFailure::WriteError(write_error),
-            ) if write_error.code == MONGO_ERR_DUPLICATE_KEY => true,
-            mongodb::error::ErrorKind::InsertMany(insert_error) => insert_error
-                .write_errors
-                .as_deref()
-                .is_some_and(|errors| {
+            mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                write_error,
+            )) if write_error.code == MONGO_ERR_DUPLICATE_KEY => true,
+            mongodb::error::ErrorKind::InsertMany(insert_error) => {
+                insert_error.write_errors.as_deref().is_some_and(|errors| {
                     errors
                         .iter()
                         .any(|write_error| write_error.code == MONGO_ERR_DUPLICATE_KEY)
-                }),
+                })
+            }
             _ => false,
         }
     }
@@ -3438,13 +3437,10 @@ mod inner {
                         .await
                     {
                         Ok(ensured_new) => {
-                            let inserted_prefix =
-                                Self::ordered_insert_inserted_prefix_len(&err);
-                            let mut newly_inserted = ordered_insert_newly_inserted_prefix(
-                                values,
-                                inserted_prefix,
-                            )
-                            .to_vec();
+                            let inserted_prefix = Self::ordered_insert_inserted_prefix_len(&err);
+                            let mut newly_inserted =
+                                ordered_insert_newly_inserted_prefix(values, inserted_prefix)
+                                    .to_vec();
                             if inserted_prefix.is_none() {
                                 warn!(
                                     "Retaining MongoDB consumer identity reservations for '{}' in \
@@ -3462,8 +3458,7 @@ mod inner {
                             return Ok(newly_inserted);
                         }
                         Err(adopt_err) => {
-                            let inserted_prefix =
-                                Self::ordered_insert_inserted_prefix_len(&err);
+                            let inserted_prefix = Self::ordered_insert_inserted_prefix_len(&err);
                             if inserted_prefix.is_none() {
                                 warn!(
                                     "Retaining MongoDB consumer identity reservations for '{}' in \
