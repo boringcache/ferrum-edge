@@ -885,6 +885,10 @@ pub enum ConfigSyncAttemptOutcome {
     /// inconsistent, rejected, or a pre-snapshot DELTA). Fail over with
     /// accumulating backoff; never treat as delivered config.
     InvalidSubscriptionBase,
+    /// A DELTA carried an envelope/body timestamp mismatch or an
+    /// implausibly-future committed timestamp. Fail over with accumulating
+    /// backoff so a skewed or hostile CP cannot poison the freshness watermark.
+    InvalidDeltaFreshness,
     /// An unusable FULL_SNAPSHOT arrived after a base was already accepted, or a
     /// non-empty DELTA was rejected. Keep serving last-known-good config, reset
     /// backoff, and reconnect to the same CP for a fresh authoritative snapshot
@@ -916,7 +920,8 @@ pub fn advance_multi_cp_backoff(
         ConfigSyncAttemptOutcome::ConnectionError
         | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
         | ConfigSyncAttemptOutcome::StaleSnapshotFenced
-        | ConfigSyncAttemptOutcome::InvalidSubscriptionBase => {
+        | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
+        | ConfigSyncAttemptOutcome::InvalidDeltaFreshness => {
             if cp_count > 1 {
                 let next_index = (state.current_cp_index + 1) % cp_count;
                 if next_index == 0 {

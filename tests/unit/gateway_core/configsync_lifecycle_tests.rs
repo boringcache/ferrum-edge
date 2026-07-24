@@ -955,6 +955,23 @@ fn invalid_subscription_base_outcome_fails_over_with_backoff() {
 }
 
 #[test]
+fn invalid_delta_freshness_outcome_fails_over_with_backoff() {
+    let mut state = MultiCpBackoffState {
+        backoff_secs: 4,
+        ..MultiCpBackoffState::new()
+    };
+    assert!(advance_multi_cp_backoff(
+        &mut state,
+        2,
+        ConfigSyncAttemptOutcome::InvalidDeltaFreshness
+    ));
+    assert_eq!(state.current_cp_index, 1);
+    assert_eq!(state.backoff_secs, 4);
+    grow_backoff_after_failure_sleep(&mut state);
+    assert_eq!(state.backoff_secs, 8);
+}
+
+#[test]
 fn repeated_fencing_reaches_backoff_cap_and_cycles_cps() {
     // A permanently stale fallback that keeps getting fenced must not busy-loop:
     // backoff still climbs to the cap and the DP still cycles across CP URLs.

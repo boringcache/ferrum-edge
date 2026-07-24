@@ -262,7 +262,7 @@ Starting in v0.9.0, CP and DP nodes exchange their Ferrum Edge binary version du
 
 What happens on rejection:
 - The **CP** returns a gRPC `FAILED_PRECONDITION` status with a message identifying both versions and the required DP version.
-- The **DP** logs the error, disconnects, and retries in 5 seconds (standard reconnect loop). It will keep failing until upgraded to a compatible version.
+- The **DP** logs the error, disconnects, and enters the standard exponential-backoff/failover loop. It will keep failing until upgraded to a compatible version.
 - **No config is exchanged** — the DP continues serving traffic with whatever config it had cached before the connection attempt.
 
 This prevents a scenario where a newer CP pushes config containing fields or structures that an older DP cannot deserialize, which could cause silent data loss or deserialization failures.

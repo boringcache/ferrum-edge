@@ -628,6 +628,22 @@ pub async fn start_dp_client_with_stream_timings(
                 update_state_disconnected(&connection_state, cp_url, is_primary);
                 ConfigSyncAttemptOutcome::StaleSnapshotFenced
             }
+            Ok(DpStreamEnd::InvalidDeltaFreshness) => {
+                // The CP supplied a DELTA whose envelope timestamp did not
+                // describe its body, or whose committed timestamp was
+                // implausibly far in the future. The delta was refused before
+                // apply, so fail over with accumulating backoff rather than
+                // letting that source poison the cross-CP freshness watermark.
+                warn!(
+                    "Refused invalid DELTA freshness from CP [{}/{}] ({}); failing over \
+                     without applying while keeping last-known-good config",
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                    cp_url
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::InvalidDeltaFreshness
+            }
             Ok(DpStreamEnd::InvalidSubscriptionBase) => {
                 // No valid FULL_SNAPSHOT base was established (or a pre-snapshot
                 // DELTA arrived first). Fail over with accumulating backoff so a
@@ -692,6 +708,7 @@ pub async fn start_dp_client_with_stream_timings(
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 | ConfigSyncAttemptOutcome::StaleSnapshotFenced
                 | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
+                | ConfigSyncAttemptOutcome::InvalidDeltaFreshness
         ) && backoff.current_cp_index == 0
             && backoff.full_cycle_count > 0
             && cp_count > 1
@@ -760,6 +777,7 @@ pub async fn start_dp_client_with_stream_timings(
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 | ConfigSyncAttemptOutcome::StaleSnapshotFenced
                 | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
+                | ConfigSyncAttemptOutcome::InvalidDeltaFreshness
         ) {
             grow_backoff_after_failure_sleep(&mut backoff);
         }
@@ -782,6 +800,10 @@ enum DpStreamEnd {
     /// the newer active config. The outer loop treats this as a
     /// failover-with-backoff failure — never as delivered config (issue #2970).
     StaleSnapshotFenced,
+    /// A DELTA envelope/body timestamp was inconsistent or implausibly far in
+    /// the future. The update is refused before apply and the outer loop fails
+    /// over with accumulating backoff so freshness authority cannot be poisoned.
+    InvalidDeltaFreshness,
     /// This subscription never committed a valid FULL_SNAPSHOT base (invalid /
     /// unparseable / rejected initial snapshot, or a pre-snapshot DELTA). Fail
     /// over with accumulating backoff.
@@ -1225,6 +1247,7 @@ pub async fn connect_and_subscribe(
         DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
         DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
         DpStreamEnd::StaleSnapshotFenced
+        | DpStreamEnd::InvalidDeltaFreshness
         | DpStreamEnd::InvalidSubscriptionBase
         | DpStreamEnd::ResyncAfterAcceptedConfig
         | DpStreamEnd::TransportFailure { .. } => Ok(()),
@@ -1280,6 +1303,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
         DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
         DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
         DpStreamEnd::StaleSnapshotFenced
+        | DpStreamEnd::InvalidDeltaFreshness
         | DpStreamEnd::InvalidSubscriptionBase
         | DpStreamEnd::ResyncAfterAcceptedConfig
         | DpStreamEnd::TransportFailure { .. } => Ok(()),
@@ -1932,32 +1956,66 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         let was_empty = result.is_empty();
                         let poll_timestamp = result.poll_timestamp;
 
-                        // Capture summary BEFORE moving `result` into apply_incremental
-                        // so the rejection log can identify the divergent CP push.
-                        let added_proxy_ids: Vec<String> = result
-                            .added_or_modified_proxies
-                            .iter()
-                            .map(|p| p.id.clone())
-                            .collect();
-                        let added_upstream_ids: Vec<String> = result
-                            .added_or_modified_upstreams
-                            .iter()
-                            .map(|u| u.id.clone())
-                            .collect();
-                        let added_consumer_ids: Vec<String> = result
-                            .added_or_modified_consumers
-                            .iter()
-                            .map(|c| c.id.clone())
-                            .collect();
-                        let added_plugin_config_ids: Vec<String> = result
-                            .added_or_modified_plugin_configs
-                            .iter()
-                            .map(|pc| pc.id.clone())
-                            .collect();
-                        let removed_proxy_ids = result.removed_proxy_ids.clone();
-                        let removed_upstream_ids = result.removed_upstream_ids.clone();
-                        let removed_consumer_ids = result.removed_consumer_ids.clone();
-                        let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
+                        // DELTA freshness is the body poll timestamp, not an
+                        // arbitrary envelope string. Refuse an inconsistency or
+                        // implausibly-future stamp before apply; otherwise a
+                        // skewed/hostile CP could commit a far-future
+                        // `loaded_at` and poison cross-CP freshness fencing.
+                        let committed_delta =
+                            match reconcile_snapshot_version(&update.version, poll_timestamp) {
+                                Ok(committed) => committed,
+                                Err(reason) => {
+                                    warn!(
+                                        ?reason,
+                                        cp_url,
+                                        version = %update.version,
+                                        poll_timestamp = %poll_timestamp,
+                                        "Refusing DELTA with inconsistent or unorderable freshness"
+                                    );
+                                    if !was_empty {
+                                        update_state_config_diverged(
+                                            connection_state,
+                                            divergence_metrics,
+                                        );
+                                    }
+                                    return Ok(DpStreamEnd::InvalidDeltaFreshness);
+                                }
+                            };
+                        if let Err(reason) =
+                            evaluate_snapshot_clock_skew(committed_delta, Utc::now())
+                        {
+                            warn!(
+                                ?reason,
+                                cp_url,
+                                version = %update.version,
+                                poll_timestamp = %poll_timestamp,
+                                "Refusing DELTA with an implausibly-future committed timestamp \
+                                 before it can poison the freshness watermark"
+                            );
+                            if !was_empty {
+                                update_state_config_diverged(
+                                    connection_state,
+                                    divergence_metrics,
+                                );
+                            }
+                            return Ok(DpStreamEnd::InvalidDeltaFreshness);
+                        }
+
+                        // Capture a bounded summary BEFORE moving `result` into
+                        // apply_incremental. Logging every user-controlled ID
+                        // would allocate and amplify one rejection into an
+                        // unbounded log record; fixed counts retain useful
+                        // diagnostics without exposing resource names.
+                        let added_proxy_count = result.added_or_modified_proxies.len();
+                        let added_upstream_count = result.added_or_modified_upstreams.len();
+                        let added_consumer_count = result.added_or_modified_consumers.len();
+                        let added_plugin_config_count =
+                            result.added_or_modified_plugin_configs.len();
+                        let removed_proxy_count = result.removed_proxy_ids.len();
+                        let removed_upstream_count = result.removed_upstream_ids.len();
+                        let removed_consumer_count = result.removed_consumer_ids.len();
+                        let removed_plugin_config_count =
+                            result.removed_plugin_config_ids.len();
                         let cp_version = update.ferrum_version.clone();
                         let update_version = update.version;
 
@@ -2025,7 +2083,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         advance_authority_from_committed(
                                             snapshot_authority,
                                             cp_url,
-                                            poll_timestamp,
+                                            committed_delta,
                                         );
                                     }
                                     debug!(
@@ -2060,14 +2118,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     error!(
                                         cp_version = %cp_version,
                                         update_version = update_version,
-                                        added_proxies = ?added_proxy_ids,
-                                        removed_proxies = ?removed_proxy_ids,
-                                        added_upstreams = ?added_upstream_ids,
-                                        removed_upstreams = ?removed_upstream_ids,
-                                        added_consumers = ?added_consumer_ids,
-                                        removed_consumers = ?removed_consumer_ids,
-                                        added_plugin_configs = ?added_plugin_config_ids,
-                                        removed_plugin_configs = ?removed_plugin_config_ids,
+                                        added_proxies = added_proxy_count,
+                                        removed_proxies = removed_proxy_count,
+                                        added_upstreams = added_upstream_count,
+                                        removed_upstreams = removed_upstream_count,
+                                        added_consumers = added_consumer_count,
+                                        removed_consumers = removed_consumer_count,
+                                        added_plugin_configs = added_plugin_config_count,
+                                        removed_plugin_configs = removed_plugin_config_count,
                                         validation_errors = ?errors,
                                         "DP rejected CP-pushed delta — terminating stream for \
                                          authoritative FULL_SNAPSHOT resync; last-known-good \
