@@ -183,8 +183,7 @@ impl ConversionPlan {
         // Synthetic/unregistered schemas (for example temporary Null placeholders)
         // fall back to a one-shot compute; registered request-path schemas hit the
         // map above and never allocate or re-walk composition here.
-        self.fallback_type_computes
-            .fetch_add(1, Ordering::Relaxed);
+        self.fallback_type_computes.fetch_add(1, Ordering::Relaxed);
         collect_schema_types(schema)
     }
 
@@ -525,8 +524,8 @@ impl OpenapiValidator {
                 for media in entry.request_validators.values() {
                     cached_nodes =
                         cached_nodes.saturating_add(media.conversion.cached_schema_type_nodes());
-                    fallback_computes = fallback_computes
-                        .saturating_add(media.conversion.fallback_type_computes());
+                    fallback_computes =
+                        fallback_computes.saturating_add(media.conversion.fallback_type_computes());
                 }
                 for media in entry
                     .response_validators
@@ -536,21 +535,21 @@ impl OpenapiValidator {
                 {
                     cached_nodes =
                         cached_nodes.saturating_add(media.conversion.cached_schema_type_nodes());
-                    fallback_computes = fallback_computes
-                        .saturating_add(media.conversion.fallback_type_computes());
+                    fallback_computes =
+                        fallback_computes.saturating_add(media.conversion.fallback_type_computes());
                 }
                 for range in &entry.response_validators.ranges {
                     for media in range.validators.values() {
-                        cached_nodes =
-                            cached_nodes.saturating_add(media.conversion.cached_schema_type_nodes());
+                        cached_nodes = cached_nodes
+                            .saturating_add(media.conversion.cached_schema_type_nodes());
                         fallback_computes = fallback_computes
                             .saturating_add(media.conversion.fallback_type_computes());
                     }
                 }
                 if let Some(default) = &entry.response_validators.default {
                     for media in default.values() {
-                        cached_nodes =
-                            cached_nodes.saturating_add(media.conversion.cached_schema_type_nodes());
+                        cached_nodes = cached_nodes
+                            .saturating_add(media.conversion.cached_schema_type_nodes());
                         fallback_computes = fallback_computes
                             .saturating_add(media.conversion.fallback_type_computes());
                     }
@@ -3251,8 +3250,7 @@ fn multipart_part_to_schema_value(
                 header_value,
                 &header_validator.schema,
                 header_validator.schema_types,
-                schema_is_composed(&header_validator.schema)
-                    .then_some(&header_validator.validator),
+                schema_is_composed(&header_validator.schema).then_some(&header_validator.validator),
             )?;
             header_validator
                 .validator
