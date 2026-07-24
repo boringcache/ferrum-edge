@@ -103,10 +103,10 @@ impl SplitDialect {
     }
 }
 
-fn scan_statements<'a>(
-    sql: &'a str,
+fn scan_statements(
+    sql: &str,
     dialect: SplitDialect,
-) -> Result<Vec<&'a str>, SqlStatementSplitError> {
+) -> Result<Vec<&str>, SqlStatementSplitError> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
     let mut i = 0usize;
@@ -198,8 +198,8 @@ fn scan_statements<'a>(
                         // enclosing BEGIN (or via DELIMITER). Depth unchanged.
                     } else if case_depth > 0 {
                         case_depth -= 1;
-                    } else if compound_depth > 0 {
-                        compound_depth -= 1;
+                    } else {
+                        compound_depth = compound_depth.saturating_sub(1);
                     }
                 }
             }
