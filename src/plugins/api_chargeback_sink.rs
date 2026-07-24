@@ -155,9 +155,7 @@ impl PendingSnapshotFinalization {
     fn age_secs(&self, now: Instant) -> u64 {
         match self {
             Self::Full(lifecycle) => lifecycle.closed_age_secs(now),
-            Self::Compact(recovery) => {
-                now.saturating_duration_since(recovery.closed_at).as_secs()
-            }
+            Self::Compact(recovery) => now.saturating_duration_since(recovery.closed_at).as_secs(),
         }
     }
 
@@ -207,9 +205,7 @@ impl CompactSnapshotRecovery {
             return false;
         };
         if let Err(error) = spool.write_events(&events) {
-            self.metrics
-                .spool_available
-                .store(false, Ordering::Release);
+            self.metrics.spool_available.store(false, Ordering::Release);
             self.metrics.record_failure(
                 FailureReason::Serialize,
                 format!("compact snapshot recovery spool handoff failed: {error}"),
@@ -383,9 +379,8 @@ async fn finalize_snapshot_generation_and_pending(current: Arc<SnapshotLifecycle
         // wrapping as Full would skip Compact and can later clear it.
         match registered.get(&current.generation) {
             Some(entry) => pending.push(entry.clone()),
-            None
-                if !current.compacted.load(Ordering::Acquire)
-                    && !current.finalized.load(Ordering::Acquire) =>
+            None if !current.compacted.load(Ordering::Acquire)
+                && !current.finalized.load(Ordering::Acquire) =>
             {
                 pending.push(PendingSnapshotFinalization::Full(Arc::clone(&current)));
             }
@@ -4884,11 +4879,11 @@ impl Default for SnapshotAtomicTotals {
 impl SnapshotAtomicTotals {
     fn try_add(&self, charge: ChargeComputation) -> Result<(), String> {
         let added_calls = charge.call_count as u64;
-        let previous = self
-            .call_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(added_calls)
-            });
+        let previous =
+            self.call_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(added_calls)
+                });
         if previous.is_err() {
             return Err(format!(
                 "{PLUGIN_NAME}: snapshot call_count overflowed u64 while accumulating"
@@ -5145,12 +5140,9 @@ impl SnapshotAccumulator {
                     .retained_bytes
                     .fetch_add(entry_bytes, Ordering::AcqRel)
                     .saturating_add(entry_bytes);
-                let next_total_bytes = next_bytes.saturating_add(
-                    self.overflow_pending_bytes.load(Ordering::Acquire),
-                );
-                if next_entries > self.max_entries
-                    || next_total_bytes > self.max_retained_bytes
-                {
+                let next_total_bytes =
+                    next_bytes.saturating_add(self.overflow_pending_bytes.load(Ordering::Acquire));
+                if next_entries > self.max_entries || next_total_bytes > self.max_retained_bytes {
                     let generation = entry.generation;
                     drop(entry);
                     if let Some((_, evicted)) = self.entries.remove_if(&key, |_, live| {
@@ -5481,13 +5473,9 @@ impl SnapshotAccumulator {
         if entry.totals.call_count.load(Ordering::Relaxed) == 0
             && entry.revision.load(Ordering::Relaxed) == 0
         {
-            self.retained_bytes
-                .fetch_add(entry_bytes, Ordering::AcqRel);
+            self.retained_bytes.fetch_add(entry_bytes, Ordering::AcqRel);
         }
-        entry
-            .totals
-            .call_count
-            .store(call_count, Ordering::Relaxed);
+        entry.totals.call_count.store(call_count, Ordering::Relaxed);
         entry.revision.fetch_add(1, Ordering::Relaxed);
         entry
             .last_seen_at
@@ -6046,9 +6034,7 @@ fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEve
                 metrics
                     .snapshot_overflow_spooled_total
                     .fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .snapshot_emits_total
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.snapshot_emits_total.fetch_add(1, Ordering::Relaxed);
                 invalidate_status_cache();
                 return;
             }

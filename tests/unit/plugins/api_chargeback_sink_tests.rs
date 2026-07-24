@@ -1874,10 +1874,7 @@ fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
     let final_events = accumulator
         .compute_deltas(&config, "node-a", 9_999, "stress-final")
         .expect("final delta");
-    let final_calls: u64 = final_events
-        .iter()
-        .map(|event| event.call_count)
-        .sum();
+    let final_calls: u64 = final_events.iter().map(|event| event.call_count).sum();
     emitted_calls.fetch_add(final_calls, Ordering::Relaxed);
 
     let recorded = recorded_calls.load(Ordering::Relaxed);
@@ -2920,15 +2917,7 @@ fn snapshot_cardinality_overflow_bounds_entries_and_preserves_protocol_dimension
     let charge = unit_call_charge(0.01);
 
     // Occupy the sole accumulator slot with an HTTP identity.
-    accumulator.record_for_test(
-        "ferrum",
-        "alice",
-        "proxy-http",
-        "HTTP",
-        200,
-        "http",
-        charge,
-    );
+    accumulator.record_for_test("ferrum", "alice", "proxy-http", "HTTP", 200, "http", charge);
     assert_eq!(accumulator.entry_count(), 1);
 
     // Additional distinct identities must not expand cardinality.
@@ -3032,7 +3021,9 @@ async fn repeated_reload_under_permanent_spool_failure_bounds_full_generations()
     }
 
     let status: Value = serde_json::from_str(&render_status_json()).unwrap();
-    let pending = status["snapshot_finalizations_pending"].as_u64().unwrap_or(0);
+    let pending = status["snapshot_finalizations_pending"]
+        .as_u64()
+        .unwrap_or(0);
     assert!(
         pending <= 64,
         "pending finalizations must stay count-bounded: {status}"
