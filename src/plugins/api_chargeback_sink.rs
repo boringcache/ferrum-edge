@@ -4725,7 +4725,7 @@ pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
     match status {
         200 | 204 => "delivered",
         413 => "payload_too_large",
-        408 | 429 => "retryable",
+        401 | 403 | 408 | 429 => "retryable",
         code if (500..600).contains(&code) => "retryable",
         code if (400..500).contains(&code) => "permanent",
         _ => "retryable",
