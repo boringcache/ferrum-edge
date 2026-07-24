@@ -10,7 +10,6 @@ use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::migrations::MigrationRunner;
 use ferrum_edge::config::types::{LoadBalancerAlgorithm, Upstream, UpstreamTarget};
 use sqlx::Row;
-use sqlx::error::DatabaseError;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
