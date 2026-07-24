@@ -3232,7 +3232,7 @@ The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTL
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `decompress_request` | bool | `false` | Enable decompression of gzip/brotli request bodies |
-| `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB). Hard-capped at 32 MiB (`33554432`); must also be ≤ `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that wire limit is set. Per-layer and cumulative decode work share this ceiling, and raw-to-decoded amplification above 1024:1 fails closed |
+| `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB). Hard-capped at 32 MiB (`33554432`); when request decompression is enabled, it must also be ≤ `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` if that wire limit is set. Per-layer and cumulative decode work share this ceiling, and raw-to-decoded amplification above 1024:1 fails closed |
 
 When `decompress_request` is enabled, `Content-Encoding` is parsed as an ordered `#content-coding` list (RFC 9110 §8.4) with OWS trimming. Supported chains (`gzip` / `x-gzip`, `br`) decode in reverse application order under the shared content-coding decoder; `identity`-only lists strip the header without rewriting bytes. Malformed members, parameters, unsupported codings, mixed `identity`, trailing/concatenated members, and limit/amplification overruns fail closed with `400`. Codec worker saturation fails closed with `503`.
 

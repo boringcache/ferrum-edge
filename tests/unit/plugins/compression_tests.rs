@@ -5095,6 +5095,19 @@ fn test_max_decompressed_request_size_cross_checks_request_body_limit() {
 }
 
 #[test]
+fn test_response_only_compression_ignores_unused_decompression_body_cross_check() {
+    CompressionPlugin::new_with_algorithm_support_and_body_limit(
+        &json!({
+            "decompress_request": false
+        }),
+        true,
+        true,
+        1_000_000,
+    )
+    .expect("response-only compression must not reject an unused decompression default");
+}
+
+#[test]
 fn test_max_decompressed_request_size_at_hard_maximum_accepted() {
     use ferrum_edge::plugins::compression::HARD_MAX_DECOMPRESSED_REQUEST_SIZE;
 

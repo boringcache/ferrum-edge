@@ -391,10 +391,20 @@ impl CompressionPlugin {
 
         let decompress_request = optional_bool(config, "decompress_request")?.unwrap_or(false);
 
-        let max_decompressed_request_size = resolve_max_decompressed_request_size(
+        let configured_max_decompressed_request_size =
             optional_positive_usize(config, "max_decompressed_request_size")?
-                .unwrap_or(DEFAULT_MAX_DECOMPRESSED_REQUEST_SIZE),
-            max_request_body_size_bytes,
+                .unwrap_or(DEFAULT_MAX_DECOMPRESSED_REQUEST_SIZE);
+        // Preserve strict field/hard-cap validation even when request
+        // decompression is disabled, but do not reject a response-only plugin
+        // because an unused decompression default exceeds the wire-body limit.
+        let decompression_body_limit = if decompress_request {
+            max_request_body_size_bytes
+        } else {
+            0
+        };
+        let max_decompressed_request_size = resolve_max_decompressed_request_size(
+            configured_max_decompressed_request_size,
+            decompression_body_limit,
         )?;
 
         let gzip_level = optional_u64(config, "gzip_level")?
