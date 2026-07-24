@@ -853,7 +853,13 @@ fn test_create_jwt_manager_rejects_invalid_max_ttl() {
     env.unset("FERRUM_ADMIN_JWT_ISSUER");
     env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
 
-    for invalid in ["18446744073709551615", "9223372036854775808", "-1", "abc"] {
+    for invalid in [
+        "",
+        "18446744073709551615",
+        "9223372036854775808",
+        "-1",
+        "abc",
+    ] {
         env.set("FERRUM_ADMIN_JWT_MAX_TTL", invalid);
         assert!(
             create_jwt_manager_from_env().is_err(),
@@ -872,9 +878,10 @@ fn test_create_jwt_manager_rejects_invalid_max_ttl() {
     }
 }
 
-/// Unset/empty secret is [`JwtError::NotConfigured`]; present-but-invalid
-/// admin JWT settings are a distinct fail-closed error so read-only modes
-/// cannot silently replace operator intent with a random secret (#2977).
+/// Only an unset secret is [`JwtError::NotConfigured`]; an explicitly empty
+/// or otherwise invalid admin JWT setting is a distinct fail-closed error so
+/// read-only modes cannot silently replace operator intent with a random
+/// secret (#2977).
 #[test]
 fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
     use ferrum_edge::admin::jwt_auth::{JwtError, create_jwt_manager_from_env};
@@ -891,9 +898,14 @@ fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
     );
 
     env.set("FERRUM_ADMIN_JWT_SECRET", "");
+    let empty_err = create_jwt_manager_from_env().expect_err("explicit empty secret must fail");
     assert!(
-        matches!(create_jwt_manager_from_env(), Err(JwtError::NotConfigured)),
-        "empty secret must be NotConfigured"
+        matches!(empty_err, JwtError::VerificationFailed(_)),
+        "explicit empty secret must not be treated as NotConfigured: {empty_err:?}"
+    );
+    assert!(
+        empty_err.to_string().contains("at least"),
+        "empty-secret diagnostic must name the length rule: {empty_err}"
     );
 
     // 20 chars — below MIN_JWT_SECRET_LENGTH (32).

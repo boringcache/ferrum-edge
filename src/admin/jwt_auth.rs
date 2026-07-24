@@ -8,7 +8,7 @@
 //! [`create_jwt_manager_from_env`] requires `FERRUM_ADMIN_JWT_SECRET` to be set
 //! and non-empty, with a minimum length of
 //! [`crate::config::types::MIN_JWT_SECRET_LENGTH`]. When the secret is unset
-//! (or empty) it returns [`JwtError::NotConfigured`]; when the secret or a
+//! it returns [`JwtError::NotConfigured`]; when the secret or a
 //! related setting (for example `FERRUM_ADMIN_JWT_MAX_TTL`) is present but
 //! invalid it returns [`JwtError::VerificationFailed`]. Read-only file/mesh/
 //! node_agent modes may generate a random secret only on `NotConfigured`; any
@@ -319,7 +319,7 @@ impl JwtManager {
 
 /// JWT Error types
 pub enum JwtError {
-    /// `FERRUM_ADMIN_JWT_SECRET` is unset or empty. Read-only modes may
+    /// `FERRUM_ADMIN_JWT_SECRET` is unset. Read-only modes may
     /// generate a random secret on this variant only.
     NotConfigured,
     MissingHeader,
@@ -362,13 +362,14 @@ impl std::error::Error for JwtError {}
 fn admin_jwt_max_ttl_from_env() -> Result<u64, JwtError> {
     use crate::config::conf_file::resolve_ferrum_var;
 
-    match resolve_ferrum_var("FERRUM_ADMIN_JWT_MAX_TTL").filter(|s| !s.is_empty()) {
+    match resolve_ferrum_var("FERRUM_ADMIN_JWT_MAX_TTL") {
         Some(raw) => {
             let parsed: u64 = raw.trim().parse().map_err(|_| {
-                JwtError::VerificationFailed(format!(
-                    "FERRUM_ADMIN_JWT_MAX_TTL must be a non-negative integer number of seconds \
-                     (got '{raw}'); use 0 to disable the lifetime cap"
-                ))
+                JwtError::VerificationFailed(
+                    "FERRUM_ADMIN_JWT_MAX_TTL must be a non-negative integer number of seconds; \
+                     use 0 to disable the lifetime cap"
+                        .to_string(),
+                )
             })?;
             if i64::try_from(parsed).is_err() {
                 return Err(JwtError::VerificationFailed(format!(
@@ -388,7 +389,7 @@ fn admin_jwt_max_ttl_from_env() -> Result<u64, JwtError> {
 /// Uses `resolve_ferrum_var()` so that `ferrum.conf` values are respected
 /// when the corresponding environment variable is not set.
 ///
-/// Returns [`JwtError::NotConfigured`] only when the secret is unset/empty
+/// Returns [`JwtError::NotConfigured`] only when the secret is unset
 /// and any explicitly supplied related JWT settings are valid. Present-but-
 /// invalid settings (short secret, malformed max TTL) return
 /// [`JwtError::VerificationFailed`] so call sites cannot treat operator
@@ -401,7 +402,7 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     // the read-only random-secret fallback.
     let max_ttl = admin_jwt_max_ttl_from_env()?;
 
-    let secret = match resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET").filter(|s| !s.is_empty()) {
+    let secret = match resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET") {
         Some(secret) => secret,
         None => return Err(JwtError::NotConfigured),
     };
