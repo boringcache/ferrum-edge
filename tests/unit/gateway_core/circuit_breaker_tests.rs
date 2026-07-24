@@ -1482,8 +1482,10 @@ fn test_concurrent_same_key_creation_shares_arc() {
         }));
     }
 
-    let results: Vec<Arc<CircuitBreaker>> =
-        handles.into_iter().map(|h| h.join().expect("join")).collect();
+    let results: Vec<Arc<CircuitBreaker>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
     let first = &results[0];
     for cb in &results[1..] {
         assert!(
@@ -1520,8 +1522,10 @@ fn test_concurrent_same_key_failures_open_shared_breaker() {
         }));
     }
 
-    let results: Vec<Arc<CircuitBreaker>> =
-        handles.into_iter().map(|h| h.join().expect("join")).collect();
+    let results: Vec<Arc<CircuitBreaker>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
     let first = &results[0];
     for cb in &results[1..] {
         assert!(Arc::ptr_eq(first, cb));
@@ -1560,8 +1564,10 @@ fn test_concurrent_config_replacement_shares_new_generation() {
         }));
     }
 
-    let results: Vec<Arc<CircuitBreaker>> =
-        handles.into_iter().map(|h| h.join().expect("join")).collect();
+    let results: Vec<Arc<CircuitBreaker>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
     let first = &results[0];
     for cb in &results[1..] {
         assert!(
@@ -1599,8 +1605,10 @@ fn test_concurrent_distinct_key_burst_respects_max_entries() {
         }));
     }
 
-    let _results: Vec<Arc<CircuitBreaker>> =
-        handles.into_iter().map(|h| h.join().expect("join")).collect();
+    let _results: Vec<Arc<CircuitBreaker>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
     assert!(
         cache.len() <= MAX_ENTRIES,
         "cache length {} exceeded max_entries {}",
