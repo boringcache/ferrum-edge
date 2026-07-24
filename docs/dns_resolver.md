@@ -40,8 +40,8 @@ The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS`.
 | `FERRUM_DNS_TTL_OVERRIDE_SECONDS` | `u64` | Disabled | Global TTL override (seconds) for all positive DNS records. When set, all cached entries use this fixed TTL regardless of the native DNS response TTL. Disabled by default — the cache respects each record's native TTL. |
 | `FERRUM_DNS_MIN_TTL_SECONDS` | `u64` | `5` | Minimum TTL floor (seconds) for cached DNS records. Prevents 0-TTL or very short TTLs from causing excessive DNS queries. Applied after all other TTL computations. |
 | `FERRUM_DNS_STALE_TTL` | `u64` | `3600` | How long (seconds) stale cached data can be served while a background refresh is in progress. Also caps failed-entry lifetime and error-TTL exponential backoff. See [Stale-While-Revalidate](#stale-while-revalidate) and [Failed DNS Retry Task](#failed-dns-retry-task). |
-| `FERRUM_DNS_ERROR_TTL` | `u64` | `5` | TTL (seconds) for caching DNS errors and empty responses. Prevents hammering DNS for known-bad hostnames. |
-| `FERRUM_DNS_CACHE_MAX_SIZE` | `usize` | `10000` | Maximum number of entries in the DNS cache. Expired entries are evicted automatically; if the cache still exceeds this limit, oldest entries are removed. |
+| `FERRUM_DNS_ERROR_TTL` | `u64` | `5` | Base TTL (seconds) for caching DNS errors and empty responses. Doubles on consecutive failures up to `FERRUM_DNS_STALE_TTL` (or 1 day when stale TTL is `0`). Prevents hammering DNS for known-bad hostnames. |
+| `FERRUM_DNS_CACHE_MAX_SIZE` | `usize` | `10000` | Maximum number of entries in the DNS cache. Expired entries are evicted automatically; if the cache still exceeds this limit, error entries are preferred for eviction over live success entries, then oldest `expires_at` within each class. |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | `usize` | `500` | Maximum number of concurrent DNS resolutions during startup/config warmup. Higher values reduce warmup time for large configs but increase burst load on upstream resolvers. |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 60s-TTL entry refreshes after 54s. Lower values add safety margin at the cost of more DNS queries. |
@@ -96,10 +96,12 @@ Background refresh tasks are bounded by a system-wide semaphore (`FERRUM_DNS_MAX
 
 ## Error Caching
 
-When DNS resolution fails (NXDOMAIN, timeout, empty response), the error is cached for `FERRUM_DNS_ERROR_TTL` seconds. During this time, subsequent lookups for the same hostname return the cached error immediately without hitting DNS again. This prevents:
+When DNS resolution fails (NXDOMAIN, timeout, empty response), the error is cached for a base TTL of `FERRUM_DNS_ERROR_TTL` seconds. Each consecutive failure for the same hostname doubles that TTL (capped at `FERRUM_DNS_STALE_TTL`, or 1 day when stale TTL is `0`). During the current error TTL, subsequent lookups for the same hostname return the cached error immediately without hitting DNS again. This prevents:
 
 - Flooding DNS servers with repeated queries for non-existent domains.
 - Latency spikes from repeated timeouts on unreachable nameservers.
+
+Error entries are also age-capped: once `FERRUM_DNS_STALE_TTL` has elapsed since the failure streak began, they are evicted even if the failed-retry task is enabled. See [Failed DNS Retry Task](#failed-dns-retry-task).
 
 ## Failed DNS Retry Task
 
@@ -108,9 +110,10 @@ A dedicated background task automatically retries DNS lookups that previously fa
 Lifecycle bounds (so decommissioned hostnames cannot warn-spam or occupy cache forever):
 
 - **Exponential error-TTL backoff**: the first failure caches for `FERRUM_DNS_ERROR_TTL`; each consecutive failure doubles that TTL, capped at `FERRUM_DNS_STALE_TTL` (or 1 day when stale TTL is `0`).
-- **Age eviction**: error entries older than `FERRUM_DNS_STALE_TTL` from their first failure are dropped even while the retry task is enabled.
+- **Age eviction**: error entries older than `FERRUM_DNS_STALE_TTL` from their first failure are dropped even while the retry task is enabled. A slow in-flight retry that crosses the age boundary removes the entry rather than extending it.
 - **Per-cycle work bound**: each cycle selects and resolves at most `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` eligible hostnames (oldest failures first), concurrently — no sequential N×timeout stall and no unbounded fan-out.
-- **Generation-guarded publish**: a retry outcome is written only if the cache entry is still the exact error generation that was selected; a concurrent foreground lookup/refresh that replaced the entry wins, so a stale background resolve cannot restore old IPs or re-error a recovered hostname.
+- **Live-entry eviction fairness**: when the cache is over `FERRUM_DNS_CACHE_MAX_SIZE`, Phase-2 capacity eviction prefers error entries over live success entries so failed hostnames cannot displace working rows.
+- **Generation-guarded publish**: a retry outcome is written only if the cache entry is still the exact error generation that was selected; a concurrent foreground lookup/refresh that replaced the entry wins, so a stale background resolve cannot restore old IPs or re-error a recovered hostname. IP-policy denial on a successful resolve advances error backoff the same way a failed resolve does, so the entry is not re-selected every cycle.
 - **No burst catch-up**: missed interval ticks use delayed behavior so a slow cycle does not fire back-to-back catch-up ticks.
 - **Log severity**: retry attempt / still-failing outcomes log at `warn` for the first few consecutive failures, then demote to `debug`. Successful recovery always logs at `warn`.
 

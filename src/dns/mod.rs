@@ -81,9 +81,11 @@ pub struct DnsConfig {
     /// Minimum TTL (seconds) floor for cached DNS records. Prevents extremely short
     /// TTLs (including 0) from causing excessive DNS queries. Default: 5.
     pub min_ttl_seconds: u64,
-    /// How long stale data can be served while a background refresh is in progress.
+    /// How long stale data can be served while a background refresh is in
+    /// progress. Also caps failed-entry lifetime and error-TTL exponential backoff.
     pub stale_ttl_seconds: u64,
-    /// TTL (seconds) for caching DNS errors and empty responses.
+    /// Base TTL (seconds) for caching DNS errors and empty responses. Doubles
+    /// on consecutive failures up to the failed-entry lifetime cap.
     pub error_ttl_seconds: u64,
     /// Maximum number of entries in the DNS cache. Entries are evicted when this limit is reached.
     pub max_cache_size: usize,
@@ -105,8 +107,9 @@ pub struct DnsConfig {
     /// Maximum in-flight queries per multiplexed connection. Default: 512.
     pub max_active_requests: usize,
     /// Maximum number of concurrent stale-while-revalidate background refresh
-    /// tasks system-wide. Prevents unbounded task spawning when many distinct
-    /// hostnames go stale simultaneously. Default: 64.
+    /// tasks system-wide, and the per-cycle cap on failed-DNS retries (selection
+    /// count and resolve concurrency). Prevents unbounded task spawning when
+    /// many distinct stale or failed hostnames are hit simultaneously. Default: 64.
     pub max_concurrent_refreshes: usize,
     /// Backend egress policy for SSRF protection. Applied to every freshly
     /// resolved address before it is cached, on every insertion path (initial
@@ -1103,8 +1106,10 @@ impl DnsCache {
     }
 
     /// Evict expired entries and enforce max cache size.
-    /// Removes entries past their stale deadline first, then evicts oldest
-    /// entries (by expiration time) if still over capacity.
+    /// Removes entries past their lifetime first, then — if still over capacity —
+    /// prefers error entries for eviction over live success entries (oldest
+    /// `expires_at` within each class) so failed hostnames cannot displace
+    /// working cache rows.
     ///
     /// Error entries are retained past their per-attempt error TTL so the
     /// failed-retry task can re-attempt them, but they are still age-capped
@@ -1134,19 +1139,25 @@ impl DnsCache {
             entry.stale_deadline > now
         });
 
-        // Phase 2: If still over capacity, evict oldest entries by expires_at
+        // Phase 2: If still over capacity, evict to 75%. Prefer error entries
+        // over live success entries so a backlog of failed hostnames cannot
+        // displace working cache rows; within each class, oldest expires_at
+        // first (backed-off error TTLs sort later among errors).
         if self.cache.len() > self.max_cache_size {
             let target_size = self.max_cache_size * 3 / 4; // Evict to 75% capacity
-            let mut entries: Vec<(String, Instant)> = self
+            let mut entries: Vec<(String, bool, Instant)> = self
                 .cache
                 .iter()
-                .map(|e| (e.key().clone(), e.expires_at))
+                .map(|e| (e.key().clone(), e.is_error, e.expires_at))
                 .collect();
-            // Sort by expires_at ascending (oldest first)
-            entries.sort_by_key(|(_, expires)| *expires);
+            entries.sort_by(|a, b| match (a.1, b.1) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.2.cmp(&b.2),
+            });
 
             let to_remove = self.cache.len().saturating_sub(target_size);
-            for (hostname, _) in entries.into_iter().take(to_remove) {
+            for (hostname, _, _) in entries.into_iter().take(to_remove) {
                 self.cache.remove(&hostname);
             }
 
@@ -1265,7 +1276,9 @@ impl DnsCache {
 
     /// Re-cache a failed-retry error only if the selected error generation is
     /// still live. Check and replacement are atomic under the DashMap entry
-    /// guard. Returns `true` when the error was published.
+    /// guard. If the generation is live but already past the failed-entry age
+    /// cap (e.g. a slow resolve crossed the boundary), the entry is removed
+    /// instead of being extended. Returns `true` when a new error was published.
     fn apply_failed_retry_error(
         &self,
         hostname: &str,
@@ -1274,11 +1287,18 @@ impl DnsCache {
     ) -> bool {
         let cache_key = dns_hostname_key(hostname);
         let now = Instant::now();
+        let error_max_age = self.failed_entry_lifetime_cap();
 
         match self.cache.entry(cache_key.into_owned()) {
             Entry::Occupied(mut occupied) => {
                 let current = occupied.get();
                 if !Self::matches_failed_retry_generation(current, generation) {
+                    return false;
+                }
+                // Do not let a slow in-flight retry re-extend residency past the
+                // lifetime cap — drop the entry so decommissioned names leave.
+                if Self::error_entry_aged_out(current, now, error_max_age) {
+                    occupied.remove();
                     return false;
                 }
                 let prior_ttl = current.original_per_proxy_ttl;
@@ -1369,6 +1389,15 @@ impl DnsCache {
                                     );
                                 }
                                 Err(e) => {
+                                    // Policy denial is a failed retry outcome:
+                                    // advance backoff (or drop if aged out) so
+                                    // the expired error is not re-selected every
+                                    // cycle until the age cap alone clears it.
+                                    let published = cache.apply_failed_retry_error(
+                                        &hostname,
+                                        &generation,
+                                        per_proxy_ttl,
+                                    );
                                     if noisy {
                                         warn!(
                                             "DNS failed retry: '{}' resolved but denied by IP policy: {}",
@@ -1378,6 +1407,12 @@ impl DnsCache {
                                         debug!(
                                             "DNS failed retry: '{}' resolved but denied by IP policy: {}",
                                             hostname, e
+                                        );
+                                    }
+                                    if !published {
+                                        debug!(
+                                            "DNS failed retry: abandoning policy-denied result for '{}' (cache generation changed or aged out during resolve)",
+                                            hostname
                                         );
                                     }
                                 }
@@ -2734,5 +2769,111 @@ mod tests {
         assert!(entry.is_error);
         assert_eq!(entry.consecutive_failures, generation.consecutive_failures);
         assert_eq!(entry.expires_at, generation.expires_at);
+    }
+
+    /// A slow retry that crosses the failed-entry age cap must drop the entry
+    /// rather than re-extending residency past the lifetime bound.
+    #[test]
+    fn apply_failed_retry_error_drops_aged_out_generation() {
+        let cache = DnsCache::new(DnsConfig {
+            error_ttl_seconds: 5,
+            stale_ttl_seconds: 30,
+            ..DnsConfig::default()
+        });
+        // Still within cap at insert time, but age == 30s so apply sees aged-out.
+        insert_error_entry(&cache, "aged.example", -1, 1, Duration::from_secs(30));
+        let generation = snapshot_error_generation(&cache, "aged.example");
+
+        assert!(
+            !cache.apply_failed_retry_error("aged.example", &generation, None),
+            "aged-out error must not be re-extended by a late retry outcome"
+        );
+        assert!(
+            cache.cache.get("aged.example").is_none(),
+            "aged-out error must be removed under the entry guard"
+        );
+    }
+
+    /// Over-capacity Phase 2 must evict error entries before live success rows,
+    /// even when the error has a farther-future expires_at (backed-off TTL).
+    #[test]
+    fn evict_expired_prefers_error_entries_over_live_on_capacity() {
+        let cache = DnsCache::new(DnsConfig {
+            max_cache_size: 4,
+            error_ttl_seconds: 5,
+            stale_ttl_seconds: 3600,
+            failed_retry_interval_seconds: 10,
+            ..DnsConfig::default()
+        });
+
+        let now = Instant::now();
+        // Live success entries expire sooner than the backed-off errors.
+        for (host, offset) in [("live-a", 10u64), ("live-b", 20), ("live-c", 30)] {
+            cache.cache.insert(
+                host.to_string(),
+                DnsCacheEntry {
+                    addresses: vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))],
+                    expires_at: now + Duration::from_secs(offset),
+                    stale_deadline: now + Duration::from_secs(offset + 60),
+                    applied_ttl: Duration::from_secs(offset),
+                    record_type_used: None,
+                    is_error: false,
+                    original_per_proxy_ttl: None,
+                    consecutive_failures: 0,
+                    first_failed_at: None,
+                },
+            );
+        }
+        // Two young errors with far-future expires_at (would sort after lives
+        // if Phase 2 used expires_at alone).
+        insert_error_entry(&cache, "err-a.invalid", 600, 3, Duration::from_secs(1));
+        insert_error_entry(&cache, "err-b.invalid", 600, 3, Duration::from_secs(2));
+
+        assert_eq!(cache.cache_len(), 5);
+        cache.evict_expired();
+
+        // target_size = max(4) * 3/4 = 3; remove 2. Both removals must be errors.
+        assert!(
+            cache.cache_len() <= 4,
+            "capacity eviction must trim to max_cache_size"
+        );
+        assert!(
+            cache.cache.get("live-a").is_some()
+                && cache.cache.get("live-b").is_some()
+                && cache.cache.get("live-c").is_some(),
+            "live success entries must not be displaced by error backlog"
+        );
+        let errors_remaining = ["err-a.invalid", "err-b.invalid"]
+            .iter()
+            .filter(|h| cache.cache.get(**h).is_some())
+            .count();
+        assert!(
+            errors_remaining <= 1,
+            "Phase 2 must prefer error entries for eviction; remaining errors={errors_remaining}"
+        );
+    }
+
+    /// Policy-denied retry success must advance error backoff (via the same
+    /// generation-guarded apply path) so the expired entry is not selected
+    /// again on every subsequent cycle.
+    #[test]
+    fn policy_denied_retry_advances_backoff_like_failed_resolve() {
+        let cache = DnsCache::new(DnsConfig {
+            error_ttl_seconds: 5,
+            stale_ttl_seconds: 3600,
+            backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+            ..DnsConfig::default()
+        });
+        insert_error_entry(&cache, "metadata.internal", -1, 0, Duration::from_secs(1));
+        let generation = snapshot_error_generation(&cache, "metadata.internal");
+
+        // Simulate the cycle's Err(policy) branch: apply_failed_retry_error.
+        assert!(cache.apply_failed_retry_error("metadata.internal", &generation, None));
+        {
+            let entry = cache.cache.get("metadata.internal").expect("error retained");
+            assert_eq!(entry.consecutive_failures, 1);
+            assert_eq!(entry.applied_ttl, Duration::from_secs(10));
+            assert!(entry.expires_at > Instant::now());
+        }
     }
 }

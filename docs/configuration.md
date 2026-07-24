@@ -600,7 +600,7 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
 | `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Also caps failed-entry lifetime and error-TTL backoff. Capped at 86400s (1 day) |
 | `FERRUM_DNS_ERROR_TTL` | No | `5` | Base TTL (seconds) for errors/empty responses; doubles on consecutive failures up to `FERRUM_DNS_STALE_TTL`. Capped at 86400s (1 day) |
-| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries |
+| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries. Over-capacity eviction prefers error entries over live success entries |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent DNS warmup resolutions during startup/config reload |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
