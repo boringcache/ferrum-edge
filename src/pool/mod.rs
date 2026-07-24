@@ -319,8 +319,22 @@ impl PendingCreation {
             }
         }
 
-        let _ = outcome.changed().await;
-        outcome.borrow().clone()
+        match outcome.changed().await {
+            Ok(()) => outcome.borrow().clone(),
+            Err(_) => {
+                // Sender dropped without an explicit outcome. `PendingCreationGuard`
+                // always publishes Finished/Failed before drop, so this is a
+                // defensive path for shutdown / forgotten Arcs. Treat a still-
+                // Pending value as Finished so waiters re-elect instead of
+                // spinning forever on a dead channel.
+                let current = outcome.borrow().clone();
+                if matches!(current, CreationNotify::Pending) {
+                    CreationNotify::Finished
+                } else {
+                    current
+                }
+            }
+        }
     }
 
     fn finish(&self) {

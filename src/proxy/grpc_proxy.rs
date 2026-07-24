@@ -1360,9 +1360,14 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
             | SharedPoolCreateKind::Other => {
                 // Structural kind for logs / is_connect_class. The authoritative
                 // ErrorClass lives on `err` and is restored via the source chain
-                // in `classify_grpc_proxy_error`.
+                // in `classify_grpc_proxy_error`. DispatchPolicyRejected creators
+                // use DnsResolution (egress denial before dial); preserve that
+                // shape so `message.contains("egress policy")` retry/CB guards
+                // stay aligned with the creator path.
                 let kind = match err.error_class() {
-                    ErrorClass::DnsLookupError => GrpcBackendUnavailableKind::DnsResolution,
+                    ErrorClass::DnsLookupError | ErrorClass::DispatchPolicyRejected => {
+                        GrpcBackendUnavailableKind::DnsResolution
+                    }
                     ErrorClass::TlsError | ErrorClass::ProtocolError => {
                         GrpcBackendUnavailableKind::TlsHandshake
                     }
@@ -1370,7 +1375,6 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                     | ErrorClass::ConnectionClosed
                     | ErrorClass::ConnectionReset
                     | ErrorClass::PortExhaustion
-                    | ErrorClass::DispatchPolicyRejected
                     | ErrorClass::ConnectionPoolError
                     | ErrorClass::ConnectionTimeout
                     | ErrorClass::ReadWriteTimeout

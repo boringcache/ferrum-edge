@@ -1331,7 +1331,6 @@ impl Http2PoolError {
 impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
     fn from(err: crate::pool::SharedPoolCreateError) -> Self {
         use crate::pool::SharedPoolCreateKind;
-        use crate::retry::ErrorClass;
 
         let message = err.message().to_string();
         match err.kind() {
@@ -1358,44 +1357,16 @@ impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
             | SharedPoolCreateKind::DispatchPolicyRejected
             | SharedPoolCreateKind::Unavailable
             | SharedPoolCreateKind::Other => {
-                // Prefer typed markers that `classify_http2_pool_error` already
-                // understands; fall back to the Shared source so the captured
-                // ErrorClass remains authoritative for egress / odd classes.
-                let source = match err.error_class() {
-                    ErrorClass::DnsLookupError => Some(BackendUnavailableSource::Dns),
-                    ErrorClass::TlsError => Some(BackendUnavailableSource::Tls(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        message.clone(),
-                    ))),
-                    ErrorClass::ConnectionRefused => Some(BackendUnavailableSource::Io(
-                        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, message.clone()),
-                    )),
-                    ErrorClass::ConnectionClosed => Some(BackendUnavailableSource::Io(
-                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, message.clone()),
-                    )),
-                    ErrorClass::ConnectionReset => Some(BackendUnavailableSource::Io(
-                        // Connect-phase RST collapses to ConnectionRefused in the
-                        // H2 classifier; use ConnectionRefused so waiter class
-                        // matches the pool's pre-wire contract.
-                        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, message.clone()),
-                    )),
-                    ErrorClass::PortExhaustion => Some(BackendUnavailableSource::Io(
-                        std::io::Error::from_raw_os_error(99),
-                    )),
-                    ErrorClass::ProtocolError
-                    | ErrorClass::DispatchPolicyRejected
-                    | ErrorClass::ConnectionPoolError
-                    | ErrorClass::ConnectionTimeout
-                    | ErrorClass::ReadWriteTimeout
-                    | ErrorClass::ClientDisconnect
-                    | ErrorClass::ResponseBodyTooLarge
-                    | ErrorClass::RequestBodyTooLarge
-                    | ErrorClass::GracefulRemoteClose
-                    | ErrorClass::RequestError => {
-                        Some(BackendUnavailableSource::Shared(err.clone()))
-                    }
-                };
-                Self::BackendUnavailable { message, source }
+                // Always attach the broadcast payload. Reconstructed io/DNS/TLS
+                // markers can drift from the creator's captured ErrorClass
+                // (egress denial, port exhaustion, ConnectionClosed wire
+                // boundary). `classify_http2_pool_error` prefers Shared so
+                // waiters keep creator ErrorClass / connection_error / retry
+                // semantics without cloning non-Clone sources.
+                Self::BackendUnavailable {
+                    message,
+                    source: Some(BackendUnavailableSource::Shared(err)),
+                }
             }
         }
     }

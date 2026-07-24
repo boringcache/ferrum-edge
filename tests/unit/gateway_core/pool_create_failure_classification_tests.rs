@@ -12,8 +12,17 @@ use ferrum_edge::proxy::grpc_proxy::{
 use ferrum_edge::proxy::http2_pool::{
     BackendUnavailableSource, Http2PoolError, classify_http2_pool_error,
 };
-use ferrum_edge::retry::{ErrorClass, classify_grpc_proxy_error};
+use ferrum_edge::retry::{ErrorClass, classify_grpc_proxy_error, request_reached_wire};
 use std::io;
+
+fn assert_wire_parity(creator_class: ErrorClass, waiter_class: ErrorClass) {
+    assert_eq!(
+        request_reached_wire(creator_class),
+        request_reached_wire(waiter_class),
+        "request_reached_wire/connection_error must match across fan-out \
+         (creator={creator_class:?}, waiter={waiter_class:?})"
+    );
+}
 
 fn assert_grpc_waiter_parity(creator: GrpcProxyError) {
     let expected = classify_grpc_proxy_error(&creator);
@@ -26,11 +35,12 @@ fn assert_grpc_waiter_parity(creator: GrpcProxyError) {
     );
 
     let waiter = GrpcProxyError::from(shared);
+    let waiter_class = classify_grpc_proxy_error(&waiter);
     assert_eq!(
-        classify_grpc_proxy_error(&waiter),
-        expected,
+        waiter_class, expected,
         "waiter reconstruction must classify like the creator ({expected:?})"
     );
+    assert_wire_parity(expected, waiter_class);
 }
 
 fn assert_h2_waiter_parity(creator: Http2PoolError) {
@@ -40,11 +50,12 @@ fn assert_h2_waiter_parity(creator: Http2PoolError) {
     assert_eq!(shared.error_class(), expected);
 
     let waiter = Http2PoolError::from(shared);
+    let waiter_class = classify_http2_pool_error(&waiter);
     assert_eq!(
-        classify_http2_pool_error(&waiter),
-        expected,
+        waiter_class, expected,
         "H2 waiter reconstruction must classify like the creator ({expected:?})"
     );
+    assert_wire_parity(expected, waiter_class);
 }
 
 #[test]
@@ -107,7 +118,26 @@ fn grpc_egress_policy_denial_preserves_classification_for_waiters() {
         classify_grpc_proxy_error(&creator),
         ErrorClass::DispatchPolicyRejected
     );
+    let shared = creator.to_shared(1);
     assert_grpc_waiter_parity(creator);
+
+    // Structural kind must stay DnsResolution so proxy retry/CB guards that
+    // combine `is_connect_class()` with `message.contains("egress policy")`
+    // treat waiters like the creator (non-connect / health-neutral).
+    let waiter = GrpcProxyError::from(shared);
+    match waiter {
+        GrpcProxyError::BackendUnavailable {
+            kind: GrpcBackendUnavailableKind::DnsResolution,
+            message,
+            ..
+        } => {
+            assert!(
+                message.contains("egress policy"),
+                "egress wording must survive fan-out for connection_error guards"
+            );
+        }
+        other => panic!("expected DnsResolution BackendUnavailable, got {other:?}"),
+    }
 }
 
 #[test]
@@ -257,10 +287,16 @@ fn anyhow_h3_timeout_waiter_keeps_typed_shared_classification() {
 
     // Waiters observe anyhow wrapping SharedPoolCreateError (blanket From).
     let waiter = anyhow::Error::new(shared);
+    let waiter_class = classify_http3_error(waiter.as_ref());
     assert_eq!(
-        classify_http3_error(waiter.as_ref()),
+        waiter_class,
         ErrorClass::ConnectionTimeout,
         "H3/anyhow waiter must retain typed timeout classification"
+    );
+    assert_wire_parity(expected, waiter_class);
+    assert!(
+        !request_reached_wire(waiter_class),
+        "H3 create timeout is pre-wire (connection_error=true)"
     );
 }
 
@@ -300,8 +336,29 @@ fn shared_pool_create_error_from_classified_round_trips_error_class() {
     assert_eq!(shared.generation(), 9);
 
     let waiter = anyhow::Error::new(shared);
-    assert_eq!(
-        classify_http3_error(waiter.as_ref()),
-        ErrorClass::DispatchPolicyRejected
+    let waiter_class = classify_http3_error(waiter.as_ref());
+    assert_eq!(waiter_class, ErrorClass::DispatchPolicyRejected);
+    assert!(
+        request_reached_wire(waiter_class),
+        "DispatchPolicyRejected must stay health-neutral (connection_error=false)"
     );
+}
+
+#[test]
+fn h2_waiter_backend_unavailable_attaches_shared_source_for_classification() {
+    let creator = Http2PoolError::BackendUnavailable {
+        message: "dns resolution failed".into(),
+        source: Some(BackendUnavailableSource::Dns),
+    };
+    let waiter = Http2PoolError::from(creator.to_shared(2));
+    match waiter {
+        Http2PoolError::BackendUnavailable {
+            source: Some(BackendUnavailableSource::Shared(shared)),
+            ..
+        } => {
+            assert_eq!(shared.error_class(), ErrorClass::DnsLookupError);
+            assert!(!request_reached_wire(shared.error_class()));
+        }
+        other => panic!("expected Shared BackendUnavailable source, got {other:?}"),
+    }
 }
