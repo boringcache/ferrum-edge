@@ -1633,7 +1633,7 @@ fn xml_node_to_value(
                 let attr_local = xml_name(property_schema, Some(property_name.as_str()))
                     .unwrap_or(property_name.as_str());
                 let attr_namespace = xml_namespace(property_schema);
-                modeled_names.insert_attribute(attr_namespace, attr_local);
+                modeled_names.insert_attribute(attr_namespace, attr_local, property_name);
                 if let Some(value) = xml_attribute_value(node, attr_namespace, attr_local) {
                     out.insert(
                         property_name.clone(),
@@ -1658,7 +1658,7 @@ fn xml_node_to_value(
             let child_local = xml_name(property_schema, Some(property_name.as_str()))
                 .unwrap_or(property_name.as_str());
             let child_namespace = xml_namespace(property_schema);
-            modeled_names.insert_element(child_namespace, child_local);
+            modeled_names.insert_element(child_namespace, child_local, property_name);
             let matches = child_elements_matching(node, child_namespace, child_local);
             match matches.as_slice() {
                 [] => {}
@@ -1678,9 +1678,14 @@ fn xml_node_to_value(
         // Always materialize undeclared members so JSON Schema keywords such as
         // additionalProperties, maxProperties, patternProperties, and propertyNames
         // observe the full XML payload instead of a filtered projection.
+        // Fail closed: a wrong-namespace member whose local name equals a
+        // namespace-qualified modeled JSON key must not rebind that property.
         let additional_schema = additional_property_schema_for_conversion(object_schema);
         for attr in node.attributes() {
-            if modeled_names.contains_attribute(attr) || out.contains_key(attr.name()) {
+            if modeled_names.contains_attribute(attr)
+                || modeled_names.reserves_json_key(attr.name())
+                || out.contains_key(attr.name())
+            {
                 continue;
             }
             let value = match additional_schema {
@@ -1696,6 +1701,9 @@ fn xml_node_to_value(
                 continue;
             }
             let name = child.tag_name().name();
+            if modeled_names.reserves_json_key(name) {
+                continue;
+            }
             let value = match additional_schema {
                 Some(Some(schema)) => xml_node_to_value(child, schema, conversion)?,
                 _ => generic_xml_node_to_value(child),
@@ -1763,9 +1771,17 @@ fn mark_xml_array_modeled_names(
         let wrapper_local =
             xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
         let wrapper_namespace = xml_namespace(property_schema);
-        modeled_names.insert_element(wrapper_namespace, wrapper_local);
+        modeled_names.insert_element(wrapper_namespace, wrapper_local, property_name);
+        // When only items declare a namespace, still reserve the array JSON key
+        // and item local so a wrong-namespace peer cannot rebind them.
+        if wrapper_namespace.is_none() && item_namespace.is_some() {
+            modeled_names.reserve_json_key(property_name);
+            if item_local != property_name {
+                modeled_names.reserve_json_key(item_local);
+            }
+        }
     } else {
-        modeled_names.insert_element(item_namespace, item_local);
+        modeled_names.insert_element(item_namespace, item_local, property_name);
     }
 }
 
@@ -3798,14 +3814,34 @@ struct ModeledXmlNames {
     exact_attributes: HashSet<(String, String)>,
     /// Unqualified attribute locals when the schema omits `xml.namespace`.
     unqualified_attributes: HashSet<String>,
+    /// JSON property keys claimed by namespace-qualified modeled properties.
+    /// Wrong-namespace members must not materialize under these keys via
+    /// local-name-only additional-member insertion.
+    reserved_json_keys: HashSet<String>,
 }
 
 impl ModeledXmlNames {
-    fn insert_element(&mut self, namespace: Option<&str>, local: &str) {
+    fn reserve_json_key(&mut self, json_key: &str) {
+        self.reserved_json_keys.insert(json_key.to_string());
+    }
+
+    fn reserves_json_key(&self, json_key: &str) -> bool {
+        self.reserved_json_keys.contains(json_key)
+    }
+
+    fn insert_element(&mut self, namespace: Option<&str>, local: &str, json_key: &str) {
         match namespace {
             Some(namespace) => {
                 self.exact_elements
                     .insert((namespace.to_string(), local.to_string()));
+                // Reserve the modeled JSON key so a non-matching expanded name
+                // with the same local name cannot rebind the property.
+                self.reserve_json_key(json_key);
+                if local != json_key {
+                    // Also reserve the XML local when it differs: additional
+                    // materialization keys off the local name.
+                    self.reserve_json_key(local);
+                }
             }
             None => {
                 self.any_namespace_elements.insert(local.to_string());
@@ -3813,11 +3849,15 @@ impl ModeledXmlNames {
         }
     }
 
-    fn insert_attribute(&mut self, namespace: Option<&str>, local: &str) {
+    fn insert_attribute(&mut self, namespace: Option<&str>, local: &str, json_key: &str) {
         match namespace {
             Some(namespace) => {
                 self.exact_attributes
                     .insert((namespace.to_string(), local.to_string()));
+                self.reserve_json_key(json_key);
+                if local != json_key {
+                    self.reserve_json_key(local);
+                }
             }
             None => {
                 self.unqualified_attributes.insert(local.to_string());

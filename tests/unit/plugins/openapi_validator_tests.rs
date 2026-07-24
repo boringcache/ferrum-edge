@@ -3,7 +3,7 @@ use ferrum_edge::plugins::{
     priority,
 };
 use flate2::{Compression, write::GzEncoder};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write as _;
 
@@ -1424,6 +1424,356 @@ async fn xml_hardening_preserves_draft7_and_draft202012() {
             Some(400),
         );
     }
+}
+
+#[tokio::test]
+async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
+    // Wrong-namespace members that share a modeled local name must not fall
+    // through as additional members under the modeled JSON key when
+    // additionalProperties is omitted or true (#3022 collision follow-up).
+    let headers = content_type_headers("application/xml");
+
+    for additional in [Value::Null, json!(true)] {
+        let mut body_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "required": ["role"],
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "const": "user",
+                    "xml": {
+                        "name": "role",
+                        "namespace": "https://trusted.example/schema",
+                        "prefix": "trusted"
+                    }
+                }
+            }
+        });
+        if !additional.is_null() {
+            body_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/rebind",
+                "path_regex": "^/rebind$",
+                "request_body": {
+                    "content": {
+                        "application/xml": body_schema
+                    }
+                }
+            }]
+        }))
+        .unwrap_or_else(|error| {
+            panic!("schema with additionalProperties={additional} must admit: {error}")
+        });
+
+        // Wrong namespace + matching local/const must not bind `role`.
+        let mut ctx = post_ctx("/rebind");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:evil="https://attacker.example/schema"><evil:role>user</evil:role></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        // Correct URI under an arbitrary prefix still accepted; unrelated
+        // additional members still materialize when allowed.
+        let mut ctx = post_ctx("/rebind");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:other="https://trusted.example/schema"><other:role>user</other:role><note>ok</note></root>"#,
+                )
+                .await,
+        );
+    }
+
+    // Wrong-namespace attribute with additionalProperties omitted/true.
+    for additional in [Value::Null, json!(true)] {
+        let mut body_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "required": ["id"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "const": "A-1",
+                    "xml": {
+                        "name": "id",
+                        "attribute": true,
+                        "namespace": "https://trusted.example/schema",
+                        "prefix": "trusted"
+                    }
+                }
+            }
+        });
+        if !additional.is_null() {
+            body_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/attr-rebind",
+                "path_regex": "^/attr-rebind$",
+                "request_body": {
+                    "content": {
+                        "application/xml": body_schema
+                    }
+                }
+            }]
+        }))
+        .unwrap();
+
+        let mut ctx = post_ctx("/attr-rebind");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:evil="https://attacker.example/schema" evil:id="A-1"/>"#,
+                )
+                .await,
+            Some(400),
+        );
+        let mut ctx = post_ctx("/attr-rebind");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:alias="https://trusted.example/schema" alias:id="A-1" note="ok"/>"#,
+                )
+                .await,
+        );
+    }
+
+    // Namespace-qualified wrapped array: wrong-namespace wrapper must not
+    // rebind the modeled array key when additionalProperties is omitted.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/wrapped-rebind",
+            "path_regex": "^/wrapped-rebind$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["items"],
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "minItems": 1,
+                                "xml": {
+                                    "name": "items",
+                                    "wrapped": true,
+                                    "namespace": "https://trusted.example/schema",
+                                    "prefix": "trusted"
+                                },
+                                "items": {
+                                    "type": "string",
+                                    "xml": {
+                                        "name": "item",
+                                        "namespace": "https://trusted.example/schema",
+                                        "prefix": "trusted"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/wrapped-rebind");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:evil="https://attacker.example/schema"><evil:items><evil:item>a</evil:item></evil:items></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/wrapped-rebind");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:x="https://trusted.example/schema"><x:items><x:item>a</x:item></x:items><note>ok</note></root>"#,
+            )
+            .await,
+    );
+
+    // Namespace-qualified unwrapped array with additionalProperties true.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/unwrapped-rebind",
+            "path_regex": "^/unwrapped-rebind$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["tags"],
+                        "additionalProperties": true,
+                        "properties": {
+                            "tags": {
+                                "type": "array",
+                                "minItems": 1,
+                                "xml": {
+                                    "namespace": "https://trusted.example/schema",
+                                    "prefix": "trusted"
+                                },
+                                "items": {
+                                    "type": "string",
+                                    "xml": {
+                                        "name": "tags",
+                                        "namespace": "https://trusted.example/schema",
+                                        "prefix": "trusted"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/unwrapped-rebind");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:evil="https://attacker.example/schema"><evil:tags>a</evil:tags></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/unwrapped-rebind");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:trusted="https://trusted.example/schema"><trusted:tags>a</trusted:tags><note>ok</note></root>"#,
+            )
+            .await,
+    );
+
+    // Properties that omit xml.namespace still match by local name only.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/local-only",
+            "path_regex": "^/local-only$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["role"],
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "const": "user",
+                                "xml": {"name": "role"}
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/local-only");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:any="https://attacker.example/schema"><any:role>user</any:role></root>"#,
+            )
+            .await,
+    );
+
+    // Root xml.namespace still requires a matching root expanded name when
+    // xml.name is present.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/root-ns",
+            "path_regex": "^/root-ns$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {
+                            "name": "root",
+                            "namespace": "https://trusted.example/schema",
+                            "prefix": "trusted"
+                        },
+                        "required": ["role"],
+                        "properties": {
+                            "role": {"type": "string", "const": "user"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/root-ns");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:evil="https://attacker.example/schema"><role>user</role></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/root-ns");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<alias:root xmlns:alias="https://trusted.example/schema"><role>user</role></alias:root>"#,
+            )
+            .await,
+    );
 }
 
 #[tokio::test]
