@@ -1141,12 +1141,7 @@ impl SnapshotOverflowJob {
             self.durable = true;
             return;
         };
-        stage_overflow_events_or_reject(
-            &self.accumulator,
-            &self.metrics,
-            self.generation,
-            events,
-        );
+        stage_overflow_events_or_reject(&self.accumulator, &self.metrics, self.generation, events);
         self.durable = true;
     }
 }
