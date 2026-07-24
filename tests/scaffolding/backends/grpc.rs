@@ -132,6 +132,10 @@ pub enum GrpcStep {
     CloseAfterHeaders,
     /// Send a GOAWAY with `error_code`, then close.
     SendGoaway { error_code: u32 },
+    /// Send a GOAWAY with `error_code` while keeping the TCP connection open
+    /// briefly. Used to race a pooled sender that still looks healthy after
+    /// a single `ready()` probe (connection-age / MaxConnectionAge).
+    SendGoawayKeepOpen { error_code: u32 },
     /// Send RST_STREAM on the current stream with `error_code`.
     SendRstStream { error_code: u32 },
     /// Wait for the gateway to reset the current response stream.
@@ -175,6 +179,23 @@ impl ScriptedGrpcBackendBuilder {
         for s in steps {
             self = self.step(s);
         }
+        self
+    }
+
+    /// Supply connection-indexed scripts. Connection 0 receives the first
+    /// script, connection 1 the second, and so on. Later connections reuse
+    /// the last script when the list is shorter than the accept count.
+    pub fn connection_scripts(
+        mut self,
+        scripts: impl IntoIterator<Item = Vec<GrpcStep>>,
+    ) -> Self {
+        let h2_scripts = scripts.into_iter().map(|steps| {
+            steps
+                .into_iter()
+                .flat_map(lower_grpc_step)
+                .collect::<Vec<_>>()
+        });
+        self.h2_builder = self.h2_builder.connection_scripts(h2_scripts);
         self
     }
 
@@ -374,6 +395,7 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
             H2Step::DropConnection,
         ],
         GrpcStep::SendGoaway { error_code } => vec![H2Step::SendGoawayAndClose { error_code }],
+        GrpcStep::SendGoawayKeepOpen { error_code } => vec![H2Step::SendGoaway { error_code }],
         GrpcStep::SendRstStream { error_code } => vec![H2Step::SendRstStream { error_code }],
         GrpcStep::ExpectReset(duration) => vec![H2Step::ExpectReset(duration)],
     }

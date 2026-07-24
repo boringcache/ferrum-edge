@@ -1094,6 +1094,11 @@ fn classify_hyper_error(hyper_err: &hyper::Error) -> Option<crate::retry::ErrorC
     if hyper_err.is_timeout() {
         return Some(ErrorClass::ReadWriteTimeout);
     }
+    if hyper_err.is_canceled() {
+        // hyper contract: the request was never dispatched onto the wire.
+        // Treat as a stale pooled-sender / pool failure (pre-wire).
+        return Some(ErrorClass::ConnectionPoolError);
+    }
     if hyper_err.is_incomplete_message() {
         return Some(ErrorClass::ConnectionClosed);
     }
@@ -1103,6 +1108,32 @@ fn classify_hyper_error(hyper_err: &hyper::Error) -> Option<crate::retry::ErrorC
         return Some(ErrorClass::ProtocolError);
     }
     None
+}
+
+/// Classify a hyper error from `SendRequest::send_request` on an already-pooled
+/// HTTP/2 sender (direct-H2 dispatch).
+///
+/// `is_canceled` means the request was never dispatched (stale idle /
+/// GOAWAY race) and maps pre-wire. Other failures walk the hyper/io chain
+/// with `phase_is_connect = false` so mid-stream resets stay post-wire.
+/// Unknown errors default to [`ErrorClass::ProtocolError`] (post-wire
+/// conservative) rather than inventing a connect-class label.
+pub fn classify_pooled_h2_send_request_error(e: &hyper::Error) -> crate::retry::ErrorClass {
+    use crate::retry::ErrorClass;
+    if let Some(cls) = classify_hyper_error(e) {
+        return cls;
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> =
+        std::error::Error::source(e as &dyn std::error::Error);
+    while let Some(node) = current {
+        if let Some(io_err) = node.downcast_ref::<std::io::Error>()
+            && let Some(cls) = classify_io_error(io_err, /* phase_is_connect */ false)
+        {
+            return cls;
+        }
+        current = node.source();
+    }
+    ErrorClass::ProtocolError
 }
 
 /// Errors specific to HTTP/2 pool operations.

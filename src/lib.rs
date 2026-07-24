@@ -207,6 +207,20 @@ pub mod _test_support {
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(duration)
     }
 
+    pub fn apply_remaining_grpc_timeout_header_for_test(
+        headers: &mut hyper::HeaderMap,
+        deadline: tokio::time::Instant,
+    ) {
+        crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(headers, deadline);
+    }
+
+    pub fn direct_h2_send_request_error_response_for_class_for_test(
+        error_class: crate::retry::ErrorClass,
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::direct_h2_send_request_error_response_for_class(error_class, resolved_ip)
+    }
+
     pub fn set_grpc_deadline_budget_for_test(
         ctx: &mut crate::plugins::RequestContext,
         budget_ms: Option<u64>,

@@ -2507,3 +2507,186 @@ async fn h2_grpc_request_headers_strip_hop_by_hop_metadata() {
         stream.headers
     );
 }
+
+/// #2932: after a successful buffered unary RPC, the backend issues GOAWAY
+/// while keeping TCP open. The next buffered unary must retry on
+/// `DispatchCanceled` (hyper never-dispatched) when
+/// `retry_on_connect_failure` is enabled, redial a fresh connection, and
+/// complete with `grpc-status: 0` instead of a spurious UNAVAILABLE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .connection_scripts([
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::any()),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+                // Keep the socket open so the pool can still hand out the
+                // dying sender for one more send_request (hyper is_canceled).
+                GrpcStep::SendGoawayKeepOpen { error_code: 0 },
+                GrpcStep::Sleep(Duration::from_secs(2)),
+            ],
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::any()),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+            ],
+        ])
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = grpc_file_config(
+        backend_port,
+        json!({
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+                "backoff": { "fixed": { "delay_ms": 1 } },
+            },
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        // Force a single pooled sender so the second RPC reuses the GOAWAY'd
+        // connection instead of landing on a healthy sibling shard.
+        .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "1")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+    let first = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+        .await
+        .expect("first RPC");
+    assert_eq!(first.grpc_status(), Some(0), "warmup RPC must succeed: {first:?}");
+
+    // Brief pause so the scripted GOAWAY lands while the pooled sender is idle.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let second = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+        .await
+        .expect("second RPC");
+    assert_eq!(
+        second.grpc_status(),
+        Some(0),
+        "buffered unary after pooled GOAWAY must redial and succeed; got {second:?}"
+    );
+    assert!(
+        backend.accepted_connections() >= 2,
+        "retry must dial a fresh backend connection after DispatchCanceled; \
+         accepted={}",
+        backend.accepted_connections()
+    );
+}
+
+/// #2934: retry attempts must preserve duplicate metadata field lines from
+/// the real collected HeaderMap (not rebuild from stringified ctx.headers).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
+    let down = reserve_port().await.expect("reserve down port");
+    let down_port = down.port;
+    drop(down); // refuse connections
+
+    let up = reserve_port().await.expect("reserve up port");
+    let up_port = up.port;
+    let backend = ScriptedGrpcBackend::builder_plain(up.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let proxy = json!({
+        "id": "grpc-scripted",
+        "listen_path": "/grpc",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": down_port,
+        "strip_listen_path": true,
+        "upstream_id": "grpc-retry-md",
+        "retry": {
+            "max_retries": 1,
+            "retry_on_connect_failure": true,
+            "backoff": { "fixed": { "delay_ms": 1 } },
+        },
+        "backend_connect_timeout_ms": 500,
+        "backend_read_timeout_ms": 5000,
+        "backend_write_timeout_ms": 5000,
+    });
+    let config = json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [],
+        "upstreams": [{
+            "id": "grpc-retry-md",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": down_port, "weight": 100 },
+                { "host": "127.0.0.1", "port": up_port, "weight": 100 },
+            ],
+        }],
+        "plugin_configs": [{
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }],
+    });
+    let yaml = serde_yaml::to_string(&config).expect("serialize yaml");
+    let harness = spawn_grpc_harness(yaml).await;
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+    let response = client
+        .unary_with_headers(
+            "/grpc/ferrum.Echo/Ping",
+            Bytes::from_static(b""),
+            &[("x-md", "a".to_string()), ("x-md", "b".to_string())],
+        )
+        .await
+        .expect("RPC response");
+    assert_eq!(response.grpc_status(), Some(0), "{response:?}");
+
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), 1, "only the live target should see the RPC");
+    let md_values: Vec<&str> = streams[0]
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("x-md"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        md_values,
+        ["a", "b"],
+        "retry attempt must forward duplicate x-md as two field lines; headers={:?}",
+        streams[0].headers
+    );
+}
