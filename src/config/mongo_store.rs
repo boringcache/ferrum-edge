@@ -4214,10 +4214,10 @@ mod inner {
     /// Ordered `insert_many` E11000: only the prefix before `first_error_index`
     /// was inserted by this attempt. `None` means attribution is unknown —
     /// retain everything (return an empty rollback-safe slice).
-    pub(crate) fn ordered_insert_newly_inserted_prefix<'a, T>(
-        values: &'a [T],
+    pub(crate) fn ordered_insert_newly_inserted_prefix<T>(
+        values: &[T],
         first_error_index: Option<usize>,
-    ) -> &'a [T] {
+    ) -> &[T] {
         match first_error_index {
             Some(i) if i <= values.len() => &values[..i],
             _ => &[],

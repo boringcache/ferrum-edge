@@ -2025,10 +2025,10 @@ pub mod _test_support {
     /// Consumer-identity ordered-insert prefix attribution (issue #2987): only
     /// the prefix before the E11000 write-error index was inserted by this
     /// attempt; `None` means attribution is unknown (retain everything).
-    pub fn ordered_insert_newly_inserted_prefix<'a, T>(
-        values: &'a [T],
+    pub fn ordered_insert_newly_inserted_prefix<T>(
+        values: &[T],
         first_error_index: Option<usize>,
-    ) -> &'a [T] {
+    ) -> &[T] {
         crate::config::mongo_store::ordered_insert_newly_inserted_prefix(values, first_error_index)
     }
 
