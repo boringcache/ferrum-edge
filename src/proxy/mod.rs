@@ -5634,6 +5634,7 @@ impl ProxyState {
             env_config_arc.compression_gzip_enabled,
             env_config_arc.compression_brotli_enabled,
         )
+        .with_max_request_body_size_bytes(env_config_arc.max_request_body_size_bytes)
         .with_tls_crl_source(env_config_arc.tls_crl_file_path.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
@@ -5689,9 +5690,11 @@ impl ProxyState {
         let mut health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
-        let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
-            env_config_arc.circuit_breaker_cache_max_entries,
-        ));
+        let circuit_breaker_cache =
+            Arc::new(CircuitBreakerCache::with_max_entries_and_shard_amount(
+                env_config_arc.circuit_breaker_cache_max_entries,
+                crate::util::sharding::pool_shard_amount(env_config_arc.pool_shard_amount),
+            ));
         // Service discovery manager (tasks started later via start_service_discovery)
         let service_discovery_manager = Arc::new(ServiceDiscoveryManager::new(
             load_balancer_cache.clone(),
@@ -15259,6 +15262,12 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             } else if mandatory_replay_transform {
                 mandatory_replay_transform_failed = Some(plugin.name());
                 break;
+            } else {
+                crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                    ctx,
+                    response_headers,
+                    response_body.len(),
+                );
             }
         }
         if let Some(plugin_name) = mandatory_replay_transform_failed {
@@ -16576,6 +16585,12 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 response_headers,
             );
             body_transformed = true;
+        } else {
+            crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                ctx,
+                response_headers,
+                response_body.len(),
+            );
         }
         ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
     }
@@ -38805,6 +38820,7 @@ mod tests {
         ));
 
         let mut compression_ctx = ctx.clone();
+        compression_ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
         compression_ctx
             .headers
             .insert("accept-encoding".to_string(), "gzip".to_string());

@@ -289,8 +289,8 @@ These settings only apply when `FERRUM_DB_TYPE=mongodb`. `FERRUM_DB_POOL_*` sett
 | `FERRUM_MONGO_APP_NAME` | No | — | App name for server-side connection tracking |
 | `FERRUM_MONGO_REPLICA_SET` | No | — | Replica set name. Required for transactions and change streams |
 | `FERRUM_MONGO_AUTH_MECHANISM` | No | (auto) | Auth mechanism override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
-| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | `30` | Server selection timeout |
-| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | `10` | TCP connection timeout |
+| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | — | Explicit server selection timeout. When unset, preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
+| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | — | Explicit TCP connect timeout. When unset, preserves `connectTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
 
 See [mongodb.md](mongodb.md) for the full deployment guide including read preference, replica sets, Atlas, and Kubernetes examples.
 
@@ -598,9 +598,9 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_RESOLVER_ADDRESS` | No | resolv.conf | Comma-separated nameservers (ip[:port]) |
 | `FERRUM_DNS_RESOLVER_HOSTS_FILE` | No | `/etc/hosts` | Path to custom hosts file |
 | `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
-| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Capped at 86400s (1 day) |
-| `FERRUM_DNS_ERROR_TTL` | No | `5` | TTL (seconds) for errors/empty responses. Capped at 86400s (1 day) |
-| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries |
+| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Also caps failed-entry lifetime and error-TTL backoff. Capped at 86400s (1 day) |
+| `FERRUM_DNS_ERROR_TTL` | No | `5` | Base TTL (seconds) for errors/empty responses; doubles on consecutive failures up to `FERRUM_DNS_STALE_TTL`. Capped at 86400s (1 day) |
+| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries. Over-capacity eviction prefers error entries over live success entries |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent DNS warmup resolutions during startup/config reload |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
@@ -608,7 +608,7 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_TRY_TCP_ON_ERROR` | No | `true` | Retry over TCP when UDP DNS responses are truncated or fail |
 | `FERRUM_DNS_NUM_CONCURRENT_REQS` | No | `3` | Nameservers to query concurrently per lookup; clamped 1..10 |
 | `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | No | `512` | Max in-flight queries per multiplexed DNS connection; clamped 1..4096 |
-| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Maximum concurrent stale-while-revalidate background refresh tasks system-wide. Prevents unbounded task spawning when many stale hostnames are hit simultaneously. Range: 1-1000 |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Max concurrent stale-while-revalidate refreshes and per-cycle failed-DNS retry work (selection + resolve concurrency). Range: 1-1000 |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
@@ -741,12 +741,12 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 |---|---|---|---|
 | `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads |
 | `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
-| `FERRUM_POOL_SHARD_AMOUNT` | No | `0` (auto) | Shard count for hot-path `DashMap`s (connection pools, pending creations, RR counters, DNS cache, per-IP request counts, TCP connection-throttle counters, router prefix/regex caches, `response_caching` cache/Vary-index/predictor maps, and shared local/Redis-fallback rate-limiter token-state maps used by `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, GraphQL type/operation limits, and `grpc_method_router`). `0` auto-derives `next_power_of_two(max(64, num_cpus * 16))` (64 on small dev hosts, 256 on a 16-core box, 1024 on a 64-core box). Any positive value is rounded up to the next power of two. Tune up for hosts running 1M+ concurrent flows; tune down only under memory pressure |
+| `FERRUM_POOL_SHARD_AMOUNT` | No | `0` (auto) | Shard count for hot-path `DashMap`s (connection pools, pending creations, RR counters, DNS cache, circuit-breaker cache, per-IP request counts, TCP connection-throttle counters, router prefix/regex caches, `response_caching` cache/Vary-index/predictor maps, and shared local/Redis-fallback rate-limiter token-state maps used by `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, GraphQL type/operation limits, and `grpc_method_router`). `0` auto-derives `next_power_of_two(max(64, num_cpus * 16))` (64 on small dev hosts, 256 on a 16-core box, 1024 on a 64-core box). Any positive value is rounded up to the next power of two. Tune up for hosts running 1M+ concurrent flows; tune down only under memory pressure |
 | `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |
 | `FERRUM_MAX_REQUESTS` | No | `0` | Max concurrent in-flight requests/streams; `0` = unlimited |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | No | `0` | Per-client-IP concurrent request cap; `0` disables |
 | `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` | No | `60` | Cleanup interval for per-IP request counters |
-| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | No | `10000` | Max circuit breaker cache entries |
+| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | No | `10000` | Max circuit breaker cache entries (`proxy_id` or `proxy_id::host:port`). Concurrent same-key creates share one breaker; new distinct keys are refused admission once full and receive a transient (uncached) breaker so overflow traffic still proceeds without growing or splitting cached state. Existing keys remain replaceable at capacity when config changes |
 | `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | No | `200` | Max distinct HTTP status code counter entries |
 | `FERRUM_TCP_LISTEN_BACKLOG` | No | `2048` | TCP listen backlog size (min 128); raise `net.core.somaxconn` to match |
 | `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept() loops per proxy listener port via SO_REUSEPORT. `0` = CPU cores, `1` = single listener. Parallelizes kernel-level connection intake independently of worker threads. Unix only (Linux 3.9+, macOS, BSDs); non-Unix platforms warn and run one accept loop |

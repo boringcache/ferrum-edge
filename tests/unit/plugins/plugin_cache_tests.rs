@@ -6963,6 +6963,7 @@ async fn test_priority_override_delegates_context_response_body_transform() {
         "GET".to_string(),
         "/api/users".to_string(),
     );
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
 
     let mut request_headers = HashMap::new();
     request_headers.insert("accept-encoding".to_string(), "gzip".to_string());
