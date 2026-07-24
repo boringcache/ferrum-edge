@@ -10,9 +10,9 @@ use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::grpc::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
-    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, MultiCpBackoffState,
-    StaleSnapshotReject, advance_multi_cp_backoff, backoff_max_secs,
-    evaluate_full_snapshot_authority, failure_backoff_sequence,
+    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, FullSnapshotStreamDisposition,
+    MultiCpBackoffState, StaleSnapshotReject, advance_multi_cp_backoff, backoff_max_secs,
+    evaluate_full_snapshot_authority, failure_backoff_sequence, full_snapshot_stream_disposition,
     grow_backoff_after_failure_sleep, silence_exceeds_liveness,
 };
 use ferrum_edge::grpc::dp_client::{DpCpConnectionState, configure_configsync_endpoint};
@@ -108,6 +108,124 @@ fn full_snapshot_fencing_rejects_older_cross_source() {
     )
     .expect("newer failover snapshot is accepted");
     assert_eq!(newer, Some(Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap()));
+}
+
+#[test]
+fn fenced_full_snapshot_disposition_terminates_stream() {
+    // Issue #2970: a fenced cross-source snapshot must map to a stream-terminating
+    // refusal, NOT a skippable message. If it were skippable, the DP would keep
+    // reading from the stale fallback CP and apply its next delta against newer
+    // config. This asserts the terminate contract at the pure decision seam the
+    // stream loop actually calls.
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+    };
+
+    match full_snapshot_stream_disposition(
+        Some(&authority),
+        "2026-06-01T12:00:00Z",
+        "http://cp-fallback:50051",
+    ) {
+        FullSnapshotStreamDisposition::RefuseAndTerminate(StaleSnapshotReject::OlderThanApplied {
+            applied: fenced_applied,
+            incoming,
+        }) => {
+            assert_eq!(fenced_applied, applied);
+            assert_eq!(incoming, Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap());
+        }
+        other => panic!("older cross-source snapshot must terminate the stream, got {other:?}"),
+    }
+
+    // An unorderable (unparseable) cross-source version against a known authority
+    // also fails closed by terminating the stream rather than skipping.
+    assert!(matches!(
+        full_snapshot_stream_disposition(Some(&authority), "garbage", "http://cp-fallback:50051"),
+        FullSnapshotStreamDisposition::RefuseAndTerminate(StaleSnapshotReject::UnparseableVersion)
+    ));
+}
+
+#[test]
+fn accepted_full_snapshot_disposition_applies_and_adopts_version() {
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+    };
+
+    // A newer cross-source failover snapshot applies and adopts its version.
+    assert_eq!(
+        full_snapshot_stream_disposition(
+            Some(&authority),
+            "2026-08-01T12:00:00Z",
+            "http://cp-fallback:50051",
+        ),
+        FullSnapshotStreamDisposition::Apply {
+            version: Some(Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap()),
+        }
+    );
+
+    // A same-source recovery snapshot always applies, even when older, so a
+    // primary reconnect/resend is never fenced against its own authority.
+    assert_eq!(
+        full_snapshot_stream_disposition(
+            Some(&authority),
+            "2026-06-01T12:00:00Z",
+            "http://cp-primary:50051",
+        ),
+        FullSnapshotStreamDisposition::Apply {
+            version: Some(Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()),
+        }
+    );
+
+    // The first snapshot (no applied authority yet) applies and adopts its
+    // parsed version.
+    assert_eq!(
+        full_snapshot_stream_disposition(None, "2026-07-20T00:00:00Z", "http://cp-a:50051"),
+        FullSnapshotStreamDisposition::Apply {
+            version: Some(Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap()),
+        }
+    );
+}
+
+#[test]
+fn stale_snapshot_fenced_outcome_fails_over_without_resetting_backoff() {
+    // A fenced snapshot must account like a connection failure: advance to the
+    // next CP, keep sleeping, and NEVER reset backoff (a stale fallback CP is
+    // not healthy progress). Contrast CleanCloseAfterConfig, which does reset.
+    let fenced = ConfigSyncAttemptOutcome::StaleSnapshotFenced;
+    let mut state = MultiCpBackoffState {
+        backoff_secs: 8,
+        ..MultiCpBackoffState::new()
+    };
+    assert!(advance_multi_cp_backoff(&mut state, 2, fenced));
+    assert_eq!(state.current_cp_index, 1, "fencing must fail over to the next CP");
+    assert_eq!(state.backoff_secs, 8, "fencing must not reset backoff");
+    grow_backoff_after_failure_sleep(&mut state);
+    assert_eq!(state.backoff_secs, 16, "backoff must keep growing after a fence");
+}
+
+#[test]
+fn repeated_fencing_reaches_backoff_cap_and_cycles_cps() {
+    // A permanently stale fallback that keeps getting fenced must not busy-loop:
+    // backoff still climbs to the cap and the DP still cycles across CP URLs.
+    let fenced = ConfigSyncAttemptOutcome::StaleSnapshotFenced;
+    let mut state = MultiCpBackoffState::new();
+    let mut reached_cap = false;
+    let mut cycled = false;
+    for _ in 0..24 {
+        assert!(advance_multi_cp_backoff(&mut state, 2, fenced));
+        if state.full_cycle_count > 0 {
+            cycled = true;
+        }
+        grow_backoff_after_failure_sleep(&mut state);
+        if state.backoff_secs == backoff_max_secs() {
+            reached_cap = true;
+        }
+    }
+    assert!(reached_cap, "repeated fencing must still reach the backoff cap");
+    assert!(cycled, "repeated fencing across 2 CPs must cycle back to primary");
 }
 
 #[test]

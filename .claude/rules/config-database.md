@@ -110,6 +110,7 @@ paths:
 - Production CP server uses `CpGrpcServer::with_channel_capacity(env_config.cp_broadcast_channel_capacity)`. `new()` default capacity 128 is for tests.
 - DP reconnects priority-ordered CP URLs with exponential backoff from 1s to 30s and plus/minus 25% jitter. Backoff follows the failure sequence across CP switches; a clean close that delivered no config message counts as a failure. Successful sustained operation (applied config) or intentional disconnect may reset it.
 - ConfigSync Subscribe streams use HTTP/2/TCP keepalive plus application heartbeats; DPs reconnect after bounded silence rather than hanging on idle `message().await`.
+- A cross-source FULL_SNAPSHOT that is older than (or unorderable against) the applied authority is fenced: the DP refuses it, terminates that stream, and fails over (`DpStreamEnd::StaleSnapshotFenced` → `ConfigSyncAttemptOutcome::StaleSnapshotFenced`, accounted like a connection failure). It must not `continue` on the same stream — that would let the stale CP's next delta apply against newer config. The fence does not mark config received, touch `last_config_received_at`, or update snapshot authority. Same-source recovery snapshots stay accepted. Decision seam: `configsync_lifecycle::full_snapshot_stream_disposition`.
 - On fallback CP, DP races the stream against primary-retry timer `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` between messages so in-flight applies are not cancelled mid-`spawn_blocking`.
 
 ## Dependency Version Sync

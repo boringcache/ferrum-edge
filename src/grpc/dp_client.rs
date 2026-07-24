@@ -38,8 +38,9 @@ use tracing::{debug, error, info, warn};
 use super::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
-    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, MultiCpBackoffState,
-    advance_multi_cp_backoff, evaluate_full_snapshot_authority, grow_backoff_after_failure_sleep,
+    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, FullSnapshotStreamDisposition,
+    MultiCpBackoffState, advance_multi_cp_backoff, full_snapshot_stream_disposition,
+    grow_backoff_after_failure_sleep,
 };
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
@@ -511,6 +512,22 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 }
             }
+            Ok(DpStreamEnd::StaleSnapshotFenced) => {
+                // The stream delivered a stale cross-source FULL_SNAPSHOT that we
+                // refused; the applied config is unchanged and still served. Fail
+                // over to the next CP with accumulating backoff — never reset it,
+                // and never mark config as received — so a stale fallback cache
+                // can neither roll config back nor masquerade as healthy progress.
+                warn!(
+                    "Refused stale FULL_SNAPSHOT from CP [{}/{}] ({}); failing over without \
+                     applying so a stale fallback cache cannot roll config back",
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                    cp_url
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::StaleSnapshotFenced
+            }
             Err(e) => {
                 error!(
                     "CP [{}/{}] connection error ({}): {}",
@@ -533,6 +550,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             attempt_outcome,
             ConfigSyncAttemptOutcome::ConnectionError
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
+                | ConfigSyncAttemptOutcome::StaleSnapshotFenced
         ) && backoff.current_cp_index == 0
             && backoff.full_cycle_count > 0
             && cp_count > 1
@@ -598,6 +616,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             attempt_outcome,
             ConfigSyncAttemptOutcome::ConnectionError
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
+                | ConfigSyncAttemptOutcome::StaleSnapshotFenced
         ) {
             grow_backoff_after_failure_sleep(&mut backoff);
         }
@@ -615,6 +634,11 @@ enum DpStreamEnd {
     TlsReload,
     /// Process shutdown observed while connected.
     Shutdown,
+    /// A cross-source FULL_SNAPSHOT was fenced as stale/unorderable, so the DP
+    /// refused this stream before any later delta from it could apply against
+    /// the newer active config. The outer loop treats this as a
+    /// failover-with-backoff failure — never as delivered config (issue #2970).
+    StaleSnapshotFenced,
 }
 
 async fn wait_for_readiness_then_primary_retry(
@@ -937,6 +961,7 @@ pub async fn connect_and_subscribe(
     {
         DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
         DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
+        DpStreamEnd::StaleSnapshotFenced => Ok(()),
     }
 }
 
@@ -984,6 +1009,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
     {
         DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
         DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
+        DpStreamEnd::StaleSnapshotFenced => Ok(()),
     }
 }
 
@@ -1186,20 +1212,32 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 // FULL_SNAPSHOT — replace the entire config, subject to
                 // cross-CP failover fencing on the snapshot version so a stale
                 // fallback CP cache cannot silently roll config back.
-                let incoming_version = match evaluate_full_snapshot_authority(
+                //
+                // A fenced snapshot must TERMINATE this stream, not `continue`:
+                // continuing would leave us reading from the same stale fallback
+                // CP, whose next DELTA (removals and trust-only updates included)
+                // would apply against the newer active config — the persistent
+                // stale-base-delta failure of issue #2970. Returning here hands
+                // the outer loop a failover-with-backoff outcome and structurally
+                // guarantees no later message from this refused stream is read.
+                // We do not mark the snapshot received, do not touch
+                // `last_config_received_at`, and do not update snapshot authority.
+                let incoming_version = match full_snapshot_stream_disposition(
                     snapshot_authority.as_ref(),
                     &update.version,
                     cp_url,
                 ) {
-                    Ok(version) => version,
-                    Err(reason) => {
+                    FullSnapshotStreamDisposition::Apply { version } => version,
+                    FullSnapshotStreamDisposition::RefuseAndTerminate(reason) => {
                         warn!(
                             ?reason,
                             cp_url,
                             version = %update.version,
-                            "Refusing FULL_SNAPSHOT from failover CP; keeping applied config"
+                            "Refusing stale cross-source FULL_SNAPSHOT and terminating this \
+                             ConfigSync stream so no later delta from it can apply against newer \
+                             config; keeping applied config and failing over"
                         );
-                        continue;
+                        return Ok(DpStreamEnd::StaleSnapshotFenced);
                     }
                 };
                 match serde_json::from_str::<GatewayConfig>(&update.config_json) {

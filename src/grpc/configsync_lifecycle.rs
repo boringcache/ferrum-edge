@@ -105,6 +105,44 @@ pub fn evaluate_full_snapshot_authority(
     Ok(Some(incoming))
 }
 
+/// How the ConfigSync stream must react to an incoming FULL_SNAPSHOT.
+///
+/// The distinction this type makes load-bearing: a fenced (older or unorderable
+/// cross-source) snapshot must **terminate** the stream, not merely be skipped
+/// on a stream that keeps reading. If the stream continued, the same stale
+/// fallback CP's next DELTA — removals and trust-only updates included — would
+/// apply against the newer active config, which is exactly the persistent
+/// stale-base-delta regression described in issue #2970. Terminating hands the
+/// outer reconnect loop a failure outcome so it fails over with bounded backoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FullSnapshotStreamDisposition {
+    /// Apply the snapshot; adopt `version` as the new applied authority once the
+    /// apply succeeds (`None` preserves "unparseable version, no fabricated
+    /// timestamp"). See [`evaluate_full_snapshot_authority`].
+    Apply { version: Option<DateTime<Utc>> },
+    /// Refuse the snapshot and terminate the stream so no later message from the
+    /// same source can apply; the outer loop fails over with bounded backoff.
+    RefuseAndTerminate(StaleSnapshotReject),
+}
+
+/// Decide how the ConfigSync stream must react to an incoming FULL_SNAPSHOT.
+///
+/// Thin wrapper over [`evaluate_full_snapshot_authority`] that keeps the
+/// accept-vs-refuse policy in one place while making the *stream* consequence
+/// explicit and unit-testable: an `Err` from the policy is never a skippable
+/// message — it is a stream-terminating refusal
+/// ([`FullSnapshotStreamDisposition::RefuseAndTerminate`]).
+pub fn full_snapshot_stream_disposition(
+    authority: Option<&AppliedSnapshotAuthority>,
+    incoming_version: &str,
+    source_cp_url: &str,
+) -> FullSnapshotStreamDisposition {
+    match evaluate_full_snapshot_authority(authority, incoming_version, source_cp_url) {
+        Ok(version) => FullSnapshotStreamDisposition::Apply { version },
+        Err(reject) => FullSnapshotStreamDisposition::RefuseAndTerminate(reject),
+    }
+}
+
 /// Multi-CP reconnect backoff state. Backoff follows the failure sequence and
 /// is not reset merely because the selected CP index changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +179,12 @@ pub enum ConfigSyncAttemptOutcome {
     CleanCloseWithoutConfig,
     /// Operator-driven disconnect (primary retry / TLS reload). Not a failure.
     IntentionalDisconnect,
+    /// A cross-source FULL_SNAPSHOT was fenced as stale/unorderable, so the DP
+    /// refused the stream before any delta from it could apply. Treated exactly
+    /// like a connection failure for failover/backoff accounting: advance to the
+    /// next CP and keep accumulating backoff. It must never reset backoff — a
+    /// stale fallback CP is not healthy progress (issue #2970).
+    StaleSnapshotFenced,
 }
 
 /// Advance multi-CP index/backoff after one attempt.
@@ -161,7 +205,8 @@ pub fn advance_multi_cp_backoff(
             true
         }
         ConfigSyncAttemptOutcome::ConnectionError
-        | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig => {
+        | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
+        | ConfigSyncAttemptOutcome::StaleSnapshotFenced => {
             if cp_count > 1 {
                 let next_index = (state.current_cp_index + 1) % cp_count;
                 if next_index == 0 {
