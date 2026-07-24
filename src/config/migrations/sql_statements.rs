@@ -103,10 +103,7 @@ impl SplitDialect {
     }
 }
 
-fn scan_statements(
-    sql: &str,
-    dialect: SplitDialect,
-) -> Result<Vec<&str>, SqlStatementSplitError> {
+fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlStatementSplitError> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
     let mut i = 0usize;
