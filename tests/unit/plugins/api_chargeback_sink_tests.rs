@@ -3283,6 +3283,63 @@ async fn snapshot_overflow_delivery_write_failure_stages_within_bound() {
     drop(plugin);
 }
 
+/// A queued overflow owns its recovery payload until durable success. Aborting
+/// an uncommitted delivery worker must re-stage that payload before releasing
+/// lifecycle delivery ownership.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_queue_abort_restages_before_delivery_release() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_abort_spool_delivery_for_test,
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-abort-recovery"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+
+    // Leave the worker behind its commit gate so the event is certainly queued
+    // when abort drops the receiver.
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-abort-recovery-1")
+    ));
+    assert!(api_chargeback_sink_abort_spool_delivery_for_test(&plugin));
+
+    let mut pending_seen = 0u64;
+    for _ in 0..200 {
+        let (spooled, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(spooled, 0, "an uncommitted worker cannot spool the event");
+        assert_eq!(
+            rejections, 0,
+            "bounded recovery has room and must not record loss"
+        );
+        if pending >= 1 {
+            pending_seen = pending;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        pending_seen, 1,
+        "worker abort must re-stage its queued snapshot overflow payload"
+    );
+    drop(plugin);
+}
+
 /// Issue #2: compaction refuses to clear full-generation state while an
 /// admission guard is held and succeeds on retry once the admitted hook drains.
 #[tokio::test]

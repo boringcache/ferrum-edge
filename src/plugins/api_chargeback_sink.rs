@@ -1054,11 +1054,111 @@ enum SpoolJob {
     /// worker advances the overflow-spooled counters; on write/cancellation
     /// failure it re-stages the exact events into the accumulator's bounded
     /// overflow so a Tokio worker never blocks on compression/write/fsync.
-    SnapshotOverflow {
+    SnapshotOverflow(SnapshotOverflowJob),
+}
+
+/// Owned snapshot-overflow delivery.
+///
+/// The queued form preserves byte leases without copying events. Once a worker
+/// starts a blocking write, `recovery_events` keeps an `Arc` to the exact
+/// payload. Dropping this owner before durable success (queue teardown, worker
+/// abort, or a failed blocking task) re-stages the payload and always releases
+/// the lifecycle's delivery count.
+struct SnapshotOverflowJob {
+    queued_events: Vec<QueuedChargeEvent>,
+    recovery_events: Option<Arc<Vec<ChargeEvent>>>,
+    accumulator: Arc<SnapshotAccumulator>,
+    generation: u64,
+    metrics: Arc<SinkMetrics>,
+    pending_jobs: Arc<AtomicUsize>,
+    pending_events: Arc<AtomicUsize>,
+    event_count: usize,
+    durable: bool,
+}
+
+impl SnapshotOverflowJob {
+    fn new(
         events: Vec<QueuedChargeEvent>,
         accumulator: Arc<SnapshotAccumulator>,
         generation: u64,
-    },
+        metrics: Arc<SinkMetrics>,
+        pending_jobs: Arc<AtomicUsize>,
+        pending_events: Arc<AtomicUsize>,
+    ) -> Self {
+        let event_count = events.len();
+        Self {
+            queued_events: events,
+            recovery_events: None,
+            accumulator,
+            generation,
+            metrics,
+            pending_jobs,
+            pending_events,
+            event_count,
+            durable: false,
+        }
+    }
+
+    fn event_count(&self) -> usize {
+        self.event_count
+    }
+
+    fn prepare_write(&mut self) -> (Arc<Vec<ChargeEvent>>, Vec<Arc<ByteLease>>) {
+        let queued_events = std::mem::take(&mut self.queued_events);
+        let (events, leases): (Vec<_>, Vec<_>) = queued_events
+            .into_iter()
+            .map(|queued| (queued.event, queued.lease))
+            .unzip();
+        let events = Arc::new(events);
+        self.recovery_events = Some(Arc::clone(&events));
+        (events, leases)
+    }
+
+    fn mark_durable(&mut self) {
+        self.durable = true;
+        self.recovery_events = None;
+    }
+
+    fn restage(&mut self) {
+        if self.durable {
+            return;
+        }
+        let events = if !self.queued_events.is_empty() {
+            std::mem::take(&mut self.queued_events)
+                .into_iter()
+                .map(|queued| queued.event)
+                .collect()
+        } else if let Some(events) = self.recovery_events.take() {
+            match Arc::try_unwrap(events) {
+                Ok(events) => events,
+                Err(events) => events.as_ref().clone(),
+            }
+        } else {
+            self.metrics.record_failure(
+                FailureReason::Serialize,
+                "snapshot overflow delivery lost internal payload ownership",
+            );
+            self.durable = true;
+            return;
+        };
+        stage_overflow_events_or_reject(
+            &self.accumulator,
+            &self.metrics,
+            self.generation,
+            events,
+        );
+        self.durable = true;
+    }
+}
+
+impl Drop for SnapshotOverflowJob {
+    fn drop(&mut self) {
+        self.restage();
+        self.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+        self.pending_events
+            .fetch_sub(self.event_count, Ordering::Relaxed);
+        self.accumulator.finish_overflow_delivery();
+    }
 }
 
 /// Bounded async handoff for spool compression/write/fsync work.
@@ -1112,9 +1212,9 @@ impl SpoolDelivery {
 
     /// Enqueue snapshot overflow events for durable async spooling. The bounded
     /// queue owns compression/write/fsync and preserves the byte leases until
-    /// the blocking write finishes. On a full or closed queue (or shutdown) the
-    /// exact events are returned so the caller can stage them in bounded
-    /// overflow instead; nothing is lost silently here.
+    /// the blocking write finishes. Admission refusal returns the exact events
+    /// to the caller; after delivery ownership begins, a full/closed queue or
+    /// worker teardown re-stages them before releasing that ownership.
     fn try_enqueue_snapshot_overflow(
         &self,
         events: Vec<QueuedChargeEvent>,
@@ -1132,11 +1232,15 @@ impl SpoolDelivery {
         self.pending_jobs.fetch_add(1, Ordering::Relaxed);
         self.pending_events
             .fetch_add(event_count, Ordering::Relaxed);
-        match self.sender.try_send(SpoolJob::SnapshotOverflow {
+        let job = SnapshotOverflowJob::new(
             events,
             accumulator,
             generation,
-        }) {
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.pending_jobs),
+            Arc::clone(&self.pending_events),
+        );
+        match self.sender.try_send(SpoolJob::SnapshotOverflow(job)) {
             Ok(()) => {
                 self.metrics
                     .spool_jobs_enqueued_total
@@ -1144,17 +1248,13 @@ impl SpoolDelivery {
                 Ok(())
             }
             Err(error) => {
-                self.pending_jobs.fetch_sub(1, Ordering::Relaxed);
-                self.pending_events
-                    .fetch_sub(event_count, Ordering::Relaxed);
                 match error.into_inner() {
-                    SpoolJob::SnapshotOverflow {
-                        events,
-                        accumulator,
-                        ..
-                    } => {
-                        accumulator.finish_overflow_delivery();
-                        Err(events)
+                    SpoolJob::SnapshotOverflow(mut job) => {
+                        // Stage back while this job still owns the lifecycle's
+                        // delivery count. Drop releases ownership only after the
+                        // accumulator mutation is complete.
+                        job.restage();
+                        Ok(())
                     }
                     SpoolJob::Events(events) => Err(events),
                 }
@@ -1256,39 +1356,29 @@ fn start_spool_delivery(
                                     );
                                 }
                             }
-                            accumulator.finish_overflow_delivery();
                             pending_jobs_for_loop.fetch_sub(1, Ordering::Relaxed);
                             pending_events_for_loop
                                 .fetch_sub(event_count, Ordering::Relaxed);
                         }
-                        Some(SpoolJob::SnapshotOverflow {
-                            events: queued_events,
-                            accumulator,
-                            generation,
-                        }) => {
-                            let event_count = queued_events.len();
-                            let (events, leases): (Vec<_>, Vec<_>) = queued_events
-                                .into_iter()
-                                .map(|queued| (queued.event, queued.lease))
-                                .unzip();
+                        Some(SpoolJob::SnapshotOverflow(mut job)) => {
+                            let event_count = job.event_count();
+                            let generation = job.generation;
+                            let (events, leases) = job.prepare_write();
                             let spool = Arc::clone(&spool);
                             let metrics = Arc::clone(&metrics_for_worker);
+                            let events_for_write = Arc::clone(&events);
+                            drop(events);
                             let write_result = tokio::task::spawn_blocking(move || {
-                                let result = spool.write_events(&events);
-                                // Recover the exact events for bounded re-staging
-                                // on durable failure; a success drops them. Leases
-                                // stay charged across the blocking write even if
-                                // the async waiter is cancelled mid-drain.
-                                let recovered = match &result {
-                                    Ok(_) => Vec::new(),
-                                    Err(_) => events,
-                                };
+                                let result = spool.write_events(events_for_write.as_slice());
+                                // Leases stay charged across the blocking write
+                                // even if its async waiter is cancelled mid-drain.
                                 drop(leases);
-                                (result, recovered)
+                                result
                             })
                             .await;
                             match write_result {
-                                Ok((Ok(_), _)) => {
+                                Ok(Ok(_)) => {
+                                    job.mark_durable();
                                     metrics
                                         .spool_jobs_written_total
                                         .fetch_add(1, Ordering::Relaxed);
@@ -1300,7 +1390,7 @@ fn start_spool_delivery(
                                         .fetch_add(event_count as u64, Ordering::Relaxed);
                                     invalidate_status_cache();
                                 }
-                                Ok((Err(error), recovered)) => {
+                                Ok(Err(error)) => {
                                     metrics.spool_available.store(false, Ordering::Release);
                                     warn!(
                                         plugin = PLUGIN_NAME,
@@ -1308,12 +1398,7 @@ fn start_spool_delivery(
                                         error = %error,
                                         "Chargeback sink async snapshot overflow spool write failed; staging in bounded overflow"
                                     );
-                                    stage_overflow_events_or_reject(
-                                        &accumulator,
-                                        &metrics,
-                                        generation,
-                                        recovered,
-                                    );
+                                    job.restage();
                                 }
                                 Err(error) => {
                                     warn!(
@@ -1326,11 +1411,9 @@ fn start_spool_delivery(
                                         event_count as u64,
                                         "snapshot overflow spool task failed",
                                     );
+                                    job.restage();
                                 }
                             }
-                            pending_jobs_for_loop.fetch_sub(1, Ordering::Relaxed);
-                            pending_events_for_loop
-                                .fetch_sub(event_count, Ordering::Relaxed);
                         }
                         None => break,
                     }
@@ -2376,6 +2459,20 @@ impl ApiChargebackSink {
             return false;
         };
         spool_snapshot_overflow_event(lifecycle, event);
+        true
+    }
+
+    /// Abort the owned spool-delivery worker so tests can prove queued snapshot
+    /// overflow ownership re-stages on teardown before durable processing.
+    #[allow(dead_code)]
+    pub(crate) fn abort_spool_delivery_for_tests(&self) -> bool {
+        let Some(runtime) = self.runtime.get() else {
+            return false;
+        };
+        let Some(delivery) = runtime.spool_delivery.as_ref() else {
+            return false;
+        };
+        delivery.worker.abort();
         true
     }
 

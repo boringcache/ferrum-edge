@@ -677,6 +677,12 @@ pub mod _test_support {
         plugin.spool_snapshot_overflow_for_tests(event)
     }
 
+    pub fn api_chargeback_sink_abort_spool_delivery_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> bool {
+        plugin.abort_spool_delivery_for_tests()
+    }
+
     pub fn api_chargeback_sink_snapshot_overflow_counters_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
     ) -> Option<(u64, u64, u64)> {
