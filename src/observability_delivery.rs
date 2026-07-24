@@ -312,9 +312,15 @@ impl DeliveryLifecycle {
             if worker.is_finished() {
                 continue;
             }
+            let pending_records = worker.pending_records();
+            warn!(
+                plugin = worker.plugin_name(),
+                record_count = pending_records,
+                "observability delivery worker did not drain before shutdown"
+            );
             self.counters
                 .lost_worker_records
-                .fetch_add(worker.pending_records(), Ordering::Relaxed);
+                .fetch_add(pending_records, Ordering::Relaxed);
             worker.abort();
         }
         self.tasks_changed.notify_one();
