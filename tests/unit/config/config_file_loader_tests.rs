@@ -2339,7 +2339,10 @@ plugin_configs: []
     )
     .expect_err("object version must be rejected");
     let msg = err.to_string();
-    assert!(msg.contains("got object"), "expected type diagnostic: {msg}");
+    assert!(
+        msg.contains("got object"),
+        "expected type diagnostic: {msg}"
+    );
     assert!(
         !msg.contains("must-not-appear") && !msg.contains("credential"),
         "invalid version values must not be echoed: {msg}"

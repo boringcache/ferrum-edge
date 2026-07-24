@@ -197,8 +197,7 @@ fn test_parse_validate_with_mode_and_spec() {
 
 #[test]
 fn test_parse_validate_with_mode_verbose() {
-    let cli = Cli::try_parse_from(["ferrum-edge", "validate", "-m", "file", "-vv"])
-        .unwrap();
+    let cli = Cli::try_parse_from(["ferrum-edge", "validate", "-m", "file", "-vv"]).unwrap();
     match cli.command {
         Some(Command::Validate(args)) => {
             assert_eq!(args.mode.as_deref(), Some("file"));
@@ -237,10 +236,7 @@ fn test_parse_validate_verbose_levels() {
         (vec!["ferrum-edge", "validate", "-v"], 1),
         (vec!["ferrum-edge", "validate", "-vv"], 2),
         (vec!["ferrum-edge", "validate", "-vvv"], 3),
-        (
-            vec!["ferrum-edge", "validate", "--verbose", "--verbose"],
-            2,
-        ),
+        (vec!["ferrum-edge", "validate", "--verbose", "--verbose"], 2),
     ] {
         let cli = Cli::try_parse_from(flags).unwrap();
         match cli.command {
@@ -315,7 +311,11 @@ fn test_select_gateway_pid_empty_returns_not_found() {
     let self_pid = 12345;
     let result = select_gateway_pid(vec![], self_pid);
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("No running ferrum-edge process"));
+    assert!(
+        result
+            .unwrap_err()
+            .contains("No running ferrum-edge process")
+    );
 }
 
 #[test]
@@ -878,7 +878,12 @@ fn test_apply_validate_overrides_explicit_mode_not_overridden_by_spec() {
 #[test]
 fn test_apply_validate_overrides_verbose_levels() {
     without_env_vars(
-        &["FERRUM_MODE", "FERRUM_LOG_LEVEL", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
         || {
             for (level, expected) in [(1, "info"), (2, "debug"), (3, "trace"), (4, "trace")] {
                 let args = ValidateArgs {
@@ -901,7 +906,12 @@ fn test_apply_validate_overrides_verbose_levels() {
 #[test]
 fn test_apply_validate_overrides_no_verbose_does_not_set_log_level() {
     without_env_vars(
-        &["FERRUM_MODE", "FERRUM_LOG_LEVEL", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
         || {
             let args = ValidateArgs {
                 settings: None,
@@ -929,7 +939,10 @@ fn test_validate_mode_and_spec_sets_env_before_infer() {
                 verbose: 0,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
-            assert_eq!(std::env::var("FERRUM_FILE_CONFIG_PATH").unwrap(), "/tmp/config.yaml");
+            assert_eq!(
+                std::env::var("FERRUM_FILE_CONFIG_PATH").unwrap(),
+                "/tmp/config.yaml"
+            );
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
             ferrum_edge::cli::infer_file_mode();
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
@@ -964,7 +977,12 @@ fn test_apply_validate_overrides_mode_wins_over_env() {
 #[test]
 fn test_apply_validate_overrides_verbose_wins_over_env() {
     without_env_vars(
-        &["FERRUM_MODE", "FERRUM_LOG_LEVEL", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
         || {
             unsafe { std::env::set_var("FERRUM_LOG_LEVEL", "error") };
             let args = ValidateArgs {
