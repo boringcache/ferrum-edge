@@ -17589,7 +17589,8 @@ components:
         suffix; IPv4/IPv6 literals are left unchanged). Cross-origin credential
         forwarding is deny-by-default: any header whose lowercased name is a
         built-in credential (Authorization, Cookie, Proxy-Authorization,
-        WWW-Authenticate, X-Api-Key, …), contains a built-in credential substring
+        Proxy-Authenticate, WWW-Authenticate, X-Api-Key, …), contains a built-in
+        credential substring
         (so vendor variants like x-openai-api-key / x-amz-security-token are also
         caught), or matches a configured sensitive_header_patterns entry is
         stripped before the distinct mirror origin. Native gRPC metadata travels
@@ -17605,7 +17606,9 @@ components:
         request bodies share Bytes with the primary buffer and are admitted under
         max_in_flight plus max_retained_request_body_bytes. The mirror request
         always has a finite deadline (mirror_timeout_ms, else positive proxy
-        backend_read_timeout_ms, else 60000ms, capped at 300000ms). The mirror
+        backend_read_timeout_ms, else 60000ms, capped at 300000ms). Label-safe
+        process-wide ferrum_request_mirror_*_total lifecycle counters are exported
+        on authenticated /metrics (no URLs, header names, or plugin IDs). The mirror
         request-target preserves the raw query (after the same auth credential
         strips as primary) including repeated pairs, order, flags, empty values,
         +, percent escapes, and non-ASCII encoded bytes.
@@ -17696,27 +17699,32 @@ components:
             must be non-empty.
         forward_sensitive_header_allowlist:
           type: array
+          maxItems: 64
           items:
             type: string
+            maxLength: 256
           description: >-
             Lowercased exact allowlist of denied sensitive header names to
             forward when forward_sensitive_headers is true. Each entry must be a
-            valid HTTP header name that the deny-by-default policy actually
-            strips (a built-in credential or a sensitive_header_patterns match);
-            non-sensitive names are rejected at construction. Default (with
+            valid HTTP header name (at most 256 bytes) that the deny-by-default
+            policy actually strips (a built-in credential or a
+            sensitive_header_patterns match); non-sensitive names are rejected at
+            construction. At most 64 entries. Default (with
             forward_sensitive_headers false) strips every sensitive header.
         sensitive_header_patterns:
           type: array
+          maxItems: 64
           items:
             type: string
+            maxLength: 128
           description: >-
             Additional lowercased substrings matched against the header name
-            (case-insensitive) that extend the built-in deny-by-default
-            credential set. A header whose lowercased name contains any pattern
-            is stripped before the mirror origin unless it is on the exact-name
-            forward_sensitive_header_allowlist. Covers HTTP headers and native
-            gRPC metadata (gRPC metadata is carried as HTTP/2 headers). Default
-            empty.
+            (case-insensitive; each at most 128 bytes, at most 64 entries) that
+            extend the built-in deny-by-default credential set. A header whose
+            lowercased name contains any pattern is stripped before the mirror
+            origin unless it is on the exact-name forward_sensitive_header_allowlist.
+            Covers HTTP headers and native gRPC metadata (gRPC metadata is carried
+            as HTTP/2 headers). Default empty.
         max_response_body_bytes:
           type: integer
           format: uint64

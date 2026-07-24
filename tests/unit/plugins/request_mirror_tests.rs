@@ -3082,6 +3082,98 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
     );
 }
 
+#[test]
+fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
+    let patterns_overflow = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_header_patterns": (0..65).map(|i| format!("pat{i}")).collect::<Vec<_>>()
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        patterns_overflow.contains("sensitive_header_patterns")
+            && patterns_overflow.contains("at most 64"),
+        "expected pattern count bound, got {patterns_overflow}"
+    );
+
+    let pattern_len = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_header_patterns": ["x".repeat(129)]
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        pattern_len.contains("maximum length of 128"),
+        "expected pattern length bound, got {pattern_len}"
+    );
+
+    let allow_count = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_header_patterns": (0..64).map(|i| format!("vendorkey{i}")).collect::<Vec<_>>(),
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": (0..65)
+                .map(|i| format!("x-vendorkey{i}"))
+                .collect::<Vec<_>>()
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        allow_count.contains("forward_sensitive_header_allowlist")
+            && allow_count.contains("at most 64"),
+        "expected allowlist count bound, got {allow_count}"
+    );
+
+    let long_allow = format!("x-{}", "a".repeat(250));
+    assert!(long_allow.len() > 256);
+    let allow_len = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_header_patterns": ["x-aaaa"],
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": [long_allow]
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        allow_len.contains("maximum length of 256"),
+        "expected allowlist item length bound, got {allow_len}"
+    );
+
+    // Exact maxima must still be accepted (fail-closed only above the bounds).
+    let patterns: Vec<String> = (0..64)
+        .map(|i| {
+            let mut pattern = format!("p{i}-");
+            while pattern.len() < 128 {
+                pattern.push('z');
+            }
+            pattern.truncate(128);
+            pattern
+        })
+        .collect();
+    let allowlist: Vec<String> = patterns.iter().map(|pattern| format!("x-{pattern}")).collect();
+    let ok = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_header_patterns": patterns,
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": allowlist
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(ok.is_ok(), "exact max bounds must be accepted: {ok:?}");
+}
+
 #[tokio::test]
 async fn content_length_responses_are_drained_for_http1_connection_reuse() {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -3415,6 +3507,11 @@ async fn sensitive_headers_stripped_by_default_including_grpc_metadata() {
         "proxy-authorization".to_string(),
         "Basic proxied".to_string(),
     );
+    headers.insert(
+        "proxy-authenticate".to_string(),
+        "Basic realm=\"shadow\"".to_string(),
+    );
+    headers.insert("www-authenticate".to_string(), "Bearer".to_string());
     headers.insert("x-api-key".to_string(), "sk-live".to_string());
     headers.insert("x-custom".to_string(), "keep-me".to_string());
 
@@ -3429,10 +3526,13 @@ async fn sensitive_headers_stripped_by_default_including_grpc_metadata() {
         "authorization:",
         "cookie:",
         "proxy-authorization:",
+        "proxy-authenticate:",
+        "www-authenticate:",
         "x-api-key:",
         "live-secret",
         "session=abc",
         "sk-live",
+        "realm=\"shadow\"",
     ] {
         assert!(
             !lower.contains(forbidden),
@@ -3586,6 +3686,10 @@ async fn grpc_metadata_credentials_stripped_by_default_on_h2c_mirror() {
     );
     headers.insert("cookie".to_string(), "sid=1".to_string());
     headers.insert("x-api-key".to_string(), "grpc-key".to_string());
+    headers.insert(
+        "proxy-authenticate".to_string(),
+        "Basic realm=\"grpc\"".to_string(),
+    );
     headers.insert("grpc-timeout".to_string(), "1S".to_string());
 
     plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
@@ -3613,6 +3717,10 @@ async fn grpc_metadata_credentials_stripped_by_default_on_h2c_mirror() {
     assert!(
         !lower.iter().any(|(k, _)| k == "x-api-key"),
         "gRPC x-api-key metadata must be stripped by default: {observed:?}"
+    );
+    assert!(
+        !lower.iter().any(|(k, _)| k == "proxy-authenticate"),
+        "gRPC Proxy-Authenticate metadata must be stripped by default: {observed:?}"
     );
     assert!(
         lower.iter().any(|(k, v)| k == "grpc-timeout" && v == "1s"),
@@ -3688,6 +3796,13 @@ async fn oversized_content_length_response_is_drained_under_bounds() {
         observed <= 4096,
         "observed size must not exceed the actual body: got {observed}"
     );
+    let m = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(
+        m.drain_truncations, 1,
+        "byte-cap truncation is its own terminal drain outcome: {m:?}"
+    );
+    assert_eq!(m.completed, 0, "truncation is not a full completion: {m:?}");
+    assert_eq!(m.dispatched, 1, "{m:?}");
 }
 
 /// #3058: deny-by-default credential stripping covers vendor-prefixed headers

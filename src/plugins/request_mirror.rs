@@ -35,7 +35,8 @@
 //! bracketed IPv6 literals keep their literal form (suffixing would yield an
 //! invalid Host). Cross-origin credential forwarding is deny-by-default: any
 //! header whose lowercased name is a built-in credential (`Authorization`,
-//! `Cookie`, `Proxy-Authorization`, `WWW-Authenticate`, `X-Api-Key`, …),
+//! `Cookie`, `Proxy-Authorization`, `Proxy-Authenticate`, `WWW-Authenticate`,
+//! `X-Api-Key`, …),
 //! contains a built-in credential substring (so vendor variants like
 //! `x-openai-api-key`, `x-amz-security-token`, `x-vendor-auth-token` are also
 //! caught), or matches an operator `sensitive_header_patterns` entry is stripped
@@ -75,13 +76,16 @@
 //!
 //! Alongside the per-event summary, each instance keeps bounded-lifetime
 //! `AtomicU64` counters (`MirrorMetrics`) for the mirror lifecycle — dispatched,
-//! completed, request/drain timeouts, request/drain failures, cancellations,
-//! and concurrency/byte-budget drops. A cancellation (runtime shutdown, panic,
-//! or future cancellation before a terminal outcome) is counted via a drop
-//! guard, so a stalled/cancelled mirror is never silently invisible. Counters
-//! are pure tallies (no header names, URLs, or credential material), reset on
-//! config reload, and are not exposed on the unauthenticated `/metrics`
-//! surface, matching how mirror summaries are excluded from `prometheus_metrics`.
+//! completed, request/drain timeouts, request/drain failures, drain truncations,
+//! cancellations, and concurrency/byte-budget drops. A cancellation (runtime
+//! shutdown, panic, or future cancellation before a terminal outcome) is counted
+//! via a drop guard, so a stalled/cancelled mirror is never silently invisible.
+//! Counters are pure tallies (no header names, URLs, plugin IDs, or credential
+//! material) and dual-write into Ferrum's process-wide authenticated Prometheus
+//! registry (`ferrum_request_mirror_*_total`). Per-instance values reset on
+//! config reload; the Prometheus series remain monotonic for the process.
+//! Mirror *transaction summaries* stay excluded from request/billing histograms —
+//! that exclusion does not apply to these label-safe lifecycle counters.
 //!
 //! Mirror timeout prefers an optional plugin `mirror_timeout_ms`, else the
 //! matched proxy's `backend_read_timeout_ms` when positive, else a finite
@@ -121,8 +125,8 @@
 //! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Shared `Bytes` bodies are charged once per task for their length; exhaustion drops the new mirror attempt without affecting the primary request. |
 //! | `mirror_timeout_ms` | u64 | (proxy / 60000) | Finite mirror request deadline in milliseconds (minimum 1, maximum 300000). When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. Zero primary timeout never disables this deadline. |
 //! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). |
-//! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); non-sensitive names are rejected at construction. |
-//! | `sensitive_header_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the header name) that extend the built-in deny-by-default credential set. Covers HTTP headers and native gRPC metadata. |
+//! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
+//! | `sensitive_header_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the header name; each ≤128 chars, at most 64 entries) that extend the built-in deny-by-default credential set. Covers HTTP headers and native gRPC metadata. |
 //!
 //! ## Percentage sampling
 //!
@@ -208,16 +212,29 @@ const MIRROR_BODY_BUDGET_DROP_ERROR: &str =
 const MIRROR_DRAIN_TIMEOUT_ERROR: &str = "mirror response body drain timed out";
 const MIRROR_DRAIN_TRANSPORT_ERROR: &str = "mirror response body stream failed";
 
+/// Hard ceiling on operator `sensitive_header_patterns` entries so an admitted
+/// config cannot create unbounded per-request substring scans or retained
+/// config memory.
+const MAX_SENSITIVE_HEADER_PATTERNS: usize = 64;
+/// Maximum UTF-8 byte length of one `sensitive_header_patterns` entry.
+const MAX_SENSITIVE_HEADER_PATTERN_LEN: usize = 128;
+/// Hard ceiling on `forward_sensitive_header_allowlist` entries.
+const MAX_FORWARD_SENSITIVE_ALLOWLIST: usize = 64;
+/// Maximum UTF-8 byte length of one allowlist header name.
+const MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN: usize = 256;
+
 /// Well-known origin-bound credential / session header names stripped from
 /// cross-origin mirror requests unless an explicit fail-closed allowlist opts
 /// in. Most are also matched by [`MIRROR_SENSITIVE_HEADER_SUBSTRINGS`]; the
-/// exact list is retained for `www-authenticate` (no covering substring) and as
-/// a self-documenting inventory of the standard credentials.
+/// exact list is retained as a self-documenting inventory of standard
+/// credentials (including challenge headers such as `WWW-Authenticate` /
+/// `Proxy-Authenticate` that may appear on secondary requests).
 const MIRROR_SENSITIVE_HEADER_NAMES: &[&str] = &[
     "authorization",
     "cookie",
     "cookie2",
     "proxy-authorization",
+    "proxy-authenticate",
     "www-authenticate",
     "x-api-key",
     "x-auth-token",
@@ -229,12 +246,15 @@ const MIRROR_SENSITIVE_HEADER_NAMES: &[&str] = &[
 /// `x-vendor-auth-token`) are stripped without an exact-name allowlist. Chosen
 /// to match credential families only: bare `token`/`key`/`session`/`auth`
 /// substrings are deliberately excluded because they also match benign headers
-/// such as pagination cursors (`x-continuation-token`). Operators extend this
-/// with `sensitive_header_patterns`. gRPC metadata is carried as HTTP/2 headers,
+/// such as pagination cursors (`x-continuation-token`). `authenticate` is
+/// included so `Proxy-Authenticate` / `WWW-Authenticate` variants are covered
+/// without a bare `auth` match. Operators extend this with
+/// `sensitive_header_patterns`. gRPC metadata is carried as HTTP/2 headers,
 /// so the same predicate covers native gRPC credential metadata.
 const MIRROR_SENSITIVE_HEADER_SUBSTRINGS: &[&str] = &[
     "authorization",
     "cookie",
+    "authenticate",
     "api-key",
     "apikey",
     "api_key",
@@ -459,26 +479,26 @@ impl Drop for RetainedMirrorBody {
 /// Per-instance, bounded-lifetime mirror observability counters.
 ///
 /// Lifetime is bounded to the plugin instance: a config reload rebuilds the
-/// plugin and resets every counter to zero (no unbounded growth, no
-/// cross-generation accumulation). Counts are aggregate outcome tallies only —
-/// they never carry header names, URLs, or credential material, so they cannot
-/// leak secrets. Mirror summaries are intentionally excluded from the
-/// unauthenticated `/metrics` surface (see `prometheus_metrics`), so these
-/// counters follow the same convention as other plugins' internal `AtomicU64`
-/// state (`ai_rate_limiter`, `ai_federation`): internal, testable, and surfaced
-/// per-event through `mirror_error` on the transaction log.
+/// plugin and resets every *per-instance* counter to zero (no unbounded growth,
+/// no cross-generation accumulation). Counts are aggregate outcome tallies only
+/// — they never carry header names, URLs, plugin IDs, or credential material.
+/// Each bump also dual-writes into the process-wide authenticated Prometheus
+/// registry (`ferrum_request_mirror_*_total`) so operators can scrape
+/// label-safe lifecycle counters on `/metrics`. Mirror *transaction summaries*
+/// remain excluded from request/billing histograms; that exclusion does not
+/// apply to these safe counters.
 ///
 /// Every dispatched task terminates in exactly one of
 /// `{completed, request_timeouts, request_failures, drain_timeouts,
-/// drain_failures, cancellations}`, so those six sum to `dispatched`. A task
-/// that is dropped before recording a terminal outcome — runtime shutdown,
-/// panic, or the executor cancelling the future — is counted as a cancellation
-/// by [`MirrorTaskGuard`].
+/// drain_failures, drain_truncations, cancellations}`, so those seven sum to
+/// `dispatched`. A task that is dropped before recording a terminal outcome —
+/// runtime shutdown, panic, or the executor cancelling the future — is counted
+/// as a cancellation by [`MirrorTaskGuard`].
 #[derive(Debug, Default)]
 struct MirrorMetrics {
     /// Detached tasks spawned (admitted past both concurrency and byte budgets).
     dispatched: AtomicU64,
-    /// Tasks that received a response and drained its body within bounds.
+    /// Tasks that received a response and drained its body fully within bounds.
     completed: AtomicU64,
     /// Request-phase deadline expiries (connect/header/body request timeout).
     request_timeouts: AtomicU64,
@@ -488,6 +508,8 @@ struct MirrorMetrics {
     drain_timeouts: AtomicU64,
     /// Response-body transport failures during the bounded drain.
     drain_failures: AtomicU64,
+    /// Response bodies truncated at `max_response_body_bytes` (still drained).
+    drain_truncations: AtomicU64,
     /// Tasks dropped before a terminal outcome (shutdown/panic/cancellation).
     cancellations: AtomicU64,
     /// Mirror attempts dropped at admission because `max_in_flight` was full.
@@ -505,6 +527,7 @@ pub struct MirrorMetricsSnapshot {
     pub request_failures: u64,
     pub drain_timeouts: u64,
     pub drain_failures: u64,
+    pub drain_truncations: u64,
     pub cancellations: u64,
     pub concurrency_drops: u64,
     pub budget_drops: u64,
@@ -519,10 +542,26 @@ impl MirrorMetrics {
             request_failures: self.request_failures.load(Ordering::Relaxed),
             drain_timeouts: self.drain_timeouts.load(Ordering::Relaxed),
             drain_failures: self.drain_failures.load(Ordering::Relaxed),
+            drain_truncations: self.drain_truncations.load(Ordering::Relaxed),
             cancellations: self.cancellations.load(Ordering::Relaxed),
             concurrency_drops: self.concurrency_drops.load(Ordering::Relaxed),
             budget_drops: self.budget_drops.load(Ordering::Relaxed),
         }
+    }
+
+    fn bump_dispatched(&self) {
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
+        super::prometheus_metrics::global_registry().record_request_mirror_dispatched();
+    }
+
+    fn bump_concurrency_drop(&self) {
+        self.concurrency_drops.fetch_add(1, Ordering::Relaxed);
+        super::prometheus_metrics::global_registry().record_request_mirror_concurrency_drop();
+    }
+
+    fn bump_budget_drop(&self) {
+        self.budget_drops.fetch_add(1, Ordering::Relaxed);
+        super::prometheus_metrics::global_registry().record_request_mirror_budget_drop();
     }
 }
 
@@ -534,6 +573,7 @@ enum MirrorTaskOutcome {
     RequestFailure,
     DrainTimeout,
     DrainFailure,
+    DrainTruncation,
 }
 
 /// Guards a detached mirror task so a drop before recording a terminal outcome
@@ -565,8 +605,18 @@ impl MirrorTaskGuard {
             MirrorTaskOutcome::RequestFailure => &self.metrics.request_failures,
             MirrorTaskOutcome::DrainTimeout => &self.metrics.drain_timeouts,
             MirrorTaskOutcome::DrainFailure => &self.metrics.drain_failures,
+            MirrorTaskOutcome::DrainTruncation => &self.metrics.drain_truncations,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+        let registry = super::prometheus_metrics::global_registry();
+        match outcome {
+            MirrorTaskOutcome::Completed => registry.record_request_mirror_completed(),
+            MirrorTaskOutcome::RequestTimeout => registry.record_request_mirror_request_timeout(),
+            MirrorTaskOutcome::RequestFailure => registry.record_request_mirror_request_failure(),
+            MirrorTaskOutcome::DrainTimeout => registry.record_request_mirror_drain_timeout(),
+            MirrorTaskOutcome::DrainFailure => registry.record_request_mirror_drain_failure(),
+            MirrorTaskOutcome::DrainTruncation => registry.record_request_mirror_drain_truncation(),
+        }
     }
 }
 
@@ -574,6 +624,7 @@ impl Drop for MirrorTaskGuard {
     fn drop(&mut self) {
         if !self.settled {
             self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
+            super::prometheus_metrics::global_registry().record_request_mirror_cancellation();
         }
     }
 }
@@ -619,10 +670,7 @@ async fn drain_mirror_response_body(
     .await
     {
         Err(_) => (advertised, MirrorDrainOutcome::Timeout),
-        Ok(Ok(observed)) => {
-            tokio::task::yield_now().await;
-            (advertised, MirrorDrainOutcome::Complete { observed })
-        }
+        Ok(Ok(observed)) => (advertised, MirrorDrainOutcome::Complete { observed }),
         Ok(Err(BoundedReadError::LimitExceeded { read_so_far, .. })) => (
             advertised,
             MirrorDrainOutcome::Truncated {
@@ -913,9 +961,9 @@ impl RequestMirror {
     }
 
     /// Snapshot of the per-instance mirror lifecycle counters for external
-    /// tests. Never surfaced on `/metrics` (mirror internals stay off the
-    /// unauthenticated surface); this is the assertion hook for the
-    /// bounded-lifetime observability contract.
+    /// tests. Process-wide authenticated `/metrics` also exports the same
+    /// aggregate tallies as `ferrum_request_mirror_*_total` (monotonic across
+    /// reloads); this hook asserts the per-instance, reload-reset view.
     #[allow(dead_code)]
     pub(crate) fn mirror_metrics_snapshot_for_test(&self) -> MirrorMetricsSnapshot {
         self.metrics.snapshot()
@@ -1079,10 +1127,17 @@ fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String>
 
 /// Parse the operator-configured `sensitive_header_patterns` list: lowercased,
 /// trimmed, non-blank substrings that extend the built-in deny-by-default set.
+/// Item count and per-item length are hard-capped so an admitted config cannot
+/// create unbounded per-request substring scans or retained config memory.
 fn parse_sensitive_header_patterns(config: &Value) -> Result<Vec<String>, String> {
     match config.get("sensitive_header_patterns") {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => {
+            if items.len() > MAX_SENSITIVE_HEADER_PATTERNS {
+                return Err(format!(
+                    "request_mirror: 'sensitive_header_patterns' must contain at most {MAX_SENSITIVE_HEADER_PATTERNS} entries"
+                ));
+            }
             let mut out = Vec::with_capacity(items.len());
             for (idx, item) in items.iter().enumerate() {
                 let Some(pattern) = item.as_str() else {
@@ -1094,6 +1149,11 @@ fn parse_sensitive_header_patterns(config: &Value) -> Result<Vec<String>, String
                 if trimmed.is_empty() {
                     return Err(format!(
                         "request_mirror: 'sensitive_header_patterns[{idx}]' must not be blank"
+                    ));
+                }
+                if trimmed.len() > MAX_SENSITIVE_HEADER_PATTERN_LEN {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_header_patterns[{idx}]' exceeds maximum length of {MAX_SENSITIVE_HEADER_PATTERN_LEN} bytes"
                     ));
                 }
                 let lower = trimmed.to_ascii_lowercase();
@@ -1117,6 +1177,11 @@ fn parse_forward_sensitive_header_allowlist(
     let raw = match config.get("forward_sensitive_header_allowlist") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(items)) => {
+            if items.len() > MAX_FORWARD_SENSITIVE_ALLOWLIST {
+                return Err(format!(
+                    "request_mirror: 'forward_sensitive_header_allowlist' must contain at most {MAX_FORWARD_SENSITIVE_ALLOWLIST} entries"
+                ));
+            }
             let mut out = Vec::with_capacity(items.len());
             for (idx, item) in items.iter().enumerate() {
                 let Some(name) = item.as_str() else {
@@ -1128,6 +1193,11 @@ fn parse_forward_sensitive_header_allowlist(
                 if trimmed.is_empty() {
                     return Err(format!(
                         "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' must not be blank"
+                    ));
+                }
+                if trimmed.len() > MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' exceeds maximum length of {MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN} bytes"
                     ));
                 }
                 if http::HeaderName::from_bytes(trimmed.as_bytes()).is_err() {
@@ -1345,9 +1415,7 @@ impl Plugin for RequestMirror {
         let permit = match self.mirror_in_flight.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                self.metrics
-                    .concurrency_drops
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.bump_concurrency_drop();
                 warn!(
                     "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
                     method, mirror_url_for_log
@@ -1376,7 +1444,7 @@ impl Plugin for RequestMirror {
         let retained_body = match self.body_budget.try_retain(body_bytes) {
             Some(retained) => retained,
             None => {
-                self.metrics.budget_drops.fetch_add(1, Ordering::Relaxed);
+                self.metrics.bump_budget_drop();
                 warn!(
                     "request_mirror: dropping mirror request for {} {} because max_retained_request_body_bytes budget was exhausted",
                     method, mirror_url_for_log
@@ -1414,7 +1482,7 @@ impl Plugin for RequestMirror {
         let mirror_plugin_id = self.plugin_config_id.clone();
         let body_for_request = retained_body.bytes.clone();
         let metrics = Arc::clone(&self.metrics);
-        metrics.dispatched.fetch_add(1, Ordering::Relaxed);
+        metrics.bump_dispatched();
 
         // Fire-and-forget: spawn an async task to send the mirror request.
         // The main request proceeds immediately — mirror latency has zero
@@ -1500,7 +1568,7 @@ impl Plugin for RequestMirror {
                             (Some(observed), None)
                         }
                         MirrorDrainOutcome::Truncated { observed } => {
-                            task_guard.settle(MirrorTaskOutcome::Completed);
+                            task_guard.settle(MirrorTaskOutcome::DrainTruncation);
                             warn!(
                                 "request_mirror: response from {} truncated at {} bytes \
                                      (max_response_body_bytes = {}; advertised = {:?})",

@@ -770,6 +770,20 @@ async fn test_registry_render_contains_expected_metrics() {
 
     // Check rate limit counter
     assert!(output.contains("ferrum_rate_limit_exceeded_total 0"));
+    // request_mirror lifecycle counters render at zero with no attacker-shaped labels.
+    assert!(output.contains("# HELP ferrum_request_mirror_dispatched_total"));
+    assert!(output.contains("# TYPE ferrum_request_mirror_dispatched_total counter"));
+    assert!(output.contains("ferrum_request_mirror_dispatched_total 0"));
+    assert!(output.contains("ferrum_request_mirror_completed_total 0"));
+    assert!(output.contains("ferrum_request_mirror_request_timeouts_total 0"));
+    assert!(output.contains("ferrum_request_mirror_request_failures_total 0"));
+    assert!(output.contains("ferrum_request_mirror_drain_timeouts_total 0"));
+    assert!(output.contains("ferrum_request_mirror_drain_failures_total 0"));
+    assert!(output.contains("ferrum_request_mirror_drain_truncations_total 0"));
+    assert!(output.contains("ferrum_request_mirror_cancellations_total 0"));
+    assert!(output.contains("ferrum_request_mirror_concurrency_drops_total 0"));
+    assert!(output.contains("ferrum_request_mirror_budget_drops_total 0"));
+    assert!(!output.contains("ferrum_request_mirror_dispatched_total{"));
 }
 
 #[tokio::test]
@@ -833,6 +847,53 @@ async fn test_registry_rate_limit_counter() {
 
     let output = registry.render_uncached();
     assert!(output.contains("ferrum_rate_limit_exceeded_total 2"));
+}
+
+#[test]
+fn request_mirror_lifecycle_counters_are_monotonic_label_safe_and_rendered() {
+    let registry = MetricsRegistry::new();
+    registry.record_request_mirror_dispatched();
+    registry.record_request_mirror_dispatched();
+    registry.record_request_mirror_completed();
+    registry.record_request_mirror_request_timeout();
+    registry.record_request_mirror_request_failure();
+    registry.record_request_mirror_drain_timeout();
+    registry.record_request_mirror_drain_failure();
+    registry.record_request_mirror_drain_truncation();
+    registry.record_request_mirror_cancellation();
+    registry.record_request_mirror_concurrency_drop();
+    registry.record_request_mirror_budget_drop();
+
+    // Second bump of completed proves monotonicity (not a gauge reset).
+    registry.record_request_mirror_completed();
+
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_request_mirror_dispatched_total 2"));
+    assert!(output.contains("ferrum_request_mirror_completed_total 2"));
+    assert!(output.contains("ferrum_request_mirror_request_timeouts_total 1"));
+    assert!(output.contains("ferrum_request_mirror_request_failures_total 1"));
+    assert!(output.contains("ferrum_request_mirror_drain_timeouts_total 1"));
+    assert!(output.contains("ferrum_request_mirror_drain_failures_total 1"));
+    assert!(output.contains("ferrum_request_mirror_drain_truncations_total 1"));
+    assert!(output.contains("ferrum_request_mirror_cancellations_total 1"));
+    assert!(output.contains("ferrum_request_mirror_concurrency_drops_total 1"));
+    assert!(output.contains("ferrum_request_mirror_budget_drops_total 1"));
+    // No URLs, header names, plugin IDs, or other high-cardinality labels.
+    assert!(!output.contains("mirror_host="));
+    assert!(!output.contains("plugin_id="));
+    assert!(!output.contains("authorization"));
+    assert!(!output.contains("http://"));
+}
+
+#[test]
+fn request_mirror_lifecycle_counters_carry_namespace_label_when_configured() {
+    let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 0, "staging");
+    registry.record_request_mirror_dispatched();
+    let output = registry.render_uncached();
+    assert!(output.contains(
+        r#"ferrum_request_mirror_dispatched_total{namespace="staging"} 1"#
+    ));
 }
 
 #[test]
