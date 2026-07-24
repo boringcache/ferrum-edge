@@ -569,12 +569,13 @@ fn log_resolved_secret_sources(resolved: &secrets::ResolvedEnvSecrets) {
 /// The secret-source report is the same kind of output and is emitted the same
 /// way, for three reasons:
 ///
-/// 1. **It would otherwise be invisible.** `init_logging()` defaults
-///    `FERRUM_LOG_LEVEL` to `warn`, so an `info!` record is filtered out of a
-///    default `ferrum-edge validate`. Unlike `run`, `validate` has no
-///    `-v/--verbose` flag (`ValidateArgs`), so there is no in-band way to raise
-///    the level — verbosity-gating this report would make it unreachable for
-///    the operators the report exists for.
+/// 1. **It is part of the report surface, not diagnostic logging.** Every other
+///    line `validate` prints (`Settings (ferrum.conf): OK`, `Mode:`,
+///    `Spec (...): OK`, `Validation passed.`) is an unconditional `println!`,
+///    not a tracing record. The secret-source report is the same kind of output
+///    and is emitted the same way, so it appears alongside the rest of the
+///    report rather than being filtered by `FERRUM_LOG_LEVEL` (which defaults
+///    to `warn`) or gated behind `-v/--verbose`.
 /// 2. **It is deterministically flushed.** `println!` goes straight to the
 ///    process stdout `LineWriter` and is flushed at the newline, so the report
 ///    cannot be lost to the non-blocking tracing sink's guard-drop drain racing

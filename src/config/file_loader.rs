@@ -81,12 +81,34 @@ pub fn load_config_from_file(
         serde_json::from_str(&content)?
     };
 
-    // Detect config version and migrate in memory if needed
-    let file_version = value
-        .get("version")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Configuration file missing required 'version' field"))?
-        .to_string();
+    // Detect config version and migrate in memory if needed.
+    //
+    // The canonical version is the string "1", but the natural YAML/JSON
+    // spelling `version: 1` parses as a number. Accept both the string form and
+    // the canonical unsigned-integer form; reject any other type (float, bool,
+    // null, array, object, negative) with a precise diagnostic rather than a
+    // misleading "missing field" error.
+    //
+    // When the integer form is accepted, rewrite it to a string in `value`
+    // before `GatewayConfig` deserialization (which expects `version: String`).
+    // That forces the JSON `Value` path below so we never hand the original
+    // numeric YAML/JSON text to a string-typed field.
+    let (file_version, version_rewritten) = match value.get_mut("version") {
+        None => anyhow::bail!("Configuration file missing required 'version' field"),
+        Some(serde_json::Value::String(s)) => (s.clone(), false),
+        Some(other) => {
+            if let Some(n) = other.as_u64() {
+                let s = n.to_string();
+                *other = serde_json::Value::String(s.clone());
+                (s, true)
+            } else {
+                anyhow::bail!(
+                    "field 'version' must be a string or integer (got {}); use version: \"1\" or version: 1",
+                    other
+                );
+            }
+        }
+    };
 
     if file_version != CURRENT_CONFIG_VERSION {
         warn!(
@@ -97,13 +119,15 @@ pub fn load_config_from_file(
     }
 
     // Deserialize from the original format to preserve YAML-specific features
-    // (like tags for enum variants). Only fall back to JSON deserialization if
-    // a migration was applied (since migrations operate on serde_json::Value).
-    let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_value(value)?
-    };
+    // (like tags for enum variants). Fall back to JSON deserialization when a
+    // migration ran or when `version` was rewritten from an integer — both
+    // leave `value` as the authoritative document.
+    let mut config: GatewayConfig =
+        if is_yaml && file_version == CURRENT_CONFIG_VERSION && !version_rewritten {
+            serde_yaml::from_str(&content)?
+        } else {
+            serde_json::from_value(value)?
+        };
 
     ValidationPipeline::new(&mut config)
         .validate_resource_ids(ValidationAction::FatalCount(
