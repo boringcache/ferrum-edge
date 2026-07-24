@@ -5634,6 +5634,7 @@ impl ProxyState {
             env_config_arc.compression_gzip_enabled,
             env_config_arc.compression_brotli_enabled,
         )
+        .with_max_request_body_size_bytes(env_config_arc.max_request_body_size_bytes)
         .with_tls_crl_source(env_config_arc.tls_crl_file_path.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will

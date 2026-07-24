@@ -1600,6 +1600,38 @@ pub(crate) struct WafInstanceScoreState {
     pub(crate) score: u32,
 }
 
+/// Exclusive compression codec admission permit held on a request context.
+///
+/// Clones are empty so `RequestContext`'s derived `Clone` stays valid: the
+/// permit is unique and must be transferred with `take()` / `mem::take` when a
+/// compatibility clone needs to own the reserved slot.
+#[derive(Default)]
+struct HeldCodecPermit(Option<tokio::sync::OwnedSemaphorePermit>);
+
+impl std::fmt::Debug for HeldCodecPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HeldCodecPermit")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl Clone for HeldCodecPermit {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl HeldCodecPermit {
+    fn set(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self.0 = Some(permit);
+    }
+
+    fn take(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.take()
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1923,6 +1955,12 @@ pub struct RequestContext {
     /// encode. This remains private for the same ownership and allocation
     /// reasons as `compression_request_decode_owner`.
     compression_response_encode_owner: Option<u64>,
+    /// Reserved codec CPU admission permit for gateway response compression.
+    /// Taken in `after_proxy` before committing `Content-Encoding` and moved
+    /// into the `spawn_blocking` closure during the body transform. Drop
+    /// releases the slot if the transform never runs (cancellation). Clones
+    /// do not duplicate the exclusive permit.
+    compression_response_codec_permit: HeldCodecPermit,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -2312,6 +2350,7 @@ impl RequestContext {
             gateway_response_compression_algorithm: None,
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
+            compression_response_codec_permit: HeldCodecPermit::default(),
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -2574,6 +2613,19 @@ impl RequestContext {
 
     pub(crate) fn owns_compression_response_encode(&self, owner: u64) -> bool {
         self.compression_response_encode_owner == Some(owner)
+    }
+
+    pub(crate) fn set_compression_response_codec_permit(
+        &mut self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        self.compression_response_codec_permit.set(permit);
+    }
+
+    pub(crate) fn take_compression_response_codec_permit(
+        &mut self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.compression_response_codec_permit.take()
     }
 
     #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
@@ -3010,6 +3062,12 @@ impl RequestContext {
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             compression_request_decode_owner: self.compression_request_decode_owner,
             compression_response_encode_owner: self.compression_response_encode_owner,
+            // Transfer the response codec permit with the compatibility clone so
+            // the body-transform path that consumes this context still owns the
+            // reserved admission slot; the donor context must not double-release.
+            compression_response_codec_permit: std::mem::take(
+                &mut self.compression_response_codec_permit,
+            ),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
@@ -7248,15 +7306,13 @@ pub fn create_plugin_with_http_client_and_config_id(
         "compression" => {
             let gzip_enabled = http_client.compression_gzip_enabled();
             let brotli_enabled = http_client.compression_brotli_enabled();
-            let plugin = if gzip_enabled && brotli_enabled {
-                compression::CompressionPlugin::new(config)?
-            } else {
-                compression::CompressionPlugin::new_with_algorithm_support(
-                    config,
-                    gzip_enabled,
-                    brotli_enabled,
-                )?
-            };
+            let max_request_body_size_bytes = http_client.max_request_body_size_bytes();
+            let plugin = compression::CompressionPlugin::new_with_algorithm_support_and_body_limit(
+                config,
+                gzip_enabled,
+                brotli_enabled,
+                max_request_body_size_bytes,
+            )?;
             Ok(Some(Arc::new(plugin)))
         }
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),

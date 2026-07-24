@@ -3219,14 +3219,18 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
 
-The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTLI_ENABLED` settings default to `true` and intersect with every instance's `algorithms` list. A codec disabled globally cannot be re-enabled by file, database, Admin API, or CP/DP plugin configuration. The same gate also disables that codec for opt-in request decompression. This gives operators a node-wide emergency/performance switch while preserving per-proxy policy.
+The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTLI_ENABLED` settings default to `true` and intersect with every instance's `algorithms` list. A codec disabled globally cannot be re-enabled by file, database, Admin API, or CP/DP plugin configuration. The same gate also disables that codec for opt-in request decompression. After those gates are applied, an instance with no remaining usable algorithm fails admission (it is not left live while still stripping `Accept-Encoding`). This gives operators a node-wide emergency/performance switch while preserving per-proxy policy.
 
 **Request decompression** (opt-in):
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `decompress_request` | bool | `false` | Enable decompression of gzip/brotli request bodies |
-| `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB) |
+| `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB). Hard-capped at 32 MiB (`33554432`); must also be ≤ `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that wire limit is set. Per-layer and cumulative decode work share this ceiling, and raw-to-decoded amplification above 1024:1 fails closed |
+
+When `decompress_request` is enabled, `Content-Encoding` is parsed as an ordered `#content-coding` list (RFC 9110 §8.4) with OWS trimming. Supported chains (`gzip` / `x-gzip`, `br`) decode in reverse application order under the shared content-coding decoder; `identity`-only lists strip the header without rewriting bytes. Malformed members, parameters, unsupported codings, mixed `identity`, trailing/concatenated members, and limit/amplification overruns fail closed with `400`. Codec worker saturation fails closed with `503`.
+
+Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded `spawn_blocking` pool (32 concurrent jobs process-wide). Response compression acquires an admission permit before committing `Content-Encoding`; when saturated it serves identity (or `406` when identity is unacceptable) instead of blocking Tokio workers.
 
 **Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
 
@@ -3251,9 +3255,11 @@ The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTL
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - After an actual compression body transform, the shared body-transform lifecycle removes representation-integrity metadata that described the uncompressed origin bytes — `Content-Digest`, `Repr-Digest`, legacy `Digest`, and `Content-MD5` (case-insensitive), along with other content-bound validators such as weak `ETag` / `Last-Modified`. Those fields are preserved when compression is skipped, negotiation declines, the body is ineligible, or the transform returns `None`. Gateway `Content-Encoding` and `Vary: Accept-Encoding` remain. On buffered H1/H2/H3 paths, trailer integrity fields are handled the same way as other stale application trailers after a rewrite: native H3 drops backend trailers once the body is rewritten, and buffered gRPC retires application trailers (including digests) while preserving reserved terminal status metadata
 - Forces response body buffering on proxies where this plugin is enabled
-- When `decompress_request` is enabled, supported gzip/brotli request bodies are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so earlier body consumers such as `soap_ws_security` inspect validated plaintext; the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode
+- When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so earlier body consumers such as `soap_ws_security` inspect validated plaintext; the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed
+- `remove_accept_encoding` only mutates the backend request when the instance still has at least one usable response codec after process-wide gates
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
 - Strong origin `ETag` validators are preserved by skipping compression; when a weak-ETag response is compressed, the shared body-transform lifecycle removes that upstream validator because the client-visible bytes changed
+- Synchronous gzip/Brotli work is offloaded through a bounded admission semaphore and `spawn_blocking` so codec CPU does not monopolize Tokio workers
 
 **Multiple instances:** A proxy may carry several `compression` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Request decompression and response compression are not idempotent, so each one-shot coding decision is tied to exactly one effective instance in configured order:
 

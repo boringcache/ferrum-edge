@@ -160,6 +160,10 @@ pub struct PluginHttpClient {
     /// construction. Defaults keep both supported codecs enabled.
     compression_gzip_enabled: bool,
     compression_brotli_enabled: bool,
+    /// Process-wide request body ceiling used to cross-check compression
+    /// `max_decompressed_request_size`. `0` means unlimited at the wire layer;
+    /// the compression hard maximum still applies.
+    max_request_body_size_bytes: usize,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -179,6 +183,10 @@ impl std::fmt::Debug for PluginHttpClient {
             .field(
                 "compression_brotli_enabled",
                 &self.compression_brotli_enabled,
+            )
+            .field(
+                "max_request_body_size_bytes",
+                &self.max_request_body_size_bytes,
             )
             .finish()
     }
@@ -472,6 +480,7 @@ impl PluginHttpClient {
             pool_shard_amount,
             compression_gzip_enabled: true,
             compression_brotli_enabled: true,
+            max_request_body_size_bytes: 0,
         }
     }
 
@@ -527,6 +536,7 @@ impl PluginHttpClient {
             pool_shard_amount: 0,
             compression_gzip_enabled: true,
             compression_brotli_enabled: true,
+            max_request_body_size_bytes: 0,
         }
     }
 
@@ -602,12 +612,24 @@ impl PluginHttpClient {
         self
     }
 
+    /// Carry the process-wide request body ceiling into compression plugin
+    /// construction so `max_decompressed_request_size` cannot exceed the
+    /// gateway's admitted upload bound.
+    pub(crate) fn with_max_request_body_size_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_request_body_size_bytes = max_bytes;
+        self
+    }
+
     pub(crate) fn compression_gzip_enabled(&self) -> bool {
         self.compression_gzip_enabled
     }
 
     pub(crate) fn compression_brotli_enabled(&self) -> bool {
         self.compression_brotli_enabled
+    }
+
+    pub(crate) fn max_request_body_size_bytes(&self) -> usize {
+        self.max_request_body_size_bytes
     }
 
     /// Carry the configured gateway CRL source for non-rustls sinks. Only a
