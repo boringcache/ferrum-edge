@@ -2093,7 +2093,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 }
             }
             other => {
-                warn!("Unknown config update type {}, ignoring", other);
+                warn!(
+                    update_type = other,
+                    cp_url,
+                    base_applied = subscription.base_applied,
+                    "Refusing unknown ConfigSync update type; terminating stream so an \
+                     unrecognized authoritative message cannot be skipped before later deltas"
+                );
+                return Ok(react_to_unusable_snapshot(subscription.base_applied));
             }
         }
     }
