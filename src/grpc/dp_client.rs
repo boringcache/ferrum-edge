@@ -45,8 +45,9 @@ use super::configsync_lifecycle::{
     advance_multi_cp_backoff, check_peer_version_compatibility, connection_error_outcome,
     delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
     full_snapshot_stream_disposition, gateway_config_content_matches,
-    grow_backoff_after_failure_sleep, reconcile_snapshot_version, resource_delta_advances_authority,
-    snapshot_failure_stream_disposition, stale_reject_from_reconcile,
+    grow_backoff_after_failure_sleep, reconcile_snapshot_version,
+    resource_delta_advances_authority, snapshot_failure_stream_disposition,
+    stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;

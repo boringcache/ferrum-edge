@@ -117,10 +117,7 @@ pub fn monotonic_watermark(
 /// polling CPs can produce identical snapshots with different timestamps.
 /// Object keys are canonicalized recursively so map insertion order cannot
 /// create a false mismatch; array order remains significant.
-pub fn gateway_config_content_matches(
-    current: &GatewayConfig,
-    incoming: &GatewayConfig,
-) -> bool {
+pub fn gateway_config_content_matches(current: &GatewayConfig, incoming: &GatewayConfig) -> bool {
     let (Ok(mut current), Ok(mut incoming)) = (
         serde_json::to_value(current),
         serde_json::to_value(incoming),

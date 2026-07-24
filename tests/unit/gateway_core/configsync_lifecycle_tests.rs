@@ -19,11 +19,11 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     FullSnapshotStreamDisposition, MultiCpBackoffState, SnapshotFailureStreamDisposition,
     StaleSnapshotReject, SubscriptionApplyState, VersionCompatError, VersionReconcileError,
     advance_authority_from_committed, advance_multi_cp_backoff, backoff_max_secs,
-    check_peer_version_compatibility, connection_error_outcome,
-    delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
-    evaluate_full_snapshot_authority, failure_backoff_sequence, full_snapshot_stream_disposition,
-    gateway_config_content_matches, grow_backoff_after_failure_sleep, monotonic_watermark,
-    reconcile_snapshot_version, resource_delta_advances_authority, silence_exceeds_liveness,
+    check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
+    evaluate_delta_against_subscription_base, evaluate_full_snapshot_authority,
+    failure_backoff_sequence, full_snapshot_stream_disposition, gateway_config_content_matches,
+    grow_backoff_after_failure_sleep, monotonic_watermark, reconcile_snapshot_version,
+    resource_delta_advances_authority, silence_exceeds_liveness,
     snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
 use ferrum_edge::grpc::dp_client::{
@@ -186,12 +186,7 @@ fn full_snapshot_fencing_rejects_older_cross_source() {
     // Same-source recovery remains accepted, but the watermark stays monotonic
     // at the newest known ordering (does not drop to the older recovery body).
     let same_source =
-        evaluate_full_snapshot_authority(
-            Some(&authority),
-            older,
-            "http://cp-primary:50051",
-            false,
-        )
+        evaluate_full_snapshot_authority(Some(&authority), older, "http://cp-primary:50051", false)
             .expect("same-source recovery snapshots remain accepted");
     assert_eq!(same_source, applied);
 
@@ -217,23 +212,13 @@ fn same_source_recovery_watermark_is_monotonic() {
     let newer = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
 
     assert_eq!(
-        evaluate_full_snapshot_authority(
-            Some(&authority),
-            older,
-            "http://cp-a:50051",
-            false,
-        )
-        .unwrap(),
+        evaluate_full_snapshot_authority(Some(&authority), older, "http://cp-a:50051", false,)
+            .unwrap(),
         applied
     );
     assert_eq!(
-        evaluate_full_snapshot_authority(
-            Some(&authority),
-            newer,
-            "http://cp-a:50051",
-            false,
-        )
-        .unwrap(),
+        evaluate_full_snapshot_authority(Some(&authority), newer, "http://cp-a:50051", false,)
+            .unwrap(),
         newer
     );
     assert_eq!(monotonic_watermark(Some(applied), older), applied);
@@ -615,13 +600,9 @@ fn unknown_prior_authority_still_accepts_cross_source() {
         source_cp_url: "http://cp-a:50051".to_string(),
     };
     let newer = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
-    let accepted = evaluate_full_snapshot_authority(
-        Some(&authority),
-        newer,
-        "http://cp-b:50051",
-        false,
-    )
-    .expect("a real failover snapshot must not be fenced by an unknown authority");
+    let accepted =
+        evaluate_full_snapshot_authority(Some(&authority), newer, "http://cp-b:50051", false)
+            .expect("a real failover snapshot must not be fenced by an unknown authority");
     assert_eq!(accepted, newer);
 }
 
