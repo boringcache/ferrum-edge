@@ -237,6 +237,24 @@ fn test_from_plugin_config_parses_valid_redis_mode() {
     assert_eq!(config.password.as_deref(), Some("secret"));
 }
 
+#[test]
+fn test_from_plugin_config_accepts_exact_max_redis_pool_size() {
+    // Inclusive upper bound: redis_pool_size == MAX_REDIS_POOL_SIZE must parse
+    // and be preserved exactly (MAX+1 / u64::MAX remain covered by rejection cases).
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379/0",
+            "redis_pool_size": MAX_REDIS_POOL_SIZE,
+        }),
+        "ferrum:test",
+    )
+    .expect("exact MAX_REDIS_POOL_SIZE must be accepted")
+    .expect("sync_mode=redis must yield Some(RedisConfig)");
+
+    assert_eq!(config.pool_size, MAX_REDIS_POOL_SIZE);
+}
+
 // ── Connection-attempt timeout wiring (issue #2310) ───────────────────────
 //
 // redis-rs 1.2.1 defaults ConnectionManager/AsyncConnectionConfig timeouts to
