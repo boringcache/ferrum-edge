@@ -1,11 +1,18 @@
-//! Deterministic coverage for the rustls→kTLS handoff safety check
+//! Deterministic coverage for the rustls→kTLS handoff gate
 //! ([issue #2955](https://github.com/ferrum-edge/ferrum-edge/issues/2955)).
 //!
 //! When a client coalesces post-handshake application data with its Finished
 //! flight, rustls decrypts those bytes into `received_plaintext` during the
 //! handshake. Installing kTLS and resuming from the raw socket would silently
-//! discard them. These tests pin that the handoff gate refuses that state
-//! while leaving the `ServerConnection` readable.
+//! discard them. A partial inbound TLS record in rustls's private deframer is
+//! the second loss/desync case — and that state is **not** observable through
+//! the public buffered `ServerConnection` API.
+//!
+//! These tests pin that:
+//! - a clean buffered handshake is **not** treated as handoff-safe (alignment
+//!   is not proven);
+//! - complete buffered plaintext and abbreviated/coalesced cases refuse
+//!   handoff while leaving the `ServerConnection` readable.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -323,7 +330,7 @@ fn complete_tls12_abbreviated_handshake_with_coalesced_app(
 }
 
 #[test]
-fn handoff_safe_when_no_post_handshake_plaintext_buffered() {
+fn handoff_refused_for_buffered_api_even_when_no_plaintext_visible() {
     let (mut server, _sock, client) = complete_tls12_handshake_clean();
     let io = server.process_new_packets().expect("io state");
     assert_eq!(
@@ -331,9 +338,18 @@ fn handoff_safe_when_no_post_handshake_plaintext_buffered() {
         0,
         "clean handshake must not buffer application plaintext"
     );
+    assert_eq!(
+        io.tls_bytes_to_write(),
+        0,
+        "clean handshake flush must leave no outbound TLS records"
+    );
+    // A clean IoState is necessary but not sufficient: the buffered API
+    // cannot prove the private inbound deframer is empty, so handoff must
+    // stay refused until an unbuffered WriteTraffic path exists.
     assert!(
-        ferrum_edge::_test_support::ktls_rustls_buffers_safe_for_kernel_handoff(&mut server),
-        "clean post-handshake state must be eligible for kTLS handoff"
+        !ferrum_edge::_test_support::ktls_rustls_buffers_safe_for_kernel_handoff(&mut server),
+        "buffered ServerConnection must not be treated as kTLS-safe without \
+         proven record alignment"
     );
     let _ = client.join();
 }

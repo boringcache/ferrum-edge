@@ -2228,13 +2228,13 @@ pub struct EnvConfig {
     pub tcp_fastopen_queue_len: u16,
 
     // ── Stream proxy performance optimizations (Linux only) ─────────────
-    /// Enable kTLS (kernel TLS) on TCP proxy TLS paths (Linux 4.13+ only).
-    /// After the userspace TLS handshake, installs symmetric keys into the kernel
-    /// so splice(2) can work on encrypted connections. Dramatically reduces latency
-    /// and CPU for TLS TCP proxy paths.
+    /// Enable kTLS (kernel TLS) probing/gating on TCP proxy TLS paths (Linux 4.13+).
+    /// Startup still probes kernel ULP + dummy key install when `auto`/`true`.
+    /// Handoff from the buffered tokio-rustls accept path is currently refuse-closed
+    /// (issue #2955): the public buffered rustls API cannot prove inbound deframer
+    /// emptiness, so frontend-TLS connections retain the userspace relay.
     /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
-    /// Default: `auto` — probes full kTLS path (ULP install + dummy key install) on
-    /// a loopback socket pair at startup. Only enables if the entire path succeeds.
+    /// Default: `auto`.
     pub ktls_enabled: AutoBool,
     /// Enable io_uring-based splice for TCP proxy zero-copy relay (Linux 5.6+ only).
     /// Uses IORING_OP_SPLICE submission queue entries instead of direct libc splice

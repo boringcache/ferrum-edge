@@ -1155,9 +1155,11 @@ pub mod _test_support {
         Ok((handshake.stream, proto))
     }
 
-    /// Inspect rustls buffers before a kTLS handoff. External tests use this
-    /// to assert that coalesced post-handshake plaintext forces userspace
-    /// fallback without consuming the TLS stream.
+    /// Inspect whether a buffered rustls `ServerConnection` may be abandoned
+    /// for kTLS. Always returns `false`: the public buffered API cannot prove
+    /// inbound deframer emptiness / record alignment (issue #2955). External
+    /// tests use this to pin fail-closed behavior and that coalesced
+    /// plaintext remains readable on the intact connection.
     pub fn ktls_rustls_buffers_safe_for_kernel_handoff(
         server_conn: &mut rustls::ServerConnection,
     ) -> bool {

@@ -821,7 +821,7 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_TLS_OFFLOAD_THREADS` | No | `0` | Dedicated TLS handshake offload threads; `0` disables |
 | `FERRUM_TCP_FASTOPEN_ENABLED` | No | `auto` | TCP Fast Open toggle: `auto`, `true`, or `false` |
 | `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | No | `256` | TCP Fast Open server queue length |
-| `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS splice acceleration toggle |
+| `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS probe/gating; buffered tokio-rustls handoff currently refuse-closed (issue #2955) |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | No | `auto` | Linux io_uring splice toggle |
 | `FERRUM_UDP_GRO_ENABLED` | No | `auto` | Linux UDP GRO toggle; currently reserved/no-op |
 | `FERRUM_UDP_GSO_ENABLED` | No | `auto` | Linux UDP GSO send batching toggle |
