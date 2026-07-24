@@ -1005,6 +1005,9 @@ async fn deliver_batch(
             // so one oversized record cannot erase co-batched siblings. Oversized
             // singles are discarded with an explicit warning; other local delivery
             // failures still propagate into retry/final-loss.
+            // Release the superseded contiguous batch before assembling each
+            // single-entry payload so the two-copy byte accounting remains exact.
+            drop(payload);
             for entry in batch {
                 match deliver_one_entry(cfg, sender, entry).await {
                     Ok(()) => {}
