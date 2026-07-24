@@ -1227,7 +1227,105 @@ fn parse_encoding_map(
             free_form_exploded_objects.join(", ")
         ));
     }
+    reject_exploded_object_key_collisions(schema, &out)?;
     Ok(out)
+}
+
+/// Fail closed when explode=true form objects would emit the same wire key into
+/// more than one logical JSON property (root sibling, sibling exploded object,
+/// or a free-form object whose unbounded child key space overlaps another).
+fn reject_exploded_object_key_collisions(
+    schema: &Value,
+    encoding: &AHashMap<String, PropertyEncoding>,
+) -> Result<(), String> {
+    let root_names = declared_object_property_names(schema);
+    let mut exploded_children: Vec<(&str, HashSet<String>)> = Vec::new();
+    let mut free_form: Vec<&str> = Vec::new();
+    for (property, property_encoding) in encoding {
+        if property_encoding.style != EncodingStyle::Form || !property_encoding.explode {
+            continue;
+        }
+        let Some(property_schema) = property_schema_from_object(schema, property) else {
+            continue;
+        };
+        if !schema_accepts_object(property_schema) {
+            continue;
+        }
+        // A free-form object (additionalProperties not false) absorbs any wire
+        // key that is not a root sibling, so its emitted-key space is unbounded.
+        if additional_property_schema_for_conversion(property_schema).is_some() {
+            free_form.push(property.as_str());
+        }
+        let child_names = declared_object_property_names(property_schema);
+        for child in &child_names {
+            if child != property && root_names.contains(child) {
+                return Err(format!(
+                    "encoding['{property}'] explode=true object child '{child}' collides with a root request-body property"
+                ));
+            }
+        }
+        exploded_children.push((property.as_str(), child_names));
+    }
+    for (index, (left_property, left_children)) in exploded_children.iter().enumerate() {
+        for (right_property, right_children) in exploded_children.iter().skip(index + 1) {
+            let mut overlap: Vec<&str> = left_children
+                .intersection(right_children)
+                .map(String::as_str)
+                .collect();
+            if overlap.is_empty() {
+                continue;
+            }
+            overlap.sort_unstable();
+            return Err(format!(
+                "encoding explode=true object properties '{left_property}' and '{right_property}' emit colliding child keys ({})",
+                overlap.join(", ")
+            ));
+        }
+    }
+    // An unbounded free-form key space intersects the declared child keys of
+    // every other exploded object (those keys are, by the root check above,
+    // non-root wire keys the free-form object would also absorb). One wire
+    // occurrence could then populate two logical properties depending on schema
+    // declaration order, so reject the coexistence fail-closed. (Two free-form
+    // objects are already rejected earlier as mutually ambiguous.)
+    if let Some(free) = free_form.first().copied()
+        && exploded_children.len() > 1
+    {
+        let mut others: Vec<&str> = exploded_children
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| *name != free)
+            .collect();
+        others.sort_unstable();
+        return Err(format!(
+            "encoding explode=true free-form object '{free}' cannot coexist with other explode=true object properties ({}); its unbounded child key space would populate more than one logical property",
+            others.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn declared_object_property_names(schema: &Value) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_declared_object_property_names(schema, &mut names, 0);
+    names
+}
+
+fn collect_declared_object_property_names(schema: &Value, out: &mut HashSet<String>, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        out.extend(properties.keys().cloned());
+    }
+    for keyword in ["allOf", "oneOf", "anyOf"] {
+        let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        for branch in branches {
+            collect_declared_object_property_names(branch, out, depth + 1);
+        }
+    }
 }
 
 fn parse_property_encoding(
@@ -1941,8 +2039,17 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
         let Some(disposition) = headers.get("content-disposition") else {
             return Err("Malformed multipart part: missing Content-Disposition".to_string());
         };
-        let params = parse_header_params(disposition)?;
-        let Some(name) = params.get("name").filter(|value| !value.is_empty()) else {
+        let (disposition_type, params) = parse_header_type_and_params(disposition)?;
+        if !disposition_type.eq_ignore_ascii_case("form-data") {
+            return Err(format!(
+                "Malformed multipart part: Content-Disposition type must be form-data (got '{disposition_type}')"
+            ));
+        }
+        let Some(name) = params
+            .get("name")
+            .map(|value| value.value.as_str())
+            .filter(|value| !value.is_empty())
+        else {
             return Err("Malformed multipart part: missing form-data name".to_string());
         };
         // RFC 7578 form-data uses `filename`; silently treating RFC 2231/5987
@@ -1959,13 +2066,13 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
             return Err("Multipart form-data name exceeds size limit".to_string());
         }
         if let Some(filename) = params.get("filename")
-            && filename.len() > MAX_MULTIPART_PARAM_BYTES
+            && filename.value.len() > MAX_MULTIPART_PARAM_BYTES
         {
             return Err("Multipart filename exceeds size limit".to_string());
         }
         parts.push(MultipartPart {
-            name: name.clone(),
-            filename: params.get("filename").cloned(),
+            name: name.to_string(),
+            filename: params.get("filename").map(|value| value.value.clone()),
             content_type: headers.get("content-type").cloned(),
             headers,
             body: part_body.to_vec(),
@@ -2484,10 +2591,7 @@ fn multipart_parts_to_schema_object(
         let Some(values) = parts.values().next() else {
             return Ok(Value::Null);
         };
-        let Some(first) = values.first() else {
-            return Ok(Value::Null);
-        };
-        return multipart_part_to_schema_value(first, schema, None, conversion);
+        return multipart_values_to_schema_value(values, schema, None, conversion);
     }
     let mut out = serde_json::Map::new();
     let empty_properties = serde_json::Map::new();
@@ -2602,6 +2706,12 @@ fn multipart_parts_to_schema_object(
                 values_to_schema_value(&[joined], property_schema, property_encoding, conversion)?,
             );
             continue;
+        }
+        if values.len() != 1 {
+            return Err(format!(
+                "Multipart field '{property}' occurs {} times but the schema expects a scalar",
+                values.len()
+            ));
         }
         if let Some(first) = values.first() {
             out.insert(
@@ -2774,6 +2884,16 @@ fn multipart_values_to_schema_value(
                 _ => ",",
             });
         return values_to_schema_value(&[joined], schema, encoding, conversion);
+    }
+    if values.len() != 1 {
+        let field = values
+            .first()
+            .map(|part| part.name.as_str())
+            .unwrap_or("field");
+        return Err(format!(
+            "Multipart field '{field}' occurs {} times but the schema expects a scalar",
+            values.len()
+        ));
     }
     let Some(first) = values.first() else {
         return Ok(Value::Null);
@@ -2954,12 +3074,7 @@ fn values_to_schema_value(
             .map(Value::Array);
     }
     if values.len() > 1 {
-        return Ok(Value::Array(
-            values
-                .iter()
-                .map(|value| scalar_to_schema_value(value, &Value::Null, conversion))
-                .collect::<Result<Vec<_>, _>>()?,
-        ));
+        return Err("Repeated form field values are not allowed for non-array schemas".to_string());
     }
     let value = values.first().map(String::as_str).unwrap_or("");
     scalar_to_schema_value(value, schema, conversion)
@@ -3496,25 +3611,45 @@ fn is_binary_media_type(media_type: &str) -> bool {
 }
 
 fn multipart_boundary(content_type: &str) -> Result<Option<String>, String> {
-    let mut params = parse_header_params(content_type)?;
-    Ok(params.remove("boundary"))
+    let (_, mut params) = parse_header_type_and_params(content_type)?;
+    let Some(param) = params.remove("boundary") else {
+        return Ok(None);
+    };
+    // RFC 2045/2046: characters outside the MIME token grammar (spaces, `:`,
+    // `/`, etc.) are only legal inside a quoted-string. Retain quote state so
+    // unquoted `boundary=abc:def` cannot silently become a valid delimiter.
+    if !param.was_quoted && !is_mime_token(&param.value) {
+        return Err(
+            "Unquoted multipart boundary must be a MIME token (quote values that require quoting)"
+                .to_string(),
+        );
+    }
+    Ok(Some(param.value))
 }
 
-/// Parse MIME/HTTP header parameters with quoted-string and escape awareness.
+#[derive(Debug, Clone)]
+struct HeaderParamValue {
+    value: String,
+    was_quoted: bool,
+}
+
+/// Parse a MIME/HTTP header into its type token and parameters with
+/// quoted-string / escape awareness.
 ///
 /// Semicolons and escapes inside quoted values are preserved. The first
-/// semicolon-delimited segment (media type / disposition type) is skipped.
-fn parse_header_params(value: &str) -> Result<HashMap<String, String>, String> {
+/// semicolon-delimited segment is the media type or disposition type.
+fn parse_header_type_and_params(
+    value: &str,
+) -> Result<(String, HashMap<String, HeaderParamValue>), String> {
     if value.len() > MAX_MULTIPART_PARAM_BYTES * 4 {
         return Err("Header parameter list exceeds size limit".to_string());
     }
     let mut params = HashMap::new();
     let mut parts = split_header_param_segments(value)?;
     if parts.is_empty() {
-        return Ok(params);
+        return Ok((String::new(), params));
     }
-    // Drop the type token (`multipart/form-data` or `form-data`).
-    parts.remove(0);
+    let type_token = parts.remove(0).trim().to_string();
     for piece in parts {
         let piece = piece.trim();
         if piece.is_empty() {
@@ -3528,14 +3663,14 @@ fn parse_header_params(value: &str) -> Result<HashMap<String, String>, String> {
             return Err("Invalid header parameter name".to_string());
         }
         let decoded = decode_header_param_value(raw_value.trim())?;
-        if decoded.len() > MAX_MULTIPART_PARAM_BYTES {
+        if decoded.value.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err(format!("Header parameter '{key}' exceeds size limit"));
         }
         if params.insert(key.clone(), decoded).is_some() {
             return Err(format!("Duplicate header parameter '{key}'"));
         }
     }
-    Ok(params)
+    Ok((type_token, params))
 }
 
 fn split_header_param_segments(value: &str) -> Result<Vec<String>, String> {
@@ -3577,7 +3712,7 @@ fn split_header_param_segments(value: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn decode_header_param_value(value: &str) -> Result<String, String> {
+fn decode_header_param_value(value: &str) -> Result<HeaderParamValue, String> {
     let value = value.trim();
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
         let inner = &value[1..value.len() - 1];
@@ -3593,12 +3728,50 @@ fn decode_header_param_value(value: &str) -> Result<String, String> {
                 out.push(ch);
             }
         }
-        return Ok(out);
+        return Ok(HeaderParamValue {
+            value: out,
+            was_quoted: true,
+        });
     }
     if value.contains(['"', '\\']) {
         return Err("Unquoted header parameter contains illegal characters".to_string());
     }
-    Ok(value.to_string())
+    Ok(HeaderParamValue {
+        value: value.to_string(),
+        was_quoted: false,
+    })
+}
+
+/// RFC 2045 `token`: 1* any CHAR except SPACE, CTLs, or tspecials.
+fn is_mime_token(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(is_mime_token_char)
+}
+
+fn is_mime_token_char(byte: u8) -> bool {
+    // RFC 2045 token = 1*<any CHAR except SPACE, CTLs, or tspecials>
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'{'
+            | b'|'
+            | b'}'
+            | b'~'
+    )
 }
 
 fn parse_part_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, String> {
@@ -3639,11 +3812,42 @@ fn parse_part_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, St
     Ok(out)
 }
 
+/// Choose the earliest header/body separator: the first blank line, i.e. the
+/// first CRLF/LF line terminator immediately followed by another CRLF/LF
+/// terminator.
+///
+/// Matching only `\r\n\r\n` and `\n\n` (and taking the lower index) still misses
+/// mixed `\n\r\n` / `\r\n\n` blank lines. A part whose header block ends with an
+/// LF line but whose blank line is CRLF (`...name"\n\r\n...`) then has no early
+/// match, so a later separator wins and the intervening body prefix is
+/// reclassified as part headers. Scanning every terminator keeps the earliest
+/// blank line winning regardless of CRLF/LF mixing, so body bytes before a later
+/// separator can never be promoted into headers.
 fn split_header_body(segment: &[u8]) -> Option<(&[u8], &[u8])> {
-    if let Some(index) = memchr::memmem::find(segment, b"\r\n\r\n") {
-        return Some((&segment[..index], &segment[index + 4..]));
+    let mut search = 0;
+    while let Some(rel) = memchr::memchr(b'\n', &segment[search..]) {
+        let lf = search + rel;
+        // The line terminator ending at `lf` starts at a preceding CR when present.
+        let term_start = if lf > 0 && segment[lf - 1] == b'\r' {
+            lf - 1
+        } else {
+            lf
+        };
+        // A blank line requires a second terminator immediately after the first.
+        let after = lf + 1;
+        let second_len = if segment[after..].starts_with(b"\r\n") {
+            Some(2)
+        } else if segment[after..].starts_with(b"\n") {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(second_len) = second_len {
+            return Some((&segment[..term_start], &segment[after + second_len..]));
+        }
+        search = lf + 1;
     }
-    memchr::memmem::find(segment, b"\n\n").map(|index| (&segment[..index], &segment[index + 2..]))
+    None
 }
 
 fn trim_trailing_line_break(mut value: &[u8]) -> &[u8] {
