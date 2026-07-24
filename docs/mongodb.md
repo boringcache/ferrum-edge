@@ -54,8 +54,8 @@ For production with authentication, always use `?authSource=admin` (or your auth
 | `FERRUM_MONGO_APP_NAME` | (none) | App name visible in `db.currentOp()` and server logs |
 | `FERRUM_MONGO_REPLICA_SET` | (none) | Replica set name. Required for transactions and change streams |
 | `FERRUM_MONGO_AUTH_MECHANISM` | (auto) | Auth override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
-| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | `30` | How long the driver waits to find a suitable server |
-| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | `10` | TCP connection timeout per server |
+| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | (unset) | Explicit server selection timeout. Unset preserves URI/`serverSelectionTimeoutMS` (or driver default); when set, overrides the URI |
+| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | (unset) | Explicit TCP connect timeout. Unset preserves URI/`connectTimeoutMS` (or driver default); when set, overrides the URI |
 
 ### MongoDB Driver Runtime Options
 
@@ -67,8 +67,8 @@ MongoDB connection pooling and topology behavior mostly lives in the MongoDB URI
 | Minimum idle pool size | `minPoolSize` URI option | Keeps warm driver connections open. Example: `?minPoolSize=5` |
 | Idle connection age | `maxIdleTimeMS` URI option | Driver-side idle eviction. Example: `?maxIdleTimeMS=600000` |
 | Pool checkout wait | `waitQueueTimeoutMS` URI option | Driver-side wait for an available connection. |
-| Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
-| TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
+| Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
+| TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
 | Read preference | Ignored by Ferrum's config store | Runtime config reads are forced to primary for authoritative polling consistency. |
 | TLS | `FERRUM_DB_TLS_MODE` plus certificate path env vars, or URI options such as `tls=true`, `tlsCAFile`, `tlsCertificateKeyFile` | Env mode values supported for MongoDB are `disable`, `require`, and `verify-full`. |
 | App name | `FERRUM_MONGO_APP_NAME` or `appName` URI option | Helps identify Ferrum connections in MongoDB server diagnostics. The env var overrides the URI value when set. |
@@ -254,6 +254,8 @@ Admission checks that cannot be expressed as unique indexes (host-overlap route 
 **Standalone (convergent post-write reconciliation):** without transactions the gateway performs the check again *after* the write. Route conflicts resolve by deterministic loser-yield on `(created_at, _id)` — the losing document removes/restores itself and the request gets a 409; upstream delete-vs-reference races re-check after the delete and restore the upstream if a reference appeared. Every interleaving of one concurrent pair converges, but a narrow residual window remains — **replica sets are required for full concurrent-write safety**, consistent with the incremental-polling and multi-document-atomicity requirements above.
 
 Consumer identity uniqueness (issue #2121 — `id`/`username`/`custom_id` share one keyspace per namespace) needs no lock documents: it is enforced atomically by the `consumer_identity_index` collection's `_id = "{namespace}:{identity_value}"` uniqueness, reserved *before* the consumer write on standalone deployments and written in the same transaction on replica sets. Consumer documents themselves use `_id = "{namespace}:{id}"`, making consumer ids per-namespace.
+
+**Standalone crash-orphan limitation (issue #2987):** if a process dies after committing identity reservations but before the consumer document lands, those reservations remain and 409 any *different* consumer that claims the same identity values. Same-owner retries heal in-band via E11000 adoption (the conflicting docs are treated as already reserved by that consumer id). Ferrum does **not** automatically delete reservations whose consumer document is absent at startup: the migration lease serializes migration runners only, not normal consumer CRUD, so a point-read "consumer missing" observation can race a live reserve-first create on another serving node and would drop that create's uniqueness guard. Prefer permanent conservative lockout (or manual mongosh removal of a confirmed orphan) over corrupting uniqueness. A generation/lease takeover protocol would be required for safe automatic different-owner reclamation.
 
 mTLS `san_dns` identity admission uses a separate majority-durable,
 non-expiring namespace mutex in `mtls_dns_admission_locks`. The connection
