@@ -1527,8 +1527,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         if update.heartbeat_negotiated && update.update_type != 0 {
             warn!(
                 update_type = update.update_type,
-                cp_url,
-                "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
+                cp_url, "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
             );
             return Ok(react_to_unusable_snapshot(subscription.base_applied));
         }
