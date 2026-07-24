@@ -338,10 +338,6 @@ fn pending_snapshot_finalization_stats() -> (usize, u64, u64, usize, u64) {
     (pending, bytes, oldest_age, full, compact_bytes)
 }
 
-fn pending_snapshot_finalizations() -> usize {
-    pending_snapshot_finalization_stats().0
-}
-
 fn pending_finalization_budget_exceeded() -> bool {
     let (pending, _bytes, _age, _full, compact_bytes) = pending_snapshot_finalization_stats();
     pending >= MAX_PENDING_SNAPSHOT_FINALIZATIONS
@@ -5437,7 +5433,8 @@ impl SnapshotAccumulator {
 
     /// Seed a single identity with an arbitrary `call_count` for boundary tests.
     #[doc(hidden)]
-    #[allow(dead_code)]
+    // External boundary tests need every identity dimension explicit.
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn seed_call_count_for_test(
         &self,
         namespace: &str,
