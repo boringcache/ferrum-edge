@@ -142,9 +142,11 @@ This is a hard requirement, not a warning:
 
 The CP/DP architecture is designed so that data source outages are invisible to API consumers:
 
-- **Auto-reconnect**: If the CP connection drops, the DP reconnects with jittered exponential backoff from 1 second to a 30-second cap. A clean stream end resets the next delay to 1 second; connection errors increase it.
-- **Cached config**: DPs continue serving traffic with their last known config indefinitely during CP outages
+- **Auto-reconnect**: If the CP connection drops, the DP reconnects with jittered exponential backoff from 1 second to a 30-second cap. Connection errors and zero-message clean closes increase backoff; a clean close after at least one applied config message resets it. Multi-CP failover keeps accumulating backoff across CP switches so the 30s cap is reachable.
+- **Stream liveness**: ConfigSync uses HTTP/2 PING keepalive (~30s interval / ~10s timeout, while-idle), TCP keepalive, and application heartbeat frames so silent partitions are detected without treating healthy idle streams as dead. The DP reconnects if no message/heartbeat arrives within 150s.
+- **Cached config**: DPs continue serving traffic with their last known config indefinitely during CP outages. `last_config_received_at` is preserved across reconnect attempts until a newer config is applied.
 - **Connect timeout**: DP uses a 10-second connect timeout per attempt
+- **Stale failover fencing**: FULL_SNAPSHOT messages from a different CP URL whose `version`/`loaded_at` is older than the applied authority are refused so a stale fallback CP cache cannot silently roll config back. Same-source recovery snapshots remain accepted.
 - **CP database outage**: If the CP's database goes offline, the CP continues serving its cached config to DPs via gRPC. It does not broadcast stale updates — DPs simply retain their last known config. When the database recovers, the next poll picks up any changes and broadcasts them.
 - **Admin API fallback**: Both CP and DP admin API read endpoints fall back to the in-memory cached config when the database is unavailable. Responses served from cache include an `X-Data-Source: cached` header. Write operations require a live database and return `503` if unavailable.
 - **Health visibility**: The `/health` endpoint reports `cached_config` status (available, loaded_at, proxy/consumer counts) so operators can see whether the node is running on cached data.
@@ -156,20 +158,21 @@ Data Planes can be configured with a priority-ordered list of Control Plane URLs
 ### How It Works
 
 1. The DP connects to the first (primary) CP URL
-2. If the connection fails, the DP moves to the next URL with a fresh backoff
+2. If the connection fails, the DP moves to the next URL while retaining accumulated backoff
 3. After exhausting all URLs, the DP loops back to the primary with accumulated backoff
-4. When connected to a fallback CP, the DP periodically retries the primary (configurable via `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`, default: 300s)
-5. On clean stream disconnect from a fallback CP, the DP always tries the primary first
+4. When connected to a fallback CP, the DP periodically retries the primary (configurable via `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`, default: 300s). Applies finish before that timer can cancel them.
+5. On clean stream disconnect from a fallback CP after receiving config, the DP always tries the primary first
 
 ### Behavior Summary
 
 | Scenario | Behavior |
 |----------|----------|
-| Primary CP down on startup | Try primary, fail, try secondary immediately (fresh backoff) |
-| Primary CP drops mid-stream | Stream ends → try primary first (clean disconnect) |
+| Primary CP down on startup | Try primary, fail, try secondary with accumulated backoff |
+| Primary CP drops mid-stream | Stream ends → try primary first after clean close with config |
 | All CPs exhausted | Cycle back to primary; keep accumulated backoff |
 | Connected to fallback, primary comes back | After retry interval, disconnect from fallback and retry primary |
 | Single URL configured | Treated as a one-entry priority list |
+| Stream listener bind conflict on DP | Logged as local bind issue; stream stays connected and readiness proceeds |
 
 ### Configuration
 

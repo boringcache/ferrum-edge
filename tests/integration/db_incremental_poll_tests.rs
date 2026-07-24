@@ -292,7 +292,13 @@ async fn non_consumer_delete_records_drive_removals_without_resource_row_scans()
         .expect("delete-only incremental poll must succeed");
 
     assert_eq!(result.sequence_cursor, 3);
-    assert_eq!(result.removed_proxy_ids, vec!["deleted-proxy"]);
+    assert_eq!(
+        result.removed_proxy_ids,
+        vec![ferrum_edge::config::db_loader::NamespacedResourceId::new(
+            "ferrum",
+            "deleted-proxy"
+        )]
+    );
     assert!(result.removed_consumer_ids.is_empty());
     assert_eq!(result.removed_plugin_config_ids, vec!["deleted-plugin"]);
     assert_eq!(result.removed_upstream_ids, vec!["deleted-upstream"]);

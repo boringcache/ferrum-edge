@@ -11,8 +11,8 @@ use crate::config::types::GatewayConfig;
 
 /// Apply an incremental result to a config snapshot in-place.
 ///
-/// Removes deleted resources by ID, upserts added/modified resources, and
-/// updates `loaded_at` to the delta's poll timestamp.
+/// Removes deleted resources by `(namespace, id)`, upserts added/modified
+/// resources, and updates `loaded_at` to the delta's poll timestamp.
 pub(crate) fn apply_incremental_to_config_snapshot(
     config: &mut GatewayConfig,
     result: IncrementalResult,
@@ -23,39 +23,46 @@ pub(crate) fn apply_incremental_to_config_snapshot(
 }
 
 fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalResult) {
-    let removed_proxies: HashSet<&str> = result
+    let removed_proxies: HashSet<(&str, &str)> = result
         .removed_proxy_ids
         .iter()
-        .map(String::as_str)
+        .map(|key| (key.namespace.as_str(), key.id.as_str()))
         .collect();
     let removed_consumers: HashSet<(&str, &str)> = result
         .removed_consumer_ids
         .iter()
         .map(|key| (key.namespace.as_str(), key.id.as_str()))
         .collect();
-    let removed_plugins: HashSet<&str> = result
+    let removed_plugins: HashSet<(&str, &str)> = result
         .removed_plugin_config_ids
         .iter()
-        .map(String::as_str)
+        .map(|key| (key.namespace.as_str(), key.id.as_str()))
         .collect();
-    let removed_upstreams: HashSet<&str> = result
+    let removed_upstreams: HashSet<(&str, &str)> = result
         .removed_upstream_ids
         .iter()
-        .map(String::as_str)
+        .map(|key| (key.namespace.as_str(), key.id.as_str()))
         .collect();
 
-    config
-        .proxies
-        .retain(|proxy| !removed_proxies.contains(proxy.id.as_str()));
+    config.proxies.retain(|proxy| {
+        !removed_proxies.contains(&(proxy.namespace.as_str(), proxy.id.as_str()))
+    });
     config.consumers.retain(|consumer| {
         !removed_consumers.contains(&(consumer.namespace.as_str(), consumer.id.as_str()))
     });
-    config
-        .plugin_configs
-        .retain(|plugin| !removed_plugins.contains(plugin.id.as_str()));
-    config
-        .upstreams
-        .retain(|upstream| !removed_upstreams.contains(upstream.id.as_str()));
+    config.plugin_configs.retain(|plugin| {
+        !removed_plugins.contains(&(plugin.namespace.as_str(), plugin.id.as_str()))
+    });
+    config.upstreams.retain(|upstream| {
+        !removed_upstreams.contains(&(upstream.namespace.as_str(), upstream.id.as_str()))
+    });
+
+    // Plugin associations are scoped by the owning proxy's namespace.
+    for proxy in &mut config.proxies {
+        proxy.plugins.retain(|assoc| {
+            !removed_plugins.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+        });
+    }
 
     upsert_by_id(
         &mut config.proxies,

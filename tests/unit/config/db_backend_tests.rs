@@ -552,7 +552,7 @@ fn incremental_result_not_empty_with_added_proxy() {
 fn incremental_result_not_empty_with_removed_proxy_id() {
     let result = IncrementalResult {
         added_or_modified_proxies: vec![],
-        removed_proxy_ids: vec!["p1".to_string()],
+        removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "p1")],
         added_or_modified_consumers: vec![],
         removed_consumer_ids: vec![],
         added_or_modified_plugin_configs: vec![],
@@ -610,7 +610,7 @@ fn incremental_result_not_empty_with_removed_plugin_config() {
         added_or_modified_consumers: vec![],
         removed_consumer_ids: vec![],
         added_or_modified_plugin_configs: vec![],
-        removed_plugin_config_ids: vec!["pc1".to_string()],
+        removed_plugin_config_ids: vec![NamespacedResourceId::new("ferrum", "pc1")],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
@@ -629,7 +629,7 @@ fn incremental_result_not_empty_with_removed_upstream() {
         added_or_modified_plugin_configs: vec![],
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
-        removed_upstream_ids: vec!["u1".to_string()],
+        removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "u1")],
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };

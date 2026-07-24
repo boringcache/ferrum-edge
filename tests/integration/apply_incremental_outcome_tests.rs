@@ -2119,13 +2119,13 @@ async fn apply_incremental_mixed_resource_mutations_are_atomic() {
     let poll_timestamp = Utc::now();
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![p1, p3],
-        removed_proxy_ids: vec!["p2".to_string()],
+        removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "p2")],
         added_or_modified_consumers: vec![c1],
         removed_consumer_ids: vec![NamespacedResourceId::new("ferrum", "c2")],
         added_or_modified_plugin_configs: vec![pc1],
-        removed_plugin_config_ids: vec!["pc2".to_string()],
+        removed_plugin_config_ids: vec![NamespacedResourceId::new("ferrum", "pc2")],
         added_or_modified_upstreams: vec![u1],
-        removed_upstream_ids: vec!["u2".to_string()],
+        removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "u2")],
         sequence_cursor: 0,
         poll_timestamp,
     };

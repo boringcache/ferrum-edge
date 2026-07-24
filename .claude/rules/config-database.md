@@ -108,8 +108,9 @@ paths:
 - CP/DP auth is HS256 JWT in `authorization` metadata. The channel carries that JWT plus the full gateway config, so the transport is secure-by-default: `EnvConfig::validate_cp_dp_grpc_transport_security()` refuses a non-loopback plaintext CP bind and a non-loopback `http://` DP URL unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`. Loopback (`127.0.0.1`/`::1`/`localhost`) plaintext is always allowed; permitted plaintext still logs a high-severity warning on CP and DP. mTLS (`FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`) is the only DP auth factor beyond the bearer JWT — warn when CP TLS is configured without it.
 - `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected at startup: tonic's `ClientTlsConfig` exposes no public verifier-skip hook, so the flag never disabled verification (CRL is likewise not applied to the tonic-managed CP/DP client). Pin the CP CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` for self-signed test certs. Do not re-add a no-verify path by hand-rolling a tonic connector.
 - Production CP server uses `CpGrpcServer::with_channel_capacity(env_config.cp_broadcast_channel_capacity)`. `new()` default capacity 128 is for tests.
-- DP reconnects priority-ordered CP URLs with exponential backoff from 1s to 30s and plus/minus 25% jitter.
-- On fallback CP, DP races the stream against primary-retry timer `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`.
+- DP reconnects priority-ordered CP URLs with exponential backoff from 1s to 30s and plus/minus 25% jitter. Backoff follows the failure sequence across CP switches; a clean close that delivered no config message counts as a failure. Successful sustained operation (applied config) or intentional disconnect may reset it.
+- ConfigSync Subscribe streams use HTTP/2/TCP keepalive plus application heartbeats; DPs reconnect after bounded silence rather than hanging on idle `message().await`.
+- On fallback CP, DP races the stream against primary-retry timer `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` between messages so in-flight applies are not cancelled mid-`spawn_blocking`.
 
 ## Dependency Version Sync
 

@@ -8317,16 +8317,17 @@ impl ProxyState {
         let old_config = self.config.load_full();
         let mut new_config = (*old_config).clone();
 
-        // Remove deleted resources
+        // Remove deleted resources by (namespace, id) so a misrouted removal
+        // cannot delete a same-id object belonging to another namespace.
         if !result.removed_proxy_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_proxy_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .proxies
-                .retain(|p| !removed.contains(p.id.as_str()));
+                .retain(|p| !removed.contains(&(p.namespace.as_str(), p.id.as_str())));
         }
         if !result.removed_consumer_ids.is_empty() {
             let removed: std::collections::HashSet<(&str, &str)> = result
@@ -8339,29 +8340,29 @@ impl ProxyState {
             });
         }
         if !result.removed_plugin_config_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_plugin_config_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .plugin_configs
-                .retain(|pc| !removed.contains(pc.id.as_str()));
+                .retain(|pc| !removed.contains(&(pc.namespace.as_str(), pc.id.as_str())));
             for proxy in &mut new_config.proxies {
-                proxy
-                    .plugins
-                    .retain(|assoc| !removed.contains(assoc.plugin_config_id.as_str()));
+                proxy.plugins.retain(|assoc| {
+                    !removed.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                });
             }
         }
         if !result.removed_upstream_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_upstream_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .upstreams
-                .retain(|u| !removed.contains(u.id.as_str()));
+                .retain(|u| !removed.contains(&(u.namespace.as_str(), u.id.as_str())));
         }
 
         // Upsert added/modified resources using HashMap index for O(1) lookups
@@ -42520,7 +42521,7 @@ mod tests {
                 added_or_modified_consumers: Vec::new(),
                 removed_consumer_ids: Vec::new(),
                 added_or_modified_plugin_configs: Vec::new(),
-                removed_plugin_config_ids: vec!["pc1".to_string()],
+                removed_plugin_config_ids: vec![NamespacedResourceId::new("ferrum", "pc1")],
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
                 sequence_cursor: 0,

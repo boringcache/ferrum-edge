@@ -1716,6 +1716,7 @@ async fn test_dp_handles_malformed_config() {
         timestamp: chrono::Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         trust_bundles_json: String::new(),
+        heartbeat: false,
     };
     let _ = update_tx.send(malformed_update);
 
@@ -2381,7 +2382,7 @@ async fn test_dp_applies_delta_update_removing_proxy() {
     // Send a DELTA that removes proxy-1
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![],
-        removed_proxy_ids: vec!["proxy-1".to_string()],
+        removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "proxy-1")],
         added_or_modified_consumers: vec![],
         removed_consumer_ids: vec![],
         added_or_modified_plugin_configs: vec![],
@@ -2562,6 +2563,7 @@ async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
         timestamp: Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         trust_bundles_json: String::new(),
+        heartbeat: false,
     };
     let _ = update_tx.send(malformed);
 
@@ -2614,13 +2616,13 @@ async fn test_incremental_result_serde_roundtrip() {
             create_test_proxy("proxy-a", "/api-a"),
             create_test_proxy("proxy-b", "/api-b"),
         ],
-        removed_proxy_ids: vec!["proxy-old".to_string()],
+        removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "proxy-old")],
         added_or_modified_consumers: vec![],
         removed_consumer_ids: vec![NamespacedResourceId::new("ferrum", "consumer-gone")],
         added_or_modified_plugin_configs: vec![],
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
-        removed_upstream_ids: vec!["upstream-x".to_string()],
+        removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "upstream-x")],
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };
@@ -2632,7 +2634,10 @@ async fn test_incremental_result_serde_roundtrip() {
     assert_eq!(deserialized.added_or_modified_proxies.len(), 2);
     assert_eq!(deserialized.added_or_modified_proxies[0].id, "proxy-a");
     assert_eq!(deserialized.added_or_modified_proxies[1].id, "proxy-b");
-    assert_eq!(deserialized.removed_proxy_ids, vec!["proxy-old"]);
+    assert_eq!(
+        deserialized.removed_proxy_ids,
+        vec![NamespacedResourceId::new("ferrum", "proxy-old")]
+    );
     assert_eq!(
         deserialized.removed_consumer_ids,
         vec![NamespacedResourceId::new("ferrum", "consumer-gone")]
@@ -2775,7 +2780,7 @@ async fn test_dp_applies_delta_with_mixed_operations() {
 
     let delta = IncrementalResult {
         added_or_modified_proxies: vec![modified, create_test_proxy("proxy-new", "/api-new")],
-        removed_proxy_ids: vec!["proxy-1".to_string()],
+        removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "proxy-1")],
         added_or_modified_consumers: vec![],
         removed_consumer_ids: vec![],
         added_or_modified_plugin_configs: vec![],
@@ -3132,7 +3137,7 @@ async fn test_dp_applies_delta_removing_upstream() {
         added_or_modified_plugin_configs: vec![],
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
-        removed_upstream_ids: vec!["u1".to_string()],
+        removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "u1")],
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };

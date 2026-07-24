@@ -3,9 +3,16 @@
 //! The outer reconnect loop (`start_dp_client_with_shutdown`) uses exponential
 //! backoff with jitter (1s → 2s → 4s → … → 30s cap, ±25% jitter) to avoid
 //! thundering-herd reconnection storms when many DPs restart simultaneously.
+//! Backoff follows the failure sequence across multi-CP failover and is not
+//! reset merely because the selected CP index changed; a clean close that
+//! delivered no config message counts as a failure for backoff purposes.
+//! Successful sustained operation (at least one applied config message) or an
+//! intentional disconnect (primary retry / TLS reload) may reset it.
+//!
 //! Inside the stream handler, two message types:
 //! - `update_type=0` (FULL_SNAPSHOT): replaces the entire `GatewayConfig`
 //! - `update_type=1` (DELTA): applies incremental changes via `apply_incremental()`
+//! Heartbeat frames (`ConfigUpdate.heartbeat`) refresh liveness without apply.
 //!
 //! Multi-CP failover: `cp_urls` is a priority-ordered list. The DP connects to
 //! the first (primary) URL and fails over to subsequent URLs when unreachable.
@@ -21,24 +28,30 @@ use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
-use tonic::transport::{Certificate, Channel, Identity};
+use tonic::transport::{Certificate, Channel, Endpoint, Identity};
 use tracing::{debug, error, info, warn};
 
+use super::configsync_lifecycle::{
+    AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
+    CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
+    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, MultiCpBackoffState,
+    advance_multi_cp_backoff, evaluate_full_snapshot_authority, grow_backoff_after_failure_sleep,
+};
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
 use crate::FERRUM_VERSION;
 use crate::config::EnvConfig;
-use crate::config::db_loader::IncrementalResult;
+use crate::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use crate::config::types::GatewayConfig;
 use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{ConfigApplyOutcome, ProxyState};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
-use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs};
+use crate::util::backoff::jittered_backoff;
 
 /// Tracks the DP's connection status to its Control Plane.
 /// Shared between the DP gRPC client and the admin API (`GET /cluster`).
@@ -363,9 +376,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         );
     }
 
-    let mut current_cp_index: usize = 0;
-    let mut backoff_secs = BACKOFF_INITIAL_SECS;
-    let mut full_cycle_count: u32 = 0;
+    let mut backoff = MultiCpBackoffState::new();
     let mut last_tls_revision = tls_reload
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
@@ -383,6 +394,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                 .as_ref()
                 .and_then(|slot| slot.load_full().as_ref().clone()),
         )));
+    let mut snapshot_authority: Option<AppliedSnapshotAuthority> = None;
 
     loop {
         if let Some(ref rx) = shutdown_rx
@@ -417,14 +429,14 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             }
         }
 
-        let cp_url = &cp_urls[current_cp_index];
-        let is_primary = current_cp_index == 0;
+        let cp_url = &cp_urls[backoff.current_cp_index];
+        let is_primary = backoff.current_cp_index == 0;
         let is_fallback = !is_primary && cp_count > 1;
 
         if is_fallback {
             info!(
                 "Connecting to fallback CP [{}/{}] at {}",
-                current_cp_index + 1,
+                backoff.current_cp_index + 1,
                 cp_count,
                 cp_url
             );
@@ -432,146 +444,106 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             info!("Connecting to primary CP at {}", cp_url);
         }
 
-        // When connected to a fallback CP and primary_retry_secs > 0,
-        // race the stream against a timer to periodically retry the primary.
-        // The timer is only armed after startup readiness (initial snapshot applied)
-        // to avoid disconnecting from the fallback before the DP has any config.
-        //
-        // Acquire pairs with the Release store in connect_and_subscribe_with_startup_ready
-        // (and the admin /health endpoint reads with Acquire too). On x86 all loads are
-        // acquire-fenced by the hardware, but on ARM/AArch64 Relaxed could theoretically
-        // delay visibility of the store, so we use Acquire/Release consistently.
-        let should_race_primary = is_fallback
-            && primary_retry_secs > 0
-            && startup_ready
-                .as_ref()
-                .is_none_or(|r| r.load(Ordering::Acquire));
-        let result = if should_race_primary {
-            tokio::select! {
-                res = connect_and_subscribe_with_startup_ready_inner(
-                    cp_url,
-                    &jwt_secret,
-                    &node_id,
-                    &proxy_state,
-                    tls_config.as_ref(),
-                    startup_ready.clone(),
-                    &namespace,
-                    connection_state.as_ref(),
-                    is_primary,
-                    frontend_tls_slot.as_ref(),
-                    frontend_tls_runtime.as_ref(),
-                    cp_frontend_tls_materialized.clone(),
-                    frontend_tls_restore_slot.clone(),
-                ) => res,
-                _ = tokio::time::sleep(Duration::from_secs(primary_retry_secs)) => {
-                    info!(
-                        "Primary CP retry interval ({}s) elapsed; disconnecting from \
-                         fallback CP [{}/{}] to retry primary",
-                        primary_retry_secs,
-                        current_cp_index + 1,
-                        cp_count,
-                    );
-                    // Mark disconnected before switching — record fallback CP as last attempted
-                    update_state_disconnected(&connection_state, cp_url, is_primary);
-                    current_cp_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
-                    update_state_disconnected(&connection_state, cp_url, is_primary);
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-            }
-        } else {
-            tokio::select! {
-                res = connect_and_subscribe_with_startup_ready_inner(
-                    cp_url,
-                    &jwt_secret,
-                    &node_id,
-                    &proxy_state,
-                    tls_config.as_ref(),
-                    startup_ready.clone(),
-                    &namespace,
-                    connection_state.as_ref(),
-                    is_primary,
-                    frontend_tls_slot.as_ref(),
-                    frontend_tls_runtime.as_ref(),
-                    cp_frontend_tls_materialized.clone(),
-                    frontend_tls_restore_slot.clone(),
-                ) => res,
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
-                    update_state_disconnected(&connection_state, cp_url, is_primary);
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-                _ = wait_for_readiness_then_primary_retry(
-                    startup_ready.clone(),
-                    primary_retry_secs,
-                ), if is_fallback && primary_retry_secs > 0 => {
-                    info!(
-                        "Primary CP retry interval ({}s) elapsed after startup readiness; disconnecting from fallback CP [{}/{}] to retry primary",
-                        primary_retry_secs,
-                        current_cp_index + 1,
-                        cp_count,
-                    );
-                    update_state_disconnected(&connection_state, cp_url, is_primary);
-                    current_cp_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-            }
-        };
+        let result = connect_and_subscribe_with_startup_ready_inner(
+            cp_url,
+            &jwt_secret,
+            &node_id,
+            &proxy_state,
+            tls_config.as_ref(),
+            startup_ready.clone(),
+            &namespace,
+            connection_state.as_ref(),
+            is_primary,
+            frontend_tls_slot.as_ref(),
+            frontend_tls_runtime.as_ref(),
+            cp_frontend_tls_materialized.clone(),
+            frontend_tls_restore_slot.clone(),
+            shutdown_rx.clone(),
+            tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+            if is_fallback { primary_retry_secs } else { 0 },
+            &mut snapshot_authority,
+        )
+        .await;
 
-        let mut increase_backoff = true;
-        match result {
-            Ok(_) => {
+        let attempt_outcome = match result {
+            Ok(DpStreamEnd::Shutdown) => {
+                info!("DP client shutting down");
+                return;
+            }
+            Ok(DpStreamEnd::PrimaryRetry) => {
+                info!(
+                    "Primary CP retry interval ({}s) elapsed; disconnecting from \
+                     fallback CP [{}/{}] to retry primary",
+                    primary_retry_secs,
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                backoff.current_cp_index = 0;
+                ConfigSyncAttemptOutcome::IntentionalDisconnect
+            }
+            Ok(DpStreamEnd::TlsReload) => {
+                info!(
+                    "{} gRPC TLS source changed; reconnecting CP stream",
+                    tls_reload
+                        .as_ref()
+                        .map(|reload| reload.label)
+                        .unwrap_or("DP")
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::IntentionalDisconnect
+            }
+            Ok(DpStreamEnd::Clean { received_config }) => {
                 warn!(
                     "CP [{}/{}] connection stream ended ({}), will reconnect...",
-                    current_cp_index + 1,
+                    backoff.current_cp_index + 1,
                     cp_count,
                     cp_url
                 );
                 update_state_disconnected(&connection_state, cp_url, is_primary);
-                // On clean disconnect, try primary first if we were on a fallback
-                if is_fallback {
-                    info!("Stream ended on fallback CP; will retry primary CP first");
-                    current_cp_index = 0;
+                if received_config {
+                    if is_fallback {
+                        info!("Stream ended on fallback CP; will retry primary CP first");
+                        backoff.current_cp_index = 0;
+                    }
+                    ConfigSyncAttemptOutcome::CleanCloseAfterConfig
+                } else {
+                    ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 }
-                backoff_secs = BACKOFF_INITIAL_SECS;
-                increase_backoff = false;
             }
             Err(e) => {
                 error!(
                     "CP [{}/{}] connection error ({}): {}",
-                    current_cp_index + 1,
+                    backoff.current_cp_index + 1,
                     cp_count,
                     cp_url,
                     e
                 );
                 update_state_disconnected(&connection_state, cp_url, is_primary);
-
-                if cp_count > 1 {
-                    let next_index = (current_cp_index + 1) % cp_count;
-                    if next_index == 0 {
-                        full_cycle_count += 1;
-                        warn!(
-                            "All {} CP URLs exhausted (cycle {}), restarting from primary",
-                            cp_count, full_cycle_count
-                        );
-                        // Keep accumulated backoff when cycling back
-                    } else {
-                        // Fresh start on next CP
-                        backoff_secs = BACKOFF_INITIAL_SECS;
-                    }
-                    current_cp_index = next_index;
-                }
+                ConfigSyncAttemptOutcome::ConnectionError
             }
+        };
+
+        let should_sleep = advance_multi_cp_backoff(&mut backoff, cp_count, attempt_outcome);
+        if !should_sleep {
+            continue;
         }
 
-        let sleep_duration = jittered_backoff(backoff_secs);
+        if matches!(
+            attempt_outcome,
+            ConfigSyncAttemptOutcome::ConnectionError
+                | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
+        ) && backoff.current_cp_index == 0
+            && backoff.full_cycle_count > 0
+            && cp_count > 1
+        {
+            warn!(
+                "All {} CP URLs exhausted (cycle {}), restarting from primary",
+                cp_count, backoff.full_cycle_count
+            );
+        }
+
+        let sleep_duration = jittered_backoff(backoff.backoff_secs);
 
         if let Some(ref rx) = shutdown_rx {
             let mut rx_clone = rx.clone();
@@ -587,7 +559,11 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                         return;
                     }
                     _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                        backoff_secs = BACKOFF_INITIAL_SECS;
+                        let _ = advance_multi_cp_backoff(
+                            &mut backoff,
+                            cp_count,
+                            ConfigSyncAttemptOutcome::IntentionalDisconnect,
+                        );
                         continue;
                     }
                 }
@@ -608,14 +584,37 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    let _ = advance_multi_cp_backoff(
+                        &mut backoff,
+                        cp_count,
+                        ConfigSyncAttemptOutcome::IntentionalDisconnect,
+                    );
                     continue;
                 }
             }
         }
 
-        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+        if matches!(
+            attempt_outcome,
+            ConfigSyncAttemptOutcome::ConnectionError
+                | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
+        ) {
+            grow_backoff_after_failure_sleep(&mut backoff);
+        }
     }
+}
+
+/// How a ConfigSync stream session ended when the connection itself succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpStreamEnd {
+    /// Stream closed cleanly (EOF).
+    Clean { received_config: bool },
+    /// Fallback primary-retry timer fired between messages.
+    PrimaryRetry,
+    /// CP/DP TLS material changed; reconnect with rotated material.
+    TlsReload,
+    /// Process shutdown observed while connected.
+    Shutdown,
 }
 
 async fn wait_for_readiness_then_primary_retry(
@@ -914,7 +913,8 @@ pub async fn connect_and_subscribe(
     tls_config: Option<&DpGrpcTlsConfig>,
     namespace: &str,
 ) -> Result<(), anyhow::Error> {
-    connect_and_subscribe_with_startup_ready(
+    let mut authority = None;
+    match connect_and_subscribe_with_startup_ready_inner(
         cp_url,
         jwt_secret,
         node_id,
@@ -925,8 +925,19 @@ pub async fn connect_and_subscribe(
         None,
         true,
         None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(ArcSwap::new(Arc::new(None))),
+        None,
+        None,
+        0,
+        &mut authority,
     )
-    .await
+    .await?
+    {
+        DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
+        DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
+    }
 }
 
 /// Connect to CP and optionally flip startup readiness after the first applied snapshot.
@@ -945,7 +956,8 @@ pub async fn connect_and_subscribe_with_startup_ready(
 ) -> Result<(), anyhow::Error> {
     let frontend_tls_runtime =
         frontend_tls_slot.map(|slot| DpFrontendTlsRuntime::new(slot.clone()));
-    connect_and_subscribe_with_startup_ready_inner(
+    let mut authority = None;
+    match connect_and_subscribe_with_startup_ready_inner(
         cp_url,
         jwt_secret,
         node_id,
@@ -963,8 +975,31 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 .map(|slot| slot.load_full().as_ref().clone())
                 .unwrap_or(None),
         ))),
+        None,
+        None,
+        0,
+        &mut authority,
     )
-    .await
+    .await?
+    {
+        DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
+        DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
+    }
+}
+
+/// Build a ConfigSync client endpoint with bounded transport keepalive so
+/// silent partitions fail the stream instead of hanging forever on idle reads.
+pub fn configure_configsync_endpoint(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(
+            CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
+        ))
+        .keep_alive_timeout(Duration::from_secs(
+            CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS,
+        ))
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(Duration::from_secs(CONFIGSYNC_TCP_KEEPALIVE_SECS)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -982,9 +1017,12 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     frontend_tls_runtime: Option<&DpFrontendTlsRuntime>,
     cp_frontend_tls_materialized: Arc<AtomicBool>,
     frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
-) -> Result<(), anyhow::Error> {
-    let mut endpoint =
-        Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    tls_revision_rx: Option<watch::Receiver<u64>>,
+    primary_retry_secs: u64,
+    snapshot_authority: &mut Option<AppliedSnapshotAuthority>,
+) -> Result<DpStreamEnd, anyhow::Error> {
+    let mut endpoint = configure_configsync_endpoint(Channel::from_shared(cp_url.to_string())?);
 
     // Apply TLS configuration if the URL uses https:// or TLS config is provided
     if let Some(tls) = tls_config {
@@ -1058,20 +1096,71 @@ async fn connect_and_subscribe_with_startup_ready_inner(
 
     let mut stream = client.subscribe(request).await?.into_inner();
     let mut initial_snapshot_applied = startup_ready.is_none();
+    let mut received_config = false;
+    let mut last_stream_activity = Instant::now();
+    let primary_retry_fut =
+        wait_for_readiness_then_primary_retry(startup_ready.clone(), primary_retry_secs);
+    tokio::pin!(primary_retry_fut);
+    let enable_primary_retry = primary_retry_secs > 0;
+    let shutdown_fut = wait_optional_shutdown(shutdown_rx.clone());
+    tokio::pin!(shutdown_fut);
+    let tls_reload_fut = wait_optional_tls_reload(tls_revision_rx.clone());
+    tokio::pin!(tls_reload_fut);
 
-    // Mark connected
+    // Mark connected while preserving last applied-config age across reconnects.
     if let Some(cs) = connection_state {
+        let prev = cs.load();
         let now = Utc::now();
         cs.store(Arc::new(DpCpConnectionState {
             connected: true,
             cp_url: cp_url.to_string(),
             is_primary,
-            last_config_received_at: None,
+            last_config_received_at: prev.last_config_received_at,
             connected_since: Some(now),
         }));
     }
 
-    while let Some(update) = stream.message().await? {
+    loop {
+        let silence_remaining = Duration::from_secs(CONFIGSYNC_MAX_SILENCE_SECS)
+            .saturating_sub(last_stream_activity.elapsed());
+
+        let update = tokio::select! {
+            biased;
+            msg = stream.message() => {
+                match msg? {
+                    Some(update) => update,
+                    None => {
+                        return Ok(DpStreamEnd::Clean { received_config });
+                    }
+                }
+            }
+            _ = &mut shutdown_fut => {
+                return Ok(DpStreamEnd::Shutdown);
+            }
+            _ = &mut tls_reload_fut => {
+                return Ok(DpStreamEnd::TlsReload);
+            }
+            _ = &mut primary_retry_fut, if enable_primary_retry => {
+                return Ok(DpStreamEnd::PrimaryRetry);
+            }
+            _ = tokio::time::sleep(silence_remaining) => {
+                return Err(anyhow::anyhow!(
+                    "ConfigSync stream silent for {}s (no message/heartbeat); reconnecting",
+                    CONFIGSYNC_MAX_SILENCE_SECS
+                ));
+            }
+        };
+
+        last_stream_activity = Instant::now();
+
+        if update.heartbeat {
+            debug!(
+                version = %update.version,
+                "Received ConfigSync heartbeat"
+            );
+            continue;
+        }
+
         info!(
             "Received config update (type={}, version={}, cp_version={})",
             update.update_type, update.version, update.ferrum_version
@@ -1088,7 +1177,13 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         match update.update_type {
             0 => {
                 // FULL_SNAPSHOT — replace entire config
-                match serde_json::from_str::<GatewayConfig>(&update.config_json) {
+                match evaluate_full_snapshot_authority(
+                    snapshot_authority.as_ref(),
+                    &update.version,
+                    cp_url,
+                ) {
+                    Ok(incoming_version) => {
+                        match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                     Ok(mut config) => {
                         let gateway_trust_bundle_update =
                             match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
@@ -1214,6 +1309,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 continue;
                             }
                         };
+                        // Await apply to completion before returning to the
+                        // select! above so primary-retry / TLS / shutdown arms
+                        // cannot cancel a detached spawn_blocking mid-apply.
                         match proxy_state.update_config_off_thread(config).await {
                             ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
                                 commit_frontend_tls_snapshot(
@@ -1229,11 +1327,25 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     gateway_trust_bundle_update,
                                 );
                                 update_state_config_received(connection_state);
+                                received_config = true;
+                                *snapshot_authority = Some(AppliedSnapshotAuthority {
+                                    version: incoming_version,
+                                    source_cp_url: cp_url.to_string(),
+                                });
                                 if !initial_snapshot_applied {
-                                    proxy_state
+                                    // Bind failures are non-fatal in DP mode —
+                                    // do not tear down a healthy ConfigSync
+                                    // stream or misclassify this as a CP error.
+                                    if let Err(error) = proxy_state
                                         .stream_listener_manager
                                         .wait_until_started(Duration::from_secs(10))
-                                        .await?;
+                                        .await
+                                    {
+                                        warn!(
+                                            error = %error,
+                                            "Stream listener startup wait timed out after CP snapshot; continuing (bind failures are non-fatal in DP mode)"
+                                        );
+                                    }
                                     // Block DP readiness on the first capability
                                     // classification. Without this the `/health`
                                     // endpoint would flip to ready while the
@@ -1264,6 +1376,17 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     }
                     Err(e) => {
                         error!("Failed to parse full config update: {}", e);
+                    }
+                }
+                    }
+                    Err(reason) => {
+                        warn!(
+                            ?reason,
+                            cp_url,
+                            version = %update.version,
+                            "Refusing FULL_SNAPSHOT from failover CP; keeping applied config"
+                        );
+                        continue;
                     }
                 }
             }
@@ -1333,6 +1456,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     gateway_trust_bundle_update,
                                 );
                                 update_state_config_received(connection_state);
+                                received_config = true;
                                 info!("Incremental config delta applied from CP");
                             }
                             ConfigApplyOutcome::Unchanged => {
@@ -1408,8 +1532,18 @@ async fn connect_and_subscribe_with_startup_ready_inner(
             }
         }
     }
+}
 
-    Ok(())
+async fn wait_optional_shutdown(mut shutdown_rx: Option<watch::Receiver<bool>>) {
+    let Some(rx) = shutdown_rx.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Defense-in-depth: filter a full config snapshot to only the DP's
@@ -1486,10 +1620,10 @@ fn clear_frontend_tls_material(config: &mut GatewayConfig) -> bool {
     had_material
 }
 
-/// Defense-in-depth filter for incremental deltas. Applied to
-/// `added_or_modified_*` vectors only; removal IDs are namespace-agnostic
-/// and harmless on the DP side because they only delete resources the DP
-/// already has (which were themselves filtered through this same check).
+/// Defense-in-depth filter for incremental deltas. Filters both
+/// `added_or_modified_*` vectors and namespace-qualified removal keys so a
+/// misrouted or adversarial delta cannot delete a same-id object in another
+/// namespace.
 ///
 /// Returns the number of resources filtered out so the caller can warn.
 fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &str) -> usize {
@@ -1498,6 +1632,10 @@ fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &s
         result.added_or_modified_consumers.len(),
         result.added_or_modified_plugin_configs.len(),
         result.added_or_modified_upstreams.len(),
+        result.removed_proxy_ids.len(),
+        result.removed_consumer_ids.len(),
+        result.removed_plugin_config_ids.len(),
+        result.removed_upstream_ids.len(),
     );
     result
         .added_or_modified_proxies
@@ -1511,10 +1649,26 @@ fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &s
     result
         .added_or_modified_upstreams
         .retain(|u| u.namespace == namespace);
+    result
+        .removed_proxy_ids
+        .retain(|key| key.namespace == namespace);
+    result
+        .removed_consumer_ids
+        .retain(|key| key.namespace == namespace);
+    result
+        .removed_plugin_config_ids
+        .retain(|key| key.namespace == namespace);
+    result
+        .removed_upstream_ids
+        .retain(|key| key.namespace == namespace);
     (pre.0 - result.added_or_modified_proxies.len())
         + (pre.1 - result.added_or_modified_consumers.len())
         + (pre.2 - result.added_or_modified_plugin_configs.len())
         + (pre.3 - result.added_or_modified_upstreams.len())
+        + (pre.4 - result.removed_proxy_ids.len())
+        + (pre.5 - result.removed_consumer_ids.len())
+        + (pre.6 - result.removed_plugin_config_ids.len())
+        + (pre.7 - result.removed_upstream_ids.len())
 }
 
 /// Check whether the CP's reported version is compatible with this DP.
@@ -1558,22 +1712,6 @@ mod tests {
     use crate::util::backoff::jittered_backoff_with_entropy;
     use chrono::Utc;
     use serde_json::json;
-
-    #[test]
-    fn next_backoff_does_not_increase_after_clean_stream_end() {
-        assert_eq!(
-            next_backoff_secs(BACKOFF_INITIAL_SECS, false),
-            BACKOFF_INITIAL_SECS
-        );
-        assert_eq!(next_backoff_secs(16, false), BACKOFF_INITIAL_SECS);
-    }
-
-    #[test]
-    fn next_backoff_increases_after_connection_error_until_cap() {
-        assert_eq!(next_backoff_secs(1, true), 2);
-        assert_eq!(next_backoff_secs(16, true), 30);
-        assert_eq!(next_backoff_secs(30, true), 30);
-    }
 
     #[test]
     fn jittered_backoff_with_entropy_stays_within_expected_range() {
@@ -1932,7 +2070,7 @@ mod tests {
                 proxy_in_namespace("p-prod", "production"),
                 proxy_in_namespace("p-staging", "staging"),
             ],
-            removed_proxy_ids: vec!["doesnt-matter".to_string()],
+            removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "doesnt-matter")],
             added_or_modified_consumers: vec![consumer_in_namespace("c-staging", "staging")],
             removed_consumer_ids: vec![],
             added_or_modified_plugin_configs: vec![plugin_config_in_namespace(
@@ -1950,7 +2088,10 @@ mod tests {
         };
 
         let filtered = filter_incremental_to_namespace(&mut delta, "production");
-        assert_eq!(filtered, 3, "1 proxy + 1 consumer + 1 upstream filtered");
+        assert_eq!(
+            filtered, 4,
+            "1 proxy + 1 consumer + 1 upstream + 1 foreign removal filtered"
+        );
 
         assert_eq!(delta.added_or_modified_proxies.len(), 1);
         assert_eq!(delta.added_or_modified_proxies[0].namespace, "production");
@@ -1958,10 +2099,8 @@ mod tests {
         assert_eq!(delta.added_or_modified_plugin_configs.len(), 1);
         assert_eq!(delta.added_or_modified_upstreams.len(), 1);
 
-        // Removal IDs are intentionally NOT filtered — the DP only has
-        // resources in its own namespace anyway, so deleting an unknown ID
-        // is harmless.
-        assert_eq!(delta.removed_proxy_ids.len(), 1);
+        // Removal keys are namespace-qualified and filtered fail-closed.
+        assert!(delta.removed_proxy_ids.is_empty());
     }
 
     #[test]

@@ -37,18 +37,22 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures_util::stream;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::time::{Instant, interval_at};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use super::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS;
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
 use crate::FERRUM_VERSION;
@@ -58,6 +62,10 @@ use crate::modes::mesh::config::{
     SidecarHostPattern, WorkloadSelector, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::slice::{MeshSliceRequest, node_waypoint_assertors_from_workloads};
+
+/// Application-level ConfigSync heartbeat interval (matches DP silence budget).
+pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
+    Duration::from_secs(CONFIGSYNC_HEARTBEAT_INTERVAL_SECS);
 
 fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) {
     if let Some(source) = config
@@ -1293,6 +1301,18 @@ impl CpGrpcServer {
         registry.touch_all();
     }
 
+    fn build_configsync_heartbeat(version: String) -> ConfigUpdate {
+        ConfigUpdate {
+            update_type: 0,
+            config_json: String::new(),
+            version,
+            timestamp: Utc::now().timestamp(),
+            ferrum_version: FERRUM_VERSION.to_string(),
+            trust_bundles_json: String::new(),
+            heartbeat: true,
+        }
+    }
+
     /// Broadcast a full config snapshot to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
         let config_json = match Self::config_json_for_dp(config) {
@@ -1319,6 +1339,7 @@ impl CpGrpcServer {
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
+            heartbeat: false,
         };
         let _ = tx.send(update);
     }
@@ -1389,6 +1410,7 @@ impl CpGrpcServer {
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
+            heartbeat: false,
         };
         let _ = tx.send(update);
     }
@@ -1649,6 +1671,7 @@ impl ConfigSync for CpGrpcServer {
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
+            heartbeat: false,
         };
 
         let config_for_recovery = self.config.clone();
@@ -1691,7 +1714,8 @@ impl ConfigSync for CpGrpcServer {
                             timestamp: chrono::Utc::now().timestamp(),
                             ferrum_version: FERRUM_VERSION.to_string(),
                             trust_bundles_json,
-                        }))
+            heartbeat: false,
+        }))
                     }
                     Err(e) => {
                         error!("Failed to serialize recovery snapshot: {}", e);
@@ -1701,10 +1725,22 @@ impl ConfigSync for CpGrpcServer {
             }
         });
 
-        // Prepend initial config, then wrap in TrackedStream so the DP is
+        // Prepend initial config, interleave application heartbeats for
+        // silent-partition detection, then wrap in TrackedStream so the DP is
         // automatically de-registered when the gRPC stream is dropped.
         let initial_stream = tokio_stream::once(Ok(initial));
-        let combined = initial_stream.chain(stream);
+        let heartbeat_config = self.config.clone();
+        let heartbeat_stream = IntervalStream::new(interval_at(
+            Instant::now() + CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
+            CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
+        ))
+        .map(move |_| {
+            let current = heartbeat_config.load_full();
+            Ok(Self::build_configsync_heartbeat(
+                current.loaded_at.to_rfc3339(),
+            ))
+        });
+        let combined = initial_stream.chain(stream::select(stream, heartbeat_stream));
         let tracked = TrackedStream {
             inner: Box::pin(combined),
             registry: self.registry.clone(),

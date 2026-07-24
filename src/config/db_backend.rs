@@ -588,7 +588,10 @@ impl Default for ApiSpecListFilter {
     }
 }
 
-/// Namespace-qualified key for resources whose IDs are not globally unique.
+/// Namespace-qualified key for resources whose IDs are only unique per namespace.
+///
+/// Used for incremental removals across every resource type so a misrouted or
+/// adversarial delta cannot delete a same-id object in another namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NamespacedResourceId {
     pub namespace: String,
@@ -604,6 +607,12 @@ impl NamespacedResourceId {
     }
 }
 
+impl std::fmt::Display for NamespacedResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.namespace, self.id)
+    }
+}
+
 /// Result of an incremental config poll.
 ///
 /// Contains only resources referenced by durable change-log records newer than
@@ -614,17 +623,18 @@ impl NamespacedResourceId {
 /// after the delta validates and applies, so rejected deltas are retried from
 /// the same durable point.
 ///
-/// Serializable for CP-to-DP gRPC delta broadcasts.
+/// Serializable for CP-to-DP gRPC delta broadcasts. Removal keys are
+/// namespace-qualified for every resource type.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IncrementalResult {
     pub added_or_modified_proxies: Vec<Proxy>,
-    pub removed_proxy_ids: Vec<String>,
+    pub removed_proxy_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_consumers: Vec<Consumer>,
     pub removed_consumer_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_plugin_configs: Vec<PluginConfig>,
-    pub removed_plugin_config_ids: Vec<String>,
+    pub removed_plugin_config_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_upstreams: Vec<Upstream>,
-    pub removed_upstream_ids: Vec<String>,
+    pub removed_upstream_ids: Vec<NamespacedResourceId>,
     /// Highest durable config change sequence included in this poll.
     #[serde(default)]
     pub sequence_cursor: u64,

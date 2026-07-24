@@ -65,6 +65,10 @@ message ConfigUpdate {
   // incremental resource payload and FULL_SNAPSHOT config_json stays
   // compatible with older DPs.
   string trust_bundles_json = 6;
+  // Lightweight keepalive frame for ConfigSync Subscribe streams. Heartbeats
+  // refresh DP stream liveness without forcing a config apply, so healthy
+  // idle clusters are not mistaken for silent partitions.
+  bool heartbeat = 7;
 }
 
 message MeshSubscribeRequest {
