@@ -1281,6 +1281,36 @@ mod tests {
     }
 
     #[test]
+    fn format_http_metrics_skips_streaming_unknown_gateway_overhead() {
+        // Issue #2532: StatsD must not emit a gateway-overhead timer when the
+        // shared summary uses the unknown sentinel for streamed body lifetime.
+        let mut summary = http_summary("GET");
+        summary.response_streamed = true;
+        summary.body_completed = true;
+        summary.latency_total_ms = 10_000.0;
+        summary.latency_backend_ttfb_ms = 5.0;
+        summary.latency_backend_total_ms = -1.0;
+        summary.latency_gateway_processing_ms = -1.0;
+        summary.latency_gateway_overhead_ms = -1.0;
+        summary.latency_plugin_execution_ms = 1.0;
+        let mut buf = String::new();
+        format_http_metrics(&summary, "ferrum", "", None, &mut buf);
+        assert!(buf.contains("ferrum.request.count:1|c"), "got: {buf}");
+        assert!(
+            buf.contains("latency_total_ms:10000.00|ms"),
+            "total must remain observable: {buf}"
+        );
+        assert!(
+            buf.contains("latency_backend_ttfb_ms:5.00|ms"),
+            "TTFB must remain observable: {buf}"
+        );
+        assert!(
+            !buf.contains("latency_gateway_overhead_ms"),
+            "unknown gateway overhead sentinel must be omitted: {buf}"
+        );
+    }
+
+    #[test]
     fn format_http_metrics_marks_terminal_body_failure() {
         let mut summary = http_summary("GET");
         summary.response_status_code = 200;

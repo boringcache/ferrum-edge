@@ -1827,9 +1827,16 @@ fn build_otlp_payload(
                 otlp_attribute("client.address", &s.client_ip),
                 otlp_attribute("service.name", &s.service_name),
                 otlp_attribute_double("gateway.latency.total_ms", s.duration_ms),
-                otlp_attribute_double("gateway.latency.processing_ms", s.gateway_processing_ms),
                 otlp_attribute_double("gateway.latency.backend_ttfb_ms", s.backend_ttfb_ms),
             ];
+            // Omit LATENCY_UNKNOWN_MS (-1) sentinel values rather than exporting
+            // them as concrete timing observations (matches backend_total_ms).
+            if s.gateway_processing_ms >= 0.0 {
+                attributes.push(otlp_attribute_double(
+                    "gateway.latency.processing_ms",
+                    s.gateway_processing_ms,
+                ));
+            }
             if !s.http_url.is_empty() {
                 attributes.push(otlp_attribute("url.path", &s.http_url));
             }
@@ -1856,10 +1863,12 @@ fn build_otlp_payload(
                 "gateway.plugin_execution_ms",
                 s.plugin_execution_ms,
             ));
-            attributes.push(otlp_attribute_double(
-                "gateway.overhead_ms",
-                s.gateway_overhead_ms,
-            ));
+            if s.gateway_overhead_ms >= 0.0 {
+                attributes.push(otlp_attribute_double(
+                    "gateway.overhead_ms",
+                    s.gateway_overhead_ms,
+                ));
+            }
             if let Some(ref consumer) = s.consumer {
                 attributes.push(otlp_attribute("enduser.id", consumer));
             }

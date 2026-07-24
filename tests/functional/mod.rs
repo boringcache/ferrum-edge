@@ -116,5 +116,6 @@ mod scripted_backend_h2_tests;
 mod scripted_backend_h3_tests;
 mod scripted_backend_matrix_tests;
 mod scripted_backend_network_sim_tests;
+mod scripted_backend_streaming_latency_tests;
 mod scripted_backend_tests;
 mod scripted_backend_udp_tests;

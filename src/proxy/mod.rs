@@ -22446,16 +22446,25 @@ async fn handle_proxy_request_inner(
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
                 let plugin_external_io_ms =
                     ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-                let gateway_processing_ms = total_ms - backend_total_ms;
-                let gateway_overhead_ms =
-                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
                 // `backend_total_ms` for the gRPC streaming path is actually the time
                 // through response headers (TTFB) — the body is forwarded frame-by-frame
                 // by hyper after this point. When body_exceeded aborts streaming, backend
                 // work is complete at the abort so total == TTFB. Otherwise the body is
-                // still flowing at log time, so total_ms is unknown (-1.0 per schema).
+                // still flowing at log time, so backend total is unknown
+                // (`LATENCY_UNKNOWN_MS` per schema).
                 let streamed = !body_exceeded;
-                let grpc_backend_total_ms = if streamed { -1.0 } else { backend_total_ms };
+                let grpc_backend_total_ms = if streamed {
+                    crate::plugins::LATENCY_UNKNOWN_MS
+                } else {
+                    backend_total_ms
+                };
+                let (gateway_processing_ms, gateway_overhead_ms) =
+                    TransactionSummary::derive_gateway_latencies(
+                        total_ms,
+                        grpc_backend_total_ms,
+                        plugin_execution_ms,
+                        streamed,
+                    );
 
                 // Build the summary up front so we can either log synchronously
                 // (body_exceeded early-return path) or defer via the streaming
@@ -24700,10 +24709,12 @@ async fn handle_proxy_request_inner(
     let backend_elapsed = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_ttfb_ms = backend_elapsed;
     // For buffered responses, backend_elapsed includes full body download (accurate total).
-    // For streaming responses, the body is still being sent to the client at log time,
-    // so we mark total as unknown (-1.0) to avoid silently reporting TTFB as total.
+    // For streaming responses, concurrent backend-body and client-delivery lifetime
+    // cannot be separated at header flush (or at deferred fire without optional
+    // tracking), so mark total as unknown (`LATENCY_UNKNOWN_MS`) rather than
+    // silently reporting TTFB as total or inflating gateway fields from it.
     let backend_total_ms = if is_streaming_response {
-        -1.0
+        crate::plugins::LATENCY_UNKNOWN_MS
     } else {
         backend_elapsed
     };
@@ -25072,13 +25083,12 @@ async fn handle_proxy_request_inner(
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
     let plugin_external_io_ms =
         ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-    let effective_backend_ms = if backend_total_ms >= 0.0 {
-        backend_total_ms
-    } else {
-        backend_ttfb_ms
-    };
-    let gateway_processing_ms = total_ms - effective_backend_ms;
-    let gateway_overhead_ms = (total_ms - effective_backend_ms - plugin_execution_ms).max(0.0);
+    let (gateway_processing_ms, gateway_overhead_ms) = TransactionSummary::derive_gateway_latencies(
+        total_ms,
+        backend_total_ms,
+        plugin_execution_ms,
+        is_streaming_response,
+    );
 
     // Log/runtime-metrics phase. Keep the no-plugin, non-streaming success
     // path lightweight, but still construct a summary when runtime metrics need

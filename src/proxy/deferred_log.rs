@@ -186,10 +186,14 @@ impl DeferredTransactionLogger {
     /// preserved as captured (they are defined by events that happen before
     /// the body streams). Backend total latency is likewise left untouched —
     /// for streaming responses the body drives that counter, not the deferred
-    /// logger, and -1.0 remains a meaningful "no second observation" signal.
+    /// logger, and [`crate::plugins::LATENCY_UNKNOWN_MS`] remains a meaningful
+    /// "no separable backend-total observation" signal.
     ///
-    /// Gateway processing and overhead are re-derived from the updated total
-    /// to keep the four latency fields internally consistent.
+    /// Gateway processing and overhead are refreshed via
+    /// [`TransactionSummary::refresh_gateway_latencies`]: when backend total
+    /// is unknown they stay at [`crate::plugins::LATENCY_UNKNOWN_MS`] instead
+    /// of treating TTFB as full backend duration (which would misattribute
+    /// streamed body lifetime as gateway work).
     pub fn new_with_start_time(
         summary: TransactionSummary,
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -269,27 +273,17 @@ impl DeferredTransactionLogger {
                 .or_insert_with(|| crate::proxy::grpc_proxy::grpc_status::UNKNOWN.to_string());
         }
 
-        // Re-derive wall-clock latencies so streaming responses report the
-        // real body-completion time instead of the header-flush snapshot.
+        // Re-derive wall-clock total so streaming responses report the real
+        // body-completion time instead of the header-flush snapshot.
         //
         // Only applied when the caller threaded a start time in via
-        // `new_with_start_time`. The four recomputed fields use the same
-        // formulas as the main handler so consumers see values computed by
-        // identical logic — the only difference is the "now" reference is
-        // body-completion instead of header-flush.
+        // `new_with_start_time`. Gateway fields follow
+        // `TransactionSummary::refresh_gateway_latencies` so an unknown
+        // streaming backend total never inflates gateway overhead via TTFB
+        // substitution.
         if let Some(start) = start_time {
-            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            // Backend total for streaming stays as captured — see rustdoc
-            // on `new_with_start_time` for the rationale.
-            let effective_backend_ms = if summary.latency_backend_total_ms >= 0.0 {
-                summary.latency_backend_total_ms
-            } else {
-                summary.latency_backend_ttfb_ms
-            };
-            summary.latency_total_ms = total_ms;
-            summary.latency_gateway_processing_ms = (total_ms - effective_backend_ms).max(0.0);
-            summary.latency_gateway_overhead_ms =
-                (total_ms - effective_backend_ms - summary.latency_plugin_execution_ms).max(0.0);
+            summary.latency_total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            summary.refresh_gateway_latencies();
         }
 
         match tokio::runtime::Handle::try_current() {
@@ -458,6 +452,9 @@ mod tests {
         summary.latency_plugin_execution_ms = 0.5;
         summary.latency_backend_ttfb_ms = 0.8;
         summary.latency_backend_total_ms = -1.0; // streaming sentinel
+        summary.response_streamed = true;
+        summary.latency_gateway_processing_ms = -1.0;
+        summary.latency_gateway_overhead_ms = -1.0;
 
         let start = Instant::now();
         let logger = DeferredTransactionLogger::new_with_start_time(summary, plugins, ctx, start);
@@ -475,10 +472,11 @@ mod tests {
             "expected re-derived total >= 40ms, got {}",
             observed.latency_total_ms
         );
-        // Gateway processing and overhead are re-derived consistently and
-        // must be non-negative.
-        assert!(observed.latency_gateway_processing_ms >= 0.0);
-        assert!(observed.latency_gateway_overhead_ms >= 0.0);
+        // Unknown streaming backend total must not inflate gateway fields via
+        // TTFB substitution — both stay at the shared unknown sentinel.
+        assert_eq!(observed.latency_gateway_processing_ms, -1.0);
+        assert_eq!(observed.latency_gateway_overhead_ms, -1.0);
+        assert_eq!(observed.latency_backend_total_ms, -1.0);
         // Fields unrelated to the re-derivation are preserved.
         assert_eq!(observed.latency_backend_ttfb_ms, 0.8);
         assert_eq!(observed.latency_plugin_execution_ms, 0.5);
