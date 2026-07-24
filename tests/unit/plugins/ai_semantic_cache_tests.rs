@@ -59,6 +59,7 @@ impl Drop for SingleflightWaitOverrideGuard<'_> {
 struct ConcurrencyTrackingEmbeddingResponder {
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
+    tracking_duration: Duration,
     response_delay: Duration,
 }
 
@@ -68,14 +69,14 @@ impl Respond for ConcurrencyTrackingEmbeddingResponder {
         self.peak.fetch_max(active, Ordering::AcqRel);
 
         let active_counter = Arc::clone(&self.active);
-        let response_delay = self.response_delay;
+        let tracking_duration = self.tracking_duration;
         tokio::spawn(async move {
-            tokio::time::sleep(response_delay).await;
+            tokio::time::sleep(tracking_duration).await;
             active_counter.fetch_sub(1, Ordering::AcqRel);
         });
 
         ResponseTemplate::new(200)
-            .set_delay(response_delay)
+            .set_delay(self.response_delay)
             .set_body_json(json!({
                 "data": [{"embedding": [1.0, 0.0, 0.0]}]
             }))
@@ -5133,7 +5134,8 @@ async fn high_cardinality_distinct_misses_are_semaphore_bounded() {
         .respond_with(ConcurrencyTrackingEmbeddingResponder {
             active: Arc::clone(&active),
             peak: Arc::clone(&peak),
-            response_delay: Duration::from_millis(100),
+            tracking_duration: Duration::from_millis(400),
+            response_delay: Duration::from_millis(500),
         })
         .expect(16)
         .mount(&mock_server)
@@ -5184,6 +5186,7 @@ async fn embedding_semaphore_admission_wait_is_bounded() {
         .respond_with(ConcurrencyTrackingEmbeddingResponder {
             active: Arc::clone(&active),
             peak: Arc::clone(&peak),
+            tracking_duration: Duration::from_millis(400),
             response_delay: Duration::from_millis(500),
         })
         .expect(8)
