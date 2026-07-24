@@ -2,7 +2,7 @@
 //! cache pruning must key resources by `(namespace, id)` so the same id in two
 //! namespaces cannot hide a tenant removal or prune the wrong tenant's state.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ferrum_edge::circuit_breaker::{CircuitBreakerCache, target_key};
 use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::*;
@@ -12,8 +12,18 @@ use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::plugin_cache::PluginCache;
 use std::collections::HashMap;
 
+/// Fixed fixture timestamp.
+///
+/// `ConfigDelta` treats any `updated_at` difference as a modification, so
+/// fixtures that are meant to be *identical* across two snapshots must not call
+/// `Utc::now()` independently on each side — that would report every unchanged
+/// resource as modified and mask the namespace-identity behavior under test.
+fn fixture_timestamp() -> DateTime<Utc> {
+    DateTime::from_timestamp(1_700_000_000, 0).expect("fixed fixture timestamp is valid")
+}
+
 fn make_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
-    let now = Utc::now();
+    let now = fixture_timestamp();
     Proxy {
         id: id.to_string(),
         namespace: namespace.to_string(),
@@ -78,7 +88,7 @@ fn make_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
 }
 
 fn make_upstream(namespace: &str, id: &str, host: &str) -> Upstream {
-    let now = Utc::now();
+    let now = fixture_timestamp();
     Upstream {
         id: id.to_string(),
         namespace: namespace.to_string(),
@@ -117,7 +127,7 @@ fn make_upstream(namespace: &str, id: &str, host: &str) -> Upstream {
 }
 
 fn make_plugin_config(namespace: &str, id: &str) -> PluginConfig {
-    let now = Utc::now();
+    let now = fixture_timestamp();
     PluginConfig {
         id: id.to_string(),
         namespace: namespace.to_string(),
@@ -134,7 +144,7 @@ fn make_plugin_config(namespace: &str, id: &str) -> PluginConfig {
 }
 
 fn make_consumer(namespace: &str, id: &str) -> Consumer {
-    let now = Utc::now();
+    let now = fixture_timestamp();
     Consumer {
         id: id.to_string(),
         namespace: namespace.to_string(),

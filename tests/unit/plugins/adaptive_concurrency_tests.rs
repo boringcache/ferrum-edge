@@ -117,7 +117,7 @@ fn adaptive_plugin_from_cache(cache: &PluginCache) -> Arc<dyn Plugin> {
 
 fn adaptive_plugin_for_proxy(cache: &PluginCache, proxy_id: &str) -> Arc<dyn Plugin> {
     cache
-        .get_plugins("ferrum", proxy_id)
+        .get_plugins("default", proxy_id)
         .iter()
         .find(|plugin| plugin.name() == "adaptive_concurrency")
         .cloned()
@@ -855,7 +855,7 @@ fn adaptive_concurrency_incremental_reload_keeps_streaming_permit_accounted() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -929,7 +929,7 @@ async fn adaptive_concurrency_global_route_refresh_preserves_unrelated_global_st
     );
     let cache = PluginCache::new(&config).expect("initial cache should build");
     let original_rate_limiter = cache
-        .get_plugins("ferrum", "proxy-1")
+        .get_plugins("default", "proxy-1")
         .iter()
         .find(|plugin| plugin.name() == "rate_limiting")
         .cloned()
@@ -951,7 +951,7 @@ async fn adaptive_concurrency_global_route_refresh_preserves_unrelated_global_st
         .expect("global adaptive route refresh should publish");
 
     let replacement_rate_limiter = cache
-        .get_plugins("ferrum", "proxy-1")
+        .get_plugins("default", "proxy-1")
         .iter()
         .find(|plugin| plugin.name() == "rate_limiting")
         .cloned()
@@ -1085,14 +1085,14 @@ fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
         cache
             .apply_delta(
                 &detached,
-                &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+                &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
                 &[],
                 false,
             )
             .expect("last scoped association should detach");
         assert!(
             cache
-                .get_plugins("ferrum", "proxy-1")
+                .get_plugins("default", "proxy-1")
                 .iter()
                 .all(|plugin| plugin.name() != "adaptive_concurrency"),
             "{scope} policy should be absent after its last association is removed"
@@ -1101,7 +1101,7 @@ fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
         cache
             .apply_delta(
                 &config,
-                &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+                &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
                 &[],
                 false,
             )
@@ -1285,7 +1285,7 @@ fn adaptive_concurrency_direct_target_reload_reclaims_retired_key_capacity() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1470,7 +1470,7 @@ fn adaptive_concurrency_proxy_group_association_growth_keeps_old_permit_active()
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-2")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-2")]),
             &[],
             false,
         )
@@ -1530,7 +1530,7 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1636,7 +1636,7 @@ fn adaptive_concurrency_global_inventory_excludes_scoped_overrides() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-2")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-2")]),
             &[],
             false,
         )
@@ -1706,7 +1706,7 @@ fn adaptive_concurrency_route_override_change_resets_target_key_space() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1776,7 +1776,7 @@ fn adaptive_concurrency_unchanged_upstream_subset_stays_compatible() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1838,7 +1838,7 @@ fn adaptive_concurrency_route_non_destination_change_stays_compatible() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1901,7 +1901,7 @@ fn adaptive_concurrency_mesh_direct_host_normalization_stays_compatible() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1966,7 +1966,7 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
     cache
         .apply_delta(
             &normalized_equivalent,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1984,7 +1984,7 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
     cache
         .apply_delta(
             &replacement,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -2096,7 +2096,7 @@ fn adaptive_concurrency_ai_and_mcp_non_destination_changes_stay_compatible() {
         cache
             .apply_delta(
                 &reloaded,
-                &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+                &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
                 &[],
                 false,
             )
@@ -2169,7 +2169,7 @@ fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -2244,7 +2244,7 @@ fn adaptive_concurrency_route_association_order_resets_winning_destination() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from([NamespacedResourceId::new("ferrum", "proxy-1")]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )

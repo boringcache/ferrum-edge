@@ -1326,7 +1326,7 @@ fn retry_exclusion_returns_none_when_only_alternate_is_unhealthy() {
     });
     let snapshot = cache.load();
     let unhealthy: DashMap<String, u64> = DashMap::new();
-    unhealthy.insert(target_key("u1", &targets[1]), 1);
+    unhealthy.insert(target_key("ferrum|u1", &targets[1]), 1);
 
     let retry = LoadBalancerCache::select_next_target_from(
         &snapshot,
@@ -1360,7 +1360,7 @@ fn port_retry_exclusion_returns_none_when_only_alternate_is_unhealthy() {
     });
     let snapshot = cache.load();
     let unhealthy: DashMap<String, u64> = DashMap::new();
-    unhealthy.insert(target_key("u1", &targets[1]), 1);
+    unhealthy.insert(target_key("ferrum|u1", &targets[1]), 1);
 
     let retry = LoadBalancerCache::select_next_target_for_port_from(
         &snapshot,
@@ -1860,7 +1860,9 @@ fn test_passive_health_filters_targets() {
     );
 
     let active: DashMap<String, u64> = DashMap::new();
-    let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
+    // Passive health is keyed by the namespace-qualified proxy identity.
+    let proxy_key = "ferrum|test-proxy";
+    let proxy_passive = checker.passive_health.get(proxy_key).map(|e| e.clone());
 
     let ctx = HealthContext {
         active_unhealthy: &active,
@@ -1934,7 +1936,9 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
         false,
         Some(&config),
     );
-    let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
+    // Passive health is keyed by the namespace-qualified proxy identity.
+    let proxy_key = "ferrum|test-proxy";
+    let proxy_passive = checker.passive_health.get(proxy_key).map(|e| e.clone());
     let proxy_passive = proxy_passive.expect("passive state should be created");
     proxy_passive
         .unhealthy
@@ -2003,7 +2007,9 @@ fn ejection_cap_zero_percent_readmits_all() {
     }
 
     let active: DashMap<String, u64> = DashMap::new();
-    let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
+    // Passive health is keyed by the namespace-qualified proxy identity.
+    let proxy_key = "ferrum|test-proxy";
+    let proxy_passive = checker.passive_health.get(proxy_key).map(|e| e.clone());
 
     let ctx = HealthContext {
         active_unhealthy: &active,
@@ -2067,7 +2073,9 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
         Some(&config),
     );
 
-    let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
+    // Passive health is keyed by the namespace-qualified proxy identity.
+    let proxy_key = "ferrum|test-proxy";
+    let proxy_passive = checker.passive_health.get(proxy_key).map(|e| e.clone());
 
     let ctx = HealthContext {
         active_unhealthy: &active,
@@ -2183,7 +2191,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
         }
         let proxy_passive = checker
             .passive_health
-            .get("test-proxy")
+            .get("ferrum|test-proxy")
             .map(|e| e.clone())
             .expect("passive state should be created");
         // Deterministic ejection timestamps (earliest = the in-pool target).

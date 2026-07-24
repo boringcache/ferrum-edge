@@ -285,8 +285,8 @@ fn port_subset_fully_unhealthy_intersection_returns_none() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert("u1::a:8080".to_string(), 0);
-    active_unhealthy.insert("u1::b:8080".to_string(), 0);
+    active_unhealthy.insert("ferrum|u1::a:8080".to_string(), 0);
+    active_unhealthy.insert("ferrum|u1::b:8080".to_string(), 0);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -768,7 +768,7 @@ fn per_port_passive_health_threshold_differs_from_upstream_level() {
     checker.report_response("ferrum", "p1", &selected, 500, false, Some(port_passive));
     let proxy_state = checker
         .passive_health
-        .get("p1")
+        .get("ferrum|p1")
         .expect("passive health state created");
     assert!(
         proxy_state.unhealthy.contains_key("a:8080"),
@@ -814,7 +814,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
     checker.report_response("ferrum", "p1", &targets[1], 500, false, Some(&port_passive));
     let proxy_state = checker
         .passive_health
-        .get("p1")
+        .get("ferrum|p1")
         .expect("passive health state created")
         .clone();
     proxy_state
@@ -882,7 +882,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
     checker.report_response("ferrum", "p1", &targets[1], 500, false, Some(&port_passive));
     let proxy_state = checker
         .passive_health
-        .get("p1")
+        .get("ferrum|p1")
         .expect("passive health state created")
         .clone();
     proxy_state
@@ -1229,7 +1229,7 @@ fn passive_ctx_ejecting<'a>(
     }
     let proxy_state = checker
         .passive_health
-        .get("p1")
+        .get("ferrum|p1")
         .expect("passive health state created")
         .clone();
     for (i, t) in ejected.iter().enumerate() {
@@ -1862,9 +1862,10 @@ fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
     let snapshot = cache.load();
 
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
-    // Active-unhealthy keys use the upstream-scoped format "upstream_id::host:port".
+    // Active-unhealthy keys use the namespaced upstream-scoped format
+    // "namespace|upstream_id::host:port".
     // This is how HTTP dispatch records active ejection state (via `target_key`).
-    active_unhealthy.insert("u1::a:9000".to_string(), 0);
+    active_unhealthy.insert("ferrum|u1::a:9000".to_string(), 0);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -1930,10 +1931,10 @@ fn per_port_selection_ignores_ejection_without_health_context() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    // Record ejection for "a" using the upstream-scoped key format, then call
-    // the primitive with `None` so this map is never consulted.
+    // Record ejection for "a" using the namespaced upstream-scoped key format,
+    // then call the primitive with `None` so this map is never consulted.
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
-    active_unhealthy.insert("u1::a:9000".to_string(), 0);
+    active_unhealthy.insert("ferrum|u1::a:9000".to_string(), 0);
 
     let dispatch_port =
         LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "ferrum", "u1");

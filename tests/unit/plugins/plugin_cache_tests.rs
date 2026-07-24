@@ -4263,13 +4263,13 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("group proxy_alerts");
     alerts_plugin.seed_proxy_lifecycle_state_for_test(
-        "p1",
+        "ferrum|p1",
         cache
             .proxy_lifecycle_generation("ferrum", "p1")
             .expect("p1 generation"),
     );
     alerts_plugin.seed_proxy_lifecycle_state_for_test(
-        "p2",
+        "ferrum|p2",
         cache
             .proxy_lifecycle_generation("ferrum", "p2")
             .expect("p2 generation"),
@@ -4344,7 +4344,7 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
         .expect("p1 generation");
     shared.seed_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen);
     shared.seed_proxy_lifecycle_state_for_test(
-        "p2",
+        "ferrum|p2",
         cache
             .proxy_lifecycle_generation("ferrum", "p2")
             .expect("p2 generation"),
@@ -4434,7 +4434,7 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         .expect("initial p1 generation");
     shared.seed_proxy_lifecycle_state_for_test("ferrum|p1", p1_initial_generation);
     shared.seed_proxy_lifecycle_state_for_test(
-        "p2",
+        "ferrum|p2",
         cache
             .proxy_lifecycle_generation("ferrum", "p2")
             .expect("p2 generation"),
@@ -4535,7 +4535,7 @@ fn test_apply_delta_rebuild_globals_resets_proxy_alerts_lifecycle() {
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("global proxy_alerts");
     alerts_before.seed_proxy_lifecycle_state_for_test(
-        "p1",
+        "ferrum|p1",
         cache
             .proxy_lifecycle_generation("ferrum", "p1")
             .expect("p1 generation"),

@@ -871,10 +871,10 @@ async fn test_restart_aborts_handles_for_removed_upstream() {
     // assert the restart prunes it.
     checker
         .active_unhealthy_targets
-        .insert("up-remove::remove-host:9002".to_string(), 12345);
+        .insert("ferrum|up-remove::remove-host:9002".to_string(), 12345);
     checker
         .active_unhealthy_targets
-        .insert("up-keep::keep-host:9001".to_string(), 67890);
+        .insert("ferrum|up-keep::keep-host:9001".to_string(), 67890);
 
     let after_remove = config_with_upstreams(vec![make_upstream_with_active_probe(
         "up-keep",
@@ -891,13 +891,13 @@ async fn test_restart_aborts_handles_for_removed_upstream() {
     assert!(
         !checker
             .active_unhealthy_targets
-            .contains_key("up-remove::remove-host:9002"),
+            .contains_key("ferrum|up-remove::remove-host:9002"),
         "stale unhealthy entry for removed upstream should be pruned"
     );
     assert!(
         checker
             .active_unhealthy_targets
-            .contains_key("up-keep::keep-host:9001"),
+            .contains_key("ferrum|up-keep::keep-host:9001"),
         "kept upstream's unhealthy state must survive the restart"
     );
 }

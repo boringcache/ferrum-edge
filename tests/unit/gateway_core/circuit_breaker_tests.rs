@@ -1103,13 +1103,14 @@ fn test_circuit_breaker_prune_stale_targets() {
     cache.get_or_create("ferrum", "proxy1", Some("10.0.0.3:8080"), &config);
     cache.get_or_create("ferrum", "proxy2", None, &config); // direct backend
 
-    // Only keep proxy1::10.0.0.1:8080 — the rest are stale
+    // Only keep ferrum|proxy1::10.0.0.1:8080 — the rest are stale. Active keys
+    // are namespace-qualified exactly as dispatch composes them.
     let mut active = std::collections::HashSet::new();
-    active.insert("proxy1::10.0.0.1:8080".to_string());
+    active.insert("ferrum|proxy1::10.0.0.1:8080".to_string());
     cache.prune_stale_targets(&active);
 
-    // Direct backend key (proxy2, no "::") should be preserved
-    assert_eq!(cache.len(), 2); // proxy1::10.0.0.1:8080 + proxy2
+    // Direct backend key (ferrum|proxy2, no "::") should be preserved
+    assert_eq!(cache.len(), 2); // ferrum|proxy1::10.0.0.1:8080 + ferrum|proxy2
 }
 
 #[test]
@@ -1129,10 +1130,10 @@ fn test_snapshot_includes_direct_and_target_scoped_breakers() {
     let snapshot = cache.snapshot();
 
     assert!(snapshot.iter().any(|(key, state, failures, successes)| {
-        key == "proxy-direct" && *state == "closed" && *failures == 1 && *successes == 0
+        key == "ferrum|proxy-direct" && *state == "closed" && *failures == 1 && *successes == 0
     }));
     assert!(snapshot.iter().any(|(key, state, failures, successes)| {
-        key == "proxy-target::10.0.0.9:8080"
+        key == "ferrum|proxy-target::10.0.0.9:8080"
             && *state == "open"
             && *failures == 3
             && *successes == 0
