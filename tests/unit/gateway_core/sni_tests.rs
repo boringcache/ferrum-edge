@@ -226,6 +226,52 @@ fn test_extract_sni_long_hostname() {
 }
 
 #[test]
+fn test_extract_sni_rejects_oversized_hostname() {
+    let hostname = "a".repeat(254);
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(extract_sni_from_client_hello(&data), None);
+}
+
+#[test]
+fn test_extract_sni_rejects_invalid_dns_hostname_characters() {
+    for hostname in [
+        "bad_name.example.com",
+        "-bad.example.com",
+        "bad-.example.com",
+        "bad..example.com",
+        "bad.example.com.",
+        "bäd.example.com",
+    ] {
+        let data = build_tls_client_hello(hostname);
+        assert_eq!(
+            extract_sni_from_client_hello(&data),
+            None,
+            "hostname {hostname:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn test_extract_sni_rejects_oversized_label() {
+    let hostname = format!("{}.example.com", "a".repeat(64));
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(extract_sni_from_client_hello(&data), None);
+}
+
+#[test]
+fn test_extract_sni_from_dtls_rejects_oversized_hostname() {
+    let hostname = "a".repeat(254);
+    let data = build_dtls_client_hello(&hostname);
+
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::NoSni
+    );
+}
+
+#[test]
 fn test_extract_sni_no_sni_extension() {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
