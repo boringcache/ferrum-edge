@@ -57,6 +57,9 @@ impl ByteBudget {
         self.used_bytes.load(Ordering::Acquire)
     }
 
+    // Read by external unit tests; the binary target compiles this shared
+    // module separately and cannot observe those callers.
+    #[allow(dead_code)]
     pub fn drops_total(&self) -> u64 {
         self.drops.load(Ordering::Relaxed)
     }
@@ -110,10 +113,6 @@ pub struct ByteLease {
 }
 
 impl ByteLease {
-    pub fn bytes(&self) -> usize {
-        self.bytes.load(Ordering::Acquire)
-    }
-
     /// Shrink a provisional reservation down to the exact retained size.
     pub fn shrink_to(&self, exact: usize) {
         let current = self.bytes.load(Ordering::Acquire);

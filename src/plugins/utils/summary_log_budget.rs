@@ -18,7 +18,7 @@ use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 #[derive(Clone)]
 pub struct QueuedSummaryPayload {
     pub json: Arc<str>,
-    pub lease: Arc<ByteLease>,
+    _lease: Arc<ByteLease>,
 }
 
 impl QueuedSummaryPayload {
@@ -28,10 +28,6 @@ impl QueuedSummaryPayload {
 
     pub fn len(&self) -> usize {
         self.json.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.json.is_empty()
     }
 }
 
@@ -69,7 +65,10 @@ pub fn serialize_under_byte_budget<T: Serialize + ?Sized>(
             return None;
         }
     };
-    Some(QueuedSummaryPayload { json, lease })
+    Some(QueuedSummaryPayload {
+        json,
+        _lease: lease,
+    })
 }
 
 fn send_payload(

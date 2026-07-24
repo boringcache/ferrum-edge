@@ -17,8 +17,8 @@
 //! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
 //! policy, matching the proxy backend / DTLS / frontend mTLS surfaces.
 //!
-//! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
-//! `LogEntry` union type, matching the http_logging plugin's behavior.
+//! Supports both HTTP and stream (TCP/UDP) transaction summaries, matching the
+//! http_logging plugin's behavior.
 
 use async_trait::async_trait;
 use rustls::pki_types::{CertificateRevocationListDer, ServerName};
@@ -30,7 +30,7 @@ use tokio::time::Duration;
 
 use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 #[cfg(test)]
-use super::utils::serialize_under_byte_budget;
+use super::utils::summary_log_budget::serialize_under_byte_budget;
 use super::utils::{
     BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
     QueuedSummaryPayload, admit_byte_limits, admit_http_summary, admit_stream_summary,

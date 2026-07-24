@@ -52,20 +52,16 @@ pub use batching_logger::{
     wait_until_committed, wait_until_committed_or_closed,
 };
 pub use byte_budget::{
-    AdmittedByteLimits, BoundedJsonWriter, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
-    DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES, HARD_MAX_ENTRY_BYTES, MIN_MAX_ENTRY_BYTES,
-    SUMMARY_ENTRY_FRAMING_BYTES, SUMMARY_ENTRY_RETAINED_COPIES, accounted_summary_bytes,
-    admit_byte_limits,
+    ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES, HARD_MAX_BUFFER_MAX_BYTES, admit_byte_limits,
 };
 pub use http_client::PluginHttpClient;
 pub use log_helpers::{
-    BatchConfigDefaults, HttpBatchDrainOutcome, SummaryLogEntry, build_batch_config,
-    drain_http_batch_response_body, handle_http_batch_response, parse_custom_headers,
-    parse_http_endpoint, validate_batch_config,
+    BatchConfigDefaults, HttpBatchDrainOutcome, build_batch_config, drain_http_batch_response_body,
+    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
 };
 pub use summary_log_budget::{
     QueuedSummaryPayload, admit_http_summary, admit_stream_summary, assemble_json_array,
-    assemble_ndjson, serialize_under_byte_budget,
+    assemble_ndjson,
 };
 // Re-exported for external unit tests; unused inside the binary target.
 #[allow(unused_imports)]

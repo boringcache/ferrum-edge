@@ -1,9 +1,10 @@
 //! Shared observability byte-budget primitive tests.
 
-use ferrum_edge::plugins::utils::{
+use ferrum_edge::plugins::utils::byte_budget::{
     ByteBudget, DEFAULT_BUFFER_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES,
-    HARD_MAX_ENTRY_BYTES, MIN_MAX_ENTRY_BYTES, admit_byte_limits, serialize_under_byte_budget,
+    HARD_MAX_ENTRY_BYTES, MIN_MAX_ENTRY_BYTES, admit_byte_limits,
 };
+use ferrum_edge::plugins::utils::summary_log_budget::serialize_under_byte_budget;
 use serde_json::json;
 
 #[test]
