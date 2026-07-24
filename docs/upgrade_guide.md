@@ -273,15 +273,38 @@ You can verify versions via the authenticated `GET /admin/metrics` endpoint on a
 
 Always upgrade in this order: **CP first, then DPs.** The CP manages the database and schema migrations. DPs are stateless proxies that receive config via gRPC. Version negotiation ensures that if you forget to upgrade a DP, it will refuse the incompatible config rather than silently applying a partial parse.
 
-During a patch-level mixed-version rollout, ConfigSync heartbeats are
-operationally safe but can be noisy because heartbeat capability is not
-negotiated separately. An older DP connected to a newer CP can reject and log
-the newer empty heartbeat envelope as an unusable snapshot. A newer DP
-connected to an older CP receives no application heartbeat and can reconnect
-after the 150-second silence bound even though transport keepalive remains
-healthy. In both directions the DP keeps serving its last-known-good config.
-Complete the CP-first, then DP rollout promptly rather than leaving patch
-versions mixed indefinitely.
+### Mixed-Version Wire Compatibility (Patch-Level Rollouts)
+
+Because patch-level differences are allowed, a CP-first rollout necessarily runs
+mixed CP/DP patch versions for a while. Two ConfigSync surfaces are explicitly
+built to survive that window without config churn.
+
+**ConfigSync heartbeats are negotiated, never assumed.** A DP advertises
+`SubscribeRequest.supports_heartbeat`, and the CP confirms with
+`ConfigUpdate.heartbeat_negotiated` on the first message of the stream. Both are
+additive protobuf fields, so peers that predate them read `false` and safely
+ignore them.
+
+| CP | DP | Behavior |
+|----|----|----------|
+| New | New | CP sends heartbeat frames; DP arms the 150s application silence watchdog |
+| New | Legacy | DP never advertises support, so the CP sends **no** heartbeat frames — the legacy DP never sees an empty envelope and never churns |
+| Legacy | New | CP never confirms, so the DP does **not** arm the silence watchdog — no reconnect the legacy CP was never asked to prevent. HTTP/2 PING and TCP keepalive still cover the stream |
+
+**Delta removal keys stay wire-compatible in both directions.** Incremental
+DELTA bodies carry namespace-qualified removals (so a misrouted delta cannot
+delete a same-ID resource in another namespace) without breaking older peers:
+the historical `removed_proxy_ids` / `removed_plugin_config_ids` /
+`removed_upstream_ids` arrays keep their bare-ID string shape, and the
+namespace-qualified `(namespace, id)` objects travel in **additive**
+`removed_*_keys` arrays that older DPs ignore. Decoding accepts either shape. A
+delta from a CP that only sent bare IDs is scoped to the DP's own already
+authorized subscription namespace, and the DP's namespace filter still drops
+anything outside it — so the cross-namespace deletion guarantee holds on both
+new/new and mixed pairs.
+
+Neither surface requires operator configuration, and neither changes behavior
+for new/new fleets. Still complete the CP-first, then DP rollout promptly.
 
 ### Step-by-Step
 

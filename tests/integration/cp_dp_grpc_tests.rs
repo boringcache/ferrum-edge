@@ -1265,6 +1265,7 @@ async fn test_cp_rejects_token_missing_required_claims() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1354,6 +1355,7 @@ async fn test_cp_accepts_token_with_matching_issuer() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1385,6 +1387,7 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
             namespace: "ferrum".to_string(),
             real_ip_header: advertised.map(str::to_string),
+            supports_heartbeat: true,
         });
         let status = client.subscribe(request).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -1412,6 +1415,7 @@ async fn test_cp_enforces_real_ip_header_ownership_contract_before_distribution(
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some("CF-CONNECTING-IP".to_string()),
+                supports_heartbeat: true,
             },
         ))
         .await;
@@ -1443,6 +1447,7 @@ async fn test_cp_treats_explicitly_empty_real_ip_header_as_unset() {
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: None,
+                supports_heartbeat: true,
             },
         ))
         .await
@@ -1457,6 +1462,7 @@ async fn test_cp_treats_explicitly_empty_real_ip_header_as_unset() {
                 ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
                 namespace: "ferrum".to_string(),
                 real_ip_header: Some(String::new()),
+                supports_heartbeat: true,
             },
         ))
         .await;
@@ -1505,6 +1511,7 @@ async fn test_cp_rejects_token_with_wrong_issuer() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1599,6 +1606,7 @@ async fn test_cp_rejects_token_with_no_issuer_claim() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1639,6 +1647,7 @@ async fn test_cp_still_rejects_token_signed_with_wrong_secret() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -1698,6 +1707,7 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
     assert!(
         good_client.subscribe(good_req).await.is_ok(),
@@ -1715,6 +1725,7 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
     let stale_result = stale_client.subscribe(stale_req).await;
     assert!(
@@ -1778,6 +1789,7 @@ async fn test_dp_handles_malformed_config() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         trust_bundles_json: String::new(),
         heartbeat: false,
+        heartbeat_negotiated: false,
     };
     let _ = update_tx.send(malformed_update);
 
@@ -2645,6 +2657,7 @@ async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         trust_bundles_json: String::new(),
         heartbeat: false,
+        heartbeat_negotiated: false,
     };
     let _ = update_tx.send(malformed);
 
@@ -2954,6 +2967,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
         ferrum_version: "99.99.0".to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -2984,6 +2998,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -3041,6 +3056,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
         ferrum_version: String::new(),
         namespace: "ferrum".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -3819,6 +3835,7 @@ async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "staging".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let result = client.subscribe(request).await;
@@ -4018,6 +4035,7 @@ async fn test_cp_accepts_dp_with_matching_namespace() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         namespace: "production".to_string(),
         real_ip_header: Some(String::new()),
+        supports_heartbeat: true,
     });
 
     let mut stream = client
@@ -4200,6 +4218,7 @@ async fn test_dp_consumes_heartbeat_without_applying_or_tearing_down_stream() {
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         trust_bundles_json: String::new(),
         heartbeat: true,
+        heartbeat_negotiated: true,
     };
     update_tx
         .send(heartbeat)
@@ -4230,4 +4249,669 @@ async fn test_dp_consumes_heartbeat_without_applying_or_tearing_down_stream() {
     );
 
     client_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// ConfigSync lifecycle regressions driven through the real production entry
+// points (issues #2967, #2969, #2970, #2971, #2972 and the #2395 mixed-version
+// compatibility cases).
+// ---------------------------------------------------------------------------
+
+/// Copy one direction of a relayed TCP connection until the blackhole flips.
+///
+/// While blackholed the task holds both socket halves open and forwards
+/// nothing, so the peer sees a healthy-looking but permanently silent
+/// connection — the "CP host power loss / NAT idle timeout / partition without
+/// RST" shape from issue #2967.
+async fn relay_pipe(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    blackhole: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        if blackhole.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
+        // `read` is cancel-safe on a TcpStream, so the periodic tick can poll
+        // the blackhole flag without losing buffered bytes.
+        let read = tokio::select! {
+            result = from.read(&mut buf) => result,
+            _ = tokio::time::sleep(Duration::from_millis(25)) => continue,
+        };
+        match read {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if to.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// A TCP relay in front of a CP that can be flipped into a silent partition.
+///
+/// Established connections stay open but stop forwarding; new connections are
+/// accepted and immediately dropped so a reconnect against the partitioned CP
+/// fails fast instead of stalling the test on the connect timeout.
+async fn spawn_blackhole_relay(
+    upstream: SocketAddr,
+) -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::TcpStream;
+
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let flag = blackhole.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((inbound, _)) = listener.accept().await else {
+                return;
+            };
+            if flag.load(Ordering::Relaxed) {
+                drop(inbound);
+                continue;
+            }
+            let Ok(outbound) = TcpStream::connect(upstream).await else {
+                continue;
+            };
+            let (client_read, client_write) = inbound.into_split();
+            let (server_read, server_write) = outbound.into_split();
+            tokio::spawn(relay_pipe(client_read, server_write, flag.clone()));
+            tokio::spawn(relay_pipe(server_read, client_write, flag.clone()));
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, blackhole, handle)
+}
+
+/// Wait until the DP's applied config holds exactly `count` proxies.
+async fn wait_for_proxy_count(state: &ProxyState, count: usize, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if state.config.load().proxies.len() == count {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until a proxy with `id` is present in the DP's applied config.
+async fn wait_for_proxy_id(state: &ProxyState, id: &str, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if state.config.load().proxies.iter().any(|p| p.id == id) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until the DP's applied config holds `proxies` proxies and no upstreams.
+async fn wait_for_proxy_count_without_upstreams(
+    state: &ProxyState,
+    proxies: usize,
+    budget: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let config = state.config.load();
+        if config.proxies.len() == proxies && config.upstreams.is_empty() {
+            return true;
+        }
+        drop(config);
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until an atomic readiness flag reads true.
+async fn wait_for_flag(flag: &std::sync::atomic::AtomicBool, budget: Duration) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if flag.load(Ordering::Acquire) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Build a DELTA envelope carrying `body` as its config JSON.
+fn delta_update(body: String) -> ferrum_edge::grpc::proto::ConfigUpdate {
+    ferrum_edge::grpc::proto::ConfigUpdate {
+        update_type: 1,
+        config_json: body,
+        version: Utc::now().to_rfc3339(),
+        timestamp: Utc::now().timestamp(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        trust_bundles_json: String::new(),
+        heartbeat: false,
+        heartbeat_negotiated: false,
+    }
+}
+
+/// A delta that only adds `proxy`.
+fn add_proxy_delta(proxy: Proxy) -> IncrementalResult {
+    IncrementalResult {
+        added_or_modified_proxies: vec![proxy],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 1,
+        poll_timestamp: Utc::now(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_blackholed_configsync_stream_fails_over_to_fallback_cp() {
+    // Issue #2967 acceptance: an established ConfigSync transport that becomes
+    // silently blackholed must be detected, torn down, and replaced by a
+    // fallback CP within a bounded interval — not left pending forever on
+    // `message().await` while `/cluster` keeps reporting "online".
+    //
+    // The production silence bound is 150s, so this drives the real DP entry
+    // point with a compressed per-invocation `ConfigSyncStreamTimings`. That
+    // policy is a plain stack argument with no global/env override, so the test
+    // value cannot leak into a production DP.
+    use std::sync::atomic::Ordering;
+
+    let primary_config = create_test_config(1);
+    let (primary_addr, _primary_tx, _primary_handle) = start_test_cp_server(primary_config).await;
+
+    let mut fallback_config = create_test_config(3);
+    fallback_config.loaded_at = Utc::now();
+    let (fallback_addr, _fallback_tx, _fallback_handle) =
+        start_test_cp_server(fallback_config).await;
+
+    let (relay_addr, blackhole, relay_handle) = spawn_blackhole_relay(primary_addr).await;
+
+    let primary_url = format!("http://{}", relay_addr);
+    let fallback_url = format!("http://{}", fallback_addr);
+    let proxy_state = create_test_proxy_state();
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&primary_url),
+    )));
+
+    let ps = proxy_state.clone();
+    let cs = connection_state.clone();
+    let urls = vec![primary_url.clone(), fallback_url.clone()];
+    let timings = ferrum_edge::grpc::configsync_lifecycle::ConfigSyncStreamTimings {
+        max_silence: Duration::from_secs(2),
+    };
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_stream_timings(
+            urls,
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            Some(cs),
+            None,
+            timings,
+        )
+        .await;
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 1, Duration::from_secs(10)).await,
+        "DP should apply the primary CP's snapshot first"
+    );
+    assert!(
+        connection_state.load().connected,
+        "DP should report connected to the primary CP"
+    );
+
+    // Silently partition the established stream: sockets stay open, bytes stop.
+    blackhole.store(true, Ordering::Relaxed);
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 3, Duration::from_secs(45)).await,
+        "DP must detect the silent partition and reach the fallback CP"
+    );
+    let state = connection_state.load();
+    assert_eq!(
+        state.cp_url, fallback_url,
+        "DP must be attached to the fallback CP after the partition"
+    );
+    assert!(
+        !state.is_primary,
+        "the fallback CP must not be reported as primary"
+    );
+
+    client_handle.abort();
+    relay_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_snapshot_apply_is_never_detached_by_a_lifecycle_select_arm() {
+    // Issue #2969 acceptance: a slow/in-flight FULL_SNAPSHOT apply must not be
+    // detachable by a lifecycle select! arm. `update_config_off_thread` is a
+    // `spawn_blocking`, so cancelling the await would leave the swap running
+    // detached and able to land after the DP has moved on — silently
+    // overwriting a newer snapshot with an older one.
+    //
+    // Deterministic proof: race a large snapshot apply against the shutdown arm,
+    // then assert the config observed when the DP client returns never changes
+    // afterwards. A detached apply would land after that return.
+    let (addr, update_tx, _server_handle) = start_test_cp_server(create_test_config(1)).await;
+
+    let proxy_state = create_test_proxy_state();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ps = proxy_state.clone();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
+            Some(shutdown_rx),
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            None,
+            None,
+        )
+        .await;
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 1, Duration::from_secs(10)).await,
+        "DP should apply the initial snapshot"
+    );
+
+    // A deliberately large snapshot so the apply has real work to do, pushed
+    // immediately before shutdown so both land in the same select! iteration.
+    let mut large = create_test_config(400);
+    large.loaded_at = Utc::now();
+    CpGrpcServer::broadcast_update(&update_tx, &large);
+    let _ = shutdown_tx.send(true);
+
+    let returned = timeout(Duration::from_secs(20), client_handle).await;
+    assert!(
+        returned.is_ok(),
+        "DP client must observe shutdown and return"
+    );
+
+    // Whatever was committed must be a complete snapshot, never a torn mix.
+    let at_return = proxy_state.config.load().proxies.len();
+    assert!(
+        at_return == 1 || at_return == 400,
+        "config must only ever be a complete snapshot, saw {at_return} proxies"
+    );
+
+    // The decisive assertion: no apply may still be in flight once the client
+    // has returned. A detached `spawn_blocking` would mutate the config here.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        proxy_state.config.load().proxies.len(),
+        at_return,
+        "no config apply may land after the DP client returned"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
+    // Issue #2970 acceptance: two CP sources, newer then older. On failover the
+    // DP must refuse the older body, terminate that source's stream (so the
+    // stale CP's next delta can never apply against newer config), and keep
+    // serving the newer active config.
+    let mut newer = create_test_config(3);
+    newer.loaded_at = Utc::now();
+    let (newer_addr, _newer_tx, newer_handle) = start_test_cp_server(newer).await;
+
+    let mut older = create_test_config(1);
+    older.loaded_at = Utc::now() - chrono::Duration::hours(6);
+    let (older_addr, older_tx, _older_handle) = start_test_cp_server(older).await;
+
+    let proxy_state = create_test_proxy_state();
+    let newer_url = format!("http://127.0.0.1:{}", newer_addr.port());
+    let older_url = format!("http://127.0.0.1:{}", older_addr.port());
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&newer_url),
+    )));
+
+    let ps = proxy_state.clone();
+    let cs = connection_state.clone();
+    let urls = vec![newer_url, older_url];
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            urls,
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            Some(cs),
+            None,
+        )
+        .await;
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 3, Duration::from_secs(10)).await,
+        "DP should apply the newer CP's snapshot"
+    );
+    let accepted_at = connection_state.load().last_config_received_at;
+
+    // Take the newer CP away so the DP fails over to the stale one.
+    newer_handle.abort();
+
+    // Give the DP several failover cycles against the stale CP.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        proxy_state.config.load().proxies.len(),
+        3,
+        "a stale fallback snapshot must never roll the applied config back"
+    );
+    assert_eq!(
+        connection_state.load().last_config_received_at,
+        accepted_at,
+        "a fenced snapshot must not advance last_config_received_at"
+    );
+
+    // The fenced stream must be terminated, not merely skipped: a delta pushed
+    // by the stale CP must never reach the DP's applied config.
+    let stale_delta = add_proxy_delta(create_test_proxy("stale-injected", "/stale"));
+    let body = serde_json::to_string(&stale_delta).unwrap();
+    let _ = older_tx.send(delta_update(body));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let injected = proxy_state
+        .config
+        .load()
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == "stale-injected");
+    assert!(
+        !injected,
+        "a delta from the fenced stale CP must never apply against newer config"
+    );
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_becomes_ready_and_applies_delta_despite_unbindable_stream_port() {
+    // Issue #2971 acceptance: a CP snapshot containing a stream proxy whose port
+    // never binds on this node must still make the DP ready, must not tear down
+    // the healthy ConfigSync stream (bind failures are non-fatal in DP mode),
+    // and a subsequent delta must still apply on that same stream.
+    let mut cp_config = create_test_config(1);
+    let stream_proxy = create_test_tcp_stream_proxy("tcp-unbindable", 19087);
+    cp_config.proxies.push(stream_proxy);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let startup_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&cp_url),
+    )));
+
+    let ps = proxy_state.clone();
+    let ready = startup_ready.clone();
+    let cs = connection_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            Some(ready),
+            "ferrum".to_string(),
+            0,
+            Some(cs),
+            None,
+        )
+        .await;
+    });
+
+    // The DP snapshot path waits up to 10s for stream listeners to start; the
+    // unbindable one never will, and that must only produce a warning.
+    assert!(
+        wait_for_flag(&startup_ready, Duration::from_secs(40)).await,
+        "one unbindable stream port must not block DP readiness"
+    );
+    assert!(
+        connection_state.load().connected,
+        "the ConfigSync stream must stay connected through a local bind failure"
+    );
+
+    // The same stream must still carry deltas.
+    let delta = add_proxy_delta(create_test_proxy("after-bind-failure", "/after"));
+    let body = serde_json::to_string(&delta).unwrap();
+    let _ = update_tx.send(delta_update(body));
+
+    assert!(
+        wait_for_proxy_id(&proxy_state, "after-bind-failure", Duration::from_secs(10)).await,
+        "a delta after a local stream bind failure must still apply"
+    );
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_returns_promptly_on_shutdown_of_a_healthy_idle_stream() {
+    // Issue #2972 acceptance: a DP parked on a healthy, idle ConfigSync stream
+    // must observe shutdown and return promptly instead of burning the outer
+    // five-second background drain in data_plane.rs.
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(create_test_config(2)).await;
+
+    let proxy_state = create_test_proxy_state();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ps = proxy_state.clone();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
+            Some(shutdown_rx),
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            None,
+            None,
+        )
+        .await;
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 2, Duration::from_secs(10)).await,
+        "DP should apply the initial snapshot"
+    );
+    // The stream is now healthy and idle — exactly the state that used to park
+    // the DP in `message().await` until the drain timeout expired.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    let _ = shutdown_tx.send(true);
+    let returned = timeout(Duration::from_secs(3), client_handle).await;
+    assert!(
+        returned.is_ok(),
+        "DP client must return on shutdown of an idle healthy stream"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "shutdown must not consume the outer 5s drain budget, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cp_only_negotiates_heartbeats_with_subscribers_that_advertise_support() {
+    // Issue #2395 mixed-version, new CP → legacy DP: heartbeats are a negotiated
+    // capability. A subscriber that does not advertise support must never be
+    // told heartbeats are on, and therefore never receives an empty heartbeat
+    // envelope it would treat as an unusable FULL_SNAPSHOT and churn on.
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(create_test_config(1)).await;
+
+    for advertises in [false, true] {
+        let token =
+            dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "hb-neg", TEST_DEFAULT_ISSUER)
+                .unwrap();
+        let mut client = connect_client_with_token!(addr, token);
+        let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+            node_id: "hb-neg".to_string(),
+            ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+            namespace: "ferrum".to_string(),
+            real_ip_header: Some(String::new()),
+            supports_heartbeat: advertises,
+        });
+        let mut stream = client.subscribe(request).await.unwrap().into_inner();
+        let initial = timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("initial update should arrive")
+            .expect("stream ok")
+            .expect("initial update present");
+
+        assert!(
+            !initial.heartbeat,
+            "the initial update is a real FULL_SNAPSHOT, never a heartbeat"
+        );
+        assert_eq!(
+            initial.heartbeat_negotiated, advertises,
+            "CP must confirm heartbeats only to subscribers that advertised them"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace() {
+    // Issue #2395 mixed-version, new DP ← legacy CP: a CP at an older patch
+    // sends removal keys as bare ID strings. The DP must accept that body and
+    // scope the removals to its already-authorized subscription namespace
+    // instead of rejecting the delta and churning through resync reconnects.
+    let mut cp_config = create_test_config(2);
+    let upstream = create_test_upstream("upstream-legacy", &[("backend", 8080)]);
+    cp_config.upstreams.push(upstream);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "legacy-delta-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 2, Duration::from_secs(10)).await,
+        "DP should apply the initial snapshot"
+    );
+
+    // Exactly the body an older same-major.minor CP emits: bare-ID removal
+    // arrays and no additive `removed_*_keys`.
+    let legacy_body = serde_json::json!({
+        "added_or_modified_proxies": [],
+        "removed_proxy_ids": ["proxy-1"],
+        "added_or_modified_consumers": [],
+        "removed_consumer_ids": [],
+        "added_or_modified_plugin_configs": [],
+        "removed_plugin_config_ids": [],
+        "added_or_modified_upstreams": [],
+        "removed_upstream_ids": ["upstream-legacy"],
+        "poll_timestamp": Utc::now().to_rfc3339(),
+    });
+    let body = serde_json::to_string(&legacy_body).unwrap();
+    let _ = update_tx.send(delta_update(body));
+
+    assert!(
+        wait_for_proxy_count_without_upstreams(&proxy_state, 1, Duration::from_secs(10)).await,
+        "a legacy bare-ID removal delta must apply in the subscription namespace"
+    );
+    assert_eq!(proxy_state.config.load().proxies[0].id, "proxy-0");
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delta_broadcast_body_stays_parseable_by_a_legacy_removal_id_shape() {
+    // Issue #2395 mixed-version, new CP → legacy DP: the DELTA body the CP puts
+    // on the wire must still deserialize under the pre-qualified-removals
+    // schema, i.e. `removed_*_ids` are bare strings and the namespace-qualified
+    // keys ride in additive arrays a legacy DP ignores.
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy("proxy-new", "/new")],
+        removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "proxy-gone")],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![NamespacedResourceId::new("ferrum", "consumer-gone")],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![NamespacedResourceId::new("ferrum", "plugin-gone")],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "upstream-gone")],
+        sequence_cursor: 3,
+        poll_timestamp: Utc::now(),
+    };
+    let (_addr, update_tx, _server_handle) = start_test_cp_server(create_test_config(1)).await;
+    let mut receiver = update_tx.subscribe();
+    let version = delta.poll_timestamp.to_rfc3339();
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, &version);
+    let broadcast = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("delta should broadcast")
+        .expect("broadcast payload");
+
+    let body: serde_json::Value = serde_json::from_str(&broadcast.config_json).unwrap();
+    assert_eq!(body["removed_proxy_ids"], serde_json::json!(["proxy-gone"]));
+    assert_eq!(
+        body["removed_plugin_config_ids"],
+        serde_json::json!(["plugin-gone"])
+    );
+    assert_eq!(
+        body["removed_upstream_ids"],
+        serde_json::json!(["upstream-gone"])
+    );
+    assert_eq!(body["removed_proxy_keys"][0]["namespace"], "ferrum");
+    assert_eq!(body["removed_consumer_ids"][0]["namespace"], "ferrum");
+    assert!(
+        !broadcast.heartbeat,
+        "a resource delta must never be flagged as a heartbeat"
+    );
 }

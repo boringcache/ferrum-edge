@@ -1284,6 +1284,9 @@ impl CpGrpcServer {
         registry.touch_all();
     }
 
+    /// Build a keepalive frame. Only ever emitted on a subscription whose DP
+    /// advertised `SubscribeRequest.supports_heartbeat`, so the frame always
+    /// restates the negotiated capability.
     fn build_configsync_heartbeat(version: String) -> ConfigUpdate {
         ConfigUpdate {
             update_type: 0,
@@ -1293,6 +1296,7 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json: String::new(),
             heartbeat: true,
+            heartbeat_negotiated: true,
         }
     }
 
@@ -1323,6 +1327,7 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
+            heartbeat_negotiated: false,
         };
         let _ = tx.send(update);
     }
@@ -1394,6 +1399,7 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
+            heartbeat_negotiated: false,
         };
         let _ = tx.send(update);
     }
@@ -1567,6 +1573,11 @@ impl ConfigSync for CpGrpcServer {
         let node_id = inner.node_id;
         let dp_version = inner.ferrum_version;
         let dp_namespace = inner.namespace;
+        // Heartbeat capability is negotiated, not assumed. A DP that predates
+        // `ConfigUpdate.heartbeat` would read an empty heartbeat envelope as an
+        // unusable FULL_SNAPSHOT and churn through reconnects, so only
+        // advertising subscribers ever receive keepalive frames.
+        let heartbeats_negotiated = inner.supports_heartbeat;
 
         // Reject DPs with incompatible versions before streaming any config.
         Self::check_version_compatibility(&dp_version)?;
@@ -1655,6 +1666,11 @@ impl ConfigSync for CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
             heartbeat: false,
+            // Confirm the capability on the first message of the stream so the
+            // DP arms its application silence watchdog only against a CP that
+            // actually committed to sending heartbeats. A CP that predates this
+            // field leaves it false and the DP never arms the watchdog.
+            heartbeat_negotiated: heartbeats_negotiated,
         };
 
         let config_for_recovery = self.config.clone();
@@ -1698,6 +1714,7 @@ impl ConfigSync for CpGrpcServer {
                             ferrum_version: FERRUM_VERSION.to_string(),
                             trust_bundles_json,
                             heartbeat: false,
+                            heartbeat_negotiated: false,
                         }))
                     }
                     Err(e) => {
@@ -1711,17 +1728,25 @@ impl ConfigSync for CpGrpcServer {
         // Prepend initial config, interleave application heartbeats for
         // silent-partition detection, then wrap in TrackedStream so the DP is
         // automatically de-registered when the gRPC stream is dropped.
+        //
+        // The timer is built unconditionally to keep one concrete stream type;
+        // when the DP did not advertise heartbeat support every tick is dropped
+        // and no frame is ever written, so a legacy subscriber sees exactly the
+        // pre-heartbeat stream contents.
         let initial_stream = tokio_stream::once(Ok(initial));
         let heartbeat_config = self.config.clone();
         let heartbeat_stream = IntervalStream::new(interval_at(
             Instant::now() + CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
             CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
         ))
-        .map(move |_| {
+        .filter_map(move |_| {
+            if !heartbeats_negotiated {
+                return None;
+            }
             let current = heartbeat_config.load_full();
-            Ok(Self::build_configsync_heartbeat(
+            Some(Ok(Self::build_configsync_heartbeat(
                 current.loaded_at.to_rfc3339(),
-            ))
+            )))
         });
         let combined = initial_stream.chain(stream::select(stream, heartbeat_stream));
         let tracked = TrackedStream {

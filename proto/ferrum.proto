@@ -25,6 +25,13 @@ message SubscribeRequest {
   // field and rejects a mismatch before streaming configuration so plugin
   // ownership admission uses one enforced cluster-wide value.
   optional string real_ip_header = 4;
+  // Additive ConfigSync capability advertisement: this DP understands
+  // `ConfigUpdate.heartbeat` keepalive frames and will arm an application
+  // silence watchdog once the CP confirms it will send them. Absent/false on
+  // peers that predate heartbeats, so a CP must never send heartbeats to a DP
+  // that did not advertise support — an unnegotiated empty heartbeat envelope
+  // would read as an unusable FULL_SNAPSHOT to such a DP.
+  bool supports_heartbeat = 5;
 }
 
 message FullConfigRequest {
@@ -67,8 +74,16 @@ message ConfigUpdate {
   string trust_bundles_json = 6;
   // Lightweight keepalive frame for ConfigSync Subscribe streams. Heartbeats
   // refresh DP stream liveness without forcing a config apply, so healthy
-  // idle clusters are not mistaken for silent partitions.
+  // idle clusters are not mistaken for silent partitions. Only ever sent to a
+  // subscriber that advertised `SubscribeRequest.supports_heartbeat`.
   bool heartbeat = 7;
+  // CP-side confirmation of the heartbeat capability, set on the initial
+  // FULL_SNAPSHOT of a Subscribe stream when the CP accepted the DP's
+  // `supports_heartbeat` advertisement and will emit heartbeat frames. A DP
+  // arms its application silence watchdog only after seeing this, so a new DP
+  // talking to a CP that predates heartbeats never reconnects on silence the
+  // CP was never asked to break. Absent/false on legacy CPs.
+  bool heartbeat_negotiated = 8;
 }
 
 message MeshSubscribeRequest {

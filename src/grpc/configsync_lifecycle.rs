@@ -31,6 +31,38 @@ pub const CONFIGSYNC_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// are not treated as dead.
 pub const CONFIGSYNC_MAX_SILENCE_SECS: u64 = 150;
 
+/// Per-connection ConfigSync stream timing policy.
+///
+/// Production always uses [`ConfigSyncStreamTimings::production`], i.e. the
+/// module constants above; the DP entry points that omit it default to exactly
+/// that. Tests may pass a compressed bound so silent-partition failover is
+/// provable inside bounded hosted CI without sleeping for production minutes.
+///
+/// The value is ordinary per-invocation state carried on the call stack — there
+/// is no global, environment, or `cfg` override — so a test value has no path
+/// into a production DP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigSyncStreamTimings {
+    /// Reconnect when a stream with *negotiated* heartbeats delivers no message
+    /// for this long. Unnegotiated streams never arm the watchdog at all.
+    pub max_silence: std::time::Duration,
+}
+
+impl ConfigSyncStreamTimings {
+    /// The shipped production policy.
+    pub const fn production() -> Self {
+        Self {
+            max_silence: std::time::Duration::from_secs(CONFIGSYNC_MAX_SILENCE_SECS),
+        }
+    }
+}
+
+impl Default for ConfigSyncStreamTimings {
+    fn default() -> Self {
+        Self::production()
+    }
+}
+
 /// Maximum tolerated future clock skew (seconds) for admitting a CP-stamped
 /// committed snapshot timestamp into freshness authority.
 ///
@@ -924,6 +956,25 @@ pub fn failure_backoff_sequence(cp_count: usize, attempts: usize) -> Vec<u64> {
         }
     }
     sleeps
+}
+
+/// Whether the application-silence watchdog may fire on this subscription.
+///
+/// Two independent reasons to arm it:
+/// - The CP confirmed heartbeat support (`ConfigUpdate.heartbeat_negotiated`),
+///   so continued silence means the keepalive it promised stopped arriving.
+/// - No message has arrived at all yet. Every CP — including one that predates
+///   heartbeats — sends its initial FULL_SNAPSHOT immediately on Subscribe, so a
+///   stream that is silent before its first message is anomalous at any version.
+///   Without this, a blackholed reconnect against an unnegotiated stream would
+///   hang forever on `message().await` (issue #2967).
+///
+/// It stays disarmed only in the case it must: a mixed-version stream from a CP
+/// that never negotiated heartbeats, after that CP has proven liveness with at
+/// least one message. Such a stream is legitimately silent while idle, and
+/// HTTP/2 PING + TCP keepalive still cover it.
+pub fn silence_watchdog_armed(heartbeats_negotiated: bool, received_any_message: bool) -> bool {
+    heartbeats_negotiated || !received_any_message
 }
 
 /// True when a silence interval exceeds the ConfigSync liveness bound.

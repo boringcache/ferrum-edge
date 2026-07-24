@@ -2603,6 +2603,7 @@ mod tests {
             ferrum_version: crate::FERRUM_VERSION.to_string(),
             trust_bundles_json: String::new(),
             heartbeat: false,
+            heartbeat_negotiated: false,
         }
     }
 

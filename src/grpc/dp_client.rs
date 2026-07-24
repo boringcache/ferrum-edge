@@ -39,8 +39,8 @@ use tracing::{debug, error, info, warn};
 
 use super::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
-    CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
-    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics,
+    CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_TCP_KEEPALIVE_SECS,
+    ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics, ConfigSyncStreamTimings,
     DeltaRejectionKind, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
     MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
     advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
@@ -49,8 +49,8 @@ use super::configsync_lifecycle::{
     full_snapshot_stream_disposition, gateway_trust_equivalence_state,
     grow_backoff_after_failure_sleep, reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
-    snapshot_failure_stream_disposition, snapshot_requires_older_payload_exception,
-    stale_reject_from_reconcile,
+    silence_watchdog_armed, snapshot_failure_stream_disposition,
+    snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
@@ -389,6 +389,45 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     jwt_secret: GrpcJwtSecret,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    tls_config: Option<DpGrpcTlsConfig>,
+    tls_reload: Option<DpGrpcTlsReload>,
+    startup_ready: Option<Arc<AtomicBool>>,
+    namespace: String,
+    primary_retry_secs: u64,
+    connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    frontend_tls_runtime: Option<DpFrontendTlsRuntime>,
+) {
+    start_dp_client_with_stream_timings(
+        cp_urls,
+        jwt_secret,
+        proxy_state,
+        shutdown_rx,
+        tls_config,
+        tls_reload,
+        startup_ready,
+        namespace,
+        primary_retry_secs,
+        connection_state,
+        frontend_tls_runtime,
+        ConfigSyncStreamTimings::production(),
+    )
+    .await
+}
+
+/// Same as [`start_dp_client_with_shutdown_and_startup_ready`] with an explicit
+/// per-invocation ConfigSync stream timing policy.
+///
+/// Production callers use the wrapper above, which always passes
+/// [`ConfigSyncStreamTimings::production`]. Tests use this entry point to
+/// compress the silent-partition bound so blackhole→failover is provable in
+/// bounded hosted CI. The policy is a plain stack argument, so a test value has
+/// no path into a production DP.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_dp_client_with_stream_timings(
+    cp_urls: Vec<String>,
+    jwt_secret: GrpcJwtSecret,
+    proxy_state: ProxyState,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     mut tls_config: Option<DpGrpcTlsConfig>,
     tls_reload: Option<DpGrpcTlsReload>,
     startup_ready: Option<Arc<AtomicBool>>,
@@ -396,6 +435,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     primary_retry_secs: u64,
     connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
     frontend_tls_runtime: Option<DpFrontendTlsRuntime>,
+    timings: ConfigSyncStreamTimings,
 ) {
     if cp_urls.is_empty() {
         error!("No CP URLs configured — cannot start DP client");
@@ -522,6 +562,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             &mut snapshot_authority,
             divergence_metrics.as_ref(),
             readiness_signal.clone(),
+            timings,
         )
         .await;
 
@@ -1177,6 +1218,7 @@ pub async fn connect_and_subscribe(
         &mut authority,
         &ConfigSyncDivergenceMetrics::default(),
         Arc::new(Notify::new()),
+        ConfigSyncStreamTimings::production(),
     )
     .await?
     {
@@ -1231,6 +1273,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
         &mut authority,
         &ConfigSyncDivergenceMetrics::default(),
         Arc::new(Notify::new()),
+        ConfigSyncStreamTimings::production(),
     )
     .await?
     {
@@ -1277,6 +1320,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     snapshot_authority: &mut Option<AppliedSnapshotAuthority>,
     divergence_metrics: &ConfigSyncDivergenceMetrics,
     readiness_signal: Arc<Notify>,
+    timings: ConfigSyncStreamTimings,
 ) -> Result<DpStreamEnd, anyhow::Error> {
     let mut endpoint = configure_configsync_endpoint(Channel::from_shared(cp_url.to_string())?);
 
@@ -1348,6 +1392,12 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 .clone()
                 .unwrap_or_default(),
         ),
+        // Advertise the heartbeat capability. The CP only emits keepalive frames
+        // to advertising subscribers, and only confirms the capability back on
+        // the initial update — so this DP arms its silence watchdog against a CP
+        // that actually committed to heartbeats, never against one that predates
+        // them.
+        supports_heartbeat: true,
     });
 
     let mut stream = client.subscribe(request).await?.into_inner();
@@ -1357,6 +1407,16 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     let mut subscription = SubscriptionApplyState::new();
     let skip_startup_readiness_work = startup_ready.is_none();
     let mut received_config = false;
+    // Application silence is only a liveness signal once the CP has confirmed it
+    // will send heartbeats. Against a CP that predates the capability the stream
+    // is legitimately silent while idle, and arming the watchdog would force a
+    // reconnect the CP was never asked to prevent. Transport keepalive (HTTP/2
+    // PING + TCP) still covers those streams. Set true and never cleared: only
+    // the initial update carries the confirmation.
+    let mut heartbeats_negotiated = false;
+    // Silence before the *first* message is anomalous at any peer version, so
+    // the watchdog stays armed until one arrives (see `silence_watchdog_armed`).
+    let mut received_any_message = false;
     let mut last_stream_activity = Instant::now();
     let primary_retry_fut = wait_for_readiness_then_primary_retry(
         startup_ready.clone(),
@@ -1378,8 +1438,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     }
 
     loop {
-        let silence_remaining = Duration::from_secs(CONFIGSYNC_MAX_SILENCE_SECS)
+        let silence_remaining = timings
+            .max_silence
             .saturating_sub(last_stream_activity.elapsed());
+        let silence_armed = silence_watchdog_armed(heartbeats_negotiated, received_any_message);
 
         // Poll lifecycle signals (shutdown / TLS reload / primary retry) before
         // the message arm so a sustained stream cannot starve them, but keep the
@@ -1415,17 +1477,26 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     }
                 }
             }
-            _ = tokio::time::sleep(silence_remaining) => {
+            _ = tokio::time::sleep(silence_remaining), if silence_armed => {
                 error!(
                     received_config,
                     "ConfigSync stream silent for {}s (no message/heartbeat); reconnecting",
-                    CONFIGSYNC_MAX_SILENCE_SECS
+                    timings.max_silence.as_secs()
                 );
                 return Ok(DpStreamEnd::TransportFailure { received_config });
             }
         };
 
         last_stream_activity = Instant::now();
+        received_any_message = true;
+
+        if update.heartbeat_negotiated && !heartbeats_negotiated {
+            heartbeats_negotiated = true;
+            debug!(
+                max_silence_secs = timings.max_silence.as_secs(),
+                "CP confirmed ConfigSync heartbeat support; arming stream silence watchdog"
+            );
+        }
 
         if update.heartbeat {
             debug!(
@@ -1797,6 +1868,23 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
                                 }
                             };
+                        // Rolling-upgrade compatibility: a same-major.minor CP
+                        // that predates namespace-qualified removals sends bare
+                        // resource IDs, which decode without a namespace. Adopt
+                        // this subscription's already-authorized namespace — the
+                        // only one this DP may act on — so the legacy semantics
+                        // are reproduced without widening reach. Keys that stay
+                        // unqualified (empty namespace) are dropped by the
+                        // namespace filter immediately below.
+                        let unqualified = result.qualify_unqualified_removals(namespace);
+                        if unqualified > 0 {
+                            debug!(
+                                unqualified,
+                                namespace,
+                                "CP delta carried legacy unqualified removal keys; scoping them to \
+                                 this subscription's authorized namespace"
+                            );
+                        }
                         // Defense in depth: filter cross-namespace
                         // additions/modifications before applying. See
                         // `filter_incremental_to_namespace`.
