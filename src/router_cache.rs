@@ -719,9 +719,8 @@ struct AlignedCounterRow(Vec<AtomicU8>);
 /// [`CMS_AGE_CHUNK`] cells. That keeps route-lookup latency bounded even while
 /// the thread-local `CACHE_KEY_BUF` borrow is held on the hit path.
 ///
-/// Memory: `2 * width` bytes + 64-byte alignment padding. With the default width
-/// of 8192, that is ~16 KiB + padding. Aging state is two `CachePadded` atomics
-/// (no extra heap).
+/// Memory: `2 * width` bytes + 64-byte alignment padding plus one `CachePadded`
+/// aging cursor atomic (no extra heap allocation for aging).
 struct CountMinSketch {
     row0: AlignedCounterRow,
     row1: AlignedCounterRow,
