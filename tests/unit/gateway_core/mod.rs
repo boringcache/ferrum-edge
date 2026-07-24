@@ -12,6 +12,7 @@ mod dns_tests;
 mod dp_client_tests;
 mod early_upload_deadline_tests;
 mod error_classifier_tests;
+mod forwarded_ownership_parity_tests;
 mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
 mod health_check_tests;

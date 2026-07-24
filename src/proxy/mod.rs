@@ -26525,7 +26525,9 @@ pub(crate) async fn proxy_to_backend_retry(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
-            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -27888,7 +27890,9 @@ async fn proxy_to_backend(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
-            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -30196,6 +30200,9 @@ async fn proxy_to_backend_hbone(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 insert_outbound_header_or_warn(
@@ -31124,6 +31131,9 @@ async fn proxy_to_backend_mesh_mtls(
             // consistency check.
             "host" => continue,
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 insert_outbound_header_or_warn(
@@ -31737,6 +31747,13 @@ async fn proxy_to_backend_http2(
             // value risked an authoritative-size mismatch with the framed
             // body when a request_transformer plugin mutated the body.
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // Strip gateway-owned forwarding identity before regenerating it
+            // below. `HeaderMap::insert` would replace, but keep the same
+            // fail-closed ownership predicate as reqwest/H3 so a capability
+            // flip cannot change which Forwarded element backends observe.
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             // RFC 9110 §7.6.1: also strip every header NAMED in the
             // request's `Connection` field — see `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -32013,9 +32030,10 @@ fn build_http3_backend_headers(
             // Do not let client-supplied values appear first on native H3
             // backend requests, where duplicate header ordering can make a
             // backend consume the spoofed value instead of Ferrum's canonical
-            // value.
-            "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" => continue,
-            "forwarded" if state.add_forwarded_header => continue,
+            // value. Same fail-closed ownership as reqwest / direct-H2.
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -37256,6 +37274,51 @@ mod tests {
         assert_eq!(
             header_value(&out, "forwarded"),
             Some("for=203.0.113.9;proto=https;host=api.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_backend_headers_drop_client_forwarded_when_regenerating() {
+        // Issue #2952: spoofed Forwarded must not precede the gateway-owned
+        // element on the H1/H2 → native-H3 header builder.
+        let env_config = crate::config::env_config::EnvConfig {
+            add_forwarded_header: true,
+            ..Default::default()
+        };
+        let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+
+        let headers = HashMap::from([
+            ("host".to_string(), "api.example".to_string()),
+            (
+                "forwarded".to_string(),
+                "for=10.0.0.1;proto=https".to_string(),
+            ),
+        ]);
+        let out = build_http3_backend_headers(
+            &state,
+            &proxy,
+            &headers,
+            Http3BackendHeaderContext {
+                client_ip: "203.0.113.9",
+                xff_append_ip: "10.0.0.7",
+                effective_host: "h3-backend.example",
+                request_is_secure: true,
+                inbound_version: hyper::Version::HTTP_11,
+                content_length: None,
+            },
+        );
+
+        let forwarded: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n.as_str() == "forwarded")
+            .filter_map(|(_, v)| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["for=203.0.113.9;proto=https;host=api.example"],
+            "only the gateway-owned Forwarded element may reach the H3 backend"
         );
     }
 

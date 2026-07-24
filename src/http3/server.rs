@@ -37,7 +37,7 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    apply_response_headers, is_backend_request_strip_header, is_proxy_generated_forwarding_header,
+    apply_response_headers, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
     parse_connection_listed_from_str_map, strip_client_response_hop_by_hop_headers,
     strip_response_hop_by_hop_trailers,
 };
@@ -7298,10 +7298,11 @@ fn build_h3_backend_headers(
             }
             // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
             n if is_backend_request_strip_header(n) => continue,
-            // Ferrum regenerates X-Forwarded-* below; copying the inbound
-            // value too would duplicate the header (the H1/H2 reqwest paths
-            // and the H3 cross-protocol bridge apply the same skip).
-            n if is_proxy_generated_forwarding_header(n) => continue,
+            // Ferrum regenerates X-Forwarded-* (always) and Forwarded when
+            // `add_forwarded_header` is set. Copying the inbound value too
+            // would duplicate the header (reqwest appends; this Vec push
+            // path would leave the spoofed element first).
+            n if is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => continue,
             // RFC 9110 §7.6.1 Connection-listed strip — see
             // `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -13053,6 +13054,76 @@ mod build_h3_backend_headers_tests {
             header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
             Some("for=203.0.113.1;proto=http;host=api.example"),
             "Forwarded must carry a trusted original HTTP scheme"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_strips_client_forwarded_when_regenerating() {
+        // Issue #2952: when FERRUM_ADD_FORWARDED_HEADER is on, client-supplied
+        // Forwarded must not survive beside the gateway-owned value.
+        let mut state = minimal_proxy_state();
+        state.add_forwarded_header = true;
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+        headers.insert(
+            "forwarded".to_string(),
+            "for=10.0.0.1;proto=https".to_string(),
+        );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+        );
+
+        let forwarded: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n.as_str() == "forwarded")
+            .filter_map(|(_, v)| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["for=203.0.113.1;proto=https;host=api.example"],
+            "only the gateway-owned Forwarded element may reach the H3 backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_passes_client_forwarded_when_not_regenerating() {
+        let state = minimal_proxy_state();
+        assert!(
+            !state.add_forwarded_header,
+            "default fixture must leave regeneration off"
+        );
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+        headers.insert(
+            "forwarded".to_string(),
+            "for=10.0.0.1;proto=https".to_string(),
+        );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+        );
+
+        assert_eq!(
+            header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
+            Some("for=10.0.0.1;proto=https"),
+            "client Forwarded passes through when Ferrum is not regenerating it"
         );
     }
 
