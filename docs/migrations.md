@@ -215,7 +215,36 @@ When `sql_postgres` or `sql_mysql` is `Some(...)`, that SQL is used instead of `
 
 ### Multi-Statement Migrations
 
-SQL statements separated by semicolons are executed independently:
+SQL statements separated by semicolons are executed independently. Ferrum splits
+custom-plugin migration SQL with a shared, fail-closed parser (not a raw
+`split(';')`), so classification and execution use the same statement
+boundaries. The full migration body must parse successfully before statement
+one runs.
+
+The splitter preserves semicolons inside:
+
+- single-quoted strings (`''` and `\'` escapes)
+- double-quoted identifiers/strings (`""` escapes)
+- backtick identifiers (MySQL / SQLite)
+- `--` / `/* … */` comments (and MySQL `#` line comments)
+- PostgreSQL dollar-quoted bodies (`$tag$ … $tag$`)
+- `BEGIN … END` compound bodies (SQLite triggers, MySQL routines)
+
+MySQL compound routines may also use the mysql-client `DELIMITER` convention:
+
+```sql
+DELIMITER //
+CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW
+BEGIN
+  SET NEW.id = 1;
+END //
+DELIMITER ;
+```
+
+`DELIMITER` lines are client meta-commands and are not sent to the server. If a
+dialect construct cannot be parsed safely (unclosed quotes/comments/dollar
+tags, unclosed `BEGIN … END`, or a MySQL `DELIMITER` that is never restored),
+registration/apply fails before any statement executes.
 
 ```rust
 sql: r#"
