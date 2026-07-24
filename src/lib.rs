@@ -667,6 +667,44 @@ pub mod _test_support {
         plugin.sample_phase_for_test()
     }
 
+    pub fn request_mirror_append_shadow_host_suffix_for_test(authority: &str) -> String {
+        crate::plugins::request_mirror::append_shadow_host_suffix(authority)
+    }
+
+    pub fn request_mirror_resolve_timeout_ms_for_test(
+        configured_mirror_timeout_ms: Option<u64>,
+        backend_read_timeout_ms: Option<u64>,
+    ) -> u64 {
+        crate::plugins::request_mirror::resolve_mirror_timeout_ms(
+            configured_mirror_timeout_ms,
+            backend_read_timeout_ms,
+        )
+    }
+
+    pub fn request_mirror_retained_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.retained_request_body_bytes_for_test()
+    }
+
+    pub fn request_mirror_max_retained_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.max_retained_request_body_bytes_for_test()
+    }
+
+    pub fn request_mirror_mirror_timeout_ms_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> Option<u64> {
+        plugin.mirror_timeout_ms_for_test()
+    }
+
+    pub fn request_mirror_metrics_snapshot_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> crate::plugins::request_mirror::MirrorMetricsSnapshot {
+        plugin.mirror_metrics_snapshot_for_test()
+    }
+
     // ── plugins/api_chargeback_sink ──────────────────────────────────────────
     pub fn api_chargeback_sink_snapshot_accumulator_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,

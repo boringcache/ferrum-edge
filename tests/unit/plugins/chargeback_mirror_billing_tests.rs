@@ -191,6 +191,7 @@ fn mirror_success(status: u16) -> MirrorResponseMeta {
         mirror_target_url: "http://shadow.local/chargeback-mirror".to_string(),
         mirror_response_status_code: Some(status),
         mirror_response_size_bytes: Some(128),
+        mirror_response_advertised_size_bytes: None,
         mirror_latency_ms: 5.0,
         mirror_error: None,
     }
@@ -204,6 +205,7 @@ fn mirror_error() -> MirrorResponseMeta {
         // fixture would create a duplicate charge without the mirror guard.
         mirror_response_status_code: Some(500),
         mirror_response_size_bytes: None,
+        mirror_response_advertised_size_bytes: None,
         mirror_latency_ms: 1.0,
         mirror_error: Some("connection refused".to_string()),
     }
