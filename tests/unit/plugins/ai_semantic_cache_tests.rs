@@ -2039,6 +2039,29 @@ async fn test_different_model_no_cache_hit() {
 
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(matches!(result, PluginResult::Continue));
+
+    // Provider model identifiers may differ only by case.
+    let body3 = json!({
+        "model": "GPT-4O",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let mut ctx3 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    ctx3.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body3).unwrap(),
+    );
+    let mut headers3 = HashMap::new();
+    headers3.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx3, &mut headers3).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "case-distinct model identifiers must not share exact cache entries"
+    );
 }
 
 #[tokio::test]

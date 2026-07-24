@@ -2086,7 +2086,7 @@ fn append_identity_key_parts(
     {
         start_key_part(key_input, has_part);
         key_input.push_str("m:");
-        append_ascii_lowercase_len_prefixed(key_input, model);
+        append_len_prefixed(key_input, model);
     }
 
     if plugin.include_params_in_key {
