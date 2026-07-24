@@ -132,6 +132,7 @@ fn upsert_by_namespace_and_id<T, FNs, FId>(
 /// are only unique per namespace. This ID-only helper remains for generic
 /// callers (e.g. control-plane unit tests) that intentionally key by a single
 /// string.
+#[cfg(test)]
 pub(crate) fn upsert_by_id<T, F>(existing: &mut Vec<T>, updates: Vec<T>, get_id: F)
 where
     F: Fn(&T) -> &str,

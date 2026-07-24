@@ -13,6 +13,7 @@
 //! Inside the stream handler, two message types:
 //! - `update_type=0` (FULL_SNAPSHOT): replaces the entire `GatewayConfig`
 //! - `update_type=1` (DELTA): applies incremental changes via `apply_incremental()`
+//!
 //! Heartbeat frames (`ConfigUpdate.heartbeat`) refresh liveness without apply.
 //!
 //! Multi-CP failover: `cp_urls` is a priority-ordered list. The DP connects to
