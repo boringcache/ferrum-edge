@@ -5257,7 +5257,8 @@ impl SnapshotAccumulator {
     fn try_reserve_bytes(&self, bytes: usize) -> bool {
         self.retained_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.max_retained_bytes)
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.max_retained_bytes)
             })
             .is_ok()
     }

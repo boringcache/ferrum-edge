@@ -3184,7 +3184,9 @@ async fn snapshot_overflow_delivery_is_nonblocking_and_durably_acknowledged() {
         Some("overflow-async"),
     )
     .expect("construct snapshot sink");
-    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
     plugin.commit_background_tasks();
 
     // Route a cardinality overflow charge through the non-blocking delivery path.
@@ -3199,7 +3201,10 @@ async fn snapshot_overflow_delivery_is_nonblocking_and_durably_acknowledged() {
         let (s, pending, rejections) =
             api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
         assert_eq!(rejections, 0, "a writable spool must never record a loss");
-        assert_eq!(pending, 0, "a writable spool must not stage bounded overflow");
+        assert_eq!(
+            pending, 0,
+            "a writable spool must not stage bounded overflow"
+        );
         if s >= 1 {
             spooled = s;
             break;
@@ -3239,7 +3244,9 @@ async fn snapshot_overflow_delivery_write_failure_stages_within_bound() {
         Some("overflow-async-fallback"),
     )
     .expect("construct snapshot sink");
-    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
     plugin.commit_background_tasks();
 
     // Make every spool write fail by replacing the directory with a file.
@@ -3255,7 +3262,10 @@ async fn snapshot_overflow_delivery_write_failure_stages_within_bound() {
     for _ in 0..200 {
         let (spooled, pending, rejections) =
             api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
-        assert_eq!(spooled, 0, "a failed write must not count a durable success");
+        assert_eq!(
+            spooled, 0,
+            "a failed write must not count a durable success"
+        );
         assert_eq!(
             rejections, 0,
             "bounded staging still has room, so no cardinality loss"
@@ -3294,7 +3304,9 @@ async fn compaction_refuses_while_admitted_and_succeeds_after_drain() {
         Some("compaction-quiescence"),
     )
     .expect("construct snapshot sink");
-    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
     plugin.commit_background_tasks();
 
     // Seed a pending delta so compaction has real state to transfer.
@@ -3371,9 +3383,8 @@ fn snapshot_admission_reservation_never_exceeds_hard_limits_under_concurrency() 
                 // Race overflow staging against entry admission on the shared
                 // combined byte ceiling from some threads.
                 if t % 2 == 0 && i % 8 == 0 {
-                    let _ = acc.stage_overflow_event_for_tests(sample_event(&format!(
-                        "ov-{t}-{i}"
-                    )));
+                    let _ =
+                        acc.stage_overflow_event_for_tests(sample_event(&format!("ov-{t}-{i}")));
                 }
                 // Hard ceilings must hold at every observation.
                 assert!(
