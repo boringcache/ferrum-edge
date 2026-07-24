@@ -596,6 +596,40 @@ impl DeliveryDrainReport {
     }
 }
 
+/// Test-owned delivery lifecycle that never touches the process-global singleton.
+///
+/// Lib/unit suites run in parallel and serving-mode paths may permanently close
+/// [`shutdown`]'s process-global admission. Deferred-log unit tests bind an
+/// owned lifecycle so terminal dispatch stays deterministic without mutating
+/// global state from concurrent tests.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct OwnedDeliveryLifecycle {
+    inner: Arc<DeliveryLifecycle>,
+}
+
+#[cfg(test)]
+impl OwnedDeliveryLifecycle {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(DeliveryLifecycle::new()),
+        }
+    }
+
+    pub(crate) fn spawn_terminal<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.inner
+            .spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, future)
+    }
+
+    /// Await admitted tasks without closing admission on this owned lifecycle.
+    pub(crate) async fn drain_tasks(&self, timeout: Duration) -> bool {
+        self.inner.wait_for_tasks(Instant::now() + timeout).await
+    }
+}
+
 /// Register request/body-originated terminal cleanup.
 pub fn spawn_terminal<F>(future: F) -> bool
 where
