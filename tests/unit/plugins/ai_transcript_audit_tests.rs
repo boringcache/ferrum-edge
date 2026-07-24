@@ -31,7 +31,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::plugin_utils::{create_test_transaction_summary, read_http11_request_headers};
+use super::plugin_utils::{
+    create_test_proxy, create_test_transaction_summary, read_http11_request_headers,
+};
+use crate::unit::env_lock::EnvGuard;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -217,6 +220,45 @@ async fn capture_roundtrip(config_overrides: Value, resp_body: &[u8]) -> Vec<Val
         .await;
     plugin
         .capture_final_response_body(&mut ctx, 200, &headers, resp_body)
+        .await;
+    wait_for_records(&server).await
+}
+
+/// A request path that embeds an email and a token in its segments — the kind of
+/// sensitive material issue #3068 must not export by default.
+const SENSITIVE_PATH: &str = "/users/alice@example.com/reset/SECRET-9f1c";
+
+/// `make_ctx` with a caller-chosen path and an optional matched proxy (whose
+/// `listen_path` is `/test`, the route identifier `path_mode: template` exports).
+fn ctx_with_path(path: &str, with_proxy: bool) -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.path = path.to_string();
+    if with_proxy {
+        ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    }
+    ctx
+}
+
+/// Drive a buffered request+response roundtrip over `ctx`, returning the records.
+async fn capture_roundtrip_over_ctx(
+    config_overrides: Value,
+    mut ctx: RequestContext,
+) -> Vec<Value> {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, config_overrides),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     wait_for_records(&server).await
 }
@@ -564,7 +606,7 @@ async fn null_optional_nested_objects_keep_defaults_and_custom_headers_stay_free
             "type": "http",
             "endpoint_url": "https://audit.example.com/x",
             "custom_headers": {
-                "Authorization": "Bearer ${AUDIT_TOKEN}",
+                "Authorization": "Bearer ${secret:AUDIT_TOKEN}",
                 "X-Custom-Collector": "fleet-a"
             },
             "retry_delay_ms": 250
@@ -658,6 +700,7 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "include_consumer_username",
             "include_client_ip",
             "include_raw_headers",
+            "path_mode",
         ]
     );
     assert_eq!(
@@ -2980,10 +3023,9 @@ async fn buffered_json_response_not_captured_when_response_capture_disabled() {
 }
 
 #[tokio::test]
-async fn custom_sink_headers_are_sent_with_env_expansion() {
-    // Exercises parse_sink_headers + the send_batch header loop + `${VAR}`
-    // expansion across all forms: a set var, an unset var, an invalid name, and
-    // an unterminated placeholder (kept literal).
+async fn custom_sink_headers_materialize_allowlisted_secret_and_literals() {
+    // A `${secret:NAME}` reference resolves ONLY FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>,
+    // and is materialized once at activation. Literal segments pass through.
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let config = json!({
@@ -2994,13 +3036,22 @@ async fn custom_sink_headers_are_sent_with_env_expansion() {
             "batch_size": 1,
             "flush_interval_ms": 100,
             "custom_headers": {
-                "x-audit-token": "set:${PATH}|unset:${FERRUM_AUDIT_UNSET_XYZ}|bad:${9nope}|open:${trail"
+                "Authorization": "Bearer ${secret:AUDIT_TOKEN}",
+                "x-fixed": "fleet-a"
             }
         }
     });
-    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
-    plugin.start_background_tasks().expect("live start");
-    plugin.commit_background_tasks();
+    // Materialize the secret into the worker while holding the env lock, then
+    // drop the guard (restoring the env) before the async roundtrip — the worker
+    // never re-reads the environment, so the header stays materialized.
+    let plugin = {
+        let env = EnvGuard::new(&["FERRUM_TRANSCRIPT_SINK_SECRET_AUDIT_TOKEN"]);
+        env.set("FERRUM_TRANSCRIPT_SINK_SECRET_AUDIT_TOKEN", "s3cr3t-value");
+        let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        plugin
+    };
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -3012,32 +3063,133 @@ async fn custom_sink_headers_are_sent_with_env_expansion() {
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
     let received = server.received_requests().await.unwrap_or_default();
-    let header = received
-        .iter()
-        .find_map(|request| {
-            request
-                .headers
-                .get("x-audit-token")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
+    let request = received.last().expect("a sink request");
+    let authorization = request
+        .headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .expect("authorization header present");
+    assert_eq!(authorization, "Bearer s3cr3t-value", "secret must materialize");
+    let fixed = request
+        .headers
+        .get("x-fixed")
+        .and_then(|value| value.to_str().ok())
+        .expect("literal header present");
+    assert_eq!(fixed, "fleet-a");
+}
+
+#[test]
+fn unrelated_process_env_cannot_be_referenced_in_sink_headers() {
+    // The core of #3047: no generic `${NAME}` interpolation. Every attempt to
+    // reference an unrelated env var — Ferrum, database, cloud, or system — is a
+    // hard config error at parse (no environment is read to decide this).
+    let cfg = |value: &str| {
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "custom_headers": { "Authorization": value }
+            }
         })
-        .expect("custom header present on the sink request");
+    };
+    let client = loopback_http_client();
+    for hostile in [
+        "Bearer ${FERRUM_DATABASE_PASSWORD}",
+        "${FERRUM_ADMIN_JWT_SECRET}",
+        "${FERRUM_DB_URL}",
+        "${AWS_SECRET_ACCESS_KEY}",
+        "${AZURE_CLIENT_SECRET}",
+        "${GOOGLE_APPLICATION_CREDENTIALS}",
+        "${PATH}",
+        "${HOME}",
+        "${env:FERRUM_DB_URL}",
+        "${secret:lowercase}",
+        "${secret:}",
+        "${secret:HAS SPACE}",
+        "${secret:9LEADING_DIGIT}",
+        "Bearer ${secret:UNCLOSED",
+    ] {
+        let result = AiTranscriptAudit::new(&cfg(hostile), client.clone());
+        assert!(
+            result.is_err(),
+            "hostile/invalid header reference must be rejected at admission: {hostile}"
+        );
+    }
+    // The one allowlisted, well-formed form parses (secret resolved later).
+    let allowed = AiTranscriptAudit::new(&cfg("Bearer ${secret:AUDIT_TOKEN}"), client.clone());
+    assert!(allowed.is_ok());
+    // An empty literal value is also rejected.
+    let empty = AiTranscriptAudit::new(&cfg(""), client);
+    assert!(empty.is_err());
+}
+
+#[tokio::test]
+async fn missing_empty_or_invalid_sink_secret_fails_activation() {
+    // #3069: a referenced-but-unset/empty/invalid secret must fail activation
+    // (start_background_tasks Err), so the plugin generation is never published
+    // instead of the header being skipped and the batch sent anyway.
+    let env = EnvGuard::new(&["FERRUM_TRANSCRIPT_SINK_SECRET_ACTIVATE"]);
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": "https://audit.example.com/x",
+            "custom_headers": { "Authorization": "Bearer ${secret:ACTIVATE}" }
+        }
+    });
+
+    // Unset -> activation fails.
+    env.unset("FERRUM_TRANSCRIPT_SINK_SECRET_ACTIVATE");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("config parses");
+    assert!(plugin.start_background_tasks().is_err(), "unset secret must fail activation");
+
+    // Empty -> activation fails.
+    env.set("FERRUM_TRANSCRIPT_SINK_SECRET_ACTIVATE", "");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("config parses");
+    assert!(plugin.start_background_tasks().is_err(), "empty secret must fail activation");
+
+    // A value that produces an invalid HeaderValue (embedded newline) -> fails.
+    env.set("FERRUM_TRANSCRIPT_SINK_SECRET_ACTIVATE", "line1\nline2");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("config parses");
     assert!(
-        !header.contains("${FERRUM_AUDIT_UNSET_XYZ}"),
-        "unset var must expand away: {header}"
+        plugin.start_background_tasks().is_err(),
+        "secret that yields an invalid header value must fail activation"
     );
+
+    // A valid value -> activation succeeds.
+    env.set("FERRUM_TRANSCRIPT_SINK_SECRET_ACTIVATE", "good-token");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("config parses");
+    assert!(plugin.start_background_tasks().is_ok(), "valid secret must activate");
+    plugin.commit_background_tasks();
+}
+
+#[tokio::test]
+async fn first_request_fail_closed_when_required_sink_secret_missing() {
+    // With on_sink_error=reject and a required auth secret that is not set,
+    // activation fails. The plugin-cache generation containing this instance is
+    // therefore rejected (start_background_tasks failure aborts the generation),
+    // so admission never begins healthy and the first request is never admitted
+    // and sent unauthenticated. Providing the secret lets activation proceed.
+    let env = EnvGuard::new(&["FERRUM_TRANSCRIPT_SINK_SECRET_FIRSTREQ"]);
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": "https://audit.example.com/x",
+            "on_sink_error": "reject",
+            "custom_headers": { "Authorization": "Bearer ${secret:FIRSTREQ}" }
+        }
+    });
+
+    env.unset("FERRUM_TRANSCRIPT_SINK_SECRET_FIRSTREQ");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("config parses");
     assert!(
-        header.contains("unset:|"),
-        "unset var expands to empty: {header}"
+        plugin.start_background_tasks().is_err(),
+        "reject-on-error with a missing auth secret must fail activation before admission"
     );
-    assert!(
-        header.contains("bad:${9nope}"),
-        "invalid env name kept literal: {header}"
-    );
-    assert!(
-        header.contains("open:${trail"),
-        "unterminated placeholder kept literal: {header}"
-    );
+
+    env.set("FERRUM_TRANSCRIPT_SINK_SECRET_FIRSTREQ", "token");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("config parses");
+    assert!(plugin.start_background_tasks().is_ok());
+    plugin.commit_background_tasks();
 }
 
 #[tokio::test]
@@ -3056,6 +3208,125 @@ async fn custom_sink_headers_validation_errors() {
     assert!(
         AiTranscriptAudit::new(&cfg(json!({ "bad name!": "v" })), loopback_http_client()).is_err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Path privacy (#3068)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn privacy_modes_default_to_route_template_not_literal_path() {
+    // #3068: metadata_only / redacted_body / hash_only must NOT export the
+    // literal sensitive path by default — they export the route identifier.
+    for mode in ["metadata_only", "redacted_body", "hash_only"] {
+        let ctx = ctx_with_path(SENSITIVE_PATH, true);
+        let records = capture_roundtrip_over_ctx(json!({ "mode": mode }), ctx).await;
+        assert_eq!(records.len(), 1, "mode {mode}");
+        assert_eq!(
+            records[0]["path"], "/test",
+            "mode {mode} must export the route template, not the literal path"
+        );
+        let serialized = records[0].to_string();
+        assert!(
+            !serialized.contains("alice@example.com") && !serialized.contains("SECRET-9f1c"),
+            "mode {mode} leaked a sensitive path segment: {serialized}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_body_mode_defaults_to_raw_path() {
+    // full_body is the deliberate raw-capture opt-in, so the literal path is
+    // exported by default there (and only there).
+    let records = capture_roundtrip_over_ctx(
+        json!({ "mode": "full_body", "allow_full_body": true }),
+        ctx_with_path(SENSITIVE_PATH, true),
+    )
+    .await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["path"], SENSITIVE_PATH);
+}
+
+#[tokio::test]
+async fn explicit_path_modes_transform_sensitive_path() {
+    // omit -> no path field at all.
+    let records = capture_roundtrip_over_ctx(
+        json!({ "privacy": { "path_mode": "omit" } }),
+        ctx_with_path(SENSITIVE_PATH, true),
+    )
+    .await;
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0].get("path").is_none(),
+        "omit must not export a path"
+    );
+
+    // redact -> literal path with the PII redactor applied (email removed).
+    let records = capture_roundtrip_over_ctx(
+        json!({ "privacy": { "path_mode": "redact" } }),
+        ctx_with_path(SENSITIVE_PATH, true),
+    )
+    .await;
+    let path = records[0]["path"].as_str().expect("redacted path present");
+    assert!(
+        !path.contains("alice@example.com") && path.contains("[REDACTED"),
+        "redact must remove the email: {path}"
+    );
+
+    // hash -> keyed HMAC-SHA256 hex digest, no literal leakage.
+    let records = capture_roundtrip_over_ctx(
+        json!({ "privacy": { "path_mode": "hash" } }),
+        ctx_with_path(SENSITIVE_PATH, true),
+    )
+    .await;
+    let path = records[0]["path"].as_str().expect("hashed path present");
+    assert_eq!(path.len(), 64, "hex sha256 digest: {path}");
+    assert!(
+        path.bytes().all(|b| b.is_ascii_hexdigit()) && !path.contains("alice"),
+        "hash must not leak segments: {path}"
+    );
+
+    // raw -> literal path verbatim (explicit opt-in).
+    let records = capture_roundtrip_over_ctx(
+        json!({ "privacy": { "path_mode": "raw" } }),
+        ctx_with_path(SENSITIVE_PATH, true),
+    )
+    .await;
+    assert_eq!(records[0]["path"], SENSITIVE_PATH);
+
+    // template with no matched proxy -> omitted (no route identifier available),
+    // never a fallback to the literal path.
+    let records = capture_roundtrip_over_ctx(
+        json!({ "privacy": { "path_mode": "template" } }),
+        ctx_with_path(SENSITIVE_PATH, false),
+    )
+    .await;
+    assert!(
+        records[0].get("path").is_none(),
+        "template without a route identifier must omit the path, not fall back to literal"
+    );
+}
+
+#[test]
+fn path_mode_redact_requires_a_redaction_pattern() {
+    // A pass-through redactor would export the literal path while claiming
+    // redaction, so redact mode requires at least one pattern.
+    let config = json!({
+        "mode": "hash_only",
+        "redaction": { "builtins": [] },
+        "privacy": { "path_mode": "redact" },
+        "sink": { "type": "http", "endpoint_url": "https://audit.example.com/x" }
+    });
+    assert!(AiTranscriptAudit::new(&config, loopback_http_client()).is_err());
+}
+
+#[test]
+fn invalid_path_mode_rejected() {
+    let config = json!({
+        "privacy": { "path_mode": "verbatim" },
+        "sink": { "type": "http", "endpoint_url": "https://audit.example.com/x" }
+    });
+    assert!(AiTranscriptAudit::new(&config, loopback_http_client()).is_err());
 }
 
 #[tokio::test]
