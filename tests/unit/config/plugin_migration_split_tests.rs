@@ -175,6 +175,15 @@ fn postgres_dollar_quoted_bodies_preserve_internal_semicolons() {
 }
 
 #[test]
+fn postgres_dollar_quoted_body_handles_non_ascii_without_byte_boundary_panics() {
+    assert_split(
+        "postgres",
+        "CREATE FUNCTION f() RETURNS text AS $body$ SELECT '日本語;é'; $body$ LANGUAGE sql;",
+        &["CREATE FUNCTION f() RETURNS text AS $body$ SELECT '日本語;é'; $body$ LANGUAGE sql"],
+    );
+}
+
+#[test]
 fn concurrently_inside_dollar_quote_stays_in_function_body_statement() {
     let sql = r#"
         CREATE FUNCTION f() RETURNS void AS $$

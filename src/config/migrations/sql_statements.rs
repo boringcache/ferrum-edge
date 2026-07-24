@@ -598,10 +598,11 @@ fn try_scan_dollar_quoted(
         return Ok(None);
     }
     let closer = &sql[start..=tag_end]; // includes both `$` markers
+    let closer_bytes = closer.as_bytes();
     let mut i = tag_end + 1;
-    while i + closer.len() <= bytes.len() {
-        if sql[i..].starts_with(closer) {
-            return Ok(Some(i + closer.len()));
+    while i + closer_bytes.len() <= bytes.len() {
+        if bytes[i..].starts_with(closer_bytes) {
+            return Ok(Some(i + closer_bytes.len()));
         }
         i += 1;
     }
