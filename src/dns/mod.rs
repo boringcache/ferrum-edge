@@ -11,6 +11,7 @@
 //! implementation that plugs into every `reqwest::Client` so all HTTP clients
 //! automatically use the shared cache.
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures_util::stream::{self, StreamExt};
 use hickory_resolver::Resolver;
@@ -205,6 +206,27 @@ struct DnsCacheEntry {
     /// failed-retry task is enabled, so decommissioned hostnames cannot
     /// occupy the cache forever.
     first_failed_at: Option<Instant>,
+}
+
+/// Exact identity of an error-cache generation selected for a failed retry.
+///
+/// A background retry awaits DNS after selection; a foreground lookup/refresh
+/// may replace the entry while that resolve is pending. Retry outcomes are
+/// published only when the live cache entry still matches this snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FailedRetryGeneration {
+    consecutive_failures: u32,
+    first_failed_at: Instant,
+    expires_at: Instant,
+}
+
+/// One hostname selected for a failed-retry cycle, with the error generation
+/// that must still be present when the outcome is published.
+#[derive(Clone, Debug)]
+struct FailedRetryCandidate {
+    hostname: String,
+    per_proxy_ttl: Option<u64>,
+    generation: FailedRetryGeneration,
 }
 
 /// Asynchronous DNS resolver with in-memory caching, stale-while-revalidate,
@@ -1143,10 +1165,14 @@ impl DnsCache {
     /// Aged-out error entries are removed immediately. Candidates are ordered
     /// by `first_failed_at` (oldest first) so a large backlog cannot starve
     /// long-lived failures behind a burst of newer ones.
-    fn select_failed_retry_candidates(&self, now: Instant) -> Vec<(String, Option<u64>, u32)> {
+    ///
+    /// Each candidate carries an exact error-generation snapshot so the later
+    /// publish path can refuse stale outcomes if a foreground lookup/refresh
+    /// replaced the entry while DNS was in flight.
+    fn select_failed_retry_candidates(&self, now: Instant) -> Vec<FailedRetryCandidate> {
         let error_max_age = self.failed_entry_lifetime_cap();
         let mut aged_out: Vec<String> = Vec::new();
-        let mut candidates: Vec<(String, Option<u64>, u32, Instant)> = Vec::new();
+        let mut candidates: Vec<FailedRetryCandidate> = Vec::new();
 
         for entry in self.cache.iter() {
             if !entry.is_error {
@@ -1158,12 +1184,15 @@ impl DnsCache {
             }
             if entry.expires_at <= now {
                 let first_failed_at = entry.first_failed_at.unwrap_or(entry.expires_at);
-                candidates.push((
-                    entry.key().clone(),
-                    entry.original_per_proxy_ttl,
-                    entry.consecutive_failures,
-                    first_failed_at,
-                ));
+                candidates.push(FailedRetryCandidate {
+                    hostname: entry.key().clone(),
+                    per_proxy_ttl: entry.original_per_proxy_ttl,
+                    generation: FailedRetryGeneration {
+                        consecutive_failures: entry.consecutive_failures,
+                        first_failed_at,
+                        expires_at: entry.expires_at,
+                    },
+                });
             }
         }
 
@@ -1171,16 +1200,115 @@ impl DnsCache {
             self.cache.remove(&hostname);
         }
 
-        candidates.sort_by_key(|(_, _, _, first_failed_at)| *first_failed_at);
+        candidates.sort_by_key(|c| c.generation.first_failed_at);
         candidates.truncate(self.max_concurrent_refreshes);
         candidates
-            .into_iter()
-            .map(|(host, ttl, failures, _)| (host, ttl, failures))
-            .collect()
+    }
+
+    /// Whether `entry` is still the exact error generation selected for retry.
+    fn matches_failed_retry_generation(
+        entry: &DnsCacheEntry,
+        generation: &FailedRetryGeneration,
+    ) -> bool {
+        entry.is_error
+            && entry.consecutive_failures == generation.consecutive_failures
+            && entry.first_failed_at == Some(generation.first_failed_at)
+            && entry.expires_at == generation.expires_at
+    }
+
+    /// Publish a failed-retry success only if the selected error generation is
+    /// still live. IP-policy validation runs before any map mutation; the
+    /// generation check and replacement are atomic under the DashMap entry
+    /// guard (no check-then-insert TOCTOU). The guard is never held across
+    /// await — callers resolve DNS before invoking this.
+    ///
+    /// Returns `Ok(Some(addrs))` when published, `Ok(None)` when the generation
+    /// changed or the key was removed, and `Err` when addresses are denied by
+    /// IP policy (nothing is written).
+    fn apply_failed_retry_success(
+        &self,
+        hostname: &str,
+        generation: &FailedRetryGeneration,
+        addresses: Vec<IpAddr>,
+        record_type: Option<CachedRecordType>,
+        ttl: Duration,
+        original_per_proxy_ttl: Option<u64>,
+    ) -> Result<Option<Vec<IpAddr>>, anyhow::Error> {
+        let ttl = ttl.min(Self::MAX_TTL);
+        // Validate before taking the shard lock so a denied answer is never
+        // published and the guard is not held across policy work.
+        self.check_backend_addresses_policy(&addresses, hostname)?;
+        let cache_key = dns_hostname_key(hostname);
+        let now = Instant::now();
+
+        match self.cache.entry(cache_key.into_owned()) {
+            Entry::Occupied(mut occupied) => {
+                if !Self::matches_failed_retry_generation(occupied.get(), generation) {
+                    return Ok(None);
+                }
+                occupied.insert(DnsCacheEntry {
+                    addresses: addresses.clone(),
+                    expires_at: now + ttl,
+                    stale_deadline: now + ttl + self.stale_ttl,
+                    applied_ttl: ttl,
+                    record_type_used: record_type,
+                    is_error: false,
+                    original_per_proxy_ttl,
+                    consecutive_failures: 0,
+                    first_failed_at: None,
+                });
+                Ok(Some(addresses))
+            }
+            Entry::Vacant(_) => Ok(None),
+        }
+    }
+
+    /// Re-cache a failed-retry error only if the selected error generation is
+    /// still live. Check and replacement are atomic under the DashMap entry
+    /// guard. Returns `true` when the error was published.
+    fn apply_failed_retry_error(
+        &self,
+        hostname: &str,
+        generation: &FailedRetryGeneration,
+        per_proxy_ttl: Option<u64>,
+    ) -> bool {
+        let cache_key = dns_hostname_key(hostname);
+        let now = Instant::now();
+
+        match self.cache.entry(cache_key.into_owned()) {
+            Entry::Occupied(mut occupied) => {
+                let current = occupied.get();
+                if !Self::matches_failed_retry_generation(current, generation) {
+                    return false;
+                }
+                let prior_ttl = current.original_per_proxy_ttl;
+                let consecutive_failures = current.consecutive_failures.saturating_add(1);
+                let first_failed_at = current.first_failed_at.or(Some(now));
+                let ttl = self.error_backoff_ttl(consecutive_failures);
+                occupied.insert(DnsCacheEntry {
+                    addresses: vec![],
+                    expires_at: now + ttl,
+                    stale_deadline: now + ttl,
+                    applied_ttl: ttl,
+                    record_type_used: None,
+                    is_error: true,
+                    original_per_proxy_ttl: per_proxy_ttl.or(prior_ttl),
+                    consecutive_failures,
+                    first_failed_at,
+                });
+                debug!(
+                    "DNS cached error for {} (ttl={:?}, consecutive_failures={})",
+                    hostname, ttl, consecutive_failures
+                );
+                true
+            }
+            Entry::Vacant(_) => false,
+        }
     }
 
     /// Run one failed-retry cycle: select eligible error entries, re-resolve
-    /// them with bounded concurrency, and re-cache / promote outcomes.
+    /// them with bounded concurrency, and re-cache / promote outcomes only
+    /// when the selected error generation is still current.
     async fn run_failed_retry_cycle(&self) {
         let now = Instant::now();
         let to_retry = self.select_failed_retry_candidates(now);
@@ -1195,10 +1323,14 @@ impl DnsCache {
 
         let concurrency = self.max_concurrent_refreshes;
         stream::iter(to_retry)
-            .for_each_concurrent(concurrency, |(hostname, per_proxy_ttl, consecutive_failures)| {
+            .for_each_concurrent(concurrency, |candidate| {
                 let cache = self.clone();
                 async move {
-                    let noisy = consecutive_failures < Self::FAILED_RETRY_WARN_FAILURES;
+                    let hostname = candidate.hostname;
+                    let per_proxy_ttl = candidate.per_proxy_ttl;
+                    let generation = candidate.generation;
+                    let noisy =
+                        generation.consecutive_failures < Self::FAILED_RETRY_WARN_FAILURES;
                     if noisy {
                         warn!(
                             "DNS failed retry: re-attempting resolution for '{}'",
@@ -1214,19 +1346,26 @@ impl DnsCache {
                     match cache.timed_resolve(&hostname).await {
                         Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                             let ttl = cache.effective_ttl(native_ttl, per_proxy_ttl);
-                            match cache.cache_success_entry(
+                            match cache.apply_failed_retry_success(
                                 &hostname,
+                                &generation,
                                 addrs,
                                 record_type,
                                 ttl,
                                 per_proxy_ttl,
                             ) {
-                                Ok(addrs) => {
+                                Ok(Some(addrs)) => {
                                     // Successful recovery is always worth a warn
                                     // so operators notice the outage ended.
                                     warn!(
                                         "DNS failed retry: '{}' resolved successfully -> {:?} (ttl={:?})",
                                         hostname, addrs[0], ttl
+                                    );
+                                }
+                                Ok(None) => {
+                                    debug!(
+                                        "DNS failed retry: abandoning stale success for '{}' (cache generation changed during resolve)",
+                                        hostname
                                     );
                                 }
                                 Err(e) => {
@@ -1245,25 +1384,51 @@ impl DnsCache {
                             }
                         }
                         Ok(_) => {
-                            cache.cache_error(&hostname, per_proxy_ttl);
-                            if noisy {
-                                warn!(
-                                    "DNS failed retry: '{}' still returning no addresses",
-                                    hostname
-                                );
+                            if cache.apply_failed_retry_error(
+                                &hostname,
+                                &generation,
+                                per_proxy_ttl,
+                            ) {
+                                if noisy {
+                                    warn!(
+                                        "DNS failed retry: '{}' still returning no addresses",
+                                        hostname
+                                    );
+                                } else {
+                                    debug!(
+                                        "DNS failed retry: '{}' still returning no addresses",
+                                        hostname
+                                    );
+                                }
                             } else {
                                 debug!(
-                                    "DNS failed retry: '{}' still returning no addresses",
+                                    "DNS failed retry: abandoning stale empty result for '{}' (cache generation changed during resolve)",
                                     hostname
                                 );
                             }
                         }
                         Err(e) => {
-                            cache.cache_error(&hostname, per_proxy_ttl);
-                            if noisy {
-                                warn!("DNS failed retry: '{}' still failing: {}", hostname, e);
+                            if cache.apply_failed_retry_error(
+                                &hostname,
+                                &generation,
+                                per_proxy_ttl,
+                            ) {
+                                if noisy {
+                                    warn!(
+                                        "DNS failed retry: '{}' still failing: {}",
+                                        hostname, e
+                                    );
+                                } else {
+                                    debug!(
+                                        "DNS failed retry: '{}' still failing: {}",
+                                        hostname, e
+                                    );
+                                }
                             } else {
-                                debug!("DNS failed retry: '{}' still failing: {}", hostname, e);
+                                debug!(
+                                    "DNS failed retry: abandoning stale failure for '{}' (cache generation changed during resolve)",
+                                    hostname
+                                );
                             }
                         }
                     }
@@ -1383,10 +1548,13 @@ impl DnsCache {
     /// entries older than `stale_ttl` are eventually evicted.
     ///
     /// Each cycle selects at most `max_concurrent_refreshes` eligible entries
-    /// and resolves them concurrently (same bound). Missed interval ticks use
-    /// `Delay` so a slow cycle cannot burst catch-up ticks. Retry attempt /
-    /// failure logs start at `warn` and demote to `debug` after the first few
-    /// consecutive failures; successful recovery always logs at `warn`.
+    /// and resolves them concurrently (same bound). Outcomes are published
+    /// only when the selected error generation is still current, so a stale
+    /// background resolve cannot overwrite a newer foreground success/failure.
+    /// Missed interval ticks use `Delay` so a slow cycle cannot burst catch-up
+    /// ticks. Retry attempt / failure logs start at `warn` and demote to
+    /// `debug` after the first few consecutive failures; successful recovery
+    /// always logs at `warn`.
     ///
     /// Returns `None` if the retry interval is zero (disabled).
     pub fn start_failed_retry_task(
@@ -2368,130 +2536,203 @@ mod tests {
             "selection must prune aged-out error entries"
         );
         assert_eq!(selected.len(), 2, "cycle work must be bounded");
-        assert_eq!(selected[0].0, "old-a.invalid");
-        assert_eq!(selected[1].0, "old-b.invalid");
+        assert_eq!(selected[0].hostname, "old-a.invalid");
+        assert_eq!(selected[1].hostname, "old-b.invalid");
         assert!(
-            !selected.iter().any(|(h, _, _)| h == "fresh.invalid"),
+            !selected.iter().any(|c| c.hostname == "fresh.invalid"),
             "unexpired error entries must not be selected"
         );
+        assert_eq!(selected[0].generation.consecutive_failures, 0);
+        assert_eq!(selected[1].generation.consecutive_failures, 1);
     }
 
-    /// Drive the real failed-retry task under paused tokio time so interval
-    /// cadence is deterministic without wall-clock sleeps. Entry ages use
-    /// `std::time::Instant` offsets so eviction / selection stay wall-clock
-    /// independent of the paused runtime.
-    #[tokio::test(start_paused = true)]
-    async fn failed_retry_task_backs_off_and_evicts_under_paused_time() {
+    fn snapshot_error_generation(cache: &DnsCache, hostname: &str) -> FailedRetryGeneration {
+        let entry = cache.cache.get(hostname).expect("error entry");
+        assert!(entry.is_error, "expected error generation for {hostname}");
+        FailedRetryGeneration {
+            consecutive_failures: entry.consecutive_failures,
+            first_failed_at: entry.first_failed_at.expect("error entries record first_failed_at"),
+            expires_at: entry.expires_at,
+        }
+    }
+
+    #[test]
+    fn apply_failed_retry_error_advances_backoff_when_generation_matches() {
         let cache = DnsCache::new(DnsConfig {
             error_ttl_seconds: 5,
-            stale_ttl_seconds: 20,
-            failed_retry_interval_seconds: 10,
-            max_concurrent_refreshes: 4,
+            stale_ttl_seconds: 3600,
             ..DnsConfig::default()
         });
+        insert_error_entry(&cache, "dead.example", -1, 0, Duration::from_secs(1));
+        let generation = snapshot_error_generation(&cache, "dead.example");
 
-        // Eligible immediately (expired TTL), young enough to retry.
-        insert_error_entry(
-            &cache,
-            "this-domain-absolutely-does-not-exist.invalid",
-            -1,
-            0,
-            Duration::from_secs(1),
-        );
-        // Already past the age cap — must be pruned on the first cycle.
-        insert_error_entry(
-            &cache,
-            "aged-out.invalid",
-            -1,
-            4,
-            Duration::from_secs(21),
-        );
-
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-        let handle = cache
-            .start_failed_retry_task(Some(shutdown_tx.subscribe()))
-            .expect("retry task enabled");
-
-        // First tick fires immediately under tokio's interval semantics.
-        tokio::task::yield_now().await;
-        // Allow the first cycle's DNS attempt to complete (network I/O is not
-        // paused; `.invalid` fails quickly).
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert!(
-            cache.cache.get("aged-out.invalid").is_none(),
-            "aged-out entry must be pruned on the first retry cycle"
-        );
+        assert!(cache.apply_failed_retry_error("dead.example", &generation, None));
         {
-            let entry = cache
-                .cache
-                .get("this-domain-absolutely-does-not-exist.invalid")
-                .expect("retried error should remain cached with backoff");
-            assert!(entry.is_error);
-            assert!(
-                entry.consecutive_failures >= 1,
-                "failed retry must increment consecutive_failures, got {}",
-                entry.consecutive_failures
-            );
-            assert!(
-                entry.applied_ttl >= Duration::from_secs(10),
-                "failed retry must double error TTL, got {:?}",
-                entry.applied_ttl
-            );
+            let entry = cache.cache.get("dead.example").expect("error entry");
+            assert_eq!(entry.consecutive_failures, 1);
+            assert_eq!(entry.applied_ttl, Duration::from_secs(10));
+            assert_eq!(entry.first_failed_at, Some(generation.first_failed_at));
         }
-
-        // Advance past the age cap relative to the original first_failed_at
-        // by re-seeding an aged entry and letting eviction run via a cycle.
-        insert_error_entry(
-            &cache,
-            "this-domain-absolutely-does-not-exist.invalid",
-            -1,
-            5,
-            Duration::from_secs(21),
-        );
-        cache.evict_expired();
-        assert!(
-            cache
-                .cache
-                .get("this-domain-absolutely-does-not-exist.invalid")
-                .is_none(),
-            "error entry past stale_ttl age must be dropped"
-        );
-
-        let _ = shutdown_tx.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn run_failed_retry_cycle_selects_only_eligible_entries() {
+    /// A stale retry success must not overwrite a newer foreground success
+    /// that replaced the selected error generation while DNS was in flight.
+    #[test]
+    fn failed_retry_success_does_not_overwrite_newer_foreground_success() {
         let cache = DnsCache::new(DnsConfig {
             error_ttl_seconds: 5,
             stale_ttl_seconds: 60,
-            max_concurrent_refreshes: 1,
-            failed_retry_interval_seconds: 10,
             ..DnsConfig::default()
         });
+        insert_error_entry(&cache, "svc.example", -1, 1, Duration::from_secs(2));
+        let stale_generation = snapshot_error_generation(&cache, "svc.example");
 
-        insert_error_entry(&cache, "fresh.invalid", 30, 0, Duration::from_secs(1));
-        insert_error_entry(
-            &cache,
-            "this-domain-absolutely-does-not-exist.invalid",
-            -1,
-            0,
-            Duration::from_secs(2),
-        );
+        // Foreground recovery while the background retry resolve is pending.
+        let foreground_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10));
+        cache
+            .cache_success_entry(
+                "svc.example",
+                vec![foreground_ip],
+                None,
+                Duration::from_secs(30),
+                Some(30),
+            )
+            .expect("foreground success");
 
-        cache.run_failed_retry_cycle().await;
-
+        let stale_ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
+        let applied = cache
+            .apply_failed_retry_success(
+                "svc.example",
+                &stale_generation,
+                vec![stale_ip],
+                None,
+                Duration::from_secs(30),
+                None,
+            )
+            .expect("policy allows documentation addresses");
         assert!(
-            cache.cache.get("fresh.invalid").is_some(),
-            "unexpired error must not be touched by a retry cycle"
+            applied.is_none(),
+            "stale retry success must abandon when generation changed"
         );
-        let retried = cache
+
+        let entry = cache.cache.get("svc.example").expect("foreground entry");
+        assert!(!entry.is_error);
+        assert_eq!(entry.addresses, vec![foreground_ip]);
+        assert_eq!(entry.original_per_proxy_ttl, Some(30));
+        assert_eq!(entry.consecutive_failures, 0);
+    }
+
+    /// Inverse generation change: a stale retry failure must not re-error a
+    /// recovered entry, and must not advance backoff on a newer error streak.
+    #[test]
+    fn failed_retry_error_does_not_overwrite_newer_generation() {
+        let cache = DnsCache::new(DnsConfig {
+            error_ttl_seconds: 5,
+            stale_ttl_seconds: 60,
+            ..DnsConfig::default()
+        });
+        insert_error_entry(&cache, "svc.example", -1, 0, Duration::from_secs(1));
+        let stale_generation = snapshot_error_generation(&cache, "svc.example");
+
+        // Newer foreground success — stale retry failure must not restore error.
+        let foreground_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 20));
+        cache
+            .cache_success_entry(
+                "svc.example",
+                vec![foreground_ip],
+                None,
+                Duration::from_secs(45),
+                None,
+            )
+            .expect("foreground success");
+        assert!(!cache.apply_failed_retry_error("svc.example", &stale_generation, None));
+        {
+            let entry = cache.cache.get("svc.example").expect("success entry");
+            assert!(!entry.is_error);
+            assert_eq!(entry.addresses, vec![foreground_ip]);
+        }
+
+        // Re-seed an error, then advance the failure streak (as a concurrent
+        // request-path cache_error would) so the original generation is stale.
+        insert_error_entry(&cache, "svc.example", -1, 0, Duration::from_secs(1));
+        let older_generation = snapshot_error_generation(&cache, "svc.example");
+        cache.cache_error("svc.example", None);
+        {
+            let entry = cache.cache.get("svc.example").expect("newer error");
+            assert_eq!(entry.consecutive_failures, 1);
+            assert_eq!(entry.applied_ttl, Duration::from_secs(10));
+        }
+        assert!(
+            !cache.apply_failed_retry_error("svc.example", &older_generation, None),
+            "stale retry must not advance a newer error generation's backoff"
+        );
+        {
+            let entry = cache.cache.get("svc.example").expect("newer error retained");
+            assert!(entry.is_error);
+            assert_eq!(entry.consecutive_failures, 1);
+            assert_eq!(entry.applied_ttl, Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn apply_failed_retry_success_publishes_when_generation_matches() {
+        let cache = DnsCache::new(DnsConfig {
+            error_ttl_seconds: 5,
+            stale_ttl_seconds: 60,
+            ..DnsConfig::default()
+        });
+        insert_error_entry(&cache, "svc.example", -1, 2, Duration::from_secs(3));
+        let generation = snapshot_error_generation(&cache, "svc.example");
+        let recovered = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 30));
+
+        let applied = cache
+            .apply_failed_retry_success(
+                "svc.example",
+                &generation,
+                vec![recovered],
+                None,
+                Duration::from_secs(60),
+                Some(60),
+            )
+            .expect("policy allows documentation addresses")
+            .expect("matching generation must publish");
+        assert_eq!(applied, vec![recovered]);
+
+        let entry = cache.cache.get("svc.example").expect("recovered entry");
+        assert!(!entry.is_error);
+        assert_eq!(entry.addresses, vec![recovered]);
+        assert_eq!(entry.consecutive_failures, 0);
+        assert!(entry.first_failed_at.is_none());
+        assert_eq!(entry.original_per_proxy_ttl, Some(60));
+    }
+
+    #[test]
+    fn apply_failed_retry_success_rejects_denied_addresses_without_publishing() {
+        let cache = DnsCache::new(DnsConfig {
+            error_ttl_seconds: 5,
+            stale_ttl_seconds: 60,
+            backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+            ..DnsConfig::default()
+        });
+        insert_error_entry(&cache, "metadata.internal", -1, 0, Duration::from_secs(1));
+        let generation = snapshot_error_generation(&cache, "metadata.internal");
+
+        let result = cache.apply_failed_retry_success(
+            "metadata.internal",
+            &generation,
+            vec!["169.254.169.254".parse().unwrap()],
+            Some(CachedRecordType::A),
+            Duration::from_secs(60),
+            None,
+        );
+        assert!(result.is_err());
+
+        let entry = cache
             .cache
-            .get("this-domain-absolutely-does-not-exist.invalid")
-            .expect("eligible error should be re-cached after failed retry");
-        assert_eq!(retried.consecutive_failures, 1);
-        assert_eq!(retried.applied_ttl, Duration::from_secs(10));
+            .get("metadata.internal")
+            .expect("denied retry must leave the selected error generation intact");
+        assert!(entry.is_error);
+        assert_eq!(entry.consecutive_failures, generation.consecutive_failures);
+        assert_eq!(entry.expires_at, generation.expires_at);
     }
 }

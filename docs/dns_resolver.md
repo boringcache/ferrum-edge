@@ -110,6 +110,7 @@ Lifecycle bounds (so decommissioned hostnames cannot warn-spam or occupy cache f
 - **Exponential error-TTL backoff**: the first failure caches for `FERRUM_DNS_ERROR_TTL`; each consecutive failure doubles that TTL, capped at `FERRUM_DNS_STALE_TTL` (or 1 day when stale TTL is `0`).
 - **Age eviction**: error entries older than `FERRUM_DNS_STALE_TTL` from their first failure are dropped even while the retry task is enabled.
 - **Per-cycle work bound**: each cycle selects and resolves at most `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` eligible hostnames (oldest failures first), concurrently — no sequential N×timeout stall and no unbounded fan-out.
+- **Generation-guarded publish**: a retry outcome is written only if the cache entry is still the exact error generation that was selected; a concurrent foreground lookup/refresh that replaced the entry wins, so a stale background resolve cannot restore old IPs or re-error a recovered hostname.
 - **No burst catch-up**: missed interval ticks use delayed behavior so a slow cycle does not fire back-to-back catch-up ticks.
 - **Log severity**: retry attempt / still-failing outcomes log at `warn` for the first few consecutive failures, then demote to `debug`. Successful recovery always logs at `warn`.
 
