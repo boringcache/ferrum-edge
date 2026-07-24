@@ -311,9 +311,7 @@ fn is_port_suffix(rest: &str) -> bool {
 /// credential substring, or contains any operator-configured
 /// `sensitive_header_patterns` substring.
 fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
-    MIRROR_SENSITIVE_HEADER_NAMES
-        .iter()
-        .any(|sensitive| *sensitive == name_lower)
+    MIRROR_SENSITIVE_HEADER_NAMES.contains(&name_lower)
         || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
             .iter()
             .any(|substr| name_lower.contains(substr))
@@ -394,7 +392,7 @@ pub(crate) fn resolve_mirror_timeout_ms(
     let raw = configured_mirror_timeout_ms
         .or_else(|| backend_read_timeout_ms.filter(|ms| *ms > 0))
         .unwrap_or(DEFAULT_MIRROR_TIMEOUT_MS);
-    raw.min(MAX_MIRROR_TIMEOUT_MS).max(1)
+    raw.clamp(1, MAX_MIRROR_TIMEOUT_MS)
 }
 
 /// Strip origin-bound credentials before a distinct mirror origin. Deny by
