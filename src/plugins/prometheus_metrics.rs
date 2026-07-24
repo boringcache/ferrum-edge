@@ -1870,14 +1870,12 @@ impl MetricsRegistry {
             (
                 "ferrum_request_mirror_request_timeouts_total",
                 "request_mirror request-phase deadline expiries (connect/headers/body).",
-                self.request_mirror_request_timeouts
-                    .load(Ordering::Relaxed),
+                self.request_mirror_request_timeouts.load(Ordering::Relaxed),
             ),
             (
                 "ferrum_request_mirror_request_failures_total",
                 "request_mirror pre-response transport failures (DNS, refused, reset, TLS, …).",
-                self.request_mirror_request_failures
-                    .load(Ordering::Relaxed),
+                self.request_mirror_request_failures.load(Ordering::Relaxed),
             ),
             (
                 "ferrum_request_mirror_drain_timeouts_total",

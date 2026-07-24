@@ -343,7 +343,8 @@ pub(crate) fn append_shadow_host_suffix(authority: &str) -> String {
         };
         let inner = &authority[1..close];
         let rest = &authority[close + 1..];
-        if inner.parse::<std::net::Ipv6Addr>().is_ok() && (rest.is_empty() || is_port_suffix(rest)) {
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() && (rest.is_empty() || is_port_suffix(rest))
+        {
             // Bracketed IPv6 (+ optional port): keep a valid authority as-is.
             return authority.to_string();
         }
@@ -848,18 +849,20 @@ impl RequestMirror {
             .transpose()?
             .unwrap_or(DEFAULT_MAX_IN_FLIGHT_MIRRORS);
 
-        let max_retained_request_body_bytes = optional_u64(config, "max_retained_request_body_bytes")?
-            .map(|v| {
-                if v == 0 {
-                    Err(
-                        "request_mirror: 'max_retained_request_body_bytes' must be >= 1".to_string(),
-                    )
-                } else {
-                    Ok(v)
-                }
-            })
-            .transpose()?
-            .unwrap_or(DEFAULT_MAX_RETAINED_REQUEST_BODY_BYTES);
+        let max_retained_request_body_bytes =
+            optional_u64(config, "max_retained_request_body_bytes")?
+                .map(|v| {
+                    if v == 0 {
+                        Err(
+                            "request_mirror: 'max_retained_request_body_bytes' must be >= 1"
+                                .to_string(),
+                        )
+                    } else {
+                        Ok(v)
+                    }
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_MAX_RETAINED_REQUEST_BODY_BYTES);
 
         let mirror_timeout_ms = optional_u64(config, "mirror_timeout_ms")?
             .map(|v| {
@@ -1459,7 +1462,10 @@ impl Plugin for RequestMirror {
             }
         };
 
-        let backend_timeout_ms = ctx.matched_proxy.as_ref().map(|p| p.backend_read_timeout_ms);
+        let backend_timeout_ms = ctx
+            .matched_proxy
+            .as_ref()
+            .map(|p| p.backend_read_timeout_ms);
         let mirror_timeout = Duration::from_millis(resolve_mirror_timeout_ms(
             self.mirror_timeout_ms,
             backend_timeout_ms,
@@ -1572,10 +1578,7 @@ impl Plugin for RequestMirror {
                             warn!(
                                 "request_mirror: response from {} truncated at {} bytes \
                                      (max_response_body_bytes = {}; advertised = {:?})",
-                                mirror_url_for_log,
-                                observed,
-                                max_response_body_bytes,
-                                advertised
+                                mirror_url_for_log, observed, max_response_body_bytes, advertised
                             );
                             (Some(observed), None)
                         }

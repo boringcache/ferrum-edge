@@ -789,7 +789,11 @@ fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
         &json!({ "mirror_host": "mirror.local", "max_in_flight": 1_048_576u64 }),
         PluginHttpClient::default(),
     );
-    assert!(at_cap.is_ok(), "cap value must be accepted: {:?}", at_cap.err());
+    assert!(
+        at_cap.is_ok(),
+        "cap value must be accepted: {:?}",
+        at_cap.err()
+    );
 
     // One above the cap is rejected as a config error.
     let above_cap = RequestMirror::new(
@@ -2088,7 +2092,10 @@ async fn test_mirror_response_body_drains_content_length_and_reports_both_sizes(
     let size = meta
         .mirror_response_size_bytes
         .expect("observed size should be reported");
-    assert_eq!(size, 2048, "bounded drain should report the observed body size");
+    assert_eq!(
+        size, 2048,
+        "bounded drain should report the observed body size"
+    );
     assert_eq!(
         meta.mirror_response_advertised_size_bytes,
         Some(2048),
@@ -3161,7 +3168,10 @@ fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
             pattern
         })
         .collect();
-    let allowlist: Vec<String> = patterns.iter().map(|pattern| format!("x-{pattern}")).collect();
+    let allowlist: Vec<String> = patterns
+        .iter()
+        .map(|pattern| format!("x-{pattern}"))
+        .collect();
     let ok = RequestMirror::new(
         &json!({
             "mirror_host": "mirror.local",
@@ -3229,7 +3239,10 @@ async fn content_length_responses_are_drained_for_http1_connection_reuse() {
         let mut headers = HashMap::new();
         plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
         let meta = ctx.collect_mirror_result().await.expect("mirror meta");
-        assert!(meta.mirror_error.is_none(), "unexpected mirror error: {meta:?}");
+        assert!(
+            meta.mirror_error.is_none(),
+            "unexpected mirror error: {meta:?}"
+        );
         assert_eq!(meta.mirror_response_size_bytes, Some(4));
         assert_eq!(meta.mirror_response_advertised_size_bytes, Some(4));
     }
@@ -3449,10 +3462,13 @@ async fn zero_backend_read_timeout_still_cancels_never_responding_mirror() {
     let mut ctx = make_ctx_with_proxy_timeout(0);
     let mut headers = HashMap::new();
     plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    let meta = tokio::time::timeout(std::time::Duration::from_secs(2), ctx.collect_mirror_result())
-        .await
-        .expect("mirror outcome must be bounded by the finite mirror deadline")
-        .expect("mirror meta");
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ctx.collect_mirror_result(),
+    )
+    .await
+    .expect("mirror outcome must be bounded by the finite mirror deadline")
+    .expect("mirror meta");
     assert!(
         meta.mirror_error.is_some(),
         "never-responding target must surface an explicit mirror_error: {meta:?}"
@@ -3501,7 +3517,10 @@ async fn sensitive_headers_stripped_by_default_including_grpc_metadata() {
     let mut ctx = make_ctx_with_proxy();
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    headers.insert("authorization".to_string(), "Bearer live-secret".to_string());
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer live-secret".to_string(),
+    );
     headers.insert("cookie".to_string(), "session=abc".to_string());
     headers.insert(
         "proxy-authorization".to_string(),
@@ -3606,7 +3625,10 @@ async fn sensitive_header_allowlist_forwards_only_listed_names() {
         lower.contains("authorization: bearer allowlisted"),
         "allowlisted Authorization must forward: {request}"
     );
-    assert!(!lower.contains("cookie:"), "Cookie must stay stripped: {request}");
+    assert!(
+        !lower.contains("cookie:"),
+        "Cookie must stay stripped: {request}"
+    );
     assert!(
         !lower.contains("x-api-key:"),
         "X-Api-Key must stay stripped: {request}"
@@ -3779,7 +3801,10 @@ async fn oversized_content_length_response_is_drained_under_bounds() {
     let mut headers = HashMap::new();
     plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     let meta = ctx.collect_mirror_result().await.expect("mirror meta");
-    assert!(meta.mirror_error.is_none(), "truncation is not an error: {meta:?}");
+    assert!(
+        meta.mirror_error.is_none(),
+        "truncation is not an error: {meta:?}"
+    );
     assert_eq!(
         meta.mirror_response_advertised_size_bytes,
         Some(4096),
@@ -3928,8 +3953,14 @@ async fn mirror_metrics_track_dispatch_completion_and_timeout() {
     let _ = ctx.collect_mirror_result().await;
     let m = request_mirror_metrics_snapshot_for_test(&ok_plugin);
     assert_eq!(m.dispatched, 1, "one task dispatched: {m:?}");
-    assert_eq!(m.completed, 1, "successful response counts as completed: {m:?}");
-    assert_eq!(m.cancellations, 0, "a settled task is not a cancellation: {m:?}");
+    assert_eq!(
+        m.completed, 1,
+        "successful response counts as completed: {m:?}"
+    );
+    assert_eq!(
+        m.cancellations, 0,
+        "a settled task is not a cancellation: {m:?}"
+    );
     assert_eq!(m.request_timeouts, 0, "{m:?}");
     assert_eq!(m.request_failures, 0, "{m:?}");
 
@@ -3962,7 +3993,10 @@ async fn mirror_metrics_track_dispatch_completion_and_timeout() {
     .await
     .expect("mirror outcome must be bounded by the finite deadline")
     .expect("mirror meta");
-    assert!(meta.mirror_error.is_some(), "never-responding target must error: {meta:?}");
+    assert!(
+        meta.mirror_error.is_some(),
+        "never-responding target must error: {meta:?}"
+    );
     let m2 = request_mirror_metrics_snapshot_for_test(&stuck_plugin);
     assert_eq!(m2.dispatched, 1, "{m2:?}");
     assert_eq!(
@@ -4028,7 +4062,10 @@ async fn mirror_metrics_count_concurrency_drops() {
     );
 
     let m = request_mirror_metrics_snapshot_for_test(&plugin);
-    assert_eq!(m.dispatched, 1, "only the first attempt was dispatched: {m:?}");
+    assert_eq!(
+        m.dispatched, 1,
+        "only the first attempt was dispatched: {m:?}"
+    );
     assert_eq!(
         m.concurrency_drops, 1,
         "the saturated second attempt is a concurrency drop: {m:?}"

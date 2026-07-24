@@ -891,9 +891,7 @@ fn request_mirror_lifecycle_counters_carry_namespace_label_when_configured() {
     registry.configure(5, 3600, 0, "staging");
     registry.record_request_mirror_dispatched();
     let output = registry.render_uncached();
-    assert!(output.contains(
-        r#"ferrum_request_mirror_dispatched_total{namespace="staging"} 1"#
-    ));
+    assert!(output.contains(r#"ferrum_request_mirror_dispatched_total{namespace="staging"} 1"#));
 }
 
 #[test]
