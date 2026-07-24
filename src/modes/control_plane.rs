@@ -1488,6 +1488,15 @@ pub async fn run(
     let initial_polled_namespaces = polled_namespaces;
     let poll_auto_apply_plugin_migrations = env_config.auto_apply_plugin_migrations;
 
+    // Poll freshness + bounded rejection metrics (CP registers the same type as
+    // database mode so authenticated `/health` and `/metrics` can expose
+    // `last_poll_completed_at` — issue #2986).
+    let database_delta_poll_metrics =
+        Arc::new(crate::modes::database::DatabaseDeltaPollMetrics::default());
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
+    let database_delta_poll_metrics_for_poll = database_delta_poll_metrics.clone();
+
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         interval.tick().await; // skip first immediate tick
@@ -1511,6 +1520,9 @@ pub async fn run(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    let _poll_completed = crate::modes::database::PollCompletedGuard::new(
+                        database_delta_poll_metrics_for_poll.clone(),
+                    );
                     // Check if the database FQDN now resolves to different IPs
                     if let Some(ref hostname) = db_hostname
                         && let Ok(ips) = dns_cache_for_poll.resolve_all(hostname, None, None).await
@@ -2043,6 +2055,21 @@ pub async fn run(
         }
     });
 
+    let db_poll_supervisor = {
+        let startup_ready = startup_ready.clone();
+        let serving_degraded = serving_degraded.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            crate::modes::db_poll_supervision::supervise_control_plane_poll_task(
+                db_poll_handle,
+                startup_ready,
+                serving_degraded,
+                shutdown_rx,
+            )
+            .await;
+        })
+    };
+
     let mesh_registry_reaper_handle = {
         let registry = mesh_registry.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
@@ -2128,7 +2155,7 @@ pub async fn run(
     // cap as the pre-refactor inline timeout — a stuck DB poll is never
     // allowed to wedge graceful shutdown.
     let mut background_handles = vec![
-        db_poll_handle,
+        db_poll_supervisor,
         mesh_registry_reaper_handle,
         runtime_system_handle,
         runtime_window_handle,

@@ -8,6 +8,7 @@ mod config_delta_tests;
 mod consumer_index_tests;
 mod cp_server_tests;
 mod date_cache_tests;
+mod db_poll_supervision_tests;
 mod dns_tests;
 mod dp_client_tests;
 mod early_upload_deadline_tests;

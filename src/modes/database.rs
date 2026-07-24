@@ -93,6 +93,14 @@ pub struct DatabaseDeltaPollMetricsSnapshot {
     pub forced_full_reloads_total: u64,
     pub recoveries_total: u64,
     pub last_resource_category: &'static str,
+    /// RFC3339 timestamp of the most recently completed poll attempt, including
+    /// empty-success and rejection outcomes. `None` until the first poll tick
+    /// finishes. Lock-free hot reads via [`DatabaseDeltaPollMetrics::snapshot`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_poll_completed_at: Option<String>,
+    /// Unix millis companion for Prometheus gauges; omitted from JSON.
+    #[serde(skip)]
+    pub last_poll_completed_at_unix_ms: u64,
     pub degraded: Option<DatabaseDeltaPollDegraded>,
 }
 
@@ -101,6 +109,10 @@ pub struct DatabaseDeltaPollMetricsSnapshot {
 /// The metric dimensions are fixed enums. Resource IDs and validation strings
 /// are hashed or classified before reaching this type so `/metrics` cannot
 /// grow unbounded time series from hostile or malformed database rows.
+///
+/// Also carries poll-task freshness (`last_poll_completed_at`) updated on every
+/// completed poll outcome — including empty success — so operators can alert
+/// when the supervised poll loop stops advancing (issue #2986).
 #[derive(Debug)]
 pub struct DatabaseDeltaPollMetrics {
     rejected_deltas_total: AtomicU64,
@@ -116,6 +128,8 @@ pub struct DatabaseDeltaPollMetrics {
     forced_full_reloads_total: AtomicU64,
     recoveries_total: AtomicU64,
     last_resource_category: AtomicU8,
+    /// Unix millis of last completed poll outcome; `0` means never completed.
+    last_poll_completed_at_unix_ms: AtomicU64,
     degraded: ArcSwap<Option<DatabaseDeltaPollDegraded>>,
 }
 
@@ -135,6 +149,7 @@ impl Default for DatabaseDeltaPollMetrics {
             forced_full_reloads_total: AtomicU64::new(0),
             recoveries_total: AtomicU64::new(0),
             last_resource_category: AtomicU8::new(DatabaseDeltaResourceCategory::None as u8),
+            last_poll_completed_at_unix_ms: AtomicU64::new(0),
             degraded: ArcSwap::from_pointee(None),
         }
     }
@@ -220,6 +235,21 @@ impl DatabaseDeltaPollMetrics {
         self.degraded.load_full().as_ref().clone()
     }
 
+    /// Record that a poll attempt finished (success, empty, rejection, or
+    /// completed error path). Lock-free; safe from the poll task hot path.
+    pub fn record_poll_completed(&self) {
+        let millis = chrono::Utc::now().timestamp_millis();
+        let millis = if millis < 0 { 0 } else { millis as u64 };
+        self.last_poll_completed_at_unix_ms
+            .store(millis, Ordering::Release);
+        invalidate_database_delta_poll_metrics_cache();
+    }
+
+    /// Lock-free read of the last completed-poll unix millis (`0` = never).
+    pub fn last_poll_completed_at_unix_ms(&self) -> u64 {
+        self.last_poll_completed_at_unix_ms.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> DatabaseDeltaPollMetricsSnapshot {
         let mut rejected_deltas_by_resource_category = BTreeMap::new();
         for category in DatabaseDeltaResourceCategory::ALL {
@@ -228,6 +258,14 @@ impl DatabaseDeltaPollMetrics {
                 self.counter_for_category(category).load(Ordering::Relaxed),
             );
         }
+
+        let last_poll_ms = self.last_poll_completed_at_unix_ms();
+        let last_poll_completed_at = if last_poll_ms == 0 {
+            None
+        } else {
+            chrono::DateTime::from_timestamp_millis(last_poll_ms as i64)
+                .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        };
 
         DatabaseDeltaPollMetricsSnapshot {
             rejected_deltas_total: self.rejected_deltas_total.load(Ordering::Relaxed),
@@ -246,6 +284,8 @@ impl DatabaseDeltaPollMetrics {
                 self.last_resource_category.load(Ordering::Relaxed),
             )
             .as_str(),
+            last_poll_completed_at,
+            last_poll_completed_at_unix_ms: last_poll_ms,
             degraded: self.degraded(),
         }
     }
@@ -259,6 +299,24 @@ impl DatabaseDeltaPollMetrics {
             DatabaseDeltaResourceCategory::Upstream => &self.rejected_upstream,
             DatabaseDeltaResourceCategory::Mixed => &self.rejected_mixed,
         }
+    }
+}
+
+/// RAII helper: records poll completion when a poll-tick scope ends (including
+/// `continue` paths). Empty-success ticks advance freshness the same as applies.
+pub struct PollCompletedGuard {
+    metrics: Arc<DatabaseDeltaPollMetrics>,
+}
+
+impl PollCompletedGuard {
+    pub fn new(metrics: Arc<DatabaseDeltaPollMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl Drop for PollCompletedGuard {
+    fn drop(&mut self) {
+        self.metrics.record_poll_completed();
     }
 }
 
@@ -1970,7 +2028,7 @@ pub async fn run(
     let rejected_delta_max_backoff =
         Duration::from_secs(env_config.db_rejected_delta_backoff_max_seconds);
     let rejected_delta_full_reload_threshold = env_config.db_rejected_delta_full_reload_threshold;
-    let mut poll_shutdown = shutdown_tx.subscribe();
+    let poll_shutdown_tx = shutdown_tx.clone();
 
     // DNS re-resolution for the database FQDN: if the URL contains a hostname
     // (not an IP literal), resolve it via DnsCache on each poll cycle and
@@ -1984,30 +2042,78 @@ pub async fn run(
     let replica_url_for_reconnect = effective_replica_url.clone();
     let poll_namespace = env_config.namespace.clone();
 
-    let db_poll_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(poll_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await; // skip first immediate tick
+    // First generation seeds the accepted durable cursor from startup; later
+    // respawn generations force an authoritative full reload (issue #2986).
+    let poll_generation = Arc::new(AtomicU64::new(0));
 
-        // Track the last known set of resolved IPs for the DB hostname.
-        // Initialized lazily on the first successful resolution.
-        let mut last_db_ips: Option<Vec<IpAddr>> = None;
-        let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
-            Arc::new(tokio::sync::Mutex::new(None));
-        let mut force_full_reload = false;
-        let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
-        let mut rejected_delta_tracker = RejectedDeltaTracker::new(
-            rejected_delta_initial_backoff,
-            rejected_delta_max_backoff,
-            rejected_delta_full_reload_threshold,
-            database_delta_poll_metrics_for_poll,
-        );
+    let db_poll_supervisor = tokio::spawn(async move {
+        let spawn_poll = {
+            let db_poll = db_poll.clone();
+            let proxy_state_poll = proxy_state_poll.clone();
+            let db_available_poll = db_available_poll.clone();
+            let config_rejected_poll = config_rejected_poll.clone();
+            let plugin_migration_reconcile_state_poll =
+                plugin_migration_reconcile_state_poll.clone();
+            let database_delta_poll_metrics_for_poll =
+                database_delta_poll_metrics_for_poll.clone();
+            let dns_cache_for_poll = dns_cache_for_poll.clone();
+            let db_url_for_reconnect = db_url_for_reconnect.clone();
+            let replica_url_for_reconnect = replica_url_for_reconnect.clone();
+            let poll_namespace = poll_namespace.clone();
+            let db_hostname = db_hostname.clone();
+            let replica_hostname = replica_hostname.clone();
+            let poll_generation = poll_generation.clone();
+            let poll_shutdown_tx = poll_shutdown_tx.clone();
+            move || {
+                let db_poll = db_poll.clone();
+                let proxy_state_poll = proxy_state_poll.clone();
+                let db_available_poll = db_available_poll.clone();
+                let config_rejected_poll = config_rejected_poll.clone();
+                let plugin_migration_reconcile_state_poll =
+                    plugin_migration_reconcile_state_poll.clone();
+                let database_delta_poll_metrics_for_poll =
+                    database_delta_poll_metrics_for_poll.clone();
+                let dns_cache_for_poll = dns_cache_for_poll.clone();
+                let db_url_for_reconnect = db_url_for_reconnect.clone();
+                let replica_url_for_reconnect = replica_url_for_reconnect.clone();
+                let poll_namespace = poll_namespace.clone();
+                let db_hostname = db_hostname.clone();
+                let replica_hostname = replica_hostname.clone();
+                let generation = poll_generation.fetch_add(1, Ordering::AcqRel);
+                let mut poll_shutdown = poll_shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(poll_interval);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    interval.tick().await; // skip first immediate tick
 
-        let mut last_change_sequence: Option<u64> = initial_change_sequence;
+                    // Track the last known set of resolved IPs for the DB hostname.
+                    // Initialized lazily on the first successful resolution.
+                    let mut last_db_ips: Option<Vec<IpAddr>> = None;
+                    let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
+                        Arc::new(tokio::sync::Mutex::new(None));
+                    let mut force_full_reload = false;
+                    let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
+                    let mut rejected_delta_tracker = RejectedDeltaTracker::new(
+                        rejected_delta_initial_backoff,
+                        rejected_delta_max_backoff,
+                        rejected_delta_full_reload_threshold,
+                        database_delta_poll_metrics_for_poll.clone(),
+                    );
 
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
+                    // Generation 0 keeps the startup cursor; unexpected respawns
+                    // start with None so the first tick does a full reload.
+                    let mut last_change_sequence: Option<u64> = if generation == 0 {
+                        initial_change_sequence
+                    } else {
+                        None
+                    };
+
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let _poll_completed = PollCompletedGuard::new(
+                                    database_delta_poll_metrics_for_poll.clone(),
+                                );
                     // Replica reconnect/DNS-watermark maintenance must run even when
                     // the plugin-migration gate later blocks publication.
                     if let Some(ref replica_url) = replica_url_for_reconnect {
@@ -2080,7 +2186,9 @@ pub async fn run(
                                 )
                                 .await
                                 {
-                                    None => continue,
+                                    None => {
+                                        continue;
+                                    }
                                     Some(true) => {
                                         force_full_reload = false;
                                         rejected_delta_tracker.record_accepted();
@@ -2176,7 +2284,9 @@ pub async fn run(
                                                     )
                                                     .await
                                                     {
-                                                        None => continue,
+                                                        None => {
+                                                            continue;
+                                                        }
                                                         Some(true) => {
                                                             rejected_delta_tracker.record_accepted();
                                                             recovered_by_full_reload = true;
@@ -2242,7 +2352,9 @@ pub async fn run(
                                                                         )
                                                                         .await
                                                                         {
-                                                                            None => continue,
+                                                                            None => {
+                                                                                continue;
+                                                                            }
                                                                             Some(true) => {
                                                                                 rejected_delta_tracker
                                                                                     .record_accepted();
@@ -2330,7 +2442,9 @@ pub async fn run(
                                         )
                                         .await
                                         {
-                                            None => continue,
+                                            None => {
+                                                continue;
+                                            }
                                             Some(true) => {
                                                 rejected_delta_tracker.record_accepted();
                                             }
@@ -2384,7 +2498,9 @@ pub async fn run(
                                                             )
                                                             .await
                                                             {
-                                                                None => continue,
+                                                                None => {
+                                                                    continue;
+                                                                }
                                                                 Some(true) => {
                                                                     rejected_delta_tracker.record_accepted();
                                                                 }
@@ -2445,7 +2561,9 @@ pub async fn run(
                                 )
                                 .await
                                 {
-                                    None => continue,
+                                    None => {
+                                        continue;
+                                    }
                                     Some(true) => {
                                         rejected_delta_tracker.record_accepted();
                                     }
@@ -2474,16 +2592,24 @@ pub async fn run(
                             }
                         }
                     }
-
-                }
-                _ = poll_shutdown.changed() => {
-                    info!("Database polling shutting down");
-                    return;
-                }
+                            }
+                            _ = poll_shutdown.changed() => {
+                                info!("Database polling shutting down");
+                                return;
+                            }
+                        }
+                    }
+                })
             }
-        }
+        };
+
+        crate::modes::db_poll_supervision::supervise_database_mode_poll_task(
+            spawn_poll,
+            poll_shutdown_tx.subscribe(),
+        )
+        .await;
     });
-    background_handles.push(db_poll_handle);
+    background_handles.push(db_poll_supervisor);
 
     // Wait for all listeners to complete (these exit when the shutdown signal fires).
     // If no listener handles were spawned (e.g., all plaintext ports disabled and no
@@ -2784,8 +2910,9 @@ mod tests {
             "database startup must retain the initial full-load change sequence"
         );
         assert!(
-            source.contains("let mut last_change_sequence: Option<u64> = initial_change_sequence;"),
-            "poll loop must start from the initial full-load cursor"
+            source.contains("let mut last_change_sequence: Option<u64> = if generation == 0 {")
+                && source.contains("initial_change_sequence"),
+            "poll loop must start from the initial full-load cursor on generation 0"
         );
     }
 
@@ -2826,11 +2953,11 @@ mod tests {
         // directly. Full-reload sites must not call update_config outside the
         // chokepoint helper.
         let poll_start = source
-            .find("let db_poll_handle = tokio::spawn(async move {")
-            .expect("database poll task must exist");
+            .find("let db_poll_supervisor = tokio::spawn(async move {")
+            .expect("database poll supervisor must exist");
         let poll_end = source[poll_start..]
-            .find("background_handles.push(db_poll_handle)")
-            .expect("poll task must be pushed onto background handles");
+            .find("background_handles.push(db_poll_supervisor)")
+            .expect("poll supervisor must be pushed onto background handles");
         let poll_section = &source[poll_start..poll_start + poll_end];
         assert!(
             !poll_section.contains("proxy_state_poll.update_config("),
@@ -3566,6 +3693,7 @@ mod tests {
             .record_rejection(identity.with_validation(&["missing plugin reference".to_string()]));
         assert!(decision.should_escalate);
         metrics.record_forced_full_reload();
+        metrics.record_poll_completed();
 
         registry.set_database_delta_poll_metrics(metrics.clone());
         let snapshot = registry
@@ -3575,9 +3703,14 @@ mod tests {
         assert_eq!(snapshot.consecutive_identical_rejections, 1);
         assert_eq!(snapshot.current_backoff_bucket, "max");
         assert_eq!(snapshot.forced_full_reloads_total, 1);
+        assert!(
+            snapshot.last_poll_completed_at.is_some(),
+            "completed poll must populate last_poll_completed_at"
+        );
 
         let output = registry.render_uncached();
         assert!(output.contains("ferrum_database_delta_rejections_total"));
+        assert!(output.contains("ferrum_database_poll_last_completed_timestamp_seconds"));
         assert!(output.contains(
             r#"ferrum_database_delta_rejections_total{resource_category="proxy",namespace="ops"} 1"#
         ));

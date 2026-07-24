@@ -9809,10 +9809,11 @@ components:
             `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
-            `unavailable` — the gateway became ready but a serving listener
-            task later exited with an error (CP gRPC or admin HTTP/HTTPS
+            `unavailable` — the gateway became ready but a supervised serving
+            listener task later exited with an error (CP gRPC or admin HTTP/HTTPS
             server, a DP proxy/admin listener, or a mesh traffic/admin
-            listener). This is a sticky, monotonic
+            listener), or — in control-plane mode — the database config poll
+            task exited unexpectedly. This is a sticky, monotonic
             degradation: it stays set across a later readiness restore
             (returned with 503 and `ready: false`). CP, DP, and mesh modes
             report it.
@@ -9820,10 +9821,12 @@ components:
           type: boolean
           description: |
             `true` once the gateway has finished startup AND no supervised
-            serving listener has failed since. While `false`, the endpoint
+            serving listener (or, in control-plane mode, the database config
+            poll task) has failed unexpectedly since. While `false`, the endpoint
             returns `503 Service Unavailable`. In CP/DP/mesh modes a post-startup
             serving-listener failure sets `ready: false` durably (sticky) even
-            though internal startup completed.
+            though internal startup completed. In CP mode an unexpected database
+            poll-task exit uses the same sticky not-ready path.
         admin_writes_enabled:
           type: boolean
           description: |
@@ -10494,10 +10497,12 @@ components:
     DatabaseDeltaPollingHealth:
       type: object
       description: |
-        Database-mode polling health for rejected incremental deltas. Present
-        only in database mode. When `status` is `degraded`, the gateway keeps
-        serving the last known-good runtime config and leaves the accepted poll
-        cursor unchanged.
+        Database/CP-mode polling health. Present in `database` and `cp` modes.
+        When `status` is `degraded` due to rejected incremental deltas, the
+        gateway keeps serving the last known-good runtime config and leaves the
+        accepted poll cursor unchanged. `last_poll_completed_at` advances on
+        every completed poll outcome (including empty success) so operators can
+        alert when the supervised poll task stops advancing.
       required: [status]
       properties:
         status:
@@ -10523,13 +10528,21 @@ components:
           format: int64
         escalated:
           type: boolean
+        last_poll_completed_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 timestamp of the most recently completed poll attempt,
+            including empty-success and rejection outcomes. Absent until the
+            first poll tick finishes.
 
     DatabaseDeltaPollingMetrics:
       type: object
       description: |
-        Bounded metrics for database incremental-delta validation rejections.
-        Resource-category and backoff dimensions are fixed enum labels; raw
-        resource IDs are never exposed as metric labels.
+        Bounded metrics for database/CP config polling. Includes incremental-
+        delta validation rejections (resource-category and backoff dimensions
+        are fixed enum labels; raw resource IDs are never exposed as metric
+        labels) and poll-task freshness via `last_poll_completed_at`.
       required:
         - rejected_deltas_total
         - rejected_deltas_by_resource_category
@@ -10569,6 +10582,13 @@ components:
         last_resource_category:
           type: string
           enum: [none, proxy, consumer, plugin_config, upstream, mixed]
+        last_poll_completed_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 timestamp of the most recently completed poll attempt,
+            including empty success. Absent until the first poll finishes.
+          nullable: true
         degraded:
           anyOf:
             - $ref: "#/components/schemas/DatabaseDeltaPollingDegraded"
