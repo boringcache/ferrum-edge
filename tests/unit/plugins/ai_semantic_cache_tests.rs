@@ -13,6 +13,7 @@ use ferrum_edge::_test_support::{
     rebuild_ai_semantic_cache_vector_index, set_ai_semantic_cache_embedding,
     set_ai_semantic_cache_scope_key,
 };
+use super::plugin_utils::create_test_proxy;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -4475,5 +4476,68 @@ async fn test_canonical_numeric_params_still_collapse_for_exact_keys() {
     assert!(
         hit,
         "canonical numeric sampling-parameter forms remain exact-key equivalent"
+    );
+}
+
+/// #3076: within one proxy, a cached response for request path A must not be
+/// replayed to a distinct request path B carrying an identical body. The same
+/// path + body must still hit.
+#[tokio::test]
+async fn distinct_request_paths_do_not_collide_within_one_proxy() {
+    async fn drive(
+        plugin: &AiSemanticCache,
+        proxy: &Arc<ferrum_edge::config::types::Proxy>,
+        path: &str,
+        body_str: &str,
+    ) -> (RequestContext, PluginResult) {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            path.to_string(),
+        );
+        ctx.matched_proxy = Some(Arc::clone(proxy));
+        ctx.metadata
+            .insert("request_body".to_string(), body_str.to_string());
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        (ctx, result)
+    }
+
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false
+    }));
+    let proxy = Arc::new(create_test_proxy());
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "same body, different route"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+
+    // Populate the cache under path A.
+    let (mut ctx_a, miss_a) = drive(&plugin, &proxy, "/v1/chat/completions", &body_str).await;
+    assert!(
+        matches!(miss_a, PluginResult::Continue),
+        "path A first request must miss"
+    );
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx_a, 200, &resp_headers, br#"{"route":"A"}"#)
+        .await;
+
+    // Same proxy + path + body must now hit.
+    let (_ctx_a2, hit_a) = drive(&plugin, &proxy, "/v1/chat/completions", &body_str).await;
+    assert!(
+        matches!(hit_a, PluginResult::RejectBinary { .. }),
+        "identical path + body must hit the entry we just stored"
+    );
+
+    // A distinct path with the identical body/proxy must not replay A's response.
+    let (_ctx_b, miss_b) = drive(&plugin, &proxy, "/v2/responses", &body_str).await;
+    assert!(
+        matches!(miss_b, PluginResult::Continue),
+        "a distinct route within the same proxy must not receive another route's cached response"
     );
 }

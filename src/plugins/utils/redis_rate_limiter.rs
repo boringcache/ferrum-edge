@@ -504,6 +504,18 @@ struct ConnectionSlot {
     connect_mutex: tokio::sync::Mutex<()>,
 }
 
+/// Outcome of a size-bounded Redis fetch ([`RedisRateLimitClient::get_bytes_bounded`]).
+#[derive(Debug)]
+pub enum BoundedRedisValue {
+    /// Key absent, or the stored value is empty.
+    Missing,
+    /// Value present and within the requested byte cap.
+    Found(Vec<u8>),
+    /// Value present but its true length exceeds the cap; only a bounded prefix
+    /// was transferred. Callers should treat it as invalid and quarantine it.
+    Oversized { length: usize },
+}
+
 /// gateway's shared DNS cache. On connection failure, every pool slot is cleared
 /// so the next attempt re-resolves DNS (handling IP changes gracefully).
 pub struct RedisRateLimitClient {
@@ -1450,6 +1462,88 @@ impl RedisRateLimitClient {
                     key = %key,
                     error = %e,
                     "Redis GET failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
+    /// Get a raw byte value from Redis, bounded to `max_bytes` before
+    /// allocation.
+    ///
+    /// A plain `GET` would allocate the full stored value regardless of size, so
+    /// a compromised or oversized entry could force an unbounded allocation. This
+    /// reads `STRLEN` and `GETRANGE key 0 max_bytes` atomically: the true length
+    /// gates the outcome while the range read caps the transferred/allocated
+    /// bytes at `max_bytes + 1`. Callers treat [`BoundedRedisValue::Oversized`]
+    /// as an invalid entry and quarantine it.
+    pub async fn get_bytes_bounded(
+        &self,
+        key: &str,
+        max_bytes: usize,
+    ) -> Result<BoundedRedisValue, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        // GETRANGE end index is inclusive, so `0..=max_bytes` reads at most
+        // `max_bytes + 1` bytes — enough to confirm an over-cap value without
+        // materializing it. STRLEN reports the true length so the outcome is
+        // gated on the real size, not the (bounded) prefix. Pipelined in one
+        // round-trip (non-transactional like `get_two_counters`); a concurrent
+        // rewrite between the two commands can only cause a benign spurious
+        // quarantine/miss, never an unbounded allocation.
+        let end = max_bytes as isize;
+        let result: Result<(usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("STRLEN")
+            .arg(key)
+            .cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(end)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok((length, prefix)) => {
+                self.available.store(true, Ordering::Relaxed);
+                if length == 0 {
+                    Ok(BoundedRedisValue::Missing)
+                } else if length > max_bytes {
+                    Ok(BoundedRedisValue::Oversized { length })
+                } else {
+                    Ok(BoundedRedisValue::Found(prefix))
+                }
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis STRLEN+GETRANGE failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
+    /// Best-effort unconditional key deletion, used to quarantine a poisoned or
+    /// invalid cache entry so it is not re-served on the next request.
+    pub async fn delete(&self, key: &str) -> Result<(), ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<i64, redis::RedisError> =
+            redis::cmd("DEL").arg(key).query_async(&mut conn).await;
+
+        match result {
+            Ok(_) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis DEL failed"
                 );
                 self.mark_unavailable();
                 Err(())

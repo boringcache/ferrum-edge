@@ -54,6 +54,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::{Semaphore, watch};
 use tracing::debug;
 use url::Host;
 
@@ -61,7 +62,7 @@ use super::utils::body_transform::{is_event_stream_content_type, is_json_content
 use super::utils::byte_budget::{ByteBudget, ByteLease};
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{
-    REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
+    BoundedRedisValue, REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
 use super::utils::response_body::read_response_body_bounded;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
@@ -176,14 +177,34 @@ const MAX_EMBEDDING_DIMENSIONS: usize = 16_384;
 /// Conservative per-point HNSW graph/metadata overhead charged against the
 /// shared cache byte budget (ZeroNode neighbors, layer bookkeeping, ids).
 const HNSW_GRAPH_OVERHEAD_PER_POINT: usize = 256;
-/// Peak retained embedding copies while `instant-distance` builds an HNSW map:
-/// rebuild scan clone + internal construction clone. The final published
-/// snapshot keeps one copy; `ByteLease::shrink_to` releases the temporary.
+/// Conservative peak-copy multiplier charged per point while `instant-distance`
+/// builds an HNSW map. Embedding floats are `Arc<[f32]>`-shared, so the scan
+/// clone and any `instant-distance` internal clones do not deep-copy the float
+/// slice; this multiplier still reserves headroom for construction working
+/// memory (reordered point/value vectors, layer scratch) so the whole live peak
+/// stays inside the cap. `ByteLease::shrink_to` releases the surplus once the
+/// published snapshot is the only retained copy.
 const HNSW_BUILD_EMBEDDING_COPIES: usize = 2;
 
 /// Minimum interval between expired-entry cleanup passes, measured against a
 /// monotonic clock so the throttle is immune to wall-clock jumps.
 const CLEANUP_INTERVAL_SECONDS: u64 = 30;
+
+/// Schema version stamped into every Redis-stored [`SerializableCacheEntry`].
+/// Redis is untrusted storage shared across gateway versions and other writers;
+/// a hit whose envelope version does not match is treated as invalid (a
+/// cross-version or foreign write) and quarantined rather than replayed. Bump
+/// this whenever the stored envelope shape changes.
+const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 1;
+
+/// Deployment-safe ceiling on concurrent outbound embedding requests per plugin
+/// instance. A burst of distinct concurrent misses (or an embedding outage that
+/// stalls in-flight calls) cannot fan out more than this many simultaneous
+/// outbound requests, bounding outbound sockets / provider quota / runtime
+/// tasks. Identical concurrent misses additionally coalesce (see the embedding
+/// singleflight in [`AiSemanticCache::compute_embedding`]) so they share one
+/// outbound request rather than each consuming a permit.
+const MAX_CONCURRENT_EMBEDDINGS: usize = 8;
 
 const RESPONSE_SHAPE_FIELDS: &[&str] = &[
     "tools",
@@ -407,7 +428,12 @@ impl EmbeddingProvider {
 
 #[derive(Debug, Clone)]
 struct EmbeddingPoint {
-    values: Vec<f32>,
+    /// Normalized embedding values behind an `Arc<[f32]>` so that cloning a
+    /// point (rebuild scan clone + `instant-distance` internal construction
+    /// clones) shares one float allocation instead of deep-copying every
+    /// dimension. A cache entry and every HNSW point derived from it reference
+    /// the same underlying slice.
+    values: Arc<[f32]>,
 }
 
 impl EmbeddingPoint {
@@ -440,11 +466,15 @@ impl EmbeddingPoint {
     }
 
     fn to_vec(&self) -> Vec<f32> {
-        self.values.clone()
+        self.values.to_vec()
     }
 
+    /// Bytes uniquely retained by this point's own struct plus its float slice.
+    /// The float slice is `Arc`-shared, so charging it for both the owning cache
+    /// entry and a derived HNSW generation conservatively over-counts shared
+    /// memory rather than under-counting — the safe direction for a hard cap.
     fn approx_size(&self) -> usize {
-        mem::size_of::<Self>() + self.values.capacity() * mem::size_of::<f32>()
+        mem::size_of::<Self>() + self.values.len() * mem::size_of::<f32>()
     }
 }
 
@@ -457,7 +487,7 @@ impl HnswPoint for EmbeddingPoint {
         let dot = self
             .values
             .iter()
-            .zip(&other.values)
+            .zip(other.values.iter())
             .fold(0.0_f32, |acc, (left, right)| acc + left * right);
         (1.0 - dot).clamp(0.0, 2.0)
     }
@@ -485,6 +515,62 @@ enum VectorRebuildOutcome {
         lease: Arc<ByteLease>,
         accounted_bytes: usize,
     },
+}
+
+/// Cancellation-safe reset for the in-flight rebuild flags. Clears the
+/// running guard and the reserved-bytes mirror on drop, so a rebuild task that
+/// is dropped mid-flight (runtime shutdown, aborted join) cannot leave the
+/// index permanently marked "rebuild running" or over-report reserved bytes.
+/// The candidate `ByteLease` itself releases independently when its owning
+/// `VectorRebuildOutcome` drops; this only resets the observable mirrors.
+struct RebuildStateGuard {
+    running: Arc<AtomicBool>,
+    reserved: Arc<AtomicUsize>,
+}
+
+impl Drop for RebuildStateGuard {
+    fn drop(&mut self) {
+        self.reserved.store(0, Ordering::Release);
+        self.running.store(false, Ordering::Release);
+    }
+}
+
+/// Result of one embedding computation, shared across coalesced waiters.
+type EmbeddingResult = Result<EmbeddingPoint, String>;
+
+/// One in-flight embedding computation. Followers clone `rx` to await the
+/// leader's published result without holding a `DashMap` shard lock across an
+/// `.await`.
+struct EmbeddingFlightSlot {
+    rx: watch::Receiver<Option<Arc<EmbeddingResult>>>,
+}
+
+/// Leader/follower role for the embedding singleflight.
+enum EmbeddingFlightRole {
+    /// First caller for this input hash: owns the sender and the slot identity.
+    Leader {
+        tx: watch::Sender<Option<Arc<EmbeddingResult>>>,
+        slot: Arc<EmbeddingFlightSlot>,
+    },
+    /// A later caller for the same in-flight input hash: awaits the leader.
+    Follower(watch::Receiver<Option<Arc<EmbeddingResult>>>),
+}
+
+/// Cancellation-safe removal of a leader's in-flight slot. Drops when the leader
+/// finishes OR is cancelled, freeing the map entry so a later identical miss can
+/// start a fresh computation. `ptr_eq` ensures we only remove our own slot, not
+/// a newer leader that replaced it after ours was gone.
+struct EmbeddingFlightCleanup {
+    map: Arc<DashMap<String, Arc<EmbeddingFlightSlot>>>,
+    key: String,
+    slot: Arc<EmbeddingFlightSlot>,
+}
+
+impl Drop for EmbeddingFlightCleanup {
+    fn drop(&mut self) {
+        self.map
+            .remove_if(&self.key, |_, existing| Arc::ptr_eq(existing, &self.slot));
+    }
 }
 
 pub struct AiSemanticCache {
@@ -530,6 +616,15 @@ pub struct AiSemanticCache {
     cache_multimodal: MultimodalCacheMode,
     /// Optional semantic-similarity configuration.
     semantic: Option<SemanticConfig>,
+    /// Bounds concurrent outbound embedding requests for this instance so a
+    /// burst of distinct misses cannot fan out unboundedly. See
+    /// [`MAX_CONCURRENT_EMBEDDINGS`].
+    embedding_semaphore: Arc<Semaphore>,
+    /// Singleflight map keyed by embedding input hash. Identical concurrent
+    /// misses coalesce onto one outbound computation; followers await the
+    /// leader's shared result. Empty in normal operation (entries live only for
+    /// the duration of an in-flight computation).
+    embedding_flights: Arc<DashMap<String, Arc<EmbeddingFlightSlot>>>,
     /// Shared outbound HTTP client for embedding calls.
     http_client: PluginHttpClient,
     /// Local in-memory cache.
@@ -549,6 +644,9 @@ pub struct AiSemanticCache {
     /// Seconds elapsed (against `created_at`) at the last cleanup pass, used to
     /// throttle cleanup to once per `CLEANUP_INTERVAL_SECONDS`.
     last_cleanup: AtomicU64,
+    /// Guards the detached cleanup task so the full-map `retain` + oldest-entry
+    /// eviction runs off the request hot path and never overlaps itself.
+    cleanup_running: Arc<AtomicBool>,
     /// Last time the semantic vector snapshot was rebuilt.
     last_vector_rebuild: Arc<AtomicU64>,
     /// Whether local semantic entries changed since the latest vector rebuild.
@@ -567,9 +665,15 @@ struct StorePostAdmitHook {
 }
 
 /// Serializable form of CacheEntry for Redis storage.
+///
+/// `version` is always written and defaults to `0` on read, so an envelope from
+/// a prior gateway version (which never wrote the field) fails the version check
+/// on hit and is quarantined instead of replayed.
 #[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SerializableCacheEntry {
+    #[serde(default)]
+    version: u8,
     status_code: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
@@ -686,6 +790,8 @@ impl AiSemanticCache {
             scope_by_consumer,
             cache_multimodal,
             semantic,
+            embedding_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EMBEDDINGS)),
+            embedding_flights: Arc::new(DashMap::new()),
             http_client,
             cache: Arc::new(DashMap::new()),
             vector_index: Arc::new(ArcSwapOption::empty()),
@@ -694,6 +800,7 @@ impl AiSemanticCache {
             created_at: Instant::now(),
             // Sentinel: never cleaned, so the first cleanup pass always runs.
             last_cleanup: AtomicU64::new(u64::MAX),
+            cleanup_running: Arc::new(AtomicBool::new(false)),
             last_vector_rebuild: Arc::new(AtomicU64::new(0)),
             vector_index_dirty: Arc::new(AtomicBool::new(false)),
             vector_index_rebuild_running: Arc::new(AtomicBool::new(false)),
@@ -840,7 +947,81 @@ impl AiSemanticCache {
         }
     }
 
+    /// Compute an embedding with bounded outbound concurrency and singleflight
+    /// coalescing.
+    ///
+    /// Identical concurrent misses (same normalized input) share one outbound
+    /// embedding request: the first caller is the leader, later callers are
+    /// followers that await the leader's published result. Distinct concurrent
+    /// inputs are additionally capped by [`Self::embedding_semaphore`] so a burst
+    /// cannot fan out more than [`MAX_CONCURRENT_EMBEDDINGS`] simultaneous
+    /// outbound requests. Cleanup is cancellation-safe: a leader that is dropped
+    /// before publishing frees its slot (via [`EmbeddingFlightCleanup`]) and
+    /// closes its channel, so followers fall back to their own bounded
+    /// computation rather than hanging.
     async fn compute_embedding(&self, input: &str) -> Result<EmbeddingPoint, String> {
+        if self.semantic.is_none() {
+            return Err("semantic similarity is disabled".to_string());
+        }
+
+        // Coalesce by input hash: the embedding depends only on the input text,
+        // so identical inputs (regardless of scope) share one computation.
+        let flight_key = hex::encode(Sha256::digest(input.as_bytes()));
+
+        // Resolve leader/follower without holding the DashMap shard guard across
+        // any `.await` (the entry guards are temporaries dropped before we
+        // await below).
+        let role = match self.embedding_flights.entry(flight_key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                EmbeddingFlightRole::Follower(occupied.get().rx.clone())
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let (tx, rx) = watch::channel::<Option<Arc<EmbeddingResult>>>(None);
+                let slot = Arc::new(EmbeddingFlightSlot { rx });
+                vacant.insert(Arc::clone(&slot));
+                EmbeddingFlightRole::Leader { tx, slot }
+            }
+        };
+
+        match role {
+            EmbeddingFlightRole::Leader { tx, slot } => {
+                // Free the slot on completion OR cancellation.
+                let _cleanup = EmbeddingFlightCleanup {
+                    map: Arc::clone(&self.embedding_flights),
+                    key: flight_key,
+                    slot,
+                };
+                // `acquire` only errors if the semaphore is closed, which never
+                // happens here; degrade to unbounded rather than panic if it
+                // somehow does.
+                let _permit = self.embedding_semaphore.acquire().await.ok();
+                let shared = Arc::new(self.compute_embedding_inner(input).await);
+                // Publish to any waiters; `send` errors only when no receivers
+                // remain, which is fine.
+                let _ = tx.send(Some(Arc::clone(&shared)));
+                (*shared).clone()
+            }
+            EmbeddingFlightRole::Follower(mut rx) => {
+                loop {
+                    // Bind the cloned value so the borrow guard drops before the
+                    // `changed().await` below re-borrows `rx`.
+                    let latest = (*rx.borrow_and_update()).clone();
+                    if let Some(shared) = latest {
+                        return (*shared).clone();
+                    }
+                    if rx.changed().await.is_err() {
+                        // Leader vanished before publishing (cancelled); fall
+                        // back to our own bounded computation.
+                        break;
+                    }
+                }
+                let _permit = self.embedding_semaphore.acquire().await.ok();
+                self.compute_embedding_inner(input).await
+            }
+        }
+    }
+
+    async fn compute_embedding_inner(&self, input: &str) -> Result<EmbeddingPoint, String> {
         let semantic = self
             .semantic
             .as_ref()
@@ -952,6 +1133,69 @@ impl AiSemanticCache {
         }
     }
 
+    /// Byte cap for a Redis-stored envelope before allocation.
+    ///
+    /// The stored value is a `SerializableCacheEntry` JSON document whose
+    /// response body is serialized as a JSON byte array (up to ~4x its raw
+    /// length) plus sanitized headers, status, and version framing. Bound the
+    /// transfer generously above that expansion; the exact per-entry limit is
+    /// re-checked against `max_entry_size_bytes` on the decoded body in
+    /// [`Self::admit_redis_hit`].
+    fn redis_value_byte_cap(&self) -> usize {
+        self.max_entry_size_bytes
+            .saturating_mul(6)
+            .saturating_add(64 * 1024)
+    }
+
+    /// Re-apply the full store-side admission contract to a Redis hit before
+    /// replaying it.
+    ///
+    /// Redis is untrusted storage shared across gateway versions and other
+    /// writers. Successful deserialization is not proof of a value this gateway
+    /// wrote: a tampered, stale, foreign, or cross-version entry must not let
+    /// the gateway emit an oversized, non-JSON, wrong-status, or unsanitized
+    /// (cookie/auth-bearing) response. Returns the sanitized response to serve,
+    /// or `None` when any invariant fails so the caller quarantines the entry.
+    fn admit_redis_hit(&self, entry: &SerializableCacheEntry) -> Option<CachedResponse> {
+        // Schema/version gate: reject envelopes not written by this version.
+        if entry.version != SEMANTIC_CACHE_ENTRY_VERSION {
+            return None;
+        }
+        // Status: same 2xx contract as the store path (exclude 204/205, which
+        // carry no body).
+        if !(200..300).contains(&entry.status_code) || matches!(entry.status_code, 204 | 205) {
+            return None;
+        }
+        // Hard per-entry body-size cap.
+        if entry.body.len() > self.max_entry_size_bytes {
+            return None;
+        }
+        // Content-type must be JSON-compatible and not an event stream, mirroring
+        // the store path. An absent content-type is rejected: the store path only
+        // admits JSON responses, so a hit lacking one is not a value we wrote.
+        let content_type = entry.headers.iter().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                .then_some(value.as_str())
+        });
+        match content_type {
+            Some(ct) if is_json_content_type(ct) && !is_event_stream_content_type(ct) => {}
+            _ => return None,
+        }
+        // Body must be syntactically valid JSON.
+        if serde_json::from_slice::<Value>(&entry.body).is_err() {
+            return None;
+        }
+        // Re-sanitize headers: a foreign writer could have injected Set-Cookie /
+        // authorization headers even though this gateway's store path strips
+        // them before writing.
+        let headers = sanitize_cached_headers(&entry.headers);
+        Some(CachedResponse {
+            status_code: entry.status_code,
+            headers,
+            body: Bytes::from(entry.body.clone()),
+        })
+    }
+
     async fn build_vector_snapshot(
         cache: Arc<DashMap<String, CacheEntry>>,
         ttl: Duration,
@@ -964,9 +1208,21 @@ impl AiSemanticCache {
             // made visible in batches. The dirty flag is cleared before this
             // snapshot; any concurrent insert that races this scan re-dirties
             // the index and schedules a later rebuild.
+            //
+            // Single pass: collect the live semantic set AND accumulate its
+            // peak/retained byte estimates together, then reserve against the
+            // shared budget for exactly the set we collected. A two-pass
+            // count-then-copy could admit a new entry between passes and copy
+            // (and index) more points than were charged; collecting first and
+            // charging the collected set is race-safe and conservative.
+            //
+            // `embedding.clone()` only bumps the `Arc<[f32]>` refcount, so the
+            // scan does not duplicate the cache's embedding float storage.
             let now = Instant::now();
-            let mut estimate = 0usize;
-            let mut point_count = 0usize;
+            let mut points: Vec<EmbeddingPoint> = Vec::new();
+            let mut values: Vec<VectorEntry> = Vec::new();
+            let mut peak_estimate = 0usize;
+            let mut retained_estimate = 0usize;
             for entry in cache.iter() {
                 if now.duration_since(entry.inserted_at) >= ttl {
                     continue;
@@ -976,66 +1232,49 @@ impl AiSemanticCache {
                 else {
                     continue;
                 };
-                point_count = point_count.saturating_add(1);
-                estimate = estimate.saturating_add(estimate_hnsw_point_peak_bytes(
-                    embedding,
-                    entry.key(),
-                    scope_key,
+                let cache_key = entry.key();
+                peak_estimate = peak_estimate.saturating_add(estimate_hnsw_point_peak_bytes(
+                    embedding, cache_key, scope_key,
                 ));
-            }
-
-            if point_count == 0 {
-                return VectorRebuildOutcome::Empty;
-            }
-
-            let Some(lease) = cache_budget.try_acquire(estimate) else {
-                return VectorRebuildOutcome::BudgetExhausted;
-            };
-            rebuild_reserved_bytes.store(estimate, Ordering::Release);
-
-            let mut points = Vec::with_capacity(point_count);
-            let mut values = Vec::with_capacity(point_count);
-            let mut retained = 0usize;
-            for entry in cache.iter() {
-                if now.duration_since(entry.inserted_at) >= ttl {
-                    continue;
-                }
-                let (Some(scope_key), Some(embedding)) =
-                    (entry.semantic_scope_key.clone(), entry.embedding.clone())
-                else {
-                    continue;
-                };
-                retained = retained.saturating_add(estimate_hnsw_point_retained_bytes(
-                    &embedding,
-                    entry.key(),
-                    &scope_key,
-                ));
-                points.push(embedding);
+                retained_estimate = retained_estimate.saturating_add(
+                    estimate_hnsw_point_retained_bytes(embedding, cache_key, scope_key),
+                );
+                points.push(embedding.clone());
                 values.push(VectorEntry {
-                    cache_key: entry.key().clone(),
-                    scope_key,
+                    cache_key: cache_key.clone(),
+                    scope_key: scope_key.clone(),
                 });
             }
 
             if points.is_empty() {
-                rebuild_reserved_bytes.store(0, Ordering::Release);
-                lease.release();
                 return VectorRebuildOutcome::Empty;
             }
 
-            // Shrink provisional peak reservation down to the published
-            // generation footprint before construction completes; build may
-            // briefly allocate internal clones already covered by the peak
-            // estimate, then drops them when returning.
-            let retained = retained.min(estimate);
-            lease.shrink_to(retained);
-            rebuild_reserved_bytes.store(retained, Ordering::Release);
+            // Reserve the whole live peak BEFORE construction. Because the old
+            // published generation still holds its own lease against this same
+            // budget, `try_acquire` only succeeds when entries + old snapshot +
+            // this candidate's peak all fit under `max_total_size_bytes`. On
+            // failure the collected `points`/`values` drop here (Arc floats
+            // stay shared with the cache entries, so nothing is duplicated).
+            let Some(lease) = cache_budget.try_acquire(peak_estimate) else {
+                return VectorRebuildOutcome::BudgetExhausted;
+            };
+            rebuild_reserved_bytes.store(peak_estimate, Ordering::Release);
 
+            // Hold the full peak lease ACROSS `build`, which allocates internal
+            // construction copies; keeping the reservation live means those
+            // copies stay inside the cap instead of escaping it.
             let index = HnswBuilder::default()
                 .ef_search(max_candidates)
                 .ef_construction(max_candidates.max(100))
                 .seed(0)
                 .build(points, values);
+
+            // Construction temporaries are freed once `build` returns; shrink
+            // the lease down to the published generation footprint.
+            let retained = retained_estimate.min(peak_estimate);
+            lease.shrink_to(retained);
+            rebuild_reserved_bytes.store(retained, Ordering::Release);
             VectorRebuildOutcome::Built {
                 index,
                 lease,
@@ -1320,6 +1559,13 @@ impl AiSemanticCache {
         let max_candidates = semantic.max_candidates;
 
         tokio::spawn(async move {
+            // Reset `rebuild_running`/`rebuild_reserved_bytes` even if this task
+            // is dropped mid-flight, so cancellation cannot wedge the index in a
+            // permanent "rebuild running" state or leak the reserved mirror.
+            let _state_guard = RebuildStateGuard {
+                running: rebuild_running,
+                reserved: Arc::clone(&rebuild_reserved_bytes),
+            };
             let build_result = Self::build_vector_snapshot(
                 cache,
                 ttl,
@@ -1334,18 +1580,18 @@ impl AiSemanticCache {
                 dirty.as_ref(),
                 rebuild_reserved_bytes.as_ref(),
             );
-            rebuild_running.store(false, Ordering::Release);
         });
     }
 
-    /// Periodic cleanup of expired entries.
+    /// Claim the current cleanup interval, if one is due.
     ///
     /// Throttled to once per `CLEANUP_INTERVAL_SECONDS` using a monotonic
     /// elapsed-seconds clock (`created_at`) rather than the wall clock, so a
     /// `SystemTime` jump cannot stall or spuriously trigger cleanup. The CAS
-    /// guarantees exactly one caller wins per interval; concurrent callers
-    /// that lose the race return without scanning.
-    fn cleanup_expired(&self) {
+    /// guarantees exactly one caller wins per interval; concurrent callers that
+    /// lose the race return `false` without scanning. This is the cheap,
+    /// hot-path portion; the O(N) scan/eviction runs in [`Self::run_cleanup`].
+    fn try_claim_cleanup_interval(&self) -> bool {
         let now = Instant::now();
         let now_secs = now.saturating_duration_since(self.created_at).as_secs();
 
@@ -1354,47 +1600,85 @@ impl AiSemanticCache {
         // the most recent pass ran.
         let last = self.last_cleanup.load(Ordering::Relaxed);
         if last != u64::MAX && now_secs.saturating_sub(last) < CLEANUP_INTERVAL_SECONDS {
+            return false;
+        }
+        self.last_cleanup
+            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Schedule expired-entry cleanup and max-entries eviction off the request
+    /// hot path.
+    ///
+    /// The winning request pays only the cheap interval CAS here; the full-map
+    /// `DashMap::retain` and oldest-entry selection run in a detached task so no
+    /// single unlucky request performs O(N) cache maintenance before backend
+    /// dispatch. Hard total-byte admission (`max_total_size_bytes`) is enforced
+    /// independently on the store path via byte leases, so eviction lag never
+    /// lets retained memory exceed the budget. `cleanup_running` prevents a slow
+    /// scan on a very large cache from overlapping the next interval's task.
+    fn spawn_cleanup_if_due(&self) {
+        if !self.try_claim_cleanup_interval() {
             return;
         }
         if self
-            .last_cleanup
-            .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .cleanup_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            // Another caller already claimed this interval.
+            // A prior interval's cleanup is still running; skip this one.
             return;
         }
 
-        let mut removed_size = 0usize;
+        let cache = Arc::clone(&self.cache);
+        let dirty = Arc::clone(&self.vector_index_dirty);
+        let cleanup_running = Arc::clone(&self.cleanup_running);
+        let ttl = self.ttl;
+        let max_entries = self.max_entries;
+        let semantic_enabled = self.semantic.is_some();
+
+        tokio::spawn(async move {
+            // Reset the guard even if the task is dropped mid-flight.
+            let _running_guard = CleanupRunningGuard {
+                running: cleanup_running,
+            };
+            let removed_semantic = Self::run_cleanup(&cache, ttl, max_entries);
+            if removed_semantic && semantic_enabled {
+                dirty.store(true, Ordering::Release);
+            }
+        });
+    }
+
+    /// Full-map expired-entry sweep and max-entries eviction. Returns whether a
+    /// semantic (embedded) entry was removed so callers can re-dirty the vector
+    /// index. Entry byte leases release when the removed `CacheEntry` drops.
+    fn run_cleanup(
+        cache: &DashMap<String, CacheEntry>,
+        ttl: Duration,
+        max_entries: usize,
+    ) -> bool {
+        let now = Instant::now();
         let mut removed_semantic_entry = false;
-        self.cache.retain(|_, entry| {
-            if now.duration_since(entry.inserted_at) >= self.ttl {
-                removed_size = removed_size.saturating_add(entry.approx_size);
+        cache.retain(|_, entry| {
+            if now.duration_since(entry.inserted_at) >= ttl {
                 removed_semantic_entry |= entry.embedding.is_some();
                 false
             } else {
                 true
             }
         });
-        if removed_size > 0 {
-            // Entry leases release on drop from retain; no separate counter.
-            if removed_semantic_entry {
-                self.mark_vector_index_dirty();
-            }
-        }
 
         // Enforce max entries by removing oldest. Use partial-select
         // (`select_nth_unstable_by_key`, average O(n)) instead of a full
         // sort (O(n log n)) — we only need to identify the k oldest, not
         // sort the entire cache.
-        if self.cache.len() > self.max_entries {
-            let mut entries_with_time: Vec<(String, Instant)> = self
-                .cache
+        if cache.len() > max_entries {
+            let mut entries_with_time: Vec<(String, Instant)> = cache
                 .iter()
                 .map(|entry| (entry.key().clone(), entry.value().inserted_at))
                 .collect();
 
-            let to_remove = self.cache.len().saturating_sub(self.max_entries);
+            let to_remove = cache.len().saturating_sub(max_entries);
             if to_remove > 0 && to_remove < entries_with_time.len() {
                 // After this call, indices [0..to_remove) hold the
                 // `to_remove` oldest entries (in unspecified order among
@@ -1402,17 +1686,38 @@ impl AiSemanticCache {
                 entries_with_time.select_nth_unstable_by_key(to_remove - 1, |(_, t)| *t);
             }
 
-            let mut removed_semantic_entry = false;
             for (key, _) in entries_with_time.into_iter().take(to_remove) {
-                if let Some((_, removed)) = self.cache.remove(&key) {
+                if let Some((_, removed)) = cache.remove(&key) {
                     removed_semantic_entry |= removed.embedding.is_some();
                     // Lease releases when `removed` drops.
                 }
             }
-            if removed_semantic_entry {
-                self.mark_vector_index_dirty();
-            }
         }
+        removed_semantic_entry
+    }
+
+    /// Synchronous cleanup used only by the external test crate's
+    /// `force_cleanup_for_tests`, which wants the sweep to have completed by the
+    /// time it returns (the production hot path uses [`Self::spawn_cleanup_if_due`]).
+    fn cleanup_expired(&self) {
+        if !self.try_claim_cleanup_interval() {
+            return;
+        }
+        if Self::run_cleanup(&self.cache, self.ttl, self.max_entries) {
+            self.mark_vector_index_dirty();
+        }
+    }
+}
+
+/// Resets the `cleanup_running` guard on drop so a cancelled or panicking
+/// cleanup task cannot permanently block future cleanup scheduling.
+struct CleanupRunningGuard {
+    running: Arc<AtomicBool>,
+}
+
+impl Drop for CleanupRunningGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
     }
 }
 
@@ -1507,6 +1812,25 @@ fn append_identity_key_parts(
     if let Some(ref proxy) = ctx.matched_proxy {
         start_key_part(key_input, has_part);
         key_input.push_str(&proxy.id);
+
+        // Route/operation identity within the same proxy. A single proxy can
+        // expose several POST endpoints (or route rules) whose bodies are
+        // byte-identical but whose semantics or effective backends differ, so
+        // `proxy.id` alone under-partitions and lets a hit on path A replay to
+        // path B. `ctx.path` is the matched request path captured at admission
+        // and is the reliable route selector available at this plugin's phase
+        // (this plugin runs before route-dispatch plugins set the
+        // `route_override_*` destination fields, so those are not yet
+        // populated here). Length-prefix it so a path cannot bleed into the
+        // next key part. Effective destination beyond path is captured by the
+        // route override fields when a later dispatch plugin is not involved.
+        start_key_part(key_input, has_part);
+        key_input.push_str("path:");
+        append_len_prefixed(key_input, &ctx.path);
+        if let Some(upstream) = ctx.effective_upstream_id(proxy.as_ref()) {
+            key_input.push_str("|up:");
+            append_len_prefixed(key_input, upstream);
+        }
     }
 
     if plugin.scope_by_consumer
@@ -3294,30 +3618,64 @@ impl Plugin for AiSemanticCache {
             }
         };
 
-        // Periodic cleanup
-        self.cleanup_expired();
+        // Periodic cleanup — scheduled off the request hot path so no single
+        // request pays the full-map scan / oldest-entry eviction.
+        self.spawn_cleanup_if_due();
 
-        // Check Redis first (centralized cache across instances)
+        // Check Redis first (centralized cache across instances). Redis is an
+        // untrusted trust boundary: every hit is byte-bounded before allocation
+        // and re-validated against the same status/content-type/size/JSON/header
+        // admission contract as a local store, and any entry that fails is
+        // quarantined so it cannot inject an oversized, non-JSON, wrong-status,
+        // or unsanitized response.
         if let Some(ref redis) = self.redis_client
             && redis.is_available()
         {
             let redis_key = redis.make_key(&[&cache_key]);
-            if let Ok(Some(data)) = redis.get_bytes(&redis_key).await
-                && let Ok(entry) = serde_json::from_slice::<SerializableCacheEntry>(&data)
+            match redis
+                .get_bytes_bounded(&redis_key, self.redis_value_byte_cap())
+                .await
             {
-                debug!(
-                    cache_key = %cache_key,
-                    "ai_semantic_cache: Redis cache HIT, returning cached response"
-                );
-                let mut response_headers = entry.headers.clone();
-                response_headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
-                self.clear_instance_staging(ctx);
-                self.set_cache_status(ctx, "HIT");
-                return PluginResult::RejectBinary {
-                    status_code: entry.status_code,
-                    body: Bytes::from(entry.body),
-                    headers: response_headers,
-                };
+                Ok(BoundedRedisValue::Found(data)) => {
+                    match serde_json::from_slice::<SerializableCacheEntry>(&data)
+                        .ok()
+                        .and_then(|entry| self.admit_redis_hit(&entry))
+                    {
+                        Some(cached) => {
+                            debug!(
+                                cache_key = %cache_key,
+                                "ai_semantic_cache: Redis cache HIT, returning cached response"
+                            );
+                            let mut response_headers = cached.headers;
+                            response_headers
+                                .insert("x-ai-cache-status".to_string(), "HIT".to_string());
+                            self.clear_instance_staging(ctx);
+                            self.set_cache_status(ctx, "HIT");
+                            return PluginResult::RejectBinary {
+                                status_code: cached.status_code,
+                                body: cached.body,
+                                headers: response_headers,
+                            };
+                        }
+                        None => {
+                            debug!(
+                                cache_key = %cache_key,
+                                "ai_semantic_cache: quarantining Redis entry that failed hit-side admission"
+                            );
+                            let _ = redis.delete(&redis_key).await;
+                        }
+                    }
+                }
+                Ok(BoundedRedisValue::Oversized { length }) => {
+                    debug!(
+                        cache_key = %cache_key,
+                        length,
+                        cap = self.redis_value_byte_cap(),
+                        "ai_semantic_cache: quarantining oversized Redis entry"
+                    );
+                    let _ = redis.delete(&redis_key).await;
+                }
+                Ok(BoundedRedisValue::Missing) | Err(()) => {}
             }
         }
 
@@ -3580,6 +3938,7 @@ impl Plugin for AiSemanticCache {
             && redis.is_available()
         {
             let serializable = SerializableCacheEntry {
+                version: SEMANTIC_CACHE_ENTRY_VERSION,
                 status_code: response_status,
                 headers: safe_headers,
                 body: body.to_vec(),
@@ -4274,6 +4633,7 @@ mod tests {
     #[test]
     fn redis_serialized_cache_entry_omits_semantic_vector_fields_when_empty() {
         let entry = SerializableCacheEntry {
+            version: SEMANTIC_CACHE_ENTRY_VERSION,
             status_code: 200,
             headers: HashMap::new(),
             body: b"cached".to_vec(),
@@ -4282,7 +4642,132 @@ mod tests {
         };
 
         let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value.get("version").and_then(Value::as_u64), Some(1));
         assert!(value.get("semantic_scope_key").is_none());
         assert!(value.get("embedding").is_none());
+    }
+
+    fn redis_entry(
+        version: u8,
+        status_code: u16,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> SerializableCacheEntry {
+        let mut headers = HashMap::new();
+        if let Some(ct) = content_type {
+            headers.insert("content-type".to_string(), ct.to_string());
+        }
+        SerializableCacheEntry {
+            version,
+            status_code,
+            headers,
+            body: body.to_vec(),
+            semantic_scope_key: None,
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn admit_redis_hit_reapplies_store_admission_and_sanitizes() {
+        let plugin = AiSemanticCache::new(
+            &json!({"ttl_seconds": 600, "max_entry_size_bytes": 64}),
+            PluginHttpClient::default(),
+        )
+        .expect("valid config");
+
+        // Valid, in-version, JSON, small entry with an injected sensitive header.
+        let mut valid = redis_entry(
+            SEMANTIC_CACHE_ENTRY_VERSION,
+            200,
+            Some("application/json"),
+            br#"{"ok":true}"#,
+        );
+        valid
+            .headers
+            .insert("set-cookie".to_string(), "sid=secret".to_string());
+        let admitted = plugin
+            .admit_redis_hit(&valid)
+            .expect("a valid versioned JSON 2xx entry must be admitted");
+        assert_eq!(admitted.status_code, 200);
+        assert_eq!(admitted.body, Bytes::from_static(br#"{"ok":true}"#));
+        assert!(
+            !admitted
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("set-cookie")),
+            "foreign-injected Set-Cookie must be stripped on the hit path"
+        );
+
+        // Cross-version / unversioned (default 0) envelope is rejected.
+        assert!(
+            plugin
+                .admit_redis_hit(&redis_entry(0, 200, Some("application/json"), br#"{"ok":true}"#))
+                .is_none(),
+            "cross-version envelope must be quarantined"
+        );
+
+        // Non-2xx and no-body 2xx statuses are rejected.
+        for status in [500u16, 302, 204, 205] {
+            assert!(
+                plugin
+                    .admit_redis_hit(&redis_entry(
+                        SEMANTIC_CACHE_ENTRY_VERSION,
+                        status,
+                        Some("application/json"),
+                        br#"{"ok":true}"#,
+                    ))
+                    .is_none(),
+                "status {status} must not be served from Redis"
+            );
+        }
+
+        // Oversized body (> max_entry_size_bytes) is rejected even if JSON.
+        let big = format!("\"{}\"", "x".repeat(200));
+        assert!(
+            plugin
+                .admit_redis_hit(&redis_entry(
+                    SEMANTIC_CACHE_ENTRY_VERSION,
+                    200,
+                    Some("application/json"),
+                    big.as_bytes(),
+                ))
+                .is_none(),
+            "an over-cap body must not be served"
+        );
+
+        // Non-JSON content type, missing content type, and invalid JSON body are rejected.
+        assert!(
+            plugin
+                .admit_redis_hit(&redis_entry(
+                    SEMANTIC_CACHE_ENTRY_VERSION,
+                    200,
+                    Some("text/html"),
+                    b"<html></html>",
+                ))
+                .is_none(),
+            "non-JSON content type must not be served"
+        );
+        assert!(
+            plugin
+                .admit_redis_hit(&redis_entry(
+                    SEMANTIC_CACHE_ENTRY_VERSION,
+                    200,
+                    None,
+                    br#"{"ok":true}"#,
+                ))
+                .is_none(),
+            "an entry without a content type must not be served"
+        );
+        assert!(
+            plugin
+                .admit_redis_hit(&redis_entry(
+                    SEMANTIC_CACHE_ENTRY_VERSION,
+                    200,
+                    Some("application/json"),
+                    b"not json",
+                ))
+                .is_none(),
+            "a syntactically invalid JSON body must not be served"
+        );
     }
 }
