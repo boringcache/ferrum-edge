@@ -1,7 +1,8 @@
+use super::plugin_utils::create_test_proxy;
 use ferrum_edge::_test_support::{
-    ai_semantic_cache_cache_budget_used_for_test, ai_semantic_cache_clear_vector_index_dirty_for_test,
-    ai_semantic_cache_embedding, ai_semantic_cache_expire_all_entries_for_test,
-    ai_semantic_cache_force_cleanup_for_test,
+    ai_semantic_cache_cache_budget_used_for_test,
+    ai_semantic_cache_clear_vector_index_dirty_for_test, ai_semantic_cache_embedding,
+    ai_semantic_cache_expire_all_entries_for_test, ai_semantic_cache_force_cleanup_for_test,
     ai_semantic_cache_force_vector_rebuild_budget_failure_for_test,
     ai_semantic_cache_instance_id_for_test, ai_semantic_cache_maintenance_committed_for_test,
     ai_semantic_cache_maintenance_handle_count_for_test,
@@ -16,7 +17,6 @@ use ferrum_edge::_test_support::{
     rebuild_ai_semantic_cache_vector_index, set_ai_semantic_cache_embedding,
     set_ai_semantic_cache_scope_key,
 };
-use super::plugin_utils::create_test_proxy;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -1878,12 +1878,7 @@ async fn exact_key_length_frames_user_controlled_instruction_fields() {
         "temperature": 0,
         "messages": [{"role": "user", "content": "Say hi."}]
     });
-    assert_exact_miss_for_variant(
-        model_with_separator,
-        model_and_temperature,
-        br#""safe""#,
-    )
-    .await;
+    assert_exact_miss_for_variant(model_with_separator, model_and_temperature, br#""safe""#).await;
 
     let two_text_parts = json!({
         "model": "gpt-4o",
@@ -1903,6 +1898,38 @@ async fn exact_key_length_frames_user_controlled_instruction_fields() {
         }]
     });
     assert_exact_miss_for_variant(two_text_parts, one_text_part, br#""safe""#).await;
+}
+
+#[tokio::test]
+async fn exact_key_recursively_canonicalizes_json_object_order() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300, "scope_by_consumer": false}));
+    let first = r#"{
+        "model":"gpt-4o",
+        "messages":[{
+            "role":"user",
+            "content":[{"type":"text","text":"same","metadata":{"z":2,"a":1}}]
+        }],
+        "response_format":{"type":"json_schema","json_schema":{"schema":{
+            "type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}
+        }}}
+    }"#;
+    let reordered = r#"{
+        "response_format":{"json_schema":{"schema":{
+            "properties":{"a":{"type":"number"},"z":{"type":"string"}},"type":"object"
+        }},"type":"json_schema"},
+        "messages":[{
+            "content":[{"metadata":{"a":1,"z":2},"text":"same","type":"text"}],
+            "role":"user"
+        }],
+        "model":"gpt-4o"
+    }"#;
+
+    store_response(&plugin, first, None, br#""canonical""#).await;
+    let hit = run_before_proxy_get_status(&plugin, reordered, None).await;
+    assert!(
+        hit,
+        "object insertion order at every nesting level must not change the exact key"
+    );
 }
 
 #[tokio::test]
@@ -4371,7 +4398,10 @@ async fn test_hnsw_rebuild_peak_charges_old_and_candidate_generations() {
     let first_peak = rebuild_ai_semantic_cache_vector_index(&plugin).await;
     let after_first = assert_size_accounting_exact(&plugin);
     let first_snapshot = ai_semantic_cache_vector_snapshot_accounted_bytes_for_test(&plugin);
-    assert!(first_snapshot > 0, "first rebuild must publish an HNSW generation");
+    assert!(
+        first_snapshot > 0,
+        "first rebuild must publish an HNSW generation"
+    );
     assert!(
         after_first >= first_snapshot,
         "published HNSW bytes must be charged against the shared budget"
@@ -4435,10 +4465,7 @@ async fn test_hnsw_rebuild_budget_failure_releases_candidate_lease() {
 #[tokio::test]
 async fn test_embedding_response_rejects_oversize_body() {
     let mock_server = MockServer::start().await;
-    let huge = format!(
-        r#"{{"embedding":[{}]}}"#,
-        "0.0,".repeat(300_000) + "1.0"
-    );
+    let huge = format!(r#"{{"embedding":[{}]}}"#, "0.0,".repeat(300_000) + "1.0");
     assert!(
         huge.len() > 1024 * 1024,
         "fixture must exceed the embedding response byte cap"
@@ -4531,12 +4558,9 @@ async fn test_canonical_numeric_params_still_collapse_for_exact_keys() {
         "temperature": 1.0,
         "messages": [{"role": "user", "content": "canonical params"}]
     });
-    let hit = run_before_proxy_get_status(
-        &plugin,
-        &serde_json::to_string(&body_float).unwrap(),
-        None,
-    )
-    .await;
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body_float).unwrap(), None)
+            .await;
     assert!(
         hit,
         "canonical numeric sampling-parameter forms remain exact-key equivalent"
@@ -4666,7 +4690,10 @@ async fn maintenance_workers_stage_commit_and_abort_on_drop() {
         .expect("start_background_tasks must succeed on a Tokio runtime");
     assert!(ai_semantic_cache_maintenance_staged_for_test(&plugin));
     assert!(!ai_semantic_cache_maintenance_committed_for_test(&plugin));
-    assert_eq!(ai_semantic_cache_maintenance_handle_count_for_test(&plugin), 1);
+    assert_eq!(
+        ai_semantic_cache_maintenance_handle_count_for_test(&plugin),
+        1
+    );
 
     // Activation rollback: drop before commit must abort staged workers.
     drop(plugin);
@@ -4680,18 +4707,15 @@ async fn maintenance_workers_stage_commit_and_abort_on_drop() {
     plugin
         .start_background_tasks()
         .expect("semantic mode stages cleanup + rebuild workers");
-    assert_eq!(ai_semantic_cache_maintenance_handle_count_for_test(&plugin), 2);
+    assert_eq!(
+        ai_semantic_cache_maintenance_handle_count_for_test(&plugin),
+        2
+    );
     plugin.commit_background_tasks();
     assert!(ai_semantic_cache_maintenance_committed_for_test(&plugin));
 
-    // Large-cache scheduling: hot path only signals; force cleanup still works.
-    let now = std::time::Instant::now();
-    for i in 0..8 {
-        // Populate via store path would be heavier; force_cleanup still exercises
-        // the synchronous sweep used by tests while production uses signals.
-        let _ = i;
-        let _ = now;
-    }
+    // Hot-path notification and the synchronous external test seam both remain
+    // available while production cleanup runs only on the lifecycle worker.
     ai_semantic_cache_notify_cleanup_for_test(&plugin);
     ai_semantic_cache_force_cleanup_for_test(&plugin);
     drop(plugin);
@@ -4722,26 +4746,29 @@ async fn identical_semantic_misses_coalesce_to_one_embedding_call() {
     });
     let body_str = serde_json::to_string(&body).unwrap();
     let proxy = Arc::new(create_test_proxy());
+    let start = Arc::new(tokio::sync::Barrier::new(13));
 
     let mut tasks = Vec::new();
     for _ in 0..12 {
         let plugin = Arc::clone(&plugin);
         let body_str = body_str.clone();
         let proxy = Arc::clone(&proxy);
+        let start = Arc::clone(&start);
         tasks.push(tokio::spawn(async move {
+            start.wait().await;
             let mut ctx = RequestContext::new(
                 "127.0.0.1".to_string(),
                 "POST".to_string(),
                 "/v1/chat/completions".to_string(),
             );
             ctx.matched_proxy = Some(proxy);
-            ctx.metadata
-                .insert("request_body".to_string(), body_str);
+            ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
             plugin.before_proxy(&mut ctx, &mut headers).await
         }));
     }
+    start.wait().await;
     for task in tasks {
         let result = task.await.expect("join");
         assert!(
@@ -4786,8 +4813,7 @@ async fn leader_cancel_reelects_one_replacement_without_stampede() {
             "/v1/chat/completions".to_string(),
         );
         ctx.matched_proxy = Some(proxy_leader);
-        ctx.metadata
-            .insert("request_body".to_string(), body_leader);
+        ctx.metadata.insert("request_body".to_string(), body_leader);
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
         plugin_leader.before_proxy(&mut ctx, &mut headers).await
@@ -4809,8 +4835,7 @@ async fn leader_cancel_reelects_one_replacement_without_stampede() {
                 "/v1/chat/completions".to_string(),
             );
             ctx.matched_proxy = Some(proxy);
-            ctx.metadata
-                .insert("request_body".to_string(), body_str);
+            ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
             plugin.before_proxy(&mut ctx, &mut headers).await
@@ -4862,8 +4887,7 @@ async fn singleflight_timeout_bypasses_without_duplicating_live_leader() {
                 "/v1/chat/completions".to_string(),
             );
             ctx.matched_proxy = Some(proxy);
-            ctx.metadata
-                .insert("request_body".to_string(), body_str);
+            ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
             plugin.before_proxy(&mut ctx, &mut headers).await
@@ -4899,8 +4923,7 @@ async fn high_cardinality_distinct_misses_are_semaphore_bounded() {
                 "/v1/chat/completions".to_string(),
             );
             ctx.matched_proxy = Some(proxy);
-            ctx.metadata
-                .insert("request_body".to_string(), body_str);
+            ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
             plugin.before_proxy(&mut ctx, &mut headers).await

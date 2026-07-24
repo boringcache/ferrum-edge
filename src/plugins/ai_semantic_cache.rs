@@ -220,9 +220,10 @@ const MIN_REDIS_INTEGRITY_KEY_BYTES: usize = 32;
 /// a hit whose envelope version does not match is treated as invalid (a
 /// cross-version or foreign write) and quarantined rather than replayed. Bump
 /// this whenever the stored envelope shape or authenticity contract changes.
-/// v2 requires an HMAC authenticity tag; there is no legacy unauthenticated
-/// read path during build-out.
-const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 2;
+/// v2 requires an HMAC authenticity tag; v3 length-frames every authenticated
+/// header name/value so embedded NUL bytes cannot repartition header fields.
+/// There is no legacy unauthenticated read path during build-out.
+const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 3;
 
 /// Deployment-safe ceiling on concurrent outbound embedding requests per plugin
 /// instance. A burst of distinct concurrent misses (or an embedding outage that
@@ -899,10 +900,7 @@ impl AiSemanticCache {
             max_entries,
             max_entry_size_bytes,
             max_total_size_bytes,
-            cache_budget: Arc::new(ByteBudget::new(
-                "ai_semantic_cache",
-                max_total_size_bytes,
-            )),
+            cache_budget: Arc::new(ByteBudget::new("ai_semantic_cache", max_total_size_bytes)),
             rebuild_reserved_bytes: Arc::new(AtomicUsize::new(0)),
             include_model_in_key,
             include_params_in_key,
@@ -1232,8 +1230,7 @@ impl AiSemanticCache {
                 *learned
             ));
         }
-        EmbeddingPoint::from_raw(values)
-            .map_err(|err| format!("embedding response invalid: {err}"))
+        EmbeddingPoint::from_raw(values).map_err(|err| format!("embedding response invalid: {err}"))
     }
 
     fn lookup_semantic(
@@ -1582,9 +1579,7 @@ impl AiSemanticCache {
         let rebuild = self.rebuild_reserved_bytes.load(Ordering::Acquire);
         (
             tracked,
-            entries
-                .saturating_add(published)
-                .saturating_add(rebuild),
+            entries.saturating_add(published).saturating_add(rebuild),
         )
     }
 
@@ -1724,55 +1719,6 @@ impl AiSemanticCache {
         self.rebuild_signal.notify_one();
     }
 
-    /// Lifecycle-owned HNSW rebuild pass. Claims the rebuild guard, clears dirty
-    /// under that claim, and builds off the request path.
-    #[allow(dead_code)]
-    async fn run_vector_index_rebuild_pass(&self) {
-        let Some(semantic) = self.semantic.as_ref() else {
-            return;
-        };
-        if !self.vector_index_dirty.load(Ordering::Acquire) {
-            return;
-        }
-        let now_epoch = current_epoch_seconds();
-        let has_snapshot = self.vector_index.load().is_some();
-        let last = self.last_vector_rebuild.load(Ordering::Relaxed);
-        if has_snapshot && now_epoch.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS {
-            return;
-        }
-        if self
-            .vector_index_rebuild_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        if !self.vector_index_dirty.swap(false, Ordering::AcqRel) {
-            self.vector_index_rebuild_running
-                .store(false, Ordering::Release);
-            return;
-        }
-        self.last_vector_rebuild.store(now_epoch, Ordering::Release);
-        let _state_guard = RebuildStateGuard {
-            running: Arc::clone(&self.vector_index_rebuild_running),
-            reserved: Arc::clone(&self.rebuild_reserved_bytes),
-        };
-        let build_result = Self::build_vector_snapshot(
-            Arc::clone(&self.cache),
-            self.ttl,
-            semantic.max_candidates,
-            Arc::clone(&self.cache_budget),
-            Arc::clone(&self.rebuild_reserved_bytes),
-        )
-        .await;
-        Self::store_vector_snapshot_result(
-            build_result,
-            self.vector_index.as_ref(),
-            self.vector_index_dirty.as_ref(),
-            self.rebuild_reserved_bytes.as_ref(),
-        );
-    }
-
     /// Claim the current cleanup interval, if one is due.
     ///
     /// Throttled to once per `CLEANUP_INTERVAL_SECONDS` using a monotonic
@@ -1811,32 +1757,10 @@ impl AiSemanticCache {
         self.cleanup_signal.notify_one();
     }
 
-    /// Lifecycle-owned cleanup pass claimed by the background worker.
-    #[allow(dead_code)]
-    fn run_cleanup_pass(&self) {
-        if self
-            .cleanup_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let _running_guard = CleanupRunningGuard {
-            running: Arc::clone(&self.cleanup_running),
-        };
-        if Self::run_cleanup(&self.cache, self.ttl, self.max_entries) {
-            self.mark_vector_index_dirty();
-        }
-    }
-
     /// Full-map expired-entry sweep and max-entries eviction. Returns whether a
     /// semantic (embedded) entry was removed so callers can re-dirty the vector
     /// index. Entry byte leases release when the removed `CacheEntry` drops.
-    fn run_cleanup(
-        cache: &DashMap<String, CacheEntry>,
-        ttl: Duration,
-        max_entries: usize,
-    ) -> bool {
+    fn run_cleanup(cache: &DashMap<String, CacheEntry>, ttl: Duration, max_entries: usize) -> bool {
         let now = Instant::now();
         let mut removed_semantic_entry = false;
         cache.retain(|_, entry| {
@@ -1960,7 +1884,9 @@ impl AiSemanticCache {
     /// Pass `None` to restore the production default.
     #[allow(dead_code)]
     pub(crate) fn set_singleflight_wait_override_for_tests(wait: Option<Duration>) {
-        let ms = wait.map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64).unwrap_or(0);
+        let ms = wait
+            .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
         SINGLEFLIGHT_WAIT_OVERRIDE_MS.store(ms, Ordering::Relaxed);
     }
 }
@@ -2148,7 +2074,7 @@ fn append_json_field(body: &Value, field: &str, key_input: &mut String, has_part
         start_key_part(key_input, has_part);
         key_input.push_str(field);
         key_input.push(':');
-        let _ = write!(key_input, "{value}");
+        key_input.push_str(&canonical_json_for_key(value));
     }
 }
 
@@ -2357,7 +2283,7 @@ fn append_object_state(
         }
         append_len_prefixed(key_input, field);
         key_input.push('=');
-        let _ = write!(key_input, "{value}");
+        key_input.push_str(&canonical_json_for_key(value));
         key_input.push(';');
     }
     key_input.push('}');
@@ -2435,7 +2361,7 @@ fn append_responses_prompt_exact_key(input: &Value, key_input: &mut String) -> O
         Value::String(_) | Value::Array(_) | Value::Object(_) => {}
         _ => return None,
     }
-    append_len_prefixed(key_input, &input.to_string());
+    append_len_prefixed(key_input, &canonical_json_for_key(input));
     Some(())
 }
 
@@ -2488,7 +2414,7 @@ fn append_family_prompt_exact_key(
                 append_len_prefixed(key_input, role);
                 append_len_prefixed(
                     key_input,
-                    &msg.get("content").unwrap_or(&Value::Null).to_string(),
+                    &canonical_json_for_key(msg.get("content").unwrap_or(&Value::Null)),
                 );
             }
             Some(())
@@ -2514,7 +2440,7 @@ fn append_family_prompt_exact_key(
                 append_len_prefixed(key_input, role);
                 append_len_prefixed(
                     key_input,
-                    &content.get("parts").unwrap_or(&Value::Null).to_string(),
+                    &canonical_json_for_key(content.get("parts").unwrap_or(&Value::Null)),
                 );
             }
             Some(())
@@ -2531,11 +2457,11 @@ fn append_family_prompt_exact_key(
                     append_len_prefixed(key_input, role);
                     append_len_prefixed(
                         key_input,
-                        &msg
-                            .get("message")
-                            .or_else(|| msg.get("content"))
-                            .unwrap_or(&Value::Null)
-                            .to_string(),
+                        &canonical_json_for_key(
+                            msg.get("message")
+                                .or_else(|| msg.get("content"))
+                                .unwrap_or(&Value::Null),
+                        ),
                     );
                 }
             }
@@ -2586,7 +2512,7 @@ fn append_family_instruction_exact_key(
             if let Some(system) = body.get("system") {
                 start_key_part(key_input, has_part);
                 key_input.push_str("sys:");
-                append_len_prefixed(key_input, &system.to_string());
+                append_len_prefixed(key_input, &canonical_json_for_key(system));
             }
             if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
@@ -2615,7 +2541,7 @@ fn append_family_instruction_exact_key(
                     start_key_part(key_input, has_part);
                     key_input.push_str(field);
                     key_input.push(':');
-                    append_len_prefixed(key_input, &system.to_string());
+                    append_len_prefixed(key_input, &canonical_json_for_key(system));
                 }
             }
         }
@@ -2782,8 +2708,7 @@ fn append_family_instruction_scope(
         CacheRequestFamily::Gemini => {
             for field in ["systemInstruction", "system_instruction"] {
                 if let Some(system) = body.get(field) {
-                    let normalized =
-                        gemini_instruction_for_key(system, PromptTextCanon::Semantic);
+                    let normalized = gemini_instruction_for_key(system, PromptTextCanon::Semantic);
                     if normalized.is_empty() {
                         continue;
                     }
@@ -2941,13 +2866,13 @@ fn prompt_value_for_key(value: &Value, mode: PromptTextCanon) -> String {
             for item in items {
                 let text = match item {
                     Value::String(text) => canonicalize_prompt_text(text, mode),
-                    other => canonicalize_prompt_text(&other.to_string(), mode),
+                    other => canonicalize_prompt_text(&canonical_json_for_key(other), mode),
                 };
                 append_len_prefixed(&mut normalized, &text);
             }
             normalized
         }
-        other => canonicalize_prompt_text(&other.to_string(), mode),
+        other => canonicalize_prompt_text(&canonical_json_for_key(other), mode),
     }
 }
 
@@ -2961,7 +2886,7 @@ fn gemini_instruction_for_key(system: &Value, mode: PromptTextCanon) -> String {
     if let Some(parts) = system.as_array() {
         return extract_gemini_parts_text(parts, mode);
     }
-    canonicalize_prompt_text(&system.to_string(), mode)
+    canonicalize_prompt_text(&canonical_json_for_key(system), mode)
 }
 
 fn system_value_for_key(system: &Value, mode: PromptTextCanon) -> String {
@@ -2978,7 +2903,7 @@ fn system_value_for_key(system: &Value, mode: PromptTextCanon) -> String {
         }
         canonicalize_prompt_text(&texts.join(" "), mode)
     } else {
-        canonicalize_prompt_text(&system.to_string(), mode)
+        canonicalize_prompt_text(&canonical_json_for_key(system), mode)
     }
 }
 
@@ -3027,7 +2952,7 @@ fn canonical_param_value(value: &Value) -> String {
             return n.to_string();
         }
     }
-    value.to_string()
+    canonical_json_for_key(value)
 }
 
 fn cache_entry_approx_size(
@@ -3528,6 +3453,81 @@ fn append_len_prefixed(buffer: &mut String, value: &str) {
     buffer.push_str(value);
 }
 
+/// Recursion bound for key-only canonical JSON serialization.
+///
+/// Ordinary request parsing already has serde_json's recursion guard. This
+/// second bound keeps cache-key work independently bounded; unusually deep
+/// values fall back to their structurally safe insertion-order serialization,
+/// which can only cause a conservative cache miss.
+const MAX_CACHE_KEY_JSON_DEPTH: usize = 64;
+
+/// Serialize JSON with recursively sorted object keys while preserving array
+/// order and scalar bytes. `serde_json`'s `preserve_order` feature is enabled
+/// transitively in this build, so `Value::to_string()` alone is not canonical.
+fn canonical_json_for_key(value: &Value) -> String {
+    let mut canonical = String::new();
+    if append_canonical_json_for_key(&mut canonical, value, MAX_CACHE_KEY_JSON_DEPTH) {
+        canonical
+    } else {
+        value.to_string()
+    }
+}
+
+fn append_canonical_json_for_key(
+    buffer: &mut String,
+    value: &Value,
+    depth_remaining: usize,
+) -> bool {
+    match value {
+        Value::Array(values) => {
+            if depth_remaining == 0 {
+                return false;
+            }
+            buffer.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    buffer.push(',');
+                }
+                if !append_canonical_json_for_key(buffer, value, depth_remaining - 1) {
+                    return false;
+                }
+            }
+            buffer.push(']');
+            true
+        }
+        Value::Object(map) => {
+            if depth_remaining == 0 {
+                return false;
+            }
+            buffer.push('{');
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    buffer.push(',');
+                }
+                let Ok(encoded_key) = serde_json::to_string(key) else {
+                    return false;
+                };
+                buffer.push_str(&encoded_key);
+                buffer.push(':');
+                let Some(child) = map.get(key) else {
+                    return false;
+                };
+                if !append_canonical_json_for_key(buffer, child, depth_remaining - 1) {
+                    return false;
+                }
+            }
+            buffer.push('}');
+            true
+        }
+        _ => {
+            let _ = write!(buffer, "{value}");
+            true
+        }
+    }
+}
+
 fn append_ascii_lowercase_len_prefixed(buffer: &mut String, value: &str) {
     let _ = write!(buffer, "{}:", value.len());
     push_ascii_lowercase(buffer, value);
@@ -3815,10 +3815,12 @@ impl Plugin for AiSemanticCache {
                 while !committed.load(Ordering::Acquire) {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
+                        _ = signal.notified() => {},
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                     }
                 }
-                let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
@@ -3838,8 +3840,21 @@ impl Plugin for AiSemanticCache {
                     let _running_guard = CleanupRunningGuard {
                         running: Arc::clone(&cleanup_running),
                     };
-                    let removed_semantic =
-                        AiSemanticCache::run_cleanup(&plugin_cache, ttl, max_entries);
+                    let cleanup_cache = Arc::clone(&plugin_cache);
+                    let removed_semantic = match tokio::task::spawn_blocking(move || {
+                        AiSemanticCache::run_cleanup(&cleanup_cache, ttl, max_entries)
+                    })
+                    .await
+                    {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            debug!(
+                                error = %error,
+                                "ai_semantic_cache: cleanup worker join failed"
+                            );
+                            false
+                        }
+                    };
                     if removed_semantic && semantic_enabled {
                         dirty.store(true, Ordering::Release);
                         rebuild_signal.notify_one();
@@ -3871,6 +3886,7 @@ impl Plugin for AiSemanticCache {
                 while !committed.load(Ordering::Acquire) {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
+                        _ = signal.notified() => {},
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                     }
                 }
@@ -4370,12 +4386,9 @@ impl Plugin for AiSemanticCache {
             && redis.is_available()
         {
             let redis_key = redis.make_key(&[&cache_key]);
-            if let Some(serializable) = self.seal_redis_entry(
-                &redis_key,
-                response_status,
-                &safe_headers,
-                body,
-            ) {
+            if let Some(serializable) =
+                self.seal_redis_entry(&redis_key, response_status, &safe_headers, body)
+            {
                 if let Ok(data) = serde_json::to_vec(&serializable) {
                     let ttl_seconds = self.ttl.as_secs().max(1);
                     let _ = redis
@@ -4457,35 +4470,40 @@ fn compute_redis_envelope_mac(
     embedding: Option<&[f32]>,
 ) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).ok()?;
-    mac.update(b"ai_semantic_cache.v2\0");
+    mac.update(b"ai_semantic_cache.v3\0");
+    mac.update(&(redis_key.len() as u64).to_le_bytes());
     mac.update(redis_key.as_bytes());
-    mac.update(b"\0");
     mac.update(&[version]);
     mac.update(&status_code.to_le_bytes());
-    mac.update(b"\0");
     let mut header_pairs: Vec<(&str, &str)> = headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
     header_pairs.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
+    mac.update(&(header_pairs.len() as u64).to_le_bytes());
     for (name, value) in header_pairs {
+        mac.update(&(name.len() as u64).to_le_bytes());
         mac.update(name.as_bytes());
-        mac.update(b"\0");
+        mac.update(&(value.len() as u64).to_le_bytes());
         mac.update(value.as_bytes());
-        mac.update(b"\0");
     }
     mac.update(&(body.len() as u64).to_le_bytes());
     mac.update(body);
     if let Some(scope) = semantic_scope_key {
-        mac.update(b"\0scope\0");
+        mac.update(&[1]);
+        mac.update(&(scope.len() as u64).to_le_bytes());
         mac.update(scope.as_bytes());
+    } else {
+        mac.update(&[0]);
     }
     if let Some(values) = embedding {
-        mac.update(b"\0emb\0");
+        mac.update(&[1]);
         mac.update(&(values.len() as u64).to_le_bytes());
         for value in values {
             mac.update(&value.to_le_bytes());
         }
+    } else {
+        mac.update(&[0]);
     }
     Some(mac.finalize().into_bytes().to_vec())
 }
@@ -5105,10 +5123,7 @@ mod tests {
             .collect();
         let body = json!({ "embedding": values });
         let err = parse_embedding_response(&body, None).expect_err("oversize");
-        assert!(
-            err.contains("maximum dimension"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("maximum dimension"), "unexpected error: {err}");
     }
 
     #[test]
@@ -5203,6 +5218,38 @@ mod tests {
 
     #[test]
     fn admit_redis_hit_reapplies_store_admission_and_sanitizes() {
+        let split_headers = HashMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        let fused_headers = HashMap::from([("a".to_string(), "1\0b\02".to_string())]);
+        let split_mac = compute_redis_envelope_mac(
+            TEST_INTEGRITY_KEY.as_bytes(),
+            TEST_REDIS_KEY,
+            SEMANTIC_CACHE_ENTRY_VERSION,
+            200,
+            &split_headers,
+            b"body",
+            None,
+            None,
+        )
+        .expect("test HMAC");
+        let fused_mac = compute_redis_envelope_mac(
+            TEST_INTEGRITY_KEY.as_bytes(),
+            TEST_REDIS_KEY,
+            SEMANTIC_CACHE_ENTRY_VERSION,
+            200,
+            &fused_headers,
+            b"body",
+            None,
+            None,
+        )
+        .expect("test HMAC");
+        assert_ne!(
+            split_mac, fused_mac,
+            "length-framed header MAC input must resist NUL boundary repartitioning"
+        );
+
         let plugin = AiSemanticCache::new(
             &json!({
                 "ttl_seconds": 600,
