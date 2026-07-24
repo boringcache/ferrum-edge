@@ -17,6 +17,40 @@ fn assert_split_err(db_type: &str, sql: &str) {
     );
 }
 
+/// Executable `DELIMITER` client meta-commands must never appear in the
+/// returned statement list (SQLx would send them to the server).
+fn assert_no_delimiter_directives(statements: &[&str]) {
+    for (idx, statement) in statements.iter().enumerate() {
+        for (line_no, line) in statement.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let upper = trimmed.to_ascii_uppercase();
+            if let Some(rest) = upper.strip_prefix("DELIMITER") {
+                // `DELIMITER` as a directive is followed by whitespace or EOL,
+                // not another identifier character (e.g. a column named
+                // `delimiter_col` is fine).
+                let is_directive = rest.is_empty()
+                    || rest.starts_with(|c: char| c.is_whitespace());
+                assert!(
+                    !is_directive,
+                    "statement[{idx}] line {line_no} must not contain an executable DELIMITER directive: {statement:?}"
+                );
+            }
+        }
+        let leading = statement
+            .trim_start_matches(|c: char| c.is_whitespace())
+            .to_ascii_uppercase();
+        assert!(
+            !leading.starts_with("DELIMITER ")
+                && !leading.starts_with("DELIMITER\t")
+                && leading != "DELIMITER"
+                && !leading.starts_with("DELIMITER;")
+                && !leading.starts_with("DELIMITER/")
+                && !leading.starts_with("DELIMITER\n"),
+            "statement[{idx}] must not begin with a DELIMITER directive: {statement:?}"
+        );
+    }
+}
+
 #[test]
 fn splits_basic_multi_statement_sql() {
     assert_split(
@@ -179,11 +213,65 @@ fn mysql_delimiter_wraps_compound_trigger_body() {
         INSERT INTO t VALUES (2);
     "#;
     let statements = split_plugin_migration_statements(sql, "mysql").unwrap();
+    assert_no_delimiter_directives(&statements);
     assert_eq!(statements.len(), 3);
     assert_eq!(statements[0], "CREATE TABLE t (id INT)");
     assert!(statements[1].contains("SET NEW.id = 1;"));
     assert!(statements[1].trim_end().ends_with("END"));
+    assert!(!statements[1].contains("//"));
     assert_eq!(statements[2], "INSERT INTO t VALUES (2)");
+}
+
+#[test]
+fn mysql_delimiter_meta_commands_are_never_returned() {
+    let sql = r#"
+        -- leading comment before directive
+        DELIMITER //
+        CREATE PROCEDURE p1()
+        BEGIN
+            SET @a = 1;
+        END //
+        DELIMITER ;
+
+        /* between routines */
+        DELIMITER //
+        CREATE PROCEDURE p2()
+        BEGIN
+            SET @b = 2;
+        END //
+        # hash comment then restore
+        DELIMITER ;
+
+        SELECT @a;
+    "#;
+    let statements = split_plugin_migration_statements(sql, "mysql").unwrap();
+    assert_no_delimiter_directives(&statements);
+    assert_eq!(statements.len(), 3);
+    assert!(
+        statements[0].to_ascii_uppercase().starts_with("CREATE PROCEDURE P1"),
+        "{}",
+        statements[0]
+    );
+    assert!(statements[0].contains("SET @a = 1;"));
+    assert!(statements[0].trim_end().ends_with("END"));
+    assert!(!statements[0].ends_with("//"));
+    assert!(
+        statements[1].to_ascii_uppercase().starts_with("CREATE PROCEDURE P2"),
+        "{}",
+        statements[1]
+    );
+    assert!(statements[1].contains("SET @b = 2;"));
+    assert_eq!(statements[2], "SELECT @a");
+}
+
+#[test]
+fn mysql_delimiter_with_surrounding_comments_and_whitespace_has_no_phantoms() {
+    let sql = "\n\n  /* prelude */\n  -- skip me\n  DELIMITER //\n  \n  CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.id = 1; END //\n  \n  /* trailing */\n  DELIMITER ;\n  -- after restore\n  \n";
+    let statements = split_plugin_migration_statements(sql, "mysql").unwrap();
+    assert_no_delimiter_directives(&statements);
+    assert_eq!(statements.len(), 1);
+    assert!(statements[0].to_ascii_uppercase().contains("CREATE TRIGGER"));
+    assert!(statements[0].trim_end().ends_with("END"));
 }
 
 #[test]
@@ -227,9 +315,11 @@ fn mysql_end_if_inside_begin_does_not_close_outer_block_early() {
         DELIMITER ;
     "#;
     let statements = split_plugin_migration_statements(sql, "mysql").unwrap();
+    assert_no_delimiter_directives(&statements);
     assert_eq!(statements.len(), 1);
     assert!(statements[0].contains("END IF;"));
     assert!(statements[0].contains("SET NEW.id = NEW.id + 1;"));
+    assert!(!statements[0].contains("//"));
 }
 
 #[test]
@@ -277,6 +367,23 @@ fn rejects_mysql_delimiter_never_restored() {
         CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.id = 1; END //
     "#;
     let err = split_plugin_migration_statements(sql, "mysql").unwrap_err();
+    assert!(
+        err.to_string().contains("never restored"),
+        "got {err}"
+    );
+}
+
+#[test]
+fn rejects_mysql_malformed_and_trailing_delimiter_directives() {
+    assert_split_err("mysql", "DELIMITER\nSELECT 1;");
+    assert_split_err("mysql", "DELIMITER // trailing\nSELECT 1;");
+    assert_split_err("mysql", "DELIMITER '\nSELECT 1;");
+    // Unrestored custom delimiter must fail before any statement executes.
+    let err = split_plugin_migration_statements(
+        "DELIMITER //\nCREATE TABLE t (id INT)//",
+        "mysql",
+    )
+    .unwrap_err();
     assert!(
         err.to_string().contains("never restored"),
         "got {err}"

@@ -124,13 +124,15 @@ fn scan_statements<'a>(
 
     while i < bytes.len() {
         // Client DELIMITER directives are only meaningful at statement starts.
+        // They are mysql-client meta-commands: never push them as executable SQL.
         if dialect.allows_delimiter_directives()
             && compound_depth == 0
             && case_depth == 0
             && is_at_statement_start(sql, stmt_start, i)
             && let Some(new_delim) = try_parse_delimiter_directive(sql, &mut i)?
         {
-            push_statement(sql, stmt_start, i, &mut statements)?;
+            // [stmt_start, previous i) was only whitespace/comments; discarding it
+            // with the directive avoids phantom comment-only or DELIMITER statements.
             delimiter = if new_delim == ";" {
                 CowDelim::Semicolon
             } else {
@@ -317,8 +319,54 @@ impl CowDelim {
     }
 }
 
+/// True when `[stmt_start, i)` is only whitespace and/or SQL comments, so a
+/// MySQL `DELIMITER` directive at `i` is still at a statement boundary.
 fn is_at_statement_start(sql: &str, stmt_start: usize, i: usize) -> bool {
-    sql[stmt_start..i].chars().all(|c| c.is_whitespace())
+    let bytes = sql.as_bytes();
+    let mut j = stmt_start;
+    while j < i {
+        if bytes[j].is_ascii_whitespace() {
+            j += 1;
+            continue;
+        }
+        if j + 1 < i && bytes[j] == b'-' && bytes[j + 1] == b'-' {
+            // Line comments extend through newline; require the scanned span
+            // to stay within `[stmt_start, i)`.
+            let after = scan_line_comment(bytes, j + 2);
+            if after > i {
+                return false;
+            }
+            j = after;
+            continue;
+        }
+        // MySQL `#` line comments (DELIMITER handling is MySQL-only).
+        if bytes[j] == b'#' {
+            let after = scan_line_comment(bytes, j + 1);
+            if after > i {
+                return false;
+            }
+            j = after;
+            continue;
+        }
+        if j + 1 < i && bytes[j] == b'/' && bytes[j + 1] == b'*' {
+            let mut k = j + 2;
+            let mut closed = false;
+            while k + 1 < bytes.len() {
+                if bytes[k] == b'*' && bytes[k + 1] == b'/' {
+                    j = k + 2;
+                    closed = true;
+                    break;
+                }
+                k += 1;
+            }
+            if !closed || j > i {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    true
 }
 
 fn try_parse_delimiter_directive(
