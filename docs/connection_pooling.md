@@ -37,8 +37,12 @@ proxies:
     pool_http2_keep_alive_timeout_seconds: 5
     pool_http2_initial_stream_window_size: 16777216   # 16 MiB
     pool_http2_initial_connection_window_size: 67108864  # 64 MiB
+    # Keep adaptive on explicitly when also setting fixed windows; otherwise
+    # an explicit window override auto-disables adaptive so fixed sizes apply.
     pool_http2_adaptive_window: true
 ```
+
+**Adaptive vs fixed window precedence:** shipped default is adaptive on (`true`). Hyper/reqwest adaptive windowing overrides `initial_stream_window_size` / `initial_connection_window_size`. Setting an explicit stream or connection window (global env/`ferrum.conf` or per-proxy `pool_http2_initial_*_window_size`) without also setting adaptive explicitly auto-disables adaptive at that config layer so the fixed windows take effect. Setting adaptive explicitly (including `true` alongside window overrides) remains authoritative. Direct `PoolConfig` construction for tests/code paths is unchanged — precedence applies only during env and per-proxy resolution.
 
 `pool_max_requests_per_connection` is accepted on proxies for backward compatibility, but it is currently a no-op at runtime. The shared reqwest/hyper HTTP client pool does not expose a stable per-connection request cap, so Ferrum validates and persists the field without applying it. DestinationRule `connectionPool.http.maxRequestsPerConnection` no longer projects into this proxy field; it is reported as deferred in Istio status instead. Values must be between 0 and 2,147,483,647; `0` preserves Istio's explicit unlimited value, and omitting the field preserves Ferrum's current unlimited behavior.
 
@@ -53,9 +57,9 @@ proxies:
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing) |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB. Inert while adaptive windowing remains enabled |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB. Inert while adaptive windowing remains enabled |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing). Overrides fixed initial windows while enabled. Explicit window overrides auto-disable adaptive unless adaptive is also set explicitly |
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum backend HTTP/2 frame payload (bytes). Range: 16384–1048576. Default: 1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 | `FERRUM_GRPC_POOL_READY_WAIT_MS` | `1` | Milliseconds the dedicated gRPC pool waits for a free H2 stream before opening another backend connection |
