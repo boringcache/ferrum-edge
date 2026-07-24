@@ -3402,8 +3402,15 @@ async fn compaction_refuses_while_overflow_delivery_can_stage_back() {
 
     let temp = tempfile::tempdir().unwrap();
     let spool_dir = temp.path().join("spool");
-    let plugin = make_snapshot_sink(&spool_dir, Some("compaction-delivery-quiescence"))
-        .expect("construct snapshot sink");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1000);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compaction-delivery-quiescence"),
+    )
+    .expect("construct snapshot sink");
     plugin
         .start_background_tasks()
         .expect("start snapshot sink");
