@@ -923,6 +923,7 @@ impl AiSemanticCache {
         );
 
         let instance_id = NEXT_AI_SEMANTIC_CACHE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        let shard_amount = http_client.pool_shard_amount();
         Ok(Self {
             instance_id,
             meta_cache_key: staging_metadata_key(instance_id, CACHE_KEY_SUFFIX),
@@ -942,9 +943,9 @@ impl AiSemanticCache {
             semantic,
             embedding_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EMBEDDINGS)),
             embedding_singleflight_wait_override_ms: AtomicU64::new(0),
-            embedding_flights: Arc::new(DashMap::new()),
+            embedding_flights: Arc::new(DashMap::with_shard_amount(shard_amount)),
             http_client,
-            cache: Arc::new(DashMap::new()),
+            cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vector_index: Arc::new(ArcSwapOption::empty()),
             embedding_dimension: Arc::new(OnceLock::new()),
             redis_client,
