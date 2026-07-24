@@ -683,6 +683,12 @@ pub mod _test_support {
         plugin.snapshot_overflow_counters_for_tests()
     }
 
+    pub fn api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_refuses_while_overflow_delivery_then_succeeds_for_tests()
+    }
+
     pub fn api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
     ) -> Option<(bool, bool)> {

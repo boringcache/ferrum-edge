@@ -412,21 +412,26 @@ async fn finalize_pending_snapshot(pending: &PendingSnapshotFinalization) -> boo
 }
 
 /// Reduce a Full snapshot generation to compact durable recovery, but never
-/// while an admitted terminal hook still holds its admission guard.
+/// while an admitted terminal hook or queued overflow delivery can still
+/// mutate the accumulator.
 ///
 /// Losslessness takes precedence over meeting a smaller full-generation count:
-/// admission is closed first and, until `in_flight` is observably zero, the
-/// Full generation is retained untouched (returns `false`) so a later
-/// compaction pass — the next reload or shutdown — can retry after drain. The
-/// budget gate is checked against the current retained estimate *before* any
-/// staged overflow is drained, so a refused compaction never loses events.
+/// admission is closed first and, until both terminal-hook admission and async
+/// overflow-delivery ownership are observably zero, the Full generation is
+/// retained untouched (returns `false`) so a later compaction pass — the next
+/// reload or shutdown — can retry after drain. The budget gate is checked
+/// against the current retained estimate *before* any staged overflow is
+/// drained, so a refused compaction never loses events.
 fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
     // Stop new admissions and require the admitted set to drain before touching
     // full-generation state. `admit()`'s double-checked `accepting` flag means
-    // that once we observe `accepting == false` and `in_flight == 0`, no guard
-    // is live and none can be created, so the accumulator is quiescent.
+    // that once we observe `accepting == false`, `in_flight == 0`, and no
+    // overflow delivery ownership, no guard or stage-back job can mutate the
+    // accumulator.
     lifecycle.mark_admission_closed();
-    if lifecycle.in_flight.load(Ordering::Acquire) > 0 {
+    if lifecycle.in_flight.load(Ordering::Acquire) > 0
+        || lifecycle.accumulator.overflow_deliveries_in_flight() > 0
+    {
         return false;
     }
 
@@ -1123,6 +1128,7 @@ impl SpoolDelivery {
         let Some(_admission) = self.worker.try_admit() else {
             return Err(events);
         };
+        accumulator.begin_overflow_delivery();
         self.pending_jobs.fetch_add(1, Ordering::Relaxed);
         self.pending_events
             .fetch_add(event_count, Ordering::Relaxed);
@@ -1142,7 +1148,14 @@ impl SpoolDelivery {
                 self.pending_events
                     .fetch_sub(event_count, Ordering::Relaxed);
                 match error.into_inner() {
-                    SpoolJob::SnapshotOverflow { events, .. } => Err(events),
+                    SpoolJob::SnapshotOverflow {
+                        events,
+                        accumulator,
+                        ..
+                    } => {
+                        accumulator.finish_overflow_delivery();
+                        Err(events)
+                    }
                     SpoolJob::Events(events) => Err(events),
                 }
             }
@@ -1243,6 +1256,7 @@ fn start_spool_delivery(
                                     );
                                 }
                             }
+                            accumulator.finish_overflow_delivery();
                             pending_jobs_for_loop.fetch_sub(1, Ordering::Relaxed);
                             pending_events_for_loop
                                 .fetch_sub(event_count, Ordering::Relaxed);
@@ -1466,7 +1480,9 @@ impl SnapshotLifecycle {
         }
 
         self.mark_admission_closed();
-        while self.in_flight.load(Ordering::Acquire) > 0 {
+        while self.in_flight.load(Ordering::Acquire) > 0
+            || self.accumulator.overflow_deliveries_in_flight() > 0
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 invalidate_status_cache();
@@ -2398,6 +2414,26 @@ impl ApiChargebackSink {
                 && compact_recovery_for_generation(lifecycle.generation).is_none()
         };
         // Admission guard dropped; in_flight is now zero. Retry compaction.
+        lifecycle.compact_failed_finalization();
+        let compacted_after_drain = lifecycle.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(lifecycle.generation).is_some();
+        Some((refused_while_held, compacted_after_drain))
+    }
+
+    /// Prove Full→Compact refuses while an async overflow delivery can still
+    /// stage back into the accumulator, then succeeds after delivery ownership
+    /// drains.
+    #[allow(dead_code)]
+    pub(crate) fn compact_refuses_while_overflow_delivery_then_succeeds_for_tests(
+        &self,
+    ) -> Option<(bool, bool)> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        lifecycle.commit();
+        lifecycle.accumulator.begin_overflow_delivery();
+        lifecycle.compact_failed_finalization();
+        let refused_while_held = !lifecycle.compacted.load(Ordering::Acquire)
+            && compact_recovery_for_generation(lifecycle.generation).is_none();
+        lifecycle.accumulator.finish_overflow_delivery();
         lifecycle.compact_failed_finalization();
         let compacted_after_drain = lifecycle.compacted.load(Ordering::Acquire)
             || compact_recovery_for_generation(lifecycle.generation).is_some();
@@ -5182,6 +5218,11 @@ pub struct SnapshotAccumulator {
     /// Overflow subset of `retained_bytes`, tracked separately so `take`/`clear`
     /// release exactly the staged portion from the combined counter.
     overflow_pending_bytes: AtomicUsize,
+    /// Async snapshot-overflow jobs that can still re-stage an event after a
+    /// durable spool failure. Full→Compact and finalization must wait for these
+    /// jobs as well as terminal-hook admission guards before transferring or
+    /// clearing accumulator state.
+    overflow_deliveries_in_flight: AtomicUsize,
     /// Test-only callback invoked after a key is selected as a stale candidate
     /// and before conditional eviction. Production leaves this unset.
     #[cfg(test)]
@@ -5207,6 +5248,7 @@ impl SnapshotAccumulator {
             retained_bytes: AtomicUsize::new(0),
             overflow_pending: Mutex::new(Vec::new()),
             overflow_pending_bytes: AtomicUsize::new(0),
+            overflow_deliveries_in_flight: AtomicUsize::new(0),
             #[cfg(test)]
             cleanup_after_stale_check_hook: Mutex::new(None),
         }
@@ -5220,6 +5262,21 @@ impl SnapshotAccumulator {
     /// `retained_bytes` already tracks both, so the accessor is a single load.
     fn retained_bytes(&self) -> usize {
         self.retained_bytes.load(Ordering::Acquire)
+    }
+
+    fn begin_overflow_delivery(&self) {
+        self.overflow_deliveries_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish_overflow_delivery(&self) {
+        self.overflow_deliveries_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn overflow_deliveries_in_flight(&self) -> usize {
+        self.overflow_deliveries_in_flight
+            .load(Ordering::Acquire)
     }
 
     // External adversarial tests assert the hard byte ceiling is never crossed;

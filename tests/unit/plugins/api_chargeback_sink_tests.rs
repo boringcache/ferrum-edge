@@ -3336,6 +3336,43 @@ async fn compaction_refuses_while_admitted_and_succeeds_after_drain() {
     drop(plugin);
 }
 
+#[tokio::test]
+async fn compaction_refuses_while_overflow_delivery_can_stage_back() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    let plugin = make_snapshot_sink(
+        &spool_dir,
+        Some("compaction-delivery-quiescence"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+        assert!(acc.stage_overflow_event_for_tests(sample_event("delivery-pending")));
+    }
+
+    let (refused_while_delivery, compacted_after_drain) =
+        api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test(&plugin)
+            .expect("snapshot lifecycle");
+    assert!(
+        refused_while_delivery,
+        "compaction must retain Full ownership while a delivery can stage back"
+    );
+    assert!(
+        compacted_after_drain,
+        "compaction should succeed after overflow delivery ownership drains"
+    );
+    drop(plugin);
+}
+
 /// Issue #3: concurrent new-key insertion, same-key refresh, and overflow
 /// staging never push the accumulator past its hard entry/byte ceilings, and no
 /// charge is double-counted or silently dropped.
