@@ -106,6 +106,31 @@ pub mod _test_support {
         ctx.take_compression_response_codec_permit()
     }
 
+    /// Whether a compression instance reserved response codec admission for this
+    /// request in `before_proxy` (the early bound on the buffered population).
+    pub fn compression_response_admission_reserved_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.has_compression_response_admission_owner()
+    }
+
+    /// Whether `before_proxy` negotiated a compressible coding but could not
+    /// obtain bounded codec admission (so the response streams identity).
+    pub fn compression_response_admission_declined_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.compression_response_admission_declined()
+    }
+
+    /// Build the request-body-hook compatibility context. Used to prove the
+    /// reserved response codec permit stays on the donor (live) context rather
+    /// than being moved into this short-lived clone.
+    pub fn clone_for_final_request_body_hooks_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> crate::plugins::RequestContext {
+        ctx.clone_for_final_request_body_hooks()
+    }
+
     pub fn gateway_response_compression_algorithm_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<&'static str> {

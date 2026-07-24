@@ -38820,6 +38820,7 @@ mod tests {
         ));
 
         let mut compression_ctx = ctx.clone();
+        compression_ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
         compression_ctx
             .headers
             .insert("accept-encoding".to_string(), "gzip".to_string());
