@@ -210,8 +210,17 @@ fn test_parse_validate_with_mode_verbose() {
 
 #[test]
 fn test_parse_validate_short_flags() {
-    let cli = Cli::try_parse_from(["ferrum-edge", "validate", "-s", "f.conf", "-c", "r.yaml", "-m", "cp"])
-        .unwrap();
+    let cli = Cli::try_parse_from([
+        "ferrum-edge",
+        "validate",
+        "-s",
+        "f.conf",
+        "-c",
+        "r.yaml",
+        "-m",
+        "cp",
+    ])
+    .unwrap();
     match cli.command {
         Some(Command::Validate(args)) => {
             assert_eq!(args.settings.unwrap().to_str().unwrap(), "f.conf");

@@ -942,8 +942,12 @@ fn find_gateway_pid() -> Result<u32, String> {
     let pids: Vec<u32> = stdout
         .trim()
         .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .collect();
+        .map(|line| {
+            line.trim()
+                .parse::<u32>()
+                .map_err(|_| "pgrep returned a non-numeric process ID".to_string())
+        })
+        .collect::<Result<_, _>>()?;
 
     select_gateway_pid(pids, self_pid)
 }

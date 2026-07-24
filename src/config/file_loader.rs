@@ -73,12 +73,15 @@ pub fn load_config_from_file(
         info!("Loading JSON configuration from {}", file_path.display());
     }
 
-    // For version detection and migration, parse to serde_json::Value
-    let mut value: serde_json::Value = if is_yaml {
+    // For version detection and migration, parse to serde_json::Value. Retain
+    // the YAML value tree as well so accepting an integer version does not
+    // force an otherwise-current YAML document through JSON and discard
+    // YAML-specific tags.
+    let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
         let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
-        serde_json::to_value(yaml_val)?
+        (serde_json::to_value(&yaml_val)?, Some(yaml_val))
     } else {
-        serde_json::from_str(&content)?
+        (serde_json::from_str(&content)?, None)
     };
 
     // Detect config version and migrate in memory if needed.
@@ -89,22 +92,35 @@ pub fn load_config_from_file(
     // null, array, object, negative) with a precise diagnostic rather than a
     // misleading "missing field" error.
     //
-    // When the integer form is accepted, rewrite it to a string in `value`
-    // before `GatewayConfig` deserialization (which expects `version: String`).
-    // That forces the JSON `Value` path below so we never hand the original
-    // numeric YAML/JSON text to a string-typed field.
-    let (file_version, version_rewritten) = match value.get_mut("version") {
+    // When the integer form is accepted, rewrite it to a string in the JSON
+    // migration value and, for YAML, in the retained YAML tree before
+    // `GatewayConfig` deserialization (which expects `version: String`).
+    let file_version = match value.get_mut("version") {
         None => anyhow::bail!("Configuration file missing required 'version' field"),
-        Some(serde_json::Value::String(s)) => (s.clone(), false),
+        Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => {
             if let Some(n) = other.as_u64() {
                 let s = n.to_string();
                 *other = serde_json::Value::String(s.clone());
-                (s, true)
+                if let Some(serde_yaml::Value::Mapping(mapping)) = yaml_value.as_mut()
+                    && let Some(yaml_version) =
+                        mapping.get_mut(&serde_yaml::Value::String("version".to_string()))
+                {
+                    *yaml_version = serde_yaml::Value::String(s.clone());
+                }
+                s
             } else {
+                let value_type = match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Number(number) if number.is_i64() => "negative integer",
+                    serde_json::Value::Number(_) => "floating-point number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::String(_) => "string",
+                };
                 anyhow::bail!(
-                    "field 'version' must be a string or integer (got {}); use version: \"1\" or version: 1",
-                    other
+                    "field 'version' must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
                 );
             }
         }
@@ -118,16 +134,18 @@ pub fn load_config_from_file(
         ConfigMigrator::migrate_in_memory(&mut value)?;
     }
 
-    // Deserialize from the original format to preserve YAML-specific features
-    // (like tags for enum variants). Fall back to JSON deserialization when a
-    // migration ran or when `version` was rewritten from an integer — both
-    // leave `value` as the authoritative document.
-    let mut config: GatewayConfig =
-        if is_yaml && file_version == CURRENT_CONFIG_VERSION && !version_rewritten {
-            serde_yaml::from_str(&content)?
-        } else {
-            serde_json::from_value(value)?
-        };
+    // Deserialize current YAML from its retained value tree to preserve
+    // YAML-specific features (including tagged enum variants). The only
+    // mutation is the accepted integer-to-string version rewrite above.
+    // Migrations still operate on serde_json::Value, which remains
+    // authoritative for older versions.
+    let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
+        serde_yaml::from_value(yaml_value.ok_or_else(|| {
+            anyhow::anyhow!("internal error: parsed YAML value was not retained")
+        })?)?
+    } else {
+        serde_json::from_value(value)?
+    };
 
     ValidationPipeline::new(&mut config)
         .validate_resource_ids(ValidationAction::FatalCount(
