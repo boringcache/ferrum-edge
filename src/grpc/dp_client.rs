@@ -1124,16 +1124,15 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         let silence_remaining = Duration::from_secs(CONFIGSYNC_MAX_SILENCE_SECS)
             .saturating_sub(last_stream_activity.elapsed());
 
+        // Poll lifecycle signals (shutdown / TLS reload / primary retry) before
+        // the message arm so a sustained stream cannot starve them, but keep the
+        // message arm ahead of the silence timer so real traffic always wins the
+        // liveness tie-break. These lifecycle futures are pending in steady
+        // state, so ordering them first never starves stream work. The config
+        // apply happens after this select returns — never inside an arm — so no
+        // arm can cancel an in-flight `spawn_blocking` apply.
         let update = tokio::select! {
             biased;
-            msg = stream.message() => {
-                match msg? {
-                    Some(update) => update,
-                    None => {
-                        return Ok(DpStreamEnd::Clean { received_config });
-                    }
-                }
-            }
             _ = &mut shutdown_fut => {
                 return Ok(DpStreamEnd::Shutdown);
             }
@@ -1142,6 +1141,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
             }
             _ = &mut primary_retry_fut, if enable_primary_retry => {
                 return Ok(DpStreamEnd::PrimaryRetry);
+            }
+            msg = stream.message() => {
+                match msg? {
+                    Some(update) => update,
+                    None => {
+                        return Ok(DpStreamEnd::Clean { received_config });
+                    }
+                }
             }
             _ = tokio::time::sleep(silence_remaining) => {
                 return Err(anyhow::anyhow!(
@@ -1176,14 +1183,26 @@ async fn connect_and_subscribe_with_startup_ready_inner(
 
         match update.update_type {
             0 => {
-                // FULL_SNAPSHOT — replace entire config
-                match evaluate_full_snapshot_authority(
+                // FULL_SNAPSHOT — replace the entire config, subject to
+                // cross-CP failover fencing on the snapshot version so a stale
+                // fallback CP cache cannot silently roll config back.
+                let incoming_version = match evaluate_full_snapshot_authority(
                     snapshot_authority.as_ref(),
                     &update.version,
                     cp_url,
                 ) {
-                    Ok(incoming_version) => {
-                        match serde_json::from_str::<GatewayConfig>(&update.config_json) {
+                    Ok(version) => version,
+                    Err(reason) => {
+                        warn!(
+                            ?reason,
+                            cp_url,
+                            version = %update.version,
+                            "Refusing FULL_SNAPSHOT from failover CP; keeping applied config"
+                        );
+                        continue;
+                    }
+                };
+                match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                     Ok(mut config) => {
                         let gateway_trust_bundle_update =
                             match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
@@ -1378,17 +1397,6 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         error!("Failed to parse full config update: {}", e);
                     }
                 }
-                    }
-                    Err(reason) => {
-                        warn!(
-                            ?reason,
-                            cp_url,
-                            version = %update.version,
-                            "Refusing FULL_SNAPSHOT from failover CP; keeping applied config"
-                        );
-                        continue;
-                    }
-                }
             }
             1 => {
                 // DELTA — apply incremental changes only
@@ -1465,11 +1473,17 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     gateway_trust_bundle_update,
                                 ) {
                                     update_state_config_received(connection_state);
+                                    // An accepted trust-only update is authoritative
+                                    // config delivery even though the gateway object
+                                    // is unchanged — keep `received_config` in step
+                                    // with the connection-state timestamp.
+                                    received_config = true;
                                     info!("Gateway trust bundle update applied from CP");
                                     continue;
                                 }
                                 if !was_empty {
                                     update_state_config_received(connection_state);
+                                    received_config = true;
                                     debug!(
                                         "Incremental config delta from CP was valid but unchanged"
                                     );
@@ -1491,6 +1505,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     gateway_trust_bundle_update,
                                 ) {
                                     update_state_config_received(connection_state);
+                                    received_config = true;
                                     info!(
                                         "Gateway trust bundle update applied from CP despite rejected resource delta"
                                     );

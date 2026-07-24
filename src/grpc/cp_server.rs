@@ -1714,8 +1714,8 @@ impl ConfigSync for CpGrpcServer {
                             timestamp: chrono::Utc::now().timestamp(),
                             ferrum_version: FERRUM_VERSION.to_string(),
                             trust_bundles_json,
-            heartbeat: false,
-        }))
+                            heartbeat: false,
+                        }))
                     }
                     Err(e) => {
                         error!("Failed to serialize recovery snapshot: {}", e);

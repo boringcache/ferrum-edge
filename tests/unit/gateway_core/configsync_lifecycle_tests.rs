@@ -11,12 +11,11 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
     CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, MultiCpBackoffState,
-    StaleSnapshotReject, advance_multi_cp_backoff, backoff_max_secs, evaluate_full_snapshot_authority,
-    failure_backoff_sequence, grow_backoff_after_failure_sleep, silence_exceeds_liveness,
+    StaleSnapshotReject, advance_multi_cp_backoff, backoff_max_secs,
+    evaluate_full_snapshot_authority, failure_backoff_sequence,
+    grow_backoff_after_failure_sleep, silence_exceeds_liveness,
 };
-use ferrum_edge::grpc::dp_client::{
-    DpCpConnectionState, configure_configsync_endpoint,
-};
+use ferrum_edge::grpc::dp_client::{DpCpConnectionState, configure_configsync_endpoint};
 use ferrum_edge::util::backoff::BACKOFF_INITIAL_SECS;
 use tonic::transport::Channel;
 
@@ -88,28 +87,19 @@ fn zero_message_clean_close_grows_backoff_like_error() {
 fn full_snapshot_fencing_rejects_older_cross_source() {
     let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
     let authority = AppliedSnapshotAuthority {
-        version: applied,
+        version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
     };
     let older = "2026-06-01T12:00:00Z";
-    let err = evaluate_full_snapshot_authority(
-        Some(&authority),
-        older,
-        "http://cp-fallback:50051",
-    )
-    .expect_err("older failover snapshot must be refused");
-    assert!(matches!(
-        err,
-        StaleSnapshotReject::OlderThanApplied { .. }
-    ));
 
-    let same_source = evaluate_full_snapshot_authority(
-        Some(&authority),
-        older,
-        "http://cp-primary:50051",
-    )
-    .expect("same-source recovery snapshots remain accepted");
-    assert!(same_source < applied);
+    let rejected =
+        evaluate_full_snapshot_authority(Some(&authority), older, "http://cp-fallback:50051");
+    assert!(matches!(rejected, Err(StaleSnapshotReject::OlderThanApplied { .. })));
+
+    let same_source =
+        evaluate_full_snapshot_authority(Some(&authority), older, "http://cp-primary:50051")
+            .expect("same-source recovery snapshots remain accepted");
+    assert_eq!(same_source, Some(Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()));
 
     let newer = evaluate_full_snapshot_authority(
         Some(&authority),
@@ -117,7 +107,60 @@ fn full_snapshot_fencing_rejects_older_cross_source() {
         "http://cp-fallback:50051",
     )
     .expect("newer failover snapshot is accepted");
-    assert!(newer > applied);
+    assert_eq!(newer, Some(Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap()));
+}
+
+#[test]
+fn unparseable_first_version_never_fences_later_valid_failover() {
+    // The first applied snapshot carried a non-RFC3339 version: the authority
+    // is recorded with NO fabricated timestamp, so a genuinely newer failover
+    // snapshot from another CP is still accepted rather than fenced forever.
+    let first = evaluate_full_snapshot_authority(None, "not-a-timestamp", "http://cp-a:50051")
+        .expect("first snapshot with an unparseable version is accepted");
+    assert!(
+        first.is_none(),
+        "an unparseable version must not fabricate an authority timestamp"
+    );
+
+    let authority = AppliedSnapshotAuthority {
+        version: first,
+        source_cp_url: "http://cp-a:50051".to_string(),
+    };
+    let newer = evaluate_full_snapshot_authority(
+        Some(&authority),
+        "2026-07-20T00:00:00Z",
+        "http://cp-b:50051",
+    )
+    .expect("a real failover snapshot must not be fenced by an unknown authority");
+    assert_eq!(newer, Some(Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap()));
+}
+
+#[test]
+fn unparseable_cross_source_against_known_authority_fails_closed() {
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-a:50051".to_string(),
+    };
+    // A known-good authority vs. an unparseable failover version cannot be
+    // ordered, so we fail closed instead of inventing a timestamp.
+    let rejected =
+        evaluate_full_snapshot_authority(Some(&authority), "garbage", "http://cp-b:50051");
+    assert!(matches!(rejected, Err(StaleSnapshotReject::UnparseableVersion)));
+}
+
+#[test]
+fn unparseable_same_source_preserves_prior_authority() {
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-a:50051".to_string(),
+    };
+    // A same-source resend with an unparseable version keeps the prior ordering
+    // so later cross-source fencing still has an authority to compare against.
+    let kept = evaluate_full_snapshot_authority(Some(&authority), "garbage", "http://cp-a:50051")
+        .expect("same-source snapshots are always accepted");
+    assert_eq!(kept, Some(applied));
 }
 
 #[test]

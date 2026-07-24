@@ -657,7 +657,6 @@ fn partition_incremental_by_namespace(
     buckets
 }
 
-
 pub async fn run(
     env_config: EnvConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,

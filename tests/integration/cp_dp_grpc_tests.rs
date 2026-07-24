@@ -2642,7 +2642,10 @@ async fn test_incremental_result_serde_roundtrip() {
         deserialized.removed_consumer_ids,
         vec![NamespacedResourceId::new("ferrum", "consumer-gone")]
     );
-    assert_eq!(deserialized.removed_upstream_ids, vec!["upstream-x"]);
+    assert_eq!(
+        deserialized.removed_upstream_ids,
+        vec![NamespacedResourceId::new("ferrum", "upstream-x")]
+    );
     assert!(deserialized.added_or_modified_consumers.is_empty());
     assert!(deserialized.added_or_modified_plugin_configs.is_empty());
     assert!(deserialized.added_or_modified_upstreams.is_empty());

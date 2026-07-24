@@ -203,7 +203,13 @@ async fn incremental_poll_uses_durable_sequence_for_create_update_delete() {
         .await
         .expect("incremental delete poll must succeed");
     assert!(deleted.added_or_modified_upstreams.is_empty());
-    assert_eq!(deleted.removed_upstream_ids, vec!["sequence-upstream"]);
+    assert_eq!(
+        deleted.removed_upstream_ids,
+        vec![ferrum_edge::config::db_loader::NamespacedResourceId::new(
+            "ferrum",
+            "sequence-upstream"
+        )]
+    );
     assert!(deleted.sequence_cursor > updated.sequence_cursor);
 }
 
@@ -300,8 +306,20 @@ async fn non_consumer_delete_records_drive_removals_without_resource_row_scans()
         )]
     );
     assert!(result.removed_consumer_ids.is_empty());
-    assert_eq!(result.removed_plugin_config_ids, vec!["deleted-plugin"]);
-    assert_eq!(result.removed_upstream_ids, vec!["deleted-upstream"]);
+    assert_eq!(
+        result.removed_plugin_config_ids,
+        vec![ferrum_edge::config::db_loader::NamespacedResourceId::new(
+            "ferrum",
+            "deleted-plugin"
+        )]
+    );
+    assert_eq!(
+        result.removed_upstream_ids,
+        vec![ferrum_edge::config::db_loader::NamespacedResourceId::new(
+            "ferrum",
+            "deleted-upstream"
+        )]
+    );
     assert!(result.added_or_modified_proxies.is_empty());
     assert!(result.added_or_modified_consumers.is_empty());
     assert!(result.added_or_modified_plugin_configs.is_empty());

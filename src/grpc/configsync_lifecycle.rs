@@ -22,54 +22,87 @@ pub const CONFIGSYNC_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 pub const CONFIGSYNC_MAX_SILENCE_SECS: u64 = 150;
 
 /// Authoritative FULL_SNAPSHOT already applied by this DP.
+///
+/// `version` is `None` when the applied snapshot carried a non-RFC3339 version
+/// string: we still record the source, but we deliberately do not invent a
+/// timestamp, because a fabricated "now" would fence out every later — and
+/// genuinely newer — failover snapshot forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedSnapshotAuthority {
-    pub version: DateTime<Utc>,
+    pub version: Option<DateTime<Utc>>,
     pub source_cp_url: String,
 }
 
 /// Why a FULL_SNAPSHOT was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaleSnapshotReject {
+    /// A failover snapshot's version could not be parsed, so freshness against
+    /// a known-good applied authority cannot be proven; fail closed.
     UnparseableVersion,
+    /// A failover snapshot is older than the applied authority.
     OlderThanApplied { applied: DateTime<Utc>, incoming: DateTime<Utc> },
 }
 
 /// Decide whether an incoming FULL_SNAPSHOT may replace the active config.
 ///
-/// Same-source snapshots are always accepted (reconnect recovery, lagging
-/// recovery). Cross-source snapshots older than the applied authority are
-/// refused so failover to a stale CP cache cannot silently roll config back.
-/// Non-RFC3339 versions are accepted when there is no cross-source authority
-/// to compare; they are refused only when fencing against a different CP.
+/// Returns the version to record as the new applied authority on accept
+/// (`None` when the accepted snapshot's version was unparseable — never a
+/// fabricated timestamp).
+///
+/// Rules:
+/// - Same-source snapshots are always accepted (reconnect / recovery). The
+///   recorded version keeps the newest known ordering; an unparseable resend
+///   does not erase a prior parseable authority.
+/// - Cross-source failover snapshots are fenced only when there is a parseable
+///   applied authority to compare against and the incoming version is strictly
+///   older. An unparseable incoming version against a known-good authority
+///   fails closed ([`StaleSnapshotReject::UnparseableVersion`]) rather than
+///   inventing a timestamp.
+/// - With no applied authority (first snapshot) or an authority whose own
+///   version is unknown, there is nothing to fence against, so the snapshot is
+///   accepted and its (possibly unknown) version adopted.
 pub fn evaluate_full_snapshot_authority(
     authority: Option<&AppliedSnapshotAuthority>,
     incoming_version: &str,
     source_cp_url: &str,
-) -> Result<DateTime<Utc>, StaleSnapshotReject> {
+) -> Result<Option<DateTime<Utc>>, StaleSnapshotReject> {
     let parsed = DateTime::parse_from_rfc3339(incoming_version)
-        .map(|dt| dt.with_timezone(&Utc));
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok();
 
     let Some(authority) = authority else {
-        return Ok(parsed.unwrap_or_else(|_| Utc::now()));
+        // First applied snapshot establishes the authority. Record only a real
+        // parsed version; never fabricate `Utc::now()`.
+        return Ok(parsed);
     };
 
     if authority.source_cp_url == source_cp_url {
-        return Ok(parsed.unwrap_or_else(|_| Utc::now()));
+        // Same source: always accept. Prefer the newly parsed version but keep
+        // the prior authority version if this resend was unparseable, so we do
+        // not lose ordering that later cross-source fencing depends on.
+        return Ok(parsed.or(authority.version));
     }
 
-    let Ok(incoming) = parsed else {
+    // Cross-source failover: fence only when a comparable applied authority
+    // version exists.
+    let Some(applied) = authority.version else {
+        // No parseable ordering authority to fence against — we cannot prove
+        // the incoming snapshot is stale, so accept and adopt its version.
+        return Ok(parsed);
+    };
+
+    let Some(incoming) = parsed else {
+        // Known-good authority vs. unparseable failover version: fail closed
+        // instead of inventing a timestamp that could roll config back or
+        // fence forever.
         return Err(StaleSnapshotReject::UnparseableVersion);
     };
 
-    if incoming < authority.version {
-        return Err(StaleSnapshotReject::OlderThanApplied {
-            applied: authority.version,
-            incoming,
-        });
+    if incoming < applied {
+        return Err(StaleSnapshotReject::OlderThanApplied { applied, incoming });
     }
 
-    Ok(incoming)
+    Ok(Some(incoming))
 }
 
 /// Multi-CP reconnect backoff state. Backoff follows the failure sequence and
