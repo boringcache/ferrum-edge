@@ -4617,9 +4617,13 @@ pub struct MirrorResponseMeta {
     /// before a response was received or was dropped/cancelled (DNS, connect,
     /// timeout, task, and concurrency errors).
     pub mirror_response_status_code: Option<u16>,
-    /// Response body size in bytes from the mirror target. Derived from
-    /// `content-length` header when present, otherwise from reading the body.
+    /// Response body size in bytes observed after a bounded drain of the
+    /// mirror response (or the truncated count when the drain cap fired).
     pub mirror_response_size_bytes: Option<u64>,
+    /// Advertised `Content-Length` from the mirror response when present.
+    /// Recorded independently of [`Self::mirror_response_size_bytes`] so
+    /// operators can compare advertised vs observed after bounded drain.
+    pub mirror_response_advertised_size_bytes: Option<u64>,
     /// Wall-clock latency of the mirror request in milliseconds.
     pub mirror_latency_ms: f64,
     /// Human-readable error message when the mirror request failed.
@@ -5053,6 +5057,7 @@ impl TransactionSummary {
             "mirror_error",
             "mirror_plugin_id",
             "response_size_bytes",
+            "mirror_response_advertised_size_bytes",
         ] {
             mirror.metadata.remove(key);
         }
@@ -5065,6 +5070,12 @@ impl TransactionSummary {
             mirror
                 .metadata
                 .insert("response_size_bytes".to_string(), size.to_string());
+        }
+        if let Some(advertised) = result.mirror_response_advertised_size_bytes {
+            mirror.metadata.insert(
+                "mirror_response_advertised_size_bytes".to_string(),
+                advertised.to_string(),
+            );
         }
         if let Some(err) = result.mirror_error {
             mirror.metadata.insert("mirror_error".to_string(), err);
