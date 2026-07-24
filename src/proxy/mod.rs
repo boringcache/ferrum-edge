@@ -942,9 +942,13 @@ fn hbone_inner_headers_with_stripped_baggage(
 
 impl H3ProbeOutcome {
     fn apply(self, record: &mut BackendCapabilityRecord, errors: &mut Vec<String>) {
-        if !matches!(self.h3, ProtocolSupport::Unknown) {
-            record.plain_http.h3 = self.h3;
-        }
+        // `probe_h3` returns the fully merged classification (including a
+        // timeout-preserved prior Unsupported/Supported, or Unknown when there
+        // was no prior record). Always write it: the refresh path builds a
+        // fresh default record, so skipping Unknown would be fine there, but
+        // skipping a preserved non-Unknown value would wipe the prior state.
+        // Writing Unknown is also intentional when the merge decided that.
+        record.plain_http.h3 = self.h3;
         if let Some(err) = self.error {
             errors.push(err);
         }
@@ -2282,6 +2286,23 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
             | retry::ErrorClass::TlsError
             | retry::ErrorClass::ProtocolError
             | retry::ErrorClass::DnsLookupError
+            | retry::ErrorClass::PortExhaustion
+    )
+}
+
+/// Reachability-class probe failures that must not wipe a previously
+/// `Supported` H2/H3 classification during periodic refresh.
+///
+/// Mirrors the HBONE probe's preserve-on-non-capability-failure contract:
+/// DNS blips, connect timeouts, refused-during-restart, and port exhaustion
+/// are transient — stamp `last_probe_error` for operators, but carry the prior
+/// classification forward. Genuine protocol/ALPN evidence still downgrades.
+pub(crate) fn is_transient_capability_probe_failure(class: retry::ErrorClass) -> bool {
+    matches!(
+        class,
+        retry::ErrorClass::DnsLookupError
+            | retry::ErrorClass::ConnectionTimeout
+            | retry::ErrorClass::ConnectionRefused
             | retry::ErrorClass::PortExhaustion
     )
 }
@@ -6437,10 +6458,14 @@ impl ProxyState {
         let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
         let host = target.host();
         let port = target.port();
-        let previous_hbone = self
-            .backend_capabilities
-            .get_by_key(&target.key)
-            .map(|record| record.hbone);
+        let previous = self.backend_capabilities.get_by_key(&target.key);
+        let previous_hbone = previous.as_ref().map(|record| record.hbone);
+        let previous_h2_tls = previous.as_ref().map(|record| record.plain_http.h2_tls);
+        let previous_grpc_h2_tls = previous
+            .as_ref()
+            .map(|record| record.grpc_transport.h2_tls);
+        let previous_h1 = previous.as_ref().map(|record| record.plain_http.h1);
+        let previous_h3 = previous.as_ref().map(|record| record.plain_http.h3);
 
         match scheme {
             BackendScheme::Http => {
@@ -6459,8 +6484,16 @@ impl ProxyState {
                 let tls_config_result = self
                     .connection_pool
                     .get_tls_config_for_backend(&probe_proxy);
-                let h2_fut =
-                    self.probe_h2_tls(&probe_proxy, probe_timeout, host, port, &mut record);
+                let h2_fut = self.probe_h2_tls(
+                    &probe_proxy,
+                    probe_timeout,
+                    host,
+                    port,
+                    previous_h2_tls,
+                    previous_grpc_h2_tls,
+                    previous_h1,
+                    &mut record,
+                );
                 let h3_fut = Self::probe_h3(
                     &self.h3_pool,
                     &probe_proxy,
@@ -6468,6 +6501,7 @@ impl ProxyState {
                     tls_config_result,
                     host,
                     port,
+                    previous_h3,
                 );
                 let (_, h3_outcome) = tokio::join!(h2_fut, h3_fut);
                 h3_outcome.apply(&mut record, &mut errors);
@@ -6563,12 +6597,21 @@ impl ProxyState {
     /// written directly; unexpected connection failures are surfaced to the
     /// caller via `errors` (this is the genuine "can't reach an HTTPS
     /// backend" signal the operator should see).
+    ///
+    /// Transient reachability failures (DNS/connect/refused/timeout) preserve
+    /// any previously cached H2/H1 classification — matching the HBONE merge
+    /// contract — and always stamp `last_probe_error` for operator visibility.
+    /// Only ALPN-negotiated HTTP/1.1 is treated as definitive H2-capability
+    /// evidence that may downgrade a prior `Supported` entry.
     async fn probe_h2_tls(
         &self,
         probe_proxy: &Proxy,
         probe_timeout: Duration,
         host: &str,
         port: u16,
+        previous_h2_tls: Option<ProtocolSupport>,
+        previous_grpc_h2_tls: Option<ProtocolSupport>,
+        previous_h1: Option<ProtocolSupport>,
         record: &mut BackendCapabilityRecord,
     ) {
         match tokio::time::timeout(probe_timeout, self.http2_pool.get_sender(probe_proxy)).await {
@@ -6587,12 +6630,48 @@ impl ProxyState {
                 // through the join! Thread the message via
                 // `record.last_probe_error` directly instead — the outer
                 // function merges this into the combined error string.
+                let class = http2_pool::classify_http2_pool_error(&err);
+                let preserve = is_transient_capability_probe_failure(class);
+                record.plain_http.h2_tls = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h2_tls,
+                    ProtocolSupport::Unknown,
+                    preserve,
+                );
+                record.grpc_transport.h2_tls =
+                    backend_capabilities::merge_protocol_probe_classification(
+                        previous_grpc_h2_tls,
+                        ProtocolSupport::Unknown,
+                        preserve,
+                    );
+                record.plain_http.h1 = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h1,
+                    ProtocolSupport::Unknown,
+                    preserve,
+                );
                 append_probe_error(
                     record,
                     format!("HTTP/2 probe failed for {host}:{port}: {err}"),
                 );
             }
             Err(_) => {
+                // Timeout is always a transient reachability fault — preserve
+                // any prior Supported/Unsupported/Unknown classification.
+                record.plain_http.h2_tls = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h2_tls,
+                    ProtocolSupport::Unknown,
+                    true,
+                );
+                record.grpc_transport.h2_tls =
+                    backend_capabilities::merge_protocol_probe_classification(
+                        previous_grpc_h2_tls,
+                        ProtocolSupport::Unknown,
+                        true,
+                    );
+                record.plain_http.h1 = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h1,
+                    ProtocolSupport::Unknown,
+                    true,
+                );
                 append_probe_error(
                     record,
                     format!(
@@ -6704,6 +6783,11 @@ impl ProxyState {
     /// handling. Written as an associated fn so it can be polled via
     /// `tokio::join!` alongside `probe_h2_tls` (which borrows `&mut record`)
     /// without aliasing `self`.
+    ///
+    /// Transient DNS/connect/refused/timeout failures preserve
+    /// `previous_h3` (HBONE merge contract) and always stamp an operator-
+    /// visible probe error. Only non-transient transport/protocol evidence
+    /// downgrades the cached classification to `Unsupported`.
     async fn probe_h3(
         h3_pool: &Arc<Http3ConnectionPool>,
         probe_proxy: &Proxy,
@@ -6711,12 +6795,20 @@ impl ProxyState {
         tls_config_result: Result<Arc<rustls::ClientConfig>, anyhow::Error>,
         host: &str,
         port: u16,
+        previous_h3: Option<ProtocolSupport>,
     ) -> H3ProbeOutcome {
         let tls_config = match tls_config_result {
             Ok(cfg) => cfg,
             Err(err) => {
+                // TLS config build failures are local/config faults, not
+                // evidence the backend lost QUIC — preserve any prior
+                // classification and surface the error.
                 return H3ProbeOutcome {
-                    h3: ProtocolSupport::Unknown,
+                    h3: backend_capabilities::merge_protocol_probe_classification(
+                        previous_h3,
+                        ProtocolSupport::Unknown,
+                        true,
+                    ),
                     error: Some(format!("HTTP/3 TLS config failed for {host}:{port}: {err}")),
                 };
             }
@@ -6733,23 +6825,45 @@ impl ProxyState {
                 error: None,
             },
             Ok(Err(err)) => {
-                debug!(
-                    "HTTP/3 probe for {}:{} classified unsupported: {}",
-                    host, port, err
+                let class = crate::http3::client::classify_http3_error(err.as_ref());
+                let preserve = is_transient_capability_probe_failure(class);
+                let h3 = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h3,
+                    ProtocolSupport::Unsupported,
+                    preserve,
                 );
+                if preserve {
+                    debug!(
+                        "HTTP/3 probe for {}:{} transient failure ({:?}); preserving {:?}: {}",
+                        host, port, class, h3, err
+                    );
+                } else {
+                    debug!(
+                        "HTTP/3 probe for {}:{} classified unsupported: {}",
+                        host, port, err
+                    );
+                }
                 H3ProbeOutcome {
-                    h3: ProtocolSupport::Unsupported,
-                    error: None,
+                    h3,
+                    error: Some(format!("HTTP/3 probe failed for {host}:{port}: {err}")),
                 }
             }
             Err(_) => {
+                let h3 = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h3,
+                    ProtocolSupport::Unknown,
+                    true,
+                );
                 debug!(
-                    "HTTP/3 probe for {}:{} timed out after {}ms; leaving unknown",
-                    host, port, probe_proxy.backend_connect_timeout_ms
+                    "HTTP/3 probe for {}:{} timed out after {}ms; preserving {:?}",
+                    host, port, probe_proxy.backend_connect_timeout_ms, h3
                 );
                 H3ProbeOutcome {
-                    h3: ProtocolSupport::Unknown,
-                    error: None,
+                    h3,
+                    error: Some(format!(
+                        "HTTP/3 probe timed out for {}:{} after {}ms",
+                        host, port, probe_proxy.backend_connect_timeout_ms
+                    )),
                 }
             }
         }

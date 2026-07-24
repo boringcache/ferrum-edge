@@ -5323,7 +5323,21 @@ async fn handle_h3_request(
                                 error!("Error reading backend h3 response during streaming: {}", e);
                                 coalesce_buf.clear();
                                 crate::http3::stream_util::abort_response_stream(&mut stream);
-                                body_error_class = Some(crate::http3::client::classify_http3_error(&e));
+                                let class = crate::http3::client::classify_http3_error(&e);
+                                // Mid-stream QUIC/H3 transport failure is a
+                                // capability-downgrade signal — same rule as the
+                                // native gRPC streaming and refined-buffered
+                                // paths. Excludes client disconnect, size
+                                // errors, graceful close, and read timeouts.
+                                if crate::proxy::is_h3_transport_error_class(class) {
+                                    state
+                                        .backend_capabilities
+                                        .mark_h3_unsupported(
+                                            &proxy,
+                                            upstream_target.as_deref(),
+                                        );
+                                }
+                                body_error_class = Some(class);
                                 break 'outer;
                             }
                         }
@@ -5405,7 +5419,15 @@ async fn handle_h3_request(
                             err
                         );
                         crate::http3::stream_util::abort_response_stream(&mut stream);
-                        body_error_class = Some(crate::http3::client::classify_http3_error(&err));
+                        let class = crate::http3::client::classify_http3_error(&err);
+                        // Trailer-boundary transport faults are the same
+                        // capability signal as mid-body resets (issue #2939).
+                        if crate::proxy::is_h3_transport_error_class(class) {
+                            state
+                                .backend_capabilities
+                                .mark_h3_unsupported(&proxy, upstream_target.as_deref());
+                        }
+                        body_error_class = Some(class);
                     }
                     Err(H3TrailerFinishError::BackendTimeout) => {
                         warn!(
@@ -6178,6 +6200,12 @@ async fn handle_h3_request(
             let mut current_target = upstream_target.clone();
             let mut current_cb_target_key = cb_target_key.clone();
             let mut current_url = backend_url.clone();
+            // Locked for the first (already-selected H3-capable) target.
+            // Recomputed only when LB rotation hands us a different host:port,
+            // mirroring `current_dispatch_h3` in the H1/H2 retry loop so
+            // mixed-capability upstreams switch to the cross-protocol bridge
+            // instead of burning a doomed QUIC connect timeout.
+            let mut current_dispatch_h3 = true;
 
             // Resolve the dispatch proxy for THIS attempt's target from the
             // retry-capped BASE proxy — never from the first target's effective
@@ -6297,6 +6325,9 @@ async fn handle_h3_request(
                 attempt += 1;
 
                 if let Some(next) = next_retry_target {
+                    let target_changed = current_target.as_ref().is_some_and(|prev_target| {
+                        next.host != prev_target.host || next.port != prev_target.port
+                    });
                     current_url = crate::proxy::build_backend_url_with_target(
                         &proxy,
                         &path,
@@ -6309,6 +6340,17 @@ async fn handle_h3_request(
                     current_cb_target_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     current_target = Some(next);
+                    if target_changed {
+                        // Per-target capability lookup is O(1). Unknown /
+                        // Unsupported both fall through to the buffered
+                        // cross-protocol bridge so mixed-capability
+                        // upstreams do not burn a doomed QUIC timeout.
+                        current_dispatch_h3 = crate::proxy::supports_native_http3_backend(
+                            &state,
+                            &selected_base_proxy,
+                            current_target.as_deref(),
+                        );
+                    }
                 }
 
                 // Re-screen the rotated retry target BEFORE admission/dispatch:
@@ -6374,6 +6416,7 @@ async fn handle_h3_request(
                     attempt = attempt,
                     max_retries = retry_config.max_retries,
                     connection_error = h3_connection_error(result.request_on_wire, result.error_class),
+                    native_h3 = current_dispatch_h3,
                     "Retrying backend request (HTTP/3 frontend)"
                 );
 
@@ -6386,20 +6429,46 @@ async fn handle_h3_request(
                     &selected_base_proxy,
                     current_target.as_deref(),
                 );
-                result = proxy_to_backend_h3(
-                    &state,
-                    attempt_dispatch_proxy.as_ref(),
-                    &current_url,
-                    &method,
-                    &proxy_headers,
-                    &body_data,
-                    &ctx.client_ip,
-                    socket_ip,
-                    current_target.as_deref(),
-                    ctx.request_is_secure,
-                    ctx.is_early_data,
-                )
-                .await;
+                result = if current_dispatch_h3 {
+                    proxy_to_backend_h3(
+                        &state,
+                        attempt_dispatch_proxy.as_ref(),
+                        &current_url,
+                        &method,
+                        &proxy_headers,
+                        &body_data,
+                        &ctx.client_ip,
+                        socket_ip,
+                        current_target.as_deref(),
+                        ctx.request_is_secure,
+                        ctx.is_early_data,
+                    )
+                    .await
+                } else {
+                    // Rotated onto an Unknown/Unsupported H3 target — bridge
+                    // via the buffered reqwest path rather than a doomed QUIC
+                    // dial. Same-target retries keep `current_dispatch_h3`
+                    // locked (no cross-protocol same-target replay).
+                    h3_buffered_result_from_backend_response(
+                        crate::proxy::proxy_to_backend_retry(
+                            &state,
+                            selected_base_proxy.as_ref(),
+                            &current_url,
+                            &method,
+                            &proxy_headers,
+                            current_target.as_deref(),
+                            Some(body_data.as_slice()),
+                            false,
+                            &plugins,
+                            &ctx,
+                            &ctx.client_ip,
+                            socket_ip,
+                            ctx.request_is_secure,
+                            hyper::Version::HTTP_3,
+                        )
+                        .await,
+                    )
+                };
             }
 
             (
@@ -6798,14 +6867,11 @@ async fn handle_h3_request(
             bytes_received = response_body_bytes;
         }
 
-        // Response-body plugins cannot inspect or transform trailers today.
-        // Conservatively drop backend trailers whenever the buffered response
-        // plugin pipeline ran successfully, rather than forwarding
-        // backend-controlled fields that may contain policy-relevant content
-        // the configured plugins never saw.
-        if !plugins.is_empty() {
-            response_trailers = None;
-        }
+        // Backend trailers remain valid whenever the body bytes on the wire
+        // still match what the backend sent. Mutation / reject / normalize
+        // arms above already clear `response_trailers` when the body pipeline
+        // replaces those bytes. Auth/logging-only plugins must not wipe
+        // trailers merely because the plugin chain is nonempty (issue #2941).
 
         // Forward backend response trailers, if any (issue #1630). Strip
         // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
@@ -8387,6 +8453,13 @@ async fn stream_h3_open_response_to_client(
                             coalesce_buf.clear();
                             crate::http3::stream_util::abort_response_stream(h3_stream);
                             let class = crate::http3::client::classify_http3_error(&error);
+                            // Mid-stream transport fault → capability downgrade
+                            // (parity with gRPC / refined-buffered; issue #2939).
+                            if crate::proxy::is_h3_transport_error_class(class) {
+                                state
+                                    .backend_capabilities
+                                    .mark_h3_unsupported(proxy, upstream_target);
+                            }
                             terminal_error_class = Some(class);
                             body_error_class = Some(class);
                             break 'outer;
@@ -8443,6 +8516,13 @@ async fn stream_h3_open_response_to_client(
                     );
                     crate::http3::stream_util::abort_response_stream(h3_stream);
                     let class = crate::http3::client::classify_http3_error(&err);
+                    // Trailer-boundary transport faults downgrade like mid-body
+                    // resets (issue #2939).
+                    if crate::proxy::is_h3_transport_error_class(class) {
+                        state
+                            .backend_capabilities
+                            .mark_h3_unsupported(proxy, upstream_target);
+                    }
                     terminal_error_class = Some(class);
                     body_error_class = Some(class);
                 }
@@ -10333,6 +10413,13 @@ async fn proxy_to_backend_h3_streaming(
                             coalesce_buf.clear();
                             crate::http3::stream_util::abort_response_stream(h3_stream);
                             let class = crate::http3::client::classify_http3_error(&e);
+                            // Mid-stream transport fault → capability downgrade
+                            // (parity with gRPC streaming; issue #2939).
+                            if crate::proxy::is_h3_transport_error_class(class) {
+                                state
+                                    .backend_capabilities
+                                    .mark_h3_unsupported(proxy, upstream_target);
+                            }
                             terminal_error_class = Some(class);
                             body_error_class = Some(class);
                             break 'outer;
@@ -10391,6 +10478,13 @@ async fn proxy_to_backend_h3_streaming(
                     );
                     crate::http3::stream_util::abort_response_stream(h3_stream);
                     let class = crate::http3::client::classify_http3_error(&err);
+                    // Trailer-boundary transport faults downgrade like mid-body
+                    // resets (issue #2939).
+                    if crate::proxy::is_h3_transport_error_class(class) {
+                        state
+                            .backend_capabilities
+                            .mark_h3_unsupported(proxy, upstream_target);
+                    }
                     terminal_error_class = Some(class);
                     body_error_class = Some(class);
                 }
@@ -10455,14 +10549,53 @@ struct H3BufferedDispatchResult {
     body: Vec<u8>,
     headers: HashMap<String, String>,
     /// Backend response trailers (issue #1630), still unsanitized. The buffered
-    /// native-H3 send path drops them when response plugins are active because
-    /// plugins cannot inspect trailers today; otherwise it strips
+    /// native-H3 send path forwards them when the body pipeline did not
+    /// invalidate them (auth/logging-only plugins keep trailers; mutation /
+    /// reject / normalize arms drop them). Otherwise it strips
     /// response-direction hop-by-hop names before forwarding. `None` on every
     /// gateway-synthesized error/reject below (no backend trailers to forward),
     /// and `None` for a successful response that carried no trailers.
     trailers: Option<http::HeaderMap>,
     error_class: Option<crate::retry::ErrorClass>,
     request_on_wire: bool,
+}
+
+/// Convert a buffered cross-protocol (`proxy_to_backend_retry`) response into
+/// the H3 buffered retry loop's result shape.
+///
+/// Used when LB rotation moves onto an Unknown/Unsupported H3 target so the
+/// attempt bridges via H1/H2 instead of burning a doomed QUIC connect timeout
+/// (issue #2937). Reqwest responses do not carry HTTP/3 trailers.
+fn h3_buffered_result_from_backend_response(
+    response: crate::retry::BackendResponse,
+) -> H3BufferedDispatchResult {
+    let request_on_wire = !response.connection_error;
+    let body = match response.body {
+        crate::retry::ResponseBody::Buffered(bytes) => bytes,
+        // `proxy_to_backend_retry(..., stream_response = false)` always returns
+        // `Buffered`. Treat any streaming variant as a bridge programming
+        // fault rather than panicking on the proxy path.
+        crate::retry::ResponseBody::Streaming { .. }
+        | crate::retry::ResponseBody::StreamingH2(_)
+        | crate::retry::ResponseBody::StreamingH3(_) => {
+            return H3BufferedDispatchResult {
+                status: 502,
+                body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                headers: HashMap::new(),
+                trailers: None,
+                error_class: Some(crate::retry::ErrorClass::ProtocolError),
+                request_on_wire,
+            };
+        }
+    };
+    H3BufferedDispatchResult {
+        status: response.status_code,
+        body,
+        headers: response.headers,
+        trailers: None,
+        error_class: response.error_class,
+        request_on_wire,
+    }
 }
 
 /// Proxy a request to the backend (buffered path — collects full response body).

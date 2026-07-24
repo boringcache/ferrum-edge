@@ -1407,3 +1407,117 @@ fn h3_streaming_grpc_web_preserves_native_statuses_and_metadata() {
     assert!(handler.contains("grpc_web_translation_mode"));
     assert!(!handler.contains("grpc_web_text_mode"));
 }
+
+#[test]
+fn h3_buffered_retry_recomputes_native_h3_on_target_rotation() {
+    let src = include_str!("../../../src/http3/server.rs");
+    let retry = src
+        .split("// ===== BUFFERED RESPONSE PATH =====")
+        .nth(1)
+        .expect("buffered H3 response path")
+        .split("// Record outcome against the final target")
+        .next()
+        .expect("bounded buffered retry loop");
+    assert!(
+        retry.contains("let mut current_dispatch_h3 = true;"),
+        "H3 buffered retry must lock native-H3 for the first already-selected target"
+    );
+    assert!(
+        retry.contains("if target_changed {")
+            && retry.contains("current_dispatch_h3 = crate::proxy::supports_native_http3_backend("),
+        "H3 buffered retry must recompute native-H3 eligibility when the concrete target changes"
+    );
+    assert!(
+        retry.contains("h3_buffered_result_from_backend_response(")
+            && retry.contains("proxy_to_backend_retry("),
+        "Unknown/Unsupported rotated targets must bridge via the buffered cross-protocol path"
+    );
+    assert!(
+        src.contains("fn h3_buffered_result_from_backend_response("),
+        "bridge conversion helper must exist"
+    );
+}
+
+#[test]
+fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
+    let src = include_str!("../../../src/http3/server.rs");
+    // Inline native-H3 streaming body fault (handle_h3_request).
+    let inline_body = src
+        .split("Error reading backend h3 response during streaming: {}")
+        .nth(1)
+        .expect("inline streaming body fault log")
+        .split("break 'outer;")
+        .next()
+        .expect("bounded inline body fault arm");
+    assert!(
+        inline_body.contains("is_h3_transport_error_class(class)")
+            && inline_body.contains("mark_h3_unsupported("),
+        "plain inline streaming body transport faults must downgrade H3 capability"
+    );
+
+    // Inline trailer-finish Backend arm.
+    let inline_trailer = src
+        .split("Error reading backend h3 response trailers during streaming: {}")
+        .nth(1)
+        .expect("inline streaming trailer fault log")
+        .split("H3TrailerFinishError::BackendTimeout")
+        .next()
+        .expect("bounded inline trailer fault arm");
+    assert!(
+        inline_trailer.contains("is_h3_transport_error_class(class)")
+            && inline_trailer.contains("mark_h3_unsupported("),
+        "plain inline streaming trailer transport faults must downgrade H3 capability"
+    );
+
+    // Refined streaming body fault.
+    let refined_body = src
+        .split("Error reading backend h3 response during refined streaming: {}")
+        .nth(1)
+        .expect("refined streaming body fault log")
+        .split("break 'outer;")
+        .next()
+        .expect("bounded refined body fault arm");
+    assert!(
+        refined_body.contains("is_h3_transport_error_class(class)")
+            && refined_body.contains("mark_h3_unsupported("),
+        "refined streaming body transport faults must downgrade H3 capability"
+    );
+
+    // Buffered-request streaming body fault (second "during streaming" after
+    // the inline path — use the proxy_to_backend_h3_streaming function scope).
+    let buffered_req = src
+        .split("async fn proxy_to_backend_h3_streaming(")
+        .nth(1)
+        .expect("buffered-request streaming function")
+        .split("Outcome of a buffered HTTP/3 backend request.")
+        .next()
+        .expect("bounded buffered-request streaming body");
+    assert!(
+        buffered_req.contains("is_h3_transport_error_class(class)")
+            && buffered_req
+                .matches("mark_h3_unsupported(proxy, upstream_target)")
+                .count()
+                >= 2,
+        "buffered-request streaming body and trailer transport faults must downgrade"
+    );
+}
+
+#[test]
+fn buffered_h3_path_does_not_drop_trailers_for_nonempty_plugin_chain() {
+    let src = include_str!("../../../src/http3/server.rs");
+    let send = src
+        .split("// Backend trailers remain valid whenever the body bytes on the wire")
+        .nth(1)
+        .expect("buffered trailer retention comment")
+        .split("// Forward backend response trailers, if any (issue #1630).")
+        .next()
+        .expect("bounded trailer gate");
+    assert!(
+        !send.contains("if !plugins.is_empty()"),
+        "buffered H3 path must not wipe trailers merely because plugins is nonempty"
+    );
+    assert!(
+        send.contains("Auth/logging-only plugins must not wipe"),
+        "retention rationale for auth/logging-only plugins must remain documented"
+    );
+}

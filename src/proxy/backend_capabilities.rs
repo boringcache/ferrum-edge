@@ -35,6 +35,30 @@ impl ProtocolSupport {
     }
 }
 
+/// Merge a fresh protocol-probe classification with the previously cached
+/// value.
+///
+/// When `preserve_previous` is set (transient DNS/connect/refused/timeout
+/// failures), keep the prior classification so a blip during periodic refresh
+/// cannot wipe a proven `Supported` entry for up to the full refresh interval.
+/// With no prior record the result stays `Unknown` rather than inventing an
+/// `Unsupported` verdict from a reachability fault alone.
+///
+/// Non-preserving probes (successful handshake, ALPN/protocol evidence that
+/// the target lacks the protocol) take `probed` as authoritative.
+#[inline]
+pub fn merge_protocol_probe_classification(
+    previous: Option<ProtocolSupport>,
+    probed: ProtocolSupport,
+    preserve_previous: bool,
+) -> ProtocolSupport {
+    if preserve_previous {
+        previous.unwrap_or(ProtocolSupport::Unknown)
+    } else {
+        probed
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlainHttpCapabilities {
     pub h1: ProtocolSupport,
