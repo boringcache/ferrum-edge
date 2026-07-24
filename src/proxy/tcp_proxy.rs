@@ -1396,9 +1396,11 @@ async fn run_tcp_accept_loop(
                             .unwrap_or(BackendScheme::Tcp),
                         consumer_index,
                     );
-                    stream_ctx.proxy_lifecycle_generation = epoch
-                        .plugin_cache
-                        .proxy_lifecycle_generation(proxy_id.as_ref());
+                    stream_ctx.proxy_lifecycle_generation = base_proxy.and_then(|p| {
+                        epoch
+                            .plugin_cache
+                            .proxy_lifecycle_generation(&p.namespace, &p.id)
+                    });
                     // Populated above from the node-waypoint resolver in
                     // NodeWaypoint topology so `mesh_authz` enforces
                     // namespace/selector-scoped policies per source pod
@@ -1463,7 +1465,11 @@ async fn run_tcp_accept_loop(
                     let final_proxy = epoch.proxy_by_id(&final_proxy_id);
                     let plugins = epoch
                         .plugin_cache
-                        .get_plugins_for_protocol(&proxy.namespace, &final_proxy_id, ProxyProtocol::Tcp);
+                        .get_plugins_for_protocol(
+                            &proxy.namespace,
+                            &final_proxy_id,
+                            ProxyProtocol::Tcp,
+                        );
                     let proxy_name = stream_ctx.proxy_name.clone();
                     let proxy_namespace = final_proxy
                         .map(|p| p.namespace.clone())
@@ -2720,7 +2726,12 @@ async fn handle_tcp_connection_inner(
                              proxy_id: &str,
                              cb_info: &TcpConnCbInfo| {
         if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(&proxy.namespace, proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
+            let cb = cb_cache.get_or_create(
+                &proxy.namespace,
+                proxy_id,
+                cb_info.cb_target_key.as_deref(),
+                cb_config,
+            );
             cb.record_failure(502, true, cb_info.is_half_open_probe);
         }
     };
@@ -2734,7 +2745,12 @@ async fn handle_tcp_connection_inner(
                              proxy_id: &str,
                              cb_info: &TcpConnCbInfo| {
         if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(&proxy.namespace, proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
+            let cb = cb_cache.get_or_create(
+                &proxy.namespace,
+                proxy_id,
+                cb_info.cb_target_key.as_deref(),
+                cb_config,
+            );
             cb.record_neutral(cb_info.is_half_open_probe);
         }
     };
@@ -3382,8 +3398,11 @@ fn resolve_backend_target(
     lb_hash_key: &str,
 ) -> Result<TcpResolvedBackendTarget, anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, &proxy.namespace, upstream_id);
+        let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+            lb_snapshot,
+            &proxy.namespace,
+            upstream_id,
+        );
         let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
             proxy,
             lb_snapshot,
@@ -3409,7 +3428,8 @@ fn resolve_backend_target(
             if let Some(port) = port_lane {
                 LoadBalancerCache::select_target_for_port_subset_from(
                     lb_snapshot,
-                    &proxy.namespace, upstream_id,
+                    &proxy.namespace,
+                    upstream_id,
                     lb_hash_key,
                     port,
                     subset_name,
@@ -3418,7 +3438,8 @@ fn resolve_backend_target(
             } else {
                 LoadBalancerCache::select_target_subset_from(
                     lb_snapshot,
-                    &proxy.namespace, upstream_id,
+                    &proxy.namespace,
+                    upstream_id,
                     lb_hash_key,
                     subset_name,
                     Some(&health_ctx),
@@ -3427,14 +3448,17 @@ fn resolve_backend_target(
         } else if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
-                &proxy.namespace, upstream_id,
+                &proxy.namespace,
+                upstream_id,
                 lb_hash_key,
                 port,
                 Some(&health_ctx),
             )
         } else {
             LoadBalancerCache::select_target_from(
-                lb_snapshot, &proxy.namespace, upstream_id,
+                lb_snapshot,
+                &proxy.namespace,
+                upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
             )
@@ -3517,7 +3541,8 @@ fn stream_port_override_affects_selection(
             || (override_config.hash_on.is_some()
                 && LoadBalancerCache::effective_algorithm_from(
                     lb_snapshot,
-                    &proxy.namespace, upstream_id,
+                    &proxy.namespace,
+                    upstream_id,
                     Some(port),
                     proxy.upstream_subset.as_deref(),
                 ) == Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing));
@@ -3539,7 +3564,8 @@ fn validate_stream_hash_on(
 ) -> Result<(), anyhow::Error> {
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         lb_snapshot,
-        &proxy.namespace, upstream_id,
+        &proxy.namespace,
+        upstream_id,
         Some(port),
         proxy.upstream_subset.as_deref(),
     );
@@ -3739,7 +3765,14 @@ mod backend_target_selection_tests {
             unhealthy_threshold: 1,
             ..Default::default()
         };
-        health_checker.report_response(&proxy.namespace, &proxy.id, &unhealthy_target, 500, false, Some(&passive));
+        health_checker.report_response(
+            &proxy.namespace,
+            &proxy.id,
+            &unhealthy_target,
+            500,
+            false,
+            Some(&passive),
+        );
 
         let (host, port, _, _, _) =
             resolve_backend_target(&proxy, &snapshot, &health_checker, "192.0.2.10")
@@ -4593,7 +4626,8 @@ fn try_next_target(
         (Some(subset_name), Some(port)) => {
             LoadBalancerCache::select_next_target_for_port_subset_from(
                 lb_snapshot,
-                &proxy.namespace, upstream_id,
+                &proxy.namespace,
+                upstream_id,
                 lb_hash_key,
                 port,
                 subset_name,
@@ -4603,7 +4637,8 @@ fn try_next_target(
         }
         (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
             lb_snapshot,
-            &proxy.namespace, upstream_id,
+            &proxy.namespace,
+            upstream_id,
             lb_hash_key,
             subset_name,
             &exclude,
@@ -4611,7 +4646,8 @@ fn try_next_target(
         ),
         (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
             lb_snapshot,
-            &proxy.namespace, upstream_id,
+            &proxy.namespace,
+            upstream_id,
             lb_hash_key,
             port,
             &exclude,
@@ -4619,7 +4655,8 @@ fn try_next_target(
         ),
         (None, None) => LoadBalancerCache::select_next_target_from(
             lb_snapshot,
-            &proxy.namespace, upstream_id,
+            &proxy.namespace,
+            upstream_id,
             lb_hash_key,
             &exclude,
             Some(&health_ctx),

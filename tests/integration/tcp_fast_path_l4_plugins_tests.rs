@@ -299,7 +299,8 @@ async fn try_spawn_fast_path_gateway(
         // Sanity check: configured plugins must actually be wired to the proxy.
         // If PluginScope / proxy_id wiring drifts, lifecycle tests below could
         // pass vacuously because no plugin is attached.
-        let attached = plugin_cache.get_plugins_for_protocol("ferrum", PROXY_ID, ProxyProtocol::Tcp);
+        let attached =
+            plugin_cache.get_plugins_for_protocol("ferrum", PROXY_ID, ProxyProtocol::Tcp);
         let attached_names: Vec<&str> = attached.iter().map(|p| p.name()).collect();
         for plugin_config in &gateway_config.plugin_configs {
             assert!(

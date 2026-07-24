@@ -462,6 +462,20 @@ async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+/// Whether `proxy` routes to the discovered upstream identity.
+///
+/// Upstream ids are per-namespace, so BOTH the namespace and the id must match.
+/// Matching on `upstream_id` alone would let a discovery update in one tenant
+/// prune the same-id upstream's passive-health state in a *different* tenant's
+/// proxy (issue #3094 follow-up).
+pub(crate) fn proxy_targets_discovered_upstream(
+    proxy: &crate::config::types::Proxy,
+    upstream_namespace: &str,
+    upstream_id: &str,
+) -> bool {
+    proxy.namespace == upstream_namespace && proxy.upstream_id.as_deref() == Some(upstream_id)
+}
+
 /// Background discovery loop for a single upstream.
 ///
 /// Exits when either the global `shutdown_rx` fires or the per-task
@@ -621,14 +635,18 @@ async fn run_discovery_loop(
                     health_checker.remove_stale_targets(upstream_namespace, upstream_id, &merged);
                     if let Some(epoch_store) = &request_epoch {
                         let epoch = epoch_store.load();
-                        for proxy in epoch
-                            .config
-                            .proxies
-                            .iter()
-                            .filter(|proxy| proxy.upstream_id.as_deref() == Some(upstream_id))
-                        {
-                            health_checker
-                                .remove_stale_passive_targets_for_proxy(&proxy.namespace, &proxy.id, &merged);
+                        for proxy in epoch.config.proxies.iter().filter(|proxy| {
+                            proxy_targets_discovered_upstream(
+                                proxy,
+                                upstream_namespace,
+                                upstream_id,
+                            )
+                        }) {
+                            health_checker.remove_stale_passive_targets_for_proxy(
+                                &proxy.namespace,
+                                &proxy.id,
+                                &merged,
+                            );
                         }
                     }
 

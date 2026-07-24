@@ -216,11 +216,14 @@ impl ConfigDelta {
                 // Association plugin_config_id values are namespace-local to
                 // the proxy (cross-namespace associations are rejected).
                 let references_changed_plugin = proxy.plugins.iter().any(|assoc| {
-                    changed_pc_keys.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                    changed_pc_keys
+                        .contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
                 }) || old_proxies_by_key.get(&proxy_key).is_some_and(|old_proxy| {
                     old_proxy.plugins.iter().any(|assoc| {
-                        changed_pc_keys
-                            .contains(&(old_proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                        changed_pc_keys.contains(&(
+                            old_proxy.namespace.as_str(),
+                            assoc.plugin_config_id.as_str(),
+                        ))
                     })
                 });
                 if references_changed_plugin

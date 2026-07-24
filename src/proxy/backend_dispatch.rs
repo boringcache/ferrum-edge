@@ -266,7 +266,7 @@ pub(crate) fn select_upstream_target(
     let subset_name = proxy.upstream_subset.as_deref();
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         balancers,
-            &proxy.namespace,
+        &proxy.namespace,
         upstream_id,
         port_scope,
         subset_name,
@@ -282,7 +282,7 @@ pub(crate) fn select_upstream_target(
     // normal selection below, which treats Passthrough as round-robin.
     if LoadBalancerCache::effective_algorithm_from(
         balancers,
-            &proxy.namespace,
+        &proxy.namespace,
         upstream_id,
         port_scope,
         subset_name,
@@ -292,7 +292,7 @@ pub(crate) fn select_upstream_target(
             Some(dst) => {
                 if let Some(target) = LoadBalancerCache::select_passthrough_from(
                     balancers,
-            &proxy.namespace,
+                    &proxy.namespace,
                     upstream_id,
                     dst,
                     port_scope,
@@ -337,7 +337,8 @@ pub(crate) fn select_upstream_target(
         if has_port_override {
             LoadBalancerCache::select_target_for_port_subset_from(
                 balancers,
-            &proxy.namespace, upstream_id,
+                &proxy.namespace,
+                upstream_id,
                 &hash_key,
                 dispatch_port,
                 subset_name,
@@ -346,7 +347,8 @@ pub(crate) fn select_upstream_target(
         } else {
             LoadBalancerCache::select_target_subset_from(
                 balancers,
-            &proxy.namespace, upstream_id,
+                &proxy.namespace,
+                upstream_id,
                 &hash_key,
                 subset_name,
                 Some(&health_ctx),
@@ -355,14 +357,20 @@ pub(crate) fn select_upstream_target(
     } else if has_port_override {
         LoadBalancerCache::select_target_for_port_from(
             balancers,
-            &proxy.namespace, upstream_id,
+            &proxy.namespace,
+            upstream_id,
             &hash_key,
             dispatch_port,
             Some(&health_ctx),
         )
     } else {
-        LoadBalancerCache::select_target_from(balancers,
-            &proxy.namespace, upstream_id, &hash_key, Some(&health_ctx))
+        LoadBalancerCache::select_target_from(
+            balancers,
+            &proxy.namespace,
+            upstream_id,
+            &hash_key,
+            Some(&health_ctx),
+        )
     };
 
     match selection_result {
@@ -394,7 +402,8 @@ pub(crate) fn select_upstream_target(
                 let tp_override = has_effective_port_override(proxy, balancers, upstream_id, tp);
                 let tp_strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
                     balancers,
-            &proxy.namespace, upstream_id,
+                    &proxy.namespace,
+                    upstream_id,
                     tp_override.then_some(tp),
                     subset_name,
                 );
@@ -470,15 +479,10 @@ pub(crate) fn health_context_for_selection<'a>(
     upstream_id: &str,
     port_scope: Option<u16>,
 ) -> HealthContext<'a> {
-    let proxy_key =
-        crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &proxy.id);
-    let proxy_passive = health_checker
-        .passive_health
-        .get(&proxy_key)
-        .map(|r| r.value().clone());
+    let proxy_passive = health_checker.passive_state(&proxy.namespace, &proxy.id);
     let max_ejection_percent = LoadBalancerCache::max_ejection_percent_resolved_from(
         balancers,
-            &proxy.namespace,
+        &proxy.namespace,
         upstream_id,
         proxy,
         port_scope,
@@ -503,7 +507,7 @@ pub(crate) fn hash_on_strategy_for_selected_target(
         .then_some(target_port);
     LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         balancers,
-            &proxy.namespace,
+        &proxy.namespace,
         upstream_id,
         port_scope,
         proxy.upstream_subset.as_deref(),
@@ -557,7 +561,12 @@ pub(crate) fn check_circuit_breaker(
         // finding 3).
         match state
             .circuit_breaker_cache
-            .can_execute_with_admission_epoch(&proxy.namespace, &proxy.id, cb_target_key.as_deref(), cb_config)
+            .can_execute_with_admission_epoch(
+                &proxy.namespace,
+                &proxy.id,
+                cb_target_key.as_deref(),
+                cb_config,
+            )
         {
             Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
                 return Ok((cb_target_key, is_half_open_probe, admission_open_epoch));
@@ -948,7 +957,8 @@ fn record_backend_outcome_inner(
         && response_status < 500
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
-        let upstream = LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id);
+        let upstream =
+            LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id);
         let has_active_hc = upstream
             .as_ref()
             .and_then(|u| u.health_checks.as_ref())
@@ -989,7 +999,8 @@ fn record_backend_outcome_inner(
     // backend passive health" comments hold.
     if !client_side_no_backend_signal
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
-        && let Some(upstream) = LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id)
+        && let Some(upstream) =
+            LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id)
     {
         let passive = passive_health_for_target(proxy, &upstream, target);
         state.health_checker.report_response(
@@ -1119,7 +1130,8 @@ pub(crate) fn select_next_retry_target(
         .filter(|port| {
             LoadBalancerCache::has_port_override_state_from(
                 &epoch.load_balancer,
-            &proxy.namespace, upstream_id,
+                &proxy.namespace,
+                upstream_id,
                 *port,
             )
         });
@@ -1131,7 +1143,8 @@ pub(crate) fn select_next_retry_target(
     let retry_key: &str = if let Some(port) = retry_override_port {
         let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
             &epoch.load_balancer,
-            &proxy.namespace, upstream_id,
+            &proxy.namespace,
+            upstream_id,
             Some(port),
             proxy.upstream_subset.as_deref(),
         );
@@ -1143,20 +1156,14 @@ pub(crate) fn select_next_retry_target(
 
     let health_ctx = HealthContext {
         active_unhealthy: &state.health_checker.active_unhealthy_targets,
-        proxy_passive: state
-            .health_checker
-            .passive_health
-            .get(&crate::config::db_backend::namespaced_runtime_key(
-                &proxy.namespace,
-                &proxy.id,
-            ))
-            .map(|r| r.value().clone()),
+        proxy_passive: state.health_checker.passive_state(&proxy.namespace, &proxy.id),
         // Same precedence as the steady-state path and `passive_health_for_target`
         // (per-port > per-subset > upstream). `retry_override_port` is already
         // `Some` only when a live per-port override covers the retried target.
         max_ejection_percent: LoadBalancerCache::max_ejection_percent_resolved_from(
             &epoch.load_balancer,
-            &proxy.namespace, upstream_id,
+            &proxy.namespace,
+            upstream_id,
             proxy,
             retry_override_port,
         ),
@@ -1166,7 +1173,8 @@ pub(crate) fn select_next_retry_target(
         if let Some(port) = retry_override_port {
             LoadBalancerCache::select_next_target_for_port_subset_from(
                 &epoch.load_balancer,
-            &proxy.namespace, upstream_id,
+                &proxy.namespace,
+                upstream_id,
                 retry_key,
                 port,
                 subset_name,
@@ -1176,7 +1184,8 @@ pub(crate) fn select_next_retry_target(
         } else {
             LoadBalancerCache::select_next_target_subset_from(
                 &epoch.load_balancer,
-            &proxy.namespace, upstream_id,
+                &proxy.namespace,
+                upstream_id,
                 retry_key,
                 subset_name,
                 prev_target,
@@ -1186,7 +1195,8 @@ pub(crate) fn select_next_retry_target(
     } else if let Some(port) = retry_override_port {
         LoadBalancerCache::select_next_target_for_port_from(
             &epoch.load_balancer,
-            &proxy.namespace, upstream_id,
+            &proxy.namespace,
+            upstream_id,
             retry_key,
             port,
             prev_target,
@@ -1195,7 +1205,8 @@ pub(crate) fn select_next_retry_target(
     } else {
         LoadBalancerCache::select_next_target_from(
             &epoch.load_balancer,
-            &proxy.namespace, upstream_id,
+            &proxy.namespace,
+            upstream_id,
             retry_key,
             prev_target,
             Some(&health_ctx),
@@ -1567,7 +1578,8 @@ mod tests {
 
         let expected = LoadBalancerCache::select_next_target_for_port_subset_from(
             &epoch.load_balancer,
-            &proxy.namespace,"mesh-upstream",
+            &proxy.namespace,
+            "mesh-upstream",
             "alice",
             8080,
             "v1",
@@ -1586,7 +1598,8 @@ mod tests {
         .filter_map(|candidate| {
             let target = LoadBalancerCache::select_next_target_for_port_subset_from(
                 &epoch.load_balancer,
-            &proxy.namespace,"mesh-upstream",
+                &proxy.namespace,
+                "mesh-upstream",
                 candidate,
                 8080,
                 "v1",

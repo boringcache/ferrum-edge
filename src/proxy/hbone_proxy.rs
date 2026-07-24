@@ -430,7 +430,7 @@ pub(super) async fn handle_hbone_request(
     ctx.matched_proxy = Some(Arc::clone(proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // HBONE relay trust boundary. The relay byte-copies this CONNECT stream
     // straight to the backend as a transparent TCP tunnel, so it must only
@@ -703,8 +703,11 @@ pub(super) async fn handle_hbone_request(
         cb.record_success(cb_is_half_open_probe);
     }
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
-        && let Some(upstream) =
-            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, &proxy.namespace, upstream_id)
+        && let Some(upstream) = LoadBalancerCache::get_upstream_from(
+            &epoch.load_balancer,
+            &proxy.namespace,
+            upstream_id,
+        )
     {
         let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
         state.health_checker.report_response(
@@ -894,7 +897,7 @@ pub(super) async fn handle_hbone_udp_request(
     ctx.matched_proxy = Some(Arc::clone(proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // Same trust boundary as the byte-stream relay: only an authenticated,
     // trust-domain-verified mesh peer may open a datagram tunnel into a local

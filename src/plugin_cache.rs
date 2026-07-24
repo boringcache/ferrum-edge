@@ -20,7 +20,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::db_backend::{NamespacedResourceId, namespaced_runtime_key};
+use crate::config::db_backend::{
+    NamespacedResourceId, namespaced_runtime_key, write_namespaced_runtime_key,
+};
 use crate::config::types::{
     BackendScheme, CountryMmdbLoadSession, CountryMmdbSnapshot, GatewayConfig,
     MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES, PluginScope,
@@ -2532,8 +2534,10 @@ fn include_adaptive_concurrency_route_rebuilds(
             }
             PluginScope::Proxy => {
                 if let Some(proxy_id) = pc.proxy_id.as_ref() {
-                    proxy_ids_to_rebuild
-                        .insert(NamespacedResourceId::new(pc.namespace.as_str(), proxy_id.as_str()));
+                    proxy_ids_to_rebuild.insert(NamespacedResourceId::new(
+                        pc.namespace.as_str(),
+                        proxy_id.as_str(),
+                    ));
                 }
             }
             PluginScope::ProxyGroup => {
@@ -3170,6 +3174,19 @@ fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin
 
 /// All plugin-cache state swapped as a single unit so a single load observes
 /// either the old generation or the new generation, never a partial rebuild.
+thread_local! {
+    /// Reusable scratch buffer for `namespace|proxy_id` runtime keys used by the
+    /// per-request plugin-cache accessors.
+    ///
+    /// Every borrow is strictly synchronous within a single accessor call, is
+    /// never held across an `await`, and never re-enters: the callee lookups
+    /// take the key by `&str` and return owned/cloned data (`Arc` clones or
+    /// `Copy` values), so nothing escapes borrowing this buffer. This keeps the
+    /// request hot path allocation-free in steady state.
+    static PROXY_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(64));
+}
+
 pub(crate) struct PluginCacheInner {
     /// proxy_id -> pre-resolved plugin list (global + proxy-scoped, merged).
     proxy_plugins: ProxyPluginMap,
@@ -3253,24 +3270,25 @@ fn build_proxy_lifecycle_generations_with_advances(
     previous: &HashMap<String, u64>,
     previous_high_water: u64,
     config: &GatewayConfig,
-    advance_proxy_ids: &HashSet<&str>,
+    advance_proxy_keys: &HashSet<String>,
 ) -> Result<(HashMap<String, u64>, u64), String> {
     let mut next = HashMap::with_capacity(config.proxies.len());
     let previous_max = previous.values().copied().max().unwrap_or(0);
     let mut high = previous_high_water.max(previous_max);
     for proxy in &config.proxies {
-        // Lifecycle ownership remains keyed by proxy id (matching hot-path
-        // admission and proxy_alerts). Namespace-qualified identity for plugin
-        // cache entries is handled separately via `proxy_runtime_key`.
-        if !advance_proxy_ids.contains(proxy.id.as_str())
-            && let Some(&generation) = previous.get(proxy.id.as_str())
+        // Lifecycle ownership is keyed by the namespace-qualified runtime key
+        // (`namespace|id`) so the same proxy id in two tenants owns independent
+        // generations and cannot share, advance, or retain the other's state.
+        let key = proxy_runtime_key(proxy);
+        if !advance_proxy_keys.contains(key.as_str())
+            && let Some(&generation) = previous.get(key.as_str())
         {
-            next.insert(proxy.id.clone(), generation);
+            next.insert(key, generation);
         } else {
             high = high
                 .checked_add(1)
                 .ok_or_else(|| "proxy lifecycle generation counter exhausted".to_string())?;
-            next.insert(proxy.id.clone(), high);
+            next.insert(key, high);
         }
     }
     Ok((next, high))
@@ -3314,10 +3332,21 @@ fn extract_mesh_bpf_metrics_exporter(
 }
 
 impl PluginCacheInner {
-    /// Admission-time ownership generation for `proxy_id`, or `None` when the
-    /// proxy is absent from this published cache generation.
-    pub(crate) fn proxy_lifecycle_generation(&self, proxy_id: &str) -> Option<u64> {
-        self.proxy_lifecycle_generations.get(proxy_id).copied()
+    /// Admission-time ownership generation for `(namespace, proxy_id)`, or
+    /// `None` when the proxy is absent from this published cache generation.
+    ///
+    /// Zero allocation beyond the reusable thread-local key buffer; the result
+    /// is `Copy` so nothing borrows the buffer.
+    pub(crate) fn proxy_lifecycle_generation(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Option<u64> {
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.proxy_lifecycle_generations.get(key.as_str()).copied()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3572,29 +3601,37 @@ impl PluginCacheInner {
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> PluginCacheRequestView {
-        let proxy_key = namespaced_runtime_key(namespace, proxy_id);
-        let capabilities = self.get_capabilities(&proxy_key, protocol);
-        let backend_path_plugins = capabilities
-            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
-            .then(|| self.get_backend_path_plugins(&proxy_key, protocol));
-        PluginCacheRequestView {
-            plugins: self.get_plugins_for_protocol(&proxy_key, protocol),
-            grpc_deadline_plugins: self.get_grpc_deadline_plugins(&proxy_key, protocol),
-            auth_plugins: self.get_auth_plugins(&proxy_key, protocol),
-            authorize_plugins: self.get_authorize_plugins(&proxy_key, protocol),
-            backend_admission_plugins: self.get_backend_admission_plugins(&proxy_key, protocol),
-            backend_path_plugins,
-            request_headers_to_redact: self.get_request_headers_to_redact(&proxy_key, protocol),
-            initial_response_header_policy_plugins: self
-                .get_initial_response_header_policy_plugins(&proxy_key, protocol),
-            initial_response_header_policy_names: self
-                .get_initial_response_header_policy_names(&proxy_key, protocol),
-            response_committed_plugins: self.get_response_committed_plugins(&proxy_key, protocol),
-            capabilities,
-            requires_response_body_buffering: self.requires_response_body_buffering(&proxy_key),
-            requires_request_body_buffering: self.requires_request_body_buffering(&proxy_key),
-            requires_ws_frame_hooks: self.requires_ws_frame_hooks(&proxy_key),
-        }
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            let proxy_key = key.as_str();
+            let capabilities = self.get_capabilities(proxy_key, protocol);
+            let backend_path_plugins = capabilities
+                .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+                .then(|| self.get_backend_path_plugins(proxy_key, protocol));
+            PluginCacheRequestView {
+                plugins: self.get_plugins_for_protocol(proxy_key, protocol),
+                grpc_deadline_plugins: self.get_grpc_deadline_plugins(proxy_key, protocol),
+                auth_plugins: self.get_auth_plugins(proxy_key, protocol),
+                authorize_plugins: self.get_authorize_plugins(proxy_key, protocol),
+                backend_admission_plugins: self
+                    .get_backend_admission_plugins(proxy_key, protocol),
+                backend_path_plugins,
+                request_headers_to_redact: self
+                    .get_request_headers_to_redact(proxy_key, protocol),
+                initial_response_header_policy_plugins: self
+                    .get_initial_response_header_policy_plugins(proxy_key, protocol),
+                initial_response_header_policy_names: self
+                    .get_initial_response_header_policy_names(proxy_key, protocol),
+                response_committed_plugins: self
+                    .get_response_committed_plugins(proxy_key, protocol),
+                capabilities,
+                requires_response_body_buffering: self
+                    .requires_response_body_buffering(proxy_key),
+                requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
+                requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+            }
+        })
     }
 
     pub(crate) fn grpc_web_request_view(
@@ -3602,36 +3639,40 @@ impl PluginCacheInner {
         namespace: &str,
         proxy_id: &str,
     ) -> PluginCacheRequestView {
-        let proxy_key = namespaced_runtime_key(namespace, proxy_id);
-        let entry = self
-            .protocol_snapshot
-            .grpc_web_proxy
-            .get(&proxy_key)
-            .unwrap_or(&self.protocol_snapshot.grpc_web_global);
-        let capabilities = entry.phase.capabilities;
-        let backend_path_plugins = capabilities
-            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
-            .then(|| Arc::clone(&entry.phase.backend_path_plugins));
-        PluginCacheRequestView {
-            plugins: Arc::clone(&entry.plugins),
-            grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
-            auth_plugins: Arc::clone(&entry.phase.auth_plugins),
-            authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
-            backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
-            backend_path_plugins,
-            request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
-            initial_response_header_policy_plugins: Arc::clone(
-                &entry.phase.initial_response_header_policy_plugins,
-            ),
-            initial_response_header_policy_names: Arc::clone(
-                &entry.phase.initial_response_header_policy_names,
-            ),
-            response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
-            capabilities,
-            requires_response_body_buffering: self.requires_response_body_buffering(&proxy_key),
-            requires_request_body_buffering: self.requires_request_body_buffering(&proxy_key),
-            requires_ws_frame_hooks: self.requires_ws_frame_hooks(&proxy_key),
-        }
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            let proxy_key = key.as_str();
+            let entry = self
+                .protocol_snapshot
+                .grpc_web_proxy
+                .get(proxy_key)
+                .unwrap_or(&self.protocol_snapshot.grpc_web_global);
+            let capabilities = entry.phase.capabilities;
+            let backend_path_plugins = capabilities
+                .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+                .then(|| Arc::clone(&entry.phase.backend_path_plugins));
+            PluginCacheRequestView {
+                plugins: Arc::clone(&entry.plugins),
+                grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
+                auth_plugins: Arc::clone(&entry.phase.auth_plugins),
+                authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
+                backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
+                backend_path_plugins,
+                request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
+                initial_response_header_policy_plugins: Arc::clone(
+                    &entry.phase.initial_response_header_policy_plugins,
+                ),
+                initial_response_header_policy_names: Arc::clone(
+                    &entry.phase.initial_response_header_policy_names,
+                ),
+                response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
+                capabilities,
+                requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
+                requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
+                requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+            }
+        })
     }
 }
 
@@ -4016,20 +4057,22 @@ impl PluginCache {
         // proxy name (issue #2572).
         crate::plugins::api_chargeback::publish_active_proxy_names(config);
 
+        // Ownership generations are keyed by the namespace-qualified runtime key
+        // (`namespace|id`), the same identity the request/frame samples resolve,
+        // so preserved global/group instances retire per-tenant rows precisely.
         let active_proxy_generations: HashMap<&str, u64> = inner
             .proxy_lifecycle_generations
             .iter()
-            .map(|(id, generation)| (id.as_str(), *generation))
+            .map(|(key, generation)| (key.as_str(), *generation))
             .collect();
         // `config` is the published generation that produced `inner`; keep the
         // parameter so call sites stay explicitly paired with that commit.
         // Check per published proxy (not length equality) so duplicate IDs in
         // `config.proxies` cannot trip a debug assertion by themselves.
         debug_assert!(
-            config
-                .proxies
-                .iter()
-                .all(|proxy| active_proxy_generations.contains_key(proxy.id.as_str())),
+            config.proxies.iter().all(|proxy| {
+                active_proxy_generations.contains_key(proxy_runtime_key(proxy).as_str())
+            }),
             "lifecycle generations must cover every published proxy"
         );
         for plugin in inner.global_plugins.iter() {
@@ -4038,7 +4081,12 @@ impl PluginCache {
 
         let mut group_members: HashMap<&str, HashMap<&str, u64>> = HashMap::new();
         for proxy in &config.proxies {
-            let Some(&generation) = inner.proxy_lifecycle_generations.get(proxy.id.as_str()) else {
+            // Borrow the stored composite key so group members carry the same
+            // namespace-qualified identity as `active_proxy_generations`.
+            let Some((owner_key, &generation)) = inner
+                .proxy_lifecycle_generations
+                .get_key_value(proxy_runtime_key(proxy).as_str())
+            else {
                 continue;
             };
             for assoc in &proxy.plugins {
@@ -4049,7 +4097,7 @@ impl PluginCache {
                     group_members
                         .entry(assoc.plugin_config_id.as_str())
                         .or_default()
-                        .insert(proxy.id.as_str(), generation);
+                        .insert(owner_key.as_str(), generation);
                 }
             }
         }
@@ -4062,15 +4110,14 @@ impl PluginCache {
         }
     }
 
-    /// Admission-time ownership generation for `proxy_id` from the live cache.
+    /// Admission-time ownership generation for `(namespace, proxy_id)` from the
+    /// live cache.
     ///
     /// Returns `None` when the proxy is absent from the published generation.
-    pub fn proxy_lifecycle_generation(&self, proxy_id: &str) -> Option<u64> {
+    pub fn proxy_lifecycle_generation(&self, namespace: &str, proxy_id: &str) -> Option<u64> {
         self.inner
             .load()
-            .proxy_lifecycle_generations
-            .get(proxy_id)
-            .copied()
+            .proxy_lifecycle_generation(namespace, proxy_id)
     }
 
     /// Build a request-scoped view of plugin-cache values for one proxy/protocol.
@@ -4956,7 +5003,7 @@ impl PluginCache {
                 .map_err(|error| format!("Config reload rejected: {error}"))?;
         }
 
-        let lifecycle_advances: HashSet<&str> = config
+        let lifecycle_advances: HashSet<String> = config
             .proxies
             .iter()
             .filter_map(|proxy| {
@@ -4970,7 +5017,7 @@ impl PluginCache {
                     .get(&key)
                     .map(Arc::as_ref)
                     .unwrap_or(new_globals.as_ref());
-                proxy_alerts_instances_changed(previous, next).then_some(proxy.id.as_str())
+                proxy_alerts_instances_changed(previous, next).then_some(key)
             })
             .collect();
         let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
@@ -5043,9 +5090,11 @@ impl PluginCache {
     /// Callers iterate by reference; no Vec clone needed.
     #[allow(dead_code)] // Used by tests for protocol-agnostic plugin inspection
     pub fn get_plugins(&self, namespace: &str, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
-        let key = namespaced_runtime_key(namespace, proxy_id);
-        let inner = self.inner.load();
-        inner.get_plugins(&key)
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.inner.load().get_plugins(key.as_str())
+        })
     }
 
     /// Get pre-resolved plugins for a proxy filtered by protocol. Lock-free O(1) lookup.
@@ -5058,9 +5107,11 @@ impl PluginCache {
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        let key = namespaced_runtime_key(namespace, proxy_id);
-        let inner = self.inner.load();
-        inner.get_plugins_for_protocol(&key, protocol)
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.inner.load().get_plugins_for_protocol(key.as_str(), protocol)
+        })
     }
 
     /// Get pre-computed auth plugins for a proxy+protocol. Lock-free O(1) lookup.
@@ -5077,9 +5128,11 @@ impl PluginCache {
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        let key = namespaced_runtime_key(namespace, proxy_id);
-        let inner = self.inner.load();
-        inner.get_auth_plugins(&key, protocol)
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.inner.load().get_auth_plugins(key.as_str(), protocol)
+        })
     }
 
     /// Get pre-computed capability bitset for a proxy+protocol. Lock-free O(1) lookup.
@@ -5095,9 +5148,11 @@ impl PluginCache {
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> PluginCapabilities {
-        let key = namespaced_runtime_key(namespace, proxy_id);
-        let inner = self.inner.load();
-        inner.get_capabilities(&key, protocol)
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.inner.load().get_capabilities(key.as_str(), protocol)
+        })
     }
 
     /// Check whether any plugin for this proxy requires response body buffering.
@@ -5108,9 +5163,11 @@ impl PluginCache {
     /// `request_view()` for cross-accessor generation consistency.
     #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn requires_response_body_buffering(&self, namespace: &str, proxy_id: &str) -> bool {
-        let key = namespaced_runtime_key(namespace, proxy_id);
-        let inner = self.inner.load();
-        inner.requires_response_body_buffering(&key)
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.inner.load().requires_response_body_buffering(key.as_str())
+        })
     }
 
     /// Check whether any plugin for this proxy may require request body
@@ -5118,9 +5175,11 @@ impl PluginCache {
     /// plugin scans entirely when body-aware plugins are absent.
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     pub fn requires_request_body_buffering(&self, namespace: &str, proxy_id: &str) -> bool {
-        let key = namespaced_runtime_key(namespace, proxy_id);
-        let inner = self.inner.load();
-        inner.requires_request_body_buffering(&key)
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.inner.load().requires_request_body_buffering(key.as_str())
+        })
     }
 
     /// Check whether any plugin for this proxy requires parsed WebSocket framing.
@@ -5132,9 +5191,11 @@ impl PluginCache {
     /// `request_view()` for cross-accessor generation consistency.
     #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn requires_ws_frame_hooks(&self, namespace: &str, proxy_id: &str) -> bool {
-        let key = namespaced_runtime_key(namespace, proxy_id);
-        let inner = self.inner.load();
-        inner.requires_ws_frame_hooks(&key)
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.inner.load().requires_ws_frame_hooks(key.as_str())
+        })
     }
 
     /// Collect all hostnames that plugins will send traffic to.

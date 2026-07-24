@@ -907,7 +907,8 @@ async fn test_http3_streaming_decision_logic() {
     // Case 1: No plugins, no retry → streaming
     let has_retry_1 = proxy_stream.retry.is_some();
     let needs_resp_buf_1 = plugin_cache.requires_response_body_buffering(&proxy_stream.id);
-    let needs_req_buf_1 = plugin_cache.requires_request_body_buffering(&proxy_stream.namespace, &proxy_stream.id);
+    let needs_req_buf_1 =
+        plugin_cache.requires_request_body_buffering(&proxy_stream.namespace, &proxy_stream.id);
     assert!(!has_retry_1, "No retry configured");
     assert!(!needs_resp_buf_1, "No response body buffering needed");
     assert!(!needs_req_buf_1, "No request body buffering needed");

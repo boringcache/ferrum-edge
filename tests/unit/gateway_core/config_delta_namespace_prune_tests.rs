@@ -383,3 +383,100 @@ fn same_id_modification_is_isolated_per_namespace() {
         Some("/staging-v2")
     );
 }
+
+#[test]
+fn proxy_lifecycle_generations_are_namespace_isolated() {
+    // Same proxy id in two tenants must own independent lifecycle generations,
+    // and removing one tenant must not advance, drop, or retain the other's
+    // generation (issue #3094 finding 3).
+    let old = GatewayConfig {
+        proxies: vec![
+            make_proxy("prod", "shared", "/prod"),
+            make_proxy("staging", "shared", "/staging"),
+        ],
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&old).expect("initial plugin cache");
+
+    let prod_gen = cache
+        .proxy_lifecycle_generation("prod", "shared")
+        .expect("prod generation");
+    let staging_gen = cache
+        .proxy_lifecycle_generation("staging", "shared")
+        .expect("staging generation");
+    assert_ne!(
+        prod_gen, staging_gen,
+        "same id in two namespaces must own distinct lifecycle generations"
+    );
+
+    // Remove only the staging tenant.
+    let new = GatewayConfig {
+        proxies: vec![make_proxy("prod", "shared", "/prod")],
+        ..GatewayConfig::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    assert_eq!(
+        delta.removed_proxy_ids,
+        vec![NamespacedResourceId::new("staging", "shared")]
+    );
+    let rebuild = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
+    cache
+        .apply_delta(&new, &rebuild, &delta.removed_proxy_ids, false)
+        .expect("namespace-qualified prune must succeed");
+
+    assert_eq!(
+        cache.proxy_lifecycle_generation("prod", "shared"),
+        Some(prod_gen),
+        "surviving tenant's lifecycle generation must be unchanged by the other tenant's removal"
+    );
+    assert_eq!(
+        cache.proxy_lifecycle_generation("staging", "shared"),
+        None,
+        "removed tenant's lifecycle generation must be dropped"
+    );
+}
+
+#[test]
+fn discovery_passive_prune_targets_only_the_discovered_upstream_tenant() {
+    // Two proxies in different tenants reference the SAME upstream id. A
+    // service-discovery update for one tenant's upstream may only prune that
+    // tenant's proxy passive-health state; matching on `upstream_id` alone
+    // would cross tenants (issue #3094 finding 1).
+    let mut prod = make_proxy("prod", "prod-proxy", "/prod");
+    prod.upstream_id = Some("shared".to_string());
+    let mut staging = make_proxy("staging", "staging-proxy", "/staging");
+    staging.upstream_id = Some("shared".to_string());
+
+    // Discovery on upstream (prod, "shared") selects only the prod proxy.
+    assert!(
+        ferrum_edge::_test_support::proxy_targets_discovered_upstream_for_test(
+            &prod, "prod", "shared"
+        )
+    );
+    assert!(
+        !ferrum_edge::_test_support::proxy_targets_discovered_upstream_for_test(
+            &staging, "prod", "shared"
+        ),
+        "a same-id upstream in another tenant must not be pruned"
+    );
+
+    // Discovery on upstream (staging, "shared") selects only the staging proxy.
+    assert!(
+        ferrum_edge::_test_support::proxy_targets_discovered_upstream_for_test(
+            &staging, "staging", "shared"
+        )
+    );
+    assert!(
+        !ferrum_edge::_test_support::proxy_targets_discovered_upstream_for_test(
+            &prod, "staging", "shared"
+        )
+    );
+
+    // A proxy that references no upstream never matches.
+    prod.upstream_id = None;
+    assert!(
+        !ferrum_edge::_test_support::proxy_targets_discovered_upstream_for_test(
+            &prod, "prod", "shared"
+        )
+    );
+}

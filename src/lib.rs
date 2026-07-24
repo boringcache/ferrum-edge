@@ -234,6 +234,23 @@ pub mod _test_support {
         cache.contains_proxy_plugins_key(namespace, proxy_id)
     }
 
+    /// Whether the service-discovery loop would prune `proxy`'s passive-health
+    /// state for a discovery update on upstream `(upstream_namespace,
+    /// upstream_id)`. Exposes the namespace-qualified proxy-selection predicate
+    /// so regression coverage can prove a discovery update in one tenant never
+    /// prunes a same-id upstream's proxy in another tenant (issue #3094).
+    pub fn proxy_targets_discovered_upstream_for_test(
+        proxy: &crate::config::types::Proxy,
+        upstream_namespace: &str,
+        upstream_id: &str,
+    ) -> bool {
+        crate::service_discovery::proxy_targets_discovered_upstream(
+            proxy,
+            upstream_namespace,
+            upstream_id,
+        )
+    }
+
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
     pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
         duration: std::time::Duration,

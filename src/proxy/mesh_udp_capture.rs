@@ -1202,8 +1202,11 @@ async fn run_udp_egress_session(
         // Engage the per-port lane only on a non-zero override port: the relay
         // proxy's `backend_port` is a placeholder, so the HTTP path's fallback
         // must not pin a mixed-port upstream (see tcp_proxy::resolve_backend_target).
-        let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb, &proxy.namespace, &entry.upstream_id);
+        let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+            lb,
+            &proxy.namespace,
+            &entry.upstream_id,
+        );
         let health_port_scope = backend_dispatch::stream_health_port_scope(
             proxy,
             lb,
@@ -1271,7 +1274,7 @@ async fn run_udp_egress_session(
             );
             return;
         };
-        let balancer = lb.balancers().get(&crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &entry.upstream_id)).cloned();
+        let balancer = lb.balancer(&proxy.namespace, &entry.upstream_id).cloned();
         (selection.target, balancer)
     };
 

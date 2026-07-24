@@ -69,6 +69,11 @@ mod tests {
     use std::cell::Cell;
     use std::collections::HashMap;
 
+    /// Namespace-qualified runtime key (`ferrum|id`) for load-balancer lookups.
+    fn rk(id: &str) -> String {
+        crate::config::db_backend::namespaced_runtime_key("ferrum", id)
+    }
+
     fn proxy(id: &str, path: &str, plugins: Vec<&str>) -> Proxy {
         Proxy {
             id: id.to_string(),
@@ -632,11 +637,11 @@ mod tests {
 
         let final_epoch = store.load();
         assert_eq!(
-            final_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].host,
+            final_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].host,
             "a2.local"
         );
         assert_eq!(
-            final_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u2")].targets[0].host,
+            final_epoch.load_balancer.upstreams()[&rk("u2")].targets[0].host,
             "b2.local"
         );
         assert_eq!(final_epoch.route_generation, 1);
@@ -797,7 +802,7 @@ mod tests {
         assert_eq!(next.lb_generation, 2);
         assert_eq!(observed_generations.get(), (1, 1, 2));
         assert_eq!(
-            next.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].host,
+            next.load_balancer.upstreams()[&rk("u1")].targets[0].host,
             "b.local"
         );
         assert!(Arc::ptr_eq(&next, &store.load()));
@@ -857,7 +862,7 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &after));
         assert_eq!(after.lb_generation, u64::MAX);
         assert_eq!(
-            after.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].host,
+            after.load_balancer.upstreams()[&rk("u1")].targets[0].host,
             "a.local"
         );
     }
@@ -1096,7 +1101,7 @@ mod tests {
         };
 
         let initial_epoch = store.load();
-        let old_target = initial_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "canary")].targets[0].clone();
+        let old_target = initial_epoch.load_balancer.upstreams()[&rk("canary")].targets[0].clone();
         match acquire(&initial_epoch, &old_target) {
             BackendAdmissionDecision::Admit(permit) => drop(permit),
             _ => panic!("initial route-override target should be admitted"),
@@ -1123,7 +1128,7 @@ mod tests {
 
         let replacement_epoch = store.load();
         let replacement_target =
-            replacement_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "canary")].targets[0].clone();
+            replacement_epoch.load_balancer.upstreams()[&rk("canary")].targets[0].clone();
         let held = match acquire(&replacement_epoch, &replacement_target) {
             BackendAdmissionDecision::Admit(permit) => permit,
             _ => panic!("replacement route-override target should be admitted"),
@@ -1179,7 +1184,7 @@ mod tests {
         };
 
         let initial_epoch = store.load();
-        let first_target = initial_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].clone();
+        let first_target = initial_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].clone();
         let old_target_permit = match acquire(&initial_epoch, &first_target) {
             BackendAdmissionDecision::Admit(permit) => permit,
             _ => panic!("initial target should be admitted"),
@@ -1203,7 +1208,7 @@ mod tests {
 
         let replacement_epoch = store.load();
         let replacement_target =
-            replacement_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].clone();
+            replacement_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].clone();
         match acquire(&initial_epoch, &first_target) {
             BackendAdmissionDecision::Reject {
                 status_code,
@@ -1266,7 +1271,7 @@ mod tests {
             .expect("second LB update should publish");
 
         let newest_epoch = store.load();
-        let newest_target = newest_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].clone();
+        let newest_target = newest_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].clone();
         match acquire(&replacement_epoch, &replacement_target) {
             BackendAdmissionDecision::Reject {
                 status_code,
@@ -1339,7 +1344,7 @@ mod tests {
         );
         let store = epoch_store(initial);
         let pinned_epoch = store.load();
-        let pinned_target = pinned_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].clone();
+        let pinned_target = pinned_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].clone();
 
         store
             .update_load_balancer(

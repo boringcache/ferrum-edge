@@ -75,7 +75,7 @@ impl CapturedMeshEgressLifecycle {
         );
         stream_ctx.proxy_lifecycle_generation = epoch
             .plugin_cache
-            .proxy_lifecycle_generation(proxy.id.as_str());
+            .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
         // NodeWaypoint TCP and Ambient UDP capture already verified the
         // originating pod's identity before handing the flow here; carry
         // it so workload_metrics attributes CLIENT spans/labels to the

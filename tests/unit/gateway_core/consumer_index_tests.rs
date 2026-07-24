@@ -1145,7 +1145,11 @@ fn test_apply_delta_remove_all_consumers() {
     let c2 = make_consumer("c2", "bob", Some("key-b"), None);
     let index = ConsumerIndex::new(&[c1, c2]);
 
-    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c1"), NamespacedResourceId::new("ferrum", "c2")], &[]);
+    index.apply_delta(
+        &[],
+        &[NamespacedResourceId::new("ferrum", "c1"), NamespacedResourceId::new("ferrum", "c2")],
+        &[],
+    );
 
     assert_eq!(index.consumer_count(), 0);
     assert!(index.find_by_api_key("key-a").is_none());

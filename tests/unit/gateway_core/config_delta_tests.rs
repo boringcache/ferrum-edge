@@ -249,7 +249,10 @@ fn test_detects_consumer_changes() {
     let delta = ConfigDelta::compute(&old, &new);
     assert_eq!(delta.added_consumers.len(), 1);
     assert_eq!(delta.added_consumers[0].id, "c3");
-    assert_eq!(delta.removed_consumer_ids, vec![NamespacedResourceId::new(default_namespace(), "c2")]);
+    assert_eq!(
+        delta.removed_consumer_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "c2")],
+    );
     assert_eq!(delta.modified_consumers.len(), 1);
     assert_eq!(delta.modified_consumers[0].id, "c1");
 }
@@ -281,7 +284,10 @@ fn test_detects_removed_upstream() {
     let new = GatewayConfig::default();
     let delta = ConfigDelta::compute(&old, &new);
     assert!(delta.added_upstreams.is_empty());
-    assert_eq!(delta.removed_upstream_ids, vec![NamespacedResourceId::new(default_namespace(), "u1")]);
+    assert_eq!(
+        delta.removed_upstream_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "u1")],
+    );
     assert!(delta.modified_upstreams.is_empty());
 }
 
@@ -339,7 +345,10 @@ fn test_upstream_mixed_add_remove_modify() {
     let delta = ConfigDelta::compute(&old, &new);
     assert_eq!(delta.added_upstreams.len(), 1);
     assert_eq!(delta.added_upstreams[0].id, "u3");
-    assert_eq!(delta.removed_upstream_ids, vec![NamespacedResourceId::new(default_namespace(), "u2")]);
+    assert_eq!(
+        delta.removed_upstream_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "u2")],
+    );
     assert_eq!(delta.modified_upstreams.len(), 1);
     assert_eq!(delta.modified_upstreams[0].id, "u1");
 }
@@ -384,7 +393,10 @@ fn test_detects_removed_plugin_config() {
     let new = GatewayConfig::default();
     let delta = ConfigDelta::compute(&old, &new);
     assert!(delta.added_plugin_configs.is_empty());
-    assert_eq!(delta.removed_plugin_config_ids, vec![NamespacedResourceId::new(default_namespace(), "pc1")]);
+    assert_eq!(
+        delta.removed_plugin_config_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "pc1")],
+    );
     assert!(delta.modified_plugin_configs.is_empty());
     assert!(delta.global_plugin_configs_changed);
 }
@@ -581,7 +593,10 @@ fn test_full_mixed_delta_all_entity_types() {
     assert_eq!(delta.removed_proxy_ids, vec![NamespacedResourceId::new(default_namespace(), "p1")]);
     assert!(delta.added_consumers.is_empty());
     assert_eq!(delta.modified_consumers.len(), 1);
-    assert_eq!(delta.removed_plugin_config_ids, vec![NamespacedResourceId::new(default_namespace(), "pc1")]);
+    assert_eq!(
+        delta.removed_plugin_config_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "pc1")],
+    );
     assert_eq!(delta.added_upstreams.len(), 1);
     assert_eq!(delta.modified_upstreams.len(), 1);
     assert!(!delta.is_empty());

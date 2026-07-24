@@ -85,8 +85,11 @@ pub(crate) async fn handle_mesh_tcp_egress(
     // effective port override exists. The per-port LB lane is stricter: it only
     // engages for selection-affecting policy fields, so passive-health-only
     // overrides can cap ejection by port without bypassing subset/upstream LB.
-    let override_port =
-        LoadBalancerCache::initial_dispatch_port_override_from(lb, &proxy.namespace, &entry.upstream_id);
+    let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+        lb,
+        &proxy.namespace,
+        &entry.upstream_id,
+    );
     let health_port_scope =
         backend_dispatch::stream_health_port_scope(proxy, lb, &entry.upstream_id, override_port);
     let port_lane = (health_port_scope.is_some()

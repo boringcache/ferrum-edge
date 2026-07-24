@@ -4129,15 +4129,15 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("global proxy_alerts");
     let p1_gen = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("p1 generation");
     let p2_gen = cache
-        .proxy_lifecycle_generation("p2")
+        .proxy_lifecycle_generation("ferrum", "p2")
         .expect("p2 generation");
-    alerts_plugin.seed_proxy_lifecycle_state_for_test("p1", p1_gen);
-    alerts_plugin.seed_proxy_lifecycle_state_for_test("p2", p2_gen);
-    assert!(alerts_plugin.has_proxy_lifecycle_state_for_test("p1"));
-    assert!(alerts_plugin.has_proxy_lifecycle_state_for_test("p2"));
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen);
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("ferrum|p2", p2_gen);
+    assert!(alerts_plugin.has_proxy_lifecycle_state_for_test("ferrum|p1"));
+    assert!(alerts_plugin.has_proxy_lifecycle_state_for_test("ferrum|p2"));
 
     let config2 = make_config(vec![make_proxy("p2", "/web", vec![])], vec![alerts]);
     let mut proxy_ids = HashSet::new();
@@ -4157,10 +4157,10 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("preserved global proxy_alerts");
     assert!(
-        !alerts_after.has_proxy_lifecycle_state_for_test("p1"),
+        !alerts_after.has_proxy_lifecycle_state_for_test("ferrum|p1"),
         "removed proxy must retire cooldown/recovery ownership"
     );
-    assert!(alerts_after.has_proxy_lifecycle_state_for_test("p2"));
+    assert!(alerts_after.has_proxy_lifecycle_state_for_test("ferrum|p2"));
 
     // ID reuse after removal must not inherit prior lifecycle state.
     let config3 = make_config(
@@ -4190,11 +4190,11 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
         "re-adding a proxy must keep the preserved global instance"
     );
     assert!(
-        !recreated.has_proxy_lifecycle_state_for_test("p1"),
+        !recreated.has_proxy_lifecycle_state_for_test("ferrum|p1"),
         "recreated proxy ID must start without inherited lifecycle state"
     );
     let p1_gen_after = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("recreated p1 generation");
     assert_ne!(
         p1_gen, p1_gen_after,
@@ -4218,7 +4218,7 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
         &stale,
     ));
     assert!(
-        !recreated.has_proxy_lifecycle_state_for_test("p1"),
+        !recreated.has_proxy_lifecycle_state_for_test("ferrum|p1"),
         "stale generation must not repopulate lifecycle state after identical-ID recreate"
     );
 }
@@ -4249,13 +4249,13 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
     alerts_plugin.seed_proxy_lifecycle_state_for_test(
         "p1",
         cache
-            .proxy_lifecycle_generation("p1")
+            .proxy_lifecycle_generation("ferrum", "p1")
             .expect("p1 generation"),
     );
     alerts_plugin.seed_proxy_lifecycle_state_for_test(
         "p2",
         cache
-            .proxy_lifecycle_generation("p2")
+            .proxy_lifecycle_generation("ferrum", "p2")
             .expect("p2 generation"),
     );
 
@@ -4285,12 +4285,12 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("preserved group proxy_alerts");
     assert!(
-        !alerts_after.has_proxy_lifecycle_state_for_test("p1"),
+        !alerts_after.has_proxy_lifecycle_state_for_test("ferrum|p1"),
         "renamed-away proxy ID must leave the preserved group instance"
     );
-    assert!(alerts_after.has_proxy_lifecycle_state_for_test("p2"));
+    assert!(alerts_after.has_proxy_lifecycle_state_for_test("ferrum|p2"));
     assert!(
-        !alerts_after.has_proxy_lifecycle_state_for_test("p1b"),
+        !alerts_after.has_proxy_lifecycle_state_for_test("ferrum|p1b"),
         "renamed-in proxy ID starts without inherited lifecycle state"
     );
 }
@@ -4319,13 +4319,13 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
         .expect("group proxy_alerts")
         .clone();
     let p1_gen = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("p1 generation");
-    shared.seed_proxy_lifecycle_state_for_test("p1", p1_gen);
+    shared.seed_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen);
     shared.seed_proxy_lifecycle_state_for_test(
         "p2",
         cache
-            .proxy_lifecycle_generation("p2")
+            .proxy_lifecycle_generation("ferrum", "p2")
             .expect("p2 generation"),
     );
     let shared_ptr = Arc::as_ptr(&shared) as *const () as usize;
@@ -4357,11 +4357,11 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
         .clone();
     assert_eq!(Arc::as_ptr(&after) as *const () as usize, shared_ptr);
     let p1_gen_after = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("recreated p1 generation");
     assert_ne!(p1_gen, p1_gen_after);
-    assert!(!after.has_proxy_lifecycle_state_for_test("p1"));
-    assert!(after.has_proxy_lifecycle_state_for_test("p2"));
+    assert!(!after.has_proxy_lifecycle_state_for_test("ferrum|p1"));
+    assert!(after.has_proxy_lifecycle_state_for_test("ferrum|p2"));
 
     let stale = ferrum_edge::plugins::TransactionSummary {
         proxy_id: Some("p1".to_string()),
@@ -4375,7 +4375,7 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
         .expect("test runtime");
     rt.block_on(ferrum_edge::plugins::Plugin::log(after.as_ref(), &stale));
     assert!(
-        !after.has_proxy_lifecycle_state_for_test("p1"),
+        !after.has_proxy_lifecycle_state_for_test("ferrum|p1"),
         "preserved proxy-group instance must reject stale generation after ID recreate"
     );
 }
@@ -4404,13 +4404,13 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         .expect("group proxy_alerts")
         .clone();
     let p1_initial_generation = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("initial p1 generation");
-    shared.seed_proxy_lifecycle_state_for_test("p1", p1_initial_generation);
+    shared.seed_proxy_lifecycle_state_for_test("ferrum|p1", p1_initial_generation);
     shared.seed_proxy_lifecycle_state_for_test(
         "p2",
         cache
-            .proxy_lifecycle_generation("p2")
+            .proxy_lifecycle_generation("ferrum", "p2")
             .expect("p2 generation"),
     );
     let shared_ptr = Arc::as_ptr(&shared) as *const () as usize;
@@ -4434,10 +4434,10 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("preserved group proxy_alerts");
-    assert!(!alerts_after.has_proxy_lifecycle_state_for_test("p1"));
-    assert!(alerts_after.has_proxy_lifecycle_state_for_test("p2"));
+    assert!(!alerts_after.has_proxy_lifecycle_state_for_test("ferrum|p1"));
+    assert!(alerts_after.has_proxy_lifecycle_state_for_test("ferrum|p2"));
     let p1_left_generation = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("generation after leaving group");
     assert_ne!(
         p1_initial_generation, p1_left_generation,
@@ -4456,7 +4456,7 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
     );
     cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
     let p1_rejoined_generation = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("generation after rejoining group");
     assert_ne!(p1_left_generation, p1_rejoined_generation);
 
@@ -4485,7 +4485,7 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         .expect("test runtime");
     rt.block_on(ferrum_edge::plugins::Plugin::log(rejoined.as_ref(), &stale));
     assert!(
-        !rejoined.has_proxy_lifecycle_state_for_test("p1"),
+        !rejoined.has_proxy_lifecycle_state_for_test("ferrum|p1"),
         "pre-leave in-flight sample must not repopulate a rejoined membership"
     );
     rt.block_on(ferrum_edge::plugins::Plugin::log(
@@ -4493,7 +4493,7 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         &current,
     ));
     assert!(
-        rejoined.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_rejoined_generation,),
+        rejoined.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p1", p1_rejoined_generation,),
         "rejoined membership must accept its current ownership generation"
     );
 }
@@ -4511,10 +4511,10 @@ fn test_apply_delta_rebuild_globals_resets_proxy_alerts_lifecycle() {
     alerts_before.seed_proxy_lifecycle_state_for_test(
         "p1",
         cache
-            .proxy_lifecycle_generation("p1")
+            .proxy_lifecycle_generation("ferrum", "p1")
             .expect("p1 generation"),
     );
-    assert!(alerts_before.has_proxy_lifecycle_state_for_test("p1"));
+    assert!(alerts_before.has_proxy_lifecycle_state_for_test("ferrum|p1"));
     let ptr_before = plugin_ptr_by_name(&before, "proxy_alerts");
 
     let mut rebuilt =
@@ -4546,7 +4546,7 @@ fn test_apply_delta_rebuild_globals_resets_proxy_alerts_lifecycle() {
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("rebuilt global proxy_alerts");
     assert!(
-        !alerts_after.has_proxy_lifecycle_state_for_test("p1"),
+        !alerts_after.has_proxy_lifecycle_state_for_test("ferrum|p1"),
         "rebuilt instance must not carry prior lifecycle state"
     );
 }
@@ -4560,7 +4560,7 @@ fn test_proxy_lifecycle_generations_remove_to_empty_then_recreate_advances() {
         &config1,
     )
     .expect("initial allocation");
-    assert_eq!(gens1.get("p1").copied(), Some(1));
+    assert_eq!(gens1.get("ferrum|p1").copied(), Some(1));
     assert_eq!(high1, 1);
 
     let empty = make_config(vec![], vec![]);
@@ -4583,7 +4583,7 @@ fn test_proxy_lifecycle_generations_remove_to_empty_then_recreate_advances() {
     )
     .expect("recreate after empty");
     assert_eq!(
-        gens2.get("p1").copied(),
+        gens2.get("ferrum|p1").copied(),
         Some(2),
         "identical-ID recreate after empty map must not reuse generation 1"
     );
@@ -4605,8 +4605,8 @@ fn test_proxy_lifecycle_generations_stable_presence_and_multi_id() {
         &config1,
     )
     .expect("initial multi-id allocation");
-    let p1 = *gens1.get("p1").expect("p1");
-    let p2 = *gens1.get("p2").expect("p2");
+    let p1 = *gens1.get("ferrum|p1").expect("p1");
+    let p2 = *gens1.get("ferrum|p2").expect("p2");
     assert_ne!(p1, p2);
     assert_eq!(high1, p1.max(p2));
 
@@ -4614,8 +4614,8 @@ fn test_proxy_lifecycle_generations_stable_presence_and_multi_id() {
         &gens1, high1, &config1,
     )
     .expect("stable presence");
-    assert_eq!(gens2.get("p1").copied(), Some(p1));
-    assert_eq!(gens2.get("p2").copied(), Some(p2));
+    assert_eq!(gens2.get("ferrum|p1").copied(), Some(p1));
+    assert_eq!(gens2.get("ferrum|p2").copied(), Some(p2));
     assert_eq!(high2, high1);
 
     let config_add = make_config(
@@ -4632,9 +4632,9 @@ fn test_proxy_lifecycle_generations_stable_presence_and_multi_id() {
         &config_add,
     )
     .expect("new id advances high-water");
-    assert_eq!(gens3.get("p1").copied(), Some(p1));
-    assert_eq!(gens3.get("p2").copied(), Some(p2));
-    let p3 = *gens3.get("p3").expect("p3");
+    assert_eq!(gens3.get("ferrum|p1").copied(), Some(p1));
+    assert_eq!(gens3.get("ferrum|p2").copied(), Some(p2));
+    let p3 = *gens3.get("ferrum|p3").expect("p3");
     assert_eq!(p3, high2 + 1);
     assert_eq!(high3, p3);
 }
@@ -4659,21 +4659,21 @@ fn test_apply_delta_proxy_lifecycle_high_water_survives_empty_active_set() {
     let config1 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
     let cache = PluginCache::new(&config1).unwrap();
     let p1_gen = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("p1 generation");
 
     let empty = make_config(vec![], vec![]);
     cache
         .apply_delta(&empty, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
         .unwrap();
-    assert_eq!(cache.proxy_lifecycle_generation("p1"), None);
+    assert_eq!(cache.proxy_lifecycle_generation("ferrum", "p1"), None);
 
     let config2 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
     let mut proxy_ids = HashSet::new();
     proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
     let p1_gen_after = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("recreated p1 generation");
     assert_ne!(
         p1_gen, p1_gen_after,
@@ -4699,13 +4699,13 @@ fn test_apply_delta_global_proxy_alerts_generation_keyed_race_isolation() {
         .expect("global proxy_alerts")
         .clone();
     let p1_gen = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("p1 generation");
     let p2_gen = cache
-        .proxy_lifecycle_generation("p2")
+        .proxy_lifecycle_generation("ferrum", "p2")
         .expect("p2 generation");
-    alerts_plugin.seed_proxy_lifecycle_state_for_test("p1", p1_gen);
-    alerts_plugin.seed_proxy_lifecycle_state_for_test("p2", p2_gen);
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen);
+    alerts_plugin.seed_proxy_lifecycle_state_for_test("ferrum|p2", p2_gen);
 
     // Remove+recreate p1 while preserving the global instance.
     let config2 = make_config(vec![make_proxy("p2", "/web", vec![])], vec![alerts.clone()]);
@@ -4730,23 +4730,23 @@ fn test_apply_delta_global_proxy_alerts_generation_keyed_race_isolation() {
         .expect("preserved global proxy_alerts")
         .clone();
     let p1_gen_after = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("recreated p1 generation");
     assert_ne!(p1_gen, p1_gen_after);
-    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p2", p2_gen));
-    assert!(!after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen));
-    assert!(!after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after));
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p2", p2_gen));
+    assert!(!after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p1", p1_gen));
+    assert!(!after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p1", p1_gen_after));
 
     // Direct store write under the old generation after replacement publication.
-    after.write_proxy_lifecycle_state_for_test("p1", p1_gen);
-    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen));
+    after.write_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen);
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p1", p1_gen));
     assert!(
-        !after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after),
+        !after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p1", p1_gen_after),
         "old-generation write after retain must not populate the replacement"
     );
 
-    after.write_proxy_lifecycle_state_for_test("p1", p1_gen_after);
-    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after));
+    after.write_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen_after);
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p1", p1_gen_after));
 }
 
 #[test]
@@ -4773,13 +4773,13 @@ fn test_apply_delta_proxy_group_proxy_alerts_generation_keyed_race_isolation() {
         .expect("group proxy_alerts")
         .clone();
     let p1_gen = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("p1 generation");
     let p2_gen = cache
-        .proxy_lifecycle_generation("p2")
+        .proxy_lifecycle_generation("ferrum", "p2")
         .expect("p2 generation");
-    shared.seed_proxy_lifecycle_state_for_test("p1", p1_gen);
-    shared.seed_proxy_lifecycle_state_for_test("p2", p2_gen);
+    shared.seed_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen);
+    shared.seed_proxy_lifecycle_state_for_test("ferrum|p2", p2_gen);
     let shared_ptr = Arc::as_ptr(&shared) as *const () as usize;
 
     let config2 = make_config(
@@ -4808,18 +4808,18 @@ fn test_apply_delta_proxy_group_proxy_alerts_generation_keyed_race_isolation() {
         .clone();
     assert_eq!(Arc::as_ptr(&after) as *const () as usize, shared_ptr);
     let p1_gen_after = cache
-        .proxy_lifecycle_generation("p1")
+        .proxy_lifecycle_generation("ferrum", "p1")
         .expect("recreated p1 generation");
     assert_ne!(p1_gen, p1_gen_after);
-    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p2", p2_gen));
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p2", p2_gen));
 
-    after.write_proxy_lifecycle_state_for_test("p1", p1_gen);
+    after.write_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen);
     assert!(
-        !after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after),
+        !after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p1", p1_gen_after),
         "proxy-group stale generation write must stay isolated from replacement"
     );
-    after.write_proxy_lifecycle_state_for_test("p1", p1_gen_after);
-    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("p1", p1_gen_after));
+    after.write_proxy_lifecycle_state_for_test("ferrum|p1", p1_gen_after);
+    assert!(after.has_proxy_lifecycle_state_for_generation_for_test("ferrum|p1", p1_gen_after));
 }
 
 #[test]
@@ -5048,7 +5048,11 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
     let to_group_ids = to_group.proxy_ids_needing_plugin_rebuild(&proxy_config, &group_config);
     assert_eq!(
         to_group_ids,
-        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p2"), NamespacedResourceId::new("ferrum", "p3")])
+        HashSet::from([
+            NamespacedResourceId::new("ferrum", "p1"),
+            NamespacedResourceId::new("ferrum", "p2"),
+            NamespacedResourceId::new("ferrum", "p3"),
+        ])
     );
     cache
         .apply_delta(
@@ -5081,7 +5085,11 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
         from_group.proxy_ids_needing_plugin_rebuild(&group_config, &moved_back_config);
     assert_eq!(
         from_group_ids,
-        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p2"), NamespacedResourceId::new("ferrum", "p3")])
+        HashSet::from([
+            NamespacedResourceId::new("ferrum", "p1"),
+            NamespacedResourceId::new("ferrum", "p2"),
+            NamespacedResourceId::new("ferrum", "p3"),
+        ])
     );
     cache
         .apply_delta(

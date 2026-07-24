@@ -175,7 +175,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     );
     stream_ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
     // Populated above for opaque-TLS captures; `None` for raw-TCP streams.
     stream_ctx.sni_hostname = sni_hostname;
     // Captured plaintext Sidecar inbound is, by direction, inbound mesh

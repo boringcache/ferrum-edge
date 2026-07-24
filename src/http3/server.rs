@@ -1575,7 +1575,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // Keep recognized gRPC-Web on its ordinary HTTP protocol key. The request
     // view below composes only grpc_method_router and grpc_deadline into that
@@ -2992,7 +2992,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // Preserve the client's original request path for access logging — the
     // transaction summaries below source `request_path` from this, not the
@@ -3134,7 +3134,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(selected_base_proxy.id.as_str());
+        .proxy_lifecycle_generation(&selected_base_proxy.namespace, &selected_base_proxy.id);
 
     let has_deferred_routing_header_hooks = backend_path_is_policy_bound
         && capabilities
@@ -7425,7 +7425,11 @@ pub(crate) fn inject_sticky_cookie(
             target,
         );
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, &proxy.namespace, upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(
+                &epoch.load_balancer,
+                &proxy.namespace,
+                upstream_id,
+            );
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()

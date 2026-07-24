@@ -2406,7 +2406,7 @@ async fn start_dtls_frontend_listener(
                 );
                 stream_ctx.proxy_lifecycle_generation = epoch
                     .plugin_cache
-                    .proxy_lifecycle_generation(proxy.id.as_str());
+                    .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
                 stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
                 stream_ctx.tls_client_cert_chain_der =
                     client_conn.tls_client_cert_chain_der.clone();
@@ -2874,7 +2874,12 @@ async fn handle_dtls_client_inner(
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
     let mut cb_is_half_open_probe = false;
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        match circuit_breaker_cache.can_execute(&proxy.namespace, proxy_id, cb_target_key.as_deref(), cb_config) {
+        match circuit_breaker_cache.can_execute(
+            &proxy.namespace,
+            proxy_id,
+            cb_target_key.as_deref(),
+            cb_config,
+        ) {
             Ok((_cb, is_half_open_probe)) => {
                 cb_is_half_open_probe = is_half_open_probe;
             }
@@ -3055,7 +3060,12 @@ async fn handle_dtls_client_inner(
 
     // Record circuit breaker success — backend connection established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        let cb = circuit_breaker_cache.get_or_create(&proxy.namespace, proxy_id, cb_target_key.as_deref(), cb_config);
+        let cb = circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            proxy_id,
+            cb_target_key.as_deref(),
+            cb_config,
+        );
         cb.record_success(cb_is_half_open_probe);
     }
 
@@ -3327,7 +3337,9 @@ async fn create_session(
         backend_scheme,
         consumer_index,
     );
-    stream_ctx.proxy_lifecycle_generation = epoch.plugin_cache.proxy_lifecycle_generation(proxy_id);
+    stream_ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(&proxy.namespace, proxy_id);
     stream_ctx.sni_hostname = sni_hostname;
     // The constructor intentionally leaves node-waypoint per-pod policy scope
     // absent: plain UDP cannot wire it without a new capture path. Identity is
@@ -3369,7 +3381,12 @@ async fn create_session(
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
     let mut cb_is_half_open_probe = false;
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        match circuit_breaker_cache.can_execute(&proxy.namespace, proxy_id, cb_target_key.as_deref(), cb_config) {
+        match circuit_breaker_cache.can_execute(
+            &proxy.namespace,
+            proxy_id,
+            cb_target_key.as_deref(),
+            cb_config,
+        ) {
             Ok((_cb, is_half_open_probe)) => {
                 cb_is_half_open_probe = is_half_open_probe;
             }
@@ -3548,7 +3565,12 @@ async fn create_session(
 
     // Record circuit breaker success — backend socket established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        let cb = circuit_breaker_cache.get_or_create(&proxy.namespace, proxy_id, cb_target_key.as_deref(), cb_config);
+        let cb = circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            proxy_id,
+            cb_target_key.as_deref(),
+            cb_config,
+        );
         cb.record_success(cb_is_half_open_probe);
     }
 
@@ -4239,8 +4261,11 @@ fn resolve_backend_target(
         // stream proxy referencing an upstream, `backend_port` is a placeholder,
         // and a coincidental match with one overridden port of a mixed-port
         // upstream would silently pin selection to that port's targets.
-        let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, &proxy.namespace, upstream_id);
+        let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+            lb_snapshot,
+            &proxy.namespace,
+            upstream_id,
+        );
         let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
             proxy,
             lb_snapshot,
@@ -4265,14 +4290,17 @@ fn resolve_backend_target(
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
-                &proxy.namespace, upstream_id,
+                &proxy.namespace,
+                upstream_id,
                 lb_hash_key,
                 port,
                 Some(&health_ctx),
             )
         } else {
             LoadBalancerCache::select_target_from(
-                lb_snapshot, &proxy.namespace, upstream_id,
+                lb_snapshot,
+                &proxy.namespace,
+                upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
             )
@@ -4323,7 +4351,7 @@ fn udp_port_lane_selection_supported(
     }
     let selection_affecting = stream_port_override_affects_selection(override_config);
     if selection_affecting {
-        validate_stream_hash_on(lb_snapshot, upstream_id, port)?;
+        validate_stream_hash_on(proxy, lb_snapshot, upstream_id, port)?;
     }
     Ok(selection_affecting)
 }
@@ -4337,13 +4365,15 @@ fn stream_port_override_affects_selection(
 }
 
 fn validate_stream_hash_on(
+    proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
     upstream_id: &str,
     port: u16,
 ) -> Result<(), anyhow::Error> {
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         lb_snapshot,
-        &proxy.namespace, upstream_id,
+        &proxy.namespace,
+        upstream_id,
         Some(port),
         None,
     );

@@ -465,7 +465,10 @@ fn test_cache_prune_removes_stale() {
     cache.get_or_create("ferrum", "proxy-2", None, &config);
     cache.get_or_create("ferrum", "proxy-3", None, &config);
 
-    cache.prune(&[ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy-1"), ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy-3")]);
+    cache.prune(&[
+        ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy-1"),
+        ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy-3"),
+    ]);
 
     // proxy-2 should still exist, proxy-1 and proxy-3 should be gone
     assert!(cache.can_execute("ferrum", "proxy-2", None, &config).is_ok());

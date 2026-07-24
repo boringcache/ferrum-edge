@@ -469,6 +469,28 @@ impl HealthChecker {
         })
     }
 
+    /// Read-only per-proxy passive health state, or `None` when the proxy has no
+    /// recorded passive state yet.
+    ///
+    /// Unlike [`get_proxy_state`](Self::get_proxy_state) this never inserts, so
+    /// dispatch-time health context construction cannot create empty partitions
+    /// for proxies that have never reported a response. Zero allocation beyond
+    /// the reusable thread-local key buffer; the returned `Arc` is cloned out so
+    /// the buffer borrow is released before the caller uses it.
+    pub(crate) fn passive_state(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Option<Arc<ProxyHealthState>> {
+        PASSIVE_PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            crate::config::db_backend::write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.passive_health
+                .get(key.as_str())
+                .map(|entry| entry.value().clone())
+        })
+    }
+
     /// Report a response from a proxied request (passive health checking).
     ///
     /// Writes to the per-proxy passive health state via the two-level index:

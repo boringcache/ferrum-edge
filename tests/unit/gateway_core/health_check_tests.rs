@@ -10,6 +10,11 @@ use std::collections::HashMap;
 
 const TEST_PROXY: &str = "test-proxy";
 
+/// Namespace-qualified runtime key (`ferrum|id`) for the default test namespace.
+fn rk(id: &str) -> String {
+    ferrum_edge::config::db_backend::namespaced_runtime_key("ferrum", id)
+}
+
 fn make_target(host: &str, port: u16) -> UpstreamTarget {
     UpstreamTarget {
         host: host.to_string(),
@@ -24,7 +29,7 @@ fn make_target(host: &str, port: u16) -> UpstreamTarget {
 
 /// Check if a target is passively unhealthy for a given proxy via the two-level index.
 fn is_passive_unhealthy(checker: &HealthChecker, proxy_id: &str, host_port: &str) -> bool {
-    let key = ferrum_edge::config::db_backend::namespaced_runtime_key(default_namespace(), proxy_id);
+    let key = rk(proxy_id);
     checker
         .passive_health
         .get(&key)
@@ -55,7 +60,14 @@ fn test_passive_health_marks_unhealthy() {
     };
 
     for _ in 0..3 {
-        checker.report_response(default_namespace(), TEST_PROXY, &target, 500, false, Some(&config));
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
@@ -76,7 +88,14 @@ fn test_passive_health_recovers() {
     };
 
     for _ in 0..2 {
-        checker.report_response(default_namespace(), TEST_PROXY, &target, 500, false, Some(&config));
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
@@ -99,7 +118,14 @@ fn test_success_does_not_mark_unhealthy() {
     };
 
     for _ in 0..100 {
-        checker.report_response(default_namespace(), TEST_PROXY, &target, 200, false, Some(&config));
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target,
+            200,
+            false,
+            Some(&config),
+        );
     }
 
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
@@ -168,14 +194,32 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
     };
 
     for _ in 0..2 {
-        checker.report_response(default_namespace(), TEST_PROXY, &target1, 500, false, Some(&config));
-        checker.report_response(default_namespace(), TEST_PROXY, &target2, 500, false, Some(&config));
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target1,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target2,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend2:8080"));
 
     // Remove backend2 from the upstream for this proxy.
-    checker.remove_stale_passive_targets_for_proxy(default_namespace(), TEST_PROXY, std::slice::from_ref(&target1));
+    checker.remove_stale_passive_targets_for_proxy(
+        default_namespace(),
+        TEST_PROXY,
+        std::slice::from_ref(&target1),
+    );
 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend2:8080"));
@@ -196,7 +240,14 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
     };
 
     for _ in 0..2 {
-        checker.report_response(default_namespace(), TEST_PROXY, &target, 500, false, Some(&config));
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
@@ -220,11 +271,29 @@ fn test_remove_stale_targets_no_op_when_all_present() {
     };
 
     for _ in 0..2 {
-        checker.report_response(default_namespace(), TEST_PROXY, &target1, 500, false, Some(&config));
-        checker.report_response(default_namespace(), TEST_PROXY, &target2, 500, false, Some(&config));
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target1,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target2,
+            500,
+            false,
+            Some(&config),
+        );
     }
 
-    checker.remove_stale_passive_targets_for_proxy(default_namespace(), TEST_PROXY, &[target1, target2]);
+    checker.remove_stale_passive_targets_for_proxy(
+        default_namespace(),
+        TEST_PROXY,
+        &[target1, target2],
+    );
     assert_eq!(passive_unhealthy_count(&checker), 2);
 }
 
@@ -354,12 +423,15 @@ fn test_prune_removed_proxies() {
     assert_eq!(checker.passive_health.len(), 3);
 
     // Remove proxy1 and proxy3
-    checker.prune_removed_proxies(&[ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy1"), ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy3")]);
+    checker.prune_removed_proxies(&[
+        ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy1"),
+        ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy3"),
+    ]);
 
     assert_eq!(checker.passive_health.len(), 1);
-    assert!(checker.passive_health.contains_key(&ferrum_edge::config::db_backend::namespaced_runtime_key("ferrum", "proxy2")));
-    assert!(!checker.passive_health.contains_key(&ferrum_edge::config::db_backend::namespaced_runtime_key("ferrum", "proxy1")));
-    assert!(!checker.passive_health.contains_key(&ferrum_edge::config::db_backend::namespaced_runtime_key("ferrum", "proxy3")));
+    assert!(checker.passive_health.contains_key(&rk("proxy2")));
+    assert!(!checker.passive_health.contains_key(&rk("proxy1")));
+    assert!(!checker.passive_health.contains_key(&rk("proxy3")));
 }
 
 #[tokio::test]
@@ -531,7 +603,14 @@ fn test_recovery_clears_failures_then_re_threshold() {
 
     // Mark unhealthy
     for _ in 0..3 {
-        checker.report_response(default_namespace(), TEST_PROXY, &target, 500, false, Some(&config));
+        checker.report_response(
+            default_namespace(),
+            TEST_PROXY,
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
