@@ -363,6 +363,31 @@ fn wrr_counter_shard() -> usize {
     })
 }
 
+/// RoundRobin / Random / LeastLatency warm-up / locality-distribute selection
+/// counters. Reuses [`WRR_COUNTER_SHARDS`] and [`wrr_counter_shard`] so every
+/// hot-path ticket advance stays on a per-worker [`CachePadded`] line instead of
+/// bouncing a single shared `AtomicU64` that sat adjacent to read-per-selection
+/// neighbors (`algorithm`, `target_indices`, `distribute_groups`, …).
+type SelectionCounterShards = [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS];
+
+/// Fresh selection-counter shards for a parent, port, or locality-distribute lane.
+///
+/// All shards start at `0` (unlike zero-weight WRR phase strides) so a single
+/// worker's ticket stream matches the historical shared `AtomicU64` sequence,
+/// independent of which shard [`wrr_counter_shard`] assigned this thread.
+/// Contention avoidance comes from per-shard [`CachePadded`] ownership; long-run
+/// ratios stay even because each shard is itself a full RR / random walk.
+#[inline]
+fn new_selection_counters() -> SelectionCounterShards {
+    std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0)))
+}
+
+/// Advance the calling thread's selection-counter shard and return the ticket.
+#[inline]
+fn selection_counter_ticket(counters: &SelectionCounterShards) -> u64 {
+    counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed)
+}
+
 /// Per-lane smooth-WRR state shared by parent, subset, and port selectors.
 ///
 /// # Concurrency / distribution tradeoff
@@ -1727,7 +1752,7 @@ fn build_locality_lb_state(
             enabled: false,
             distribute_weights: None,
             distribute_groups: None,
-            distribute_counter: AtomicU64::new(0),
+            distribute_counter: new_selection_counters(),
             failover_target_matches: None,
         });
     }
@@ -1741,7 +1766,7 @@ fn build_locality_lb_state(
             enabled: true,
             distribute_weights: None,
             distribute_groups: None,
-            distribute_counter: AtomicU64::new(0),
+            distribute_counter: new_selection_counters(),
             failover_target_matches: None,
         });
     };
@@ -1904,7 +1929,7 @@ fn build_locality_lb_state(
         enabled: true,
         distribute_weights,
         distribute_groups,
-        distribute_counter: AtomicU64::new(0),
+        distribute_counter: new_selection_counters(),
         failover_target_matches,
     })
 }
@@ -2010,8 +2035,9 @@ pub struct LoadBalancer {
     /// via `write!()` into a thread-local buffer.
     target_index: HashMap<String, usize>,
     algorithm: LoadBalancerAlgorithm,
-    /// Round-robin counter.
-    rr_counter: AtomicU64,
+    /// Round-robin / random / least-latency warm-up selection counters.
+    /// Sharded and cache-line padded; see [`SelectionCounterShards`].
+    rr_counter: SelectionCounterShards,
     /// Weighted round-robin lane state (smooth weighted round-robin).
     /// See [`WrrLaneState`] for the wait-free hot path and rebuild tradeoff.
     wrr_state: WrrLaneState,
@@ -2115,9 +2141,10 @@ struct LocalityLbState {
     /// picks one bucket by the configured locality share, then runs the
     /// upstream / port / subset algorithm inside that bucket.
     distribute_groups: Option<Vec<LocalityDistributeGroup>>,
-    /// Independent counter for weighted locality-bucket selection. This keeps
-    /// the endpoint algorithm's own counter cadence unchanged.
-    distribute_counter: AtomicU64,
+    /// Independent counters for weighted locality-bucket selection. This keeps
+    /// the endpoint algorithm's own counter cadence unchanged. Sharded and
+    /// cache-line padded; see [`SelectionCounterShards`].
+    distribute_counter: SelectionCounterShards,
     /// Per-target failover-region match, index-aligned with `LoadBalancer.targets`.
     /// `true` when the target's locality region matches the failover `to`
     /// region for this source. `None` when no `failover[]` entry matched
@@ -2137,7 +2164,7 @@ struct PortLbState {
     target_indices: Vec<usize>,
     algorithm: LoadBalancerAlgorithm,
     algorithm_overridden: bool,
-    rr_counter: AtomicU64,
+    rr_counter: SelectionCounterShards,
     wrr_state: WrrLaneState,
     hash_ring: Vec<(u64, usize)>,
     hash_on_strategy: HashOnStrategy,
@@ -2381,7 +2408,7 @@ impl LoadBalancer {
                         target_indices,
                         algorithm: effective_algorithm,
                         algorithm_overridden: override_config.algorithm.is_some(),
-                        rr_counter: AtomicU64::new(0),
+                        rr_counter: new_selection_counters(),
                         wrr_state,
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
@@ -2444,7 +2471,7 @@ impl LoadBalancer {
             target_locality_ranks,
             target_index,
             algorithm,
-            rr_counter: AtomicU64::new(0),
+            rr_counter: new_selection_counters(),
             wrr_state: if algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
                 WrrLaneState::new(targets.len())
             } else {
@@ -3254,11 +3281,11 @@ impl LoadBalancer {
         ctx_key: &str,
         total: u64,
         algorithm: LoadBalancerAlgorithm,
-        distribute_counter: &AtomicU64,
+        distribute_counter: &SelectionCounterShards,
     ) -> u64 {
         let raw = match algorithm {
             LoadBalancerAlgorithm::ConsistentHashing => fx_hash_str(ctx_key),
-            _ => distribute_counter.fetch_add(1, Ordering::Relaxed),
+            _ => selection_counter_ticket(distribute_counter),
         };
         golden_ratio_hash(raw) % total
     }
@@ -3833,7 +3860,10 @@ impl LoadBalancer {
     }
 
     #[inline]
-    fn port_subset_rr_counter<'a>(&'a self, port_state: &'a PortLbState) -> &'a AtomicU64 {
+    fn port_subset_rr_counter<'a>(
+        &'a self,
+        port_state: &'a PortLbState,
+    ) -> &'a SelectionCounterShards {
         if port_state.algorithm_overridden {
             &port_state.rr_counter
         } else {
@@ -3919,7 +3949,7 @@ impl LoadBalancer {
         ctx_key: &str,
         healthy: &HealthBitset,
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
         wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
@@ -3941,7 +3971,7 @@ impl LoadBalancer {
             // `Passthrough` reaches the balancer only as the fallback after the
             // request path's orig-dst match missed; behave as round-robin.
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Passthrough => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let idx = selection_counter_ticket(rr_counter) as usize;
                 let target_idx = if all {
                     idx % self.targets.len()
                 } else {
@@ -3950,7 +3980,7 @@ impl LoadBalancer {
                 Some(Arc::clone(&self.targets[target_idx]))
             }
             LoadBalancerAlgorithm::Random => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed);
+                let idx = selection_counter_ticket(rr_counter);
                 let hash = golden_ratio_hash(idx) as usize;
                 let target_idx = if all {
                     hash % self.targets.len()
@@ -4023,7 +4053,7 @@ impl LoadBalancer {
         ctx_key: &str,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
         wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
@@ -4044,11 +4074,11 @@ impl LoadBalancer {
             // `Passthrough` reaches the balancer only as the round-robin
             // fallback after the request path's orig-dst match missed.
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Passthrough => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let idx = selection_counter_ticket(rr_counter) as usize;
                 Some(Arc::clone(candidates[idx % candidates.len()].1))
             }
             LoadBalancerAlgorithm::Random => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed);
+                let idx = selection_counter_ticket(rr_counter);
                 let hash = golden_ratio_hash(idx) as usize;
                 Some(Arc::clone(candidates[hash % candidates.len()].1))
             }
@@ -4953,7 +4983,7 @@ impl LoadBalancer {
     fn select_least_latency_bitset(
         &self,
         healthy: &HealthBitset,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
     ) -> Option<Arc<UpstreamTarget>> {
         let hcount = healthy.count();
         if hcount == 0 {
@@ -4983,7 +5013,7 @@ impl LoadBalancer {
 
         // Initial warm-up: round-robin so all targets get baseline measurements.
         if warmed_count == 0 || !any_has_data {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
@@ -5042,7 +5072,7 @@ impl LoadBalancer {
         }
 
         if best_latency == LATENCY_UNSET {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
@@ -5138,7 +5168,7 @@ impl LoadBalancer {
     fn select_least_latency_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
     ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
@@ -5162,7 +5192,7 @@ impl LoadBalancer {
         }
 
         if warmed_count == 0 || !any_has_data {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
@@ -5211,7 +5241,7 @@ impl LoadBalancer {
         }
 
         if best_latency == LATENCY_UNSET {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 

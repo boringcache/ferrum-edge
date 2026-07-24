@@ -180,6 +180,8 @@ When `path` is not set on a target, the proxy's `backend_path` is used as the pa
 
 Distributes requests evenly across all healthy targets in sequential order. Each target gets an equal share of traffic regardless of weight.
 
+**Concurrency model:** Parent, port-override, and locality-distribute selection counters reuse the same 16 cache-line-padded per-thread shards as WRR (`wrr_counter_shard`). Each worker advances its own shard, so small healthy sets no longer bounce a single shared cache line on every pick. Workers do not share one global interleaving; each shard is itself a full round-robin (or random / warm-up RR) walk, so long-run ratios stay even and single-worker ticket streams remain identical to the historical shared counter.
+
 ```yaml
 upstreams:
   - id: "my-upstream"
