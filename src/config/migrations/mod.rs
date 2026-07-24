@@ -2,7 +2,7 @@ pub(crate) mod sql_dialect;
 pub(crate) mod sql_statements;
 pub mod v001_initial_schema;
 
-pub use sql_statements::{SqlStatementSplitError, split_plugin_migration_statements};
+pub use sql_statements::split_plugin_migration_statements;
 
 use chrono::Utc;
 use sqlx::any::AnyRow;

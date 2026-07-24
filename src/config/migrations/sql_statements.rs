@@ -22,11 +22,6 @@ impl SqlStatementSplitError {
             position,
         }
     }
-
-    /// Byte offset into the migration SQL where scanning failed, when known.
-    pub fn position(&self) -> Option<usize> {
-        self.position
-    }
 }
 
 impl fmt::Display for SqlStatementSplitError {
