@@ -8,6 +8,53 @@ use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::GatewayConfig;
+
+/// Last reconciler-accepted Kubernetes translation held independently of the
+/// DB-authored `GatewayConfig` snapshot. CP full reloads re-merge this overlay
+/// before publication so a DB poll cannot wipe in-memory K8s-derived state
+/// (issues #2982 / #2984).
+#[derive(Debug, Clone)]
+pub struct AcceptedK8sOverlay {
+    pub translation: GatewayConfig,
+    pub managed_namespaces: BTreeSet<String>,
+}
+
+/// Shared slot written by the K8s reconciler and read by CP DB publication.
+pub type K8sOverlaySlot = Arc<ArcSwap<Option<AcceptedK8sOverlay>>>;
+
+/// Create an empty overlay slot (no K8s translation accepted yet).
+pub fn empty_k8s_overlay_slot() -> K8sOverlaySlot {
+    Arc::new(ArcSwap::from_pointee(None))
+}
+
+/// Record the last accepted K8s translation for later CP full-reload re-merge.
+pub fn store_accepted_k8s_overlay(
+    slot: &K8sOverlaySlot,
+    translation: GatewayConfig,
+    managed_namespaces: BTreeSet<String>,
+) {
+    slot.store(Arc::new(Some(AcceptedK8sOverlay {
+        translation,
+        managed_namespaces,
+    })));
+}
+
+/// Compose a DB-authored snapshot with the independently owned K8s overlay.
+///
+/// When the slot is empty the DB snapshot is returned unchanged.
+pub fn compose_db_with_k8s_overlay(
+    db_config: &GatewayConfig,
+    overlay_slot: &K8sOverlaySlot,
+) -> GatewayConfig {
+    match overlay_slot.load_full().as_ref() {
+        Some(overlay) => merge_k8s_translation(
+            db_config,
+            &overlay.translation,
+            &overlay.managed_namespaces,
+        ),
+        None => db_config.clone(),
+    }
+}
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     translate_k8s_objects_with_filter,
@@ -60,6 +107,7 @@ pub struct ReconcileBroadcasters {
 pub fn spawn_reconcile_loop(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
+    overlay_slot: K8sOverlaySlot,
     broadcasters: ReconcileBroadcasters,
     reconciler_config: ReconcilerConfig,
     gateway_status_writer: Option<GatewayApiStatusWriter>,
@@ -76,6 +124,7 @@ pub fn spawn_reconcile_loop(
     tokio::spawn(run_reconcile_loop(
         store_set,
         config_arc,
+        overlay_slot,
         broadcasters,
         reconciler_config,
         gateway_status_writer,
@@ -89,6 +138,7 @@ pub fn spawn_reconcile_loop(
 async fn run_reconcile_loop(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
+    overlay_slot: K8sOverlaySlot,
     broadcasters: ReconcileBroadcasters,
     reconciler_config: ReconcilerConfig,
     gateway_status_writer: Option<GatewayApiStatusWriter>,
@@ -134,6 +184,7 @@ async fn run_reconcile_loop(
         Arc::clone(&store_set),
         ReconcileContext {
             config_arc: Arc::clone(&config_arc),
+            overlay_slot: Arc::clone(&overlay_slot),
             broadcasts: Arc::clone(&broadcasters.broadcasts),
             cp_scope: broadcasters.cp_scope.clone(),
             dp_registry: Arc::clone(&broadcasters.dp_registry),
@@ -177,6 +228,7 @@ async fn run_reconcile_loop(
                     Arc::clone(&store_set),
                     ReconcileContext {
                         config_arc: Arc::clone(&config_arc),
+                        overlay_slot: Arc::clone(&overlay_slot),
                         broadcasts: Arc::clone(&broadcasters.broadcasts),
                         cp_scope: broadcasters.cp_scope.clone(),
                         dp_registry: Arc::clone(&broadcasters.dp_registry),
@@ -217,6 +269,7 @@ async fn run_reconcile_loop(
                     Arc::clone(&store_set),
                     ReconcileContext {
                         config_arc: Arc::clone(&config_arc),
+                        overlay_slot: Arc::clone(&overlay_slot),
                         broadcasts: Arc::clone(&broadcasters.broadcasts),
                         cp_scope: broadcasters.cp_scope.clone(),
                         dp_registry: Arc::clone(&broadcasters.dp_registry),
@@ -405,6 +458,9 @@ async fn wait_for_initial_store_readiness_with_timeout(
 /// values once per reconcile is cheap relative to the reconciliation work.
 struct ReconcileContext {
     config_arc: Arc<ArcSwap<GatewayConfig>>,
+    /// Independently owned last-accepted K8s translation for CP full-reload
+    /// re-merge (issues #2982 / #2984).
+    overlay_slot: K8sOverlaySlot,
     broadcasts: Arc<NamespaceBroadcasts>,
     cp_scope: CpScope,
     dp_registry: Arc<DpNodeRegistry>,
@@ -522,6 +578,13 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         &ctx.namespace,
         &ctx.watch_namespaces,
         &translation.config.known_namespaces,
+    );
+    // Persist the translation independently of `config_arc` so CP DB full
+    // reloads can re-merge it instead of broadcasting a wipe (#2982).
+    store_accepted_k8s_overlay(
+        &ctx.overlay_slot,
+        translation.config.clone(),
+        managed_namespaces.clone(),
     );
     let Some(new_config) =
         swap_merged_k8s_translation(&ctx.config_arc, &translation.config, &managed_namespaces)
@@ -710,7 +773,7 @@ async fn patch_istio_statuses(
     }
 }
 
-fn swap_merged_k8s_translation(
+pub fn swap_merged_k8s_translation(
     config_arc: &ArcSwap<GatewayConfig>,
     k8s_config: &GatewayConfig,
     managed_namespaces: &BTreeSet<String>,
@@ -773,7 +836,7 @@ fn namespace_is_managed(namespace: &str, managed_namespaces: &BTreeSet<String>) 
     managed_namespaces.is_empty() || managed_namespaces.contains(namespace)
 }
 
-fn merge_k8s_translation(
+pub fn merge_k8s_translation(
     active: &GatewayConfig,
     k8s_config: &GatewayConfig,
     managed_namespaces: &BTreeSet<String>,

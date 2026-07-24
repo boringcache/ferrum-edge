@@ -3336,4 +3336,79 @@ pub mod _test_support {
             }
         }
     }
+
+    // ── CP overlay / poll isolation (#2982–#2985) ───────────────────────────
+
+    pub use crate::k8s_controller::{
+        AcceptedK8sOverlay, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
+        merge_k8s_translation, store_accepted_k8s_overlay, swap_merged_k8s_translation,
+    };
+
+    pub fn cas_publish_db_snapshot_with_k8s_overlay_for_test(
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        overlay_slot: &K8sOverlaySlot,
+        db_config: crate::config::types::GatewayConfig,
+    ) -> std::sync::Arc<crate::config::types::GatewayConfig> {
+        crate::modes::control_plane::cas_publish_db_snapshot_with_k8s_overlay(
+            config_arc,
+            overlay_slot,
+            db_config,
+        )
+    }
+
+    /// Returns `(composed_config, accepted_namespaces, rejected_namespaces)`.
+    pub fn compose_incremental_partitions_for_test(
+        base: &crate::config::types::GatewayConfig,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+    ) -> (
+        crate::config::types::GatewayConfig,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        let outcome =
+            crate::modes::control_plane::compose_incremental_partitions(base, partitions);
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        (outcome.config, accepted, rejected)
+    }
+
+    /// Returns `(published_config, accepted_namespaces, rejected_namespaces)`.
+    pub fn cas_publish_incremental_partitions_for_test(
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+    ) -> (
+        crate::config::types::GatewayConfig,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        let outcome =
+            crate::modes::control_plane::cas_publish_incremental_partitions(config_arc, partitions);
+        let published = (*config_arc.load_full()).clone();
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        // When nothing was accepted the ArcSwap is unchanged; return the
+        // compose view so callers can still inspect last-known-good state.
+        let config = if accepted.is_empty() {
+            outcome.config
+        } else {
+            published
+        };
+        (config, accepted, rejected)
+    }
+
+    pub fn cp_poll_source_uses_missed_tick_delay_for_test() -> bool {
+        include_str!("../modes/control_plane.rs").contains(
+            "interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);",
+        )
+    }
 }

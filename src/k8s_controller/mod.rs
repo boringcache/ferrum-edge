@@ -26,6 +26,10 @@ use crate::grpc::mesh_server::MeshConfigBroadcast;
 use istio_status::IstioStatusWriter;
 use metrics::ControllerMetrics;
 pub use reconciler::ReconcileBroadcasters;
+pub use reconciler::{
+    AcceptedK8sOverlay, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
+    merge_k8s_translation, store_accepted_k8s_overlay, swap_merged_k8s_translation,
+};
 use reconciler::{ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
 use status::GatewayApiStatusWriter;
@@ -83,6 +87,7 @@ impl K8sControllerHandle {
 pub async fn start_k8s_controller(
     controller_config: K8sControllerConfig,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
+    overlay_slot: K8sOverlaySlot,
     broadcasts: Arc<NamespaceBroadcasts>,
     cp_scope: CpScope,
     dp_registry: Arc<DpNodeRegistry>,
@@ -177,6 +182,7 @@ pub async fn start_k8s_controller(
     let reconciler_handle = spawn_reconcile_loop(
         store_set.clone(),
         config_arc,
+        overlay_slot,
         ReconcileBroadcasters {
             broadcasts,
             cp_scope,
