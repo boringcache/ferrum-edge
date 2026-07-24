@@ -89,6 +89,7 @@ struct ConversionPlan {
     object_schemas: AHashMap<usize, Arc<Value>>,
     array_item_schemas: AHashMap<usize, Arc<Value>>,
     composed_scalar_validators: AHashMap<usize, jsonschema::Validator>,
+    pattern_property_schemas: AHashMap<usize, Vec<(Regex, Arc<Value>)>>,
 }
 
 impl ConversionPlan {
@@ -146,6 +147,18 @@ impl ConversionPlan {
                 self.register_schema(child, schema_draft, visited, depth + 1)?;
             }
         }
+        if let Some(patterns) = schema.get("patternProperties").and_then(Value::as_object) {
+            let mut compiled = Vec::with_capacity(patterns.len());
+            for (pattern, child) in patterns {
+                let regex = Regex::new(pattern).map_err(|error| {
+                    format!("invalid patternProperties regex '{pattern}': {error}")
+                })?;
+                let child = Arc::new(child.clone());
+                self.register_schema(child.as_ref(), schema_draft, visited, depth + 1)?;
+                compiled.push((regex, child));
+            }
+            self.pattern_property_schemas.insert(key, compiled);
+        }
         for keyword in ["items", "additionalProperties"] {
             if let Some(child) = schema.get(keyword).filter(|child| child.is_object()) {
                 self.register_schema(child, schema_draft, visited, depth + 1)?;
@@ -179,6 +192,33 @@ impl ConversionPlan {
     fn composed_scalar_validator(&self, schema: &Value) -> Option<&jsonschema::Validator> {
         self.composed_scalar_validators
             .get(&(schema as *const Value as usize))
+    }
+
+    fn pattern_property_schema<'a>(
+        &'a self,
+        schema: &Value,
+        property_name: &str,
+    ) -> Option<&'a Value> {
+        let mut first_match = None;
+        for (pattern, child) in self
+            .pattern_property_schemas
+            .get(&(schema as *const Value as usize))?
+        {
+            if !pattern.is_match(property_name) {
+                continue;
+            }
+            let child = child.as_ref();
+            if first_match.is_none() {
+                first_match = Some(child);
+            }
+            if !collect_scalar_types(child).is_empty()
+                || schema_accepts_object(child)
+                || schema_accepts_array(child)
+            {
+                return Some(child);
+            }
+        }
+        first_match
     }
 }
 
@@ -1702,8 +1742,11 @@ fn xml_node_to_value(
                     attr.name()
                 ));
             }
-            let value = match additional_schema {
-                Some(Some(schema)) => scalar_to_schema_value(attr.value(), schema, conversion)?,
+            let member_schema = conversion
+                .pattern_property_schema(object_schema, attr.name())
+                .or_else(|| additional_schema.flatten());
+            let value = match member_schema {
+                Some(schema) => scalar_to_schema_value(attr.value(), schema, conversion)?,
                 _ => Value::String(attr.value().to_string()),
             };
             if out.insert(attr.name().to_string(), value).is_some() {
@@ -1723,8 +1766,11 @@ fn xml_node_to_value(
                     "XML element '{name}' collides with a modeled property name but does not match its modeled XML construct or namespace"
                 ));
             }
-            let value = match additional_schema {
-                Some(Some(schema)) => xml_node_to_value(child, schema, conversion)?,
+            let member_schema = conversion
+                .pattern_property_schema(object_schema, name)
+                .or_else(|| additional_schema.flatten());
+            let value = match member_schema {
+                Some(schema) => xml_node_to_value(child, schema, conversion)?,
                 _ => generic_xml_node_to_value(child)?,
             };
             match out.get_mut(name) {
