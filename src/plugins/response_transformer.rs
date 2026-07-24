@@ -131,6 +131,12 @@ impl ResponseTransformer {
             .unwrap_or(self.default_enabled)
     }
 
+    fn replay_transform_required(&self, ctx: &RequestContext) -> bool {
+        ctx.finalized_response_replay
+            && self.runtime_overlay_scope.is_some()
+            && self.rules_enabled()
+    }
+
     fn static_rules_may_modify_content_type(&self) -> bool {
         self.header_rules.iter().any(|rule| match rule.operation {
             HeaderOp::Add | HeaderOp::Update | HeaderOp::Remove => rule.key == "content-type",
@@ -756,9 +762,11 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return;
         }
-        // Finalized cache/idempotent replays already carry post-transform
-        // headers. Consume any route override without re-applying it.
-        if ctx.finalized_response_replay {
+        // Finalized cache/idempotent replays usually already carry post-transform
+        // headers. Runtime-overlay-gated rules are the exception: an entry may
+        // have been stored while the gate was disabled and later replayed after
+        // policy tightened, so apply the currently enabled rules once more.
+        if ctx.finalized_response_replay && !self.replay_transform_required(ctx) {
             let _ = ctx.route_override_response_transform.take();
             return;
         }
@@ -961,6 +969,10 @@ impl Plugin for ResponseTransformer {
         !self.body_rules.is_empty() && self.rules_enabled()
     }
 
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        self.replay_transform_required(ctx) && !self.body_rules.is_empty()
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -970,12 +982,14 @@ impl Plugin for ResponseTransformer {
         if !self.rules_enabled() {
             return PluginResult::Continue;
         }
-        // `response_caching` HIT/REVALIDATED and idempotent replays store the
-        // final post-transform header map. Re-running static or route-level
-        // sequences (especially non-idempotent `add`) would mutate the cached
-        // representation. Consume the route override so a later sibling cannot
-        // apply it either; leave the replayed headers untouched.
-        if ctx.finalized_response_replay {
+        // `response_caching` HIT/REVALIDATED and idempotent replays usually
+        // store the final post-transform header map. Re-running static or
+        // route-level sequences (especially non-idempotent `add`) would mutate
+        // the cached representation. Runtime-overlay-gated rules are the
+        // exception: a cache entry may have been stored while the gate was
+        // disabled and later replayed after policy tightened, so apply the
+        // currently enabled rules once more.
+        if ctx.finalized_response_replay && !self.replay_transform_required(ctx) {
             let _ = ctx.route_override_response_transform.take();
             return PluginResult::Continue;
         }
@@ -1098,8 +1112,10 @@ impl Plugin for ResponseTransformer {
         // Defense in depth: the shared synthetic path already skips ordinary
         // presentation transforms when `finalized_response_replay` is set.
         // Returning `None` here keeps direct callers from re-mutating a cached
-        // final body if they forget that gate.
-        if ctx.finalized_response_replay {
+        // final body if they forget that gate. Runtime-overlay-gated rules are
+        // the exception because a cached representation may predate the
+        // currently enabled redaction policy.
+        if ctx.finalized_response_replay && !self.replay_transform_required(ctx) {
             return None;
         }
         if framed_grpc_request_without_proven_media_type(ctx, body) {

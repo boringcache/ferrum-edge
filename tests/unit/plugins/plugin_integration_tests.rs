@@ -640,6 +640,122 @@ async fn test_response_caching_stores_transformed_body() {
     );
 }
 
+#[tokio::test]
+async fn test_response_cache_hit_replays_runtime_enabled_response_transformer_redaction() {
+    use ferrum_edge::_test_support::finalize_plugin_rejection_for_test;
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay as response_gate;
+
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    response_gate::reset_for_test();
+
+    let plugins = sort_plugins(vec![
+        create_plugin(
+            "response_caching",
+            &json!({
+                "ttl_seconds": 60,
+                "add_cache_status_header": true,
+                "cache_key_include_consumer": true,
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+        create_plugin(
+            "response_transformer",
+            &json!({
+                "runtime_overlay_scope": "cache_redaction_test",
+                "default_enabled": false,
+                "rules": [
+                    {
+                        "target": "body",
+                        "operation": "update",
+                        "key": "secret",
+                        "value": "[redacted]"
+                    },
+                    {
+                        "target": "header",
+                        "operation": "update",
+                        "key": "x-secret",
+                        "value": "[redacted]"
+                    }
+                ]
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+    ]);
+
+    let mut miss_ctx = create_response_context("/cache-redaction-policy-tightened");
+    let mut miss_headers = HashMap::new();
+    miss_headers.insert("content-type".to_string(), "application/json".to_string());
+    miss_headers.insert("x-secret".to_string(), "TOPSECRET".to_string());
+    miss_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+
+    let (status, headers, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        miss_headers,
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("TOPSECRET")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"TOPSECRET"}"#
+    );
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.response_transformer.cache_redaction_test.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+    response_gate::apply_overlay(&MeshRuntimeOverlay { fields });
+
+    let mut hit_ctx = create_response_context("/cache-redaction-policy-tightened");
+    let mut proxy_headers = hit_ctx.headers.clone();
+    let mut cache_hit = None;
+    for plugin in &plugins {
+        match plugin.before_proxy(&mut hit_ctx, &mut proxy_headers).await {
+            PluginResult::Continue => {}
+            result @ PluginResult::Reject { .. } | result @ PluginResult::RejectBinary { .. } => {
+                cache_hit = Some(result);
+                break;
+            }
+        }
+    }
+    let hit = cache_hit.expect("expected response_caching HIT");
+
+    match finalize_plugin_rejection_for_test(&plugins, &mut hit_ctx, hit).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(
+                headers.get("x-secret").map(String::as_str),
+                Some("[redacted]")
+            );
+            assert_eq!(
+                String::from_utf8(body.to_vec()).unwrap(),
+                r#"{"secret":"[redacted]"}"#
+            );
+            assert_eq!(
+                headers.get("x-cache-status").map(String::as_str),
+                Some("HIT")
+            );
+        }
+        other => panic!("expected finalized HIT RejectBinary, got {other:?}"),
+    }
+
+    response_gate::reset_for_test();
+}
+
 /// #2381: store final post-transform representation; full synthetic HIT
 /// finalizer must not re-apply non-idempotent body or header sequences.
 #[tokio::test]
