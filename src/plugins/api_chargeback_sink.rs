@@ -411,13 +411,28 @@ async fn finalize_pending_snapshot(pending: &PendingSnapshotFinalization) -> boo
     }
 }
 
-fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle, events: Vec<ChargeEvent>) -> bool {
-    let retained_bytes = events
-        .iter()
-        .map(charge_event_retained_bytes)
-        .fold(0usize, usize::saturating_add);
+/// Reduce a Full snapshot generation to compact durable recovery, but never
+/// while an admitted terminal hook still holds its admission guard.
+///
+/// Losslessness takes precedence over meeting a smaller full-generation count:
+/// admission is closed first and, until `in_flight` is observably zero, the
+/// Full generation is retained untouched (returns `false`) so a later
+/// compaction pass — the next reload or shutdown — can retry after drain. The
+/// budget gate is checked against the current retained estimate *before* any
+/// staged overflow is drained, so a refused compaction never loses events.
+fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
+    // Stop new admissions and require the admitted set to drain before touching
+    // full-generation state. `admit()`'s double-checked `accepting` flag means
+    // that once we observe `accepting == false` and `in_flight == 0`, no guard
+    // is live and none can be created, so the accumulator is quiescent.
+    lifecycle.mark_admission_closed();
+    if lifecycle.in_flight.load(Ordering::Acquire) > 0 {
+        return false;
+    }
+
+    let estimated_bytes = lifecycle.accumulator.retained_bytes();
     let (pending, _bytes, _age, full, compact_bytes) = pending_snapshot_finalization_stats();
-    if (compact_bytes.saturating_add(retained_bytes as u64)
+    if (compact_bytes.saturating_add(estimated_bytes as u64)
         > MAX_COMPACT_SNAPSHOT_RECOVERY_BYTES as u64
         || pending >= MAX_PENDING_SNAPSHOT_FINALIZATIONS)
         && full <= 1
@@ -425,11 +440,45 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle, events: Vec<ChargeE
         warn!(
             plugin = PLUGIN_NAME,
             generation = lifecycle.generation,
-            retained_bytes,
+            retained_bytes = estimated_bytes,
             "Chargeback sink cannot compact failed finalization; pending recovery budget exhausted"
         );
         return false;
     }
+
+    // Admission is closed and drained; preparing the pending deltas is now
+    // race-free against the request path.
+    let Some(events) = lifecycle.prepare_compaction_events() else {
+        // Serialize failure: keep the Full generation intact and retry later.
+        return false;
+    };
+
+    // Stop the periodic emitter for this generation regardless of outcome.
+    let _ = lifecycle.shutdown_tx.send(true);
+    {
+        let mut task = match lifecycle.task.lock() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = task.take() {
+            task.abort();
+        }
+    }
+
+    if events.is_empty() {
+        // Nothing pending to hand off; the generation is already durable. Retire
+        // it as a successful finalization rather than leaking a Full entry.
+        lifecycle.finalized.store(true, Ordering::Release);
+        unregister_full_snapshot_generation(lifecycle.generation);
+        enforce_full_pending_finalization_bound(lifecycle.generation);
+        invalidate_status_cache();
+        return true;
+    }
+
+    let retained_bytes = events
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add);
     let recovery = Arc::new(CompactSnapshotRecovery {
         generation: lifecycle.generation,
         plugin_config_id: Arc::clone(&lifecycle.runtime.plugin_config_id),
@@ -453,17 +502,6 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle, events: Vec<ChargeE
         );
     }
     lifecycle.compacted.store(true, Ordering::Release);
-    lifecycle.accepting.store(false, Ordering::Release);
-    let _ = lifecycle.shutdown_tx.send(true);
-    {
-        let mut task = match lifecycle.task.lock() {
-            Ok(task) => task,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(task) = task.take() {
-            task.abort();
-        }
-    }
     lifecycle.accumulator.clear_for_compaction();
     enforce_full_pending_finalization_bound(lifecycle.generation);
     invalidate_status_cache();
@@ -498,9 +536,10 @@ fn enforce_full_pending_finalization_bound(keep_generation: u64) {
         full.into_iter().take(remove_count).collect()
     };
     for lifecycle in overflow {
-        if let Some(events) = lifecycle.prepare_compaction_events() {
-            let _ = compact_snapshot_lifecycle(&lifecycle, events);
-        }
+        // compact_snapshot_lifecycle closes admission and refuses (retaining the
+        // Full generation) until its own in_flight drains, so an admitted hook
+        // can never race the accumulator clear here.
+        let _ = compact_snapshot_lifecycle(&lifecycle);
     }
 }
 
@@ -1006,6 +1045,15 @@ struct QueuedChargeEvent {
 
 enum SpoolJob {
     Events(Vec<QueuedChargeEvent>),
+    /// Snapshot cardinality/byte overflow charges. On durable write success the
+    /// worker advances the overflow-spooled counters; on write/cancellation
+    /// failure it re-stages the exact events into the accumulator's bounded
+    /// overflow so a Tokio worker never blocks on compression/write/fsync.
+    SnapshotOverflow {
+        events: Vec<QueuedChargeEvent>,
+        accumulator: Arc<SnapshotAccumulator>,
+        generation: u64,
+    },
 }
 
 /// Bounded async handoff for spool compression/write/fsync work.
@@ -1053,6 +1101,50 @@ impl SpoolDelivery {
                 self.metrics
                     .record_spool_job_loss(event_count as u64, "delivery queue closed");
                 false
+            }
+        }
+    }
+
+    /// Enqueue snapshot overflow events for durable async spooling. The bounded
+    /// queue owns compression/write/fsync and preserves the byte leases until
+    /// the blocking write finishes. On a full or closed queue (or shutdown) the
+    /// exact events are returned so the caller can stage them in bounded
+    /// overflow instead; nothing is lost silently here.
+    fn try_enqueue_snapshot_overflow(
+        &self,
+        events: Vec<QueuedChargeEvent>,
+        accumulator: Arc<SnapshotAccumulator>,
+        generation: u64,
+    ) -> Result<(), Vec<QueuedChargeEvent>> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let event_count = events.len();
+        let Some(_admission) = self.worker.try_admit() else {
+            return Err(events);
+        };
+        self.pending_jobs.fetch_add(1, Ordering::Relaxed);
+        self.pending_events
+            .fetch_add(event_count, Ordering::Relaxed);
+        match self.sender.try_send(SpoolJob::SnapshotOverflow {
+            events,
+            accumulator,
+            generation,
+        }) {
+            Ok(()) => {
+                self.metrics
+                    .spool_jobs_enqueued_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                self.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+                self.pending_events
+                    .fetch_sub(event_count, Ordering::Relaxed);
+                match error.into_inner() {
+                    SpoolJob::SnapshotOverflow { events, .. } => Err(events),
+                    SpoolJob::Events(events) => Err(events),
+                }
             }
         }
     }
@@ -1148,6 +1240,77 @@ fn start_spool_delivery(
                                     metrics.record_spool_job_loss(
                                         event_count as u64,
                                         "spool write task failed",
+                                    );
+                                }
+                            }
+                            pending_jobs_for_loop.fetch_sub(1, Ordering::Relaxed);
+                            pending_events_for_loop
+                                .fetch_sub(event_count, Ordering::Relaxed);
+                        }
+                        Some(SpoolJob::SnapshotOverflow {
+                            events: queued_events,
+                            accumulator,
+                            generation,
+                        }) => {
+                            let event_count = queued_events.len();
+                            let (events, leases): (Vec<_>, Vec<_>) = queued_events
+                                .into_iter()
+                                .map(|queued| (queued.event, queued.lease))
+                                .unzip();
+                            let spool = Arc::clone(&spool);
+                            let metrics = Arc::clone(&metrics_for_worker);
+                            let write_result = tokio::task::spawn_blocking(move || {
+                                let result = spool.write_events(&events);
+                                // Recover the exact events for bounded re-staging
+                                // on durable failure; a success drops them. Leases
+                                // stay charged across the blocking write even if
+                                // the async waiter is cancelled mid-drain.
+                                let recovered = match &result {
+                                    Ok(_) => Vec::new(),
+                                    Err(_) => events,
+                                };
+                                drop(leases);
+                                (result, recovered)
+                            })
+                            .await;
+                            match write_result {
+                                Ok((Ok(_), _)) => {
+                                    metrics
+                                        .spool_jobs_written_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    metrics
+                                        .snapshot_overflow_spooled_total
+                                        .fetch_add(event_count as u64, Ordering::Relaxed);
+                                    metrics
+                                        .snapshot_emits_total
+                                        .fetch_add(event_count as u64, Ordering::Relaxed);
+                                    invalidate_status_cache();
+                                }
+                                Ok((Err(error), recovered)) => {
+                                    metrics.spool_available.store(false, Ordering::Release);
+                                    warn!(
+                                        plugin = PLUGIN_NAME,
+                                        generation,
+                                        error = %error,
+                                        "Chargeback sink async snapshot overflow spool write failed; staging in bounded overflow"
+                                    );
+                                    stage_overflow_events_or_reject(
+                                        &accumulator,
+                                        &metrics,
+                                        generation,
+                                        recovered,
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        plugin = PLUGIN_NAME,
+                                        generation,
+                                        error = %error,
+                                        "Chargeback sink async snapshot overflow spool task failed"
+                                    );
+                                    metrics.record_spool_job_loss(
+                                        event_count as u64,
+                                        "snapshot overflow spool task failed",
                                     );
                                 }
                             }
@@ -1430,16 +1593,10 @@ impl SnapshotLifecycle {
                 return;
             }
         }
-        match self.prepare_compaction_events() {
-            Some(events) if !events.is_empty() => {
-                let _ = compact_snapshot_lifecycle(self, events);
-            }
-            Some(_) => {
-                enforce_full_pending_finalization_bound(self.generation);
-                invalidate_status_cache();
-            }
-            None => {}
-        }
+        // compact_snapshot_lifecycle owns the whole gated sequence: it closes
+        // admission, refuses (leaving the Full generation for a later retry)
+        // until in_flight drains, then prepares and compacts the pending deltas.
+        let _ = compact_snapshot_lifecycle(self);
     }
 
     fn finalize_without_await(&self) {
@@ -2194,6 +2351,58 @@ impl ApiChargebackSink {
             &lifecycle.emission_lock,
         ))
     }
+
+    /// Drive one snapshot cardinality overflow charge through the non-blocking
+    /// delivery path for tests. Returns false when no snapshot lifecycle exists.
+    #[allow(dead_code)]
+    pub(crate) fn spool_snapshot_overflow_for_tests(&self, event: ChargeEvent) -> bool {
+        let Some(lifecycle) = self.snapshot_lifecycle.get() else {
+            return false;
+        };
+        spool_snapshot_overflow_event(lifecycle, event);
+        true
+    }
+
+    /// Snapshot overflow counters `(spooled, pending, cardinality_rejections)`
+    /// for the live generation; lets tests poll async durable-handoff outcomes.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_overflow_counters_for_tests(&self) -> Option<(u64, u64, u64)> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        let metrics = &lifecycle.runtime.metrics;
+        Some((
+            metrics
+                .snapshot_overflow_spooled_total
+                .load(Ordering::Relaxed),
+            metrics
+                .snapshot_overflow_pending_total
+                .load(Ordering::Relaxed),
+            metrics
+                .snapshot_cardinality_rejections_total
+                .load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Prove compaction refuses while an admission guard is held and succeeds
+    /// after the admitted hook drains. Returns
+    /// `(refused_while_admitted, compacted_after_drain)`.
+    #[allow(dead_code)]
+    pub(crate) fn compact_refuses_while_admitted_then_succeeds_for_tests(
+        &self,
+    ) -> Option<(bool, bool)> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        lifecycle.commit();
+        let refused_while_held = {
+            let _admission = lifecycle.admit()?;
+            lifecycle.compact_failed_finalization();
+            !lifecycle.compacted.load(Ordering::Acquire)
+                && compact_recovery_for_generation(lifecycle.generation).is_none()
+        };
+        // Admission guard dropped; in_flight is now zero. Retry compaction.
+        lifecycle.compact_failed_finalization();
+        let compacted_after_drain = lifecycle.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(lifecycle.generation).is_some();
+        Some((refused_while_held, compacted_after_drain))
+    }
 }
 
 impl Drop for ApiChargebackSink {
@@ -2931,13 +3140,13 @@ fn render_prometheus_for_sinks(
             "chargeback_sink_snapshot_retained_bytes {}\n",
             snapshot_retained_bytes
         ));
-        output.push_str("# HELP chargeback_sink_snapshot_overflow_spooled_total Snapshot charges immediately spooled after accumulator cardinality or byte budget overflow.\n");
+        output.push_str("# HELP chargeback_sink_snapshot_overflow_spooled_total Snapshot charges durably spooled through the bounded async delivery worker after accumulator cardinality or byte budget overflow.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_overflow_spooled_total counter\n");
         output.push_str(&format!(
             "chargeback_sink_snapshot_overflow_spooled_total {}\n",
             snapshot_overflow_spooled
         ));
-        output.push_str("# HELP chargeback_sink_snapshot_overflow_pending_total Snapshot overflow charges staged for the next durable emission after immediate spool failure.\n");
+        output.push_str("# HELP chargeback_sink_snapshot_overflow_pending_total Snapshot overflow charges staged for the next durable emission when async spool handoff was unavailable or its write failed.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_overflow_pending_total counter\n");
         output.push_str(&format!(
             "chargeback_sink_snapshot_overflow_pending_total {}\n",
@@ -4958,8 +5167,20 @@ pub struct SnapshotAccumulator {
     next_generation: AtomicU64,
     max_entries: usize,
     max_retained_bytes: usize,
+    /// Authoritative identity-slot reservation gate. Reserved before a new key
+    /// is published and released on eviction or a lost publish race, so the
+    /// hard `max_entries` ceiling holds under concurrent inserts without a
+    /// global request-path lock. Tracks `entries.len()` up to transient
+    /// same-key reservation windows that only ever reject conservatively.
+    reserved_entries: AtomicUsize,
+    /// Combined retained-byte reservation (accumulator entries plus staged
+    /// overflow). Both entry insertion and overflow staging CAS against this
+    /// single counter so the combined hard ceiling cannot be exceeded even when
+    /// they race.
     retained_bytes: AtomicUsize,
     overflow_pending: Mutex<Vec<ChargeEvent>>,
+    /// Overflow subset of `retained_bytes`, tracked separately so `take`/`clear`
+    /// release exactly the staged portion from the combined counter.
     overflow_pending_bytes: AtomicUsize,
     /// Test-only callback invoked after a key is selected as a stale candidate
     /// and before conditional eviction. Production leaves this unset.
@@ -4982,6 +5203,7 @@ impl SnapshotAccumulator {
             next_generation: AtomicU64::new(1),
             max_entries: max_entries.max(1),
             max_retained_bytes: max_retained_bytes.max(1),
+            reserved_entries: AtomicUsize::new(0),
             retained_bytes: AtomicUsize::new(0),
             overflow_pending: Mutex::new(Vec::new()),
             overflow_pending_bytes: AtomicUsize::new(0),
@@ -4994,15 +5216,62 @@ impl SnapshotAccumulator {
         self.entries.len()
     }
 
-    pub fn retained_bytes(&self) -> usize {
+    /// Combined retained bytes (accumulator entries plus staged overflow).
+    /// `retained_bytes` already tracks both, so the accessor is a single load.
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Acquire)
+    }
+
+    // External adversarial tests assert the hard byte ceiling is never crossed;
+    // the binary target compiles this module separately and cannot observe them.
+    #[allow(dead_code)]
+    pub fn retained_bytes_for_tests(&self) -> usize {
+        self.retained_bytes()
+    }
+
+    /// Reserve one identity slot and its retained bytes against the hard
+    /// ceilings before a new key is published. Returns `false` when either
+    /// ceiling would be exceeded so the caller durably spools the charge. On a
+    /// byte-ceiling refusal the already-taken slot reservation is released.
+    fn try_reserve_identity(&self, entry_bytes: usize) -> bool {
+        if self
+            .reserved_entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < self.max_entries).then_some(count + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if self.try_reserve_bytes(entry_bytes) {
+            true
+        } else {
+            self.reserved_entries.fetch_sub(1, Ordering::AcqRel);
+            false
+        }
+    }
+
+    /// Reserve `bytes` against the combined retained-byte ceiling. Shared by
+    /// entry insertion and overflow staging so their combined footprint can
+    /// never exceed `max_retained_bytes` under concurrency.
+    fn try_reserve_bytes(&self, bytes: usize) -> bool {
         self.retained_bytes
-            .load(Ordering::Acquire)
-            .saturating_add(self.overflow_pending_bytes.load(Ordering::Acquire))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= self.max_retained_bytes)
+            })
+            .is_ok()
+    }
+
+    /// Release a previously reserved identity slot and its retained bytes.
+    fn release_identity(&self, entry_bytes: usize) {
+        self.reserved_entries.fetch_sub(1, Ordering::AcqRel);
+        self.retained_bytes.fetch_sub(entry_bytes, Ordering::AcqRel);
     }
 
     fn clear_for_compaction(&self) {
         self.entries.clear();
         self.last_emitted.clear();
+        self.reserved_entries.store(0, Ordering::Release);
         self.retained_bytes.store(0, Ordering::Release);
         if let Ok(mut pending) = self.overflow_pending.lock() {
             pending.clear();
@@ -5093,6 +5362,8 @@ impl SnapshotAccumulator {
         now: i64,
     ) -> SnapshotRecordOutcome {
         let key = meta.clone();
+        // Fast path: refresh an already-published identity in place. No new
+        // admission is charged for a same-key refresh.
         if let Some(entry) = self.entries.get(&key) {
             entry.last_seen_at.store(now, Ordering::Relaxed);
             entry.revision.fetch_add(1, Ordering::Relaxed);
@@ -5104,18 +5375,18 @@ impl SnapshotAccumulator {
         }
 
         let entry_bytes = snapshot_metadata_retained_bytes(&meta);
-        let current_entries = self.entries.len();
-        let current_bytes = self.retained_bytes();
-        if current_entries >= self.max_entries
-            || current_bytes.saturating_add(entry_bytes) > self.max_retained_bytes
-        {
+        // Reserve the identity slot and its retained bytes against the hard
+        // ceilings *before* publishing the key. Because the reservation is
+        // atomic, concurrent new-key inserts can never publish state above
+        // `max_entries`/`max_retained_bytes`, and the old publish-then-recheck
+        // overshoot window (which could pin an over-budget entry when a same-key
+        // refresh raced the recheck) no longer exists.
+        if !self.try_reserve_identity(entry_bytes) {
             return SnapshotRecordOutcome::OverflowImmediate;
         }
 
-        // Race-safe insert: only the first creator pays the budget. A losing
-        // inserter refreshes the winner in place without a second cardinality charge.
         let mut created = false;
-        {
+        let refresh_result = {
             let entry = self.entries.entry(key.clone()).or_insert_with(|| {
                 created = true;
                 SnapshotEntry {
@@ -5127,77 +5398,60 @@ impl SnapshotAccumulator {
                     retained_bytes: entry_bytes,
                 }
             });
-            if created {
-                // Re-check after winning the insert slot. If we overshot under
-                // concurrency, immediately spill this identity to durable overflow
-                // rather than retaining an over-budget map entry.
-                let next_entries = self.entries.len();
-                let next_bytes = self
-                    .retained_bytes
-                    .fetch_add(entry_bytes, Ordering::AcqRel)
-                    .saturating_add(entry_bytes);
-                let next_total_bytes =
-                    next_bytes.saturating_add(self.overflow_pending_bytes.load(Ordering::Acquire));
-                if next_entries > self.max_entries || next_total_bytes > self.max_retained_bytes {
-                    let generation = entry.generation;
-                    drop(entry);
-                    if let Some((_, evicted)) = self.entries.remove_if(&key, |_, live| {
-                        live.generation == generation
-                            && live.totals.snapshot().is_zero()
-                            && live.revision.load(Ordering::Relaxed) == 0
-                    }) {
-                        self.retained_bytes
-                            .fetch_sub(evicted.retained_bytes, Ordering::AcqRel);
-                        return SnapshotRecordOutcome::OverflowImmediate;
-                    }
-                    // A concurrent refresh already attached totals; keep the entry.
-                } else {
-                    entry.last_seen_at.store(now, Ordering::Relaxed);
-                    entry.revision.fetch_add(1, Ordering::Relaxed);
-                    if let Err(error) = entry.totals.try_add(charge) {
-                        warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
-                        return SnapshotRecordOutcome::OverflowImmediate;
-                    }
-                    return SnapshotRecordOutcome::Accumulated;
-                }
-            } else {
-                entry.last_seen_at.store(now, Ordering::Relaxed);
-                entry.revision.fetch_add(1, Ordering::Relaxed);
-                if let Err(error) = entry.totals.try_add(charge) {
-                    warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
-                    return SnapshotRecordOutcome::OverflowImmediate;
-                }
-                return SnapshotRecordOutcome::Accumulated;
-            }
-        }
-        if let Some(entry) = self.entries.get(&key) {
             entry.last_seen_at.store(now, Ordering::Relaxed);
             entry.revision.fetch_add(1, Ordering::Relaxed);
-            if let Err(error) = entry.totals.try_add(charge) {
+            entry.totals.try_add(charge)
+        };
+
+        if !created {
+            // Lost the publish race: another inserter already owns the single
+            // reservation for this identity. Release ours exactly once so the
+            // budget stays exact, and keep the winner's refresh above.
+            self.release_identity(entry_bytes);
+        }
+
+        match refresh_result {
+            Ok(()) => SnapshotRecordOutcome::Accumulated,
+            Err(error) => {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
-                return SnapshotRecordOutcome::OverflowImmediate;
+                if created {
+                    // The freshly created identity could not accept the charge
+                    // and still holds zero totals. Roll it back (releasing its
+                    // reservation) unless a concurrent refresh already attached
+                    // real totals, in which case its reservation is legitimate.
+                    self.remove_pristine_entry(&key);
+                }
+                SnapshotRecordOutcome::OverflowImmediate
             }
         }
-        SnapshotRecordOutcome::Accumulated
+    }
+
+    /// Remove a just-created identity that never accepted a charge, releasing
+    /// its reservation. A concurrent same-key refresh that attached real totals
+    /// keeps the entry (and the single reservation that backs it).
+    fn remove_pristine_entry(&self, key: &SnapshotMetadata) {
+        if let Some((_, evicted)) = self.entries.remove_if(key, |_, live| {
+            live.totals.snapshot().is_zero() && live.revision.load(Ordering::Relaxed) <= 1
+        }) {
+            self.release_identity(evicted.retained_bytes);
+        }
     }
 
     fn stage_overflow_event(&self, event: ChargeEvent) -> bool {
         let bytes = charge_event_retained_bytes(&event);
-        let current = self.retained_bytes();
-        if current.saturating_add(bytes) > self.max_retained_bytes {
+        // Reserve against the combined retained-byte ceiling shared with entry
+        // insertion, so concurrent staging and new-key admission can never push
+        // the accumulator over `max_retained_bytes`.
+        if !self.try_reserve_bytes(bytes) {
             return false;
         }
         let mut pending = match self.overflow_pending.lock() {
             Ok(pending) => pending,
             Err(poisoned) => poisoned.into_inner(),
         };
-        // Re-check under the lock so concurrent overflow staging cannot exceed
-        // the retained-byte hard budget.
-        let locked_bytes = self.retained_bytes();
-        if locked_bytes.saturating_add(bytes) > self.max_retained_bytes {
-            return false;
-        }
         pending.push(event);
+        // Track the staged portion of the combined reservation so `take`/`clear`
+        // release exactly these bytes.
         self.overflow_pending_bytes
             .fetch_add(bytes, Ordering::AcqRel);
         true
@@ -5214,7 +5468,11 @@ impl SnapshotAccumulator {
             Err(poisoned) => poisoned.into_inner(),
         };
         let drained = std::mem::take(&mut *pending);
-        self.overflow_pending_bytes.store(0, Ordering::Release);
+        // Release exactly the staged overflow portion from the combined
+        // retained-byte counter while holding the lock so a concurrent stage
+        // cannot have its bytes released out from under it.
+        let released = self.overflow_pending_bytes.swap(0, Ordering::AcqRel);
+        self.retained_bytes.fetch_sub(released, Ordering::AcqRel);
         drained
     }
 
@@ -5382,8 +5640,7 @@ impl SnapshotAccumulator {
                 self.last_emitted.remove_if(&key, |_, baseline| {
                     baseline.generation == evicted.generation
                 });
-                self.retained_bytes
-                    .fetch_sub(evicted.retained_bytes, Ordering::AcqRel);
+                self.release_identity(evicted.retained_bytes);
                 removed += 1;
             }
         }
@@ -5418,6 +5675,52 @@ impl SnapshotAccumulator {
             charge,
             unix_timestamp_seconds(),
         );
+    }
+
+    /// Record a charge and report whether it was accumulated (`true`) or spilled
+    /// to durable overflow (`false`). Adversarial concurrency tests tally the
+    /// two outcomes to prove no charge is double-counted or silently dropped.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_accumulated_for_test(
+        &self,
+        namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        status_code: u16,
+        protocol: &str,
+        charge: ChargeComputation,
+    ) -> bool {
+        matches!(
+            self.record_at(
+                SnapshotMetadata {
+                    namespace: namespace.to_string(),
+                    consumer_id: consumer.to_string(),
+                    consumer_name: None,
+                    proxy_id: proxy_id.to_string(),
+                    proxy_name: proxy_name.to_string(),
+                    route_id: None,
+                    status_code,
+                    http_status_code: (protocol == "http").then_some(status_code),
+                    grpc_status: None,
+                    protocol: protocol.to_string(),
+                },
+                charge,
+                unix_timestamp_seconds(),
+            ),
+            SnapshotRecordOutcome::Accumulated
+        )
+    }
+
+    /// Sum of accumulated `call_count` across every live identity. Equals the
+    /// number of accumulated records in a test that seeds one call per record.
+    #[allow(dead_code)]
+    pub fn total_call_count_for_tests(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| entry.value().totals.call_count.load(Ordering::Relaxed))
+            .fold(0u64, u64::saturating_add)
     }
 
     #[doc(hidden)]
@@ -5470,6 +5773,7 @@ impl SnapshotAccumulator {
         if entry.totals.call_count.load(Ordering::Relaxed) == 0
             && entry.revision.load(Ordering::Relaxed) == 0
         {
+            self.reserved_entries.fetch_add(1, Ordering::AcqRel);
             self.retained_bytes.fetch_add(entry_bytes, Ordering::AcqRel);
         }
         entry.totals.call_count.store(call_count, Ordering::Relaxed);
@@ -6023,42 +6327,90 @@ fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<S
         .filter(|value| !value.is_empty())
 }
 
+/// Durably record a snapshot cardinality/byte overflow charge without ever
+/// blocking the calling Tokio worker on compression/write/fsync.
+///
+/// The event is handed to the owned, bounded [`SpoolDelivery`] worker (charged
+/// against the export byte budget until the worker's blocking write finishes),
+/// which advances the durable-success counters only after the write genuinely
+/// lands. If the bounded queue is full or closed, or the byte budget is
+/// exhausted, the exact event is staged in the accumulator's bounded overflow
+/// instead; only when durable handoff *and* bounded staging both fail is a
+/// genuine cardinality loss recorded.
 fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEvent) {
-    let metrics = &lifecycle.runtime.metrics;
-    if let Some(spool) = lifecycle.runtime.spool.as_ref() {
-        match spool.write_events(std::slice::from_ref(&event)) {
-            Ok(_) => {
-                metrics
-                    .snapshot_overflow_spooled_total
-                    .fetch_add(1, Ordering::Relaxed);
-                metrics.snapshot_emits_total.fetch_add(1, Ordering::Relaxed);
-                invalidate_status_cache();
-                return;
-            }
-            Err(error) => {
-                metrics.spool_available.store(false, Ordering::Release);
-                metrics.record_failure(
-                    FailureReason::Serialize,
-                    format!("snapshot cardinality overflow spool handoff failed: {error}"),
-                );
+    let runtime = &lifecycle.runtime;
+    let metrics = &runtime.metrics;
+    // Prefer the bounded async delivery worker so terminal hooks never run spool
+    // I/O inline. Recover the exact event when it cannot be handed off.
+    let event = match runtime.spool_delivery.as_ref() {
+        Some(delivery) => {
+            let retained = charge_event_retained_bytes(&event);
+            match runtime.byte_budget.try_acquire(retained) {
+                Some(lease) => {
+                    let queued = QueuedChargeEvent { event, lease };
+                    match delivery.try_enqueue_snapshot_overflow(
+                        vec![queued],
+                        Arc::clone(&lifecycle.accumulator),
+                        lifecycle.generation,
+                    ) {
+                        Ok(()) => {
+                            // Durable-success/overflow counters advance on the
+                            // delivery worker after the write genuinely lands.
+                            invalidate_status_cache();
+                            return;
+                        }
+                        // Queue full/closed: recover the event (the lease drops
+                        // here, releasing its export-queue byte reservation) and
+                        // fall through to bounded in-memory staging.
+                        Err(mut returned) => match returned.pop() {
+                            Some(queued) => queued.event,
+                            None => return,
+                        },
+                    }
+                }
+                // Export byte budget exhausted: stage the original event below.
+                None => event,
             }
         }
-    }
-    if lifecycle.accumulator.stage_overflow_event(event) {
-        metrics
-            .snapshot_overflow_pending_total
-            .fetch_add(1, Ordering::Relaxed);
-        invalidate_status_cache();
-        return;
-    }
-    metrics
-        .snapshot_cardinality_rejections_total
-        .fetch_add(1, Ordering::Relaxed);
-    warn!(
-        plugin = PLUGIN_NAME,
-        generation = lifecycle.generation,
-        "Chargeback sink snapshot cardinality budget exhausted and overflow could not be staged; restore spool capacity"
+        None => event,
+    };
+    stage_overflow_events_or_reject(
+        &lifecycle.accumulator,
+        metrics,
+        lifecycle.generation,
+        vec![event],
     );
+}
+
+/// Stage overflow charges into bounded pending state, or record a genuine
+/// cardinality loss for any that the retained-byte budget cannot hold.
+fn stage_overflow_events_or_reject(
+    accumulator: &SnapshotAccumulator,
+    metrics: &SinkMetrics,
+    generation: u64,
+    events: Vec<ChargeEvent>,
+) {
+    let mut rejected = 0u64;
+    for event in events {
+        if accumulator.stage_overflow_event(event) {
+            metrics
+                .snapshot_overflow_pending_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            rejected = rejected.saturating_add(1);
+        }
+    }
+    if rejected > 0 {
+        metrics
+            .snapshot_cardinality_rejections_total
+            .fetch_add(rejected, Ordering::Relaxed);
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation,
+            rejected,
+            "Chargeback sink snapshot cardinality budget exhausted and overflow could not be staged; restore spool capacity"
+        );
+    }
     invalidate_status_cache();
 }
 

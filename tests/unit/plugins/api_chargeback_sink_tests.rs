@@ -3147,3 +3147,269 @@ async fn compact_recovery_survives_subsequent_full_finalize_after_mapping() {
     );
     drop(plugin);
 }
+
+fn snapshot_sink_config(spool_dir: &Path, max_entries: usize) -> Value {
+    let mut config = valid_config(spool_dir);
+    config["mode"] = json!("snapshot");
+    config["spool"]["dir"] = json!(spool_dir.to_string_lossy());
+    config["snapshot"] = json!({
+        "interval_secs": 30,
+        "cleanup_interval_secs": 300,
+        "stale_entry_ttl_secs": 3600,
+        "max_entries": max_entries,
+        "max_retained_bytes": 16_777_216
+    });
+    config["pricing_tiers"] = json!([{"status_codes": [200], "price_per_call": 0.01}]);
+    config
+}
+
+/// Issue #1: overflow delivery is bounded, owned, non-blocking, and only counts
+/// a durable success after the async worker's blocking write genuinely lands.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_delivery_is_nonblocking_and_durably_acknowledged() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-async"),
+    )
+    .expect("construct snapshot sink");
+    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Route a cardinality overflow charge through the non-blocking delivery path.
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-async-1")
+    ));
+
+    // Durable-success counters advance only after the worker's blocking write.
+    let mut spooled = 0u64;
+    for _ in 0..200 {
+        let (s, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(rejections, 0, "a writable spool must never record a loss");
+        assert_eq!(pending, 0, "a writable spool must not stage bounded overflow");
+        if s >= 1 {
+            spooled = s;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        spooled, 1,
+        "overflow charge must be durably spooled via the bounded async worker"
+    );
+    assert!(
+        disk_owned_bytes(&spool_dir) > 0,
+        "durable overflow acknowledgement must leave a spool file on disk"
+    );
+    drop(plugin);
+}
+
+/// Issue #1: when the async spool write fails, the exact overflow event is
+/// re-staged in bounded overflow (not silently lost) and no cardinality loss is
+/// recorded while bounded staging still has room.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_delivery_write_failure_stages_within_bound() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-async-fallback"),
+    )
+    .expect("construct snapshot sink");
+    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Make every spool write fail by replacing the directory with a file.
+    fs::remove_dir_all(&spool_dir).unwrap();
+    fs::write(&spool_dir, b"blocked").unwrap();
+
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-async-fallback-1")
+    ));
+
+    let mut pending_seen = 0u64;
+    for _ in 0..200 {
+        let (spooled, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(spooled, 0, "a failed write must not count a durable success");
+        assert_eq!(
+            rejections, 0,
+            "bounded staging still has room, so no cardinality loss"
+        );
+        if pending >= 1 {
+            pending_seen = pending;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        pending_seen, 1,
+        "a failed async write must re-stage the exact event in bounded overflow"
+    );
+    drop(plugin);
+}
+
+/// Issue #2: compaction refuses to clear full-generation state while an
+/// admission guard is held and succeeds on retry once the admitted hook drains.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn compaction_refuses_while_admitted_and_succeeds_after_drain() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1000);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compaction-quiescence"),
+    )
+    .expect("construct snapshot sink");
+    plugin.start_background_tasks().expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Seed a pending delta so compaction has real state to transfer.
+    if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+        acc.record_for_test(
+            "ferrum",
+            "alice",
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+    }
+
+    let (refused_while_admitted, compacted_after_drain) =
+        api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test(&plugin)
+            .expect("snapshot lifecycle must exist");
+    assert!(
+        refused_while_admitted,
+        "compaction must refuse to clear full state while an admission guard is held"
+    );
+    assert!(
+        compacted_after_drain,
+        "compaction must succeed once the admitted hook has drained"
+    );
+    drop(plugin);
+}
+
+/// Issue #3: concurrent new-key insertion, same-key refresh, and overflow
+/// staging never push the accumulator past its hard entry/byte ceilings, and no
+/// charge is double-counted or silently dropped.
+#[test]
+fn snapshot_admission_reservation_never_exceeds_hard_limits_under_concurrency() {
+    const MAX_ENTRIES: usize = 64;
+    // Small enough that the retained-byte ceiling also binds before max_entries.
+    const MAX_BYTES: usize = 8 * 1024;
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 4_000;
+    // More distinct identities than the entry ceiling forces overflow, and
+    // reusing them across all threads forces new-key/refresh races on hot keys.
+    const DISTINCT_KEYS: usize = 200;
+
+    let accumulator = Arc::new(SnapshotAccumulator::with_limits(MAX_ENTRIES, MAX_BYTES));
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let accumulated = Arc::new(AtomicU64::new(0));
+    let overflowed = Arc::new(AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let acc = Arc::clone(&accumulator);
+        let barrier = Arc::clone(&barrier);
+        let accumulated = Arc::clone(&accumulated);
+        let overflowed = Arc::clone(&overflowed);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for i in 0..PER_THREAD {
+                let key = (i + t) % DISTINCT_KEYS;
+                let consumer = format!("consumer-{key}");
+                let accepted = acc.record_accumulated_for_test(
+                    "ferrum",
+                    &consumer,
+                    "proxy",
+                    "Proxy",
+                    200,
+                    "http",
+                    unit_call_charge(0.01),
+                );
+                if accepted {
+                    accumulated.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    overflowed.fetch_add(1, Ordering::Relaxed);
+                }
+                // Race overflow staging against entry admission on the shared
+                // combined byte ceiling from some threads.
+                if t % 2 == 0 && i % 8 == 0 {
+                    let _ = acc.stage_overflow_event_for_tests(sample_event(&format!(
+                        "ov-{t}-{i}"
+                    )));
+                }
+                // Hard ceilings must hold at every observation.
+                assert!(
+                    acc.entry_count() <= MAX_ENTRIES,
+                    "entry count exceeded the hard ceiling"
+                );
+                assert!(
+                    acc.retained_bytes_for_tests() <= MAX_BYTES,
+                    "combined retained bytes exceeded the hard ceiling"
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let total = (THREADS * PER_THREAD) as u64;
+    let accumulated = accumulated.load(Ordering::Relaxed);
+    let overflowed = overflowed.load(Ordering::Relaxed);
+    assert_eq!(
+        accumulated + overflowed,
+        total,
+        "every record must be accumulated or overflowed exactly once"
+    );
+    assert!(
+        overflowed > 0,
+        "the test must actually exercise the overflow path"
+    );
+    // No double-count and no silent drop: one call per accumulated record means
+    // the summed call_count across live entries must equal the accumulated count.
+    assert_eq!(
+        accumulator.total_call_count_for_tests(),
+        accumulated,
+        "accumulated call_count must equal the accumulated record count"
+    );
+    assert!(accumulator.entry_count() <= MAX_ENTRIES);
+    assert!(accumulator.retained_bytes_for_tests() <= MAX_BYTES);
+}

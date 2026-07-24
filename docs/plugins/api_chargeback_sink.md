@@ -72,11 +72,15 @@ are checked every `snapshot.cleanup_interval_secs`, but cleanup never removes a
 key whose current totals still exceed its last durable baseline. Pending or
 never-emitted charges therefore survive first-tick races and prolonged spool
 outages. Hard `snapshot.max_entries` and `snapshot.max_retained_bytes` budgets
-bound accumulator memory; new identities beyond those budgets are immediately
-spooled as per-event rows, or staged within the same retained-byte budget for
-the next durable emission, rather than merged into unrelated keys. If both
-durable spooling and bounded staging are exhausted, the sink records an
-explicit cardinality rejection counter instead of growing memory without bound.
+bound accumulator memory; new identities beyond those budgets are spooled as
+per-event rows through the bounded async spool delivery worker (never inline on
+the terminal hook), or staged within the same retained-byte budget for the next
+durable emission, rather than merged into unrelated keys. The overflow-spooled
+counter advances only after the delivery worker's blocking write genuinely
+lands; a full/closed delivery queue or a failed write re-stages the exact event
+within the retained-byte budget. If both durable handoff and bounded staging are
+exhausted, the sink records an explicit cardinality rejection counter instead of
+growing memory without bound.
 
 ### Snapshot concurrency contract
 
@@ -84,6 +88,14 @@ Request-path `record`, periodic delta emission, and stale cleanup share the
 accumulator without a global request-path lock (per-key DashMap shard locking
 only):
 
+- A new identity reserves one entry slot and its estimated retained bytes
+  against the hard `max_entries`/`max_retained_bytes` ceilings (atomic CAS, no
+  global lock) **before** the key is published. Retained bytes are a single
+  combined counter shared with staged overflow, so concurrent identity admission
+  and overflow staging can never exceed the byte ceiling. A losing same-key
+  inserter releases its reservation and refreshes the winner exactly once, so a
+  new-key/refresh race can never pin state above the configured ceilings or
+  double-charge a slot.
 - Each accumulator slot has a stable **generation** (assigned at insert) and a
   **revision** that bumps on every refresh. Stale cleanup may scan candidates
   first, but eviction is a single conditional `remove_if`: the entry is removed
@@ -134,7 +146,12 @@ are ignored.
 Spool write failure leaves the generation unfinalized. After the bounded
 finalization deadline the sink reduces failed generations to a compact recovery
 payload (pending terminal deltas plus a spool handle) instead of retaining the
-full accumulator/runtime indefinitely. Once mapped, Compact owns that
+full accumulator/runtime indefinitely. Compaction never clears, replaces, or
+unregisters a full generation until admission is closed and every already
+admitted terminal hook has released its guard (`in_flight == 0`); until that
+drain is observed the Full generation is retained untouched and a later
+compaction pass retries, so an in-flight record can never race the accumulator
+clear. Once mapped, Compact owns that
 generation's recovery: later Full finalize/Drop paths must follow the registry
 mapping and must not treat a cleared accumulator as an empty successful
 finalization that unregisters Compact. Every later multi-threaded reload retries

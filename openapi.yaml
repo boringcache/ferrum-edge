@@ -20972,11 +20972,12 @@ components:
               default: 100000
               description: |
                 Hard ceiling on distinct snapshot accumulator identities.
-                New identities beyond this budget are immediately spooled as
-                per-event rows, or staged within the retained-byte budget for
+                New identities beyond this budget are spooled as per-event rows
+                through the bounded async spool delivery worker (never inline on
+                the terminal hook), or staged within the retained-byte budget for
                 the next durable emission, rather than merged into unrelated
-                keys. Exhaustion of both paths increments the explicit
-                cardinality-rejection counter.
+                keys. Exhaustion of both durable handoff and bounded staging
+                increments the explicit cardinality-rejection counter.
             max_retained_bytes:
               type: integer
               minimum: 1
@@ -20984,10 +20985,12 @@ components:
               default: 67108864
               description: |
                 Hard ceiling on estimated retained bytes for snapshot
-                accumulator identities and staged overflow events. Overflow
-                uses the same durable immediate-spool strategy as max_entries.
-                Runtime additionally requires the value to be at least one
-                bounded charge-event size.
+                accumulator identities and staged overflow events, enforced as a
+                single combined reservation so concurrent identity admission and
+                overflow staging cannot exceed it. Overflow uses the same bounded
+                async delivery-worker spool strategy as max_entries. Runtime
+                additionally requires the value to be at least one bounded
+                charge-event size.
 
     ChargebackResponse:
       type: object

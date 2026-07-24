@@ -670,6 +670,25 @@ pub mod _test_support {
         plugin.emit_snapshot_tick_for_tests()
     }
 
+    pub fn api_chargeback_sink_spool_snapshot_overflow_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        event: crate::plugins::api_chargeback_sink::ChargeEvent,
+    ) -> bool {
+        plugin.spool_snapshot_overflow_for_tests(event)
+    }
+
+    pub fn api_chargeback_sink_snapshot_overflow_counters_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(u64, u64, u64)> {
+        plugin.snapshot_overflow_counters_for_tests()
+    }
+
+    pub fn api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_refuses_while_admitted_then_succeeds_for_tests()
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
