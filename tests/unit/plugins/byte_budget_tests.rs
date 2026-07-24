@@ -63,8 +63,8 @@ fn byte_budget_reserves_before_serialize_and_rejects_oversize() {
 
     let admitted = serialize_under_byte_budget(&budget, 64, &json!({"k": "v"}))
         .expect("admission after release");
-    assert!(admitted.json.len() <= 64);
-    assert_eq!(budget.used(), (admitted.json.len() + 1) * 2);
+    assert!(admitted.as_bytes().len() <= 64);
+    assert_eq!(budget.used(), (admitted.as_bytes().len() + 1) * 2);
     drop(admitted);
     assert_eq!(budget.used(), 0);
 }

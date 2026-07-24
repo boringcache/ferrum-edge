@@ -17,7 +17,7 @@ use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 /// One admitted, pre-serialized summary record retained in a batching queue.
 #[derive(Clone)]
 pub struct QueuedSummaryPayload {
-    pub json: Arc<str>,
+    json: Arc<str>,
     _lease: Arc<ByteLease>,
 }
 
