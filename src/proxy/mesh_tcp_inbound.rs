@@ -64,7 +64,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // connection (drop) instead of relaying to the app.
     let plugins = epoch
         .plugin_cache
-        .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Tcp);
+        .get_plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Tcp);
 
     // No global TCP chain resolved: relay immediately. There is no plugin state
     // to track and no policy to evaluate, so the connect/disconnect lifecycle is

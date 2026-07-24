@@ -3386,7 +3386,7 @@ fn streaming_response_status_is_passively_unhealthy(
         return false;
     };
     let Some(upstream) =
-        crate::load_balancer::LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
+        crate::load_balancer::LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id)
     else {
         return false;
     };
@@ -4077,7 +4077,7 @@ pub(crate) fn plugin_rebuild_targets_for_incremental_stage(
     current_config: &GatewayConfig,
     candidate_config: &GatewayConfig,
     delta: &crate::config_delta::ConfigDelta,
-) -> HashSet<String> {
+) -> HashSet<crate::config::db_backend::NamespacedResourceId> {
     delta.proxy_ids_needing_plugin_rebuild(current_config, candidate_config)
 }
 
@@ -7054,7 +7054,7 @@ impl ProxyState {
             // to keep the pool warm.
             let per_proxy_pool = pool_config.for_proxy(proxy);
             let requires_request_body_buffering =
-                self.plugin_cache.requires_request_body_buffering(&proxy.id);
+                self.plugin_cache.requires_request_body_buffering(&proxy.namespace, &proxy.id);
             let forces_reqwest = proxy_config_forces_reqwest_dispatch(
                 proxy,
                 per_proxy_pool.enable_http2,
@@ -7398,19 +7398,19 @@ impl ProxyState {
             return Self::projected_route_proxy_content_changed(old_config, new_config);
         }
 
-        let old_route_indexed_proxy_ids: std::collections::HashSet<&str> = old_config
+        let old_route_indexed_proxy_ids: std::collections::HashSet<(&str, &str)> = old_config
             .proxies
             .iter()
             .filter(|proxy| is_route_indexed(proxy))
-            .map(|proxy| proxy.id.as_str())
+            .map(|proxy| (proxy.namespace.as_str(), proxy.id.as_str()))
             .collect();
 
         delta
             .modified_proxies
             .iter()
-            .map(|proxy| proxy.id.as_str())
-            .chain(delta.removed_proxy_ids.iter().map(String::as_str))
-            .any(|id| old_route_indexed_proxy_ids.contains(id))
+            .map(|proxy| (proxy.namespace.as_str(), proxy.id.as_str()))
+            .chain(delta.removed_proxy_ids.iter().map(|key| key.as_key()))
+            .any(|id| old_route_indexed_proxy_ids.contains(&id))
             || Self::projected_route_proxy_content_changed(old_config, new_config)
     }
 
@@ -8116,11 +8116,11 @@ impl ProxyState {
             for proxy in &new_config.proxies {
                 if let Some(ref upstream_id) = proxy.upstream_id
                     && let Some(upstream) =
-                        new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                        new_config.upstreams.iter().find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
                 {
                     for target in &upstream.targets {
                         active_keys
-                            .insert(format!("{}::{}:{}", proxy.id, target.host, target.port));
+                            .insert(format!("{}|{}::{}:{}", proxy.namespace, proxy.id, target.host, target.port));
                     }
                 }
             }
@@ -8134,10 +8134,10 @@ impl ProxyState {
         }
         for proxy in &new_config.proxies {
             if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                && let Some(upstream) = new_config.upstreams.iter().find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
             {
                 self.health_checker
-                    .remove_stale_passive_targets_for_proxy(&proxy.id, &upstream.targets);
+                    .remove_stale_passive_targets_for_proxy(&proxy.namespace, &proxy.id, &upstream.targets);
             }
         }
 
@@ -8578,11 +8578,11 @@ impl ProxyState {
             for proxy in &new_config.proxies {
                 if let Some(ref upstream_id) = proxy.upstream_id
                     && let Some(upstream) =
-                        new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                        new_config.upstreams.iter().find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
                 {
                     for target in &upstream.targets {
                         active_keys
-                            .insert(format!("{}::{}:{}", proxy.id, target.host, target.port));
+                            .insert(format!("{}|{}::{}:{}", proxy.namespace, proxy.id, target.host, target.port));
                     }
                 }
             }
@@ -8596,10 +8596,10 @@ impl ProxyState {
         }
         for proxy in &new_config.proxies {
             if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                && let Some(upstream) = new_config.upstreams.iter().find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
             {
                 self.health_checker
-                    .remove_stale_passive_targets_for_proxy(&proxy.id, &upstream.targets);
+                    .remove_stale_passive_targets_for_proxy(&proxy.namespace, &proxy.id, &upstream.targets);
             }
         }
 
@@ -8667,12 +8667,12 @@ impl ProxyState {
         // idempotent and only restarts listeners whose reload key actually
         // changed.
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
-            let removed_set: std::collections::HashSet<&str> =
-                delta.removed_proxy_ids.iter().map(|s| s.as_str()).collect();
-            old_config
-                .proxies
-                .iter()
-                .any(|p| removed_set.contains(p.id.as_str()) && p.dispatch_kind.is_stream())
+            let removed_set: std::collections::HashSet<(&str, &str)> =
+                delta.removed_proxy_ids.iter().map(|key| key.as_key()).collect();
+            old_config.proxies.iter().any(|p| {
+                removed_set.contains(&(p.namespace.as_str(), p.id.as_str()))
+                    && p.dispatch_kind.is_stream()
+            })
         } else {
             false
         };
@@ -9536,6 +9536,7 @@ async fn handle_websocket_request_authenticated(
                     // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
                         let cb = state.circuit_breaker_cache.get_or_create(
+                            &proxy.namespace,
                             &proxy.id,
                             current_cb_target_key.as_deref(),
                             cb_config,
@@ -9634,6 +9635,7 @@ async fn handle_websocket_request_authenticated(
                     let mut retry_admitted_by_cb = true;
                     if !retry_path_mismatch && let Some(cb_config) = &proxy.circuit_breaker {
                         match state.circuit_breaker_cache.can_execute(
+                            &proxy.namespace,
                             &proxy.id,
                             retry_cb_target_key.as_deref(),
                             cb_config,
@@ -9691,6 +9693,7 @@ async fn handle_websocket_request_authenticated(
                 // permanently.
                 if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
@@ -9846,6 +9849,7 @@ async fn handle_websocket_request_authenticated(
     // target. Mirrors the H3 WS path (`src/http3/websocket.rs`).
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
             &proxy.id,
             current_cb_target_key.as_deref(),
             cb_config,
@@ -9961,7 +9965,7 @@ async fn handle_websocket_request_authenticated(
             target,
         );
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, &proxy.namespace, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -17190,7 +17194,7 @@ fn release_circuit_breaker_probe_on_admission_reject(
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state
             .circuit_breaker_cache
-            .get_or_create(&proxy.id, target_key, cb_config);
+            .get_or_create(&proxy.namespace, &proxy.id, target_key, cb_config);
         cb.record_neutral(true);
     }
 }
@@ -18898,7 +18902,7 @@ async fn handle_proxy_request_inner(
         record_status(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
         let logging_plugins = epoch
             .plugin_cache
-            .request_view(&proxy.id, request_protocol)
+            .request_view(&proxy.namespace, &proxy.id, request_protocol)
             .plugins();
         log_pre_backend_rejected_request(
             &logging_plugins,
@@ -18988,7 +18992,7 @@ async fn handle_proxy_request_inner(
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
-    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
+    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.namespace, &proxy.id, request_protocol);
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
@@ -20998,6 +21002,7 @@ async fn handle_proxy_request_inner(
             cb: if cb_is_half_open_probe {
                 proxy.circuit_breaker.as_ref().map(|cfg| {
                     state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         cb_target_key.as_deref(),
                         cfg,
@@ -21470,6 +21475,7 @@ async fn handle_proxy_request_inner(
                     match proxy.circuit_breaker.as_ref() {
                         Some(cb_config) => {
                             let cb = state.circuit_breaker_cache.get_or_create(
+                                &proxy.namespace,
                                 &proxy.id,
                                 grpc_final_cb_key.as_deref(),
                                 cb_config,
@@ -21812,6 +21818,7 @@ async fn handle_proxy_request_inner(
                 // Record circuit breaker failure for current target
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         grpc_current_cb_key.as_deref(),
                         cb_config,
@@ -21990,6 +21997,7 @@ async fn handle_proxy_request_inner(
                     match state
                         .circuit_breaker_cache
                         .can_execute_with_admission_epoch(
+                            &proxy.namespace,
                             &proxy.id,
                             grpc_current_cb_key.as_deref(),
                             cb_config,
@@ -22131,6 +22139,7 @@ async fn handle_proxy_request_inner(
         // breaker rejected (already recorded for the prior target).
         if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
             let cb = state.circuit_breaker_cache.get_or_create(
+                &proxy.namespace,
                 &proxy.id,
                 grpc_final_cb_key.as_deref(),
                 cb_config,
@@ -22293,6 +22302,7 @@ async fn handle_proxy_request_inner(
                     false
                 } else if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         grpc_final_cb_key.as_deref(),
                         cb_config,
@@ -23349,7 +23359,7 @@ async fn handle_proxy_request_inner(
                     );
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
                         let upstream =
-                            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+                            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, &proxy.namespace, upstream_id);
                         let default_cc = crate::config::types::HashOnCookieConfig::default();
                         let cookie_config = upstream
                             .as_ref()
@@ -24127,6 +24137,7 @@ async fn handle_proxy_request_inner(
             // before potentially switching to a different target for the next retry.
             if let Some(cb_config) = &proxy.circuit_breaker {
                 let cb = state.circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     &proxy.id,
                     current_cb_target_key.as_deref(),
                     cb_config,
@@ -24270,6 +24281,7 @@ async fn handle_proxy_request_inner(
                 match state
                     .circuit_breaker_cache
                     .can_execute_with_admission_epoch(
+                        &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
@@ -24664,7 +24676,7 @@ async fn handle_proxy_request_inner(
         {
             state
                 .circuit_breaker_cache
-                .get_or_create(&proxy.id, final_cb_target_key.as_deref(), cb_config)
+                .get_or_create(&proxy.namespace, &proxy.id, final_cb_target_key.as_deref(), cb_config)
                 .record_neutral(true);
         }
     } else {
@@ -25038,7 +25050,7 @@ async fn handle_proxy_request_inner(
             target,
         );
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, &proxy.namespace, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()

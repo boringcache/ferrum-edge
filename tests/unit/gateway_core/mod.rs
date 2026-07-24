@@ -4,6 +4,7 @@ mod backend_dispatch_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;
 mod client_ip_tests;
+mod config_delta_namespace_prune_tests;
 mod config_delta_tests;
 mod consumer_index_tests;
 mod cp_server_tests;

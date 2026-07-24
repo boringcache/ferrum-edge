@@ -699,7 +699,7 @@ async fn test_udp_logging_optional_fail_open_omits_unknown_key_instance() {
 
     let omitted = PluginCache::new(&bad_gateway).expect("cache omits failed optional plugin");
     assert!(
-        omitted.get_plugins("p1").is_empty(),
+        omitted.get_plugins("ferrum", "p1").is_empty(),
         "unknown-key udp_logging must be omitted, not silently defaulted to plaintext"
     );
 
@@ -712,13 +712,13 @@ async fn test_udp_logging_optional_fail_open_omits_unknown_key_instance() {
         ..GatewayConfig::default()
     };
     let cache = PluginCache::new(&valid_gateway).expect("valid dtls config constructs");
-    assert_eq!(cache.get_plugins("p1").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
 
     cache
         .rebuild(&bad_gateway)
         .expect("OptionalFailOpen reload omits bad udp rather than rejecting the generation");
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "reload with unknown keys must drop the previously published udp instance"
     );
 }

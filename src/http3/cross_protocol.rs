@@ -334,7 +334,7 @@ fn release_cross_protocol_circuit_breaker_probe_on_admission_reject(
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state
             .circuit_breaker_cache
-            .get_or_create(&proxy.id, target_key, cb_config);
+            .get_or_create(&proxy.namespace, &proxy.id, target_key, cb_config);
         cb.record_neutral(true);
     }
 }
@@ -456,7 +456,7 @@ fn record_cross_protocol_retry_failure(
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state
             .circuit_breaker_cache
-            .get_or_create(&proxy.id, cb_target_key, cb_config);
+            .get_or_create(&proxy.namespace, &proxy.id, cb_target_key, cb_config);
         cb.record_failure(response_status, connection_error, is_half_open_probe);
     }
 }
@@ -8591,21 +8591,21 @@ mod tests {
         let target_key = Some("backend.example:443");
         let cb = state
             .circuit_breaker_cache
-            .get_or_create(&proxy.id, target_key, &config);
+            .get_or_create(&proxy.namespace, &proxy.id, target_key, &config);
 
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
         let (_, is_half_open_probe) = state
             .circuit_breaker_cache
-            .can_execute(&proxy.id, target_key, &config)
+            .can_execute(&proxy.namespace, &proxy.id, target_key, &config)
             .expect("half-open probe should be admitted");
         assert!(is_half_open_probe);
         assert_eq!(cb.half_open_in_flight(), 1);
         assert!(
             state
                 .circuit_breaker_cache
-                .can_execute(&proxy.id, target_key, &config)
+                .can_execute(&proxy.namespace, &proxy.id, target_key, &config)
                 .is_err(),
             "single probe slot should be occupied before neutral release"
         );
@@ -8622,7 +8622,7 @@ mod tests {
         assert!(
             state
                 .circuit_breaker_cache
-                .can_execute(&proxy.id, target_key, &config)
+                .can_execute(&proxy.namespace, &proxy.id, target_key, &config)
                 .is_ok(),
             "neutral client-fault release must allow the next half-open probe"
         );

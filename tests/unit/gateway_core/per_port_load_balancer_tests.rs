@@ -96,7 +96,7 @@ fn initial_dispatch_port_override_requires_all_targets_on_overridden_port() {
     let mixed_snapshot = mixed_cache.load();
 
     assert_eq!(
-        LoadBalancerCache::initial_dispatch_port_override_from(&mixed_snapshot, "u1"),
+        LoadBalancerCache::initial_dispatch_port_override_from(&mixed_snapshot, "ferrum", "u1"),
         0,
         "mixed-port upstreams must wait until a concrete target is selected"
     );
@@ -114,7 +114,7 @@ fn initial_dispatch_port_override_requires_all_targets_on_overridden_port() {
     let uniform_snapshot = uniform_cache.load();
 
     assert_eq!(
-        LoadBalancerCache::initial_dispatch_port_override_from(&uniform_snapshot, "u1"),
+        LoadBalancerCache::initial_dispatch_port_override_from(&uniform_snapshot, "ferrum", "u1"),
         8080,
         "single-port upstreams can use the port override before selection"
     );
@@ -147,13 +147,13 @@ fn port_wrr_zero_weight_fallback_uses_port_counter() {
     let snapshot = cache.load();
 
     for _ in 0..2 {
-        LoadBalancerCache::select_target_from(&snapshot, "u1", "parent", None)
+        LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "parent", None)
             .expect("parent selection");
     }
 
     let port_sequence: Vec<String> = (0..2)
         .map(|_| {
-            LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "port", 8080, None)
+            LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "port", 8080, None)
                 .expect("port selection")
                 .target
                 .host
@@ -187,13 +187,13 @@ fn port_least_latency_warmup_fallback_uses_port_counter() {
     let snapshot = cache.load();
 
     for _ in 0..2 {
-        LoadBalancerCache::select_target_from(&snapshot, "u1", "parent", None)
+        LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "parent", None)
             .expect("parent selection");
     }
 
     let port_sequence: Vec<String> = (0..2)
         .map(|_| {
-            LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "port", 8080, None)
+            LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "port", 8080, None)
                 .expect("port selection")
                 .target
                 .host
@@ -228,13 +228,13 @@ fn port_wrr_vec_zero_weight_fallback_uses_port_counter() {
     let snapshot = cache.load();
     let control_snapshot = control_cache.load();
 
-    LoadBalancerCache::select_target_from(&snapshot, "u1", "parent", None)
+    LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "parent", None)
         .expect("parent selection");
     let selected =
-        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "port", 8080, None)
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "port", 8080, None)
             .expect("port selection");
     let control =
-        LoadBalancerCache::select_target_for_port_from(&control_snapshot, "u1", "port", 8080, None)
+        LoadBalancerCache::select_target_for_port_from(&control_snapshot, "ferrum", "u1", "port", 8080, None)
             .expect("control port selection");
 
     assert_eq!(
@@ -284,7 +284,7 @@ fn port_subset_fully_unhealthy_intersection_returns_none() {
 
     let selection = LoadBalancerCache::select_target_for_port_subset_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "key",
         8080,
         "v1",
@@ -329,7 +329,7 @@ fn port_subset_vec_fallback_filters_intersection_for_large_upstreams() {
     let snapshot = cache.load();
 
     let selection = LoadBalancerCache::select_target_for_port_subset_from(
-        &snapshot, "u1", "key", 8080, "v1", None,
+        &snapshot, "ferrum", "u1", "key", 8080, "v1", None,
     )
     .expect("large-target port subset selection");
     assert_eq!(selection.target.port, 8080);
@@ -340,7 +340,7 @@ fn port_subset_vec_fallback_filters_intersection_for_large_upstreams() {
 
     let retry = LoadBalancerCache::select_next_target_for_port_subset_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "retry",
         8080,
         "v1",
@@ -395,14 +395,14 @@ fn hash_on_only_port_override_preserves_subset_algorithm_with_port_hash_key() {
     let snapshot = cache.load();
 
     assert_eq!(
-        LoadBalancerCache::effective_algorithm_from(&snapshot, "u1", Some(8080), Some("v1")),
+        LoadBalancerCache::effective_algorithm_from(&snapshot, "ferrum", "u1", Some(8080), Some("v1")),
         Some(LoadBalancerAlgorithm::ConsistentHashing),
         "a hash_on-only port override must not replace the subset algorithm"
     );
     assert_eq!(
         LoadBalancerCache::get_hash_on_strategy_for_selection_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             Some(8080),
             Some("v1"),
         ),
@@ -412,7 +412,7 @@ fn hash_on_only_port_override_preserves_subset_algorithm_with_port_hash_key() {
     assert_eq!(
         LoadBalancerCache::get_hash_on_strategy_for_selection_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             None,
             Some("v1"),
         ),
@@ -449,8 +449,8 @@ fn port_retry_selection_does_not_escape_selected_port() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &targets[0]), 0);
-    active_unhealthy.insert(target_key("u1", &targets[3]), 0);
+    active_unhealthy.insert(target_key("ferrum|u1", &targets[0]), 0);
+    active_unhealthy.insert(target_key("ferrum|u1", &targets[3]), 0);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -459,6 +459,7 @@ fn port_retry_selection_does_not_escape_selected_port() {
 
     let selection = LoadBalancerCache::select_next_target_for_port_from(
         &snapshot,
+        "ferrum",
         "u1",
         "key",
         8080,
@@ -471,9 +472,10 @@ fn port_retry_selection_does_not_escape_selected_port() {
         "retry selection must not escape the selected port or pick an unhealthy same-port target"
     );
 
-    active_unhealthy.remove(&target_key("u1", &targets[3]));
+    active_unhealthy.remove(&target_key("ferrum|u1", &targets[3]));
     let selection = LoadBalancerCache::select_next_target_for_port_from(
         &snapshot,
+        "ferrum",
         "u1",
         "key",
         8080,
@@ -544,7 +546,7 @@ fn upstream_round_robin_port_override_random_uses_port_specific_algorithm() {
 
     let port_sequence: Vec<String> = (0..3)
         .map(|_| {
-            LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "same-key", 8080, None)
+            LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "same-key", 8080, None)
                 .expect("port override should select")
                 .target
                 .host
@@ -560,7 +562,7 @@ fn upstream_round_robin_port_override_random_uses_port_specific_algorithm() {
 
     let parent_sequence: Vec<String> = (0..3)
         .map(|_| {
-            LoadBalancerCache::select_target_from(&snapshot, "u1", "same-key", None)
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "same-key", None)
                 .expect("parent LB should select")
                 .target
                 .host
@@ -594,16 +596,16 @@ fn algorithm_port_override_without_hash_on_clears_upstream_hash_strategy() {
     let snapshot = cache.load();
 
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_from(&snapshot, "u1"),
+        LoadBalancerCache::get_hash_on_strategy_from(&snapshot, "ferrum", "u1"),
         HashOnStrategy::Cookie("srv".to_string())
     );
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "u1", 8080),
+        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "ferrum", "u1", 8080),
         HashOnStrategy::Ip,
         "switching a port to a non-hash algorithm should clear upstream sticky hash state"
     );
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "u1", 9090),
+        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "ferrum", "u1", 9090),
         HashOnStrategy::Cookie("srv".to_string()),
         "ports without an override should keep the upstream strategy"
     );
@@ -633,14 +635,14 @@ fn non_algorithm_port_override_inherits_upstream_algorithm_and_hash_strategy() {
     let snapshot = cache.load();
 
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "u1", 8080),
+        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "ferrum", "u1", 8080),
         HashOnStrategy::Header("x-user-id".to_string()),
         "non-LB port overrides should inherit upstream sticky hash state"
     );
 
     let port_sequence: Vec<String> = (0..2)
         .map(|_| {
-            LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "same-key", 8080, None)
+            LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "same-key", 8080, None)
                 .expect("port selection")
                 .target
                 .host
@@ -683,7 +685,7 @@ fn consistent_hash_port_override_without_hash_on_preserves_upstream_hash_strateg
     let snapshot = cache.load();
 
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "u1", 8080),
+        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "ferrum", "u1", 8080),
         HashOnStrategy::Cookie("srv".to_string()),
         "a consistent-hash port override should inherit the upstream hash key when none is set"
     );
@@ -738,7 +740,7 @@ fn per_port_passive_health_threshold_differs_from_upstream_level() {
 
     let checker = HealthChecker::default();
     let selected = target("a", 8080);
-    checker.report_response("p1", &selected, 500, false, Some(port_passive));
+    checker.report_response("ferrum", "p1", &selected, 500, false, Some(port_passive));
     let proxy_state = checker
         .passive_health
         .get("p1")
@@ -783,8 +785,8 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
     let snapshot = cache.load();
 
     let checker = HealthChecker::new();
-    checker.report_response("p1", &targets[0], 500, false, Some(&port_passive));
-    checker.report_response("p1", &targets[1], 500, false, Some(&port_passive));
+    checker.report_response("ferrum", "p1", &targets[0], 500, false, Some(&port_passive));
+    checker.report_response("ferrum", "p1", &targets[1], 500, false, Some(&port_passive));
     let proxy_state = checker
         .passive_health
         .get("p1")
@@ -805,7 +807,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
     };
 
     let selection =
-        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "key", 8080, Some(&health))
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "key", 8080, Some(&health))
             .expect("port selection");
 
     assert!(
@@ -845,8 +847,8 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
     let snapshot = cache.load();
 
     let checker = HealthChecker::new();
-    checker.report_response("p1", &targets[0], 500, false, Some(&port_passive));
-    checker.report_response("p1", &targets[1], 500, false, Some(&port_passive));
+    checker.report_response("ferrum", "p1", &targets[0], 500, false, Some(&port_passive));
+    checker.report_response("ferrum", "p1", &targets[1], 500, false, Some(&port_passive));
     let proxy_state = checker
         .passive_health
         .get("p1")
@@ -867,7 +869,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
     };
 
     let selection =
-        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "key", 8080, Some(&health))
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "key", 8080, Some(&health))
             .expect("port selection");
 
     assert!(
@@ -915,7 +917,7 @@ fn port_passive_override_without_max_ejection_does_not_inherit_upstream_cap() {
     assert_eq!(
         LoadBalancerCache::max_ejection_percent_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &config.proxies[0],
             8080,
         ),
@@ -925,7 +927,7 @@ fn port_passive_override_without_max_ejection_does_not_inherit_upstream_cap() {
     assert_eq!(
         LoadBalancerCache::max_ejection_percent_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &config.proxies[0],
             9090,
         ),
@@ -968,7 +970,7 @@ fn subset_bound_proxy_uses_subset_max_ejection_cap_not_upstream() {
     assert_eq!(
         LoadBalancerCache::max_ejection_percent_resolved_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &config.proxies[0],
             None,
         ),
@@ -1008,7 +1010,7 @@ fn unsubsetted_proxy_uses_upstream_max_ejection_cap_even_when_subset_overlay_exi
     assert_eq!(
         LoadBalancerCache::max_ejection_percent_resolved_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &config.proxies[0],
             None,
         ),
@@ -1049,7 +1051,7 @@ fn subset_overlay_without_max_ejection_does_not_inherit_upstream_cap() {
     assert_eq!(
         LoadBalancerCache::max_ejection_percent_resolved_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &config.proxies[0],
             None,
         ),
@@ -1106,7 +1108,7 @@ fn per_port_override_wins_over_subset_max_ejection_cap() {
     assert_eq!(
         LoadBalancerCache::max_ejection_percent_resolved_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &config.proxies[0],
             Some(8080),
         ),
@@ -1119,7 +1121,7 @@ fn per_port_override_wins_over_subset_max_ejection_cap() {
     assert_eq!(
         LoadBalancerCache::max_ejection_percent_resolved_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &config.proxies[0],
             None,
         ),
@@ -1179,7 +1181,7 @@ fn passive_ctx_ejecting<'a>(
         ..PassiveHealthCheck::default()
     };
     for t in ejected {
-        checker.report_response("p1", t, 500, false, Some(&pasv));
+        checker.report_response("ferrum", "p1", t, 500, false, Some(&pasv));
     }
     let proxy_state = checker
         .passive_health
@@ -1237,7 +1239,7 @@ fn subset_ejection_cap_denominator_is_subset_pool_not_full_upstream() {
     let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0], &targets[1]], Some(50));
 
     let selection =
-        LoadBalancerCache::select_target_subset_from(&snapshot, "u1", "key", "v1", Some(&health))
+        LoadBalancerCache::select_target_subset_from(&snapshot, "ferrum", "u1", "key", "v1", Some(&health))
             .expect("subset must stay available: the 50% subset cap re-admits 1 of 2 ejected");
     assert!(
         !selection.is_fallback,
@@ -1252,7 +1254,7 @@ fn subset_ejection_cap_denominator_is_subset_pool_not_full_upstream() {
     assert_eq!(
         LoadBalancerCache::max_ejection_percent_resolved_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &config.proxies[0],
             None,
         ),
@@ -1293,7 +1295,7 @@ fn subset_ejection_cap_denominator_is_subset_pool_vec_fallback() {
     let health = passive_ctx_ejecting(&active_unhealthy, &[&targets[0], &targets[1]], Some(50));
 
     let selection =
-        LoadBalancerCache::select_target_subset_from(&snapshot, "u1", "key", "v1", Some(&health))
+        LoadBalancerCache::select_target_subset_from(&snapshot, "ferrum", "u1", "key", "v1", Some(&health))
             .expect("Vec fallback must scope the subset cap to the subset pool too");
     assert!(!selection.is_fallback);
     assert_eq!(selection.target.host, "v1-a");
@@ -1354,7 +1356,7 @@ fn port_subset_ejection_cap_denominator_is_subset_intersect_port() {
 
     let selection = LoadBalancerCache::select_target_for_port_subset_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "key",
         8080,
         "v1",
@@ -1416,7 +1418,7 @@ fn upstream_retry_excludes_previous_target_before_ejection_cap() {
 
     let retry = LoadBalancerCache::select_next_target_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "retry",
         &targets[0],
         Some(&health),
@@ -1471,7 +1473,7 @@ fn port_retry_excludes_previous_target_before_ejection_cap() {
 
     let retry = LoadBalancerCache::select_next_target_for_port_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "retry",
         8080,
         &targets[0],
@@ -1527,7 +1529,7 @@ fn subset_retry_excludes_previous_target_before_ejection_cap() {
 
     let retry = LoadBalancerCache::select_next_target_subset_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "retry",
         "v1",
         &targets[0], // exclude v1-a, the earliest-ejected candidate
@@ -1602,7 +1604,7 @@ fn port_subset_retry_excludes_previous_target_before_ejection_cap() {
 
     let retry = LoadBalancerCache::select_next_target_for_port_subset_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "retry",
         8080,
         "v1",
@@ -1657,7 +1659,7 @@ fn stream_path_engages_per_port_algorithm_when_all_targets_on_one_port() {
     let snapshot = cache.load();
 
     // All targets are on port 9000 → initial_dispatch_port_override is 9000.
-    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "ferrum", "u1");
     assert_eq!(
         dispatch_port, 9000,
         "single-port upstream must expose its port as the initial dispatch override"
@@ -1668,7 +1670,7 @@ fn stream_path_engages_per_port_algorithm_when_all_targets_on_one_port() {
         .map(|_| {
             LoadBalancerCache::select_target_for_port_from(
                 &snapshot,
-                "u1",
+                "ferrum", "u1",
                 "stream-key",
                 dispatch_port,
                 None,
@@ -1705,7 +1707,7 @@ fn stream_path_hint_is_zero_for_mixed_port_upstream() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "ferrum", "u1");
     assert_eq!(
         dispatch_port, 0,
         "mixed-port upstream must not resolve a pre-selection dispatch port"
@@ -1743,7 +1745,7 @@ fn stream_path_per_port_selection_excludes_off_port_targets() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "ferrum", "u1");
     assert_eq!(
         dispatch_port, 0,
         "mixed-port upstream: per-port lane must not engage pre-selection"
@@ -1751,7 +1753,7 @@ fn stream_path_per_port_selection_excludes_off_port_targets() {
 
     // Explicit per-port selection on 9000 only returns targets on that port.
     let selected =
-        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "key", 9000, None)
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "key", 9000, None)
             .expect("port-9000 target must be selectable");
     assert_eq!(
         selected.target.host, "a",
@@ -1802,7 +1804,7 @@ fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
         max_ejection_percent: Some(50),
     };
 
-    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "ferrum", "u1");
     assert_eq!(
         dispatch_port, 9000,
         "single-port upstream resolves dispatch port"
@@ -1813,7 +1815,7 @@ fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
     for _ in 0..4 {
         let selected = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             "http-key",
             dispatch_port,
             Some(&health),
@@ -1864,7 +1866,7 @@ fn per_port_selection_ignores_ejection_without_health_context() {
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
     active_unhealthy.insert("u1::a:9000".to_string(), 0);
 
-    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "ferrum", "u1");
     assert_eq!(dispatch_port, 9000);
 
     // With no health context, ejection state is NOT consulted. Both "a" and
@@ -1874,7 +1876,7 @@ fn per_port_selection_ignores_ejection_without_health_context() {
     for i in 0..8 {
         let selected = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("stream-key-{i}"),
             dispatch_port,
             None, // no health context
@@ -1926,7 +1928,7 @@ fn stream_path_per_port_subset_engages_when_single_port() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "ferrum", "u1");
     assert_eq!(dispatch_port, 9000);
 
     // Simulate the stream subset path: select_target_for_port_subset_from.
@@ -1934,7 +1936,7 @@ fn stream_path_per_port_subset_engages_when_single_port() {
         .map(|_| {
             LoadBalancerCache::select_target_for_port_subset_from(
                 &snapshot,
-                "u1",
+                "ferrum", "u1",
                 "stream-subset-key",
                 dispatch_port,
                 "prod",
@@ -1996,7 +1998,7 @@ fn per_port_consistent_hash_overrides_upstream_round_robin() {
     // so the same ctx_key always selects the same target.
     let first = LoadBalancerCache::select_target_for_port_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "sticky-session-abc",
         9000,
         None,
@@ -2009,7 +2011,7 @@ fn per_port_consistent_hash_overrides_upstream_round_robin() {
     for _ in 0..4 {
         let again = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             "sticky-session-abc",
             9000,
             None,
@@ -2028,7 +2030,7 @@ fn per_port_consistent_hash_overrides_upstream_round_robin() {
     // proving the two lanes are independent.
     let rr: Vec<String> = (0..3)
         .map(|_| {
-            LoadBalancerCache::select_target_from(&snapshot, "u1", "rr-key", None)
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "rr-key", None)
                 .expect("upstream-level selection must succeed")
                 .target
                 .host
@@ -2090,7 +2092,7 @@ fn port_subset_selection_unchanged_after_alloc_free_mask_refactor() {
     for i in 0..10 {
         let selection = LoadBalancerCache::select_target_for_port_subset_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("key-{i}"),
             8080,
             "v1",

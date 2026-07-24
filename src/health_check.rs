@@ -44,6 +44,9 @@ use tracing::{debug, info, warn};
 thread_local! {
     static HP_KEY_BUF: std::cell::RefCell<String> =
         std::cell::RefCell::new(String::with_capacity(64));
+    /// Scratch buffer for namespace-qualified passive-health outer keys.
+    static PASSIVE_PROXY_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(64));
 }
 
 /// Wait for a shutdown signal on a watch channel.
@@ -360,6 +363,7 @@ impl HealthChecker {
                         let handle = self.start_active_check(
                             target,
                             active,
+                            &upstream.namespace,
                             &upstream.id,
                             shutdown_rx.clone(),
                             &upstream_client,
@@ -428,7 +432,14 @@ impl HealthChecker {
         let active_keys: std::collections::HashSet<String> = new_config
             .upstreams
             .iter()
-            .flat_map(|u| u.targets.iter().map(move |t| target_key(&u.id, t)))
+            .flat_map(|u| {
+                let upstream_key =
+                    crate::config::db_backend::namespaced_runtime_key(&u.namespace, &u.id);
+                u.targets
+                    .iter()
+                    .map(|t| target_key(&upstream_key, t))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         self.active_unhealthy_targets
             .retain(|key, _| active_keys.contains(key));
@@ -440,27 +451,33 @@ impl HealthChecker {
 
     /// Get or create the per-proxy passive health state.
     ///
-    /// Fast-path: `get()` with borrowed `&str` (zero allocation, read lock).
-    /// Cold-path: `entry()` with owned `String` (one allocation, write lock) —
-    /// only on the first request from a new proxy_id.
-    fn get_proxy_state(&self, proxy_id: &str) -> Arc<ProxyHealthState> {
-        if let Some(existing) = self.passive_health.get(proxy_id) {
-            return existing.value().clone();
-        }
-        self.passive_health
-            .entry(proxy_id.to_owned())
-            .or_insert_with(|| Arc::new(ProxyHealthState::new()))
-            .clone()
+    /// Fast-path: `get()` with a thread-local `namespace|id` key (zero allocation
+    /// beyond the reusable buffer, read lock). Cold-path: `entry()` with owned
+    /// `String` (one allocation, write lock) — only on the first request from a
+    /// new proxy identity.
+    fn get_proxy_state(&self, namespace: &str, proxy_id: &str) -> Arc<ProxyHealthState> {
+        PASSIVE_PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            crate::config::db_backend::write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            if let Some(existing) = self.passive_health.get(key.as_str()) {
+                return existing.value().clone();
+            }
+            self.passive_health
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(ProxyHealthState::new()))
+                .clone()
+        })
     }
 
     /// Report a response from a proxied request (passive health checking).
     ///
     /// Writes to the per-proxy passive health state via the two-level index:
-    /// `proxy_id → ProxyHealthState → host:port`. This ensures proxy A's
+    /// `namespace|proxy_id → ProxyHealthState → host:port`. This ensures proxy A's
     /// failures cannot affect proxy B's health view, even when both proxies
-    /// share the same upstream.
+    /// share the same upstream — including across namespaces.
     pub fn report_response(
         &self,
+        namespace: &str,
         proxy_id: &str,
         target: &UpstreamTarget,
         status_code: u16,
@@ -472,7 +489,7 @@ impl HealthChecker {
             None => return,
         };
 
-        let proxy_state = self.get_proxy_state(proxy_id);
+        let proxy_state = self.get_proxy_state(namespace, proxy_id);
 
         // Format "host:port" into a thread-local buffer to avoid a String
         // allocation on every proxied response. DashMap lookups use &str
@@ -570,25 +587,32 @@ impl HealthChecker {
     /// prevent unbounded growth of the health DashMaps when targets are
     /// dynamically removed. This runs in a background task, NOT on the
     /// proxy hot path.
-    pub fn remove_stale_targets(&self, upstream_id: &str, current_targets: &[UpstreamTarget]) {
-        // Active: exact key match on "upstream_id::host:port".
+    pub fn remove_stale_targets(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        current_targets: &[UpstreamTarget],
+    ) {
+        // Active: exact key match on "namespace|upstream_id::host:port".
         // Only filter entries belonging to THIS upstream (prefix match) —
         // other upstreams' entries must be preserved.
+        let upstream_key =
+            crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         let active_keys: std::collections::HashSet<String> = current_targets
             .iter()
-            .map(|t| target_key(upstream_id, t))
+            .map(|t| target_key(&upstream_key, t))
             .collect();
         self.active_unhealthy_targets.retain(|key, _| {
             key.split_once("::")
                 .map(|(key_upstream_id, _)| {
-                    key_upstream_id != upstream_id || active_keys.contains(key)
+                    key_upstream_id != upstream_key.as_str() || active_keys.contains(key)
                 })
                 .unwrap_or(true)
         });
         self.active_target_states.retain(|key, _| {
             key.split_once("::")
                 .map(|(key_upstream_id, _)| {
-                    key_upstream_id != upstream_id || active_keys.contains(key)
+                    key_upstream_id != upstream_key.as_str() || active_keys.contains(key)
                 })
                 .unwrap_or(true)
         });
@@ -615,10 +639,12 @@ impl HealthChecker {
     /// config reloads remove targets from an upstream.
     pub fn remove_stale_passive_targets_for_proxy(
         &self,
+        namespace: &str,
         proxy_id: &str,
         current_targets: &[UpstreamTarget],
     ) {
-        let Some(proxy_state) = self.passive_health.get(proxy_id).map(|entry| entry.clone()) else {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, proxy_id);
+        let Some(proxy_state) = self.passive_health.get(&key).map(|entry| entry.clone()) else {
             return;
         };
         let current_keys: std::collections::HashSet<String> =
@@ -635,9 +661,13 @@ impl HealthChecker {
     /// config. Prevents the outer `passive_health` DashMap from growing
     /// unboundedly as proxies are added and removed over the gateway's lifetime.
     /// Called from `ProxyState::update_config()` alongside circuit breaker pruning.
-    pub fn prune_removed_proxies(&self, removed_proxy_ids: &[String]) {
-        for id in removed_proxy_ids {
-            self.passive_health.remove(id);
+    pub fn prune_removed_proxies(
+        &self,
+        removed_proxies: &[crate::config::db_backend::NamespacedResourceId],
+    ) {
+        for resource in removed_proxies {
+            let key = resource.runtime_key();
+            self.passive_health.remove(&key);
         }
     }
 
@@ -785,12 +815,15 @@ impl HealthChecker {
         &self,
         target: &UpstreamTarget,
         config: &ActiveHealthCheck,
+        upstream_namespace: &str,
         upstream_id: &str,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         upstream_client: &Arc<reqwest::Client>,
         tls_config: &BackendTlsConfig,
     ) -> tokio::task::JoinHandle<()> {
-        let key = target_key(upstream_id, target);
+        let upstream_key =
+            crate::config::db_backend::namespaced_runtime_key(upstream_namespace, upstream_id);
+        let key = target_key(&upstream_key, target);
         let interval = Duration::from_secs(config.interval_seconds);
         let timeout = Duration::from_millis(config.timeout_ms);
         let healthy_threshold = config.healthy_threshold;
@@ -815,6 +848,7 @@ impl HealthChecker {
 
         let probe_target = target.clone();
         let lb_cache = self.lb_cache.clone();
+        let upstream_namespace_owned = upstream_namespace.to_owned();
         let upstream_id_owned = upstream_id.to_owned();
         let probe_tls_config = tls_config.clone();
         let probe_global_ca = self.global_tls_ca_bundle_path.clone();
@@ -989,7 +1023,12 @@ impl HealthChecker {
 
                     if let Some(ref cache) = lb_cache {
                         let latency_us = probe_start.elapsed().as_micros() as u64;
-                        cache.record_latency(&upstream_id_owned, &probe_target, latency_us);
+                        cache.record_latency(
+                            &upstream_namespace_owned,
+                            &upstream_id_owned,
+                            &probe_target,
+                            latency_us,
+                        );
                     }
 
                     if successes >= healthy_threshold && unhealthy_targets.remove(&key).is_some() {
@@ -998,7 +1037,11 @@ impl HealthChecker {
                             key, probe_type
                         );
                         if let Some(ref cache) = lb_cache {
-                            cache.reset_recovered_target_latency(&upstream_id_owned, &probe_target);
+                            cache.reset_recovered_target_latency(
+                                &upstream_namespace_owned,
+                                &upstream_id_owned,
+                                &probe_target,
+                            );
                         }
                     }
                 } else {

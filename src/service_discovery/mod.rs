@@ -343,6 +343,7 @@ impl ServiceDiscoveryManager {
         };
 
         let upstream_id_owned = upstream_id.to_string();
+        let upstream_namespace_owned = upstream_namespace.to_string();
         let lb_cache = self.load_balancer_cache.clone();
         let request_epoch = self.request_epoch.clone();
         let static_targets = upstream.targets.clone();
@@ -356,6 +357,7 @@ impl ServiceDiscoveryManager {
 
         let handle = tokio::spawn(async move {
             run_discovery_loop(
+                &upstream_namespace_owned,
                 &upstream_id_owned,
                 discoverer,
                 &lb_cache,
@@ -466,6 +468,7 @@ async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
 /// `cancel_rx` is signaled (e.g. during config reconcile).
 #[allow(clippy::too_many_arguments)]
 async fn run_discovery_loop(
+    upstream_namespace: &str,
     upstream_id: &str,
     discoverer: Box<dyn ServiceDiscoverer>,
     lb_cache: &LoadBalancerCache,
@@ -584,6 +587,7 @@ async fn run_discovery_loop(
                             |current| {
                                 Some(LoadBalancerCache::build_update_targets_inner(
                                     &current.load_balancer,
+                                    upstream_namespace,
                                     upstream_id,
                                     merged.clone(),
                                     algorithm,
@@ -605,6 +609,7 @@ async fn run_discovery_loop(
                         }
                     } else {
                         lb_cache.update_targets(
+                            upstream_namespace,
                             upstream_id,
                             merged.clone(),
                             algorithm,
@@ -613,7 +618,7 @@ async fn run_discovery_loop(
                     }
 
                     // Clean up stale health state for targets that were removed
-                    health_checker.remove_stale_targets(upstream_id, &merged);
+                    health_checker.remove_stale_targets(upstream_namespace, upstream_id, &merged);
                     if let Some(epoch_store) = &request_epoch {
                         let epoch = epoch_store.load();
                         for proxy in epoch
@@ -623,7 +628,7 @@ async fn run_discovery_loop(
                             .filter(|proxy| proxy.upstream_id.as_deref() == Some(upstream_id))
                         {
                             health_checker
-                                .remove_stale_passive_targets_for_proxy(&proxy.id, &merged);
+                                .remove_stale_passive_targets_for_proxy(&proxy.namespace, &proxy.id, &merged);
                         }
                     }
 

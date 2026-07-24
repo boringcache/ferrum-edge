@@ -339,7 +339,7 @@ mod tests {
         let epoch_a = store.load();
         let plugins_a = epoch_a
             .plugin_cache
-            .request_view("checkout", ProxyProtocol::Http)
+            .request_view("ferrum", "checkout", ProxyProtocol::Http)
             .plugins();
 
         let mut fault_b = static_fault();
@@ -376,7 +376,7 @@ mod tests {
         let epoch_b = store.load();
         let plugins_b = epoch_b
             .plugin_cache
-            .request_view("checkout", ProxyProtocol::Http)
+            .request_view("ferrum", "checkout", ProxyProtocol::Http)
             .plugins();
         assert!(!Arc::ptr_eq(&epoch_a, &epoch_b));
         assert!(matches!(
@@ -473,7 +473,7 @@ mod tests {
 
         let plugin_view = after
             .plugin_cache
-            .request_view("secure", ProxyProtocol::Http);
+            .request_view("ferrum", "secure", ProxyProtocol::Http);
         assert_eq!(plugin_view.auth_plugins().len(), 1);
     }
 
@@ -575,7 +575,7 @@ mod tests {
             vec![upstream("u1", vec![target("a.local", 80)])],
         );
         let current = LoadBalancerCache::build_inner(&old);
-        let old_balancer = current.get_balancer("u1").unwrap();
+        let old_balancer = current.get_balancer("ferrum", "u1").unwrap();
         let new = config(
             vec![proxy("p2", "/two", vec![])],
             vec![],
@@ -583,7 +583,7 @@ mod tests {
         );
 
         let next = LoadBalancerCache::build_delta_inner(&current, &new, &[], &[], &[]);
-        let next_balancer = next.get_balancer("u1").unwrap();
+        let next_balancer = next.get_balancer("ferrum", "u1").unwrap();
         assert!(Arc::ptr_eq(&old_balancer, &next_balancer));
     }
 
@@ -632,11 +632,11 @@ mod tests {
 
         let final_epoch = store.load();
         assert_eq!(
-            final_epoch.load_balancer.upstreams()["u1"].targets[0].host,
+            final_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].host,
             "a2.local"
         );
         assert_eq!(
-            final_epoch.load_balancer.upstreams()["u2"].targets[0].host,
+            final_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u2")].targets[0].host,
             "b2.local"
         );
         assert_eq!(final_epoch.route_generation, 1);
@@ -797,7 +797,7 @@ mod tests {
         assert_eq!(next.lb_generation, 2);
         assert_eq!(observed_generations.get(), (1, 1, 2));
         assert_eq!(
-            next.load_balancer.upstreams()["u1"].targets[0].host,
+            next.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].host,
             "b.local"
         );
         assert!(Arc::ptr_eq(&next, &store.load()));
@@ -857,7 +857,7 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &after));
         assert_eq!(after.lb_generation, u64::MAX);
         assert_eq!(
-            after.load_balancer.upstreams()["u1"].targets[0].host,
+            after.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].host,
             "a.local"
         );
     }
@@ -904,7 +904,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("p1")
+                .get_plugins("ferrum", "p1")
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -996,7 +996,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("p1")
+                .get_plugins("ferrum", "p1")
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1079,7 +1079,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("p1")
+                .get_plugins("ferrum", "p1")
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1096,7 +1096,7 @@ mod tests {
         };
 
         let initial_epoch = store.load();
-        let old_target = initial_epoch.load_balancer.upstreams()["canary"].targets[0].clone();
+        let old_target = initial_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "canary")].targets[0].clone();
         match acquire(&initial_epoch, &old_target) {
             BackendAdmissionDecision::Admit(permit) => drop(permit),
             _ => panic!("initial route-override target should be admitted"),
@@ -1123,7 +1123,7 @@ mod tests {
 
         let replacement_epoch = store.load();
         let replacement_target =
-            replacement_epoch.load_balancer.upstreams()["canary"].targets[0].clone();
+            replacement_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "canary")].targets[0].clone();
         let held = match acquire(&replacement_epoch, &replacement_target) {
             BackendAdmissionDecision::Admit(permit) => permit,
             _ => panic!("replacement route-override target should be admitted"),
@@ -1162,7 +1162,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("p1")
+                .get_plugins("ferrum", "p1")
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1179,7 +1179,7 @@ mod tests {
         };
 
         let initial_epoch = store.load();
-        let first_target = initial_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        let first_target = initial_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].clone();
         let old_target_permit = match acquire(&initial_epoch, &first_target) {
             BackendAdmissionDecision::Admit(permit) => permit,
             _ => panic!("initial target should be admitted"),
@@ -1203,7 +1203,7 @@ mod tests {
 
         let replacement_epoch = store.load();
         let replacement_target =
-            replacement_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+            replacement_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].clone();
         match acquire(&initial_epoch, &first_target) {
             BackendAdmissionDecision::Reject {
                 status_code,
@@ -1266,7 +1266,7 @@ mod tests {
             .expect("second LB update should publish");
 
         let newest_epoch = store.load();
-        let newest_target = newest_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        let newest_target = newest_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].clone();
         match acquire(&replacement_epoch, &replacement_target) {
             BackendAdmissionDecision::Reject {
                 status_code,
@@ -1339,7 +1339,7 @@ mod tests {
         );
         let store = epoch_store(initial);
         let pinned_epoch = store.load();
-        let pinned_target = pinned_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        let pinned_target = pinned_epoch.load_balancer.upstreams()[&crate::config::db_backend::namespaced_runtime_key("ferrum", "u1")].targets[0].clone();
 
         store
             .update_load_balancer(
@@ -1359,7 +1359,7 @@ mod tests {
 
         let plugin = pinned_epoch
             .plugin_cache
-            .get_plugins("p1")
+            .get_plugins("ferrum", "p1")
             .iter()
             .find(|plugin| plugin.name() == "adaptive_concurrency")
             .cloned()

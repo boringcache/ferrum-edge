@@ -942,6 +942,7 @@ fn test_least_latency_record_for_nonexistent_target() {
 // ─── HashOnStrategy Tests ───────────────────────────────────────────────────
 
 use ferrum_edge::load_balancer::HashOnStrategy;
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 
 #[test]
 fn test_hash_on_strategy_parse_defaults_to_ip() {
@@ -1127,7 +1128,7 @@ fn test_load_balancer_cache_get_subset_hash_on_strategy() {
     assert_eq!(
         LoadBalancerCache::get_hash_on_strategy_for_selection_from(
             &snapshot,
-            "us-subset",
+            "ferrum", "us-subset",
             None,
             Some("stable"),
         ),
@@ -1136,7 +1137,7 @@ fn test_load_balancer_cache_get_subset_hash_on_strategy() {
     assert_eq!(
         LoadBalancerCache::get_hash_on_strategy_for_selection_from(
             &snapshot,
-            "us-subset",
+            "ferrum", "us-subset",
             None,
             Some("canary"),
         ),
@@ -1224,16 +1225,16 @@ fn port_override_lanes_use_target_policy_port_not_dial_port() {
     let snapshot = cache.load();
 
     assert!(LoadBalancerCache::has_port_override_state_from(
-        &snapshot, "u1", 80
+        &snapshot, "ferrum", "u1", 80
     ));
     assert!(LoadBalancerCache::has_port_override_state_from(
-        &snapshot, "u1", 81
+        &snapshot, "ferrum", "u1", 81
     ));
 
     let p80 =
-        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "", 80, None).unwrap();
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "", 80, None).unwrap();
     let p81 =
-        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "", 81, None).unwrap();
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "ferrum", "u1", "", 81, None).unwrap();
 
     assert_eq!(p80.target.port, 8080);
     assert_eq!(p81.target.port, 8080);
@@ -1299,13 +1300,13 @@ fn port_override_retry_exclusion_uses_policy_port_identity() {
 
     assert!(
         LoadBalancerCache::select_next_target_for_port_from(
-            &snapshot, "u1", "retry", 81, &failed, None,
+            &snapshot, "ferrum", "u1", "retry", 81, &failed, None,
         )
         .is_none(),
         "the failed target is the only target in policy lane 81"
     );
     let other_lane = LoadBalancerCache::select_next_target_for_port_from(
-        &snapshot, "u1", "retry", 80, &failed, None,
+        &snapshot, "ferrum", "u1", "retry", 80, &failed, None,
     )
     .expect("the sibling policy lane remains selectable");
     assert_eq!(other_lane.port, 8080);
@@ -1325,7 +1326,7 @@ fn retry_exclusion_returns_none_when_only_alternate_is_unhealthy() {
 
     let retry = LoadBalancerCache::select_next_target_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "retry",
         &targets[0],
         Some(&active_health_ctx(&unhealthy)),
@@ -1358,7 +1359,7 @@ fn port_retry_exclusion_returns_none_when_only_alternate_is_unhealthy() {
 
     let retry = LoadBalancerCache::select_next_target_for_port_from(
         &snapshot,
-        "u1",
+        "ferrum", "u1",
         "retry",
         8080,
         &targets[0],
@@ -1404,7 +1405,7 @@ fn test_apply_delta_remove_upstream() {
     assert!(cache.select_target("u1", "", None).is_some());
 
     let new_config = GatewayConfig::default();
-    cache.apply_delta(&new_config, &[], &["u1".to_string()], &[]);
+    cache.apply_delta(&new_config, &[], &[NamespacedResourceId::new("ferrum", "u1")], &[]);
 
     // u1 should be gone
     assert!(
@@ -1468,7 +1469,7 @@ fn test_apply_delta_mixed_add_remove_modify() {
         upstreams: vec![modified_u2.clone(), u3.clone()],
         ..Default::default()
     };
-    cache.apply_delta(&new_config, &[u3], &["u1".to_string()], &[modified_u2]);
+    cache.apply_delta(&new_config, &[u3], &[NamespacedResourceId::new("ferrum", "u1")], &[modified_u2]);
 
     assert!(
         cache.select_target("u1", "", None).is_none(),
@@ -1833,7 +1834,7 @@ fn test_passive_health_filters_targets() {
     };
 
     // Mark host1 as passively unhealthy
-    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
+    checker.report_response("ferrum", "test-proxy", &targets[1], 500, false, Some(&config));
 
     let active: DashMap<String, u64> = DashMap::new();
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
@@ -1886,9 +1887,9 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
     };
 
     // Eject 3 targets (host0, host1, host2) — exceeds 50% cap (max 2)
-    checker.report_response("test-proxy", &targets[0], 500, false, Some(&config));
-    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
-    checker.report_response("test-proxy", &targets[2], 500, false, Some(&config));
+    checker.report_response("ferrum", "test-proxy", &targets[0], 500, false, Some(&config));
+    checker.report_response("ferrum", "test-proxy", &targets[1], 500, false, Some(&config));
+    checker.report_response("ferrum", "test-proxy", &targets[2], 500, false, Some(&config));
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
     let proxy_passive = proxy_passive.expect("passive state should be created");
     proxy_passive
@@ -1954,7 +1955,7 @@ fn ejection_cap_zero_percent_readmits_all() {
 
     // Eject all 3 targets
     for t in &targets {
-        checker.report_response("test-proxy", t, 500, false, Some(&config));
+        checker.report_response("ferrum", "test-proxy", t, 500, false, Some(&config));
     }
 
     let active: DashMap<String, u64> = DashMap::new();
@@ -2013,7 +2014,7 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
     };
-    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
+    checker.report_response("ferrum", "test-proxy", &targets[1], 500, false, Some(&config));
 
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
 
@@ -2127,7 +2128,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
     let dial_decision = |ejected: &[(&UpstreamTarget, u64)]| -> bool {
         let checker = HealthChecker::new();
         for (t, _) in ejected {
-            checker.report_response("test-proxy", t, 500, false, Some(&config));
+            checker.report_response("ferrum", "test-proxy", t, 500, false, Some(&config));
         }
         let proxy_passive = checker
             .passive_health
@@ -2519,7 +2520,7 @@ fn apply_delta_preserves_subset_indices() {
     let snapshot = cache.load();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..50 {
-        let sel = LoadBalancerCache::select_target_subset_from(&snapshot, "u1", "", "canary", None)
+        let sel = LoadBalancerCache::select_target_subset_from(&snapshot, "ferrum", "u1", "", "canary", None)
             .unwrap();
         seen.insert(sel.target.host.clone());
     }
@@ -2555,12 +2556,12 @@ fn update_targets_preserves_existing_subsets() {
         path: None,
     });
 
-    cache.update_targets("u1", refreshed, LoadBalancerAlgorithm::RoundRobin, None);
+    cache.update_targets("ferrum", "u1", refreshed, LoadBalancerAlgorithm::RoundRobin, None);
 
     let snapshot = cache.load();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..90 {
-        let sel = LoadBalancerCache::select_target_subset_from(&snapshot, "u1", "", "canary", None)
+        let sel = LoadBalancerCache::select_target_subset_from(&snapshot, "ferrum", "u1", "", "canary", None)
             .unwrap();
         seen.insert(sel.target.host.clone());
     }

@@ -195,9 +195,19 @@ pub mod _test_support {
     pub fn incremental_plugin_rebuild_targets_for_test(
         current: &crate::config::types::GatewayConfig,
         candidate: &crate::config::types::GatewayConfig,
-    ) -> HashSet<String> {
+    ) -> HashSet<crate::config::db_backend::NamespacedResourceId> {
         let delta = crate::config_delta::ConfigDelta::compute(current, candidate);
         crate::proxy::plugin_rebuild_targets_for_incremental_stage(current, candidate, &delta)
+    }
+
+    /// Whether the published plugin cache still holds a proxy plugin list for
+    /// `(namespace, id)`.
+    pub fn plugin_cache_contains_proxy_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> bool {
+        cache.contains_proxy_plugins_key(namespace, proxy_id)
     }
 
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
@@ -303,7 +313,7 @@ pub mod _test_support {
         proxy_id: &str,
     ) -> GrpcWebPluginViewForTest {
         let inner = cache.load_inner();
-        let view = inner.grpc_web_request_view(proxy_id);
+        let view = inner.grpc_web_request_view("ferrum", proxy_id);
         GrpcWebPluginViewForTest {
             plugins: view
                 .plugins()

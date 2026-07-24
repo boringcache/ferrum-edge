@@ -322,7 +322,7 @@ fn test_load_balancer_cache_update_targets() {
     let cache = LoadBalancerCache::new(&config);
 
     // Verify initial state
-    let u1 = cache.get_upstream("upstream-1").unwrap();
+    let u1 = cache.get_upstream("ferrum", "upstream-1").unwrap();
     assert_eq!(u1.targets.len(), 2);
 
     // Update targets for upstream-1
@@ -331,20 +331,19 @@ fn test_load_balancer_cache_update_targets() {
         make_target("host-b", 8080),
         make_target("host-d", 8080), // new discovered target
     ];
-    cache.update_targets(
-        "upstream-1",
+    cache.update_targets("ferrum", "upstream-1",
         new_targets,
         LoadBalancerAlgorithm::RoundRobin,
         None,
     );
 
     // Verify updated state
-    let u1 = cache.get_upstream("upstream-1").unwrap();
+    let u1 = cache.get_upstream("ferrum", "upstream-1").unwrap();
     assert_eq!(u1.targets.len(), 3);
     assert_eq!(u1.targets[2].host, "host-d");
 
     // Verify upstream-2 is untouched
-    let u2 = cache.get_upstream("upstream-2").unwrap();
+    let u2 = cache.get_upstream("ferrum", "upstream-2").unwrap();
     assert_eq!(u2.targets.len(), 1);
     assert_eq!(u2.targets[0].host, "host-c");
 }
@@ -364,8 +363,7 @@ fn test_load_balancer_cache_update_targets_selection_works() {
     assert_eq!(sel.target.host, "old-host");
 
     // Update to new targets
-    cache.update_targets(
-        "up",
+    cache.update_targets("ferrum", "up",
         vec![make_target("new-host", 9090)],
         LoadBalancerAlgorithm::RoundRobin,
         None,
@@ -1570,20 +1568,19 @@ fn test_load_balancer_cache_update_targets_nonexistent_upstream() {
     let cache = LoadBalancerCache::new(&config);
 
     // Updating a non-existent upstream should not panic
-    cache.update_targets(
-        "does-not-exist",
+    cache.update_targets("ferrum", "does-not-exist",
         vec![make_target("h2", 90)],
         LoadBalancerAlgorithm::RoundRobin,
         None,
     );
 
     // Original upstream should be untouched
-    let u1 = cache.get_upstream("up-1").unwrap();
+    let u1 = cache.get_upstream("ferrum", "up-1").unwrap();
     assert_eq!(u1.targets.len(), 1);
 
     // A stale service-discovery update must not create a selectable phantom
     // balancer after the upstream has been removed from config.
-    assert!(cache.get_upstream("does-not-exist").is_none());
+    assert!(cache.get_upstream("ferrum", "does-not-exist").is_none());
     assert!(cache.select_target("does-not-exist", "key", None).is_none());
 }
 
@@ -1598,9 +1595,9 @@ fn test_load_balancer_cache_update_targets_to_empty() {
     let cache = LoadBalancerCache::new(&config);
 
     // Update to zero targets
-    cache.update_targets("up-1", vec![], LoadBalancerAlgorithm::RoundRobin, None);
+    cache.update_targets("ferrum", "up-1", vec![], LoadBalancerAlgorithm::RoundRobin, None);
 
-    let u1 = cache.get_upstream("up-1").unwrap();
+    let u1 = cache.get_upstream("ferrum", "up-1").unwrap();
     assert!(u1.targets.is_empty());
 }
 
@@ -1638,7 +1635,7 @@ async fn test_manager_start_with_mismatched_provider_skips() {
     manager.stop();
 
     // Static target should remain unchanged
-    let u = cache.get_upstream("up-mismatched").unwrap();
+    let u = cache.get_upstream("ferrum", "up-mismatched").unwrap();
     assert_eq!(u.targets.len(), 1);
     assert_eq!(u.targets[0].host, "fallback");
 }
@@ -1735,7 +1732,7 @@ async fn test_manager_start_with_mesh_missing_epoch_skips() {
     manager.start(&config, None);
     manager.stop();
 
-    let u = cache.get_upstream("up-mesh").unwrap();
+    let u = cache.get_upstream("ferrum", "up-mesh").unwrap();
     assert_eq!(u.targets.len(), 1);
     assert_eq!(u.targets[0].host, "fallback");
 }
@@ -1782,7 +1779,7 @@ async fn test_manager_mesh_discovery_populates_load_balancer() {
     let mut discovered = Vec::new();
     for _ in 0..50 {
         discovered = cache
-            .get_upstream("up-mesh")
+            .get_upstream("ferrum", "up-mesh")
             .map(|upstream| upstream.targets.clone())
             .unwrap_or_default();
         if !discovered.is_empty() {

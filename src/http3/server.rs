@@ -1639,9 +1639,9 @@ async fn handle_h3_request(
             .await?;
         }
         let logging_view = if grpc_web_response_content_type.is_some() {
-            epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+            epoch.plugin_cache.grpc_web_request_view(&proxy.namespace, &proxy.id)
         } else {
-            epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+            epoch.plugin_cache.request_view(&proxy.namespace, &proxy.id, request_protocol)
         };
         let logging_plugins = logging_view.plugins();
         log_pre_backend_rejected_request(
@@ -1688,9 +1688,9 @@ async fn handle_h3_request(
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
     let plugin_cache_view = if grpc_web_response_content_type.is_some() {
-        epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+        epoch.plugin_cache.grpc_web_request_view(&proxy.namespace, &proxy.id)
     } else {
-        epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+        epoch.plugin_cache.request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
@@ -6280,6 +6280,7 @@ async fn handle_h3_request(
                 // as a transport-level failure for CB tripping.
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
@@ -7189,7 +7190,7 @@ fn release_h3_circuit_breaker_probe_on_admission_reject(
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state
             .circuit_breaker_cache
-            .get_or_create(&proxy.id, target_key, cb_config);
+            .get_or_create(&proxy.namespace, &proxy.id, target_key, cb_config);
         cb.record_neutral(true);
     }
 }
@@ -7424,7 +7425,7 @@ pub(crate) fn inject_sticky_cookie(
             target,
         );
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, &proxy.namespace, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()

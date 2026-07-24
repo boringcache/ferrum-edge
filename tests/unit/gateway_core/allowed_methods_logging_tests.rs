@@ -18,7 +18,7 @@ fn h1_h2_allowed_methods_rejection_logs_before_request_hooks() {
         .expect("gRPC POST gate must follow allowed_methods");
     let plugin_view = region
         .find(
-            "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
+            "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.namespace, &proxy.id, request_protocol);",
         )
         .expect("full plugin-cache view must load after method admission");
     let on_request = region

@@ -551,7 +551,7 @@ fn resolve_udp_session_epoch_view(
         .clone();
     let plugins = epoch
         .plugin_cache
-        .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Udp);
+        .get_plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Udp);
     let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
         .iter()
         .filter(|p| p.requires_udp_datagram_hooks())
@@ -2378,7 +2378,7 @@ async fn start_dtls_frontend_listener(
                 };
                 let plugins = epoch
                     .plugin_cache
-                    .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Udp);
+                    .get_plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Udp);
                 let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
                     .iter()
                     .filter(|p| p.requires_udp_datagram_hooks())
@@ -2874,7 +2874,7 @@ async fn handle_dtls_client_inner(
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
     let mut cb_is_half_open_probe = false;
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        match circuit_breaker_cache.can_execute(proxy_id, cb_target_key.as_deref(), cb_config) {
+        match circuit_breaker_cache.can_execute(&proxy.namespace, proxy_id, cb_target_key.as_deref(), cb_config) {
             Ok((_cb, is_half_open_probe)) => {
                 cb_is_half_open_probe = is_half_open_probe;
             }
@@ -2910,6 +2910,7 @@ async fn handle_dtls_client_inner(
             // recover. Genuine DNS/transport failures still record a failure.
             if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -2948,6 +2949,7 @@ async fn handle_dtls_client_inner(
             Err(e) => {
                 if let Some(ref cb_config) = proxy.circuit_breaker {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         proxy_id,
                         cb_target_key.as_deref(),
                         cb_config,
@@ -2960,6 +2962,7 @@ async fn handle_dtls_client_inner(
         if let Err(e) = socket.connect(backend_addr).await {
             if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -2985,6 +2988,7 @@ async fn handle_dtls_client_inner(
             Err(e) => {
                 if let Some(ref cb_config) = proxy.circuit_breaker {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         proxy_id,
                         cb_target_key.as_deref(),
                         cb_config,
@@ -3020,6 +3024,7 @@ async fn handle_dtls_client_inner(
             Err(e) => {
                 if let Some(ref cb_config) = proxy.circuit_breaker {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         proxy_id,
                         cb_target_key.as_deref(),
                         cb_config,
@@ -3032,6 +3037,7 @@ async fn handle_dtls_client_inner(
         if let Err(e) = sock.connect(backend_addr).await {
             if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -3049,7 +3055,7 @@ async fn handle_dtls_client_inner(
 
     // Record circuit breaker success — backend connection established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        let cb = circuit_breaker_cache.get_or_create(proxy_id, cb_target_key.as_deref(), cb_config);
+        let cb = circuit_breaker_cache.get_or_create(&proxy.namespace, proxy_id, cb_target_key.as_deref(), cb_config);
         cb.record_success(cb_is_half_open_probe);
     }
 
@@ -3363,7 +3369,7 @@ async fn create_session(
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
     let mut cb_is_half_open_probe = false;
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        match circuit_breaker_cache.can_execute(proxy_id, cb_target_key.as_deref(), cb_config) {
+        match circuit_breaker_cache.can_execute(&proxy.namespace, proxy_id, cb_target_key.as_deref(), cb_config) {
             Ok((_cb, is_half_open_probe)) => {
                 cb_is_half_open_probe = is_half_open_probe;
             }
@@ -3400,6 +3406,7 @@ async fn create_session(
             // recover. Genuine DNS/transport failures still record a failure.
             if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -3436,6 +3443,7 @@ async fn create_session(
                 Err(e) => {
                     if let Some(ref cb_config) = proxy.circuit_breaker {
                         let cb = circuit_breaker_cache.get_or_create(
+                            &proxy.namespace,
                             proxy_id,
                             cb_target_key.as_deref(),
                             cb_config,
@@ -3448,6 +3456,7 @@ async fn create_session(
             if let Err(e) = socket.connect(backend_addr).await {
                 if let Some(ref cb_config) = proxy.circuit_breaker {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         proxy_id,
                         cb_target_key.as_deref(),
                         cb_config,
@@ -3474,6 +3483,7 @@ async fn create_session(
                 Err(e) => {
                     if let Some(ref cb_config) = proxy.circuit_breaker {
                         let cb = circuit_breaker_cache.get_or_create(
+                            &proxy.namespace,
                             proxy_id,
                             cb_target_key.as_deref(),
                             cb_config,
@@ -3507,6 +3517,7 @@ async fn create_session(
                 Err(e) => {
                     if let Some(ref cb_config) = proxy.circuit_breaker {
                         let cb = circuit_breaker_cache.get_or_create(
+                            &proxy.namespace,
                             proxy_id,
                             cb_target_key.as_deref(),
                             cb_config,
@@ -3519,6 +3530,7 @@ async fn create_session(
             if let Err(e) = socket.connect(backend_addr).await {
                 if let Some(ref cb_config) = proxy.circuit_breaker {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         proxy_id,
                         cb_target_key.as_deref(),
                         cb_config,
@@ -3536,7 +3548,7 @@ async fn create_session(
 
     // Record circuit breaker success — backend socket established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        let cb = circuit_breaker_cache.get_or_create(proxy_id, cb_target_key.as_deref(), cb_config);
+        let cb = circuit_breaker_cache.get_or_create(&proxy.namespace, proxy_id, cb_target_key.as_deref(), cb_config);
         cb.record_success(cb_is_half_open_probe);
     }
 
@@ -4228,7 +4240,7 @@ fn resolve_backend_target(
         // and a coincidental match with one overridden port of a mixed-port
         // upstream would silently pin selection to that port's targets.
         let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, &proxy.namespace, upstream_id);
         let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
             proxy,
             lb_snapshot,
@@ -4253,15 +4265,14 @@ fn resolve_backend_target(
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
-                upstream_id,
+                &proxy.namespace, upstream_id,
                 lb_hash_key,
                 port,
                 Some(&health_ctx),
             )
         } else {
             LoadBalancerCache::select_target_from(
-                lb_snapshot,
-                upstream_id,
+                lb_snapshot, &proxy.namespace, upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
             )
@@ -4332,7 +4343,7 @@ fn validate_stream_hash_on(
 ) -> Result<(), anyhow::Error> {
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         lb_snapshot,
-        upstream_id,
+        &proxy.namespace, upstream_id,
         Some(port),
         None,
     );

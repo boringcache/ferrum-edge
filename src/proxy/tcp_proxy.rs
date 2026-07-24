@@ -1463,7 +1463,7 @@ async fn run_tcp_accept_loop(
                     let final_proxy = epoch.proxy_by_id(&final_proxy_id);
                     let plugins = epoch
                         .plugin_cache
-                        .get_plugins_for_protocol(&final_proxy_id, ProxyProtocol::Tcp);
+                        .get_plugins_for_protocol(&proxy.namespace, &final_proxy_id, ProxyProtocol::Tcp);
                     let proxy_name = stream_ctx.proxy_name.clone();
                     let proxy_namespace = final_proxy
                         .map(|p| p.namespace.clone())
@@ -1693,6 +1693,7 @@ struct TcpConnParams {
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
 /// Includes circuit breaker config and target key for circuit breaker checks.
 struct TcpConnCbInfo {
+    namespace: String,
     cb_config: Option<crate::config::types::CircuitBreakerConfig>,
     cb_target_key: Option<String>,
     is_half_open_probe: bool,
@@ -2235,7 +2236,7 @@ async fn handle_tcp_connection_inner(
 
     let plugins = epoch
         .plugin_cache
-        .get_plugins_for_protocol(proxy_id, ProxyProtocol::Tcp);
+        .get_plugins_for_protocol(&proxy.namespace, proxy_id, ProxyProtocol::Tcp);
 
     // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
     // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
@@ -2311,6 +2312,7 @@ async fn handle_tcp_connection_inner(
         // half-open probe flag for the matching record_success/failure call.
         if let Some(ref cb_config) = cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
+                &proxy.namespace,
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2381,6 +2383,7 @@ async fn handle_tcp_connection_inner(
             Err(e) => {
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
@@ -2431,6 +2434,7 @@ async fn handle_tcp_connection_inner(
                 // traffic cannot wedge HALF_OPEN.
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
@@ -2457,6 +2461,7 @@ async fn handle_tcp_connection_inner(
                 .inspect_err(|_| {
                     if let Some(ref cb_config) = cb_info.cb_config {
                         let cb = circuit_breaker_cache.get_or_create(
+                            &proxy.namespace,
                             proxy_id,
                             cb_info.cb_target_key.as_deref(),
                             cb_config,
@@ -2536,6 +2541,7 @@ async fn handle_tcp_connection_inner(
         // Record circuit breaker outcome.
         if let Some(ref cb_config) = cb_info.cb_config {
             let cb = circuit_breaker_cache.get_or_create(
+                &proxy.namespace,
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2714,7 +2720,7 @@ async fn handle_tcp_connection_inner(
                              proxy_id: &str,
                              cb_info: &TcpConnCbInfo| {
         if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
+            let cb = cb_cache.get_or_create(&proxy.namespace, proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
             cb.record_failure(502, true, cb_info.is_half_open_probe);
         }
     };
@@ -2728,7 +2734,7 @@ async fn handle_tcp_connection_inner(
                              proxy_id: &str,
                              cb_info: &TcpConnCbInfo| {
         if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
+            let cb = cb_cache.get_or_create(&proxy.namespace, proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
             cb.record_neutral(cb_info.is_half_open_probe);
         }
     };
@@ -2756,6 +2762,7 @@ async fn handle_tcp_connection_inner(
         // for actual probe requests.
         if let Some(ref cb_config) = current_cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
+                &proxy.namespace,
                 proxy_id,
                 current_cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -3279,6 +3286,7 @@ async fn handle_tcp_connection_inner(
     // Record circuit breaker outcome based on copy result.
     if let Some(ref cb_config) = current_cb_info.cb_config {
         let cb = circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
             proxy_id,
             current_cb_info.cb_target_key.as_deref(),
             cb_config,
@@ -3375,7 +3383,7 @@ fn resolve_backend_target(
 ) -> Result<TcpResolvedBackendTarget, anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
         let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, &proxy.namespace, upstream_id);
         let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
             proxy,
             lb_snapshot,
@@ -3401,7 +3409,7 @@ fn resolve_backend_target(
             if let Some(port) = port_lane {
                 LoadBalancerCache::select_target_for_port_subset_from(
                     lb_snapshot,
-                    upstream_id,
+                    &proxy.namespace, upstream_id,
                     lb_hash_key,
                     port,
                     subset_name,
@@ -3410,7 +3418,7 @@ fn resolve_backend_target(
             } else {
                 LoadBalancerCache::select_target_subset_from(
                     lb_snapshot,
-                    upstream_id,
+                    &proxy.namespace, upstream_id,
                     lb_hash_key,
                     subset_name,
                     Some(&health_ctx),
@@ -3419,15 +3427,14 @@ fn resolve_backend_target(
         } else if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
-                upstream_id,
+                &proxy.namespace, upstream_id,
                 lb_hash_key,
                 port,
                 Some(&health_ctx),
             )
         } else {
             LoadBalancerCache::select_target_from(
-                lb_snapshot,
-                upstream_id,
+                lb_snapshot, &proxy.namespace, upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
             )
@@ -3510,7 +3517,7 @@ fn stream_port_override_affects_selection(
             || (override_config.hash_on.is_some()
                 && LoadBalancerCache::effective_algorithm_from(
                     lb_snapshot,
-                    upstream_id,
+                    &proxy.namespace, upstream_id,
                     Some(port),
                     proxy.upstream_subset.as_deref(),
                 ) == Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing));
@@ -3532,7 +3539,7 @@ fn validate_stream_hash_on(
 ) -> Result<(), anyhow::Error> {
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         lb_snapshot,
-        upstream_id,
+        &proxy.namespace, upstream_id,
         Some(port),
         proxy.upstream_subset.as_deref(),
     );
@@ -3705,7 +3712,7 @@ mod backend_target_selection_tests {
         proxy.upstream_id = Some("orders".to_string());
         let health_checker = HealthChecker::new();
         health_checker.active_unhealthy_targets.insert(
-            crate::load_balancer::target_key("orders", &unhealthy_target),
+            crate::load_balancer::target_key("ferrum|orders", &unhealthy_target),
             1,
         );
 
@@ -3732,7 +3739,7 @@ mod backend_target_selection_tests {
             unhealthy_threshold: 1,
             ..Default::default()
         };
-        health_checker.report_response(&proxy.id, &unhealthy_target, 500, false, Some(&passive));
+        health_checker.report_response(&proxy.namespace, &proxy.id, &unhealthy_target, 500, false, Some(&passive));
 
         let (host, port, _, _, _) =
             resolve_backend_target(&proxy, &snapshot, &health_checker, "192.0.2.10")
@@ -3875,7 +3882,7 @@ mod backend_target_selection_tests {
         let proxy = proxy_with_subset(None);
         let health_checker = HealthChecker::new();
         health_checker.active_unhealthy_targets.insert(
-            crate::load_balancer::target_key("orders", &unhealthy_target),
+            crate::load_balancer::target_key("ferrum|orders", &unhealthy_target),
             1,
         );
 
@@ -4586,7 +4593,7 @@ fn try_next_target(
         (Some(subset_name), Some(port)) => {
             LoadBalancerCache::select_next_target_for_port_subset_from(
                 lb_snapshot,
-                upstream_id,
+                &proxy.namespace, upstream_id,
                 lb_hash_key,
                 port,
                 subset_name,
@@ -4596,7 +4603,7 @@ fn try_next_target(
         }
         (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
             lb_snapshot,
-            upstream_id,
+            &proxy.namespace, upstream_id,
             lb_hash_key,
             subset_name,
             &exclude,
@@ -4604,7 +4611,7 @@ fn try_next_target(
         ),
         (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
             lb_snapshot,
-            upstream_id,
+            &proxy.namespace, upstream_id,
             lb_hash_key,
             port,
             &exclude,
@@ -4612,7 +4619,7 @@ fn try_next_target(
         ),
         (None, None) => LoadBalancerCache::select_next_target_from(
             lb_snapshot,
-            upstream_id,
+            &proxy.namespace, upstream_id,
             lb_hash_key,
             &exclude,
             Some(&health_ctx),

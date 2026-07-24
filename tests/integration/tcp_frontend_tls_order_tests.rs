@@ -304,7 +304,7 @@ async fn try_spawn_tcp_tls_gateway(
     };
     let plugin_cache = Arc::new(PluginCache::new(&gateway_config).expect("build plugin cache"));
     if !gateway_config.plugin_configs.is_empty() {
-        let attached = plugin_cache.get_plugins_for_protocol(PROXY_ID, ProxyProtocol::Tcp);
+        let attached = plugin_cache.get_plugins_for_protocol("ferrum", PROXY_ID, ProxyProtocol::Tcp);
         let attached_names: Vec<&str> = attached.iter().map(|p| p.name()).collect();
         for plugin_config in &gateway_config.plugin_configs {
             assert!(

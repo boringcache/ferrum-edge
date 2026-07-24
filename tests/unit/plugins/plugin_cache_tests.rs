@@ -13,6 +13,7 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
 };
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
@@ -669,7 +670,7 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
     let three_cache = PluginCache::new(&three).expect("three-instance CORS cache");
     assert_eq!(
         three_cache
-            .get_plugins("p1")
+            .get_plugins("ferrum", "p1")
             .iter()
             .map(|plugin| plugin.name())
             .collect::<Vec<_>>(),
@@ -686,7 +687,7 @@ async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_re
             vec![origin_a, origin_b],
         );
         let disjoint_cache = PluginCache::new(&disjoint).expect("disjoint CORS cache");
-        let disjoint_plugins = disjoint_cache.get_plugins("p1");
+        let disjoint_plugins = disjoint_cache.get_plugins("ferrum", "p1");
         let mut request = RequestContext::new(
             "127.0.0.1".to_string(),
             "GET".to_string(),
@@ -887,7 +888,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
             stream_delta.global_plugin_configs_changed,
         )
         .expect("delta reload must ignore stream-only interloper");
-    let last_good = cache.get_plugins("p1");
+    let last_good = cache.get_plugins("ferrum", "p1");
     assert_eq!(
         last_good
             .iter()
@@ -926,7 +927,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
         err.contains("cors instances must remain contiguous in HTTP/gRPC chains"),
         "got: {err}"
     );
-    let after_reject = cache.get_plugins("p1");
+    let after_reject = cache.get_plugins("ferrum", "p1");
     assert_eq!(after_reject.len(), last_good.len());
     assert!(Arc::ptr_eq(&after_reject[0], &last_good[0]));
 }
@@ -941,14 +942,14 @@ fn rejected_cors_reload_retains_the_last_good_snapshot() {
         ],
     );
     let cache = PluginCache::new(&valid).expect("initial CORS cache");
-    let before = cache.get_plugins("p1");
+    let before = cache.get_plugins("ferrum", "p1");
 
     let mut invalid = valid.clone();
     invalid.plugin_configs[0].config = json!({"origins": ["*"]});
     invalid.plugin_configs[0].updated_at = Utc::now();
     assert!(cache.rebuild(&invalid).is_err());
 
-    let after = cache.get_plugins("p1");
+    let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), before.len());
     assert!(Arc::ptr_eq(&after[0], &before[0]));
 }
@@ -967,7 +968,7 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
     let cache = PluginCache::new(&initial).expect("initial single-CORS cache");
     assert_eq!(
         cache
-            .get_plugins("p1")
+            .get_plugins("ferrum", "p1")
             .iter()
             .map(|plugin| plugin.name())
             .collect::<Vec<_>>(),
@@ -1255,8 +1256,8 @@ fn test_global_plugins_returned_for_all_proxies() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let p1_plugins = cache.get_plugins("p1");
-    let p2_plugins = cache.get_plugins("p2");
+    let p1_plugins = cache.get_plugins("ferrum", "p1");
+    let p2_plugins = cache.get_plugins("ferrum", "p2");
 
     assert_eq!(p1_plugins.len(), 1);
     assert_eq!(p1_plugins[0].name(), "stdout_logging");
@@ -1513,7 +1514,7 @@ fn test_api_chargeback_allows_one_instance_per_proxy_with_mixed_currency() {
     let cache = PluginCache::new(&config).expect("one chargeback per proxy is valid");
     assert_eq!(
         cache
-            .get_plugins("p1")
+            .get_plugins("ferrum", "p1")
             .iter()
             .filter(|plugin| plugin.name() == "api_chargeback")
             .count(),
@@ -1521,7 +1522,7 @@ fn test_api_chargeback_allows_one_instance_per_proxy_with_mixed_currency() {
     );
     assert_eq!(
         cache
-            .get_plugins("p2")
+            .get_plugins("ferrum", "p2")
             .iter()
             .filter(|plugin| plugin.name() == "api_chargeback")
             .count(),
@@ -1603,7 +1604,7 @@ fn test_proxy_scoped_plugins_override_globals_of_same_name() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     // Should have 1 plugin (proxy-scoped replaces global of same name)
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "stdout_logging");
@@ -1630,11 +1631,11 @@ fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
     let cache = PluginCache::new(&config).unwrap();
 
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "failed proxy-scoped optional plugin must shadow the same-name global"
     );
-    assert_eq!(cache.get_plugins("p2").len(), 1);
-    assert_eq!(cache.get_plugins("p2")[0].name(), "stdout_logging");
+    assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p2")[0].name(), "stdout_logging");
 }
 
 #[test]
@@ -1651,7 +1652,7 @@ fn test_disabled_plugins_excluded() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 0);
 }
 
@@ -1767,7 +1768,7 @@ fn test_optional_custom_plugin_validation_failure_is_omitted() {
 
     let cache = PluginCache::new(&config).expect("optional plugin failure should not abort cache");
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "failed optional custom plugin must be omitted"
     );
 }
@@ -1792,7 +1793,7 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
     let cache = PluginCache::new(&invalid)
         .expect("OptionalFailOpen must admit snapshot despite bad config");
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "invalid ws_frame_logging must be omitted from published cache"
     );
     assert!(
@@ -1813,7 +1814,7 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
     let cache = PluginCache::new(&valid).expect("empty ws_frame_logging config is valid");
     assert_eq!(
         cache
-            .get_plugins("p1")
+            .get_plugins("ferrum", "p1")
             .iter()
             .map(|plugin| plugin.name())
             .collect::<Vec<_>>(),
@@ -1845,7 +1846,7 @@ fn test_ws_frame_logging_invalid_config_is_omitted_on_admission_and_reload() {
         )
         .expect("OptionalFailOpen reload must publish by omitting the bad instance");
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "reload must omit oversized payload_preview_bytes rather than clamp"
     );
     assert!(!cache.requires_ws_frame_hooks("p1"));
@@ -1888,7 +1889,7 @@ fn test_disabled_unknown_plugin_is_ignored() {
 
     let cache = PluginCache::new(&config).expect("disabled unknown plugin should be ignored");
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "disabled plugin configs must not be instantiated"
     );
 }
@@ -1911,7 +1912,7 @@ fn test_registered_custom_plugin_is_resolved_before_unknown_rejection() {
     );
 
     let cache = PluginCache::new(&config).expect("registered custom plugin should be accepted");
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "example_plugin");
 }
@@ -1933,7 +1934,7 @@ fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance
         )],
     );
     let cache = PluginCache::new(&valid).expect("valid example plugin cache");
-    let before = cache.get_plugins("p1");
+    let before = cache.get_plugins("ferrum", "p1");
     assert_eq!(before.len(), 1);
 
     let malformed = make_config(
@@ -1951,7 +1952,7 @@ fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance
         .expect_err("malformed example config must reject cache publication");
     assert!(error.contains("example_plugin"), "got: {error}");
 
-    let after = cache.get_plugins("p1");
+    let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
     assert!(
         Arc::ptr_eq(&before[0], &after[0]),
@@ -1976,7 +1977,7 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
         )],
     );
     let cache = PluginCache::new(&valid).expect("valid response_caching must admit");
-    let before = cache.get_plugins("p1");
+    let before = cache.get_plugins("ferrum", "p1");
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].name(), "response_caching");
 
@@ -2010,7 +2011,7 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
         "reload error must path-qualify consumer typo: {error}"
     );
 
-    let after = cache.get_plugins("p1");
+    let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].name(), "response_caching");
     assert!(
@@ -2032,7 +2033,7 @@ async fn test_tcp_logging_unknown_key_reload_keeps_last_known_good() {
         )],
     );
     let cache = PluginCache::new(&valid).expect("valid tcp_logging must admit");
-    let before = cache.get_plugins("p1");
+    let before = cache.get_plugins("ferrum", "p1");
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].name(), "tcp_logging");
 
@@ -2051,7 +2052,7 @@ async fn test_tcp_logging_unknown_key_reload_keeps_last_known_good() {
         .expect_err("unknown tcp_logging key must reject cache publication");
     assert!(error.contains("config.tlls"), "got: {error}");
 
-    let after = cache.get_plugins("p1");
+    let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].name(), "tcp_logging");
     assert!(
@@ -2073,7 +2074,7 @@ fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
         )],
     );
     let cache = PluginCache::new(&valid).expect("valid compression cache");
-    let before = cache.get_plugins("p1");
+    let before = cache.get_plugins("ferrum", "p1");
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].name(), "compression");
 
@@ -2092,7 +2093,7 @@ fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
         .expect_err("unknown compression key must reject cache publication");
     assert!(error.contains("config.min_content_lenght"), "got: {error}");
 
-    let after = cache.get_plugins("p1");
+    let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
     assert!(
         Arc::ptr_eq(&before[0], &after[0]),
@@ -2128,7 +2129,7 @@ fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
         )],
     );
     let cache = PluginCache::new(&valid).expect("valid proxy_alerts cache");
-    let before = cache.get_plugins("p1");
+    let before = cache.get_plugins("ferrum", "p1");
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].name(), "proxy_alerts");
 
@@ -2164,7 +2165,7 @@ fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
         .rebuild(&malformed)
         .expect("malformed optional proxy_alerts config must not abort cache publication");
 
-    let after = cache.get_plugins("p1");
+    let after = cache.get_plugins("ferrum", "p1");
     assert!(
         after.is_empty(),
         "OptionalFailOpen must omit malformed proxy_alerts instead of retaining it"
@@ -2184,7 +2185,7 @@ fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
         )],
     );
     let cache = PluginCache::new(&config1).unwrap();
-    let pre_rebuild = cache.get_plugins("p1");
+    let pre_rebuild = cache.get_plugins("ferrum", "p1");
     assert_eq!(pre_rebuild[0].name(), "stdout_logging");
 
     let config2 = make_config(
@@ -2205,7 +2206,7 @@ fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
     assert!(err.contains("pc2"), "{err}");
     assert!(err.contains("proxy_id=p1"), "{err}");
 
-    let post_failure = cache.get_plugins("p1");
+    let post_failure = cache.get_plugins("ferrum", "p1");
     assert_eq!(post_failure.len(), 1);
     assert_eq!(post_failure[0].name(), "stdout_logging");
     assert_eq!(pre_rebuild[0].name(), "stdout_logging");
@@ -2223,7 +2224,7 @@ fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
     cache
         .rebuild(&config3)
         .expect("valid reload after a rejection should replace cache");
-    let post_success = cache.get_plugins("p1");
+    let post_success = cache.get_plugins("ferrum", "p1");
     assert_eq!(post_success.len(), 1);
     assert_eq!(post_success[0].name(), "transaction_debugger");
 }
@@ -2242,8 +2243,8 @@ fn test_rebuild_produces_updated_plugin_set() {
     );
     let cache = PluginCache::new(&config1).unwrap();
 
-    assert_eq!(cache.get_plugins("p1").len(), 1);
-    assert_eq!(cache.get_plugins("p1")[0].name(), "stdout_logging");
+    assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "stdout_logging");
 
     // Rebuild with different plugin
     let config2 = make_config(
@@ -2258,8 +2259,8 @@ fn test_rebuild_produces_updated_plugin_set() {
     );
     cache.rebuild(&config2).unwrap();
 
-    assert_eq!(cache.get_plugins("p1").len(), 1);
-    assert_eq!(cache.get_plugins("p1")[0].name(), "transaction_debugger");
+    assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "transaction_debugger");
 }
 
 #[test]
@@ -2275,7 +2276,7 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
         )],
     );
     let cache = PluginCache::new(&config1).unwrap();
-    let request_view = cache.request_view("p1", ProxyProtocol::Http);
+    let request_view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
 
     let config2 = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1", "ps2", "ps3"])],
@@ -2348,7 +2349,7 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
     audit.priority_override = Some(125);
     let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
     let cache = PluginCache::new(&config).unwrap();
-    let view = cache.request_view("p1", ProxyProtocol::Http);
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
 
     assert!(
         view.capabilities()
@@ -2362,7 +2363,7 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
     assert_eq!(view.response_committed_plugins()[0].priority(), 125);
     assert!(
         !cache
-            .request_view("missing", ProxyProtocol::Http)
+            .request_view("ferrum", "missing", ProxyProtocol::Http)
             .capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
     );
@@ -2384,13 +2385,13 @@ fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    let grpc_view = cache.request_view("ferrum", "p1", ProxyProtocol::Grpc);
     assert_eq!(grpc_view.grpc_deadline_plugins().len(), 1);
     assert_eq!(grpc_view.grpc_deadline_plugins()[0].name(), "grpc_deadline");
     assert_eq!(grpc_view.grpc_deadline_plugins()[0].priority(), 120);
     assert!(
         cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .grpc_deadline_plugins()
             .is_empty()
     );
@@ -2435,7 +2436,7 @@ fn test_request_view_precomputes_authorize_plugins() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let request_view = cache.request_view("p1", ProxyProtocol::Http);
+    let request_view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
 
     let authorize_plugins = request_view.authorize_plugins();
     let names: Vec<&str> = authorize_plugins.iter().map(|p| p.name()).collect();
@@ -2455,7 +2456,7 @@ fn test_request_view_precomputes_key_auth_header_redaction() {
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let view = cache.request_view("p1", ProxyProtocol::Http);
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
 
     assert_eq!(
         view.request_headers_to_redact().as_ref(),
@@ -2484,8 +2485,8 @@ fn test_plugins_persist_across_get_calls() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let call1 = cache.get_plugins("p1");
-    let call2 = cache.get_plugins("p1");
+    let call1 = cache.get_plugins("ferrum", "p1");
+    let call2 = cache.get_plugins("ferrum", "p1");
 
     // Same Arc pointer — same plugin instance, not a copy
     assert!(std::sync::Arc::ptr_eq(&call1[0], &call2[0]));
@@ -2506,7 +2507,7 @@ fn test_unknown_proxy_falls_back_to_globals() {
     let cache = PluginCache::new(&config).unwrap();
 
     // "unknown" proxy not in config — should get global plugins
-    let plugins = cache.get_plugins("unknown");
+    let plugins = cache.get_plugins("ferrum", "unknown");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
@@ -2529,7 +2530,7 @@ fn test_multiple_global_and_proxy_plugins() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     // 2 global + 1 proxy-scoped = 3
     assert_eq!(plugins.len(), 3);
 
@@ -3178,7 +3179,7 @@ fn test_plugins_sorted_by_priority() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 3);
     // CORS (100) < key_auth (1200) < stdout_logging (9000)
@@ -3227,7 +3228,7 @@ fn test_full_plugin_priority_chain() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
     assert_eq!(
@@ -3278,7 +3279,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
 
     assert_eq!(names, vec!["cors", "request_termination"]);
@@ -3335,7 +3336,7 @@ fn test_global_plugins_also_sorted() {
     let cache = PluginCache::new(&config).unwrap();
 
     // Even for unknown proxy (global fallback), should be sorted
-    let plugins = cache.get_plugins("unknown");
+    let plugins = cache.get_plugins("ferrum", "unknown");
     assert_eq!(plugins.len(), 2);
     assert_eq!(plugins[0].name(), "cors"); // 100
     assert_eq!(plugins[1].name(), "stdout_logging"); // 9000
@@ -3366,7 +3367,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     let rate_limiter = &plugins[0];
     assert_eq!(rate_limiter.name(), "rate_limiting");
 
@@ -3423,7 +3424,7 @@ async fn test_concurrent_get_plugins() {
     for _ in 0..10 {
         let cache = cache.clone();
         handles.push(tokio::spawn(async move {
-            let plugins = cache.get_plugins("p1");
+            let plugins = cache.get_plugins("ferrum", "p1");
             assert_eq!(plugins.len(), 1);
             assert_eq!(plugins[0].name(), "stdout_logging");
         }));
@@ -3449,7 +3450,7 @@ async fn test_rebuild_during_reads() {
     let cache = std::sync::Arc::new(PluginCache::new(&config1).unwrap());
 
     // Snapshot before rebuild
-    let pre_rebuild = cache.get_plugins("p1");
+    let pre_rebuild = cache.get_plugins("ferrum", "p1");
     assert_eq!(pre_rebuild[0].name(), "stdout_logging");
 
     // Rebuild with different plugin
@@ -3466,7 +3467,7 @@ async fn test_rebuild_during_reads() {
     cache.rebuild(&config2).unwrap();
 
     // Post-rebuild should see new plugin
-    let post_rebuild = cache.get_plugins("p1");
+    let post_rebuild = cache.get_plugins("ferrum", "p1");
     assert_eq!(post_rebuild[0].name(), "transaction_debugger");
 
     // Pre-rebuild snapshot still valid (Arc keeps it alive)
@@ -3519,14 +3520,14 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
     );
 
     let mut proxy_ids = std::collections::HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
 
     let result = cache.apply_delta(&config2, &proxy_ids, &[], false);
     assert!(
         result.is_err(),
         "apply_delta should reject invalid security plugin config"
     );
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
@@ -3571,7 +3572,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
         ],
     );
 
-    let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+    let proxy_ids = std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
     let error = cache
         .apply_delta(&config2, &proxy_ids, &[], false)
         .expect_err("unknown jwt_auth key must reject the reload");
@@ -3582,7 +3583,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
         "unexpected reload error: {error}"
     );
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
@@ -3609,7 +3610,7 @@ fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good()
     let cache = PluginCache::new(&config1).expect("valid load_testing must admit");
     assert!(
         cache
-            .get_plugins("p1")
+            .get_plugins("ferrum", "p1")
             .iter()
             .any(|plugin| plugin.name() == "load_testing"),
         "baseline cache must include load_testing"
@@ -3631,7 +3632,7 @@ fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good()
         )],
     );
 
-    let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+    let proxy_ids = std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
     let error = cache
         .apply_delta(&config2, &proxy_ids, &[], false)
         .expect_err("unknown load_testing key must reject the reload");
@@ -3640,7 +3641,7 @@ fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good()
         "unexpected reload error: {error}"
     );
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "load_testing");
     assert!(
@@ -3674,7 +3675,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
     let cache = PluginCache::new(&config1).expect("valid ai_stream_router must admit");
     assert!(
         cache
-            .get_plugins("p1")
+            .get_plugins("ferrum", "p1")
             .iter()
             .any(|plugin| plugin.name() == "ai_stream_router"),
         "baseline cache must include ai_stream_router"
@@ -3734,7 +3735,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
                 Some("p1"),
             )],
         );
-        let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+        let proxy_ids = std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
         let error = match cache.apply_delta(&config2, &proxy_ids, &[], false) {
             Err(error) => error,
             Ok(()) => panic!("{label}: unknown ai_stream_router key must reject reload"),
@@ -3746,7 +3747,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
         );
         assert!(
             cache
-                .get_plugins("p1")
+                .get_plugins("ferrum", "p1")
                 .iter()
                 .any(|plugin| plugin.name() == "ai_stream_router"),
             "{label}: rejected candidate must retain last-known-good ai_stream_router"
@@ -3793,7 +3794,7 @@ fn test_apply_delta_rejects_unknown_ai_tool_governor_keys_and_keeps_last_known_g
         )],
     );
 
-    let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+    let proxy_ids = std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
     let error = cache
         .apply_delta(&config2, &proxy_ids, &[], false)
         .expect_err("unknown ai_tool_governor key must reject the reload");
@@ -3804,7 +3805,7 @@ fn test_apply_delta_rejects_unknown_ai_tool_governor_keys_and_keeps_last_known_g
         "unexpected reload error: {message}"
     );
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "ai_tool_governor");
     assert_eq!(
@@ -3841,7 +3842,7 @@ fn test_apply_delta_rejects_unknown_mesh_route_nested_keys_and_keeps_last_known_
     let cache = PluginCache::new(&config1).expect("valid mesh_route_dispatch must admit");
     assert!(
         cache
-            .get_plugins("p1")
+            .get_plugins("ferrum", "p1")
             .iter()
             .any(|plugin| plugin.name() == "mesh_route_dispatch"),
         "baseline cache must include mesh_route_dispatch"
@@ -3878,7 +3879,7 @@ fn test_apply_delta_rejects_unknown_mesh_route_nested_keys_and_keeps_last_known_
                 Some("p1"),
             )],
         );
-        let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+        let proxy_ids = std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
         let error = cache
             .apply_delta(&config2, &proxy_ids, &[], false)
             .expect_err("unknown nested mesh_route_dispatch keys must reject the reload");
@@ -3888,7 +3889,7 @@ fn test_apply_delta_rejects_unknown_mesh_route_nested_keys_and_keeps_last_known_
         );
         assert!(
             cache
-                .get_plugins("p1")
+                .get_plugins("ferrum", "p1")
                 .iter()
                 .any(|plugin| plugin.name() == "mesh_route_dispatch"),
             "rejected candidate must retain the last-known-good mesh_route_dispatch generation"
@@ -3948,7 +3949,7 @@ fn test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cach
     );
 
     let mut proxy_ids = std::collections::HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
 
     let err = cache
         .apply_delta(&config2, &proxy_ids, &[], false)
@@ -3957,7 +3958,7 @@ fn test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cach
     assert!(err.contains("pc2"), "{err}");
     assert!(err.contains("proxy_id=p1"), "{err}");
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
@@ -3988,7 +3989,7 @@ fn test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache() {
     );
 
     let mut proxy_ids = std::collections::HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
 
     let err = cache
         .apply_delta(&config2, &proxy_ids, &[], false)
@@ -3997,7 +3998,7 @@ fn test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache() {
     assert!(err.contains("pc2"), "{err}");
     assert!(err.contains("proxy_id=p1"), "{err}");
 
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
@@ -4032,7 +4033,7 @@ fn test_apply_delta_accepts_valid_config() {
     );
 
     let mut proxy_ids = std::collections::HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
 
     let result = cache.apply_delta(&config2, &proxy_ids, &[], false);
     assert!(result.is_ok(), "apply_delta should accept valid config");
@@ -4055,8 +4056,8 @@ fn test_apply_delta_preserves_proxy_group_instance_for_unchanged_group_config() 
     );
     let cache = PluginCache::new(&config1).unwrap();
 
-    let p1_before = cache.get_plugins("p1");
-    let p2_before = cache.get_plugins("p2");
+    let p1_before = cache.get_plugins("ferrum", "p1");
+    let p2_before = cache.get_plugins("ferrum", "p2");
     let group_ptr_before = plugin_ptr_by_name(&p1_before, "rate_limiting");
     assert_eq!(
         group_ptr_before,
@@ -4087,12 +4088,12 @@ fn test_apply_delta_preserves_proxy_group_instance_for_unchanged_group_config() 
         ],
     );
     let mut proxy_ids = std::collections::HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
 
     cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
 
-    let p1_after = cache.get_plugins("p1");
-    let p2_after = cache.get_plugins("p2");
+    let p1_after = cache.get_plugins("ferrum", "p1");
+    let p2_after = cache.get_plugins("ferrum", "p2");
     assert_eq!(
         plugin_ptr_by_name(&p1_after, "rate_limiting"),
         group_ptr_before,
@@ -4122,7 +4123,7 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
         vec![alerts.clone()],
     );
     let cache = PluginCache::new(&config1).unwrap();
-    let global_before = cache.get_plugins("p1");
+    let global_before = cache.get_plugins("ferrum", "p1");
     let alerts_plugin = global_before
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
@@ -4142,10 +4143,10 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
     let mut proxy_ids = HashSet::new();
     // p1 removed; p2 unchanged so the global instance is preserved.
     cache
-        .apply_delta(&config2, &proxy_ids, &["p1".to_string()], false)
+        .apply_delta(&config2, &proxy_ids, &[NamespacedResourceId::new("ferrum", "p1")], false)
         .unwrap();
 
-    let global_after = cache.get_plugins("p2");
+    let global_after = cache.get_plugins("ferrum", "p2");
     assert_eq!(
         plugin_ptr_by_name(&global_before, "proxy_alerts"),
         plugin_ptr_by_name(&global_after, "proxy_alerts"),
@@ -4175,10 +4176,10 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
             true,
         )],
     );
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
     let recreated = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("global proxy_alerts after recreate")
@@ -4239,7 +4240,7 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
         vec![group_alerts.clone()],
     );
     let cache = PluginCache::new(&config1).unwrap();
-    let p1_before = cache.get_plugins("p1");
+    let p1_before = cache.get_plugins("ferrum", "p1");
     let group_ptr_before = plugin_ptr_by_name(&p1_before, "proxy_alerts");
     let alerts_plugin = p1_before
         .iter()
@@ -4268,12 +4269,12 @@ fn test_apply_delta_prunes_proxy_group_proxy_alerts_on_membership_churn() {
         vec![group_alerts],
     );
     let mut proxy_ids = HashSet::new();
-    proxy_ids.insert("p1b".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1b"));
     cache
-        .apply_delta(&config2, &proxy_ids, &["p1".to_string()], false)
+        .apply_delta(&config2, &proxy_ids, &[NamespacedResourceId::new("ferrum", "p1")], false)
         .unwrap();
 
-    let p2_after = cache.get_plugins("p2");
+    let p2_after = cache.get_plugins("ferrum", "p2");
     assert_eq!(
         plugin_ptr_by_name(&p2_after, "proxy_alerts"),
         group_ptr_before,
@@ -4312,7 +4313,7 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
     );
     let cache = PluginCache::new(&config1).unwrap();
     let shared = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("group proxy_alerts")
@@ -4334,7 +4335,7 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
         vec![group_alerts.clone()],
     );
     cache
-        .apply_delta(&config2, &HashSet::new(), &["p1".to_string()], false)
+        .apply_delta(&config2, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
         .unwrap();
 
     let config3 = make_config(
@@ -4345,11 +4346,11 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
         vec![group_alerts],
     );
     let mut proxy_ids = HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
 
     let after = cache
-        .get_plugins("p2")
+        .get_plugins("ferrum", "p2")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("preserved group proxy_alerts")
@@ -4397,7 +4398,7 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
     );
     let cache = PluginCache::new(&config1).unwrap();
     let shared = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("group proxy_alerts")
@@ -4424,10 +4425,10 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         vec![group_alerts.clone()],
     );
     let mut proxy_ids = HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
 
-    let p2_after = cache.get_plugins("p2");
+    let p2_after = cache.get_plugins("ferrum", "p2");
     assert_eq!(plugin_ptr_by_name(&p2_after, "proxy_alerts"), shared_ptr);
     let alerts_after = p2_after
         .iter()
@@ -4460,7 +4461,7 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
     assert_ne!(p1_left_generation, p1_rejoined_generation);
 
     let rejoined = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("rejoined group proxy_alerts")
@@ -4502,7 +4503,7 @@ fn test_apply_delta_rebuild_globals_resets_proxy_alerts_lifecycle() {
     let alerts = make_plugin_config("g-alerts", "proxy_alerts", PluginScope::Global, None, true);
     let config1 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![alerts]);
     let cache = PluginCache::new(&config1).unwrap();
-    let before = cache.get_plugins("p1");
+    let before = cache.get_plugins("ferrum", "p1");
     let alerts_before = before
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
@@ -4531,10 +4532,10 @@ fn test_apply_delta_rebuild_globals_resets_proxy_alerts_lifecycle() {
     });
     let config2 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![rebuilt]);
     let mut proxy_ids = HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config2, &proxy_ids, &[], true).unwrap();
 
-    let after = cache.get_plugins("p1");
+    let after = cache.get_plugins("ferrum", "p1");
     assert_ne!(
         plugin_ptr_by_name(&after, "proxy_alerts"),
         ptr_before,
@@ -4663,13 +4664,13 @@ fn test_apply_delta_proxy_lifecycle_high_water_survives_empty_active_set() {
 
     let empty = make_config(vec![], vec![]);
     cache
-        .apply_delta(&empty, &HashSet::new(), &["p1".to_string()], false)
+        .apply_delta(&empty, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
         .unwrap();
     assert_eq!(cache.proxy_lifecycle_generation("p1"), None);
 
     let config2 = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
     let mut proxy_ids = HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
     let p1_gen_after = cache
         .proxy_lifecycle_generation("p1")
@@ -4692,7 +4693,7 @@ fn test_apply_delta_global_proxy_alerts_generation_keyed_race_isolation() {
     );
     let cache = PluginCache::new(&config1).unwrap();
     let alerts_plugin = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("global proxy_alerts")
@@ -4709,7 +4710,7 @@ fn test_apply_delta_global_proxy_alerts_generation_keyed_race_isolation() {
     // Remove+recreate p1 while preserving the global instance.
     let config2 = make_config(vec![make_proxy("p2", "/web", vec![])], vec![alerts.clone()]);
     cache
-        .apply_delta(&config2, &HashSet::new(), &["p1".to_string()], false)
+        .apply_delta(&config2, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
         .unwrap();
     let config3 = make_config(
         vec![
@@ -4719,11 +4720,11 @@ fn test_apply_delta_global_proxy_alerts_generation_keyed_race_isolation() {
         vec![alerts],
     );
     let mut proxy_ids = HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
 
     let after = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("preserved global proxy_alerts")
@@ -4766,7 +4767,7 @@ fn test_apply_delta_proxy_group_proxy_alerts_generation_keyed_race_isolation() {
     );
     let cache = PluginCache::new(&config1).unwrap();
     let shared = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("group proxy_alerts")
@@ -4786,7 +4787,7 @@ fn test_apply_delta_proxy_group_proxy_alerts_generation_keyed_race_isolation() {
         vec![group_alerts.clone()],
     );
     cache
-        .apply_delta(&config2, &HashSet::new(), &["p1".to_string()], false)
+        .apply_delta(&config2, &HashSet::new(), &[NamespacedResourceId::new("ferrum", "p1")], false)
         .unwrap();
     let config3 = make_config(
         vec![
@@ -4796,11 +4797,11 @@ fn test_apply_delta_proxy_group_proxy_alerts_generation_keyed_race_isolation() {
         vec![group_alerts],
     );
     let mut proxy_ids = HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
 
     let after = cache
-        .get_plugins("p2")
+        .get_plugins("ferrum", "p2")
         .iter()
         .find(|plugin| plugin.name() == "proxy_alerts")
         .expect("preserved group proxy_alerts")
@@ -4835,7 +4836,7 @@ fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed()
     );
     let cache = PluginCache::new(&config1).unwrap();
 
-    let p1_before = cache.get_plugins("p1");
+    let p1_before = cache.get_plugins("ferrum", "p1");
     let held_group_plugin = Arc::clone(
         p1_before
             .iter()
@@ -4854,11 +4855,11 @@ fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed()
         )],
     );
     let mut proxy_ids = std::collections::HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
 
     cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
 
-    let p1_after_removal = cache.get_plugins("p1");
+    let p1_after_removal = cache.get_plugins("ferrum", "p1");
     assert!(
         p1_after_removal
             .iter()
@@ -4878,7 +4879,7 @@ fn test_apply_delta_prunes_proxy_group_instance_after_last_association_removed()
     );
     cache.apply_delta(&config3, &proxy_ids, &[], false).unwrap();
 
-    let p1_after_reattach = cache.get_plugins("p1");
+    let p1_after_reattach = cache.get_plugins("ferrum", "p1");
     let reattached_group_plugin = p1_after_reattach
         .iter()
         .find(|plugin| plugin.name() == "rate_limiting")
@@ -4902,9 +4903,9 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
     );
     let cache = PluginCache::new(&old_config).unwrap();
 
-    assert_eq!(cache.get_plugins("p1").len(), 1);
-    assert_eq!(cache.get_plugins("p2").len(), 1);
-    assert_eq!(cache.get_plugins("unknown").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "unknown").len(), 1);
 
     let mut proxy_scoped = make_plugin_config(
         "pc1",
@@ -4934,15 +4935,15 @@ fn test_apply_delta_global_to_proxy_scope_refreshes_all_proxy_views() {
         )
         .unwrap();
 
-    let p1_plugins = cache.get_plugins("p1");
+    let p1_plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(p1_plugins.len(), 1);
     assert_eq!(p1_plugins[0].name(), "stdout_logging");
     assert!(
-        cache.get_plugins("p2").is_empty(),
+        cache.get_plugins("ferrum", "p2").is_empty(),
         "known proxies that no longer reference the plugin must drop stale global instances"
     );
     assert!(
-        cache.get_plugins("unknown").is_empty(),
+        cache.get_plugins("ferrum", "unknown").is_empty(),
         "global fallback must drop plugins that changed away from global scope"
     );
 }
@@ -4960,8 +4961,8 @@ fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
     let p2 = make_proxy("p2", "/two", vec![]);
     let old_config = make_config(vec![p1.clone(), p2.clone()], vec![old_fault.clone()]);
     let cache = PluginCache::new(&old_config).expect("initial fault cache");
-    assert_eq!(cache.get_plugins("p1")[0].name(), "fault_injection");
-    assert!(cache.get_plugins("p2").is_empty());
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "fault_injection");
+    assert!(cache.get_plugins("ferrum", "p2").is_empty());
 
     let mut moved_from = p1;
     moved_from.plugins.clear();
@@ -4983,12 +4984,12 @@ fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
             .iter()
             .cloned()
             .collect::<HashSet<_>>(),
-        HashSet::from(["p1".to_string(), "p2".to_string()])
+        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p2")])
     );
     let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&old_config, &new_config);
     assert_eq!(
         proxy_ids,
-        HashSet::from(["p1".to_string(), "p2".to_string()])
+        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p2")])
     );
 
     cache
@@ -5001,10 +5002,10 @@ fn fault_delta_proxy_id_move_rebuilds_former_and_new_placements() {
         .expect("proxy_id move should rebuild both placements");
 
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "former proxy must not retain the moved fault plugin"
     );
-    assert_eq!(cache.get_plugins("p2")[0].name(), "fault_injection");
+    assert_eq!(cache.get_plugins("ferrum", "p2")[0].name(), "fault_injection");
 }
 
 #[test]
@@ -5047,7 +5048,7 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
     let to_group_ids = to_group.proxy_ids_needing_plugin_rebuild(&proxy_config, &group_config);
     assert_eq!(
         to_group_ids,
-        HashSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
+        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p2"), NamespacedResourceId::new("ferrum", "p3")])
     );
     cache
         .apply_delta(
@@ -5057,9 +5058,9 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
             to_group.global_plugin_configs_changed,
         )
         .expect("proxy-to-group scope move");
-    assert!(cache.get_plugins("p1").is_empty());
-    assert_eq!(cache.get_plugins("p2")[0].name(), "fault_injection");
-    assert_eq!(cache.get_plugins("p3")[0].name(), "fault_injection");
+    assert!(cache.get_plugins("ferrum", "p1").is_empty());
+    assert_eq!(cache.get_plugins("ferrum", "p2")[0].name(), "fault_injection");
+    assert_eq!(cache.get_plugins("ferrum", "p3")[0].name(), "fault_injection");
 
     let mut new_proxy = p1;
     new_proxy.plugins = vec![PluginAssociation {
@@ -5080,7 +5081,7 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
         from_group.proxy_ids_needing_plugin_rebuild(&group_config, &moved_back_config);
     assert_eq!(
         from_group_ids,
-        HashSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
+        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p2"), NamespacedResourceId::new("ferrum", "p3")])
     );
     cache
         .apply_delta(
@@ -5090,9 +5091,9 @@ fn fault_delta_scope_moves_rebuild_proxy_and_proxy_group_placements() {
             from_group.global_plugin_configs_changed,
         )
         .expect("group-to-proxy scope move");
-    assert_eq!(cache.get_plugins("p1")[0].name(), "fault_injection");
-    assert!(cache.get_plugins("p2").is_empty());
-    assert!(cache.get_plugins("p3").is_empty());
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].name(), "fault_injection");
+    assert!(cache.get_plugins("ferrum", "p2").is_empty());
+    assert!(cache.get_plugins("ferrum", "p3").is_empty());
 }
 
 #[test]
@@ -5112,7 +5113,7 @@ fn fault_delta_group_membership_move_and_removal_invalidate_former_associations(
         vec![group_fault.clone()],
     );
     let cache = PluginCache::new(&old_config).expect("initial group fault cache");
-    let unchanged_before = cache.get_plugins("p2");
+    let unchanged_before = cache.get_plugins("ferrum", "p2");
 
     let mut former_member = p1;
     former_member.plugins.clear();
@@ -5131,7 +5132,7 @@ fn fault_delta_group_membership_move_and_removal_invalidate_former_associations(
     let moved_ids = moved_delta.proxy_ids_needing_plugin_rebuild(&old_config, &moved_config);
     assert_eq!(
         moved_ids,
-        HashSet::from(["p1".to_string(), "p3".to_string()])
+        HashSet::from([NamespacedResourceId::new("ferrum", "p1"), NamespacedResourceId::new("ferrum", "p3")])
     );
     cache
         .apply_delta(
@@ -5141,9 +5142,9 @@ fn fault_delta_group_membership_move_and_removal_invalidate_former_associations(
             moved_delta.global_plugin_configs_changed,
         )
         .expect("group association move");
-    assert!(cache.get_plugins("p1").is_empty());
-    assert!(Arc::ptr_eq(&unchanged_before, &cache.get_plugins("p2")));
-    assert_eq!(cache.get_plugins("p3")[0].name(), "fault_injection");
+    assert!(cache.get_plugins("ferrum", "p1").is_empty());
+    assert!(Arc::ptr_eq(&unchanged_before, &cache.get_plugins("ferrum", "p2")));
+    assert_eq!(cache.get_plugins("ferrum", "p3")[0].name(), "fault_injection");
 
     let mut removed_proxies = moved_config.proxies.clone();
     for proxy in &mut removed_proxies {
@@ -5161,8 +5162,8 @@ fn fault_delta_group_membership_move_and_removal_invalidate_former_associations(
             removed_delta.global_plugin_configs_changed,
         )
         .expect("fault plugin removal");
-    assert!(cache.get_plugins("p2").is_empty());
-    assert!(cache.get_plugins("p3").is_empty());
+    assert!(cache.get_plugins("ferrum", "p2").is_empty());
+    assert!(cache.get_plugins("ferrum", "p3").is_empty());
 }
 
 #[test]
@@ -5182,8 +5183,8 @@ fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
         vec![fault],
     );
     let cache = PluginCache::new(&config).expect("initial priority fault cache");
-    let p1_before = cache.get_plugins("p1");
-    let p2_before = cache.get_plugins("p2");
+    let p1_before = cache.get_plugins("ferrum", "p1");
+    let p2_before = cache.get_plugins("ferrum", "p2");
 
     let unchanged = ConfigDelta::compute(&config, &config);
     assert!(unchanged.is_empty());
@@ -5192,14 +5193,14 @@ fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
             .proxy_ids_needing_plugin_rebuild(&config, &config)
             .is_empty()
     );
-    assert!(Arc::ptr_eq(&p1_before, &cache.get_plugins("p1")));
+    assert!(Arc::ptr_eq(&p1_before, &cache.get_plugins("ferrum", "p1")));
 
     let mut reprioritized = config.clone();
     reprioritized.plugin_configs[0].priority_override = Some(42);
     reprioritized.plugin_configs[0].updated_at += chrono::Duration::seconds(1);
     let delta = ConfigDelta::compute(&config, &reprioritized);
     let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&config, &reprioritized);
-    assert_eq!(proxy_ids, HashSet::from(["p1".to_string()]));
+    assert_eq!(proxy_ids, HashSet::from([NamespacedResourceId::new("ferrum", "p1")]));
     cache
         .apply_delta(
             &reprioritized,
@@ -5209,9 +5210,9 @@ fn fault_delta_priority_change_is_targeted_and_unchanged_config_is_noop() {
         )
         .expect("fault priority change");
 
-    let p1_after = cache.get_plugins("p1");
+    let p1_after = cache.get_plugins("ferrum", "p1");
     assert!(!Arc::ptr_eq(&p1_before[0], &p1_after[0]));
-    assert!(Arc::ptr_eq(&p2_before, &cache.get_plugins("p2")));
+    assert!(Arc::ptr_eq(&p2_before, &cache.get_plugins("ferrum", "p2")));
 }
 
 #[test]
@@ -5256,7 +5257,7 @@ fn fault_reconciliation_priority_change_advances_the_actual_generation() {
     assert_eq!(delta.modified_plugin_configs.len(), 1);
     assert_eq!(
         incremental_plugin_rebuild_targets_for_test(&accepted, &candidate),
-        HashSet::from(["p1".to_string()]),
+        HashSet::from([NamespacedResourceId::new("ferrum", "p1")]),
         "the staged rebuild count and targets must come from this accepted snapshot"
     );
 }
@@ -5339,11 +5340,11 @@ fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
         .unwrap();
 
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "failed proxy-scoped optional plugin must shadow the same-name global on delta reload"
     );
     assert_eq!(
-        cache.get_plugins("p2").len(),
+        cache.get_plugins("ferrum", "p2").len(),
         1,
         "unrelated proxies keep the global plugin"
     );
@@ -5401,11 +5402,11 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
         .unwrap();
 
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "failed proxy-group optional plugin must shadow the same-name global on delta reload"
     );
     assert_eq!(
-        cache.get_plugins("p2").len(),
+        cache.get_plugins("ferrum", "p2").len(),
         1,
         "unrelated proxies keep the global plugin"
     );
@@ -5440,8 +5441,8 @@ fn transaction_log_schema_only_cache_preserves_no_plugin_fast_path_for_all_proto
     );
     let cache = PluginCache::new(&config).expect("schema-only cache must build");
 
-    assert!(cache.get_plugins("p1").is_empty());
-    assert!(cache.get_plugins("unknown").is_empty());
+    assert!(cache.get_plugins("ferrum", "p1").is_empty());
+    assert!(cache.get_plugins("ferrum", "unknown").is_empty());
     for protocol in [
         ProxyProtocol::Http,
         ProxyProtocol::Grpc,
@@ -5449,8 +5450,8 @@ fn transaction_log_schema_only_cache_preserves_no_plugin_fast_path_for_all_proto
         ProxyProtocol::Tcp,
         ProxyProtocol::Udp,
     ] {
-        let first_view = cache.request_view("p1", protocol);
-        let second_view = cache.request_view("p1", protocol);
+        let first_view = cache.request_view("ferrum", "p1", protocol);
+        let second_view = cache.request_view("ferrum", "p1", protocol);
         let first_plugins = first_view.plugins();
         let second_plugins = second_view.plugins();
         assert!(
@@ -5530,7 +5531,7 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
 
     assert!(registry::lookup_named("before").is_none());
     assert!(registry::lookup_named("after").is_some());
-    assert!(cache.get_plugins("p1").is_empty());
+    assert!(cache.get_plugins("ferrum", "p1").is_empty());
     for protocol in [
         ProxyProtocol::Http,
         ProxyProtocol::Grpc,
@@ -6063,7 +6064,7 @@ fn test_plugin_cache_requires_ws_frame_hooks_apply_delta_preserves_false() {
         ],
     );
     let mut proxy_ids = std::collections::HashSet::new();
-    proxy_ids.insert("p1".to_string());
+    proxy_ids.insert(NamespacedResourceId::new("ferrum", "p1"));
     cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
 
     // Still false — neither rate_limiting nor key_auth opt into ws_frame hooks
@@ -6293,7 +6294,7 @@ fn test_multiple_same_type_proxy_plugins_both_present() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     // Both instances should be present
     assert_eq!(plugins.len(), 2);
@@ -6410,7 +6411,7 @@ fn test_proxy_scoped_plugin_removes_only_global_of_same_name() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     // Global is removed, both proxy-scoped remain = 2
     assert_eq!(plugins.len(), 2);
@@ -6439,9 +6440,9 @@ fn test_proxy_without_scoped_keeps_global() {
     let cache = PluginCache::new(&config).unwrap();
 
     // p1: proxy-scoped replaces global = 1
-    assert_eq!(cache.get_plugins("p1").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
     // p2: keeps global = 1
-    assert_eq!(cache.get_plugins("p2").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
 }
 
 #[test]
@@ -6469,7 +6470,7 @@ fn test_priority_override_changes_sort_order() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 2);
     // ps2 (priority 9000) should come first, ps1 (priority 9200) second
@@ -6492,7 +6493,7 @@ fn test_priority_override_applied_correctly() {
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
@@ -6514,7 +6515,7 @@ async fn priority_overridden_correlation_retains_owned_deadline_header() {
         vec![correlation],
     );
     let cache = PluginCache::new(&config).expect("priority-overridden correlation cache");
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 777);
 
@@ -6589,7 +6590,7 @@ async fn test_priority_override_delegates_deadline_rejection_replacement_capabil
     audit.priority_override = Some(100);
     let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
@@ -6616,7 +6617,7 @@ fn test_priority_override_delegates_spec_rejection_replacement_capability() {
         vec![plugin_config],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "spec_expose");
@@ -6641,7 +6642,7 @@ fn test_grpc_backend_path_plugins_are_precomputed_with_priority_override() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    let grpc_view = cache.request_view("ferrum", "p1", ProxyProtocol::Grpc);
     assert!(
         grpc_view
             .capabilities()
@@ -6654,7 +6655,7 @@ fn test_grpc_backend_path_plugins_are_precomputed_with_priority_override() {
     );
     assert_eq!(grpc_view.backend_path_plugins()[0].priority(), 300);
 
-    let http_view = cache.request_view("p1", ProxyProtocol::Http);
+    let http_view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
     assert!(
         !http_view
             .capabilities()
@@ -6677,7 +6678,7 @@ async fn test_priority_override_delegates_response_stream_termination_hook() {
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "request_deduplication");
@@ -6766,8 +6767,8 @@ async fn plugin_cache_wires_stable_plugin_config_id_into_dedup_logical_keys() {
 
     let first_cache = PluginCache::new(&first_gateway).unwrap();
     let second_cache = PluginCache::new(&second_gateway).unwrap();
-    let first_plugins = first_cache.get_plugins("orders");
-    let second_plugins = second_cache.get_plugins("orders");
+    let first_plugins = first_cache.get_plugins("ferrum", "orders");
+    let second_plugins = second_cache.get_plugins("ferrum", "orders");
     assert_eq!(first_plugins.len(), 2);
     assert_eq!(second_plugins.len(), 1);
     assert!(
@@ -6858,7 +6859,7 @@ fn test_priority_override_delegates_response_buffering_refinement() {
         vec![plugin_config],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
@@ -6915,7 +6916,7 @@ fn test_priority_override_delegates_request_buffering_refinement() {
         vec![plugin_config],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
@@ -6951,7 +6952,7 @@ async fn test_priority_override_delegates_context_response_body_transform() {
         vec![plugin_config],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "compression");
@@ -7040,7 +7041,7 @@ fn test_priority_override_delegates_response_header_refinement_hooks() {
         vec![transformer_config, security_config],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     let ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -7056,7 +7057,7 @@ fn test_priority_override_delegates_response_header_refinement_hooks() {
     assert!(plugins[1].may_add_response_strong_etag(&ctx, &response_headers));
 
     let policy_plugins = cache
-        .request_view("p1", ProxyProtocol::Grpc)
+        .request_view("ferrum", "p1", ProxyProtocol::Grpc)
         .initial_response_header_policy_plugins();
     assert_eq!(policy_plugins.len(), 1);
     assert_eq!(policy_plugins[0].name(), "security_headers");
@@ -7091,7 +7092,7 @@ fn test_initial_response_policy_plan_preserves_multiple_instance_priority_order(
         vec![second, first],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let view = cache.request_view("p1", ProxyProtocol::WebSocket);
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::WebSocket);
     let policy_plugins = view.initial_response_header_policy_plugins();
     let mut headers = HashMap::new();
 
@@ -7135,7 +7136,7 @@ fn test_multiple_same_type_with_different_plugins_mixed() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 3);
     let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
@@ -7154,7 +7155,7 @@ fn test_multiple_global_same_type_plugins() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 2);
     assert!(plugins.iter().all(|p| p.name() == "stdout_logging"));
@@ -7180,9 +7181,9 @@ fn test_proxy_group_plugin_shared_across_multiple_proxies() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let p1_plugins = cache.get_plugins("p1");
-    let p2_plugins = cache.get_plugins("p2");
-    let p3_plugins = cache.get_plugins("p3");
+    let p1_plugins = cache.get_plugins("ferrum", "p1");
+    let p2_plugins = cache.get_plugins("ferrum", "p2");
+    let p3_plugins = cache.get_plugins("ferrum", "p3");
 
     assert_eq!(p1_plugins.len(), 1);
     assert_eq!(p1_plugins[0].name(), "cors");
@@ -7209,8 +7210,8 @@ fn test_proxy_group_plugin_shares_same_arc_instance() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let p1_plugins = cache.get_plugins("p1");
-    let p2_plugins = cache.get_plugins("p2");
+    let p1_plugins = cache.get_plugins("ferrum", "p1");
+    let p2_plugins = cache.get_plugins("ferrum", "p2");
 
     // Both proxies should share the exact same Arc<dyn Plugin> instance
     let p1_ptr = std::sync::Arc::as_ptr(&p1_plugins[0]) as *const () as usize;
@@ -7232,8 +7233,8 @@ fn test_proxy_group_plugin_overrides_global_of_same_name() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let p1_plugins = cache.get_plugins("p1");
-    let p2_plugins = cache.get_plugins("p2");
+    let p1_plugins = cache.get_plugins("ferrum", "p1");
+    let p2_plugins = cache.get_plugins("ferrum", "p2");
 
     // p1 gets the group plugin (replaces global cors)
     assert_eq!(p1_plugins.len(), 1);
@@ -7270,11 +7271,11 @@ fn test_invalid_optional_proxy_group_plugin_still_shadows_global() {
     let cache = PluginCache::new(&config).unwrap();
 
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "failed proxy-group optional plugin must shadow the same-name global"
     );
-    assert_eq!(cache.get_plugins("p2").len(), 1);
-    assert_eq!(cache.get_plugins("p2")[0].name(), "stdout_logging");
+    assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p2")[0].name(), "stdout_logging");
 }
 
 #[test]
@@ -7289,7 +7290,7 @@ fn test_proxy_group_with_proxy_scoped_and_global() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 3);
     let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
@@ -7311,7 +7312,7 @@ fn test_disabled_proxy_group_plugin_excluded() {
         )],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 0);
 }
 
@@ -7324,7 +7325,7 @@ fn test_empty_config_produces_empty_cache() {
 
     assert_eq!(cache.proxy_count(), 0);
     // Unknown proxy falls back to globals, which are also empty
-    let plugins = cache.get_plugins("nonexistent");
+    let plugins = cache.get_plugins("ferrum", "nonexistent");
     assert_eq!(plugins.len(), 0);
     assert!(!cache.requires_response_body_buffering("nonexistent"));
     assert!(!cache.requires_request_body_buffering("nonexistent"));
@@ -7346,7 +7347,7 @@ fn test_single_proxy_single_plugin_cached() {
     let cache = PluginCache::new(&config).unwrap();
 
     assert_eq!(cache.proxy_count(), 1);
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].name(), "cors");
 }
@@ -7367,11 +7368,11 @@ fn test_multiple_proxies_with_different_plugins() {
 
     assert_eq!(cache.proxy_count(), 2);
 
-    let p1_plugins = cache.get_plugins("p1");
+    let p1_plugins = cache.get_plugins("ferrum", "p1");
     assert_eq!(p1_plugins.len(), 1);
     assert_eq!(p1_plugins[0].name(), "cors");
 
-    let p2_plugins = cache.get_plugins("p2");
+    let p2_plugins = cache.get_plugins("ferrum", "p2");
     assert_eq!(p2_plugins.len(), 1);
     assert_eq!(p2_plugins[0].name(), "rate_limiting");
 }
@@ -7394,7 +7395,7 @@ fn test_tcp_only_plugin_excluded_from_http() {
     let cache = PluginCache::new(&config).unwrap();
 
     // tcp_connection_throttle should be in the unfiltered list
-    let all = cache.get_plugins("p1");
+    let all = cache.get_plugins("ferrum", "p1");
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].name(), "tcp_connection_throttle");
 
@@ -7818,7 +7819,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
         json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0});
     replacement.plugin_configs[0].updated_at = Utc::now();
     cache
-        .apply_delta(&replacement, &HashSet::from(["p1".to_string()]), &[], false)
+        .apply_delta(&replacement, &HashSet::from([NamespacedResourceId::new("ferrum", "p1")]), &[], false)
         .unwrap();
     let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
     let mut second = make_tcp_stream_context("10.0.0.3");
@@ -8661,7 +8662,7 @@ fn test_requires_udp_datagram_hooks_flag_with_udp_rate_limiting() {
     let cache = PluginCache::new(&config).unwrap();
 
     // The unfiltered plugin list should contain udp_rate_limiting
-    let all = cache.get_plugins("p1");
+    let all = cache.get_plugins("ferrum", "p1");
     assert_eq!(all.len(), 1);
     assert!(
         all[0].requires_udp_datagram_hooks(),
@@ -8684,7 +8685,7 @@ fn test_requires_udp_datagram_hooks_false_for_non_udp_plugin() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let all = cache.get_plugins("p1");
+    let all = cache.get_plugins("ferrum", "p1");
     assert_eq!(all.len(), 1);
     assert!(
         !all[0].requires_udp_datagram_hooks(),
@@ -8753,16 +8754,16 @@ fn test_proxy_group_only_applies_to_associated_proxies() {
     let cache = PluginCache::new(&config).unwrap();
 
     // p1 and p3 should have the group plugin
-    let p1 = cache.get_plugins("p1");
+    let p1 = cache.get_plugins("ferrum", "p1");
     assert_eq!(p1.len(), 1);
     assert_eq!(p1[0].name(), "rate_limiting");
 
-    let p3 = cache.get_plugins("p3");
+    let p3 = cache.get_plugins("ferrum", "p3");
     assert_eq!(p3.len(), 1);
     assert_eq!(p3[0].name(), "rate_limiting");
 
     // p2 should have no plugins (no global, no association)
-    let p2 = cache.get_plugins("p2");
+    let p2 = cache.get_plugins("ferrum", "p2");
     assert_eq!(
         p2.len(),
         0,
@@ -8793,8 +8794,8 @@ fn test_proxy_scoped_overrides_global_for_specific_proxy_only() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let p1 = cache.get_plugins("p1");
-    let p2 = cache.get_plugins("p2");
+    let p1 = cache.get_plugins("ferrum", "p1");
+    let p2 = cache.get_plugins("ferrum", "p2");
 
     // Both should have exactly one cors plugin
     assert_eq!(p1.len(), 1);
@@ -8836,7 +8837,7 @@ fn test_request_view_contains_all_precomputed_fields() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let view = cache.request_view("p1", ProxyProtocol::Http);
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
 
     // Plugins should be filtered for HTTP protocol
     let plugins = view.plugins();
@@ -8878,7 +8879,7 @@ fn test_default_priority_used_when_no_override() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 2);
     // cors (100) should come before key_auth (1200)
@@ -8946,7 +8947,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
     assert_eq!(view.backend_path_plugins, vec!["grpc_method_router"]);
 
     let merged_names = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .filter(|plugin| {
             plugin.supported_protocols().contains(&ProxyProtocol::Http)
@@ -8987,7 +8988,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
     cache
         .apply_delta(
             &reloaded,
-            &std::collections::HashSet::from(["p1".to_string()]),
+            &std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]),
             &[],
             false,
         )
@@ -9034,7 +9035,7 @@ fn test_priority_override_reverses_default_order() {
         ],
     );
     let cache = PluginCache::new(&config).unwrap();
-    let plugins = cache.get_plugins("p1");
+    let plugins = cache.get_plugins("ferrum", "p1");
 
     assert_eq!(plugins.len(), 2);
     // key_auth (50) should now come before cors (5000)
@@ -9066,7 +9067,7 @@ fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good() {
         )],
     );
     let cache = PluginCache::new(&valid).expect("valid ai_semantic_cache must admit");
-    let last_good = cache.get_plugins("p1");
+    let last_good = cache.get_plugins("ferrum", "p1");
     assert_eq!(last_good.len(), 1);
     assert_eq!(last_good[0].name(), "ai_semantic_cache");
 
@@ -9100,7 +9101,7 @@ fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good() {
             error.contains("ai_semantic_cache: unknown configuration key(s):"),
             "unexpected reload error for {bad_config}: {error}"
         );
-        let after_reject = cache.get_plugins("p1");
+        let after_reject = cache.get_plugins("ferrum", "p1");
         assert_eq!(after_reject.len(), 1);
         assert!(
             Arc::ptr_eq(&after_reject[0], &last_good[0]),

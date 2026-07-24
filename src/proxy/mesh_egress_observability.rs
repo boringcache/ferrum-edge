@@ -54,7 +54,7 @@ impl CapturedMeshEgressLifecycle {
     ) -> Option<Self> {
         let plugins: Vec<_> = epoch
             .plugin_cache
-            .get_plugins_for_protocol(&proxy.id, protocol)
+            .get_plugins_for_protocol(&proxy.namespace, &proxy.id, protocol)
             .iter()
             .filter(|plugin| plugin.name() == WORKLOAD_METRICS_PLUGIN)
             .cloned()

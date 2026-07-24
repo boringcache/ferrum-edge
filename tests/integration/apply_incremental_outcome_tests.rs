@@ -443,7 +443,7 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
     let state = proxy_state_with_config(load());
     let plugins = state
         .plugin_cache
-        .request_view("geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "geo-proxy", ProxyProtocol::Http)
         .plugins();
     let geo = plugins
         .iter()
@@ -474,7 +474,7 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
 
     let plugins = state
         .plugin_cache
-        .request_view("geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "geo-proxy", ProxyProtocol::Http)
         .plugins();
     let geo = plugins
         .iter()
@@ -569,7 +569,7 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
 
     let plugins = state
         .plugin_cache
-        .request_view("adaptive-route-2", ProxyProtocol::Http)
+        .request_view("ferrum", "adaptive-route-2", ProxyProtocol::Http)
         .plugins();
     let geo = plugins
         .iter()
@@ -636,7 +636,7 @@ async fn incremental_preloaded_geo_handoff_normalizes_padded_db_path() {
 
     let plugins = state
         .plugin_cache
-        .request_view("geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "geo-proxy", ProxyProtocol::Http)
         .plugins();
     let geo = plugins
         .iter()
@@ -718,7 +718,7 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
     });
     let unaffected_before = state
         .plugin_cache
-        .request_view("second-geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "second-geo-proxy", ProxyProtocol::Http)
         .plugins()
         .iter()
         .find(|plugin| plugin.name() == "geo_restriction")
@@ -739,7 +739,7 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
 
     let selected_plugins = state
         .plugin_cache
-        .request_view("first-geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "first-geo-proxy", ProxyProtocol::Http)
         .plugins();
     let selected_after = selected_plugins
         .iter()
@@ -762,7 +762,7 @@ async fn incremental_geo_refresh_preserves_out_of_scope_policy_snapshot() {
 
     let plugins = state
         .plugin_cache
-        .request_view("second-geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "second-geo-proxy", ProxyProtocol::Http)
         .plugins();
     let unaffected_after = plugins
         .iter()
@@ -824,7 +824,7 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
 
     let plugins = state
         .plugin_cache
-        .request_view("geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "geo-proxy", ProxyProtocol::Http)
         .plugins();
     let geo = plugins
         .iter()
@@ -854,7 +854,7 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
 
     let plugins = state
         .plugin_cache
-        .request_view("geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "geo-proxy", ProxyProtocol::Http)
         .plugins();
     let geo = plugins
         .iter()
@@ -897,7 +897,7 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
 
     let plugins = state
         .plugin_cache
-        .request_view("geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "geo-proxy", ProxyProtocol::Http)
         .plugins();
     let geo = plugins
         .iter()
@@ -930,7 +930,7 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
 
     let plugins = state
         .plugin_cache
-        .request_view("geo-proxy", ProxyProtocol::Http)
+        .request_view("ferrum", "geo-proxy", ProxyProtocol::Http)
         .plugins();
     let geo = plugins
         .iter()
@@ -993,7 +993,7 @@ async fn dp_full_snapshot_applies_new_geo_policy_over_retained_mmdb() {
     let live_geo_plugin = |state: &ProxyState| {
         state
             .plugin_cache
-            .request_view("geo-proxy", ProxyProtocol::Http)
+            .request_view("ferrum", "geo-proxy", ProxyProtocol::Http)
             .plugins()
             .iter()
             .find(|plugin| plugin.name() == "geo_restriction")
@@ -1300,7 +1300,7 @@ async fn request_termination_invalid_reload_keeps_last_known_good_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "request_termination")
@@ -1328,7 +1328,7 @@ async fn request_termination_invalid_reload_keeps_last_known_good_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "request_termination"),
@@ -1358,7 +1358,7 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "security_headers")
@@ -1388,7 +1388,7 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "security_headers"),
@@ -1420,7 +1420,7 @@ async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "load_testing")
@@ -1452,7 +1452,7 @@ async fn load_testing_unknown_key_reload_keeps_last_known_good_generation() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "load_testing"),
@@ -1488,7 +1488,7 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "ai_stream_router")
@@ -1560,7 +1560,7 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
         assert!(
             state
                 .plugin_cache
-                .request_view("p1", ProxyProtocol::Http)
+                .request_view("ferrum", "p1", ProxyProtocol::Http)
                 .plugins()
                 .iter()
                 .any(|plugin| plugin.name() == "ai_stream_router"),
@@ -1592,7 +1592,7 @@ async fn compression_unknown_key_reload_keeps_last_known_good_generation() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "compression")
@@ -1617,7 +1617,7 @@ async fn compression_unknown_key_reload_keeps_last_known_good_generation() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "compression"),
@@ -1715,7 +1715,7 @@ async fn correlation_id_invalid_reload_keeps_last_known_good_plugin_generation()
         Some(60)
     );
 
-    let request_view = state.plugin_cache.request_view("p1", ProxyProtocol::Http);
+    let request_view = state.plugin_cache.request_view("ferrum", "p1", ProxyProtocol::Http);
     let request_plugins = request_view.plugins();
     let correlations: Vec<_> = request_plugins
         .iter()
@@ -1786,7 +1786,7 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
         serde_json::json!({"allow": ["10.0.0.0/8"]})
     );
 
-    let request_view = state.plugin_cache.request_view("p1", ProxyProtocol::Http);
+    let request_view = state.plugin_cache.request_view("ferrum", "p1", ProxyProtocol::Http);
     let mut ctx = RequestContext::new(
         "198.51.100.44".to_string(),
         "GET".to_string(),
@@ -1834,7 +1834,7 @@ async fn ai_tool_governor_unknown_key_reload_keeps_last_known_good_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "ai_tool_governor")
@@ -1866,7 +1866,7 @@ async fn ai_tool_governor_unknown_key_reload_keeps_last_known_good_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "ai_tool_governor"),
@@ -1895,7 +1895,7 @@ async fn grpc_web_typo_reload_keeps_last_known_good_expose_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "grpc_web"),
@@ -1924,7 +1924,7 @@ async fn grpc_web_typo_reload_keeps_last_known_good_expose_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "grpc_web"),
@@ -1954,7 +1954,7 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "ldap_auth")
@@ -1982,7 +1982,7 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "ldap_auth"),
@@ -2017,7 +2017,7 @@ async fn ai_transcript_audit_unknown_key_reload_keeps_last_known_good_instance()
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "ai_transcript_audit")
@@ -2055,7 +2055,7 @@ async fn ai_transcript_audit_unknown_key_reload_keeps_last_known_good_instance()
     assert!(
         state
             .plugin_cache
-            .request_view("p1", ProxyProtocol::Http)
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
             .plugins()
             .iter()
             .any(|plugin| plugin.name() == "ai_transcript_audit"),

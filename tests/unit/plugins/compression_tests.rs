@@ -4942,7 +4942,7 @@ async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
     ]);
     let cache = ferrum_edge::PluginCache::new(&seed).expect("seed compression cache");
     let compression: Vec<_> = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .filter(|p| p.name() == "compression")
         .cloned()
@@ -5007,7 +5007,7 @@ async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
         .expect("compression multi-instance reload");
 
     let after_compression: Vec<_> = cache
-        .get_plugins("p1")
+        .get_plugins("ferrum", "p1")
         .iter()
         .filter(|p| p.name() == "compression")
         .cloned()

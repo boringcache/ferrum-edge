@@ -782,7 +782,7 @@ fn resolve_wrr_vec_candidate<'a>(
 /// per-upstream) and passive (per-proxy) unhealthy target state.
 ///
 /// A target is filtered out if it appears in EITHER:
-/// - `active_unhealthy`: keyed by `upstream_id::host:port` (matches `LoadBalancer.target_keys`)
+/// - `active_unhealthy`: keyed by `namespace|upstream_id::host:port` (matches `LoadBalancer.target_keys`)
 /// - `proxy_passive`: the calling proxy's `ProxyHealthState.unhealthy` map,
 ///   keyed by plain `host:port` (matches `LoadBalancer.host_port_keys`) —
 ///   resolved once via the outer `passive_health` DashMap before calling `select_target`
@@ -1000,8 +1000,9 @@ impl LoadBalancerCacheInner {
     }
 
     #[inline]
-    pub fn get_balancer(&self, upstream_id: &str) -> Option<Arc<LoadBalancer>> {
-        self.balancers.get(upstream_id).cloned()
+    pub fn get_balancer(&self, namespace: &str, upstream_id: &str) -> Option<Arc<LoadBalancer>> {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        self.balancers.get(&key).cloned()
     }
 }
 
@@ -1046,10 +1047,14 @@ impl LoadBalancerCache {
     fn build_balancers(config: &GatewayConfig) -> HashMap<String, Arc<LoadBalancer>> {
         let mut map = HashMap::with_capacity(config.upstreams.len());
         for upstream in &config.upstreams {
+            let key = crate::config::db_backend::namespaced_runtime_key(
+                &upstream.namespace,
+                &upstream.id,
+            );
             map.insert(
-                upstream.id.clone(),
+                key.clone(),
                 Arc::new(LoadBalancer::with_subsets_and_port_overrides(
-                    &upstream.id,
+                    &key,
                     upstream.algorithm,
                     &upstream.targets,
                     upstream.hash_on.clone(),
@@ -1067,7 +1072,11 @@ impl LoadBalancerCache {
     fn build_upstream_index(config: &GatewayConfig) -> HashMap<String, Arc<Upstream>> {
         let mut map = HashMap::with_capacity(config.upstreams.len());
         for upstream in &config.upstreams {
-            map.insert(upstream.id.clone(), Arc::new(upstream.clone()));
+            let key = crate::config::db_backend::namespaced_runtime_key(
+                &upstream.namespace,
+                &upstream.id,
+            );
+            map.insert(key, Arc::new(upstream.clone()));
         }
         map
     }
@@ -1085,7 +1094,7 @@ impl LoadBalancerCache {
         current: &LoadBalancerCacheInner,
         full_new_config: &GatewayConfig,
         added: &[Upstream],
-        removed_ids: &[String],
+        removed_ids: &[crate::config::db_backend::NamespacedResourceId],
         modified: &[Upstream],
     ) -> Arc<LoadBalancerCacheInner> {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
@@ -1098,17 +1107,22 @@ impl LoadBalancerCache {
         // Clone the current map -- O(n) Arc pointer copies, no LoadBalancer cloning
         let mut new_balancers = current.balancers.clone();
 
-        // Remove deleted upstreams
-        for id in removed_ids {
-            new_balancers.remove(id);
+        // Remove deleted upstreams by namespace-qualified runtime key
+        for resource in removed_ids {
+            let key = resource.runtime_key();
+            new_balancers.remove(&key);
         }
 
         // Create fresh LoadBalancer instances only for added/modified upstreams
         for upstream in added.iter().chain(modified.iter()) {
+            let key = crate::config::db_backend::namespaced_runtime_key(
+                &upstream.namespace,
+                &upstream.id,
+            );
             new_balancers.insert(
-                upstream.id.clone(),
+                key.clone(),
                 Arc::new(LoadBalancer::with_subsets_and_port_overrides(
-                    &upstream.id,
+                    &key,
                     upstream.algorithm,
                     &upstream.targets,
                     upstream.hash_on.clone(),
@@ -1135,7 +1149,7 @@ impl LoadBalancerCache {
         &self,
         full_new_config: &GatewayConfig,
         added: &[Upstream],
-        removed_ids: &[String],
+        removed_ids: &[crate::config::db_backend::NamespacedResourceId],
         modified: &[Upstream],
     ) {
         let current = self.inner.load();
@@ -1144,10 +1158,11 @@ impl LoadBalancerCache {
         self.store_inner(inner);
     }
 
-    /// O(1) lookup of an upstream by ID from the pre-built index.
-    pub fn get_upstream(&self, upstream_id: &str) -> Option<Arc<Upstream>> {
+    /// O(1) lookup of an upstream by namespace-qualified identity from the
+    /// pre-built index.
+    pub fn get_upstream(&self, namespace: &str, upstream_id: &str) -> Option<Arc<Upstream>> {
         let inner = self.inner.load();
-        inner.upstreams.get(upstream_id).cloned()
+        Self::get_upstream_from(&inner, namespace, upstream_id)
     }
 
     /// Update the targets for a single upstream (used by service discovery).
@@ -1157,6 +1172,7 @@ impl LoadBalancerCache {
     /// with preserved round-robin counters and connection counts.
     pub fn update_targets(
         &self,
+        namespace: &str,
         upstream_id: &str,
         new_targets: Vec<UpstreamTarget>,
         algorithm: LoadBalancerAlgorithm,
@@ -1165,6 +1181,7 @@ impl LoadBalancerCache {
         let current = self.inner.load();
         self.store_inner(Self::build_update_targets_inner(
             &current,
+            namespace,
             upstream_id,
             new_targets,
             algorithm,
@@ -1174,12 +1191,14 @@ impl LoadBalancerCache {
 
     pub(crate) fn build_update_targets_inner(
         current: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         new_targets: Vec<UpstreamTarget>,
         algorithm: LoadBalancerAlgorithm,
         hash_on: Option<String>,
     ) -> Arc<LoadBalancerCacheInner> {
-        let Some(existing_upstream) = current.upstreams.get(upstream_id) else {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let Some(existing_upstream) = current.upstreams.get(&key) else {
             return Arc::new(LoadBalancerCacheInner {
                 balancers: current.balancers.clone(),
                 upstreams: current.upstreams.clone(),
@@ -1197,9 +1216,9 @@ impl LoadBalancerCache {
         let existing_locality_lb_setting = existing_upstream.locality_lb_setting.clone();
         let existing_locality_lb_strict = existing_upstream.locality_lb_strict;
         new_balancers.insert(
-            upstream_id.to_string(),
+            key.clone(),
             Arc::new(LoadBalancer::with_subsets_and_port_overrides(
-                upstream_id,
+                &key,
                 algorithm,
                 &new_targets,
                 hash_on,
@@ -1214,7 +1233,7 @@ impl LoadBalancerCache {
         let mut new_upstreams = current.upstreams.clone();
         let mut updated = (**existing_upstream).clone();
         updated.targets = new_targets;
-        new_upstreams.insert(upstream_id.to_string(), Arc::new(updated));
+        new_upstreams.insert(key, Arc::new(updated));
 
         Arc::new(LoadBalancerCacheInner {
             balancers: new_balancers,
@@ -1224,13 +1243,9 @@ impl LoadBalancerCache {
 
     /// Get the pre-parsed hash-on strategy for an upstream.
     /// Returns `HashOnStrategy::Ip` if the upstream is not found.
-    pub fn get_hash_on_strategy(&self, upstream_id: &str) -> HashOnStrategy {
+    pub fn get_hash_on_strategy(&self, namespace: &str, upstream_id: &str) -> HashOnStrategy {
         let inner = self.inner.load();
-        inner
-            .balancers
-            .get(upstream_id)
-            .map(|b| b.hash_on_strategy.clone())
-            .unwrap_or(HashOnStrategy::Ip)
+        Self::get_hash_on_strategy_from(&inner, namespace, upstream_id)
     }
 
     /// Select a target from the upstream, filtering out unhealthy targets.
@@ -1243,13 +1258,13 @@ impl LoadBalancerCache {
     /// map (per-proxy traffic failures) are filtered out.
     pub fn select_target(
         &self,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
         let inner = self.inner.load();
-        let balancer = inner.balancers.get(upstream_id)?;
-        balancer.select(ctx_key, health)
+        Self::select_target_from(&inner, namespace, upstream_id, ctx_key, health)
     }
 
     /// Load the balancers map once and return a guard for multiple lookups.
@@ -1266,11 +1281,13 @@ impl LoadBalancerCache {
     #[inline]
     pub fn get_hash_on_strategy_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
     ) -> HashOnStrategy {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         snapshot
             .balancers
-            .get(upstream_id)
+            .get(&key)
             .map(|b| b.hash_on_strategy.clone())
             .unwrap_or(HashOnStrategy::Ip)
     }
@@ -1279,12 +1296,14 @@ impl LoadBalancerCache {
     #[inline]
     pub fn get_hash_on_strategy_for_port_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         port: u16,
     ) -> HashOnStrategy {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         snapshot
             .balancers
-            .get(upstream_id)
+            .get(&key)
             .map(|b| b.hash_on_strategy_for_port(port))
             .unwrap_or(HashOnStrategy::Ip)
     }
@@ -1295,13 +1314,15 @@ impl LoadBalancerCache {
     #[inline]
     pub fn get_hash_on_strategy_for_selection_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         port: Option<u16>,
         subset_name: Option<&str>,
     ) -> HashOnStrategy {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         snapshot
             .balancers
-            .get(upstream_id)
+            .get(&key)
             .map(|b| b.hash_on_strategy_for_selection(port, subset_name))
             .unwrap_or(HashOnStrategy::Ip)
     }
@@ -1312,11 +1333,13 @@ impl LoadBalancerCache {
     #[inline]
     pub fn initial_dispatch_port_override_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
     ) -> u16 {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         snapshot
             .balancers
-            .get(upstream_id)
+            .get(&key)
             .map(|b| b.initial_dispatch_port_override)
             .unwrap_or(0)
     }
@@ -1328,32 +1351,38 @@ impl LoadBalancerCache {
     #[inline]
     pub fn has_port_override_state_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         port: u16,
     ) -> bool {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         snapshot
             .balancers
-            .get(upstream_id)
+            .get(&key)
             .is_some_and(|b| b.has_port_override_state(port))
     }
 
     #[inline]
     pub fn get_upstream_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
     ) -> Option<Arc<Upstream>> {
-        snapshot.upstreams.get(upstream_id).cloned()
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        snapshot.upstreams.get(&key).cloned()
     }
 
     /// Select a target from a pre-loaded snapshot.
     #[inline]
     pub fn select_target_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select(ctx_key, health)
     }
 
@@ -1361,12 +1390,14 @@ impl LoadBalancerCache {
     #[inline]
     pub fn select_target_for_port_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         port: u16,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select_for_port(ctx_key, port, health)
     }
 
@@ -1375,12 +1406,14 @@ impl LoadBalancerCache {
     #[inline]
     pub fn select_target_subset_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         subset_name: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select_from_subset(ctx_key, subset_name, health)
     }
 
@@ -1388,13 +1421,15 @@ impl LoadBalancerCache {
     #[inline]
     pub fn select_target_for_port_subset_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         port: u16,
         subset_name: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select_for_port_from_subset(ctx_key, port, subset_name, health)
     }
 
@@ -1404,13 +1439,15 @@ impl LoadBalancerCache {
     #[inline]
     pub fn effective_algorithm_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         port: Option<u16>,
         subset_name: Option<&str>,
     ) -> Option<LoadBalancerAlgorithm> {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         snapshot
             .balancers
-            .get(upstream_id)
+            .get(&key)
             .map(|b| b.effective_algorithm(port, subset_name))
     }
 
@@ -1420,66 +1457,75 @@ impl LoadBalancerCache {
     #[inline]
     pub fn select_passthrough_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         orig_dst: std::net::SocketAddr,
         port: Option<u16>,
         subset_name: Option<&str>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select_passthrough(orig_dst, port, subset_name, health)
     }
 
     /// Select next target, excluding a previously tried target (for retries).
     pub fn select_next_target(
         &self,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         let inner = self.inner.load();
-        let balancer = inner.balancers.get(upstream_id)?;
-        balancer.select_excluding(ctx_key, exclude, health)
+        Self::select_next_target_from(&inner, namespace, upstream_id, ctx_key, exclude, health)
     }
 
     pub fn select_next_target_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select_excluding(ctx_key, exclude, health)
     }
 
     pub fn select_next_target_for_port_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         port: u16,
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select_excluding_for_port(ctx_key, port, exclude, health)
     }
 
     pub fn select_next_target_subset_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         subset_name: &str,
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select_excluding_from_subset(ctx_key, subset_name, exclude, health)
     }
 
     pub fn select_next_target_for_port_subset_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         ctx_key: &str,
         port: u16,
@@ -1487,18 +1533,21 @@ impl LoadBalancerCache {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let balancer = snapshot.balancers.get(upstream_id)?;
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let balancer = snapshot.balancers.get(&key)?;
         balancer.select_excluding_for_port_from_subset(ctx_key, port, subset_name, exclude, health)
     }
 
     #[inline]
     pub fn max_ejection_percent_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
     ) -> Option<u8> {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         snapshot
             .upstreams
-            .get(upstream_id)
+            .get(&key)
             .and_then(|u| u.health_checks.as_ref())
             .and_then(|hc| hc.passive.as_ref())
             .and_then(|p| p.max_ejection_percent)
@@ -1507,11 +1556,12 @@ impl LoadBalancerCache {
     #[inline]
     pub fn max_ejection_percent_for_port_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         proxy: &Proxy,
         port: u16,
     ) -> Option<u8> {
-        if Self::has_port_override_state_from(snapshot, upstream_id, port)
+        if Self::has_port_override_state_from(snapshot, namespace, upstream_id, port)
             && let Some(port_passive) = proxy
                 .dispatch_port_overrides
                 .as_ref()
@@ -1521,7 +1571,7 @@ impl LoadBalancerCache {
             return port_passive.max_ejection_percent;
         }
 
-        Self::max_ejection_percent_from(snapshot, upstream_id)
+        Self::max_ejection_percent_from(snapshot, namespace, upstream_id)
     }
 
     /// Resolve the passive-health `maxEjectionPercent` cap for a dispatch using
@@ -1567,6 +1617,7 @@ impl LoadBalancerCache {
     #[inline]
     pub fn max_ejection_percent_resolved_from(
         snapshot: &LoadBalancerCacheInner,
+        namespace: &str,
         upstream_id: &str,
         proxy: &Proxy,
         port: Option<u16>,
@@ -1574,7 +1625,7 @@ impl LoadBalancerCache {
         // Per-port tier: a live override lane whose `passive_health_check` is
         // present wins wholesale (its cap may be `None`).
         if let Some(port) = port
-            && Self::has_port_override_state_from(snapshot, upstream_id, port)
+            && Self::has_port_override_state_from(snapshot, namespace, upstream_id, port)
             && let Some(port_passive) = proxy
                 .dispatch_port_overrides
                 .as_ref()
@@ -1588,10 +1639,11 @@ impl LoadBalancerCache {
         // `outlierDetection` overlay wins wholesale over the upstream level
         // (mirrors how `passive_health_for_target` reaches the subset overlay
         // via `resolved_subset_tls`).
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
         if let Some(subset) = proxy.upstream_subset.as_deref()
             && let Some(subset_passive) = snapshot
                 .upstreams
-                .get(upstream_id)
+                .get(&key)
                 .and_then(|u| u.resolved_subset_tls.get(subset))
                 .and_then(|resolved| resolved.passive_health_check.as_ref())
         {
@@ -1599,7 +1651,7 @@ impl LoadBalancerCache {
         }
 
         // Upstream tier.
-        Self::max_ejection_percent_from(snapshot, upstream_id)
+        Self::max_ejection_percent_from(snapshot, namespace, upstream_id)
     }
 
     /// Snapshot of active connection counts per upstream for metrics.
@@ -1622,17 +1674,29 @@ impl LoadBalancerCache {
     }
 
     /// Record that a connection was opened to a target (for least-connections).
-    pub fn record_connection_start(&self, upstream_id: &str, target: &UpstreamTarget) {
+    pub fn record_connection_start(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+    ) {
         let inner = self.inner.load();
-        if let Some(balancer) = inner.balancers.get(upstream_id) {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        if let Some(balancer) = inner.balancers.get(&key) {
             balancer.record_connection_start(target);
         }
     }
 
     /// Record that a connection was closed to a target (for least-connections).
-    pub fn record_connection_end(&self, upstream_id: &str, target: &UpstreamTarget) {
+    pub fn record_connection_end(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+    ) {
         let inner = self.inner.load();
-        if let Some(balancer) = inner.balancers.get(upstream_id) {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        if let Some(balancer) = inner.balancers.get(&key) {
             balancer.record_connection_end(target);
         }
     }
@@ -1647,9 +1711,16 @@ impl LoadBalancerCache {
     /// - **Active path**: `health_check.rs` after each successful probe RTT
     /// - **Passive path**: `proxy/mod.rs` after each successful non-5xx backend
     ///   response (TTFB) -- only when no active health checks are configured
-    pub fn record_latency(&self, upstream_id: &str, target: &UpstreamTarget, latency_us: u64) {
+    pub fn record_latency(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+        latency_us: u64,
+    ) {
         let inner = self.inner.load();
-        if let Some(balancer) = inner.balancers.get(upstream_id) {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        if let Some(balancer) = inner.balancers.get(&key) {
             balancer.record_latency(target, latency_us);
         }
     }
@@ -1657,18 +1728,25 @@ impl LoadBalancerCache {
     /// Reset the latency EWMA for a target to the current minimum among healthy
     /// targets. Called when a target recovers from unhealthy status so it gets a
     /// fair chance at traffic instead of being penalized by a stale high EWMA.
-    pub fn reset_recovered_target_latency(&self, upstream_id: &str, target: &UpstreamTarget) {
+    pub fn reset_recovered_target_latency(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+    ) {
         let inner = self.inner.load();
-        if let Some(balancer) = inner.balancers.get(upstream_id) {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        if let Some(balancer) = inner.balancers.get(&key) {
             balancer.reset_recovered_target_latency(target);
         }
     }
 }
 
-/// Build a health-check-scoped key ("upstream_id::host:port") for a target.
-/// Used by `LoadBalancer::target_keys` and `HealthChecker` to scope health
-/// state per-upstream, preventing cross-upstream contamination when different
-/// upstreams contain overlapping host:port targets.
+/// Build a health-check-scoped key for a target.
+///
+/// Pass a namespace-qualified upstream identity (`namespace|upstream_id`) so
+/// active health state cannot collide across tenants that reuse the same id.
+/// Used by `LoadBalancer::target_keys` and `HealthChecker`.
 pub fn target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
     let mut key = String::with_capacity(upstream_id.len() + 2 + target.host.len() + 6);
     key.push_str(upstream_id);

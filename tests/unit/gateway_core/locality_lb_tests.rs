@@ -120,7 +120,7 @@ fn locality_priority_prefers_exact_tier() {
     for i in 0..8 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("ctx-{i}"),
             no_health(),
         )
@@ -145,14 +145,14 @@ fn locality_priority_falls_back_to_zone_when_exact_unhealthy() {
     let cache = LoadBalancerCache::new(&config(upstream));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &exact), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
         max_ejection_percent: None,
     };
 
-    let selection = LoadBalancerCache::select_target_from(&snapshot, "u1", "ctx", Some(&health))
+    let selection = LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "ctx", Some(&health))
         .expect("target selected");
 
     assert_eq!(selection.target.host, "same-zone.local");
@@ -175,15 +175,15 @@ fn locality_priority_falls_back_to_region_when_zone_unavailable() {
     let cache = LoadBalancerCache::new(&config(upstream));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &exact), 1);
-    active_unhealthy.insert(target_key("u1", &zone), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &zone), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
         max_ejection_percent: None,
     };
 
-    let selection = LoadBalancerCache::select_target_from(&snapshot, "u1", "ctx", Some(&health))
+    let selection = LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "ctx", Some(&health))
         .expect("target selected");
 
     assert_eq!(selection.target.host, "same-region.local");
@@ -210,16 +210,16 @@ fn locality_priority_falls_back_to_any_when_all_preferred_tiers_unhealthy() {
     let cache = LoadBalancerCache::new(&config(upstream));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &exact), 1);
-    active_unhealthy.insert(target_key("u1", &zone), 1);
-    active_unhealthy.insert(target_key("u1", &region), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &zone), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &region), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
         max_ejection_percent: None,
     };
 
-    let selection = LoadBalancerCache::select_target_from(&snapshot, "u1", "ctx", Some(&health))
+    let selection = LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "ctx", Some(&health))
         .expect("target selected");
     assert_eq!(selection.target.host, "other.local");
     assert!(!selection.is_fallback);
@@ -243,7 +243,7 @@ fn locality_priority_targets_without_locality_treated_as_no_preference() {
 
     for i in 0..8 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("a-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("a-{i}"), no_health())
                 .expect("target selected");
         assert_eq!(
             selection.target.host, "exact.local",
@@ -254,13 +254,13 @@ fn locality_priority_targets_without_locality_treated_as_no_preference() {
     // Knock the exact target out — unannotated should now be reachable as
     // the residual fallback (no rank 0/1/2 candidates left).
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &exact), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
         max_ejection_percent: None,
     };
-    let selection = LoadBalancerCache::select_target_from(&snapshot, "u1", "fb", Some(&health))
+    let selection = LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "fb", Some(&health))
         .expect("target selected");
     assert_eq!(selection.target.host, "unannotated.local");
 }
@@ -298,7 +298,7 @@ fn locality_priority_applies_inside_subset_selection() {
     for i in 0..6 {
         let selection = LoadBalancerCache::select_target_subset_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("k-{i}"),
             "v1",
             no_health(),
@@ -329,7 +329,7 @@ fn locality_priority_applies_inside_port_override_selection() {
     for i in 0..6 {
         let selection = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("p-{i}"),
             8080,
             no_health(),
@@ -370,7 +370,7 @@ fn locality_priority_applies_to_port_subset_selection() {
     for i in 0..6 {
         let selection = LoadBalancerCache::select_target_for_port_subset_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("ps-{i}"),
             8080,
             "v1",
@@ -396,7 +396,7 @@ fn locality_priority_applies_when_excluding_a_target() {
     let snapshot = cache.load();
 
     let next =
-        LoadBalancerCache::select_next_target_from(&snapshot, "u1", "rk", &exact, no_health())
+        LoadBalancerCache::select_next_target_from(&snapshot, "ferrum", "u1", "rk", &exact, no_health())
             .expect("retry selected");
     assert_eq!(
         next.host, "zone.local",
@@ -422,11 +422,11 @@ fn locality_priority_works_with_consistent_hashing() {
     let snapshot = cache.load();
 
     let preferred: HashSet<&str> = ["ex-a.local", "ex-b.local"].into_iter().collect();
-    let first = LoadBalancerCache::select_target_from(&snapshot, "u1", "hash-key", no_health())
+    let first = LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "hash-key", no_health())
         .expect("hash selection");
     assert!(preferred.contains(first.target.host.as_str()));
     for _ in 0..5 {
-        let again = LoadBalancerCache::select_target_from(&snapshot, "u1", "hash-key", no_health())
+        let again = LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "hash-key", no_health())
             .expect("hash selection");
         assert_eq!(
             again.target.host, first.target.host,
@@ -459,7 +459,7 @@ fn locality_priority_vec_fallback_path_picks_preferred_tier_above_128_targets() 
 
     for i in 0..32 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("k-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("k-{i}"), no_health())
                 .expect("vec-fallback selection");
         assert!(
             selection.target.host.starts_with("exact-"),
@@ -515,14 +515,14 @@ fn locality_priority_bitset_and_vec_paths_agree_on_preferred_set() {
     for i in 0..50 {
         let small_sel = LoadBalancerCache::select_target_from(
             &small_snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("p-{i}"),
             no_health(),
         )
         .expect("bitset selection");
         let big_sel = LoadBalancerCache::select_target_from(
             &big_snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("p-{i}"),
             no_health(),
         )
@@ -560,7 +560,7 @@ fn locality_priority_disabled_when_source_locality_absent() {
     let mut seen: HashSet<String> = HashSet::new();
     for i in 0..30 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("k-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("k-{i}"), no_health())
                 .expect("selected");
         seen.insert(selection.target.host.clone());
     }
@@ -602,7 +602,7 @@ fn seen_hosts(snapshot: &ferrum_edge::load_balancer::LoadBalancerCacheInner) -> 
     let mut seen: HashSet<String> = HashSet::new();
     for i in 0..40 {
         let selection =
-            LoadBalancerCache::select_target_from(snapshot, "u1", &format!("k-{i}"), no_health())
+            LoadBalancerCache::select_target_from(snapshot, "ferrum", "u1", &format!("k-{i}"), no_health())
                 .expect("selected");
         seen.insert(selection.target.host.clone());
     }
@@ -819,7 +819,7 @@ fn cross_cluster_unhealthy_local_fails_over_to_healthy_gateway() {
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &local), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &local), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -829,7 +829,7 @@ fn cross_cluster_unhealthy_local_fails_over_to_healthy_gateway() {
     for i in 0..8 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("xc-failover-{i}"),
             Some(&health),
         )
@@ -922,7 +922,7 @@ fn strict_locality_present_source_unchanged_priority_tier() {
 
     for i in 0..8 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("c-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("c-{i}"), no_health())
                 .expect("selected");
         assert_eq!(
             selection.target.host, "exact.local",
@@ -947,7 +947,7 @@ fn strict_locality_absent_source_falls_back_to_unhealthy_local_not_remote() {
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &local), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &local), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -957,7 +957,7 @@ fn strict_locality_absent_source_falls_back_to_unhealthy_local_not_remote() {
     for i in 0..8 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("strict-local-fallback-{i}"),
             Some(&health),
         )
@@ -991,7 +991,7 @@ fn strict_locality_vec_path_falls_back_to_unhealthy_local_not_remote() {
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
     for local in &locals {
-        active_unhealthy.insert(target_key("u1", local), 1);
+        active_unhealthy.insert(target_key("ferrum|u1", local), 1);
     }
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
@@ -1003,7 +1003,7 @@ fn strict_locality_vec_path_falls_back_to_unhealthy_local_not_remote() {
     for i in 0..8 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("strict-local-vec-fallback-{i}"),
             Some(&health),
         )
@@ -1060,7 +1060,7 @@ fn strict_locality_port_scope_falls_back_to_unhealthy_local_not_remote() {
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &local), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &local), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -1070,7 +1070,7 @@ fn strict_locality_port_scope_falls_back_to_unhealthy_local_not_remote() {
     for i in 0..8 {
         let selection = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("strict-port-fallback-{i}"),
             8080,
             Some(&health),
@@ -1113,7 +1113,7 @@ fn strict_locality_remote_only_port_scope_does_not_black_hole() {
     for i in 0..8 {
         let selection = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("strict-remote-only-port-{i}"),
             9090,
             no_health(),
@@ -1157,7 +1157,7 @@ fn strict_locality_subset_scope_falls_back_to_unhealthy_local_not_remote() {
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &local), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &local), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -1167,7 +1167,7 @@ fn strict_locality_subset_scope_falls_back_to_unhealthy_local_not_remote() {
     for i in 0..8 {
         let selection = LoadBalancerCache::select_target_subset_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("strict-subset-fallback-{i}"),
             "v1",
             Some(&health),
@@ -1197,7 +1197,7 @@ fn strict_locality_retry_excluding_only_local_fails_closed_not_remote() {
     for i in 0..8 {
         let next = LoadBalancerCache::select_next_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("strict-retry-{i}"),
             &local,
             no_health(),
@@ -1226,7 +1226,7 @@ fn strict_locality_port_retry_excluding_only_local_fails_closed_not_remote() {
     for i in 0..8 {
         let next = LoadBalancerCache::select_next_target_for_port_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("strict-port-retry-{i}"),
             8080,
             &local,
@@ -1255,7 +1255,7 @@ fn strict_locality_vec_retry_excluding_only_local_fails_closed_not_remote() {
     for i in 0..8 {
         let next = LoadBalancerCache::select_next_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("strict-vec-retry-{i}"),
             &local,
             no_health(),
@@ -1314,7 +1314,7 @@ fn locality_distribute_overrides_priority_tier_with_weights() {
     let mut by_target: HashMap<String, u32> = HashMap::new();
     for i in 0..2000 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("d-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("d-{i}"), no_health())
                 .expect("distribute selection");
         *by_target.entry(selection.target.host.clone()).or_default() += 1;
     }
@@ -1373,7 +1373,7 @@ fn locality_distribute_excludes_targets_with_zero_weight() {
 
     for i in 0..100 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("k-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("k-{i}"), no_health())
                 .expect("distribute selection");
         assert_eq!(
             selection.target.host, "east.local",
@@ -1410,7 +1410,7 @@ fn locality_distribute_treats_all_zero_endpoint_weight_locality_as_ineligible() 
     for i in 0..100 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("drained-{i}"),
             no_health(),
         )
@@ -1452,7 +1452,7 @@ fn locality_distribute_preserves_endpoint_weights_within_locality_share() {
     for i in 0..2000 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("endpoint-weight-{i}"),
             no_health(),
         )
@@ -1501,7 +1501,7 @@ fn locality_distribute_assigns_overlapping_to_localities_once() {
     for i in 0..2000 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("overlap-{i}"),
             no_health(),
         )
@@ -1552,13 +1552,13 @@ fn locality_distribute_preserves_consistent_hashing_within_selected_locality() {
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
 
-    let first = LoadBalancerCache::select_target_from(&snapshot, "u1", "sticky-user", no_health())
+    let first = LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "sticky-user", no_health())
         .expect("consistent hash distribute selection");
     assert!(first.target.host.starts_with("east-"));
 
     for _ in 0..16 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", "sticky-user", no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "sticky-user", no_health())
                 .expect("consistent hash distribute selection");
         assert_eq!(
             selection.target.host, first.target.host,
@@ -1598,13 +1598,13 @@ fn locality_distribute_vec_fallback_preserves_consistent_hashing_within_selected
     let snapshot = cache.load();
 
     let first =
-        LoadBalancerCache::select_target_from(&snapshot, "u1", "sticky-user-vec", no_health())
+        LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "sticky-user-vec", no_health())
             .expect("consistent hash distribute vec selection");
     assert!(first.target.host.starts_with("east-"));
 
     for _ in 0..16 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", "sticky-user-vec", no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "sticky-user-vec", no_health())
                 .expect("consistent hash distribute vec selection");
         assert_eq!(
             selection.target.host, first.target.host,
@@ -1639,7 +1639,7 @@ fn locality_distribute_from_terminal_wildcard_matches_source_subzone() {
     for i in 0..16 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("wild-{i}"),
             no_health(),
         )
@@ -1677,7 +1677,7 @@ fn locality_distribute_from_region_only_matches_zoned_source_locality() {
     for i in 0..16 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("region-only-{i}"),
             no_health(),
         )
@@ -1715,7 +1715,7 @@ fn locality_distribute_from_global_wildcard_matches_any_source_locality() {
     for i in 0..16 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("global-wild-{i}"),
             no_health(),
         )
@@ -1755,7 +1755,7 @@ fn locality_distribute_falls_through_when_every_weighted_target_is_unhealthy() {
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &east), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &east), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -1765,7 +1765,7 @@ fn locality_distribute_falls_through_when_every_weighted_target_is_unhealthy() {
     for i in 0..16 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("fb-{i}"),
             Some(&health),
         )
@@ -1803,7 +1803,7 @@ fn locality_distribute_vec_fallback_empty_mask_preserves_priority_tier() {
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &east), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &east), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -1813,7 +1813,7 @@ fn locality_distribute_vec_fallback_empty_mask_preserves_priority_tier() {
     for i in 0..16 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("vec-fb-{i}"),
             Some(&health),
         )
@@ -1853,7 +1853,7 @@ fn locality_distribute_no_matching_from_uses_priority_tier() {
 
     for i in 0..16 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("p-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("p-{i}"), no_health())
                 .expect("priority selection");
         assert_eq!(
             selection.target.host, "exact.local",
@@ -1894,9 +1894,9 @@ fn locality_failover_overrides_region_fallback_when_all_local_tiers_unhealthy() 
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &exact), 1);
-    active_unhealthy.insert(target_key("u1", &zone), 1);
-    active_unhealthy.insert(target_key("u1", &region), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &zone), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &region), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -1906,7 +1906,7 @@ fn locality_failover_overrides_region_fallback_when_all_local_tiers_unhealthy() 
     for i in 0..6 {
         let selection = LoadBalancerCache::select_target_from(
             &snapshot,
-            "u1",
+            "ferrum", "u1",
             &format!("k-{i}"),
             Some(&health),
         )
@@ -1941,7 +1941,7 @@ fn locality_failover_does_not_apply_when_local_tier_is_healthy() {
     let snapshot = cache.load();
     for i in 0..16 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("h-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("h-{i}"), no_health())
                 .expect("priority selection");
         assert_eq!(
             selection.target.host, "exact.local",
@@ -1974,14 +1974,14 @@ fn locality_failover_falls_through_when_failover_region_is_also_empty() {
     let cache = LoadBalancerCache::new(&config(up));
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert(target_key("u1", &exact), 1);
+    active_unhealthy.insert(target_key("ferrum|u1", &exact), 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
         max_ejection_percent: None,
     };
 
-    let selection = LoadBalancerCache::select_target_from(&snapshot, "u1", "ft", Some(&health))
+    let selection = LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "ft", Some(&health))
         .expect("fallthrough selection");
     assert_eq!(selection.target.host, "eu.local");
 }
@@ -2016,7 +2016,7 @@ fn locality_lb_enabled_false_disables_priority_distribute_and_failover() {
     let mut seen: HashSet<String> = HashSet::new();
     for i in 0..30 {
         let selection =
-            LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("k-{i}"), no_health())
+            LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", &format!("k-{i}"), no_health())
                 .expect("selected");
         seen.insert(selection.target.host.clone());
     }

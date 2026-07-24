@@ -660,6 +660,7 @@ pub(super) async fn handle_hbone_request(
             );
             if let Some(cb_config) = &proxy.circuit_breaker {
                 let cb = state.circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     &proxy.id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -694,6 +695,7 @@ pub(super) async fn handle_hbone_request(
 
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
             &proxy.id,
             cb_target_key.as_deref(),
             cb_config,
@@ -702,10 +704,11 @@ pub(super) async fn handle_hbone_request(
     }
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
         && let Some(upstream) =
-            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id)
+            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, &proxy.namespace, upstream_id)
     {
         let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
         state.health_checker.report_response(
+            &proxy.namespace,
             &proxy.id,
             target,
             StatusCode::OK.as_u16(),
