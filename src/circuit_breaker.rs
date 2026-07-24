@@ -608,8 +608,15 @@ impl CircuitBreakerCache {
     }
 
     pub fn with_max_entries(max_entries: usize) -> Self {
+        Self::with_max_entries_and_shard_amount(
+            max_entries,
+            crate::util::sharding::pool_shard_amount(0),
+        )
+    }
+
+    pub fn with_max_entries_and_shard_amount(max_entries: usize, shard_amount: usize) -> Self {
         Self {
-            breakers: DashMap::new(),
+            breakers: DashMap::with_shard_amount(shard_amount),
             entry_count: AtomicUsize::new(0),
             max_entries,
         }
