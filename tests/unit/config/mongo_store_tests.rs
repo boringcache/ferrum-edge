@@ -301,3 +301,136 @@ fn classic_renew_update_refreshes_expiry_without_touching_ownership() {
         "renew must not upsert a new lock document: {update:?}"
     );
 }
+
+#[test]
+fn same_owner_orphan_reservation_is_adoptable_cross_owner_is_conflict() {
+    use ferrum_edge::_test_support::{
+        ConsumerIdentityReservationDisposition, classify_consumer_identity_reservation,
+        consumer_identity_reservation_is_same_owner,
+        orphaned_consumer_identity_reservation_may_delete,
+    };
+
+    assert_eq!(
+        classify_consumer_identity_reservation(None, "alice"),
+        ConsumerIdentityReservationDisposition::Vacant
+    );
+    assert_eq!(
+        classify_consumer_identity_reservation(Some("alice"), "alice"),
+        ConsumerIdentityReservationDisposition::Adopted,
+        "orphaned same-owner reservation must be adoptable on retry"
+    );
+    assert_eq!(
+        classify_consumer_identity_reservation(Some("bob"), "alice"),
+        ConsumerIdentityReservationDisposition::Conflict,
+        "a different owner must never steal a live reservation"
+    );
+    assert!(consumer_identity_reservation_is_same_owner("alice", "alice"));
+    assert!(!consumer_identity_reservation_is_same_owner("bob", "alice"));
+    assert!(
+        orphaned_consumer_identity_reservation_may_delete(false),
+        "ownership proof: absent consumer doc permits orphan delete"
+    );
+    assert!(
+        !orphaned_consumer_identity_reservation_may_delete(true),
+        "ownership proof: present consumer doc must keep the reservation"
+    );
+}
+
+#[test]
+fn mongo_timeout_overrides_preserve_uri_unless_env_explicit() {
+    use ferrum_edge::_test_support::apply_mongo_timeout_overrides;
+    use mongodb::options::ClientOptions;
+    use std::time::Duration;
+
+    let mut options = ClientOptions::default();
+    options.server_selection_timeout = Some(Duration::from_millis(5_000));
+    options.connect_timeout = Some(Duration::from_millis(3_000));
+
+    apply_mongo_timeout_overrides(&mut options, None, None);
+    assert_eq!(
+        options.server_selection_timeout,
+        Some(Duration::from_millis(5_000)),
+        "URI-only serverSelectionTimeoutMS must survive when env is unset"
+    );
+    assert_eq!(
+        options.connect_timeout,
+        Some(Duration::from_millis(3_000)),
+        "URI-only connectTimeoutMS must survive when env is unset"
+    );
+
+    apply_mongo_timeout_overrides(&mut options, Some(30), Some(10));
+    assert_eq!(
+        options.server_selection_timeout,
+        Some(Duration::from_secs(30)),
+        "explicit FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS must override URI"
+    );
+    assert_eq!(
+        options.connect_timeout,
+        Some(Duration::from_secs(10)),
+        "explicit FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS must override URI"
+    );
+
+    // Driver/default path: unset options stay unset when env is also unset.
+    let mut bare = ClientOptions::default();
+    apply_mongo_timeout_overrides(&mut bare, None, None);
+    assert!(
+        bare.server_selection_timeout.is_none() && bare.connect_timeout.is_none(),
+        "defaults must not clobber absent URI timeout options"
+    );
+}
+
+#[test]
+fn metadata_replace_one_requires_exactly_one_match() {
+    use ferrum_edge::_test_support::mongo_replace_one_matched_exactly_one;
+
+    assert!(mongo_replace_one_matched_exactly_one(1));
+    assert!(
+        !mongo_replace_one_matched_exactly_one(0),
+        "zero-match replace must not be reported as a successful metadata update"
+    );
+    assert!(!mongo_replace_one_matched_exactly_one(2));
+}
+
+#[test]
+fn replace_api_spec_metadata_shortcut_checks_matched_count() {
+    let replace = mongo_method("replace_api_spec_bundle(");
+    let shortcut = replace
+        .find("Only update metadata fields on the spec doc")
+        .expect("metadata-only shortcut marker");
+    let matched = replace[shortcut..]
+        .find("mongo_replace_one_matched_exactly_one")
+        .or_else(|| replace[shortcut..].find("matched_count"))
+        .expect("metadata shortcut must verify matched_count");
+    let release = replace[shortcut..]
+        .find("release_mtls_dns_admission_leases")
+        .expect("shortcut lease release");
+    assert!(
+        matched < release,
+        "matched_count must be checked before the metadata shortcut returns success"
+    );
+}
+
+#[test]
+fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
+    let standalone = mongo_method("reserve_consumer_identity_docs_standalone(");
+    assert!(
+        standalone.contains("ensure_consumer_identity_docs_owned"),
+        "standalone reserve must same-owner-adopt on E11000"
+    );
+    assert!(
+        standalone.contains("is_duplicate_key"),
+        "standalone reserve must classify duplicate-key before adopting"
+    );
+
+    let session = mongo_method("insert_consumer_identity_docs_in_session(");
+    assert!(
+        session.contains("ensure_consumer_identity_docs_owned_in_session"),
+        "replica-set reserve must same-owner-adopt on E11000"
+    );
+
+    let migrations = mongo_method("run_migrations(");
+    assert!(
+        migrations.contains("reconcile_orphaned_consumer_identity_reservations"),
+        "startup migrations must reconcile orphaned identity reservations"
+    );
+}

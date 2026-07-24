@@ -54,8 +54,8 @@ For production with authentication, always use `?authSource=admin` (or your auth
 | `FERRUM_MONGO_APP_NAME` | (none) | App name visible in `db.currentOp()` and server logs |
 | `FERRUM_MONGO_REPLICA_SET` | (none) | Replica set name. Required for transactions and change streams |
 | `FERRUM_MONGO_AUTH_MECHANISM` | (auto) | Auth override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
-| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | `30` | How long the driver waits to find a suitable server |
-| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | `10` | TCP connection timeout per server |
+| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | (unset) | Explicit server selection timeout. Unset preserves URI/`serverSelectionTimeoutMS` (or driver default); when set, overrides the URI |
+| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | (unset) | Explicit TCP connect timeout. Unset preserves URI/`connectTimeoutMS` (or driver default); when set, overrides the URI |
 
 ### MongoDB Driver Runtime Options
 
@@ -67,8 +67,8 @@ MongoDB connection pooling and topology behavior mostly lives in the MongoDB URI
 | Minimum idle pool size | `minPoolSize` URI option | Keeps warm driver connections open. Example: `?minPoolSize=5` |
 | Idle connection age | `maxIdleTimeMS` URI option | Driver-side idle eviction. Example: `?maxIdleTimeMS=600000` |
 | Pool checkout wait | `waitQueueTimeoutMS` URI option | Driver-side wait for an available connection. |
-| Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
-| TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
+| Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
+| TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | Env override applies only when explicitly set; unset leaves the URI value (or driver default) intact. |
 | Read preference | Ignored by Ferrum's config store | Runtime config reads are forced to primary for authoritative polling consistency. |
 | TLS | `FERRUM_DB_TLS_MODE` plus certificate path env vars, or URI options such as `tls=true`, `tlsCAFile`, `tlsCertificateKeyFile` | Env mode values supported for MongoDB are `disable`, `require`, and `verify-full`. |
 | App name | `FERRUM_MONGO_APP_NAME` or `appName` URI option | Helps identify Ferrum connections in MongoDB server diagnostics. The env var overrides the URI value when set. |

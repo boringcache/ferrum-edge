@@ -2003,8 +2003,52 @@ pub mod _test_support {
         crate::plugin_cache::validate_tcp_connection_throttle_attachments(config)
     }
 
+    pub use crate::config::mongo_store::ConsumerIdentityReservationDisposition;
+
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
+    }
+
+    pub fn apply_mongo_timeout_overrides(
+        client_options: &mut mongodb::options::ClientOptions,
+        server_selection_timeout_secs: Option<u64>,
+        connect_timeout_secs: Option<u64>,
+    ) {
+        crate::config::mongo_store::apply_mongo_timeout_overrides(
+            client_options,
+            server_selection_timeout_secs,
+            connect_timeout_secs,
+        )
+    }
+
+    pub fn classify_consumer_identity_reservation(
+        existing_owner: Option<&str>,
+        claimant_consumer_id: &str,
+    ) -> ConsumerIdentityReservationDisposition {
+        crate::config::mongo_store::classify_consumer_identity_reservation(
+            existing_owner,
+            claimant_consumer_id,
+        )
+    }
+
+    pub fn consumer_identity_reservation_is_same_owner(
+        existing_owner: &str,
+        claimant_consumer_id: &str,
+    ) -> bool {
+        crate::config::mongo_store::consumer_identity_reservation_is_same_owner(
+            existing_owner,
+            claimant_consumer_id,
+        )
+    }
+
+    pub fn orphaned_consumer_identity_reservation_may_delete(consumer_doc_exists: bool) -> bool {
+        crate::config::mongo_store::orphaned_consumer_identity_reservation_may_delete(
+            consumer_doc_exists,
+        )
+    }
+
+    pub fn mongo_replace_one_matched_exactly_one(matched_count: u64) -> bool {
+        crate::config::mongo_store::mongo_replace_one_matched_exactly_one(matched_count)
     }
 
     // ── plugins/grpc_web ─────────────────────────────────────────────────────
