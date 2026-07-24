@@ -5500,12 +5500,8 @@ async fn test_unsafe_global_response_limits_decline_compression_before_buffering
         let accept_encoding = "gzip, identity;q=0";
         let mut identity_barred_ctx = make_ctx(Some(accept_encoding));
         identity_barred_ctx.max_response_body_size_bytes = limit;
-        before_proxy_with_accept_encoding(
-            &plugin,
-            &mut identity_barred_ctx,
-            Some(accept_encoding),
-        )
-        .await;
+        before_proxy_with_accept_encoding(&plugin, &mut identity_barred_ctx, Some(accept_encoding))
+            .await;
         assert!(
             !plugin.should_buffer_response_body(&identity_barred_ctx),
             "unsafe response limit {limit} must not buffer when identity is prohibited"
