@@ -805,8 +805,8 @@ impl VersionCompatError {
 /// Compatibility compares **major and minor only**. Patch, prerelease
 /// (`-rc.1`), and build metadata (`+gitsha`) differences are allowed when
 /// major.minor match. Empty and unparseable versions are rejected on both
-/// CP admission and DP ConfigUpdate processing. Heartbeats are not checked
-/// by callers (they carry no config schema contract).
+/// CP admission and every DP ConfigUpdate envelope, including heartbeats, so
+/// an incompatible peer cannot keep an otherwise-refused stream alive.
 pub fn check_peer_version_compatibility(
     local_version: &str,
     peer_version: &str,
