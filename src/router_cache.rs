@@ -51,6 +51,14 @@ const HEAD_BLEND_PERIOD: u64 = 8;
 /// panics on a zero capacity (a fixed compile-time constant, so this is an
 /// invariant, never a runtime input).
 const ROUTER_CACHE_EVICTION_RING_CAPACITY: usize = 4096;
+/// Maximum number of Count-Min Sketch cells halved per `increment` call.
+///
+/// Aging used to sweep both rows inline when `age_threshold` was crossed
+/// (~65k–131k atomic RMWs on one unlucky route lookup). Work is now amortized:
+/// each increment past an armed aging cycle processes at most this many cells.
+/// Must stay well below typical sketch width (default ≥1024 → ≥2048 cells) so
+/// no single lookup completes a full-row sweep. Exposed for unit tests.
+const CMS_AGE_CHUNK: usize = 256;
 
 /// How [`RouterCache::search_route_table`] treats direction-scoped materialized
 /// mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`). The inbound and
@@ -706,8 +714,14 @@ struct AlignedCounterRow(Vec<AtomicU8>);
 /// to estimate access frequency for cache keys. The sketch supports periodic aging
 /// (right-shift all counters by 1) to adapt to changing workloads.
 ///
+/// Aging is incremental: crossing `age_threshold` arms a pass that halves every
+/// cell across both rows, but each `increment` only processes up to
+/// [`CMS_AGE_CHUNK`] cells. That keeps route-lookup latency bounded even while
+/// the thread-local `CACHE_KEY_BUF` borrow is held on the hit path.
+///
 /// Memory: `2 * width` bytes + 64-byte alignment padding. With the default width
-/// of 8192, that is ~16 KiB + padding.
+/// of 8192, that is ~16 KiB + padding. Aging state is two `CachePadded` atomics
+/// (no extra heap).
 struct CountMinSketch {
     row0: AlignedCounterRow,
     row1: AlignedCounterRow,
@@ -716,9 +730,18 @@ struct CountMinSketch {
     total_increments: CachePadded<AtomicU64>,
     /// Age (halve all counters) after this many increments.
     age_threshold: u64,
+    /// Cells left to halve in the current aging pass (`0` = idle).
+    /// Also acts as the exclusive high-water index into the flat `[row0||row1]`
+    /// layout: claiming `n` cells ages the half-open range
+    /// `[remaining - n, remaining)`.
+    age_remaining: CachePadded<AtomicUsize>,
 }
 
 impl CountMinSketch {
+    /// Maximum cells aged per `increment` (see [`CMS_AGE_CHUNK`]).
+    #[cfg(test)]
+    const AGE_CHUNK: usize = CMS_AGE_CHUNK;
+
     /// Create a new sketch with the given width (rounded up to a power of two).
     /// `age_threshold` controls how often counters are halved (typically `cache_capacity * 4`).
     fn new(width: usize, age_threshold: u64) -> Self {
@@ -731,7 +754,20 @@ impl CountMinSketch {
             width_mask: width - 1,
             total_increments: CachePadded::new(AtomicU64::new(0)),
             age_threshold,
+            age_remaining: CachePadded::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Width of each row (power of two).
+    #[inline]
+    fn width(&self) -> usize {
+        self.width_mask + 1
+    }
+
+    /// Total cells across both rows.
+    #[inline]
+    fn total_cells(&self) -> usize {
+        self.width() * 2
     }
 
     /// Hash a key using FNV-1a with the given seed.
@@ -746,8 +782,69 @@ impl CountMinSketch {
         hash
     }
 
+    /// Arm a full aging pass if one is not already in progress.
+    ///
+    /// Concurrent callers racing at the threshold: at most one wins the CAS and
+    /// starts the pass. A threshold that fires while a pass is already running is
+    /// absorbed (skipped); production thresholds (`capacity * 4`) are far larger
+    /// than the number of increments needed to drain a pass (`2 * width / chunk`).
+    #[inline]
+    fn arm_aging(&self) {
+        let _ = self.age_remaining.compare_exchange(
+            0,
+            self.total_cells(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Halve at most [`CMS_AGE_CHUNK`] cells of an in-progress aging pass.
+    ///
+    /// Lock-free: contested claims retry the CAS. Per-call work is capped at
+    /// `CMS_AGE_CHUNK` atomic RMWs regardless of sketch width.
+    #[inline]
+    fn age_step(&self) {
+        loop {
+            let remaining = self.age_remaining.load(Ordering::Relaxed);
+            if remaining == 0 {
+                return;
+            }
+            let n = remaining.min(CMS_AGE_CHUNK);
+            match self.age_remaining.compare_exchange(
+                remaining,
+                remaining - n,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.age_cells_in_range(remaining - n, remaining);
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Right-shift cells in the flat `[row0 || row1]` index range `[start, end)`.
+    #[inline]
+    fn age_cells_in_range(&self, start: usize, end: usize) {
+        let width = self.width();
+        for flat in start..end {
+            let cell = if flat < width {
+                &self.row0.0[flat]
+            } else {
+                &self.row1.0[flat - width]
+            };
+            let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
+        }
+    }
+
     /// Increment the frequency count for a key and return the estimated count.
-    /// Triggers aging if the total increment count crosses the threshold.
+    ///
+    /// Crossing `age_threshold` arms an incremental aging pass; each call then
+    /// performs at most [`CMS_AGE_CHUNK`] cell halvings. The returned estimate is
+    /// always the post-increment, pre-aging value for this key (same as before
+    /// incremental aging).
     #[inline]
     fn increment(&self, key: &str) -> u8 {
         let h0 = Self::fnv1a(key, 0) as usize & self.width_mask;
@@ -765,16 +862,22 @@ impl CountMinSketch {
             })
             .unwrap_or(255);
 
-        // Check if we need to age
-        let total = self.total_increments.fetch_add(1, Ordering::Relaxed) + 1;
-        if total.is_multiple_of(self.age_threshold) {
-            self.age();
-        }
-
-        // Return post-increment min (the fetched value is pre-increment, so add 1)
+        // Return value is post-increment / pre-aging (fetched value is pre-increment).
         let c0 = if v0 < 255 { v0 + 1 } else { 255 };
         let c1 = if v1 < 255 { v1 + 1 } else { 255 };
-        c0.min(c1)
+        let result = c0.min(c1);
+
+        // Arm a new aging cycle on the threshold, then advance at most one chunk.
+        // Ordering matters: arm before step so the threshold-crossing call does
+        // bounded work immediately, and mid-cycle threshold hits cannot re-arm
+        // until `age_remaining` returns to 0.
+        let total = self.total_increments.fetch_add(1, Ordering::Relaxed) + 1;
+        if total.is_multiple_of(self.age_threshold) {
+            self.arm_aging();
+        }
+        self.age_step();
+
+        result
     }
 
     /// Estimate the frequency of a key without incrementing.
@@ -788,13 +891,21 @@ impl CountMinSketch {
     }
 
     /// Age all counters by right-shifting by 1 (halves all frequencies).
-    /// This prevents long-running hot entries from permanently dominating.
+    ///
+    /// Completes any in-progress incremental pass first, then runs a fresh full
+    /// pass via the same chunked helper used on the hot path. Not used by
+    /// production `increment` (which only arms + steps); kept for tests and any
+    /// explicit full-refresh callers.
     fn age(&self) {
-        for cell in &self.row0.0 {
-            let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
+        // Finish a partially drained pass so cells are not double-halved when we
+        // force a new full cycle below.
+        while self.age_remaining.load(Ordering::Relaxed) > 0 {
+            self.age_step();
         }
-        for cell in &self.row1.0 {
-            let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
+        self.age_remaining
+            .store(self.total_cells(), Ordering::Relaxed);
+        while self.age_remaining.load(Ordering::Relaxed) > 0 {
+            self.age_step();
         }
     }
 
@@ -807,6 +918,7 @@ impl CountMinSketch {
             cell.store(0, Ordering::Relaxed);
         }
         self.total_increments.store(0, Ordering::Relaxed);
+        self.age_remaining.store(0, Ordering::Relaxed);
     }
 }
 
@@ -2929,25 +3041,128 @@ mod tests {
 
     #[test]
     fn cms_age_triggered_by_threshold() {
-        // Set age_threshold = 10 so aging happens every 10 increments
+        // Width 1024 → 2048 cells; AGE_CHUNK is 256, so one threshold-crossing
+        // increment cannot finish the pass.
         let cms = CountMinSketch::new(1024, 10);
-        // Increment a single key 10 times — on the 10th, aging triggers
         for _ in 0..9 {
             cms.increment("key-a");
         }
         assert_eq!(cms.estimate("key-a"), 9);
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
 
-        // The 10th increment: row goes 9→10, then age() halves it to 5.
-        // increment() returns the PRE-age post-increment value (10).
+        // The 10th increment: row goes 9→10, return is pre-aging, and aging arms
+        // with a single bounded chunk — not a full-row sweep.
         let val = cms.increment("key-a");
         assert_eq!(val, 10, "Return value is pre-age post-increment");
+        let remaining_after_arm = cms.age_remaining.load(Ordering::Relaxed);
+        let total_cells = cms.total_cells();
+        assert!(
+            remaining_after_arm > 0,
+            "aging cycle must still be in progress after one increment"
+        );
+        assert!(
+            remaining_after_arm < total_cells,
+            "threshold-crossing increment must age some cells"
+        );
+        let aged = total_cells - remaining_after_arm;
+        assert_eq!(
+            aged,
+            CountMinSketch::AGE_CHUNK,
+            "first aging step must process exactly AGE_CHUNK cells"
+        );
 
-        // But estimate() now sees the aged value
+        // Drain the rest of the cycle via age_step (no further key increments) so
+        // the halved estimate is deterministic.
+        let mut steps = 1usize; // already did one chunk in increment()
+        while cms.age_remaining.load(Ordering::Relaxed) > 0 {
+            let before = cms.age_remaining.load(Ordering::Relaxed);
+            cms.age_step();
+            let after = cms.age_remaining.load(Ordering::Relaxed);
+            assert!(
+                before - after <= CountMinSketch::AGE_CHUNK,
+                "each age_step must be ≤ AGE_CHUNK"
+            );
+            steps += 1;
+            assert!(steps <= total_cells.div_ceil(CountMinSketch::AGE_CHUNK));
+        }
+        assert_eq!(steps, total_cells.div_ceil(CountMinSketch::AGE_CHUNK));
+
         assert_eq!(
             cms.estimate("key-a"),
             5,
-            "Post-age estimate should be halved"
+            "after a full incremental cycle, seeded counter must be halved"
         );
+    }
+
+    #[test]
+    fn cms_incremental_aging_completes_without_full_row_sweep() {
+        // Require a sketch large enough that one chunk cannot cover both rows.
+        let width = 1024;
+        let total_cells = width * 2;
+        assert!(
+            total_cells > CountMinSketch::AGE_CHUNK,
+            "test setup must make a full-row sweep impossible in one step"
+        );
+
+        // High threshold so seeding and the observed cycle are not interleaved
+        // with automatic re-arming.
+        let cms = CountMinSketch::new(width, u64::MAX);
+        for _ in 0..20 {
+            cms.increment("hot");
+        }
+        assert_eq!(cms.estimate("hot"), 20);
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
+
+        // Pick a driver whose CMS cells do not overlap "hot", so the post-cycle
+        // estimate stays deterministic under concurrent increments + aging.
+        let hot0 = CountMinSketch::fnv1a("hot", 0) as usize & cms.width_mask;
+        let hot1 = CountMinSketch::fnv1a("hot", 0x9e3779b97f4a7c15) as usize & cms.width_mask;
+        let driver = (0..10_000)
+            .map(|i| format!("cycle-driver-{i}"))
+            .find(|k| {
+                let d0 = CountMinSketch::fnv1a(k, 0) as usize & cms.width_mask;
+                let d1 = CountMinSketch::fnv1a(k, 0x9e3779b97f4a7c15) as usize & cms.width_mask;
+                d0 != hot0 && d0 != hot1 && d1 != hot0 && d1 != hot1
+            })
+            .expect("non-colliding driver key");
+
+        // Arm a pass the same way the threshold path does, then drive completion
+        // only through increment()'s age_step. Threshold is u64::MAX so increment
+        // never re-arms mid-cycle.
+        cms.arm_aging();
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), total_cells);
+
+        let expected_steps = total_cells.div_ceil(CountMinSketch::AGE_CHUNK);
+        let mut prev = total_cells;
+        let mut increments = 0usize;
+        while cms.age_remaining.load(Ordering::Relaxed) > 0 {
+            cms.increment(&driver);
+            let now = cms.age_remaining.load(Ordering::Relaxed);
+            let aged = prev - now;
+            assert!(
+                aged > 0 && aged <= CountMinSketch::AGE_CHUNK,
+                "expected 1..=AGE_CHUNK cells aged, got {aged} (prev={prev}, now={now})"
+            );
+            assert!(
+                aged < total_cells,
+                "a single increment must not sweep the full sketch"
+            );
+            prev = now;
+            increments += 1;
+            assert!(increments <= expected_steps);
+        }
+
+        assert_eq!(
+            increments, expected_steps,
+            "cycle must take cells/chunk increments, not one full sweep"
+        );
+        assert_eq!(cms.estimate("hot"), 10);
+    }
+
+    #[test]
+    fn cms_age_chunk_constant_is_explicit() {
+        assert_eq!(CountMinSketch::AGE_CHUNK, 256);
+        assert_eq!(CMS_AGE_CHUNK, 256);
     }
 
     #[test]
@@ -2962,6 +3177,7 @@ mod tests {
         cms.reset();
         assert_eq!(cms.estimate("key-a"), 0);
         assert_eq!(cms.total_increments.load(Ordering::Relaxed), 0);
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
     }
 
     #[test]
