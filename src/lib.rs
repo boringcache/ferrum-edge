@@ -3394,6 +3394,13 @@ pub mod _test_support {
         )
     }
 
+    /// External regression coverage for issue #2959 (DTLS demux identity-aware
+    /// session removal). See
+    /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].
+    pub fn dtls_stale_session_removal_preserves_newer_generation_for_test() -> Result<(), String> {
+        crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
+    }
+
     pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
         crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
     }
