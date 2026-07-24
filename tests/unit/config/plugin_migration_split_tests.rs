@@ -28,8 +28,7 @@ fn assert_no_delimiter_directives(statements: &[&str]) {
                 // `DELIMITER` as a directive is followed by whitespace or EOL,
                 // not another identifier character (e.g. a column named
                 // `delimiter_col` is fine).
-                let is_directive = rest.is_empty()
-                    || rest.starts_with(|c: char| c.is_whitespace());
+                let is_directive = rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace());
                 assert!(
                     !is_directive,
                     "statement[{idx}] line {line_no} must not contain an executable DELIMITER directive: {statement:?}"

@@ -80,9 +80,7 @@ impl SplitDialect {
             "postgres" => Ok(Self::Postgres),
             "mysql" => Ok(Self::Mysql),
             other => Err(SqlStatementSplitError::new(
-                format!(
-                    "unsupported database type for custom-plugin SQL splitting: {other}"
-                ),
+                format!("unsupported database type for custom-plugin SQL splitting: {other}"),
                 None,
             )),
         }
@@ -562,11 +560,7 @@ fn scan_line_comment(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() && bytes[i] != b'\n' {
         i += 1;
     }
-    if i < bytes.len() {
-        i + 1
-    } else {
-        i
-    }
+    if i < bytes.len() { i + 1 } else { i }
 }
 
 fn scan_block_comment(sql: &str, start: usize) -> Result<usize, SqlStatementSplitError> {
@@ -590,7 +584,10 @@ fn scan_block_comment(sql: &str, start: usize) -> Result<usize, SqlStatementSpli
 /// Returns `Ok(Some(end))` when a dollar quote was consumed, `Ok(None)` when
 /// the `$` is not a dollar-quote opener (ordinary `$`), and `Err` on an
 /// unclosed dollar-quoted body.
-fn try_scan_dollar_quoted(sql: &str, start: usize) -> Result<Option<usize>, SqlStatementSplitError> {
+fn try_scan_dollar_quoted(
+    sql: &str,
+    start: usize,
+) -> Result<Option<usize>, SqlStatementSplitError> {
     let bytes = sql.as_bytes();
     if bytes.get(start) != Some(&b'$') {
         return Ok(None);
@@ -769,9 +766,7 @@ fn contains_sql_word(sql: &str, word: &str) -> bool {
                 while i < bytes.len() && is_ident_byte(bytes[i]) {
                     i += 1;
                 }
-                if sql[start..i].eq_ignore_ascii_case(word)
-                    && word_bytes.len() == i - start
-                {
+                if sql[start..i].eq_ignore_ascii_case(word) && word_bytes.len() == i - start {
                     return true;
                 }
             }
@@ -838,8 +833,7 @@ pub(super) fn statements_require_non_transactional_postgres(
             || normalized.starts_with("ALTER SYSTEM")
             || normalized.starts_with("REINDEX") && normalized.contains(" CONCURRENTLY")
             || normalized.starts_with("CREATE INDEX") && normalized.contains(" CONCURRENTLY")
-            || normalized.starts_with("CREATE UNIQUE INDEX")
-                && normalized.contains(" CONCURRENTLY")
+            || normalized.starts_with("CREATE UNIQUE INDEX") && normalized.contains(" CONCURRENTLY")
             || normalized.starts_with("DROP INDEX") && normalized.contains(" CONCURRENTLY")
     })
 }

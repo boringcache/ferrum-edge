@@ -752,8 +752,8 @@ impl MigrationRunner {
                 // Fail-closed: parse the full migration body into statement
                 // boundaries before executing statement one. Classification and
                 // execution share this exact split.
-                let statements = split_plugin_migration_statements(sql, &self.db_type)
-                    .map_err(|err| {
+                let statements =
+                    split_plugin_migration_statements(sql, &self.db_type).map_err(|err| {
                         anyhow::anyhow!(
                             "plugin '{}' migration V{} ({}): {}",
                             plugin_name,
@@ -762,10 +762,11 @@ impl MigrationRunner {
                             err
                         )
                     })?;
-                let non_transactional = sql_statements::statements_require_non_transactional_postgres(
-                    &self.db_type,
-                    &statements,
-                );
+                let non_transactional =
+                    sql_statements::statements_require_non_transactional_postgres(
+                        &self.db_type,
+                        &statements,
+                    );
                 let now;
                 if non_transactional {
                     // PostgreSQL online DDL such as CREATE INDEX CONCURRENTLY
