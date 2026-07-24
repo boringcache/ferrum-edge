@@ -157,7 +157,10 @@ fn test_global_algorithm_gates_intersect_response_and_request_support() {
         false,
         false,
     );
-    let err = disabled.expect_err("all-disabled global gates must fail admission");
+    let err = match disabled {
+        Err(err) => err,
+        Ok(_) => panic!("all-disabled global gates must fail admission"),
+    };
     assert!(
         err.contains("no usable algorithms after applying process-wide codec gates"),
         "got: {err}"
@@ -5059,17 +5062,20 @@ fn test_max_decompressed_request_size_hard_maximum_rejected() {
     use ferrum_edge::plugins::compression::HARD_MAX_DECOMPRESSED_REQUEST_SIZE;
 
     let over = HARD_MAX_DECOMPRESSED_REQUEST_SIZE.saturating_add(1);
-    let err = CompressionPlugin::new(&json!({
+    let result = CompressionPlugin::new(&json!({
         "decompress_request": true,
         "max_decompressed_request_size": over
-    }))
-    .expect_err("values above the hard maximum must fail admission");
+    }));
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("values above the hard maximum must fail admission"),
+    };
     assert!(err.contains("hard maximum"), "got: {err}");
 }
 
 #[test]
 fn test_max_decompressed_request_size_cross_checks_request_body_limit() {
-    let err = CompressionPlugin::new_with_algorithm_support_and_body_limit(
+    let result = CompressionPlugin::new_with_algorithm_support_and_body_limit(
         &json!({
             "decompress_request": true,
             "max_decompressed_request_size": 2_000_000
@@ -5077,8 +5083,11 @@ fn test_max_decompressed_request_size_cross_checks_request_body_limit() {
         true,
         true,
         1_000_000,
-    )
-    .expect_err("decompressed ceiling must not exceed the request body limit");
+    );
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("decompressed ceiling must not exceed the request body limit"),
+    };
     assert!(
         err.contains("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES"),
         "got: {err}"
