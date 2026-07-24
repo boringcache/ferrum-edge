@@ -1208,7 +1208,7 @@ impl DnsCache {
         }
 
         for hostname in aged_out {
-            self.cache.remove(&hostname);
+            self.remove_aged_out_failed_retry_candidate(&hostname, now, error_max_age);
         }
 
         candidates.sort_by_key(|c| c.generation.first_failed_at);
@@ -1225,6 +1225,24 @@ impl DnsCache {
             && entry.consecutive_failures == generation.consecutive_failures
             && entry.first_failed_at == Some(generation.first_failed_at)
             && entry.expires_at == generation.expires_at
+    }
+
+    /// Remove an aged-out retry candidate only when the current map entry is
+    /// still an aged error. Selection releases its DashMap guard before this
+    /// cleanup runs, so an unconditional remove by hostname could otherwise
+    /// delete a newer foreground success published in that interval.
+    fn remove_aged_out_failed_retry_candidate(
+        &self,
+        hostname: &str,
+        now: Instant,
+        max_age: Duration,
+    ) {
+        if let Entry::Occupied(occupied) = self.cache.entry(hostname.to_string())
+            && occupied.get().is_error
+            && Self::error_entry_aged_out(occupied.get(), now, max_age)
+        {
+            occupied.remove();
+        }
     }
 
     /// Publish a failed-retry success only if the selected error generation is
@@ -2579,6 +2597,44 @@ mod tests {
         );
         assert_eq!(selected[0].generation.consecutive_failures, 0);
         assert_eq!(selected[1].generation.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn aged_out_retry_cleanup_preserves_newer_foreground_success() {
+        let cache = DnsCache::new(DnsConfig {
+            error_ttl_seconds: 5,
+            stale_ttl_seconds: 30,
+            failed_retry_interval_seconds: 10,
+            ..DnsConfig::default()
+        });
+        let hostname = "recovered.example";
+        let cleanup_now = Instant::now();
+
+        insert_error_entry(&cache, hostname, -1, 4, Duration::from_secs(31));
+
+        let recovered = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 40));
+        cache
+            .cache_success_entry(
+                hostname,
+                vec![recovered],
+                None,
+                Duration::from_secs(60),
+                None,
+            )
+            .expect("foreground success");
+
+        cache.remove_aged_out_failed_retry_candidate(
+            hostname,
+            cleanup_now,
+            cache.failed_entry_lifetime_cap(),
+        );
+
+        let entry = cache
+            .cache
+            .get(hostname)
+            .expect("cleanup must retain the newer success generation");
+        assert!(!entry.is_error);
+        assert_eq!(entry.addresses, vec![recovered]);
     }
 
     fn snapshot_error_generation(cache: &DnsCache, hostname: &str) -> FailedRetryGeneration {
