@@ -5689,9 +5689,11 @@ impl ProxyState {
         let mut health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
-        let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
-            env_config_arc.circuit_breaker_cache_max_entries,
-        ));
+        let circuit_breaker_cache =
+            Arc::new(CircuitBreakerCache::with_max_entries_and_shard_amount(
+                env_config_arc.circuit_breaker_cache_max_entries,
+                crate::util::sharding::pool_shard_amount(env_config_arc.pool_shard_amount),
+            ));
         // Service discovery manager (tasks started later via start_service_discovery)
         let service_discovery_manager = Arc::new(ServiceDiscoveryManager::new(
             load_balancer_cache.clone(),
