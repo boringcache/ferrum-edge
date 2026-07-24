@@ -4201,7 +4201,9 @@ async fn test_dp_consumes_heartbeat_without_applying_or_tearing_down_stream() {
         trust_bundles_json: String::new(),
         heartbeat: true,
     };
-    update_tx.send(heartbeat).expect("heartbeat should broadcast");
+    update_tx
+        .send(heartbeat)
+        .expect("heartbeat should broadcast");
 
     // Give the DP time to consume the heartbeat; config must remain at 1 proxy.
     tokio::time::sleep(Duration::from_millis(300)).await;
