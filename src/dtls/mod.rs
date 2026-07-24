@@ -336,8 +336,8 @@ pub(crate) fn client_send_output_drain_needs_another_round_for_test(
 /// Returns `Ok(())` only when the generation-2 entry and active counter both
 /// survive, and matching generation-2 cleanup then removes the entry once.
 #[allow(dead_code)] // used through library `_test_support`
-pub(crate) fn dtls_stale_session_removal_preserves_newer_generation_for_test(
-) -> Result<(), String> {
+pub(crate) fn dtls_stale_session_removal_preserves_newer_generation_for_test() -> Result<(), String>
+{
     let peer_addr: SocketAddr = "127.0.0.1:2959"
         .parse()
         .map_err(|e| format!("parse peer addr: {e}"))?;
@@ -1246,9 +1246,7 @@ impl DtlsServer {
         let mut app_out_rx = Some(app_out_rx);
         let (app_in_tx, mut app_in_rx) = mpsc::channel::<Vec<u8>>(256);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        let generation = self
-            .next_session_generation
-            .fetch_add(1, Ordering::Relaxed);
+        let generation = self.next_session_generation.fetch_add(1, Ordering::Relaxed);
         // Terminating DTLS: this is best-effort SNI for the session's identity /
         // logging field only — dimpl runs the real handshake and rejects malformed
         // input itself, so a continuation fragment or no-SNI ClientHello both map
