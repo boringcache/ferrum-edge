@@ -41,8 +41,8 @@ use super::configsync_lifecycle::{
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
     CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics,
     DeltaRejectionKind, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
-    MultiCpBackoffState, SnapshotFailureStreamDisposition, SubscriptionApplyState,
-    advance_authority_from_committed, advance_multi_cp_backoff,
+    MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
+    advance_multi_cp_backoff,
     authoritative_snapshot_payload_matches, check_peer_version_compatibility,
     connection_error_outcome, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, full_snapshot_stream_disposition,
@@ -55,7 +55,7 @@ use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
 use crate::FERRUM_VERSION;
 use crate::config::EnvConfig;
-use crate::config::db_loader::{IncrementalResult, NamespacedResourceId};
+use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
@@ -2055,6 +2055,7 @@ mod tests {
     //! `tests/integration/cp_dp_grpc_tests.rs` via
     //! `test_dp_filters_cross_namespace_resources_from_snapshot`.
     use super::*;
+    use crate::config::db_loader::NamespacedResourceId;
     use crate::config::EnvConfig;
     use crate::dns::{DnsCache, DnsConfig};
     use crate::proxy::ProxyState;

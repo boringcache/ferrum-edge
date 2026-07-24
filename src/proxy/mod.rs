@@ -33656,6 +33656,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::config::db_loader::NamespacedResourceId;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
     use crate::plugins::PluginHttpClient;
     use crate::plugins::ai_federation::AiFederation;

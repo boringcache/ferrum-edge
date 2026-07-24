@@ -434,7 +434,10 @@ async fn sparse_global_sequence_gap_without_retention_still_polls_incrementally(
     assert_eq!(result.sequence_cursor, 10);
     assert_eq!(
         result.removed_upstream_ids,
-        vec!["missing-upstream".to_string()]
+        vec![ferrum_edge::config::db_loader::NamespacedResourceId::new(
+            "ferrum",
+            "missing-upstream"
+        )]
     );
 }
 
