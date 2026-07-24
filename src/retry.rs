@@ -262,6 +262,18 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
 pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -> ErrorClass {
     use crate::proxy::grpc_proxy::{GrpcBackendUnavailableKind, GrpcProxyError, GrpcTimeoutKind};
 
+    // Coalesced-create waiters reconstruct `BackendUnavailable` with a
+    // `SharedPoolCreateError` source that already carries the creator's
+    // canonical ErrorClass. Prefer it before kind/message heuristics so
+    // DNS/TLS/timeout/egress/port-exhaustion stay aligned across the fan-out.
+    if let GrpcProxyError::BackendUnavailable {
+        source: Some(src), ..
+    } = e
+        && let Some(shared) = src.downcast_ref::<crate::pool::SharedPoolCreateError>()
+    {
+        return shared.error_class();
+    }
+
     // A DnsCacheResolver egress-policy denial (a gRPC backend hostname or
     // dns_override that resolves — or rebinds — to a blocked IP) surfaces as a
     // BackendUnavailable{DnsResolution} whose message carries "...denied by
@@ -363,6 +375,13 @@ fn classify_typed_chain(
 ) -> Option<ErrorClass> {
     let mut current = start;
     while let Some(err) = current {
+        // Coalesced GenericPool create failures broadcast a cloneable
+        // `SharedPoolCreateError` that already carries the creator's canonical
+        // ErrorClass. Prefer it before walking io/rustls sources so H3/anyhow
+        // waiters keep DNS/TLS/timeout/port-exhaustion/egress parity.
+        if let Some(shared) = err.downcast_ref::<crate::pool::SharedPoolCreateError>() {
+            return Some(shared.error_class());
+        }
         // `HbonePoolError` is the shared dial/setup error for ALL mesh-transport
         // tunnels (HBONE raw-TCP, Sidecar mesh-mTLS, and the WebSocket Extended
         // CONNECT egress). Every variant is a pre-wire DIAL/setup failure, so its

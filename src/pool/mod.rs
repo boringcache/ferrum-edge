@@ -22,15 +22,35 @@ fn now_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Coarse classification retained when a pool create failure is broadcast to
-/// coalesced waiters. Kept intentionally small so waiters can rebuild
+/// Structural + classification tag retained when a pool create failure is
+/// broadcast to coalesced waiters.
+///
+/// Kept cloneable and free of live IO/TLS handles so waiters can rebuild
 /// pool-specific errors without cloning non-`Clone` sources (`io::Error`,
-/// `hyper::Error`, credential material, etc.).
+/// `hyper::Error`, credential material, etc.). The canonical
+/// [`crate::retry::ErrorClass`] is stored alongside this kind so ErrorClass /
+/// health / retry diagnostics stay aligned with the creator's pre-wire
+/// classification (DNS, TLS, timeout, refused/closed, protocol/ALPN, port
+/// exhaustion, egress/policy denial, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedPoolCreateKind {
     /// Connect / handshake budget exhausted.
     TimedOut,
-    /// Backend unreachable or handshake failed.
+    /// DNS resolution / invalid server name failed.
+    Dns,
+    /// TLS handshake (or H2-over-TLS handshake) failed.
+    Tls,
+    /// TCP connect refused / equivalent connect-phase refusal.
+    ConnectionRefused,
+    /// Peer closed or aborted during connect/handshake.
+    ConnectionClosed,
+    /// Protocol / ALPN / framing failure (excluding intentional H1 fallback).
+    Protocol,
+    /// Ephemeral port exhaustion (`EADDRNOTAVAIL`).
+    PortExhaustion,
+    /// Gateway egress / dispatch policy denied the dial.
+    DispatchPolicyRejected,
+    /// Generic backend unreachable / pool acquire failure.
     Unavailable,
     /// Pool-internal / configuration failure.
     Internal,
@@ -41,10 +61,43 @@ pub enum SharedPoolCreateKind {
     Other,
 }
 
+impl SharedPoolCreateKind {
+    /// Map a canonical [`crate::retry::ErrorClass`] onto the shared create kind
+    /// used for waiter reconstruction. Prefer this over substring heuristics.
+    pub fn from_error_class(class: crate::retry::ErrorClass) -> Self {
+        use crate::retry::ErrorClass;
+        match class {
+            ErrorClass::ConnectionTimeout | ErrorClass::ReadWriteTimeout => Self::TimedOut,
+            ErrorClass::DnsLookupError => Self::Dns,
+            ErrorClass::TlsError => Self::Tls,
+            ErrorClass::ConnectionRefused => Self::ConnectionRefused,
+            ErrorClass::ConnectionClosed => Self::ConnectionClosed,
+            // Connect-phase pool creates treat RST like refusal for the
+            // structural kind; the stored ErrorClass remains authoritative.
+            ErrorClass::ConnectionReset => Self::ConnectionRefused,
+            ErrorClass::ProtocolError => Self::Protocol,
+            ErrorClass::PortExhaustion => Self::PortExhaustion,
+            ErrorClass::DispatchPolicyRejected => Self::DispatchPolicyRejected,
+            ErrorClass::ConnectionPoolError => Self::Unavailable,
+            ErrorClass::ClientDisconnect
+            | ErrorClass::ResponseBodyTooLarge
+            | ErrorClass::RequestBodyTooLarge
+            | ErrorClass::GracefulRemoteClose
+            | ErrorClass::RequestError => Self::Other,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SharedPoolCreateErrorInner {
     message: String,
     kind: SharedPoolCreateKind,
+    /// Canonical pre-wire classification captured from the creator's typed
+    /// classifier (`classify_grpc_proxy_error`, `classify_http2_pool_error`,
+    /// `classify_http3_error` / `classify_boxed_setup_error`). Waiters and
+    /// source-chain classifiers must prefer this over re-deriving from the
+    /// reconstructed message alone.
+    error_class: crate::retry::ErrorClass,
     /// Monotonic id for this failed creation generation. Waiters that share a
     /// coalesced create observe the same value; a later independent request
     /// starts a new generation.
@@ -61,8 +114,8 @@ struct SharedPoolCreateErrorInner {
 /// The original creator error often carries non-`Clone` typed sources. Rather
 /// than requiring those errors to be cloneable (or retaining secrets embedded
 /// in source chains), the pool captures a sanitized message plus
-/// [`SharedPoolCreateKind`] and fans that out. Callers reconstruct their
-/// error type via `From<SharedPoolCreateError>`.
+/// [`SharedPoolCreateKind`] / [`crate::retry::ErrorClass`] and fans that out.
+/// Callers reconstruct their error type via `From<SharedPoolCreateError>`.
 #[derive(Debug, Clone)]
 pub struct SharedPoolCreateError {
     inner: Arc<SharedPoolCreateErrorInner>,
@@ -72,6 +125,7 @@ impl SharedPoolCreateError {
     pub(crate) fn new(
         message: impl Into<String>,
         kind: SharedPoolCreateKind,
+        error_class: crate::retry::ErrorClass,
         generation: u64,
         detail: Option<String>,
     ) -> Self {
@@ -79,20 +133,34 @@ impl SharedPoolCreateError {
             inner: Arc::new(SharedPoolCreateErrorInner {
                 message: message.into(),
                 kind,
+                error_class,
                 generation,
                 detail,
             }),
         }
     }
 
-    /// Capture a broadcastable failure from any std error, assigning `generation`.
-    pub fn capture(err: &(dyn std::error::Error + 'static), generation: u64) -> Self {
-        Self::new(
-            err.to_string(),
-            classify_shared_create_error(err),
-            generation,
-            None,
-        )
+    /// Build from an already-computed canonical [`crate::retry::ErrorClass`].
+    pub fn from_classified(
+        message: impl Into<String>,
+        error_class: crate::retry::ErrorClass,
+        generation: u64,
+        detail: Option<String>,
+    ) -> Self {
+        let kind = SharedPoolCreateKind::from_error_class(error_class);
+        Self::new(message, kind, error_class, generation, detail)
+    }
+
+    /// Capture a broadcastable failure from a setup-phase std error, assigning
+    /// `generation`. Uses the canonical boxed setup classifier rather than
+    /// substring heuristics so H3/anyhow GenericPool waiters retain typed
+    /// shared classification.
+    pub fn capture(
+        err: &(dyn std::error::Error + Send + Sync + 'static),
+        generation: u64,
+    ) -> Self {
+        let error_class = crate::retry::classify_boxed_setup_error(err);
+        Self::from_classified(err.to_string(), error_class, generation, None)
     }
 
     pub fn message(&self) -> &str {
@@ -101,6 +169,11 @@ impl SharedPoolCreateError {
 
     pub fn kind(&self) -> SharedPoolCreateKind {
         self.inner.kind
+    }
+
+    /// Canonical ErrorClass captured when the creator failed.
+    pub fn error_class(&self) -> crate::retry::ErrorClass {
+        self.inner.error_class
     }
 
     pub fn generation(&self) -> u64 {
@@ -122,53 +195,34 @@ impl std::error::Error for SharedPoolCreateError {}
 
 /// Error types that can be broadcast to coalesced create waiters.
 ///
-/// Implementations capture the std error chain or preserve
-/// classification-critical typed variants (for example direct-H2
-/// `BackendSelectedHttp1`) without cloning non-`Clone` sources.
+/// Implementations must preserve the creator's canonical pre-wire
+/// classification (via existing typed classifiers) without cloning
+/// non-`Clone` sources. Direct-H2 also preserves the
+/// `BackendSelectedHttp1` structural signal.
 pub trait ShareablePoolCreateError: 'static {
     fn to_shared(&self, generation: u64) -> SharedPoolCreateError;
 }
 
 impl ShareablePoolCreateError for anyhow::Error {
     fn to_shared(&self, generation: u64) -> SharedPoolCreateError {
+        // H3 and reqwest GenericPool creates both surface `anyhow::Error`.
+        // `classify_boxed_setup_error` is the shared setup-phase classifier
+        // (typed chain + anchored fallback) and avoids a pool→http3 import
+        // cycle while still preserving timeout/DNS/TLS/refused/port-exhaustion.
         SharedPoolCreateError::capture(self.as_ref(), generation)
     }
 }
 
 impl ShareablePoolCreateError for SharedPoolCreateError {
     fn to_shared(&self, generation: u64) -> SharedPoolCreateError {
-        // Preserve kind/detail; refresh generation for a new broadcast.
+        // Preserve kind/class/detail; refresh generation for a new broadcast.
         SharedPoolCreateError::new(
             self.message().to_string(),
             self.kind(),
+            self.error_class(),
             generation,
             self.detail().map(str::to_string),
         )
-    }
-}
-
-fn classify_shared_create_error(err: &(dyn std::error::Error + 'static)) -> SharedPoolCreateKind {
-    let mut current = Some(err);
-    while let Some(e) = current {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            return match io.kind() {
-                std::io::ErrorKind::TimedOut => SharedPoolCreateKind::TimedOut,
-                std::io::ErrorKind::Interrupted => SharedPoolCreateKind::Other,
-                _ => SharedPoolCreateKind::Unavailable,
-            };
-        }
-        current = e.source();
-    }
-
-    let lower = err.to_string().to_ascii_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") {
-        SharedPoolCreateKind::TimedOut
-    } else if lower.contains("internal") {
-        SharedPoolCreateKind::Internal
-    } else if lower.contains("negotiated http/1.1") || lower.contains("does not support http/2") {
-        SharedPoolCreateKind::NegotiatedHttp1
-    } else {
-        SharedPoolCreateKind::Unavailable
     }
 }
 
@@ -864,6 +918,10 @@ mod tests {
             CreationNotify::Failed(err) => {
                 assert_eq!(err.generation(), 7);
                 assert_eq!(err.kind(), SharedPoolCreateKind::TimedOut);
+                assert_eq!(
+                    err.error_class(),
+                    crate::retry::ErrorClass::ConnectionTimeout
+                );
                 assert_eq!(err.message(), shared.message());
             }
             other => panic!("expected Failed, got {other:?}"),

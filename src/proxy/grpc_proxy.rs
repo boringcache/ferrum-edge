@@ -1327,20 +1327,58 @@ impl std::error::Error for GrpcProxyError {
 
 impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
     fn from(err: crate::pool::SharedPoolCreateError) -> Self {
+        use crate::pool::SharedPoolCreateKind;
+        use crate::retry::ErrorClass;
+
         let message = err.message().to_string();
         match err.kind() {
-            crate::pool::SharedPoolCreateKind::TimedOut => Self::BackendTimeout {
+            SharedPoolCreateKind::TimedOut => Self::BackendTimeout {
                 // Pool create failures are connect-phase.
-                kind: GrpcTimeoutKind::Connect,
+                kind: match err.error_class() {
+                    ErrorClass::ReadWriteTimeout => GrpcTimeoutKind::Read,
+                    _ => GrpcTimeoutKind::Connect,
+                },
                 message,
             },
-            crate::pool::SharedPoolCreateKind::Internal => Self::Internal(message),
+            SharedPoolCreateKind::Internal => Self::Internal(message),
             // NegotiatedHttp1 is an H2-pool signal; gRPC create never emits it.
-            // Map conservatively to connect-unavailable so waiters still fail.
-            crate::pool::SharedPoolCreateKind::NegotiatedHttp1
-            | crate::pool::SharedPoolCreateKind::Unavailable
-            | crate::pool::SharedPoolCreateKind::Other => {
-                Self::backend_unavailable(GrpcBackendUnavailableKind::Connect, message)
+            // Fall through to unavailable reconstruction so waiters still fail.
+            SharedPoolCreateKind::NegotiatedHttp1
+            | SharedPoolCreateKind::Dns
+            | SharedPoolCreateKind::Tls
+            | SharedPoolCreateKind::ConnectionRefused
+            | SharedPoolCreateKind::ConnectionClosed
+            | SharedPoolCreateKind::Protocol
+            | SharedPoolCreateKind::PortExhaustion
+            | SharedPoolCreateKind::DispatchPolicyRejected
+            | SharedPoolCreateKind::Unavailable
+            | SharedPoolCreateKind::Other => {
+                // Structural kind for logs / is_connect_class. The authoritative
+                // ErrorClass lives on `err` and is restored via the source chain
+                // in `classify_grpc_proxy_error`.
+                let kind = match err.error_class() {
+                    ErrorClass::DnsLookupError => GrpcBackendUnavailableKind::DnsResolution,
+                    ErrorClass::TlsError | ErrorClass::ProtocolError => {
+                        GrpcBackendUnavailableKind::TlsHandshake
+                    }
+                    ErrorClass::ConnectionRefused
+                    | ErrorClass::ConnectionClosed
+                    | ErrorClass::ConnectionReset
+                    | ErrorClass::PortExhaustion
+                    | ErrorClass::DispatchPolicyRejected
+                    | ErrorClass::ConnectionPoolError
+                    | ErrorClass::ConnectionTimeout
+                    | ErrorClass::ReadWriteTimeout
+                    | ErrorClass::ClientDisconnect
+                    | ErrorClass::ResponseBodyTooLarge
+                    | ErrorClass::RequestBodyTooLarge
+                    | ErrorClass::GracefulRemoteClose
+                    | ErrorClass::RequestError => GrpcBackendUnavailableKind::Connect,
+                };
+                // Retain the shared classification payload as the typed source so
+                // classifiers recover the creator's ErrorClass without substring
+                // heuristics (port exhaustion, egress denial, ConnectionClosed, …).
+                Self::backend_unavailable_with_source(kind, message, err)
             }
         }
     }
@@ -1349,28 +1387,48 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
 impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
     fn to_shared(&self, generation: u64) -> crate::pool::SharedPoolCreateError {
         use crate::pool::{SharedPoolCreateError, SharedPoolCreateKind};
+        use crate::retry::ErrorClass;
+
+        // Canonical classifier — preserves DNS/TLS/timeout/refused/port-exhaustion
+        // /egress without new substring heuristics on the shared path.
+        let error_class = crate::retry::classify_grpc_proxy_error(self);
         match self {
             Self::BackendTimeout { message, .. } => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::TimedOut,
+                error_class,
                 generation,
                 None,
             ),
             Self::Internal(message) => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::Internal,
+                error_class,
                 generation,
                 None,
             ),
             Self::BackendUnavailable { message, .. }
             | Self::ClientDeadlineExceeded(message)
             | Self::ResourceExhausted(message)
-            | Self::ResponseTooLarge(message) => SharedPoolCreateError::new(
-                message.clone(),
-                SharedPoolCreateKind::Unavailable,
-                generation,
-                None,
-            ),
+            | Self::ResponseTooLarge(message) => {
+                let kind = match error_class {
+                    ErrorClass::DnsLookupError => SharedPoolCreateKind::Dns,
+                    ErrorClass::TlsError => SharedPoolCreateKind::Tls,
+                    ErrorClass::ConnectionRefused => SharedPoolCreateKind::ConnectionRefused,
+                    ErrorClass::ConnectionClosed => SharedPoolCreateKind::ConnectionClosed,
+                    ErrorClass::ProtocolError => SharedPoolCreateKind::Protocol,
+                    ErrorClass::PortExhaustion => SharedPoolCreateKind::PortExhaustion,
+                    ErrorClass::DispatchPolicyRejected => {
+                        SharedPoolCreateKind::DispatchPolicyRejected
+                    }
+                    ErrorClass::ConnectionTimeout | ErrorClass::ReadWriteTimeout => {
+                        SharedPoolCreateKind::TimedOut
+                    }
+                    ErrorClass::ConnectionPoolError => SharedPoolCreateKind::Unavailable,
+                    _ => SharedPoolCreateKind::from_error_class(error_class),
+                };
+                SharedPoolCreateError::new(message.clone(), kind, error_class, generation, None)
+            }
         }
     }
 }
