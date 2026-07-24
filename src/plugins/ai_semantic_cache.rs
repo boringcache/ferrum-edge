@@ -1392,20 +1392,16 @@ impl AiSemanticCache {
             // snapshot; any concurrent insert that races this scan re-dirties
             // the index and schedules a later rebuild.
             //
-            // Single pass: collect the live semantic set AND accumulate its
-            // peak/retained byte estimates together, then reserve against the
-            // shared budget for exactly the set we collected. A two-pass
-            // count-then-copy could admit a new entry between passes and copy
-            // (and index) more points than were charged; collecting first and
-            // charging the collected set is race-safe and conservative.
-            //
-            // `embedding.clone()` only bumps the `Arc<[f32]>` refcount, so the
-            // scan does not duplicate the cache's embedding float storage.
+            // First measure the current live semantic set without allocating
+            // candidate vectors, then reserve its full estimated peak before
+            // any rebuild-owned key/value clones are created. The map can
+            // change between passes, so the collection pass independently
+            // measures each current entry and admits it only when the running
+            // peak remains within the amount already reserved. A concurrent
+            // insert can therefore be skipped, but can never make the rebuild
+            // allocate or index more points than were charged.
             let now = Instant::now();
-            let mut points: Vec<EmbeddingPoint> = Vec::new();
-            let mut values: Vec<VectorEntry> = Vec::new();
             let mut peak_estimate = 0usize;
-            let mut retained_estimate = 0usize;
             for entry in cache.iter() {
                 if now.duration_since(entry.inserted_at) >= ttl {
                     continue;
@@ -1419,9 +1415,48 @@ impl AiSemanticCache {
                 peak_estimate = peak_estimate.saturating_add(estimate_hnsw_point_peak_bytes(
                     embedding, cache_key, scope_key,
                 ));
+            }
+
+            if peak_estimate == 0 {
+                return VectorRebuildOutcome::Empty;
+            }
+
+            // Reserve the measured live peak BEFORE allocating candidate
+            // vectors. Because the old published generation still holds its
+            // own lease against this same budget, `try_acquire` only succeeds
+            // when entries + old snapshot + this candidate's peak all fit
+            // under `max_total_size_bytes`.
+            let Some(lease) = cache_budget.try_acquire(peak_estimate) else {
+                return VectorRebuildOutcome::BudgetExhausted;
+            };
+            rebuild_reserved_bytes.store(peak_estimate, Ordering::Release);
+
+            let mut points: Vec<EmbeddingPoint> = Vec::new();
+            let mut values: Vec<VectorEntry> = Vec::new();
+            let mut collected_peak = 0usize;
+            let mut retained_estimate = 0usize;
+            for entry in cache.iter() {
+                if now.duration_since(entry.inserted_at) >= ttl {
+                    continue;
+                }
+                let (Some(scope_key), Some(embedding)) =
+                    (entry.semantic_scope_key.as_ref(), entry.embedding.as_ref())
+                else {
+                    continue;
+                };
+                let cache_key = entry.key();
+                let point_peak =
+                    estimate_hnsw_point_peak_bytes(embedding, cache_key, scope_key);
+                let next_peak = collected_peak.saturating_add(point_peak);
+                if next_peak > peak_estimate {
+                    continue;
+                }
+                collected_peak = next_peak;
                 retained_estimate = retained_estimate.saturating_add(
                     estimate_hnsw_point_retained_bytes(embedding, cache_key, scope_key),
                 );
+                // `embedding.clone()` only bumps the `Arc<[f32]>` refcount, so
+                // the scan does not duplicate the cache's float allocation.
                 points.push(embedding.clone());
                 values.push(VectorEntry {
                     cache_key: cache_key.clone(),
@@ -1432,17 +1467,6 @@ impl AiSemanticCache {
             if points.is_empty() {
                 return VectorRebuildOutcome::Empty;
             }
-
-            // Reserve the whole live peak BEFORE construction. Because the old
-            // published generation still holds its own lease against this same
-            // budget, `try_acquire` only succeeds when entries + old snapshot +
-            // this candidate's peak all fit under `max_total_size_bytes`. On
-            // failure the collected `points`/`values` drop here (Arc floats
-            // stay shared with the cache entries, so nothing is duplicated).
-            let Some(lease) = cache_budget.try_acquire(peak_estimate) else {
-                return VectorRebuildOutcome::BudgetExhausted;
-            };
-            rebuild_reserved_bytes.store(peak_estimate, Ordering::Release);
 
             // Hold the full peak lease ACROSS `build`, which allocates internal
             // construction copies; keeping the reservation live means those
