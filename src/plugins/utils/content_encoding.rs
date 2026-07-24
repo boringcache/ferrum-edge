@@ -242,11 +242,7 @@ fn decode_brotli_stream(
             return Err(format!("brotli decoded content exceeds {max_bytes} bytes"));
         }
         decoded.extend_from_slice(&chunk[..output_offset]);
-        if let Err(error) =
-            enforce_amplification(input.len(), decoded.len(), max_amplification_ratio)
-        {
-            return Err(error);
-        }
+        enforce_amplification(input.len(), decoded.len(), max_amplification_ratio)?;
 
         match result {
             BrotliResult::ResultSuccess => {

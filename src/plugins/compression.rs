@@ -542,15 +542,15 @@ impl CompressionPlugin {
                     "identity".to_string(),
                 );
                 headers.remove("content-length");
-                return PluginResult::Continue;
+                PluginResult::Continue
             }
             RequestCodingPlan::Decode(marker) => {
                 let decode_source: Option<Vec<u8>> = if let Some(body) = body.as_deref() {
                     Some(body.to_vec())
-                } else if let Some(bytes) = ctx.request_body_bytes.as_ref() {
-                    Some(bytes.to_vec())
                 } else {
-                    None
+                    ctx.request_body_bytes
+                        .as_ref()
+                        .map(|bytes| bytes.to_vec())
                 };
                 let Some(decode_source) = decode_source else {
                     // Unbuffered path (e.g. HBONE CONNECT): without a rejectable body
