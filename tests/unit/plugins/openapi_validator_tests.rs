@@ -3483,10 +3483,12 @@ fn exploded_object_key_collisions_are_rejected_for_form_and_multipart() {
                                 "properties": {
                                     "left": {
                                         "type": "object",
+                                        "additionalProperties": false,
                                         "properties": {"shared": {"type": "string"}}
                                     },
                                     "right": {
                                         "type": "object",
+                                        "additionalProperties": false,
                                         "properties": {"shared": {"type": "string"}}
                                     }
                                 }
