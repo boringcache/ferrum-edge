@@ -1769,9 +1769,6 @@ fn xml_node_to_value(
         let empty_properties = serde_json::Map::new();
         let properties =
             merged_object_properties(object_schema, conversion).unwrap_or(&empty_properties);
-        if properties.is_empty() {
-            return generic_xml_node_to_value(node);
-        }
         let mut out = serde_json::Map::new();
         let mut modeled_names = ModeledXmlNames::default();
         for (property_name, property_schema) in properties {
@@ -1830,6 +1827,8 @@ fn xml_node_to_value(
         // vice versa) must not rebind that property or be silently dropped;
         // return a conversion error.
         let additional_schema = additional_property_schema_for_conversion(object_schema);
+        let mut additional_attribute_locals = HashSet::new();
+        let mut additional_element_names: HashMap<String, Option<String>> = HashMap::new();
         for attr in node.attributes() {
             if modeled_names.contains_attribute(attr) {
                 continue;
@@ -1847,6 +1846,7 @@ fn xml_node_to_value(
                 Some(schema) => scalar_to_schema_value(attr.value(), schema, conversion)?,
                 _ => Value::String(attr.value().to_string()),
             };
+            additional_attribute_locals.insert(attr.name().to_string());
             if out.insert(attr.name().to_string(), value).is_some() {
                 return Err(format!(
                     "XML attributes sharing local name '{}' cannot be represented unambiguously",
@@ -1863,6 +1863,21 @@ fn xml_node_to_value(
                 return Err(format!(
                     "XML element '{name}' collides with a modeled property name but does not match its modeled XML construct or namespace"
                 ));
+            }
+            if additional_attribute_locals.contains(name) {
+                return Err(format!(
+                    "XML attribute and element sharing local name '{name}' cannot be represented unambiguously"
+                ));
+            }
+            let namespace = child.tag_name().namespace();
+            if let Some(previous_namespace) = additional_element_names.get(name) {
+                if previous_namespace.as_deref() != namespace {
+                    return Err(format!(
+                        "XML elements sharing local name '{name}' across namespaces cannot be represented unambiguously"
+                    ));
+                }
+            } else {
+                additional_element_names.insert(name.to_string(), namespace.map(str::to_string));
             }
             let member_schema = conversion
                 .pattern_property_schema(object_schema, name)
@@ -1881,6 +1896,11 @@ fn xml_node_to_value(
                     out.insert(name.to_string(), value);
                 }
             }
+        }
+        if node.children().any(|child| {
+            child.is_text() && child.text().is_some_and(|text| !text.trim().is_empty())
+        }) {
+            return Err("XML object contains unmodeled text content".to_string());
         }
         return Ok(Value::Object(out));
     }
@@ -1981,7 +2001,9 @@ fn xml_array_item_name<'a>(
 
 fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
+    let mut attribute_locals = HashSet::new();
     for attr in node.attributes() {
+        attribute_locals.insert(attr.name().to_string());
         if out
             .insert(
                 attr.name().to_string(),
@@ -2009,17 +2031,33 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, Str
         }
         return Ok(Value::Object(out));
     }
+    let mut element_names: HashMap<String, Option<String>> = HashMap::new();
     for child in children {
+        let local = child.tag_name().name();
+        if attribute_locals.contains(local) {
+            return Err(format!(
+                "XML attribute and element sharing local name '{local}' cannot be represented unambiguously"
+            ));
+        }
+        let namespace = child.tag_name().namespace();
+        if let Some(previous_namespace) = element_names.get(local) {
+            if previous_namespace.as_deref() != namespace {
+                return Err(format!(
+                    "XML elements sharing local name '{local}' across namespaces cannot be represented unambiguously"
+                ));
+            }
+        } else {
+            element_names.insert(local.to_string(), namespace.map(str::to_string));
+        }
         let value = generic_xml_node_to_value(child)?;
-        let name = child.tag_name().name().to_string();
-        match out.get_mut(&name) {
+        match out.get_mut(local) {
             Some(Value::Array(values)) => values.push(value),
             Some(existing) => {
                 let first = std::mem::take(existing);
                 *existing = Value::Array(vec![first, value]);
             }
             None => {
-                out.insert(name, value);
+                out.insert(local.to_string(), value);
             }
         }
     }

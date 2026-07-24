@@ -1012,6 +1012,82 @@ async fn xml_preserves_additional_properties_and_leaf_attributes() {
             .await,
         Some(400),
     );
+
+    // A schema with no declared properties must still use its typed
+    // additionalProperties schema during XML conversion.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/only-additional",
+            "path_regex": "^/only-additional$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {},
+                        "additionalProperties": {"type": "integer"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/only-additional");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><count>7</count></root>"#,
+            )
+            .await,
+    );
+
+    // Distinct expanded names cannot collapse into one local-name JSON key.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/ambiguous-additional",
+            "path_regex": "^/ambiguous-additional$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {},
+                        "additionalProperties": true
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/ambiguous-additional");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:a="urn:a" xmlns:b="urn:b"><a:extra>one</a:extra><b:extra>two</b:extra></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/ambiguous-additional");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root extra="attribute"><extra>element</extra></root>"#,
+            )
+            .await,
+        Some(400),
+    );
 }
 
 #[tokio::test]
