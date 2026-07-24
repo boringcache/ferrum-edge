@@ -1582,24 +1582,32 @@ fn xml_body_to_value(
     let doc =
         roxmltree::Document::parse(body).map_err(|error| format!("Invalid XML body: {error}"))?;
     let root = doc.root_element();
-    if let Some(expected_root) = xml_name(schema, None) {
-        let expected_namespace = xml_namespace(schema);
-        if !xml_expanded_name_matches(root.tag_name(), expected_namespace, expected_root) {
-            return Err(match expected_namespace {
-                Some(namespace) => format!(
-                    "XML root element '{}{}' does not match schema xml.name '{}' in namespace '{}'",
-                    xml_namespace_display(root.tag_name().namespace()),
-                    root.tag_name().name(),
-                    expected_root,
-                    namespace
-                ),
-                None => format!(
-                    "XML root element '{}' does not match schema xml.name '{}'",
-                    root.tag_name().name(),
-                    expected_root
-                ),
-            });
-        }
+    let expected_root = xml_name(schema, None);
+    let expected_namespace = xml_namespace(schema);
+    let root_local_matches = expected_root.is_none_or(|local| root.tag_name().name() == local);
+    let root_namespace_matches =
+        expected_namespace.is_none_or(|namespace| root.tag_name().namespace() == Some(namespace));
+    if !root_local_matches || !root_namespace_matches {
+        return Err(match (expected_root, expected_namespace) {
+            (Some(local), Some(namespace)) => format!(
+                "XML root element '{}{}' does not match schema xml.name '{}' in namespace '{}'",
+                xml_namespace_display(root.tag_name().namespace()),
+                root.tag_name().name(),
+                local,
+                namespace
+            ),
+            (Some(local), None) => format!(
+                "XML root element '{}' does not match schema xml.name '{}'",
+                root.tag_name().name(),
+                local
+            ),
+            (None, Some(namespace)) => format!(
+                "XML root namespace '{}' does not match schema xml.namespace '{}'",
+                root.tag_name().namespace().unwrap_or(""),
+                namespace
+            ),
+            (None, None) => "XML root metadata did not match the schema".to_string(),
+        });
     }
     xml_node_to_value(root, schema, conversion)
 }
@@ -1624,7 +1632,7 @@ fn xml_node_to_value(
         let properties =
             merged_object_properties(object_schema, conversion).unwrap_or(&empty_properties);
         if properties.is_empty() {
-            return Ok(generic_xml_node_to_value(node));
+            return generic_xml_node_to_value(node);
         }
         let mut out = serde_json::Map::new();
         let mut modeled_names = ModeledXmlNames::default();
@@ -1694,14 +1702,16 @@ fn xml_node_to_value(
                     attr.name()
                 ));
             }
-            if out.contains_key(attr.name()) {
-                continue;
-            }
             let value = match additional_schema {
                 Some(Some(schema)) => scalar_to_schema_value(attr.value(), schema, conversion)?,
                 _ => Value::String(attr.value().to_string()),
             };
-            out.insert(attr.name().to_string(), value);
+            if out.insert(attr.name().to_string(), value).is_some() {
+                return Err(format!(
+                    "XML attributes sharing local name '{}' cannot be represented unambiguously",
+                    attr.name()
+                ));
+            }
         }
         for child in node.children().filter(roxmltree::Node::is_element) {
             if modeled_names.contains_element(child) {
@@ -1715,7 +1725,7 @@ fn xml_node_to_value(
             }
             let value = match additional_schema {
                 Some(Some(schema)) => xml_node_to_value(child, schema, conversion)?,
-                _ => generic_xml_node_to_value(child),
+                _ => generic_xml_node_to_value(child)?,
             };
             match out.get_mut(name) {
                 Some(Value::Array(values)) => values.push(value),
@@ -1828,13 +1838,21 @@ fn xml_array_item_name<'a>(
     )
 }
 
-fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Value {
+fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
     for attr in node.attributes() {
-        out.insert(
-            attr.name().to_string(),
-            Value::String(attr.value().to_string()),
-        );
+        if out
+            .insert(
+                attr.name().to_string(),
+                Value::String(attr.value().to_string()),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "XML attributes sharing local name '{}' cannot be represented unambiguously",
+                attr.name()
+            ));
+        }
     }
     let children: Vec<_> = node
         .children()
@@ -1843,15 +1861,15 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Value {
     if children.is_empty() {
         let text = node.text().unwrap_or("").trim().to_string();
         if out.is_empty() {
-            return Value::String(text);
+            return Ok(Value::String(text));
         }
         if !text.is_empty() {
             out.insert("#text".to_string(), Value::String(text));
         }
-        return Value::Object(out);
+        return Ok(Value::Object(out));
     }
     for child in children {
-        let value = generic_xml_node_to_value(child);
+        let value = generic_xml_node_to_value(child)?;
         let name = child.tag_name().name().to_string();
         match out.get_mut(&name) {
             Some(Value::Array(values)) => values.push(value),
@@ -1869,7 +1887,7 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Value {
     {
         out.insert("#text".to_string(), Value::String(text.to_string()));
     }
-    Value::Object(out)
+    Ok(Value::Object(out))
 }
 
 fn form_urlencoded_to_value(

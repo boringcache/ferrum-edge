@@ -822,6 +822,22 @@ async fn xml_preserves_additional_properties_and_leaf_attributes() {
             )
             .await,
     );
+    // Distinct attribute namespaces may reuse one local name, but the JSON
+    // instance cannot represent both without a first/last-win differential.
+    let mut ctx = post_ctx("/extra");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:a="urn:a" xmlns:b="urn:b" a:extra="7" b:extra="8">
+                    <known>x</known>
+                </root>"#,
+            )
+            .await,
+        Some(400),
+    );
 
     // Omitted additionalProperties still preserves members for object-wide keywords.
     let plugin = OpenapiValidator::new(&json!({
@@ -1919,6 +1935,55 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
                 &mut ctx,
                 &headers,
                 br#"<alias:root xmlns:alias="https://trusted.example/schema"><role>user</role></alias:root>"#,
+            )
+            .await,
+    );
+
+    // A root namespace remains authoritative even when xml.name is omitted.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/root-ns-only",
+            "path_regex": "^/root-ns-only$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {
+                            "namespace": "https://trusted.example/schema",
+                            "prefix": "trusted"
+                        },
+                        "properties": {
+                            "role": {"type": "string", "const": "user"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/root-ns-only");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns="https://attacker.example/schema"><role>user</role></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/root-ns-only");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<alias:document xmlns:alias="https://trusted.example/schema">
+                    <role>user</role>
+                </alias:document>"#,
             )
             .await,
     );
