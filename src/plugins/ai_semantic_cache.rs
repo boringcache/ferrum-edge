@@ -991,7 +991,7 @@ impl AiSemanticCache {
     /// 1. Classify the JSON body into an exclusive provider request family
     /// 2. Optionally scope by proxy and authenticated consumer
     /// 3. Optionally include model name and family-correct generation controls
-    /// 4. Canonicalize family-correct prompt text (lowercase + collapse whitespace)
+    /// 4. Preserve family-correct prompt text and structural JSON bytes exactly
     /// 5. Include hashed fingerprints for non-text multimodal / native tool blocks
     /// 6. Include family instruction state (`system`, `instructions`,
     ///    `systemInstruction`, `preamble`, `previous_response_id`, ...)
