@@ -1519,8 +1519,9 @@ fn parse_property_encoding(
             }
             // Header Object may wrap `schema`; accept either that public OAS
             // shape or the internal bare-schema representation. Header Object
-            // `required` defaults to false (OAS 3.1 §4.8.21), so an optional
-            // part header must not reject an otherwise valid multipart body.
+            // `required` defaults to false (OAS 3.1 §4.8.21), while the
+            // internal bare-schema representation preserves its historical
+            // fail-closed presence requirement.
             let header_object = header_schema.as_object();
             // `required`, `description`, and `examples` are also valid JSON
             // Schema keywords, so they cannot distinguish the supported bare
@@ -1540,7 +1541,7 @@ fn parse_property_encoding(
                     }
                 }
             } else {
-                false
+                true
             };
             if is_header_object
                 && header_object.is_some_and(|object| object.contains_key("content"))
