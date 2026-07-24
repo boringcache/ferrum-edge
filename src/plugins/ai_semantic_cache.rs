@@ -5235,7 +5235,7 @@ mod tests {
             ("b".to_string(), "2".to_string()),
         ]);
         // Intentional embedded NULs: `1` NUL `b` NUL `2` (not an octal `\02`).
-        let fused_headers = HashMap::from([("a".to_string(), "1\0b\x0002".to_string())]);
+        let fused_headers = HashMap::from([("a".to_string(), "1\0b\0\x32".to_string())]);
         let split_mac = compute_redis_envelope_mac(
             TEST_INTEGRITY_KEY.as_bytes(),
             &RedisEnvelopeMacInput {
