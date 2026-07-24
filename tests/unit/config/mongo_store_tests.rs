@@ -307,7 +307,6 @@ fn same_owner_orphan_reservation_is_adoptable_cross_owner_is_conflict() {
     use ferrum_edge::_test_support::{
         ConsumerIdentityReservationDisposition, classify_consumer_identity_reservation,
         consumer_identity_reservation_is_same_owner,
-        orphaned_consumer_identity_reservation_may_delete,
     };
 
     assert_eq!(
@@ -326,13 +325,55 @@ fn same_owner_orphan_reservation_is_adoptable_cross_owner_is_conflict() {
     );
     assert!(consumer_identity_reservation_is_same_owner("alice", "alice"));
     assert!(!consumer_identity_reservation_is_same_owner("bob", "alice"));
+}
+
+#[test]
+fn live_reservation_cannot_be_reclaimed_from_point_read_absence() {
+    use ferrum_edge::_test_support::{
+        ConsumerIdentityReconcileObservation, automatic_consumer_identity_orphan_reclaim_permitted,
+        consumer_identity_values_safe_to_rollback_release, ordered_insert_newly_inserted_prefix,
+    };
+
+    // Dangerous interleaving: node A reserved identity, consumer insert still
+    // in flight; node B sees consumer absent. Reclaim must be refused — proving
+    // absence is not `!consumer_exists` alone.
     assert!(
-        orphaned_consumer_identity_reservation_may_delete(false),
-        "ownership proof: absent consumer doc permits orphan delete"
+        !automatic_consumer_identity_orphan_reclaim_permitted(
+            ConsumerIdentityReconcileObservation::ConsumerAbsentSameOwnerCreateInFlight
+        ),
+        "in-flight same-owner reserve-first create must keep its reservation"
     );
     assert!(
-        !orphaned_consumer_identity_reservation_may_delete(true),
-        "ownership proof: present consumer doc must keep the reservation"
+        !automatic_consumer_identity_orphan_reclaim_permitted(
+            ConsumerIdentityReconcileObservation::ConsumerAbsentNoKnownWriter
+        ),
+        "point-read consumer absence without a known writer is still not reclaim-safe \
+         across serving nodes (migration lease does not serialize CRUD)"
+    );
+    assert!(
+        !automatic_consumer_identity_orphan_reclaim_permitted(
+            ConsumerIdentityReconcileObservation::ConsumerPresent
+        ),
+        "present consumer means the reservation is live"
+    );
+
+    // Rollback may release only this attempt's newly inserted prefix; adopted
+    // same-owner docs (provenance unknown) stay out of the release set.
+    let values = ["alice".to_string(), "alice@example.com".to_string()];
+    assert_eq!(
+        ordered_insert_newly_inserted_prefix(&values, Some(1)),
+        &values[..1],
+        "ordered E11000 at index 1 means only the leading value was inserted here"
+    );
+    assert!(
+        ordered_insert_newly_inserted_prefix(&values, None).is_empty(),
+        "unknown write-error index ⇒ retain all (empty rollback-safe set)"
+    );
+    let adopted_only: [String; 0] = [];
+    assert_eq!(
+        consumer_identity_values_safe_to_rollback_release(&adopted_only),
+        &[] as &[String],
+        "pure same-owner adoption must not roll back pre-existing reservations"
     );
 }
 
@@ -421,6 +462,11 @@ fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
         standalone.contains("is_duplicate_key"),
         "standalone reserve must classify duplicate-key before adopting"
     );
+    assert!(
+        standalone.contains("newly_inserted")
+            || standalone.contains("consumer_identity_values_safe_to_rollback_release"),
+        "standalone reserve must expose newly-inserted values for safe rollback"
+    );
 
     let session = mongo_method("insert_consumer_identity_docs_in_session(");
     assert!(
@@ -428,9 +474,21 @@ fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
         "replica-set reserve must same-owner-adopt on E11000"
     );
 
+    let create = mongo_method("create_consumer(");
+    assert!(
+        create.contains("consumer_identity_values_safe_to_rollback_release")
+            || create.contains("newly_inserted_identity_values"),
+        "create_consumer rollback must release only newly-inserted reservations"
+    );
+
     let migrations = mongo_method("run_migrations(");
     assert!(
-        migrations.contains("reconcile_orphaned_consumer_identity_reservations"),
-        "startup migrations must reconcile orphaned identity reservations"
+        !migrations.contains("reconcile_orphaned_consumer_identity_reservations"),
+        "startup migrations must not reclaim reservations from point-read consumer absence"
+    );
+    assert!(
+        migrations.contains("automatic_consumer_identity_orphan_reclaim_permitted")
+            || migrations.contains("Intentionally no automatic orphan reconcile"),
+        "migrations must document why automatic orphan reclaim is omitted"
     );
 }

@@ -2003,7 +2003,9 @@ pub mod _test_support {
         crate::plugin_cache::validate_tcp_connection_throttle_attachments(config)
     }
 
-    pub use crate::config::mongo_store::ConsumerIdentityReservationDisposition;
+    pub use crate::config::mongo_store::{
+        ConsumerIdentityReconcileObservation, ConsumerIdentityReservationDisposition,
+    };
 
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
@@ -2041,9 +2043,24 @@ pub mod _test_support {
         )
     }
 
-    pub fn orphaned_consumer_identity_reservation_may_delete(consumer_doc_exists: bool) -> bool {
-        crate::config::mongo_store::orphaned_consumer_identity_reservation_may_delete(
-            consumer_doc_exists,
+    pub fn automatic_consumer_identity_orphan_reclaim_permitted(
+        observation: ConsumerIdentityReconcileObservation,
+    ) -> bool {
+        crate::config::mongo_store::automatic_consumer_identity_orphan_reclaim_permitted(observation)
+    }
+
+    pub fn ordered_insert_newly_inserted_prefix<'a, T>(
+        values: &'a [T],
+        first_error_index: Option<usize>,
+    ) -> &'a [T] {
+        crate::config::mongo_store::ordered_insert_newly_inserted_prefix(values, first_error_index)
+    }
+
+    pub fn consumer_identity_values_safe_to_rollback_release<'a>(
+        newly_inserted_by_this_attempt: &'a [String],
+    ) -> &'a [String] {
+        crate::config::mongo_store::consumer_identity_values_safe_to_rollback_release(
+            newly_inserted_by_this_attempt,
         )
     }
 

@@ -255,6 +255,8 @@ Admission checks that cannot be expressed as unique indexes (host-overlap route 
 
 Consumer identity uniqueness (issue #2121 — `id`/`username`/`custom_id` share one keyspace per namespace) needs no lock documents: it is enforced atomically by the `consumer_identity_index` collection's `_id = "{namespace}:{identity_value}"` uniqueness, reserved *before* the consumer write on standalone deployments and written in the same transaction on replica sets. Consumer documents themselves use `_id = "{namespace}:{id}"`, making consumer ids per-namespace.
 
+**Standalone crash-orphan limitation (issue #2987):** if a process dies after committing identity reservations but before the consumer document lands, those reservations remain and 409 any *different* consumer that claims the same identity values. Same-owner retries heal in-band via E11000 adoption (the conflicting docs are treated as already reserved by that consumer id). Ferrum does **not** automatically delete reservations whose consumer document is absent at startup: the migration lease serializes migration runners only, not normal consumer CRUD, so a point-read "consumer missing" observation can race a live reserve-first create on another serving node and would drop that create's uniqueness guard. Prefer permanent conservative lockout (or manual mongosh removal of a confirmed orphan) over corrupting uniqueness. A generation/lease takeover protocol would be required for safe automatic different-owner reclamation.
+
 mTLS `san_dns` identity admission uses a separate majority-durable,
 non-expiring namespace mutex in `mtls_dns_admission_locks`. The connection
 bundle that acquires the mutex is pinned through the authoritative candidate
