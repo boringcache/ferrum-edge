@@ -266,19 +266,19 @@ pub struct AdminState {
     /// (`db_available=false`) during a transient DB outage.
     pub db_available: Option<Arc<AtomicBool>>,
     /// Set by the database- or CP-mode poll loop when the latest full config
-    /// load was rejected by the shared runtime-config *validation* contract (a
-    /// reachable backend served a semantically-invalid snapshot) rather than
-    /// failing on connectivity. Orthogonal to `db_available`: on a validation
-    /// rejection the backend is reachable and admin writes are the in-band repair
-    /// tool, so `db_available` stays `true` while this flag rises. Cleared only by
-    /// the next accepted authoritative full reload. Surfaced only in the
-    /// authenticated `/health` detail (`config_rejected`) and coarsely as a
-    /// `"degraded"` status; `None` in modes without a writable poll loop.
+    /// load was rejected by the shared runtime-config validation contract or by
+    /// typed SQL row decoding (a reachable backend served a semantically invalid
+    /// or undecodable snapshot) rather than failing on connectivity. Orthogonal
+    /// to `db_available`: the backend is reachable and admin writes are the
+    /// in-band repair tool, so `db_available` stays `true` while this flag rises.
+    /// Cleared only by the next accepted authoritative full reload. Surfaced only
+    /// in the authenticated `/health` detail (`config_rejected`) and coarsely as
+    /// a `"degraded"` status; `None` in modes without a writable poll loop.
     ///
     /// The stored flag is deliberately sticky across a later connectivity outage;
     /// the `/health` handler suppresses the detailed `config_rejected` field while
     /// `db_available=false` so it never advertises the writable repair path when
-    /// admin writes are actually blocked. See issue #2158.
+    /// admin writes are actually blocked. See issues #2158 and #2997.
     pub config_rejected: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
