@@ -289,8 +289,8 @@ These settings only apply when `FERRUM_DB_TYPE=mongodb`. `FERRUM_DB_POOL_*` sett
 | `FERRUM_MONGO_APP_NAME` | No | — | App name for server-side connection tracking |
 | `FERRUM_MONGO_REPLICA_SET` | No | — | Replica set name. Required for transactions and change streams |
 | `FERRUM_MONGO_AUTH_MECHANISM` | No | (auto) | Auth mechanism override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
-| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | `30` | Server selection timeout |
-| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | `10` | TCP connection timeout |
+| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | — | Explicit server selection timeout. When unset, preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
+| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | — | Explicit TCP connect timeout. When unset, preserves `connectTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
 
 See [mongodb.md](mongodb.md) for the full deployment guide including read preference, replica sets, Atlas, and Kubernetes examples.
 
@@ -598,9 +598,9 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_RESOLVER_ADDRESS` | No | resolv.conf | Comma-separated nameservers (ip[:port]) |
 | `FERRUM_DNS_RESOLVER_HOSTS_FILE` | No | `/etc/hosts` | Path to custom hosts file |
 | `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
-| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Capped at 86400s (1 day) |
-| `FERRUM_DNS_ERROR_TTL` | No | `5` | TTL (seconds) for errors/empty responses. Capped at 86400s (1 day) |
-| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries |
+| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Also caps failed-entry lifetime and error-TTL backoff. Capped at 86400s (1 day) |
+| `FERRUM_DNS_ERROR_TTL` | No | `5` | Base TTL (seconds) for errors/empty responses; doubles on consecutive failures up to `FERRUM_DNS_STALE_TTL`. Capped at 86400s (1 day) |
+| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries. Over-capacity eviction prefers error entries over live success entries |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent DNS warmup resolutions during startup/config reload |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
@@ -608,7 +608,7 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_TRY_TCP_ON_ERROR` | No | `true` | Retry over TCP when UDP DNS responses are truncated or fail |
 | `FERRUM_DNS_NUM_CONCURRENT_REQS` | No | `3` | Nameservers to query concurrently per lookup; clamped 1..10 |
 | `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | No | `512` | Max in-flight queries per multiplexed DNS connection; clamped 1..4096 |
-| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Maximum concurrent stale-while-revalidate background refresh tasks system-wide. Prevents unbounded task spawning when many stale hostnames are hit simultaneously. Range: 1-1000 |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Max concurrent stale-while-revalidate refreshes and per-cycle failed-DNS retry work (selection + resolve concurrency). Range: 1-1000 |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 

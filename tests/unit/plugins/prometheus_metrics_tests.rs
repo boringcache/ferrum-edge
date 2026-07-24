@@ -757,6 +757,14 @@ async fn test_registry_render_contains_expected_metrics() {
     assert!(output.contains("# TYPE ferrum_backend_duration_ms histogram"));
     assert!(output.contains("# HELP ferrum_rate_limit_exceeded_total"));
     assert!(output.contains("# TYPE ferrum_rate_limit_exceeded_total counter"));
+    assert!(output.contains("# HELP ferrum_compression_codec_admitted_total"));
+    assert!(output.contains("# TYPE ferrum_compression_codec_admitted_total counter"));
+    assert!(output.contains("# HELP ferrum_compression_codec_saturated_total"));
+    assert!(output.contains("# TYPE ferrum_compression_codec_saturated_total counter"));
+    assert!(output.contains("# HELP ferrum_compression_codec_join_failures_total"));
+    assert!(output.contains("# TYPE ferrum_compression_codec_join_failures_total counter"));
+    assert!(output.contains("# HELP ferrum_compression_codec_worker_failures_total"));
+    assert!(output.contains("# TYPE ferrum_compression_codec_worker_failures_total counter"));
 
     // Check counter line
     assert!(output.contains(

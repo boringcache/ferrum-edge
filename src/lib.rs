@@ -100,6 +100,30 @@ pub mod _test_support {
         ctx.compression_ownership_for_test()
     }
 
+    pub fn take_compression_response_codec_permit_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        ctx.take_compression_response_codec_permit()
+    }
+
+    pub fn gateway_response_compression_algorithm_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<&'static str> {
+        ctx.gateway_response_compression_algorithm()
+    }
+
+    pub fn reconcile_aborted_gateway_response_encoding_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_headers: &mut std::collections::HashMap<String, String>,
+        body_len: usize,
+    ) {
+        crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+            ctx,
+            response_headers,
+            body_len,
+        );
+    }
+
     pub fn validate_correlation_id_composition_for_test(
         plugins: &[Arc<dyn Plugin>],
     ) -> Result<(), String> {
@@ -2029,6 +2053,14 @@ pub mod _test_support {
         crate::config::db_loader::MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL
     }
 
+    pub fn mysql_config_change_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL
+    }
+
+    pub fn mysql_proxy_route_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL
+    }
+
     pub fn mtls_dns_policy_requires_consumer_load(
         config: &crate::config::types::GatewayConfig,
     ) -> bool {
@@ -2043,6 +2075,46 @@ pub mod _test_support {
 
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
+    }
+
+    /// MongoDB timeout precedence (issue #2988): URI-parsed
+    /// `serverSelectionTimeoutMS`/`connectTimeoutMS` survive when the env
+    /// override is `None`, and are replaced only when explicitly set.
+    pub fn apply_mongo_timeout_overrides(
+        client_options: &mut mongodb::options::ClientOptions,
+        server_selection_timeout_secs: Option<u64>,
+        connect_timeout_secs: Option<u64>,
+    ) {
+        crate::config::mongo_store::apply_mongo_timeout_overrides(
+            client_options,
+            server_selection_timeout_secs,
+            connect_timeout_secs,
+        )
+    }
+
+    /// Consumer-identity ordered-insert prefix attribution (issue #2987): only
+    /// the prefix before the E11000 write-error index was inserted by this
+    /// attempt; `None` means attribution is unknown (retain everything).
+    pub fn ordered_insert_newly_inserted_prefix<T>(
+        values: &[T],
+        first_error_index: Option<usize>,
+    ) -> &[T] {
+        crate::config::mongo_store::ordered_insert_newly_inserted_prefix(values, first_error_index)
+    }
+
+    /// Consumer-identity adoption-failure release set (issue #2987): the
+    /// verifiable ordered-insert prefix plus vacant reservations this adoption
+    /// attempt inserted before failing — never pre-existing same-owner docs.
+    pub fn consumer_identity_adoption_failure_release_values(
+        ordered_values: &[String],
+        ordered_first_error_index: Option<usize>,
+        adoption_newly_inserted: &[String],
+    ) -> Vec<String> {
+        crate::config::mongo_store::consumer_identity_adoption_failure_release_values(
+            ordered_values,
+            ordered_first_error_index,
+            adoption_newly_inserted,
+        )
     }
 
     // ── plugins/grpc_web ─────────────────────────────────────────────────────
