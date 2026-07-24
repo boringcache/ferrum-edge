@@ -833,6 +833,7 @@ impl HealthChecker {
     }
 
     /// Start an active health check background task for a target.
+    #[allow(clippy::too_many_arguments)]
     fn start_active_check(
         &self,
         target: &UpstreamTarget,

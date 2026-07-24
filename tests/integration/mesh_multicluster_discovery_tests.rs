@@ -283,7 +283,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     // All healthy: every selection lands on the local (same-region) endpoint.
     for i in 0..20 {
         let selection = lb
-            .select_target(upstream_id, &i.to_string(), None)
+            .select_target("default", upstream_id, &i.to_string(), None)
             .expect("target");
         assert_eq!(
             selection.target.host, "10.1.0.1",
@@ -304,7 +304,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     // remote endpoint tier.
     for i in 0..20 {
         let selection = lb
-            .select_target(upstream_id, &i.to_string(), Some(&health))
+            .select_target("default", upstream_id, &i.to_string(), Some(&health))
             .expect("failover target");
         assert_eq!(
             selection.target.host, "10.2.0.1",

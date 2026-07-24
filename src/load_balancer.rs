@@ -1552,6 +1552,7 @@ impl LoadBalancerCache {
         balancer.select_excluding_from_subset(ctx_key, subset_name, exclude, health)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn select_next_target_for_port_subset_from(
         snapshot: &LoadBalancerCacheInner,
         namespace: &str,

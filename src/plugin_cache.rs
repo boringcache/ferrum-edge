@@ -1714,6 +1714,7 @@ fn target_matches_subset(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_upstream_route(
     keys: &mut Vec<AdaptiveConcurrencyRouteKey>,
     upstream_routes: &mut Vec<AdaptiveConcurrencyUpstreamRoute>,

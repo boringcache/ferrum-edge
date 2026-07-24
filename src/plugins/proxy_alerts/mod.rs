@@ -391,6 +391,7 @@ impl ProxyAlerts {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_observation(
         &self,
         rule: &Rule,
