@@ -1961,6 +1961,16 @@ pub struct RequestContext {
     /// releases the slot if the transform never runs (cancellation). Clones
     /// do not duplicate the exclusive permit.
     compression_response_codec_permit: HeldCodecPermit,
+    /// Validated plaintext staged by the rare buffered request-decode fallback
+    /// (headers stripped in `before_proxy` without a mutable body view). The
+    /// owning transform must emit these bytes so the backend never sees a
+    /// compressed body without `Content-Encoding`.
+    compression_staged_request_plaintext: Option<Vec<u8>>,
+    /// Set when the response-encode owner cannot produce bytes that match a
+    /// previously committed gateway `Content-Encoding`. Shared transform loops
+    /// must restore an identity representation (or otherwise fail closed)
+    /// instead of forwarding plaintext under a coded header.
+    compression_response_encode_aborted: bool,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -2351,6 +2361,8 @@ impl RequestContext {
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
             compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_staged_request_plaintext: None,
+            compression_response_encode_aborted: false,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -2626,6 +2638,28 @@ impl RequestContext {
         &mut self,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.compression_response_codec_permit.take()
+    }
+
+    pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
+        self.compression_staged_request_plaintext = Some(plaintext);
+    }
+
+    pub(crate) fn take_compression_staged_request_plaintext(&mut self) -> Option<Vec<u8>> {
+        self.compression_staged_request_plaintext.take()
+    }
+
+    pub(crate) fn mark_compression_response_encode_aborted(&mut self) {
+        self.compression_response_encode_aborted = true;
+    }
+
+    pub(crate) fn take_compression_response_encode_aborted(&mut self) -> bool {
+        std::mem::take(&mut self.compression_response_encode_aborted)
+    }
+
+    pub(crate) fn clear_gateway_response_compression(&mut self) {
+        self.gateway_response_compression_algorithm = None;
+        self.compression_response_encode_owner = None;
+        let _ = self.compression_response_codec_permit.take();
     }
 
     #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
@@ -3067,6 +3101,12 @@ impl RequestContext {
             // reserved admission slot; the donor context must not double-release.
             compression_response_codec_permit: std::mem::take(
                 &mut self.compression_response_codec_permit,
+            ),
+            compression_staged_request_plaintext: std::mem::take(
+                &mut self.compression_staged_request_plaintext,
+            ),
+            compression_response_encode_aborted: std::mem::take(
+                &mut self.compression_response_encode_aborted,
             ),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
@@ -7186,7 +7226,11 @@ pub trait Plugin: Send + Sync {
 /// identity.
 #[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
-    create_plugin_with_http_client(name, config, PluginHttpClient::default())
+    create_plugin_with_http_client(
+        name,
+        config,
+        PluginHttpClient::default().with_process_compression_admission_policy(),
+    )
 }
 
 /// Create a plugin instance with a shared HTTP client for outbound calls.
@@ -7577,7 +7621,11 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
 #[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
-    validate_plugin_config_with_http_client(name, config, PluginHttpClient::default())
+    validate_plugin_config_with_http_client(
+        name,
+        config,
+        PluginHttpClient::default().with_process_compression_admission_policy(),
+    )
 }
 
 /// Validate a plugin configuration with a caller-supplied HTTP policy without
@@ -7625,7 +7673,8 @@ pub fn validate_plugin_config_with_policy(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+        .with_process_compression_admission_policy();
     validate_plugin_config_with_http_client(name, config, http_client)?;
     validate_plugin_config_policy_only(name, config, backend_allow_ips)
 }

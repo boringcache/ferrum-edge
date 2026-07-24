@@ -277,6 +277,16 @@ impl PluginTlsPosture {
 /// redirects and ambient proxies disabled and applies the caller's TLS posture.
 /// If that cannot be constructed either, drop custom TLS posture but retain
 /// those two non-negotiable egress controls.
+fn env_flag_default_true(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
+}
+
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
@@ -618,6 +628,23 @@ impl PluginHttpClient {
     pub(crate) fn with_max_request_body_size_bytes(mut self, max_bytes: usize) -> Self {
         self.max_request_body_size_bytes = max_bytes;
         self
+    }
+
+    /// Apply process-wide compression codec gates and the gateway request-body
+    /// ceiling from environment defaults.
+    ///
+    /// Admin/file/CP validation clients that do not inherit a live `ProxyState`
+    /// plugin client must call this so compression admission matches the serving
+    /// plugin cache (including `max_decompressed_request_size` cross-checks).
+    pub(crate) fn with_process_compression_admission_policy(self) -> Self {
+        let gzip_enabled = env_flag_default_true("FERRUM_COMPRESSION_GZIP_ENABLED");
+        let brotli_enabled = env_flag_default_true("FERRUM_COMPRESSION_BROTLI_ENABLED");
+        let max_request_body_size_bytes = std::env::var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10_485_760);
+        self.with_compression_algorithms(gzip_enabled, brotli_enabled)
+            .with_max_request_body_size_bytes(max_request_body_size_bytes)
     }
 
     pub(crate) fn compression_gzip_enabled(&self) -> bool {

@@ -1321,7 +1321,13 @@ the terminal numeric `grpc_status` (`0`–`16`, or `OTHER` for malformed/future
 codes), so application failures under HTTP 200 are distinguishable. The
 `ferrum_rate_limit_exceeded_total` process counter aggregates each rejection,
 UDP drop, and WebSocket policy close produced by `rate_limiting`,
-`ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`.
+`ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`. Process-wide
+compression codec admission is exported as
+`ferrum_compression_codec_admitted_total`,
+`ferrum_compression_codec_saturated_total`,
+`ferrum_compression_codec_join_failures_total`, and
+`ferrum_compression_codec_worker_failures_total` so operators can scrape queue
+saturation and worker failures from the same authenticated `/metrics` surface.
 
 WebSocket teardown exports `ferrum_websocket_sessions_total`,
 `ferrum_websocket_session_duration_ms`, `ferrum_websocket_bytes_total`, and
@@ -3230,7 +3236,7 @@ The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTL
 
 When `decompress_request` is enabled, `Content-Encoding` is parsed as an ordered `#content-coding` list (RFC 9110 §8.4) with OWS trimming. Supported chains (`gzip` / `x-gzip`, `br`) decode in reverse application order under the shared content-coding decoder; `identity`-only lists strip the header without rewriting bytes. Malformed members, parameters, unsupported codings, mixed `identity`, trailing/concatenated members, and limit/amplification overruns fail closed with `400`. Codec worker saturation fails closed with `503`.
 
-Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded `spawn_blocking` pool (32 concurrent jobs process-wide). Response compression acquires an admission permit before committing `Content-Encoding`; when saturated it serves identity (or `406` when identity is unacceptable) instead of blocking Tokio workers.
+Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded `spawn_blocking` pool (32 concurrent jobs process-wide). Response compression acquires an admission permit before committing `Content-Encoding`; when saturated it serves identity (or `406` when identity is unacceptable) instead of blocking Tokio workers. Authenticated `/metrics` exports `ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total`. If encoding fails after `Content-Encoding` was committed (worker error or join failure), shared H1/H2/H3 buffered transform loops atomically restore an identity response with matching headers/length rather than emitting plaintext under a coded header. Rare buffered request-decode fallback paths that strip encoding headers without a mutable body view stage the validated plaintext onto the request context so the later transform emits those bytes without a second codec admission.
 
 **Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
 
@@ -3255,11 +3261,11 @@ Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - After an actual compression body transform, the shared body-transform lifecycle removes representation-integrity metadata that described the uncompressed origin bytes — `Content-Digest`, `Repr-Digest`, legacy `Digest`, and `Content-MD5` (case-insensitive), along with other content-bound validators such as weak `ETag` / `Last-Modified`. Those fields are preserved when compression is skipped, negotiation declines, the body is ineligible, or the transform returns `None`. Gateway `Content-Encoding` and `Vary: Accept-Encoding` remain. On buffered H1/H2/H3 paths, trailer integrity fields are handled the same way as other stale application trailers after a rewrite: native H3 drops backend trailers once the body is rewritten, and buffered gRPC retires application trailers (including digests) while preserving reserved terminal status metadata
 - Forces response body buffering on proxies where this plugin is enabled
-- When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so earlier body consumers such as `soap_ws_security` inspect validated plaintext; the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed
+- When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so earlier body consumers such as `soap_ws_security` inspect validated plaintext; the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed. On the rare buffered fallback that validates without a mutable body view, validated plaintext is staged on the request context before headers are stripped so the later transform cannot forward compressed bytes without encoding metadata
 - `remove_accept_encoding` only mutates the backend request when the instance still has at least one usable response codec after process-wide gates
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
 - Strong origin `ETag` validators are preserved by skipping compression; when a weak-ETag response is compressed, the shared body-transform lifecycle removes that upstream validator because the client-visible bytes changed
-- Synchronous gzip/Brotli work is offloaded through a bounded admission semaphore and `spawn_blocking` so codec CPU does not monopolize Tokio workers
+- Synchronous gzip/Brotli work is offloaded through a bounded admission semaphore and `spawn_blocking` so codec CPU does not monopolize Tokio workers; encoder failure after a committed coding restores identity headers on shared buffered paths
 
 **Multiple instances:** A proxy may carry several `compression` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Request decompression and response compression are not idempotent, so each one-shot coding decision is tied to exactly one effective instance in configured order:
 

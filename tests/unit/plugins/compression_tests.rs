@@ -5271,54 +5271,241 @@ async fn test_content_encoding_malformed_and_unsupported_fail_closed() {
 
 #[tokio::test]
 async fn test_codec_admission_saturation_rejects_request_decode() {
-    use ferrum_edge::plugins::compression::{
-        acquire_all_codec_permits_for_test, compression_codec_metrics,
-    };
+    use ferrum_edge::plugins::compression::{compression_codec_metrics, with_test_codec_budget};
     use flate2::write::GzEncoder;
     use std::io::Write;
 
-    let _permits = acquire_all_codec_permits_for_test();
-    let before = compression_codec_metrics();
+    with_test_codec_budget(0, || async {
+        let before = compression_codec_metrics();
+
+        let plugin = make_plugin(json!({"decompress_request": true}));
+        let original = b"saturation fixture";
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), "gzip".to_string());
+        let mut body = compressed;
+        let result = plugin
+            .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Reject { status_code: 503, .. }),
+            "saturated codec budget must reject request decode, got {result:?}"
+        );
+        let after = compression_codec_metrics();
+        assert!(after.saturated > before.saturated);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_codec_admission_saturation_skips_response_commit() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    with_test_codec_budget(0, || async {
+        let plugin = make_plugin(json!({"min_content_length": 10}));
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut headers = HashMap::new();
+        headers.insert("accept-encoding".to_string(), "gzip".to_string());
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp = HashMap::new();
+        resp.insert("content-type".to_string(), "application/json".to_string());
+        resp.insert("content-length".to_string(), "1000".to_string());
+        let result = plugin.after_proxy(&mut ctx, 200, &mut resp).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(
+            !resp.contains_key("content-encoding"),
+            "saturated codec budget must not commit Content-Encoding"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_request_fallback_stages_plaintext_before_header_strip() {
+    use bytes::Bytes;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
 
     let plugin = make_plugin(json!({"decompress_request": true}));
-    let original = b"saturation fixture";
+    let original = b"fallback-staged-plaintext";
     let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(original).unwrap();
     let compressed = encoder.finish().unwrap();
 
     let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    // Simulate the rare path: body bytes are present on the context, but
+    // before_proxy has no mutable body view.
+    ctx.request_body_bytes = Some(Bytes::from(compressed.clone()));
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
-    let mut body = compressed;
-    let result = plugin
-        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
-        .await;
-    assert!(
-        matches!(result, PluginResult::Reject { status_code: 503, .. }),
-        "saturated codec budget must reject request decode, got {result:?}"
+    headers.insert(
+        "content-length".to_string(),
+        compressed.len().to_string(),
     );
-    let after = compression_codec_metrics();
-    assert!(after.saturated > before.saturated);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "successful fallback decode must strip Content-Encoding"
+    );
+    assert!(
+        ctx.metadata
+            .contains_key("compression:request_decoded"),
+        "fallback must mark the request as decoded"
+    );
+
+    // Transform must emit staged plaintext without needing a second codec slot.
+    let transformed = plugin
+        .transform_request_body_with_context(&mut ctx, &compressed, None, &headers)
+        .await
+        .expect("staged plaintext must be transferred");
+    assert_eq!(transformed.as_slice(), original);
 }
 
 #[tokio::test]
-async fn test_codec_admission_saturation_skips_response_commit() {
-    use ferrum_edge::plugins::compression::acquire_all_codec_permits_for_test;
+async fn test_response_encode_abort_restores_identity_representation() {
+    use ferrum_edge::_test_support::{
+        gateway_response_compression_algorithm_for_test,
+        reconcile_aborted_gateway_response_encoding_for_test,
+        take_compression_response_codec_permit_for_test,
+    };
 
-    let _permits = acquire_all_codec_permits_for_test();
     let plugin = make_plugin(json!({"min_content_length": 10}));
     let mut ctx = make_ctx(Some("gzip"));
-    let mut headers = HashMap::new();
-    headers.insert("accept-encoding".to_string(), "gzip".to_string());
-    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut req_headers = HashMap::new();
+    req_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
 
     let mut resp = HashMap::new();
     resp.insert("content-type".to_string(), "application/json".to_string());
     resp.insert("content-length".to_string(), "1000".to_string());
-    let result = plugin.after_proxy(&mut ctx, 200, &mut resp).await;
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(resp.get("content-encoding").map(String::as_str), Some("gzip"));
+
+    // Simulate a missing permit / encoder abort after Content-Encoding commit.
+    let _ = take_compression_response_codec_permit_for_test(&mut ctx);
+    let identity = compressible_json_body();
+    let transformed = plugin
+        .transform_response_body_with_context(&mut ctx, &identity, Some("application/json"), &resp)
+        .await;
+    assert!(
+        transformed.is_none(),
+        "encode abort must not emit compressed bytes"
+    );
+    reconcile_aborted_gateway_response_encoding_for_test(&mut ctx, &mut resp, identity.len());
     assert!(
         !resp.contains_key("content-encoding"),
-        "saturated codec budget must not commit Content-Encoding"
+        "encode abort must restore identity headers"
+    );
+    let expected_len = identity.len().to_string();
+    assert_eq!(resp.get("content-length"), Some(&expected_len));
+    assert!(gateway_response_compression_algorithm_for_test(&ctx).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_codec_offload_allows_unrelated_async_progress() {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    let plugin = make_plugin(json!({"min_content_length": 10, "gzip_level": 9}));
+    let body = vec![b'a'; 64 * 1024];
+    let progressed = Arc::new(AtomicBool::new(false));
+    let progressed_flag = Arc::clone(&progressed);
+
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    req_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+    let mut resp = HashMap::new();
+    resp.insert("content-type".to_string(), "application/json".to_string());
+    resp.insert("content-length".to_string(), body.len().to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+        PluginResult::Continue
+    ));
+
+    let encode = tokio::spawn(async move {
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &resp,
+            )
+            .await
+    });
+
+    // Deterministic liveness: an unrelated task must be able to run while the
+    // codec job occupies a blocking-pool worker. No wall-clock threshold.
+    let observer = tokio::spawn(async move {
+        progressed_flag.store(true, AtomicOrdering::SeqCst);
+    });
+
+    while !progressed.load(AtomicOrdering::SeqCst) && !encode.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        progressed.load(AtomicOrdering::SeqCst),
+        "Tokio must schedule unrelated work while bounded codec jobs run on spawn_blocking"
+    );
+    observer.await.expect("observer task");
+    let compressed = encode
+        .await
+        .expect("encode task join")
+        .expect("encode must succeed under an unsaturated budget");
+    assert!(
+        !compressed.is_empty(),
+        "compressed output should be non-empty"
+    );
+}
+
+#[test]
+fn test_validation_and_admin_paths_apply_process_compression_admission_policy() {
+    // Every plugin-construction/admission client that does not inherit a live
+    // ProxyState must apply the process body-limit + codec-gate cross-check.
+    let plugins_mod = include_str!("../../../src/plugins/mod.rs");
+    let admin = include_str!("../../../src/admin/mod.rs");
+    let pipeline = include_str!("../../../src/config/validation_pipeline.rs");
+    let http_client = include_str!("../../../src/plugins/utils/http_client.rs");
+    assert!(
+        http_client.contains("fn with_process_compression_admission_policy"),
+        "PluginHttpClient must expose the shared admission-policy seam"
+    );
+    assert!(
+        plugins_mod.contains("with_process_compression_admission_policy()"),
+        "validate_plugin_config* must apply process compression admission policy"
+    );
+    assert!(
+        admin.contains("with_process_compression_admission_policy()"),
+        "admin plugin_validation_http_client fallback must apply process policy"
+    );
+    assert!(
+        pipeline.contains("with_process_compression_admission_policy()"),
+        "config validation pipeline must apply process compression admission policy"
+    );
+}
+
+#[test]
+fn test_shared_paths_reconcile_aborted_gateway_encoding() {
+    // Pin that every shared buffered response-body transform loop restores
+    // identity when compression marks an encode abort.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/cross_protocol.rs");
+    assert!(
+        proxy.matches("reconcile_aborted_gateway_response_encoding").count() >= 2,
+        "H1/H2 shared transform helpers must reconcile aborted gateway encodings"
+    );
+    assert!(
+        h3.matches("reconcile_aborted_gateway_response_encoding").count() >= 2,
+        "H3 cross-protocol buffered transforms must reconcile aborted gateway encodings"
     );
 }

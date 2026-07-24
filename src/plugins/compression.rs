@@ -9,10 +9,16 @@
 //! pre-`before_proxy` normalization phase so earlier body consumers (for
 //! example `soap_ws_security`) inspect validated plaintext. The same plaintext
 //! is forwarded to the backend after encoding/length headers are stripped only
-//! on successful decode.
+//! on successful decode. Rare buffered fallback paths that strip headers without
+//! a mutable body view stage the validated plaintext onto the request context
+//! so the later transform emits those bytes instead of re-decoding.
 //!
 //! Gzip/Brotli codec CPU runs on a bounded `spawn_blocking` pool guarded by an
-//! admission semaphore so Tokio workers are not monopolized.
+//! admission semaphore so Tokio workers are not monopolized. Queue saturation
+//! and worker-join failures are exported on the authenticated Prometheus
+//! `/metrics` surface. When a committed gateway `Content-Encoding` cannot be
+//! produced, shared H1/H2/H3 buffered transforms restore an identity response
+//! with matching headers rather than emitting a mislabeled body.
 //!
 //! Multiple effective instances compose with first-wins ownership: one instance
 //! owns request decode and one owns response encode per request so Content-
@@ -27,6 +33,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -80,6 +87,14 @@ static CODEC_BUDGET: LazyLock<Arc<Semaphore>> =
 static CODEC_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static CODEC_SATURATED: AtomicU64 = AtomicU64::new(0);
 static CODEC_JOIN_FAILURES: AtomicU64 = AtomicU64::new(0);
+static CODEC_WORKER_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+tokio::task_local! {
+    /// Test-only injected codec budget. When set, admission uses this semaphore
+    /// instead of the process-global pool so saturation tests cannot starve
+    /// unrelated parallel codec work.
+    static TEST_CODEC_BUDGET: Arc<Semaphore>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Algorithm {
@@ -162,28 +177,41 @@ pub struct CompressionCodecMetrics {
     pub admitted: u64,
     pub saturated: u64,
     pub join_failures: u64,
+    pub worker_failures: u64,
 }
 
-/// Snapshot process-wide codec admission counters.
+/// Snapshot process-wide codec admission counters (also scraped via Prometheus).
 pub fn compression_codec_metrics() -> CompressionCodecMetrics {
     CompressionCodecMetrics {
         admitted: CODEC_ADMITTED.load(Ordering::Relaxed),
         saturated: CODEC_SATURATED.load(Ordering::Relaxed),
         join_failures: CODEC_JOIN_FAILURES.load(Ordering::Relaxed),
+        worker_failures: CODEC_WORKER_FAILURES.load(Ordering::Relaxed),
     }
 }
 
-/// Acquire every available codec admission permit (tests only).
-pub fn acquire_all_codec_permits_for_test() -> Vec<OwnedSemaphorePermit> {
-    let mut permits = Vec::with_capacity(MAX_CONCURRENT_CODEC_JOBS);
-    while let Ok(permit) = Arc::clone(&CODEC_BUDGET).try_acquire_owned() {
-        permits.push(permit);
-    }
-    permits
+/// Run `f` with an isolated codec admission budget of `permits` slots.
+///
+/// Saturation tests must use this seam instead of draining the process-global
+/// semaphore, which would nondeterministically force unrelated parallel codec
+/// work onto 503/identity paths.
+pub async fn with_test_codec_budget<F, Fut, T>(permits: usize, f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let budget = Arc::new(Semaphore::new(permits));
+    TEST_CODEC_BUDGET.scope(budget, f()).await
+}
+
+fn active_codec_budget() -> Arc<Semaphore> {
+    TEST_CODEC_BUDGET
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| Arc::clone(&CODEC_BUDGET))
 }
 
 fn try_acquire_codec_permit() -> Result<OwnedSemaphorePermit, ()> {
-    match Arc::clone(&CODEC_BUDGET).try_acquire_owned() {
+    match active_codec_budget().try_acquire_owned() {
         Ok(permit) => {
             CODEC_ADMITTED.fetch_add(1, Ordering::Relaxed);
             Ok(permit)
@@ -193,6 +221,27 @@ fn try_acquire_codec_permit() -> Result<OwnedSemaphorePermit, ()> {
             Err(())
         }
     }
+}
+
+/// Restore identity response headers when a committed gateway content coding
+/// cannot be produced. Shared H1/H2/H3 buffered transform loops call this after
+/// a transform returns `None` so plaintext is never served under a coded header.
+pub(crate) fn reconcile_aborted_gateway_response_encoding(
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+    body_len: usize,
+) {
+    if !ctx.take_compression_response_encode_aborted() {
+        return;
+    }
+    response_headers.remove("content-encoding");
+    response_headers.insert("content-length".to_string(), body_len.to_string());
+    ctx.metadata.remove(RESPONSE_ALGORITHM_METADATA_KEY);
+    ctx.clear_gateway_response_compression();
+    warn!(
+        "compression: restored identity response after failed gateway content coding \
+         (body_len={body_len})"
+    );
 }
 
 struct CompressionConfig {
@@ -443,9 +492,10 @@ impl CompressionPlugin {
     /// When `body` is provided (pre-`before_proxy` normalization), successful
     /// decode replaces it with plaintext so later `before_proxy` consumers see
     /// the same bytes the backend will receive. When `body` is `None`, this
-    /// only validates `ctx.request_body_bytes` (legacy buffered `before_proxy`
-    /// path / rare unbuffered fallback) and leaves the transform stage to emit
-    /// plaintext.
+    /// validates `ctx.request_body_bytes` (legacy buffered `before_proxy` path /
+    /// rare unbuffered fallback), stages the validated plaintext on the request
+    /// context, and strips encoding headers only after that staging so a later
+    /// transform can emit the plaintext without re-acquiring the codec budget.
     async fn try_claim_and_decode_request(
         &self,
         ctx: &mut RequestContext,
@@ -535,6 +585,7 @@ impl CompressionPlugin {
                 let decompressed = match decode_result {
                     Ok(Ok(plain)) => plain,
                     Ok(Err(e)) => {
+                        CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             "compression: rejecting request with undecodable Content-Encoding '{ce}': {e}"
                         );
@@ -579,11 +630,20 @@ impl CompressionPlugin {
                         marker
                     );
                     *body = decompressed;
-                    ctx.metadata.insert(
-                        REQUEST_DECODED_METADATA_KEY.to_string(),
-                        marker,
+                } else {
+                    // Fallback path: headers are stripped only after staging the
+                    // validated plaintext for the later body transform.
+                    debug!(
+                        "compression: staged decoded request body ({} bytes, {}) for transform handoff",
+                        decompressed.len(),
+                        marker
                     );
+                    ctx.set_compression_staged_request_plaintext(decompressed);
                 }
+                ctx.metadata.insert(
+                    REQUEST_DECODED_METADATA_KEY.to_string(),
+                    marker,
+                );
 
                 PluginResult::Continue
             }
@@ -874,9 +934,10 @@ impl CompressionPlugin {
                 Some(compressed)
             }
             Ok(Err(e)) => {
+                CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
                 error!(
                     "compression: encoder failure for committed Content-Encoding '{}' — \
-                     response will be malformed: {e}",
+                     restoring identity representation: {e}",
                     encoding_owned
                 );
                 None
@@ -884,7 +945,8 @@ impl CompressionPlugin {
             Err(_) => {
                 CODEC_JOIN_FAILURES.fetch_add(1, Ordering::Relaxed);
                 error!(
-                    "compression: encoder worker join failed for committed Content-Encoding '{}'",
+                    "compression: encoder worker join failed for committed Content-Encoding '{}' — \
+                     restoring identity representation",
                     encoding_owned
                 );
                 None
@@ -921,6 +983,7 @@ impl CompressionPlugin {
                 Some(decompressed)
             }
             Ok(Err(e)) => {
+                CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
                 warn!("compression: request decompression failed: {e}");
                 None
             }
@@ -1644,6 +1707,11 @@ impl Plugin for CompressionPlugin {
         if !self.is_request_decode_owner(ctx) {
             return None;
         }
+        // Fallback path staged validated plaintext when headers were stripped
+        // without a mutable body view. Emit those bytes; never re-decode.
+        if let Some(plaintext) = ctx.take_compression_staged_request_plaintext() {
+            return Some(plaintext);
+        }
         // Early normalization already replaced the buffered body with validated
         // plaintext; re-decoding would corrupt the backend-visible bytes.
         if ctx.metadata.contains_key(REQUEST_DECODED_METADATA_KEY) {
@@ -1702,6 +1770,7 @@ impl Plugin for CompressionPlugin {
             error!(
                 "compression: missing codec admission permit for committed Content-Encoding '{encoding}'"
             );
+            ctx.mark_compression_response_encode_aborted();
             return None;
         };
 
@@ -1715,6 +1784,16 @@ impl Plugin for CompressionPlugin {
         // When CL is unknown (chunked / streamed responses), we accept that the
         // rare tiny chunked body will be compressed needlessly
         // — far cheaper than serving a malformed response.
-        self.compress_response_body(body, encoding, permit).await
+        //
+        // Encoder / join failure marks abort so shared transform loops restore
+        // an identity representation with correct headers instead of emitting
+        // mislabeled plaintext.
+        match self.compress_response_body(body, encoding, permit).await {
+            Some(compressed) => Some(compressed),
+            None => {
+                ctx.mark_compression_response_encode_aborted();
+                None
+            }
+        }
     }
 }
