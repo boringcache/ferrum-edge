@@ -238,11 +238,7 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
 }
 
 /// `BEGIN` starts a transaction when followed by `;` / EOF or a transaction mode keyword.
-fn is_transaction_begin_keyword(
-    sql: &str,
-    after_begin: usize,
-    dialect: SplitDialect,
-) -> bool {
+fn is_transaction_begin_keyword(sql: &str, after_begin: usize, dialect: SplitDialect) -> bool {
     let bytes = sql.as_bytes();
     let mut i = after_begin;
     skip_sql_whitespace_and_comments(sql, &mut i, dialect);
@@ -770,10 +766,7 @@ fn is_postgres_identifier_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '$')
 }
 
-fn strip_leading_sql_comments_for_dialect(
-    mut sql: &str,
-    dialect: SplitDialect,
-) -> &str {
+fn strip_leading_sql_comments_for_dialect(mut sql: &str, dialect: SplitDialect) -> &str {
     loop {
         sql = sql.trim_start();
         let bytes = sql.as_bytes();
@@ -826,8 +819,7 @@ fn validate_mysql_compound_statements(statements: &[&str]) -> Result<(), SqlStat
 }
 
 fn is_orphan_mysql_end_block(statement: &str) -> bool {
-    let body =
-        strip_leading_sql_comments_for_dialect(statement, SplitDialect::Mysql).trim();
+    let body = strip_leading_sql_comments_for_dialect(statement, SplitDialect::Mysql).trim();
     let mut tokens = body.split_whitespace();
     match (tokens.next(), tokens.next(), tokens.next()) {
         (Some(end), Some(kind), None) => {
