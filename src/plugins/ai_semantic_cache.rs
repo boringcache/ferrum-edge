@@ -4474,10 +4474,7 @@ struct RedisEnvelopeMacInput<'a> {
 /// namespace/key so a valid-looking foreign JSON document under another key
 /// cannot be replayed. Returns `None` only when the HMAC implementation fails
 /// to initialize (fail closed).
-fn compute_redis_envelope_mac(
-    key: &[u8],
-    envelope: &RedisEnvelopeMacInput<'_>,
-) -> Option<Vec<u8>> {
+fn compute_redis_envelope_mac(key: &[u8], envelope: &RedisEnvelopeMacInput<'_>) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).ok()?;
     mac.update(b"ai_semantic_cache.v3\0");
     mac.update(&(envelope.redis_key.len() as u64).to_le_bytes());

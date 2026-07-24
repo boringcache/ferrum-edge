@@ -1843,8 +1843,8 @@ impl std::fmt::Debug for RedisRateLimitClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_floored_total, floor_zero_compensation, redis_getrange_end_index,
-        RedisGetrangeEndIndexError,
+        RedisGetrangeEndIndexError, clamp_floored_total, floor_zero_compensation,
+        redis_getrange_end_index,
     };
 
     #[test]
