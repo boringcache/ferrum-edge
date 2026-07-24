@@ -1407,7 +1407,10 @@ fn legacy_bare_id_delta_decodes_and_scopes_to_the_authorized_namespace() {
     // Before qualification the keys carry no namespace, so the DP namespace
     // filter would fail them closed rather than deleting anything.
     let mut unqualified = decoded.clone();
-    assert_eq!(filter_incremental_to_namespace(&mut unqualified, "production"), 4);
+    assert_eq!(
+        filter_incremental_to_namespace(&mut unqualified, "production"),
+        4
+    );
 
     assert_eq!(decoded.qualify_unqualified_removals("production"), 4);
     assert_eq!(
