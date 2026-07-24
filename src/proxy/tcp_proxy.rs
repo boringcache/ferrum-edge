@@ -7424,13 +7424,72 @@ enum KtlsError {
     Installed(anyhow::Error),
 }
 
+/// Return whether rustls userspace buffers are safe to abandon for kernel TLS.
+///
+/// `dangerous_extract_secrets` / `dangerous_into_kernel_connection` only refuse
+/// handoff when **outbound** TLS records remain buffered (`sendable_tls`). Any
+/// decrypted-but-unread **received** plaintext — and any partial record still
+/// sitting in the deframer — is silently discarded. After a handshake read that
+/// coalesced the Finished flight with application data (TLS 1.2 abbreviated
+/// handshakes, False Start, or an eager TLS 1.3 client), those plaintext bytes
+/// would be lost if we installed kTLS and resumed from the raw socket.
+///
+/// Partial deframer ciphertext is not observable through rustls's public API.
+/// Calling [`rustls::ServerConnection::process_new_packets`] first surfaces any
+/// complete records still queued in the deframer as plaintext so we can detect
+/// them; when anything remains unreadable as plaintext we still cannot prove
+/// the deframer is empty, but pending plaintext is the actionable case and the
+/// only fully safe response is to keep the connection on the userspace relay
+/// with the `TlsStream` intact (preserving already-read bytes).
+///
+/// Returns `false` when handoff must be skipped (pending plaintext, pending
+/// outbound TLS records, or `process_new_packets` failure). Does not consume
+/// or discard any client bytes.
+pub(crate) fn ktls_rustls_buffers_safe_for_kernel_handoff(
+    server_conn: &mut rustls::ServerConnection,
+) -> bool {
+    match server_conn.process_new_packets() {
+        Ok(io) => {
+            if io.plaintext_bytes_to_read() > 0 {
+                debug!(
+                    plaintext_bytes = io.plaintext_bytes_to_read(),
+                    "kTLS: rustls has buffered decrypted plaintext after handshake; \
+                     falling back to userspace copy"
+                );
+                return false;
+            }
+            if io.tls_bytes_to_write() > 0 {
+                // Mirror rustls's own `dangerous_into_kernel_connection` gate,
+                // but refuse *before* `into_inner()` so we can still fall back.
+                debug!(
+                    tls_bytes = io.tls_bytes_to_write(),
+                    "kTLS: rustls has buffered outbound TLS records; \
+                     falling back to userspace copy"
+                );
+                return false;
+            }
+            true
+        }
+        Err(e) => {
+            debug!(
+                error = %e,
+                "kTLS: process_new_packets failed during handoff safety check; \
+                 falling back to userspace copy"
+            );
+            false
+        }
+    }
+}
+
 /// Attempt kTLS-accelerated splice for a frontend-TLS + plain-backend connection.
 ///
 /// 1. Check that the negotiated cipher is AES-128-GCM or AES-256-GCM.
 /// 2. Check that the negotiated TLS version is TLS 1.2 (see below).
-/// 3. Extract TLS session keys via `dangerous_extract_secrets()`.
-/// 4. Install keys into the kernel via `enable_ktls()`.
-/// 5. Use `bidirectional_splice()` for zero-copy relay.
+/// 3. Refuse handoff when rustls still holds buffered plaintext or outbound
+///    TLS records (see [`ktls_rustls_buffers_safe_for_kernel_handoff`]).
+/// 4. Extract TLS session keys via `dangerous_extract_secrets()`.
+/// 5. Install keys into the kernel via `enable_ktls()`.
+/// 6. Use `bidirectional_splice()` for zero-copy relay.
 ///
 /// Returns `KtlsError::Unsupported` with the original streams if kTLS cannot
 /// be used, allowing the caller to fall back to userspace `bidirectional_copy`.
@@ -7533,6 +7592,20 @@ async fn try_ktls_splice(
         }
     };
 
+    // Fail closed on buffered plaintext / outbound records BEFORE TCP_ULP or
+    // `into_inner()`. ULP installation is sticky on the fd; mutating the socket
+    // and then falling back would leave userspace rustls on a TLS-ULP socket.
+    // Pending plaintext must stay readable via the intact `TlsStream`.
+    {
+        let (_, server_conn) = tls_stream.get_mut();
+        if !ktls_rustls_buffers_safe_for_kernel_handoff(server_conn) {
+            return Err(KtlsError::Unsupported(Box::new((
+                tls_stream,
+                backend_stream,
+            ))));
+        }
+    }
+
     // Pre-flight: probe TCP_ULP installation on the raw fd BEFORE consuming
     // the TLS stream. If the kernel doesn't support kTLS (ENOPROTOOPT), we
     // can still fall back with the TLS stream intact.
@@ -7563,7 +7636,8 @@ async fn try_ktls_splice(
 
     // Point of no return: consume the TLS stream to extract secrets.
     // TCP_ULP is already installed on the underlying fd, so kTLS key
-    // installation should succeed.
+    // installation should succeed. We only reach here after the buffer
+    // safety check above confirmed no pending plaintext/outbound records.
     let (tcp_stream, server_conn) = tls_stream.into_inner();
 
     let secrets = match server_conn.dangerous_extract_secrets() {

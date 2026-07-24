@@ -1155,6 +1155,15 @@ pub mod _test_support {
         Ok((handshake.stream, proto))
     }
 
+    /// Inspect rustls buffers before a kTLS handoff. External tests use this
+    /// to assert that coalesced post-handshake plaintext forces userspace
+    /// fallback without consuming the TLS stream.
+    pub fn ktls_rustls_buffers_safe_for_kernel_handoff(
+        server_conn: &mut rustls::ServerConnection,
+    ) -> bool {
+        crate::proxy::tcp_proxy::ktls_rustls_buffers_safe_for_kernel_handoff(server_conn)
+    }
+
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
     /// unit tests. Only available on Linux — on other platforms there is no
     /// splice path to exercise.
