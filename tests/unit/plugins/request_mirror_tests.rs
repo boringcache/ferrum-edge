@@ -1,4 +1,7 @@
 use ferrum_edge::_test_support::{
+    request_mirror_append_shadow_host_suffix_for_test,
+    request_mirror_max_retained_request_body_bytes_for_test,
+    request_mirror_resolve_timeout_ms_for_test, request_mirror_retained_request_body_bytes_for_test,
     request_mirror_sample_phase_for_test, request_mirror_sample_threshold_for_test,
     request_mirror_should_mirror_for_test,
 };
@@ -93,6 +96,7 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
         mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
         mirror_response_status_code: Some(204),
         mirror_response_size_bytes: Some(0),
+        mirror_response_advertised_size_bytes: None,
         mirror_latency_ms: 250.0,
         mirror_error: None,
     }))
@@ -153,6 +157,7 @@ async fn multiple_mirror_results_log_independently_in_completion_order() {
             mirror_target_url: format!("http://{id}.example/shadow"),
             mirror_response_status_code: status,
             mirror_response_size_bytes: status.map(|_| 0),
+            mirror_response_advertised_size_bytes: None,
             mirror_latency_ms: 1.0,
             mirror_error: error.map(str::to_string),
         }))
@@ -228,6 +233,7 @@ async fn mirror_results_before_at_and_after_five_seconds_remain_observable() {
                 mirror_target_url: format!("http://mirror.local/result-{status}"),
                 mirror_response_status_code: Some(status),
                 mirror_response_size_bytes: Some(0),
+                mirror_response_advertised_size_bytes: None,
                 mirror_latency_ms: delay_seconds as f64 * 1000.0,
                 mirror_error: None,
             }))
@@ -401,6 +407,7 @@ async fn closed_task_channel_returns_seeded_failure_result() {
         mirror_target_url: "http://mirror.local/cancelled".to_string(),
         mirror_response_status_code: None,
         mirror_response_size_bytes: None,
+        mirror_response_advertised_size_bytes: None,
         mirror_latency_ms: 0.0,
         mirror_error: Some("mirror task ended before publishing a result".to_string()),
     };
@@ -487,6 +494,7 @@ fn test_mirror_summary_uses_its_own_terminal_outcome() {
         mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
         mirror_response_status_code: Some(204),
         mirror_response_size_bytes: Some(0),
+        mirror_response_advertised_size_bytes: None,
         mirror_latency_ms: 10.0,
         mirror_error: None,
     });
@@ -513,6 +521,7 @@ fn test_mirror_summary_uses_its_own_terminal_outcome() {
         mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
         mirror_response_status_code: None,
         mirror_response_size_bytes: None,
+        mirror_response_advertised_size_bytes: None,
         mirror_latency_ms: 10.0,
         mirror_error: Some("connection refused".to_string()),
     });
@@ -809,6 +818,21 @@ fn max_in_flight_is_documented_across_source_guide_and_example() {
     assert!(
         source.contains("get_http2") && source.contains("is_native_grpc"),
         "source must select the HTTP/2 companion for native gRPC mirrors"
+    );
+    assert!(
+        source.contains("`max_retained_request_body_bytes`")
+            && section.contains("`max_retained_request_body_bytes`"),
+        "retained-body budget must be documented in source and guide"
+    );
+    assert!(
+        source.contains("`mirror_timeout_ms`") && section.contains("`mirror_timeout_ms`"),
+        "finite mirror timeout must be documented in source and guide"
+    );
+    assert!(
+        source.contains("`forward_sensitive_headers`")
+            && section.contains("`forward_sensitive_headers`")
+            && section.contains("forward_sensitive_header_allowlist"),
+        "credential forwarding opt-in must be documented fail-closed"
     );
 }
 
@@ -1964,16 +1988,16 @@ async fn test_mirror_response_body_bounded_when_oversized_no_content_length() {
     );
 }
 
-/// When the mirror response carries Content-Length, the body is never read
-/// (CL fast path). The reported size is the CL header value, regardless of
-/// `max_response_body_bytes`.
+/// When the mirror response carries Content-Length, the body is still drained
+/// under `max_response_body_bytes` so keep-alive pools can reclaim the socket.
+/// Advertised and observed sizes are recorded independently.
 #[tokio::test]
-async fn test_mirror_response_body_uses_content_length_fast_path() {
+async fn test_mirror_response_body_drains_content_length_and_reports_both_sizes() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    let body = vec![b'C'; 4096];
+    let body = vec![b'C'; 2048];
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
         .mount(&server)
@@ -1988,8 +2012,8 @@ async fn test_mirror_response_body_uses_content_length_fast_path() {
         &json!({
             "mirror_host": host,
             "mirror_port": port,
-            // 1 KiB cap, but CL is 4 KiB — fast path skips the bounded read.
-            "max_response_body_bytes": 1024,
+            // Cap above the body so drain completes fully.
+            "max_response_body_bytes": 4096,
             "mirror_request_body": false
         }),
         PluginHttpClient::default(),
@@ -2008,8 +2032,13 @@ async fn test_mirror_response_body_uses_content_length_fast_path() {
         .expect("mirror metadata should arrive");
     let size = meta
         .mirror_response_size_bytes
-        .expect("size should be reported");
-    assert_eq!(size, 4096, "CL fast-path should report the full 4 KiB size");
+        .expect("observed size should be reported");
+    assert_eq!(size, 2048, "bounded drain should report the observed body size");
+    assert_eq!(
+        meta.mirror_response_advertised_size_bytes,
+        Some(2048),
+        "advertised Content-Length must be retained independently"
+    );
 }
 
 // === Finding #13: query-string secrets must not leak into mirror_error ===
@@ -2833,5 +2862,661 @@ async fn test_grpc_mirror_preserves_multiframe_client_stream_body_over_h2c() {
     assert_eq!(
         body, multi_frame,
         "client-streaming multi-frame body must be preserved byte-for-byte"
+    );
+}
+
+// === Audit workstream #3054–#3058 ============================================
+
+#[test]
+fn shadow_host_suffix_preserves_ipv6_and_ipv4_literals() {
+    assert_eq!(
+        request_mirror_append_shadow_host_suffix_for_test("[2001:db8::1]:8080"),
+        "[2001:db8::1]:8080",
+        "bracketed IPv6 with port must stay protocol-valid"
+    );
+    assert_eq!(
+        request_mirror_append_shadow_host_suffix_for_test("[2001:db8::1]"),
+        "[2001:db8::1]",
+        "bracketed IPv6 without port must stay protocol-valid"
+    );
+    assert_eq!(
+        request_mirror_append_shadow_host_suffix_for_test("192.0.2.10:8443"),
+        "192.0.2.10:8443",
+        "IPv4 literal with port must not receive a DNS suffix"
+    );
+    assert_eq!(
+        request_mirror_append_shadow_host_suffix_for_test("192.0.2.10"),
+        "192.0.2.10"
+    );
+    assert_eq!(
+        request_mirror_append_shadow_host_suffix_for_test("internal.example.com:8443"),
+        "internal.example.com-shadow:8443"
+    );
+    assert_eq!(
+        request_mirror_append_shadow_host_suffix_for_test("exact.internal"),
+        "exact.internal-shadow"
+    );
+    assert_eq!(
+        request_mirror_append_shadow_host_suffix_for_test("2001:db8::1"),
+        "2001:db8::1",
+        "unbracketed IPv6 must not be rewritten into an invalid Host"
+    );
+}
+
+#[test]
+fn mirror_timeout_remains_finite_when_backend_read_timeout_is_zero() {
+    assert_eq!(
+        request_mirror_resolve_timeout_ms_for_test(None, Some(0)),
+        60_000,
+        "zero primary timeout must fall back to the finite mirror default"
+    );
+    assert_eq!(
+        request_mirror_resolve_timeout_ms_for_test(None, None),
+        60_000
+    );
+    assert_eq!(
+        request_mirror_resolve_timeout_ms_for_test(None, Some(5_000)),
+        5_000
+    );
+    assert_eq!(
+        request_mirror_resolve_timeout_ms_for_test(Some(1_500), Some(0)),
+        1_500,
+        "explicit mirror_timeout_ms wins even when primary timeout is zero"
+    );
+    assert_eq!(
+        request_mirror_resolve_timeout_ms_for_test(Some(999_999), Some(5_000)),
+        300_000,
+        "hard maximum must clamp oversized deadlines"
+    );
+}
+
+#[test]
+fn forward_sensitive_headers_opt_in_is_fail_closed() {
+    let missing_allowlist = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_headers": true
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        missing_allowlist
+            .err()
+            .unwrap()
+            .contains("forward_sensitive_header_allowlist"),
+        "true without allowlist must fail closed"
+    );
+
+    let allowlist_without_flag = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        allowlist_without_flag
+            .err()
+            .unwrap()
+            .contains("forward_sensitive_headers=true"),
+        "allowlist without opt-in flag must fail closed"
+    );
+
+    let unknown = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["x-custom-secret"]
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        unknown.err().unwrap().contains("must be one of"),
+        "unknown sensitive names must be rejected"
+    );
+
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "forward_sensitive_headers": true,
+                "forward_sensitive_header_allowlist": ["authorization", "cookie"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn content_length_responses_are_drained_for_http1_connection_reuse() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_task = accepts.clone();
+    tokio::spawn(async move {
+        // One accepted TCP connection should serve both mirrored requests when
+        // the body is drained and keep-alive is honored.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        accepts_task.fetch_add(1, AtomicOrdering::SeqCst);
+        for _ in 0..2 {
+            let mut buf = [0u8; 4096];
+            let mut total = 0usize;
+            loop {
+                let n = stream.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nping",
+                )
+                .await;
+        }
+        // Leave the socket open briefly so the client can reuse it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "max_in_flight": 2,
+            "mirror_timeout_ms": 2000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let mut ctx = make_ctx_with_proxy();
+        let mut headers = HashMap::new();
+        plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let meta = ctx.collect_mirror_result().await.expect("mirror meta");
+        assert!(meta.mirror_error.is_none(), "unexpected mirror error: {meta:?}");
+        assert_eq!(meta.mirror_response_size_bytes, Some(4));
+        assert_eq!(meta.mirror_response_advertised_size_bytes, Some(4));
+    }
+
+    assert_eq!(
+        accepts.load(AtomicOrdering::SeqCst),
+        1,
+        "drained Content-Length responses must reuse one HTTP/1.1 connection"
+    );
+}
+
+#[tokio::test]
+async fn mesh_shadow_ipv6_authority_stays_valid_on_outbound_host() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 2048];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+
+    let route = create_plugin(
+        "mesh_route_dispatch",
+        &json!({
+            "rules": [{
+                "match": { "uri": {"prefix": "/api"}, "methods": ["POST"] },
+                "destination": { "backend_host": "primary.internal", "backend_port": 8080 },
+                "rewrite": {
+                    "uri": "/mesh-rewritten",
+                    "authority": "[2001:db8::10]:8080"
+                }
+            }]
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    let mirror = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "percentage": 100,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert("host".to_string(), "client.example".to_string());
+    plugin_utils::assert_continue(route.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(mirror.before_proxy(&mut ctx, &mut headers).await);
+    let _ = ctx.collect_mirror_result().await;
+
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+        .await
+        .expect("mirror request timeout")
+        .expect("mirror request body");
+    assert!(
+        request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("host: [2001:db8::10]:8080")),
+        "IPv6 shadow Host must remain bracketed with port: {request}"
+    );
+    assert!(
+        !request.to_ascii_lowercase().contains("]-shadow"),
+        "must not emit invalid bracketed-IPv6-shadow Host: {request}"
+    );
+}
+
+#[tokio::test]
+async fn retained_body_budget_drops_when_exhausted_and_releases_on_completion() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, oneshot};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (gate_tx, mut gate_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 8192];
+        let mut total = 0usize;
+        loop {
+            let n = stream.read(&mut buf[total..]).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        // Hold the first mirror open until the second attempt is evaluated.
+        let (release_tx, release_rx) = oneshot::channel();
+        let _ = gate_tx.send(release_tx).await;
+        let _ = release_rx.await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+
+    let body = bytes::Bytes::from(vec![b'B'; 1024]);
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": true,
+            "max_in_flight": 4,
+            "max_retained_request_body_bytes": 1024,
+            "mirror_timeout_ms": 2000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        request_mirror_max_retained_request_body_bytes_for_test(&plugin),
+        1024
+    );
+
+    let mut first = make_ctx_with_proxy();
+    first.request_body_bytes = Some(body.clone());
+    let mut first_headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut first, &mut first_headers).await);
+
+    // Wait until the first mirror is in-flight and holding the body lease.
+    let release = tokio::time::timeout(std::time::Duration::from_secs(1), gate_rx.recv())
+        .await
+        .expect("first mirror should reach the sink")
+        .expect("gate sender");
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        1024
+    );
+
+    let mut second = make_ctx_with_proxy();
+    second.request_body_bytes = Some(body);
+    let mut second_headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut second, &mut second_headers).await);
+    let dropped = second
+        .collect_mirror_result()
+        .await
+        .expect("budget drop must publish an explicit result");
+    assert!(
+        dropped
+            .mirror_error
+            .as_deref()
+            .is_some_and(|e| e.contains("max_retained_request_body_bytes")),
+        "expected body-budget drop, got {dropped:?}"
+    );
+
+    let _ = release.send(());
+    let _ = first.collect_mirror_result().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if request_mirror_retained_request_body_bytes_for_test(&plugin) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("body lease must release when the mirror task ends");
+}
+
+#[tokio::test]
+async fn zero_backend_read_timeout_still_cancels_never_responding_mirror() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        // Accept the connection but never respond — exercises the finite
+        // mirror deadline that must remain even when primary timeout is 0.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "mirror_timeout_ms": 100
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy_timeout(0);
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let meta = tokio::time::timeout(std::time::Duration::from_secs(2), ctx.collect_mirror_result())
+        .await
+        .expect("mirror outcome must be bounded by the finite mirror deadline")
+        .expect("mirror meta");
+    assert!(
+        meta.mirror_error.is_some(),
+        "never-responding target must surface an explicit mirror_error: {meta:?}"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_headers_stripped_by_default_including_grpc_metadata() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("authorization".to_string(), "Bearer live-secret".to_string());
+    headers.insert("cookie".to_string(), "session=abc".to_string());
+    headers.insert(
+        "proxy-authorization".to_string(),
+        "Basic proxied".to_string(),
+    );
+    headers.insert("x-api-key".to_string(), "sk-live".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let _ = ctx.collect_mirror_result().await;
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+        .await
+        .expect("timeout")
+        .expect("request");
+    let lower = request.to_ascii_lowercase();
+    for forbidden in [
+        "authorization:",
+        "cookie:",
+        "proxy-authorization:",
+        "x-api-key:",
+        "live-secret",
+        "session=abc",
+        "sk-live",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "default mirror must not forward credential material `{forbidden}`: {request}"
+        );
+    }
+    assert!(
+        lower.contains("x-custom: keep-me"),
+        "non-sensitive headers must still forward: {request}"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_header_allowlist_forwards_only_listed_names() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer allowlisted".to_string(),
+    );
+    headers.insert("cookie".to_string(), "session=nope".to_string());
+    headers.insert("x-api-key".to_string(), "sk-nope".to_string());
+
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let _ = ctx.collect_mirror_result().await;
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+        .await
+        .expect("timeout")
+        .expect("request");
+    let lower = request.to_ascii_lowercase();
+    assert!(
+        lower.contains("authorization: bearer allowlisted"),
+        "allowlisted Authorization must forward: {request}"
+    );
+    assert!(!lower.contains("cookie:"), "Cookie must stay stripped: {request}");
+    assert!(
+        !lower.contains("x-api-key:"),
+        "X-Api-Key must stay stripped: {request}"
+    );
+}
+
+#[tokio::test]
+async fn grpc_metadata_credentials_stripped_by_default_on_h2c_mirror() {
+    use h2::server as h2_server;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<Vec<(String, String)>>();
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut h2) = h2_server::handshake(tcp).await else {
+            return;
+        };
+        let mut tx = Some(tx);
+        while let Some(result) = h2.accept().await {
+            let Ok((request, mut respond)) = result else {
+                break;
+            };
+            let Some(tx) = tx.take() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let headers = request
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut body = request.into_body();
+                while let Some(chunk) = body.data().await {
+                    if let Ok(bytes) = chunk {
+                        let _ = body.flow_control().release_capacity(bytes.len());
+                    }
+                }
+                let response = http::Response::builder()
+                    .status(200)
+                    .body(())
+                    .expect("empty response");
+                let _ = respond.send_response(response, true);
+                let _ = tx.send(headers);
+            });
+        }
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": true,
+            "percentage": 100.0
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.path = "/pkg.Service/Method".to_string();
+    ctx.request_body_bytes = Some(bytes::Bytes::from(vec![0, 0, 0, 0, 1, b'x']));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer grpc-secret".to_string(),
+    );
+    headers.insert("cookie".to_string(), "sid=1".to_string());
+    headers.insert("x-api-key".to_string(), "grpc-key".to_string());
+    headers.insert("grpc-timeout".to_string(), "1S".to_string());
+
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let meta = ctx.collect_mirror_result().await.expect("mirror result");
+    assert!(
+        meta.mirror_error.is_none(),
+        "gRPC mirror should succeed: {meta:?}"
+    );
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+        .await
+        .expect("timeout")
+        .expect("headers");
+    let lower = observed
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    assert!(
+        !lower.iter().any(|(k, _)| k == "authorization"),
+        "gRPC Authorization metadata must be stripped by default: {observed:?}"
+    );
+    assert!(
+        !lower.iter().any(|(k, _)| k == "cookie"),
+        "gRPC Cookie metadata must be stripped by default: {observed:?}"
+    );
+    assert!(
+        !lower.iter().any(|(k, _)| k == "x-api-key"),
+        "gRPC x-api-key metadata must be stripped by default: {observed:?}"
+    );
+    assert!(
+        lower.iter().any(|(k, v)| k == "grpc-timeout" && v == "1s"),
+        "non-sensitive gRPC metadata must still forward: {observed:?}"
     );
 }

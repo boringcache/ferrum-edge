@@ -17585,14 +17585,24 @@ components:
         request-only markers, and proxy-owned X-Forwarded-* identity); these
         forwarding fields are stripped rather than regenerated, so mirrors do
         not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
-        the mirror URL. Native gRPC mirrors re-synthesise te: trailers and dial
+        the mirror URL (mesh shadow Host uses a protocol-valid DNS `-shadow`
+        suffix; IPv4/IPv6 literals are left unchanged). Origin-bound credentials
+        (Authorization, Cookie, Proxy-Authorization, and related session/API-key
+        headers) are stripped by default; forwarding requires the fail-closed
+        pair forward_sensitive_headers=true plus a non-empty allowlist limited
+        to that closed set. Native gRPC mirrors re-synthesise te: trailers and dial
         via the shared PluginHttpClient HTTP/2 companion (h2c prior knowledge for
         cleartext http targets; ALPN h2 for https). Ordinary HTTP mirrors keep
         the default all-version client so HTTP/1.1 destinations continue to work.
-        The mirror request-target preserves the raw query (after the
-        same auth credential strips as primary) including repeated pairs,
-        order, flags, empty values, +, percent escapes, and non-ASCII encoded
-        bytes.
+        Mirror response bodies are always drained under max_response_body_bytes
+        so Content-Length responses do not strand keep-alive pools. Retained
+        request bodies share Bytes with the primary buffer and are admitted under
+        max_in_flight plus max_retained_request_body_bytes. The mirror request
+        always has a finite deadline (mirror_timeout_ms, else positive proxy
+        backend_read_timeout_ms, else 60000ms, capped at 300000ms). The mirror
+        request-target preserves the raw query (after the same auth credential
+        strips as primary) including repeated pairs, order, flags, empty values,
+        +, percent escapes, and non-ASCII encoded bytes.
       required:
         - mirror_host
       properties:
@@ -17637,7 +17647,7 @@ components:
         mirror_request_body:
           type: boolean
           default: true
-          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy."
+          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy. Shared Bytes are charged against max_retained_request_body_bytes for each in-flight task."
         max_in_flight:
           type: integer
           format: uint64
@@ -17647,12 +17657,59 @@ components:
             Maximum mirror tasks allowed concurrently. Requests that arrive
             while every permit is in use are still served normally but are not
             mirrored.
+        max_retained_request_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 67108864
+          description: >-
+            Aggregate retained request-body budget for in-flight mirrors on this
+            plugin instance. Shared Bytes bodies are charged once per task for
+            their length; exhaustion drops the new mirror attempt without
+            affecting the primary request. Default is 64 MiB.
+        mirror_timeout_ms:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 300000
+          description: >-
+            Finite mirror request deadline in milliseconds. When omitted, uses
+            the matched proxy backend_read_timeout_ms when positive, otherwise
+            60000. Always capped at 300000. A zero primary timeout never
+            disables this deadline.
+        forward_sensitive_headers:
+          type: boolean
+          default: false
+          description: >-
+            Dangerous opt-in. When true, selected origin-bound credential
+            headers may cross to the distinct mirror origin, but only names
+            listed in forward_sensitive_header_allowlist. Construction is
+            fail-closed: both fields are required together and the allowlist
+            must be non-empty.
+        forward_sensitive_header_allowlist:
+          type: array
+          items:
+            type: string
+            enum:
+              - authorization
+              - cookie
+              - cookie2
+              - proxy-authorization
+              - www-authenticate
+              - x-api-key
+              - x-auth-token
+              - x-csrf-token
+          description: >-
+            Lowercased allowlist of sensitive header names to forward when
+            forward_sensitive_headers is true. Unknown names are rejected at
+            construction. Default (with forward_sensitive_headers false) strips
+            the entire closed sensitive set.
         max_response_body_bytes:
           type: integer
           format: uint64
           minimum: 1
           default: 1048576
-          description: "Cap on bytes read from a mirror response when deriving its size. Only consulted when the response has no `content-length` header — streaming is aborted as soon as the limit is crossed and the mirror task records the truncated count. Bytes are discarded after measurement, so this only bounds memory pressure from misbehaving mirror sinks. Default is 1 MiB."
+          description: "Cap on bytes drained from every mirror response when deriving its size (with or without Content-Length). Streaming is aborted as soon as the limit is crossed and the mirror task records the truncated/observed count. Bytes are discarded after measurement so HTTP/1.1 keep-alive pools can reclaim the socket. Default is 1 MiB."
 
     ServerlessFunctionConfig:
       type: object
