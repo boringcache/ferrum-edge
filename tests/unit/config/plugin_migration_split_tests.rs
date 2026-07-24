@@ -56,10 +56,7 @@ fn splits_basic_multi_statement_sql() {
     assert_split(
         "sqlite",
         "CREATE TABLE t (id TEXT); INSERT INTO t VALUES ('x');",
-        &[
-            "CREATE TABLE t (id TEXT)",
-            "INSERT INTO t VALUES ('x')",
-        ],
+        &["CREATE TABLE t (id TEXT)", "INSERT INTO t VALUES ('x')"],
     );
 }
 
@@ -248,7 +245,9 @@ fn mysql_delimiter_meta_commands_are_never_returned() {
     assert_no_delimiter_directives(&statements);
     assert_eq!(statements.len(), 3);
     assert!(
-        statements[0].to_ascii_uppercase().starts_with("CREATE PROCEDURE P1"),
+        statements[0]
+            .to_ascii_uppercase()
+            .starts_with("CREATE PROCEDURE P1"),
         "{}",
         statements[0]
     );
@@ -256,7 +255,9 @@ fn mysql_delimiter_meta_commands_are_never_returned() {
     assert!(statements[0].trim_end().ends_with("END"));
     assert!(!statements[0].ends_with("//"));
     assert!(
-        statements[1].to_ascii_uppercase().starts_with("CREATE PROCEDURE P2"),
+        statements[1]
+            .to_ascii_uppercase()
+            .starts_with("CREATE PROCEDURE P2"),
         "{}",
         statements[1]
     );
@@ -270,7 +271,11 @@ fn mysql_delimiter_with_surrounding_comments_and_whitespace_has_no_phantoms() {
     let statements = split_plugin_migration_statements(sql, "mysql").unwrap();
     assert_no_delimiter_directives(&statements);
     assert_eq!(statements.len(), 1);
-    assert!(statements[0].to_ascii_uppercase().contains("CREATE TRIGGER"));
+    assert!(
+        statements[0]
+            .to_ascii_uppercase()
+            .contains("CREATE TRIGGER")
+    );
     assert!(statements[0].trim_end().ends_with("END"));
 }
 
@@ -327,7 +332,9 @@ fn mysql_single_statement_function_without_begin_is_allowed() {
     assert_split(
         "mysql",
         "CREATE FUNCTION hello(s CHAR(20)) RETURNS CHAR(50) DETERMINISTIC RETURN CONCAT('Hello, ', s);",
-        &["CREATE FUNCTION hello(s CHAR(20)) RETURNS CHAR(50) DETERMINISTIC RETURN CONCAT('Hello, ', s)"],
+        &[
+            "CREATE FUNCTION hello(s CHAR(20)) RETURNS CHAR(50) DETERMINISTIC RETURN CONCAT('Hello, ', s)",
+        ],
     );
 }
 
@@ -349,7 +356,10 @@ fn rejects_unclosed_quotes_comments_and_dollar_tags() {
     assert_split_err("sqlite", r#"SELECT "unclosed"#);
     assert_split_err("mysql", "SELECT `unclosed");
     assert_split_err("sqlite", "SELECT 1 /* unclosed");
-    assert_split_err("postgres", "CREATE FUNCTION f() RETURNS void AS $$ BEGIN PERFORM 1;");
+    assert_split_err(
+        "postgres",
+        "CREATE FUNCTION f() RETURNS void AS $$ BEGIN PERFORM 1;",
+    );
 }
 
 #[test]
@@ -367,10 +377,7 @@ fn rejects_mysql_delimiter_never_restored() {
         CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.id = 1; END //
     "#;
     let err = split_plugin_migration_statements(sql, "mysql").unwrap_err();
-    assert!(
-        err.to_string().contains("never restored"),
-        "got {err}"
-    );
+    assert!(err.to_string().contains("never restored"), "got {err}");
 }
 
 #[test]
@@ -379,15 +386,9 @@ fn rejects_mysql_malformed_and_trailing_delimiter_directives() {
     assert_split_err("mysql", "DELIMITER // trailing\nSELECT 1;");
     assert_split_err("mysql", "DELIMITER '\nSELECT 1;");
     // Unrestored custom delimiter must fail before any statement executes.
-    let err = split_plugin_migration_statements(
-        "DELIMITER //\nCREATE TABLE t (id INT)//",
-        "mysql",
-    )
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("never restored"),
-        "got {err}"
-    );
+    let err = split_plugin_migration_statements("DELIMITER //\nCREATE TABLE t (id INT)//", "mysql")
+        .unwrap_err();
+    assert!(err.to_string().contains("never restored"), "got {err}");
 }
 
 #[test]
@@ -453,12 +454,11 @@ async fn semicolon_inside_string_literal_round_trips_on_sqlite() {
     let applied = runner.run_plugin_pending(&migrations).await.unwrap();
     assert_eq!(applied.len(), 1);
 
-    let value: String = sqlx::query_scalar(
-        "SELECT value FROM literal_plugin_data WHERE id = 'row1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("seeded row must round-trip");
+    let value: String =
+        sqlx::query_scalar("SELECT value FROM literal_plugin_data WHERE id = 'row1'")
+            .fetch_one(&pool)
+            .await
+            .expect("seeded row must round-trip");
     assert_eq!(value, "a;b");
 }
 
