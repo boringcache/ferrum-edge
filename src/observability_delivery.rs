@@ -254,15 +254,11 @@ impl DeliveryLifecycle {
     async fn wait_for_tasks(&self, deadline: Instant) -> bool {
         loop {
             let changed = self.tasks_changed.notified();
-            if self.tasks.is_empty()
-                && self.active_task_registrations.load(Ordering::Acquire) == 0
+            if self.tasks.is_empty() && self.active_task_registrations.load(Ordering::Acquire) == 0
             {
                 return true;
             }
-            if tokio::time::timeout_at(deadline, changed)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
                 return false;
             }
         }
@@ -273,19 +269,12 @@ impl DeliveryLifecycle {
             let changed = self.workers_changed.notified();
             let workers = match self.workers.lock() {
                 Ok(workers) => workers.values().cloned().collect::<Vec<_>>(),
-                Err(poisoned) => poisoned
-                    .into_inner()
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                Err(poisoned) => poisoned.into_inner().values().cloned().collect::<Vec<_>>(),
             };
             if workers.iter().all(|worker| worker.is_finished()) {
                 return true;
             }
-            if tokio::time::timeout_at(deadline, changed)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
                 return false;
             }
         }
@@ -294,11 +283,7 @@ impl DeliveryLifecycle {
     fn close_workers(&self) {
         let workers = match self.workers.lock() {
             Ok(workers) => workers.values().cloned().collect::<Vec<_>>(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .values()
-                .cloned()
-                .collect::<Vec<_>>(),
+            Err(poisoned) => poisoned.into_inner().values().cloned().collect::<Vec<_>>(),
         };
         for worker in workers {
             worker.close_admission();
@@ -321,11 +306,7 @@ impl DeliveryLifecycle {
 
         let workers = match self.workers.lock() {
             Ok(workers) => workers.values().cloned().collect::<Vec<_>>(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .values()
-                .cloned()
-                .collect::<Vec<_>>(),
+            Err(poisoned) => poisoned.into_inner().values().cloned().collect::<Vec<_>>(),
         };
         for worker in workers {
             if worker.is_finished() {
@@ -351,7 +332,8 @@ impl DeliveryLifecycle {
         let deadline = Instant::now() + timeout;
 
         let tasks_drained = self.wait_for_tasks(deadline).await;
-        self.accepting_internal_tasks.store(false, Ordering::Release);
+        self.accepting_internal_tasks
+            .store(false, Ordering::Release);
         self.accepting_workers.store(false, Ordering::Release);
         self.close_workers();
         let workers_drained = tasks_drained && self.wait_for_workers(deadline).await;
@@ -383,11 +365,7 @@ impl DeliveryLifecycle {
                 .counters
                 .rejected_terminal
                 .load(Ordering::Relaxed)
-                .saturating_add(
-                    self.counters
-                        .rejected_mirror
-                        .load(Ordering::Relaxed),
-                )
+                .saturating_add(self.counters.rejected_mirror.load(Ordering::Relaxed))
                 .saturating_add(
                     self.counters
                         .rejected_deadline_cleanup
@@ -397,20 +375,13 @@ impl DeliveryLifecycle {
                 .counters
                 .cancelled_terminal
                 .load(Ordering::Relaxed)
-                .saturating_add(
-                    self.counters
-                        .cancelled_mirror
-                        .load(Ordering::Relaxed),
-                )
+                .saturating_add(self.counters.cancelled_mirror.load(Ordering::Relaxed))
                 .saturating_add(
                     self.counters
                         .cancelled_deadline_cleanup
                         .load(Ordering::Relaxed),
                 ),
-            lost_worker_records: self
-                .counters
-                .lost_worker_records
-                .load(Ordering::Relaxed),
+            lost_worker_records: self.counters.lost_worker_records.load(Ordering::Relaxed),
         }
     }
 }
@@ -455,10 +426,7 @@ pub struct DeliveryWorkerControl {
 }
 
 impl DeliveryWorkerControl {
-    pub fn new<F>(
-        plugin_name: &'static str,
-        pending: F,
-    ) -> (Arc<Self>, watch::Receiver<bool>)
+    pub fn new<F>(plugin_name: &'static str, pending: F) -> (Arc<Self>, watch::Receiver<bool>)
     where
         F: Fn() -> u64 + Send + Sync + 'static,
     {
@@ -705,10 +673,7 @@ pub fn render_prometheus() -> String {
         report.rejected_tasks,
         report.cancelled_tasks,
         report.lost_worker_records,
-        lifecycle
-            .counters
-            .timed_out_drains
-            .load(Ordering::Relaxed),
+        lifecycle.counters.timed_out_drains.load(Ordering::Relaxed),
     )
 }
 
@@ -747,13 +712,9 @@ mod tests {
         terminal_started.notified().await;
 
         let shutdown_lifecycle = Arc::clone(&lifecycle);
-        let shutdown = tokio::spawn(async move {
-            shutdown_lifecycle.shutdown(Duration::from_secs(1)).await
-        });
-        while lifecycle
-            .accepting_external_tasks
-            .load(Ordering::Acquire)
-        {
+        let shutdown =
+            tokio::spawn(async move { shutdown_lifecycle.shutdown(Duration::from_secs(1)).await });
+        while lifecycle.accepting_external_tasks.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
         release_terminal.notify_one();
@@ -778,8 +739,7 @@ mod tests {
             async move {
                 task_started.notify_one();
                 task_release.notified().await;
-                let (worker, mut close_rx) =
-                    DeliveryWorkerControl::new("terminal_sink", || 0);
+                let (worker, mut close_rx) = DeliveryWorkerControl::new("terminal_sink", || 0);
                 let completion = worker.completion();
                 let task = tokio::spawn(async move {
                     let mut completion = completion;
@@ -798,13 +758,9 @@ mod tests {
         terminal_started.notified().await;
 
         let shutdown_lifecycle = Arc::clone(&lifecycle);
-        let shutdown = tokio::spawn(async move {
-            shutdown_lifecycle.shutdown(Duration::from_secs(1)).await
-        });
-        while lifecycle
-            .accepting_external_tasks
-            .load(Ordering::Acquire)
-        {
+        let shutdown =
+            tokio::spawn(async move { shutdown_lifecycle.shutdown(Duration::from_secs(1)).await });
+        while lifecycle.accepting_external_tasks.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
         release_terminal.notify_one();
@@ -845,16 +801,12 @@ mod tests {
         let lifecycle = Arc::new(DeliveryLifecycle::new());
         let report = lifecycle.shutdown(Duration::from_millis(50)).await;
         assert!(report.complete());
-        assert!(!lifecycle.spawn(
-            TaskAdmission::External,
-            DeliveryTaskKind::Terminal,
-            async {},
-        ));
+        assert!(
+            !lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
+            },)
+        );
         assert_eq!(
-            lifecycle
-                .counters
-                .rejected_terminal
-                .load(Ordering::Relaxed),
+            lifecycle.counters.rejected_terminal.load(Ordering::Relaxed),
             1
         );
     }
@@ -873,10 +825,7 @@ mod tests {
         assert!(!report.tasks_drained);
         assert_eq!(report.cancelled_tasks, 1);
         assert_eq!(
-            lifecycle
-                .counters
-                .timed_out_drains
-                .load(Ordering::Relaxed),
+            lifecycle.counters.timed_out_drains.load(Ordering::Relaxed),
             1
         );
     }
@@ -889,10 +838,7 @@ mod tests {
 
         assert_eq!(second, first);
         assert_eq!(
-            lifecycle
-                .counters
-                .timed_out_drains
-                .load(Ordering::Relaxed),
+            lifecycle.counters.timed_out_drains.load(Ordering::Relaxed),
             0
         );
     }
@@ -940,10 +886,7 @@ mod tests {
         assert!(!report.complete());
         assert_eq!(report.lost_worker_records, 3);
         assert_eq!(
-            lifecycle
-                .counters
-                .timed_out_drains
-                .load(Ordering::Relaxed),
+            lifecycle.counters.timed_out_drains.load(Ordering::Relaxed),
             1
         );
     }

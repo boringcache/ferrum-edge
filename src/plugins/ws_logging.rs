@@ -42,15 +42,14 @@ use super::utils::log_schema::{
 };
 use super::utils::{
     BatchConfigDefaults, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
-    MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config,
-    wait_until_committed_or_closed,
+    MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config, wait_until_committed_or_closed,
 };
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
     WsDisconnectContext,
 };
-use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::observability_delivery::DeliveryWorkerControl;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 /// Default / hard maxima for per-entry serialization and aggregate queued,
 /// batch-assembly, and retry bytes.

@@ -1184,15 +1184,12 @@ impl BufferedTraceExporter {
         match Handle::try_current() {
             Ok(handle) => {
                 let pending_spans = Arc::clone(&self.queued_spans);
-                let (worker, close_rx) =
-                    DeliveryWorkerControl::new("otel_tracing", move || {
-                        pending_spans.load(Ordering::Relaxed) as u64
-                    });
+                let (worker, close_rx) = DeliveryWorkerControl::new("otel_tracing", move || {
+                    pending_spans.load(Ordering::Relaxed) as u64
+                });
                 if self.worker.set(Arc::clone(&worker)).is_err() {
                     *deferred = Some((receiver, cfg));
-                    return Err(
-                        "trace exporter lifecycle worker already started".to_string()
-                    );
+                    return Err("trace exporter lifecycle worker already started".to_string());
                 }
                 let completion = worker.completion();
                 let worker_drain_control = Arc::clone(&worker);

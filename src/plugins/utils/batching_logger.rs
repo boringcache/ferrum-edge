@@ -291,10 +291,9 @@ impl<T: Send + 'static> BatchingLogger<T> {
         let worker_outstanding_count = Arc::clone(&outstanding_count);
         let pending_count = Arc::clone(&outstanding_count);
         let on_failed_batch = hooks.on_failed_batch.clone();
-        let (worker_control, close_rx) =
-            DeliveryWorkerControl::new(plugin_name, move || {
-                pending_count.load(Ordering::Relaxed) as u64
-            });
+        let (worker_control, close_rx) = DeliveryWorkerControl::new(plugin_name, move || {
+            pending_count.load(Ordering::Relaxed) as u64
+        });
         let completion = worker_control.completion();
         let worker_drain_control = Arc::clone(&worker_control);
         let worker = tokio::spawn(async move {

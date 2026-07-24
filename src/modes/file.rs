@@ -274,9 +274,7 @@ impl ServeHandles {
         background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
         join_background_handles(background_handles, self.background_drain_timeout).await;
         crate::observability_delivery::shutdown(Duration::from_millis(
-            self.proxy_state
-                .env_config
-                .log_shutdown_drain_timeout_ms,
+            self.proxy_state.env_config.log_shutdown_drain_timeout_ms,
         ))
         .await;
         crate::plugins::api_chargeback_sink::finalize_all_snapshot_generations().await;

@@ -910,8 +910,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         // producer-specific finalizers. This idempotent fallback covers early
         // mode errors and non-serving modes after mode-owned state has dropped,
         // before the Tokio runtime or process-log appenders can shut down.
-        let _ =
-            observability_delivery::shutdown(observability_delivery_timeout).await;
+        let _ = observability_delivery::shutdown(observability_delivery_timeout).await;
 
         match result {
             Ok(()) => {
