@@ -1100,6 +1100,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         "GET".to_string(),
         "/cache-vary-order".to_string(),
     );
+    gzip_store_ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     gzip_store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     gzip_store_ctx
         .headers
