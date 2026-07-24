@@ -165,8 +165,13 @@ async fn file_mode_rejects_explicit_short_admin_jwt_secret() {
     };
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let err = match file::serve(file_env(proxy_port, admin_port), empty_gateway_config(), opts, shutdown_tx)
-        .await
+    let err = match file::serve(
+        file_env(proxy_port, admin_port),
+        empty_gateway_config(),
+        opts,
+        shutdown_tx,
+    )
+    .await
     {
         Ok(_) => panic!("serve() must fail when FERRUM_ADMIN_JWT_SECRET is shorter than 32 chars"),
         Err(e) => e,
@@ -212,8 +217,13 @@ async fn file_mode_rejects_invalid_max_ttl_even_when_secret_unset() {
     };
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let err = match file::serve(file_env(proxy_port, admin_port), empty_gateway_config(), opts, shutdown_tx)
-        .await
+    let err = match file::serve(
+        file_env(proxy_port, admin_port),
+        empty_gateway_config(),
+        opts,
+        shutdown_tx,
+    )
+    .await
     {
         Ok(_) => panic!("serve() must fail when FERRUM_ADMIN_JWT_MAX_TTL is malformed"),
         Err(e) => e,
@@ -221,8 +231,7 @@ async fn file_mode_rejects_invalid_max_ttl_even_when_secret_unset() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("Invalid admin JWT configuration")
-            || msg.contains("FERRUM_ADMIN_JWT_MAX_TTL"),
+        msg.contains("Invalid admin JWT configuration") || msg.contains("FERRUM_ADMIN_JWT_MAX_TTL"),
         "startup error must name the JWT max TTL misconfiguration; got {msg}"
     );
 }

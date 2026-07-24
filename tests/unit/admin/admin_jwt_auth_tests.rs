@@ -877,7 +877,7 @@ fn test_create_jwt_manager_rejects_invalid_max_ttl() {
 /// cannot silently replace operator intent with a random secret (#2977).
 #[test]
 fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
-    use ferrum_edge::admin::jwt_auth::{create_jwt_manager_from_env, JwtError};
+    use ferrum_edge::admin::jwt_auth::{JwtError, create_jwt_manager_from_env};
 
     let env = AdminJwtEnvGuard::new();
     env.unset("FERRUM_ADMIN_JWT_ISSUER");
@@ -886,19 +886,13 @@ fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
 
     env.unset("FERRUM_ADMIN_JWT_SECRET");
     assert!(
-        matches!(
-            create_jwt_manager_from_env(),
-            Err(JwtError::NotConfigured)
-        ),
+        matches!(create_jwt_manager_from_env(), Err(JwtError::NotConfigured)),
         "unset secret must be NotConfigured"
     );
 
     env.set("FERRUM_ADMIN_JWT_SECRET", "");
     assert!(
-        matches!(
-            create_jwt_manager_from_env(),
-            Err(JwtError::NotConfigured)
-        ),
+        matches!(create_jwt_manager_from_env(), Err(JwtError::NotConfigured)),
         "empty secret must be NotConfigured"
     );
 
