@@ -31,7 +31,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
 use tonic::transport::{Certificate, Channel, Endpoint, Identity};
@@ -45,10 +45,11 @@ use super::configsync_lifecycle::{
     MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
     advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
     check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
-    evaluate_delta_against_subscription_base, full_snapshot_stream_disposition,
-    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, reconcile_snapshot_version,
-    record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
-    resource_delta_advances_authority, snapshot_failure_stream_disposition,
+    evaluate_delta_against_subscription_base, evaluate_snapshot_clock_skew,
+    full_snapshot_stream_disposition, gateway_trust_equivalence_state,
+    grow_backoff_after_failure_sleep, reconcile_snapshot_version, record_applied_gateway_trust,
+    resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
+    snapshot_failure_stream_disposition, snapshot_requires_older_payload_exception,
     stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
@@ -99,6 +100,33 @@ impl DpCpConnectionState {
             config_diverged: false,
             config_diverged_since: None,
             config_divergence_recoveries_total: 0,
+        }
+    }
+
+    /// Build the connected-state view a reconnect must publish, preserving the
+    /// applied-config age and sticky ConfigSync divergence carried across the
+    /// disconnect while marking the new stream connected.
+    ///
+    /// A reconnect (including CP failover) must not reset `last_config_received_at`
+    /// or clear `config_diverged` / `config_diverged_since` /
+    /// `config_divergence_recoveries_total`: last-known-good config keeps serving
+    /// and sticky divergence clears only after an accepted authoritative
+    /// FULL_SNAPSHOT, not merely because the transport reconnected.
+    pub fn reconnected(
+        &self,
+        cp_url: &str,
+        is_primary: bool,
+        connected_since: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            connected: true,
+            cp_url: cp_url.to_string(),
+            is_primary,
+            last_config_received_at: self.last_config_received_at,
+            connected_since: Some(connected_since),
+            config_diverged: self.config_diverged,
+            config_diverged_since: self.config_diverged_since,
+            config_divergence_recoveries_total: self.config_divergence_recoveries_total,
         }
     }
 }
@@ -421,6 +449,10 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     let divergence_metrics = Arc::new(ConfigSyncDivergenceMetrics::default());
     crate::plugins::prometheus_metrics::global_registry()
         .set_configsync_divergence_metrics(divergence_metrics.clone());
+    // Event-driven startup-readiness wakeup shared across subscription attempts.
+    // Paired with `startup_ready` (the source-of-truth flag) so the fallback
+    // primary-retry timer waits for readiness without a busy-poll (nit N2).
+    let readiness_signal = Arc::new(Notify::new());
 
     loop {
         if let Some(ref rx) = shutdown_rx
@@ -489,6 +521,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             if is_fallback { primary_retry_secs } else { 0 },
             &mut snapshot_authority,
             divergence_metrics.as_ref(),
+            readiness_signal.clone(),
         )
         .await;
 
@@ -644,11 +677,13 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                         return;
                     }
                     _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                        let _ = advance_multi_cp_backoff(
-                            &mut backoff,
-                            cp_count,
-                            ConfigSyncAttemptOutcome::IntentionalDisconnect,
-                        );
+                        // TLS material rotated mid-backoff: reconnect immediately
+                        // with the new material (rebuilt at the top of the loop),
+                        // but PRESERVE accumulated failure backoff. No connection
+                        // has succeeded, so resetting to the initial delay would
+                        // let a flapping TLS source defeat backoff against a
+                        // still-failing CP (L2). Only real healthy progress or an
+                        // intentional connected disconnect resets backoff.
                         continue;
                     }
                 }
@@ -669,11 +704,10 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    let _ = advance_multi_cp_backoff(
-                        &mut backoff,
-                        cp_count,
-                        ConfigSyncAttemptOutcome::IntentionalDisconnect,
-                    );
+                    // Same as the shutdown-aware arm above: reconnect immediately
+                    // with rotated TLS material while preserving accumulated
+                    // failure backoff. A TLS source flap is not healthy progress
+                    // and must not reset the delay against a still-failing CP (L2).
                     continue;
                 }
             }
@@ -722,6 +756,7 @@ enum DpStreamEnd {
 
 async fn wait_for_readiness_then_primary_retry(
     startup_ready: Option<Arc<AtomicBool>>,
+    readiness_signal: Arc<Notify>,
     primary_retry_secs: u64,
 ) {
     // A startup-readiness gate only DELAYS the first primary retry so the DP does
@@ -731,8 +766,16 @@ async fn wait_for_readiness_then_primary_retry(
     // pre-refactor `startup_ready.is_none_or(..)` race semantics. Returning a
     // never-ready future here would strand the DP on a fallback CP forever.
     if let Some(startup_ready) = startup_ready {
+        // Event-driven wait (no 100ms busy-poll, nit N2). `startup_ready` is the
+        // source of truth; the paired `Notify` only delivers the wakeup. The
+        // apply path stores `true` then calls `notify_one`, which stores a permit
+        // even if no waiter is currently parked — so a store that races the flag
+        // check below is never a lost wakeup: the subsequent `notified().await`
+        // consumes the stored permit immediately and the loop re-observes the
+        // flag. Cancellation-safe: dropping this future (when another select! arm
+        // wins) leaves no state behind.
         while !startup_ready.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            readiness_signal.notified().await;
         }
     }
     tokio::time::sleep(Duration::from_secs(primary_retry_secs)).await;
@@ -809,6 +852,17 @@ fn update_state_config_diverged(
             config_divergence_recoveries_total: prev.config_divergence_recoveries_total,
         }));
     }
+}
+
+/// Record a fenced (refused-without-applying) cross-source FULL_SNAPSHOT and
+/// invalidate the cached `/metrics` render so the fixed-cardinality fenced
+/// counter surfaces promptly. Fencing keeps last-known-good config and does not
+/// raise sticky `config_diverged` — it is a failover/skew signal, not a
+/// delta-rejection divergence.
+fn record_fenced_full_snapshot(metrics: &ConfigSyncDivergenceMetrics) {
+    metrics.record_fenced_snapshot();
+    crate::plugins::prometheus_metrics::global_registry()
+        .invalidate_configsync_divergence_metrics_cache();
 }
 
 /// Clear sticky divergence after an accepted authoritative FULL_SNAPSHOT.
@@ -1122,6 +1176,7 @@ pub async fn connect_and_subscribe(
         0,
         &mut authority,
         &ConfigSyncDivergenceMetrics::default(),
+        Arc::new(Notify::new()),
     )
     .await?
     {
@@ -1175,6 +1230,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
         0,
         &mut authority,
         &ConfigSyncDivergenceMetrics::default(),
+        Arc::new(Notify::new()),
     )
     .await?
     {
@@ -1220,6 +1276,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     primary_retry_secs: u64,
     snapshot_authority: &mut Option<AppliedSnapshotAuthority>,
     divergence_metrics: &ConfigSyncDivergenceMetrics,
+    readiness_signal: Arc<Notify>,
 ) -> Result<DpStreamEnd, anyhow::Error> {
     let mut endpoint = configure_configsync_endpoint(Channel::from_shared(cp_url.to_string())?);
 
@@ -1301,8 +1358,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     let skip_startup_readiness_work = startup_ready.is_none();
     let mut received_config = false;
     let mut last_stream_activity = Instant::now();
-    let primary_retry_fut =
-        wait_for_readiness_then_primary_retry(startup_ready.clone(), primary_retry_secs);
+    let primary_retry_fut = wait_for_readiness_then_primary_retry(
+        startup_ready.clone(),
+        readiness_signal.clone(),
+        primary_retry_secs,
+    );
     tokio::pin!(primary_retry_fut);
     let enable_primary_retry = primary_retry_secs > 0;
     let shutdown_fut = wait_optional_shutdown(shutdown_rx.clone());
@@ -1310,20 +1370,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     let tls_reload_fut = wait_optional_tls_reload(tls_revision_rx.clone());
     tokio::pin!(tls_reload_fut);
 
-    // Mark connected while preserving last applied-config age across reconnects.
+    // Mark connected while preserving last applied-config age and sticky
+    // divergence across reconnects (see `DpCpConnectionState::reconnected`).
     if let Some(cs) = connection_state {
         let prev = cs.load();
-        let now = Utc::now();
-        cs.store(Arc::new(DpCpConnectionState {
-            connected: true,
-            cp_url: cp_url.to_string(),
-            is_primary,
-            last_config_received_at: prev.last_config_received_at,
-            connected_since: Some(now),
-            config_diverged: prev.config_diverged,
-            config_diverged_since: prev.config_diverged_since,
-            config_divergence_recoveries_total: prev.config_divergence_recoveries_total,
-        }));
+        cs.store(Arc::new(prev.reconnected(cp_url, is_primary, Utc::now())));
     }
 
     loop {
@@ -1542,6 +1593,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     Ok(committed) => committed,
                     Err(err) => {
                         let reason = stale_reject_from_reconcile(err);
+                        record_fenced_full_snapshot(divergence_metrics);
                         warn!(
                             ?reason,
                             cp_url,
@@ -1553,20 +1605,52 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         return Ok(DpStreamEnd::StaleSnapshotFenced);
                     }
                 };
+                // Bounded clock-skew guard: a committed stamp implausibly far in
+                // this DP's future indicates a skewed or hostile CP clock. Admit
+                // it and the monotonic watermark is poisoned — every correct-clock
+                // failover CP with genuinely newer config is fenced until wall
+                // time catches up. Fail closed: refuse, alarm, and fail over while
+                // last-known-good config keeps serving. Never clamp the untrusted
+                // stamp into authority (issue M1).
+                if let Err(reason) = evaluate_snapshot_clock_skew(committed, Utc::now()) {
+                    record_fenced_full_snapshot(divergence_metrics);
+                    warn!(
+                        ?reason,
+                        cp_url,
+                        version = %update.version,
+                        loaded_at = %config.loaded_at,
+                        "Refusing FULL_SNAPSHOT with an implausibly-future committed timestamp \
+                         (CP clock skew beyond tolerance) and terminating this ConfigSync stream \
+                         so a skewed clock cannot poison the freshness watermark"
+                    );
+                    return Ok(DpStreamEnd::StaleSnapshotFenced);
+                }
                 // Older-cross-source identical-fallback must compare the complete
                 // authoritative payload: GatewayConfig content plus effective CP
                 // gateway-trust side-channel state. Empty/unchanged trust side
-                // channels fail closed (cannot establish equivalence).
-                let incoming_trust_equiv =
-                    gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
-                let incoming_matches_applied = match snapshot_authority.as_ref() {
-                    Some(authority) => authoritative_snapshot_payload_matches(
-                        proxy_state.current_config().as_ref(),
-                        &authority.gateway_trust,
-                        &config,
-                        incoming_trust_equiv.as_ref(),
-                    ),
-                    None => false,
+                // channels fail closed (cannot establish equivalence). The two
+                // canonical JSON conversions are expensive, so only run them when
+                // the disposition actually depends on the exception — a cross-
+                // source candidate strictly older than a parseable applied
+                // watermark. Routine same-source/fresh snapshots skip it (nit N1).
+                let incoming_matches_applied = if snapshot_requires_older_payload_exception(
+                    snapshot_authority.as_ref(),
+                    committed,
+                    cp_url,
+                ) {
+                    let incoming_trust_equiv =
+                        gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
+                    match snapshot_authority.as_ref() {
+                        Some(authority) => authoritative_snapshot_payload_matches(
+                            proxy_state.current_config().as_ref(),
+                            &authority.gateway_trust,
+                            &config,
+                            incoming_trust_equiv.as_ref(),
+                        ),
+                        None => false,
+                    }
+                } else {
+                    false
                 };
                 let watermark = match full_snapshot_stream_disposition(
                     snapshot_authority.as_ref(),
@@ -1576,6 +1660,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 ) {
                     FullSnapshotStreamDisposition::Apply { version } => version,
                     FullSnapshotStreamDisposition::RefuseAndTerminate(reason) => {
+                        record_fenced_full_snapshot(divergence_metrics);
                         warn!(
                             ?reason,
                             cp_url,
@@ -1656,6 +1741,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             proxy_state.refresh_backend_capabilities().await;
                             if let Some(ref startup_ready) = startup_ready {
                                 startup_ready.store(true, Ordering::Release);
+                                // Wake a fallback subscription's primary-retry
+                                // timer waiting on readiness (event-driven, nit
+                                // N2). `notify_one` stores a permit so the wakeup
+                                // is never lost even if the waiter is mid-check.
+                                readiness_signal.notify_one();
                             }
                             info!(
                                 "DP startup complete; backend capabilities classified; /health now reports ready"
@@ -1997,7 +2087,11 @@ fn clear_frontend_tls_material(config: &mut GatewayConfig) -> bool {
 /// namespace.
 ///
 /// Returns the number of resources filtered out so the caller can warn.
-fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &str) -> usize {
+///
+/// Exposed so the namespace-qualified removal fail-closed behavior can be
+/// exercised directly by external unit tests instead of reimplementing the
+/// retain logic.
+pub fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &str) -> usize {
     let pre = (
         result.added_or_modified_proxies.len(),
         result.added_or_modified_consumers.len(),

@@ -108,6 +108,18 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
     }
 }
 
+/// Build a TCP stream proxy (`dispatch_kind.is_stream()`) bound to `listen_port`.
+/// Used to drive `StreamListenerManager::wait_until_started` timeout coverage.
+fn create_test_tcp_stream_proxy(id: &str, listen_port: u16) -> Proxy {
+    let mut proxy = create_test_proxy(id, "/unused");
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    proxy.listen_path = None;
+    proxy.listen_port = Some(listen_port);
+    proxy.hosts = vec![];
+    proxy
+}
+
 /// Create a GatewayConfig with the given number of test proxies.
 fn create_test_config(proxy_count: usize) -> GatewayConfig {
     let proxies: Vec<Proxy> = (0..proxy_count)
@@ -4116,4 +4128,104 @@ async fn test_dp_filters_cross_namespace_resources_from_snapshot() {
     assert_eq!(cfg.upstreams[0].namespace, "production");
 
     server_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_until_started_times_out_when_stream_listener_never_binds() {
+    // #2971 production seam the DP relies on: after the first CP snapshot the DP
+    // calls `stream_listener_manager.wait_until_started(...)` and only WARNS
+    // (non-fatal in DP mode) when it times out. Place a stream proxy in the shared
+    // config ArcSwap WITHOUT starting/reconciling any listener, so the desired
+    // listener can never report started and the wait must return Err — the exact
+    // timeout branch the DP snapshot path treats as a non-fatal warning.
+    let proxy_state = create_test_proxy_state();
+    let mut config = GatewayConfig::default();
+    config
+        .proxies
+        .push(create_test_tcp_stream_proxy("tcp-1", 19071));
+    proxy_state.config.store(Arc::new(config));
+
+    let result = proxy_state
+        .stream_listener_manager
+        .wait_until_started(Duration::from_millis(50))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "wait_until_started must time out when the stream listener never binds"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_consumes_heartbeat_without_applying_or_tearing_down_stream() {
+    // ConfigSync heartbeats keep an otherwise-silent stream alive without being
+    // treated as config. Prove both properties on a single subscription: a
+    // heartbeat whose payload is a 5-proxy FULL_SNAPSHOT must NOT be applied
+    // (config stays at 1), and the stream must survive it so a subsequent real
+    // config still applies over the same stream.
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "hb-node", &ps, None, "ferrum")
+            .await
+    });
+
+    // Wait for the initial snapshot (1 proxy).
+    let received_initial = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_initial.is_ok(),
+        "DP should receive the initial snapshot"
+    );
+
+    // A heartbeat carrying a would-be 5-proxy FULL_SNAPSHOT payload. If heartbeat
+    // handling were broken, this would parse and apply to 5 proxies.
+    let heartbeat_payload = serde_json::to_string(&create_test_config(5)).unwrap();
+    let heartbeat = ferrum_edge::grpc::proto::ConfigUpdate {
+        update_type: 0,
+        config_json: heartbeat_payload,
+        version: String::new(),
+        timestamp: Utc::now().timestamp(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        trust_bundles_json: String::new(),
+        heartbeat: true,
+    };
+    update_tx.send(heartbeat).expect("heartbeat should broadcast");
+
+    // Give the DP time to consume the heartbeat; config must remain at 1 proxy.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        proxy_state.config.load().proxies.len(),
+        1,
+        "a heartbeat must not be applied as config"
+    );
+
+    // The stream must have survived the heartbeat: a real update still applies.
+    CpGrpcServer::broadcast_update(&update_tx, &create_test_config(3));
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        applied.is_ok(),
+        "the stream must survive the heartbeat and apply the subsequent config"
+    );
+
+    client_handle.abort();
 }

@@ -2289,6 +2289,17 @@ impl MetricsRegistry {
                 u64::from(snapshot.diverged),
                 &ns_label,
             );
+
+            output.push_str(
+                "# HELP ferrum_configsync_fenced_full_snapshots_total Cross-source ConfigSync FULL_SNAPSHOTs the DP fenced without applying (stale/older, unorderable/inconsistent, or an implausibly-future CP clock stamp); last-known-good config keeps serving.\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_fenced_full_snapshots_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_fenced_full_snapshots_total",
+                snapshot.fenced_full_snapshots_total,
+                &ns_label,
+            );
         }
 
         let admin_conn_metrics = self.admin_conn_metrics.load_full();

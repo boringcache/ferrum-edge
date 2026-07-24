@@ -31,6 +31,26 @@ pub const CONFIGSYNC_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// are not treated as dead.
 pub const CONFIGSYNC_MAX_SILENCE_SECS: u64 = 150;
 
+/// Maximum tolerated future clock skew (seconds) for admitting a CP-stamped
+/// committed snapshot timestamp into freshness authority.
+///
+/// The freshness watermark ([`AppliedSnapshotAuthority::version`]) is entirely
+/// CP-clock stamped (it tracks committed `GatewayConfig.loaded_at`). A CP whose
+/// wall clock runs ahead would otherwise poison the monotonic watermark: once a
+/// far-future stamp is admitted, every correct-clock failover CP carrying
+/// genuinely newer config is fenced as "older than applied" until real wall
+/// time catches up. To bound that, a committed stamp more than this far ahead of
+/// the DP's own wall clock is treated as an implausibly-future (skewed or
+/// hostile) stamp and refused — the DP fails closed, keeps last-known-good
+/// config, and fails over, rather than silently clamping the untrusted timestamp
+/// into authority.
+///
+/// 300s (5 minutes) matches the long-established Kerberos / JWT `iat`/`nbf`
+/// leeway for tolerable NTP drift: generous enough that realistic DP↔CP clock
+/// differences never false-reject a legitimate snapshot, tight enough that
+/// watermark poisoning is bounded to at most one skew window.
+pub const CONFIGSYNC_MAX_FUTURE_SKEW_SECS: i64 = 300;
+
 /// Bounded, material-free view of the last accepted CP-authoritative gateway
 /// trust-bundle state used by older-cross-source snapshot equivalence.
 ///
@@ -110,6 +130,14 @@ pub enum StaleSnapshotReject {
     OlderThanApplied {
         applied: DateTime<Utc>,
         incoming: DateTime<Utc>,
+    },
+    /// The committed stamp is implausibly far in the DP's future — a skewed or
+    /// hostile CP clock. Admitting it would poison the monotonic freshness
+    /// watermark, so it fails closed instead of being clamped into authority.
+    ImplausiblyFutureStamp {
+        committed: DateTime<Utc>,
+        now: DateTime<Utc>,
+        tolerance_secs: i64,
     },
 }
 
@@ -358,6 +386,104 @@ pub fn resource_delta_advances_authority(accepted: bool, was_empty: bool) -> boo
     accepted && !was_empty
 }
 
+/// Canonical `(scheme, host, port)` identity of a configured CP endpoint URL.
+///
+/// Scheme and host are ASCII-lowercased; the port defaults per scheme when the
+/// URL omits it. Path, query, and fragment are ignored so harmless equivalent
+/// spellings (e.g. a trailing slash) do not read as distinct endpoints. Returns
+/// `None` for a URL that cannot be canonicalized (unparseable, missing
+/// scheme/host, or an unknown scheme without an explicit port) so the caller can
+/// fail closed.
+fn canonical_cp_endpoint(url: &str) -> Option<(String, String, u16)> {
+    let uri = url.parse::<http::Uri>().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let host = uri.host()?.to_ascii_lowercase();
+    let port = match uri.port_u16() {
+        Some(port) => port,
+        None => match scheme.as_str() {
+            "https" | "grpcs" => 443,
+            "http" | "grpc" => 80,
+            // Unknown scheme with no explicit port: cannot canonicalize safely.
+            _ => return None,
+        },
+    };
+    Some((scheme, host, port))
+}
+
+/// True when two configured CP endpoint URLs address the same source.
+///
+/// Same-source detection gates whether a FULL_SNAPSHOT is a reconnect/recovery
+/// (always accepted, monotonic watermark) or a cross-source failover candidate
+/// (subject to stale-fencing). Comparing raw URL strings would treat harmless
+/// equivalent spellings such as a trailing slash as cross-source and needlessly
+/// fence them; canonicalizing to `(scheme, host, port)` avoids that while
+/// keeping distinct schemes/hosts/ports distinct.
+///
+/// Fails closed for malformed input: if either URL cannot be canonicalized,
+/// only a byte-identical spelling is treated as same-source, so a parse failure
+/// can never merge two genuinely different endpoints into one.
+pub fn cp_endpoints_same_source(a: &str, b: &str) -> bool {
+    match (canonical_cp_endpoint(a), canonical_cp_endpoint(b)) {
+        (Some(canonical_a), Some(canonical_b)) => canonical_a == canonical_b,
+        _ => a == b,
+    }
+}
+
+/// Refuse a committed snapshot stamp that is implausibly far in the DP's future.
+///
+/// A committed `loaded_at` more than [`CONFIGSYNC_MAX_FUTURE_SKEW_SECS`] ahead of
+/// `now` indicates a skewed or hostile CP clock. Admitting it into the monotonic
+/// freshness watermark would fence every correct-clock failover CP carrying
+/// genuinely newer config until wall time caught up, so it fails closed. The
+/// stamp is never clamped into authority — the caller terminates the stream and
+/// fails over while last-known-good config keeps serving. Stamps at or behind
+/// `now`, and stamps within tolerance, are admitted unchanged.
+pub fn evaluate_snapshot_clock_skew(
+    incoming_committed: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), StaleSnapshotReject> {
+    if incoming_committed.signed_duration_since(now)
+        > chrono::Duration::seconds(CONFIGSYNC_MAX_FUTURE_SKEW_SECS)
+    {
+        return Err(StaleSnapshotReject::ImplausiblyFutureStamp {
+            committed: incoming_committed,
+            now,
+            tolerance_secs: CONFIGSYNC_MAX_FUTURE_SKEW_SECS,
+        });
+    }
+    Ok(())
+}
+
+/// True only when the FULL_SNAPSHOT disposition actually depends on the
+/// expensive complete-payload equivalence check.
+///
+/// The identical-payload exception is consulted by
+/// [`evaluate_full_snapshot_authority`] in exactly one case: a cross-source
+/// candidate (different CP than the applied authority) that is strictly older
+/// than a parseable applied watermark. Every other case — no authority yet,
+/// same-source reconnect, an authority with no comparable version, or an
+/// incoming stamp at/after the applied watermark — is decided without the
+/// exception, so the two canonical JSON conversions can be skipped (nit N1).
+///
+/// Fails closed: returns `false` (compute nothing / assume no match) whenever the
+/// exception is not strictly required.
+pub fn snapshot_requires_older_payload_exception(
+    authority: Option<&AppliedSnapshotAuthority>,
+    incoming_committed: DateTime<Utc>,
+    source_cp_url: &str,
+) -> bool {
+    let Some(authority) = authority else {
+        return false;
+    };
+    if cp_endpoints_same_source(&authority.source_cp_url, source_cp_url) {
+        return false;
+    }
+    let Some(applied) = authority.version else {
+        return false;
+    };
+    incoming_committed < applied
+}
+
 /// Decide whether an incoming FULL_SNAPSHOT may replace the active config.
 ///
 /// `incoming_committed` must already be the reconciled snapshot `loaded_at`
@@ -386,7 +512,7 @@ pub fn evaluate_full_snapshot_authority(
         return Ok(incoming_committed);
     };
 
-    if authority.source_cp_url == source_cp_url {
+    if cp_endpoints_same_source(&authority.source_cp_url, source_cp_url) {
         return Ok(monotonic_watermark(authority.version, incoming_committed));
     }
 
@@ -552,6 +678,7 @@ pub fn delta_rejection_stream_disposition(
 pub struct ConfigSyncDivergenceMetrics {
     rejected_nonempty_deltas_total: AtomicU64,
     recoveries_total: AtomicU64,
+    fenced_full_snapshots_total: AtomicU64,
     diverged: AtomicBool,
 }
 
@@ -559,6 +686,7 @@ pub struct ConfigSyncDivergenceMetrics {
 pub struct ConfigSyncDivergenceMetricsSnapshot {
     pub rejected_nonempty_deltas_total: u64,
     pub recoveries_total: u64,
+    pub fenced_full_snapshots_total: u64,
     pub diverged: bool,
 }
 
@@ -567,6 +695,16 @@ impl ConfigSyncDivergenceMetrics {
         self.rejected_nonempty_deltas_total
             .fetch_add(1, Ordering::Relaxed);
         self.diverged.store(true, Ordering::Release);
+    }
+
+    /// Record a cross-source FULL_SNAPSHOT the DP fenced without applying
+    /// (stale/older, unorderable/inconsistent, or an implausibly-future clock
+    /// stamp). Fixed-cardinality operator signal for skew/hostile-CP fencing.
+    /// Does not touch sticky `diverged`: fencing keeps last-known-good config
+    /// and is a failover event, not a delta-rejection divergence.
+    pub fn record_fenced_snapshot(&self) {
+        self.fenced_full_snapshots_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Clear sticky divergence only after an authoritative FULL_SNAPSHOT is
@@ -590,6 +728,7 @@ impl ConfigSyncDivergenceMetrics {
                 .rejected_nonempty_deltas_total
                 .load(Ordering::Relaxed),
             recoveries_total: self.recoveries_total.load(Ordering::Relaxed),
+            fenced_full_snapshots_total: self.fenced_full_snapshots_total.load(Ordering::Relaxed),
             diverged: self.is_diverged(),
         }
     }

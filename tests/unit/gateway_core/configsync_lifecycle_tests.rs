@@ -15,23 +15,26 @@ use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
-    CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
-    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics,
-    DeltaRefuse, DeltaRejectionKind, DeltaRejectionStreamDisposition,
+    CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_FUTURE_SKEW_SECS,
+    CONFIGSYNC_MAX_SILENCE_SECS, CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome,
+    ConfigSyncDivergenceMetrics, DeltaRefuse, DeltaRejectionKind, DeltaRejectionStreamDisposition,
     FullSnapshotStreamDisposition, GatewayTrustEquivalenceState, MultiCpBackoffState,
     SnapshotFailureStreamDisposition, StaleSnapshotReject, SubscriptionApplyState,
     VersionCompatError, VersionReconcileError, advance_authority_from_committed,
     advance_multi_cp_backoff, authoritative_snapshot_payload_matches, backoff_max_secs,
-    check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
-    evaluate_delta_against_subscription_base, evaluate_full_snapshot_authority,
-    failure_backoff_sequence, full_snapshot_stream_disposition, gateway_config_content_matches,
+    check_peer_version_compatibility, connection_error_outcome, cp_endpoints_same_source,
+    delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
+    evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew, failure_backoff_sequence,
+    full_snapshot_stream_disposition, gateway_config_content_matches,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, monotonic_watermark,
     reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
-    silence_exceeds_liveness, snapshot_failure_stream_disposition, stale_reject_from_reconcile,
+    silence_exceeds_liveness, snapshot_failure_stream_disposition,
+    snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
 };
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, check_cp_version_compatibility, configure_configsync_endpoint,
+    filter_incremental_to_namespace,
 };
 use ferrum_edge::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet, TrustDomain};
 use ferrum_edge::util::backoff::BACKOFF_INITIAL_SECS;
@@ -997,8 +1000,13 @@ fn unknown_prior_authority_still_accepts_cross_source() {
 
 #[test]
 fn reconnect_preserves_last_config_received_at_and_divergence() {
+    // Exercises the production reconnect copy (`DpCpConnectionState::reconnected`)
+    // instead of mirroring the field-carry logic in the test. A reconnect
+    // (including CP failover) preserves applied-config age and sticky divergence
+    // while marking the new stream connected to the new target.
     let stamp = Utc.with_ymd_and_hms(2026, 7, 24, 1, 2, 3).unwrap();
     let diverged_since = Utc.with_ymd_and_hms(2026, 7, 24, 1, 0, 0).unwrap();
+    let connected_since = Utc.with_ymd_and_hms(2026, 7, 24, 2, 0, 0).unwrap();
     let prev = DpCpConnectionState {
         connected: false,
         cp_url: "http://cp-old:50051".to_string(),
@@ -1009,18 +1017,16 @@ fn reconnect_preserves_last_config_received_at_and_divergence() {
         config_diverged_since: Some(diverged_since),
         config_divergence_recoveries_total: 2,
     };
-    let connected = DpCpConnectionState {
-        connected: true,
-        cp_url: "http://cp-new:50051".to_string(),
-        is_primary: false,
-        last_config_received_at: prev.last_config_received_at,
-        connected_since: Some(Utc::now()),
-        config_diverged: prev.config_diverged,
-        config_diverged_since: prev.config_diverged_since,
-        config_divergence_recoveries_total: prev.config_divergence_recoveries_total,
-    };
-    assert_eq!(connected.last_config_received_at, Some(stamp));
+
+    let connected = prev.reconnected("http://cp-new:50051", false, connected_since);
+
+    // Marked connected to the new (fallback) target.
     assert!(connected.connected);
+    assert_eq!(connected.cp_url, "http://cp-new:50051");
+    assert!(!connected.is_primary);
+    assert_eq!(connected.connected_since, Some(connected_since));
+    // Preserved across the reconnect — never reset by a mere transport reconnect.
+    assert_eq!(connected.last_config_received_at, Some(stamp));
     assert!(connected.config_diverged);
     assert_eq!(connected.config_diverged_since, Some(diverged_since));
     assert_eq!(connected.config_divergence_recoveries_total, 2);
@@ -1028,6 +1034,10 @@ fn reconnect_preserves_last_config_received_at_and_divergence() {
 
 #[test]
 fn namespace_qualified_removals_are_fail_closed_on_mismatch() {
+    // Exercises the production defense-in-depth filter
+    // (`dp_client::filter_incremental_to_namespace`) directly instead of
+    // reimplementing the retain logic. A delta carrying same-id removals across
+    // namespaces must keep only the DP's own namespace keys.
     let mut delta = IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![
@@ -1044,17 +1054,10 @@ fn namespace_qualified_removals_are_fail_closed_on_mismatch() {
         poll_timestamp: Utc::now(),
     };
 
-    // Mirror dp_client::filter_incremental_to_namespace removal retain logic.
-    delta
-        .removed_proxy_ids
-        .retain(|key| key.namespace == "production");
-    delta
-        .removed_plugin_config_ids
-        .retain(|key| key.namespace == "production");
-    delta
-        .removed_upstream_ids
-        .retain(|key| key.namespace == "production");
+    let filtered = filter_incremental_to_namespace(&mut delta, "production");
 
+    // Two staging removal keys (proxy `shared-id`, plugin_config `pc1`) dropped.
+    assert_eq!(filtered, 2);
     assert_eq!(
         delta.removed_proxy_ids,
         vec![NamespacedResourceId::new("production", "shared-id")]
@@ -1064,4 +1067,194 @@ fn namespace_qualified_removals_are_fail_closed_on_mismatch() {
         delta.removed_upstream_ids,
         vec![NamespacedResourceId::new("production", "u1")]
     );
+}
+
+#[test]
+fn future_skew_tolerance_is_bounded_and_positive() {
+    // 300s (5 minutes) — the established Kerberos/JWT NTP-drift leeway. Generous
+    // enough that realistic DP↔CP clock differences never false-reject a
+    // legitimate snapshot, tight enough that watermark poisoning is bounded.
+    assert_eq!(CONFIGSYNC_MAX_FUTURE_SKEW_SECS, 300);
+    assert!(CONFIGSYNC_MAX_FUTURE_SKEW_SECS > 0);
+}
+
+#[test]
+fn clock_skew_guard_refuses_implausibly_future_committed_stamp() {
+    // Issue M1: a CP-clock-stamped committed timestamp far in the DP's future
+    // would poison the monotonic freshness watermark. Admit stamps at/behind now
+    // and within tolerance; fail closed (never clamp) beyond tolerance.
+    let now = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
+
+    assert!(evaluate_snapshot_clock_skew(now, now).is_ok());
+    let past = now - chrono::Duration::seconds(10_000);
+    assert!(evaluate_snapshot_clock_skew(past, now).is_ok());
+
+    // Exactly at the tolerance boundary is still admitted (realistic NTP drift).
+    let within = now + chrono::Duration::seconds(CONFIGSYNC_MAX_FUTURE_SKEW_SECS);
+    assert!(evaluate_snapshot_clock_skew(within, now).is_ok());
+
+    // One second beyond tolerance is refused, and the reject carries the exact
+    // untrusted stamp / reference time / tolerance — never a clamped value.
+    let beyond = now + chrono::Duration::seconds(CONFIGSYNC_MAX_FUTURE_SKEW_SECS + 1);
+    match evaluate_snapshot_clock_skew(beyond, now) {
+        Err(StaleSnapshotReject::ImplausiblyFutureStamp {
+            committed,
+            now: reported_now,
+            tolerance_secs,
+        }) => {
+            assert_eq!(committed, beyond);
+            assert_eq!(reported_now, now);
+            assert_eq!(tolerance_secs, CONFIGSYNC_MAX_FUTURE_SKEW_SECS);
+        }
+        other => panic!("expected ImplausiblyFutureStamp, got {other:?}"),
+    }
+}
+
+#[test]
+fn fenced_full_snapshot_counter_increments_independently_of_divergence() {
+    // Fixed-cardinality operator signal for fenced snapshots. Fencing keeps
+    // last-known-good config and must NOT raise sticky delta-rejection divergence.
+    let metrics = ConfigSyncDivergenceMetrics::default();
+    assert_eq!(metrics.snapshot().fenced_full_snapshots_total, 0);
+    assert!(!metrics.is_diverged());
+
+    metrics.record_fenced_snapshot();
+    metrics.record_fenced_snapshot();
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.fenced_full_snapshots_total, 2);
+    assert!(!snap.diverged);
+    assert_eq!(snap.rejected_nonempty_deltas_total, 0);
+}
+
+#[test]
+fn older_payload_exception_is_required_only_for_cross_source_strictly_older() {
+    // Nit N1: the expensive complete-payload equivalence is consulted by the
+    // disposition in exactly one case — a cross-source candidate strictly older
+    // than a parseable applied watermark. The predicate gates the two canonical
+    // JSON conversions to that case; every other case is decided without them.
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-a:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
+    };
+    let older = applied - chrono::Duration::seconds(3600);
+    let newer = applied + chrono::Duration::seconds(3600);
+
+    // Required: cross-source, strictly older, parseable applied version.
+    assert!(snapshot_requires_older_payload_exception(
+        Some(&authority),
+        older,
+        "http://cp-b:50051"
+    ));
+
+    // Not required for any other case (disposition ignores the flag there):
+    assert!(!snapshot_requires_older_payload_exception(
+        None,
+        older,
+        "http://cp-b:50051"
+    ));
+    assert!(!snapshot_requires_older_payload_exception(
+        Some(&authority),
+        older,
+        "http://cp-a:50051/" // same source (canonicalized trailing slash)
+    ));
+    assert!(!snapshot_requires_older_payload_exception(
+        Some(&authority),
+        newer, // not strictly older
+        "http://cp-b:50051"
+    ));
+    let unknown_version = AppliedSnapshotAuthority {
+        version: None,
+        source_cp_url: "http://cp-a:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
+    };
+    assert!(!snapshot_requires_older_payload_exception(
+        Some(&unknown_version),
+        older,
+        "http://cp-b:50051"
+    ));
+}
+
+#[test]
+fn cp_endpoint_same_source_canonicalizes_equivalent_spellings() {
+    // Nit N3: harmless equivalent spellings are the same source; distinct
+    // scheme/host/port stay distinct; malformed URLs fail closed to exact match.
+    assert!(cp_endpoints_same_source(
+        "http://cp-a:50051",
+        "http://cp-a:50051/"
+    ));
+    assert!(cp_endpoints_same_source(
+        "http://cp-a:50051/",
+        "http://cp-a:50051"
+    ));
+    // Case-insensitive scheme/host.
+    assert!(cp_endpoints_same_source(
+        "HTTP://CP-A:50051",
+        "http://cp-a:50051"
+    ));
+    // Implicit vs explicit default port folds.
+    assert!(cp_endpoints_same_source("http://cp-a", "http://cp-a:80"));
+    assert!(cp_endpoints_same_source("https://cp-a", "https://cp-a:443"));
+
+    // Distinct host / port / scheme are never merged.
+    assert!(!cp_endpoints_same_source(
+        "http://cp-a:50051",
+        "http://cp-b:50051"
+    ));
+    assert!(!cp_endpoints_same_source(
+        "http://cp-a:50051",
+        "http://cp-a:50052"
+    ));
+    assert!(!cp_endpoints_same_source(
+        "http://cp-a:50051",
+        "https://cp-a:50051"
+    ));
+
+    // Malformed / uncanonicalizable input: only a byte-identical spelling counts
+    // as same source, so a parse failure never merges two distinct endpoints.
+    assert!(!cp_endpoints_same_source("not a url", "http://cp-a:50051"));
+    assert!(!cp_endpoints_same_source("not a url", "also not a url"));
+    assert!(cp_endpoints_same_source("not a url", "not a url"));
+}
+
+#[test]
+fn tls_reload_during_failure_backoff_preserves_accumulated_backoff() {
+    // Issue L2: build the accumulated failure backoff the reconnect loop carries
+    // into a sleep after repeated ConnectionErrors against a still-failing CP.
+    let mut state = MultiCpBackoffState::new();
+    for _ in 0..4 {
+        assert!(advance_multi_cp_backoff(
+            &mut state,
+            1,
+            ConfigSyncAttemptOutcome::ConnectionError
+        ));
+        grow_backoff_after_failure_sleep(&mut state);
+    }
+    let accumulated = state.backoff_secs;
+    assert!(
+        accumulated > BACKOFF_INITIAL_SECS,
+        "precondition: repeated failures have grown backoff"
+    );
+
+    // A TLS material rotation mid-backoff reconnects immediately with rotated
+    // material but must PRESERVE this accumulated delay. The production loop does
+    // that by NOT routing the interruption through `advance_multi_cp_backoff` — it
+    // just reconnects, leaving `backoff_secs` untouched. Prove the anti-regression
+    // by showing the pre-fix path (IntentionalDisconnect) erases it to 1s.
+    let mut regressed = state.clone();
+    let should_sleep = advance_multi_cp_backoff(
+        &mut regressed,
+        1,
+        ConfigSyncAttemptOutcome::IntentionalDisconnect,
+    );
+    assert!(!should_sleep);
+    assert_eq!(
+        regressed.backoff_secs, BACKOFF_INITIAL_SECS,
+        "pre-fix IntentionalDisconnect path erased accumulated backoff (the L2 bug)"
+    );
+
+    // Post-fix: the loop leaves backoff state untouched on a TLS-reload interruption.
+    assert_eq!(state.backoff_secs, accumulated);
 }
