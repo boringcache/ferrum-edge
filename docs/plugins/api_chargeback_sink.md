@@ -64,9 +64,9 @@ silently labeling a mixed aggregate with the first record's metadata.
 per-transaction only). Every `snapshot.interval_secs`, the sink emits deltas
 since the last snapshot. Use this when event volume dominates ingest cost and
 aggregate reconciliation is sufficient. Snapshot mode requires
-`spool.enabled: true` because the accumulator advances after a delta is handed
-to the sink queue; the spool is the durable path when ClickHouse or the
-in-memory queue is unavailable. Idle snapshot keys are evicted after
+`spool.enabled: true` because the accumulator advances only after a delta is
+written to the spool; the queue is an additional low-latency delivery attempt,
+not the durability boundary. Idle snapshot keys are evicted after
 `snapshot.stale_entry_ttl_secs` and checked every
 `snapshot.cleanup_interval_secs`.
 
@@ -90,10 +90,45 @@ only):
   present, so emission and cleanup cannot orphan or double-subtract totals
   across a remove/reinsert.
 - Each accumulator has exactly one periodic snapshot task and therefore one
-  delta emitter. This single-emitter ownership prevents same-generation
-  baseline publication from being reordered; request-path recorders remain
-  concurrent with that emitter and cleanup.
+  delta emitter. Before that emitter advances a baseline, it writes the exact
+  snapshot events to the required spool. It then enqueues the same event IDs as
+  a low-latency ClickHouse attempt; spool replay remains the durable path and
+  `ReplacingMergeTree` makes the duplicate-safe attempts idempotent. This
+  single-emitter ownership prevents same-generation baseline publication from
+  being reordered; request-path recorders remain concurrent with that emitter
+  and cleanup.
 - Unrelated keys never block each other on the request path.
+
+### Snapshot generation shutdown
+
+Every committed snapshot generation owns an explicit shutdown lifecycle. A
+successful config replacement and graceful shutdown in database, file,
+data-plane, and mesh modes stop admission to the old generation, wait for
+already-entered record hooks, and then await its snapshot task. The task
+computes the final delta and writes it directly to the required spool before
+the accumulator baseline advances or the generation is released. This direct
+handoff bypasses both the ClickHouse request path and the bounded in-memory
+logger queue, so an unavailable endpoint or queue pressure cannot wedge reload
+or shutdown.
+
+Shutdown wins a simultaneous timer selection. If a periodic tick has already
+durably spooled its events and advanced the baseline, the final handoff
+observes a zero delta; if shutdown wins first, the final spool write advances
+that same baseline. Thus one path, but never both, owns each pending delta.
+The periodic queue attempt may still be in flight during reload, but it uses
+the same event IDs as the durable spool rows, so aborting it cannot lose the
+delta and successful duplicate delivery cannot double-charge it. Repeated
+finalization is idempotent, and record hooks arriving after admission closes
+are ignored.
+
+Spool write failure leaves the generation unfinalized and retains its
+accumulator in the process-wide lifecycle registry. Every later multi-threaded
+reload retries all older retained generations concurrently with the generation
+being retired, and graceful shutdown retries the complete registry. Each retry
+is bounded. The failure is reported through the sink
+failure/spool-availability metrics and status. Because snapshot mode requires
+the spool, operators should treat an unwritable or exhausted spool as a
+billing-durability incident and restore it before terminating the process.
 
 Both modes use the same pricing fields as `api_chargeback`. At least one
 nonempty pricing dimension is mandatory and matches
@@ -383,6 +418,8 @@ Response contract:
 
 - `enabled` is `true` when at least one accepted instance is live.
 - `instance_count` is the number of published instances.
+- `snapshot_finalizations_pending` is the number of retired snapshot
+  generations retaining an unspooled terminal delta for bounded retry.
 - `totals` aggregates queue depth/capacity/high-water hits, spool files/bytes/
   drops/prepare failures, and export counters across every current accepted
   instance.
@@ -405,6 +442,7 @@ across the current accepted sink generation for every stable plugin-config ID:
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
+- `chargeback_sink_snapshot_finalizations_pending`
 - `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
