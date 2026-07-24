@@ -1445,8 +1445,7 @@ impl AiSemanticCache {
                     continue;
                 };
                 let cache_key = entry.key();
-                let point_peak =
-                    estimate_hnsw_point_peak_bytes(embedding, cache_key, scope_key);
+                let point_peak = estimate_hnsw_point_peak_bytes(embedding, cache_key, scope_key);
                 let next_peak = collected_peak.saturating_add(point_peak);
                 if next_peak > peak_estimate {
                     continue;
