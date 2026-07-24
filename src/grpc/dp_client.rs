@@ -42,9 +42,8 @@ use super::configsync_lifecycle::{
     CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics,
     DeltaRejectionKind, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
     MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
-    advance_multi_cp_backoff,
-    authoritative_snapshot_payload_matches, check_peer_version_compatibility,
-    connection_error_outcome, delta_rejection_stream_disposition,
+    advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
+    check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, full_snapshot_stream_disposition,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, reconcile_snapshot_version,
     record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
@@ -2055,8 +2054,8 @@ mod tests {
     //! `tests/integration/cp_dp_grpc_tests.rs` via
     //! `test_dp_filters_cross_namespace_resources_from_snapshot`.
     use super::*;
-    use crate::config::db_loader::NamespacedResourceId;
     use crate::config::EnvConfig;
+    use crate::config::db_loader::NamespacedResourceId;
     use crate::dns::{DnsCache, DnsConfig};
     use crate::proxy::ProxyState;
     use crate::util::backoff::jittered_backoff_with_entropy;
