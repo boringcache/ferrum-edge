@@ -2657,6 +2657,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_incremental_keys_proxies_by_namespace_and_id() {
+        let mut prod = make_proxy("shared");
+        prod.namespace = "prod".to_string();
+        let mut staging = make_proxy("shared");
+        staging.namespace = "staging".to_string();
+        let mut updated_staging = staging.clone();
+        updated_staging.backend_port = 9999;
+        let mut config = GatewayConfig {
+            proxies: vec![prod, staging],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.added_or_modified_proxies = vec![updated_staging];
+
+        apply_incremental_to_config(&mut config, inc);
+
+        assert_eq!(config.proxies.len(), 2);
+        assert_eq!(
+            config
+                .proxies
+                .iter()
+                .find(|proxy| proxy.namespace == "prod")
+                .expect("prod proxy must remain")
+                .backend_port,
+            8080
+        );
+        assert_eq!(
+            config
+                .proxies
+                .iter()
+                .find(|proxy| proxy.namespace == "staging")
+                .expect("staging proxy must be updated")
+                .backend_port,
+            9999
+        );
+    }
+
     // Regression: prior to this fix, CP mode used `tokio::select!` over the
     // admin/HTTPS/gRPC listener handles. The first listener to exit (panic
     // or otherwise) short-circuited the select and dropped the inner

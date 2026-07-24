@@ -1,7 +1,8 @@
 //! External unit tests for DP ConfigSync lifecycle policy helpers.
 //!
 //! Covers silent-partition/keepalive constants, multi-CP backoff continuity,
-//! FULL_SNAPSHOT fencing, connection-state staleness preservation, and
+//! FULL_SNAPSHOT fencing, monotonic watermarks, version/`loaded_at` reconcile,
+//! subscription base gating, connection-state staleness preservation, and
 //! namespace-qualified removal filtering surfaces exposed for deterministic
 //! verification without standing up a live CP.
 
@@ -10,10 +11,14 @@ use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::grpc::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
-    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, FullSnapshotStreamDisposition,
-    MultiCpBackoffState, StaleSnapshotReject, advance_multi_cp_backoff, backoff_max_secs,
+    CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, DeltaRefuse,
+    FullSnapshotStreamDisposition, MultiCpBackoffState, SnapshotFailureStreamDisposition,
+    StaleSnapshotReject, VersionReconcileError, advance_authority_from_committed,
+    advance_multi_cp_backoff, backoff_max_secs, evaluate_delta_against_subscription_base,
     evaluate_full_snapshot_authority, failure_backoff_sequence, full_snapshot_stream_disposition,
-    grow_backoff_after_failure_sleep, silence_exceeds_liveness,
+    grow_backoff_after_failure_sleep, monotonic_watermark, reconcile_snapshot_version,
+    resource_delta_advances_authority, silence_exceeds_liveness,
+    snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
 use ferrum_edge::grpc::dp_client::{DpCpConnectionState, configure_configsync_endpoint};
 use ferrum_edge::util::backoff::BACKOFF_INITIAL_SECS;
@@ -84,30 +89,77 @@ fn zero_message_clean_close_grows_backoff_like_error() {
 }
 
 #[test]
+fn reconcile_snapshot_version_requires_envelope_loaded_at_parity() {
+    let loaded_at = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    assert_eq!(
+        reconcile_snapshot_version(&loaded_at.to_rfc3339(), loaded_at).unwrap(),
+        loaded_at
+    );
+    assert!(matches!(
+        reconcile_snapshot_version("garbage", loaded_at),
+        Err(VersionReconcileError::UnparseableEnvelope)
+    ));
+    let other = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    assert!(matches!(
+        reconcile_snapshot_version(&other.to_rfc3339(), loaded_at),
+        Err(VersionReconcileError::Inconsistent { .. })
+    ));
+    assert!(matches!(
+        stale_reject_from_reconcile(VersionReconcileError::UnparseableEnvelope),
+        StaleSnapshotReject::UnparseableVersion
+    ));
+}
+
+#[test]
 fn full_snapshot_fencing_rejects_older_cross_source() {
     let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
     };
-    let older = "2026-06-01T12:00:00Z";
+    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
 
     let rejected =
         evaluate_full_snapshot_authority(Some(&authority), older, "http://cp-fallback:50051");
     assert!(matches!(rejected, Err(StaleSnapshotReject::OlderThanApplied { .. })));
 
+    // Same-source recovery remains accepted, but the watermark stays monotonic
+    // at the newest known ordering (does not drop to the older recovery body).
     let same_source =
         evaluate_full_snapshot_authority(Some(&authority), older, "http://cp-primary:50051")
             .expect("same-source recovery snapshots remain accepted");
-    assert_eq!(same_source, Some(Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()));
+    assert_eq!(same_source, applied);
 
-    let newer = evaluate_full_snapshot_authority(
+    let newer = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
+    let accepted = evaluate_full_snapshot_authority(
         Some(&authority),
-        "2026-08-01T12:00:00Z",
+        newer,
         "http://cp-fallback:50051",
     )
     .expect("newer failover snapshot is accepted");
-    assert_eq!(newer, Some(Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap()));
+    assert_eq!(accepted, newer);
+}
+
+#[test]
+fn same_source_recovery_watermark_is_monotonic() {
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-a:50051".to_string(),
+    };
+    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let newer = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
+
+    assert_eq!(
+        evaluate_full_snapshot_authority(Some(&authority), older, "http://cp-a:50051").unwrap(),
+        applied
+    );
+    assert_eq!(
+        evaluate_full_snapshot_authority(Some(&authority), newer, "http://cp-a:50051").unwrap(),
+        newer
+    );
+    assert_eq!(monotonic_watermark(Some(applied), older), applied);
+    assert_eq!(monotonic_watermark(None, older), older);
 }
 
 #[test]
@@ -125,7 +177,7 @@ fn fenced_full_snapshot_disposition_terminates_stream() {
 
     match full_snapshot_stream_disposition(
         Some(&authority),
-        "2026-06-01T12:00:00Z",
+        Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap(),
         "http://cp-fallback:50051",
     ) {
         FullSnapshotStreamDisposition::RefuseAndTerminate(StaleSnapshotReject::OlderThanApplied {
@@ -137,13 +189,6 @@ fn fenced_full_snapshot_disposition_terminates_stream() {
         }
         other => panic!("older cross-source snapshot must terminate the stream, got {other:?}"),
     }
-
-    // An unorderable (unparseable) cross-source version against a known authority
-    // also fails closed by terminating the stream rather than skipping.
-    assert!(matches!(
-        full_snapshot_stream_disposition(Some(&authority), "garbage", "http://cp-fallback:50051"),
-        FullSnapshotStreamDisposition::RefuseAndTerminate(StaleSnapshotReject::UnparseableVersion)
-    ));
 }
 
 #[test]
@@ -158,34 +203,93 @@ fn accepted_full_snapshot_disposition_applies_and_adopts_version() {
     assert_eq!(
         full_snapshot_stream_disposition(
             Some(&authority),
-            "2026-08-01T12:00:00Z",
+            Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
             "http://cp-fallback:50051",
         ),
         FullSnapshotStreamDisposition::Apply {
-            version: Some(Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap()),
+            version: Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
         }
     );
 
-    // A same-source recovery snapshot always applies, even when older, so a
-    // primary reconnect/resend is never fenced against its own authority.
+    // A same-source recovery snapshot always applies, even when older, but the
+    // watermark remains at the prior high-water mark.
     assert_eq!(
         full_snapshot_stream_disposition(
             Some(&authority),
-            "2026-06-01T12:00:00Z",
+            Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap(),
             "http://cp-primary:50051",
         ),
-        FullSnapshotStreamDisposition::Apply {
-            version: Some(Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()),
-        }
+        FullSnapshotStreamDisposition::Apply { version: applied }
     );
 
     // The first snapshot (no applied authority yet) applies and adopts its
-    // parsed version.
+    // committed stamp.
+    let first = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
     assert_eq!(
-        full_snapshot_stream_disposition(None, "2026-07-20T00:00:00Z", "http://cp-a:50051"),
-        FullSnapshotStreamDisposition::Apply {
-            version: Some(Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap()),
-        }
+        full_snapshot_stream_disposition(None, first, "http://cp-a:50051"),
+        FullSnapshotStreamDisposition::Apply { version: first }
+    );
+}
+
+#[test]
+fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
+    let t0 = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let t1 = Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap();
+    let mut authority = Some(AppliedSnapshotAuthority {
+        version: Some(t0),
+        source_cp_url: "http://cp-a:50051".to_string(),
+    });
+
+    assert!(resource_delta_advances_authority(true, false));
+    assert!(!resource_delta_advances_authority(true, true));
+    assert!(!resource_delta_advances_authority(false, false));
+
+    advance_authority_from_committed(&mut authority, "http://cp-a:50051", t1);
+    assert_eq!(authority.as_ref().unwrap().version, Some(t1));
+
+    // A later older stamp must not lower the watermark.
+    advance_authority_from_committed(&mut authority, "http://cp-a:50051", t0);
+    assert_eq!(authority.as_ref().unwrap().version, Some(t1));
+}
+
+#[test]
+fn delta_after_resource_advances_fences_older_cross_source_snapshot() {
+    // Blocker 1: accepted resource deltas move the active config ahead; the
+    // watermark must follow so a later cross-source snapshot between those
+    // versions is refused rather than rolling config back.
+    let snapshot = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let after_delta = Utc.with_ymd_and_hms(2026, 7, 1, 14, 0, 0).unwrap();
+    let stale_failover = Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap();
+
+    let mut authority = None;
+    advance_authority_from_committed(&mut authority, "http://cp-primary:50051", snapshot);
+    advance_authority_from_committed(&mut authority, "http://cp-primary:50051", after_delta);
+
+    assert!(matches!(
+        evaluate_full_snapshot_authority(
+            authority.as_ref(),
+            stale_failover,
+            "http://cp-fallback:50051",
+        ),
+        Err(StaleSnapshotReject::OlderThanApplied { .. })
+    ));
+}
+
+#[test]
+fn subscription_requires_valid_snapshot_base_before_delta() {
+    assert_eq!(
+        evaluate_delta_against_subscription_base(false),
+        Err(DeltaRefuse::BeforeSnapshotBase)
+    );
+    assert!(evaluate_delta_against_subscription_base(true).is_ok());
+
+    assert_eq!(
+        snapshot_failure_stream_disposition(false),
+        SnapshotFailureStreamDisposition::TerminateAndFailover
+    );
+    assert_eq!(
+        snapshot_failure_stream_disposition(true),
+        SnapshotFailureStreamDisposition::ContinueKeepingBase
     );
 }
 
@@ -204,6 +308,23 @@ fn stale_snapshot_fenced_outcome_fails_over_without_resetting_backoff() {
     assert_eq!(state.backoff_secs, 8, "fencing must not reset backoff");
     grow_backoff_after_failure_sleep(&mut state);
     assert_eq!(state.backoff_secs, 16, "backoff must keep growing after a fence");
+}
+
+#[test]
+fn invalid_subscription_base_outcome_fails_over_with_backoff() {
+    let mut state = MultiCpBackoffState {
+        backoff_secs: 4,
+        ..MultiCpBackoffState::new()
+    };
+    assert!(advance_multi_cp_backoff(
+        &mut state,
+        2,
+        ConfigSyncAttemptOutcome::InvalidSubscriptionBase
+    ));
+    assert_eq!(state.current_cp_index, 1);
+    assert_eq!(state.backoff_secs, 4);
+    grow_backoff_after_failure_sleep(&mut state);
+    assert_eq!(state.backoff_secs, 8);
 }
 
 #[test]
@@ -229,56 +350,21 @@ fn repeated_fencing_reaches_backoff_cap_and_cycles_cps() {
 }
 
 #[test]
-fn unparseable_first_version_never_fences_later_valid_failover() {
-    // The first applied snapshot carried a non-RFC3339 version: the authority
-    // is recorded with NO fabricated timestamp, so a genuinely newer failover
-    // snapshot from another CP is still accepted rather than fenced forever.
-    let first = evaluate_full_snapshot_authority(None, "not-a-timestamp", "http://cp-a:50051")
-        .expect("first snapshot with an unparseable version is accepted");
-    assert!(
-        first.is_none(),
-        "an unparseable version must not fabricate an authority timestamp"
-    );
-
+fn unknown_prior_authority_still_accepts_cross_source() {
+    // An authority recorded without a comparable timestamp cannot fence; a
+    // real failover snapshot is accepted and its committed stamp adopted.
     let authority = AppliedSnapshotAuthority {
-        version: first,
+        version: None,
         source_cp_url: "http://cp-a:50051".to_string(),
     };
-    let newer = evaluate_full_snapshot_authority(
+    let newer = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
+    let accepted = evaluate_full_snapshot_authority(
         Some(&authority),
-        "2026-07-20T00:00:00Z",
+        newer,
         "http://cp-b:50051",
     )
     .expect("a real failover snapshot must not be fenced by an unknown authority");
-    assert_eq!(newer, Some(Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap()));
-}
-
-#[test]
-fn unparseable_cross_source_against_known_authority_fails_closed() {
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let authority = AppliedSnapshotAuthority {
-        version: Some(applied),
-        source_cp_url: "http://cp-a:50051".to_string(),
-    };
-    // A known-good authority vs. an unparseable failover version cannot be
-    // ordered, so we fail closed instead of inventing a timestamp.
-    let rejected =
-        evaluate_full_snapshot_authority(Some(&authority), "garbage", "http://cp-b:50051");
-    assert!(matches!(rejected, Err(StaleSnapshotReject::UnparseableVersion)));
-}
-
-#[test]
-fn unparseable_same_source_preserves_prior_authority() {
-    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
-    let authority = AppliedSnapshotAuthority {
-        version: Some(applied),
-        source_cp_url: "http://cp-a:50051".to_string(),
-    };
-    // A same-source resend with an unparseable version keeps the prior ordering
-    // so later cross-source fencing still has an authority to compare against.
-    let kept = evaluate_full_snapshot_authority(Some(&authority), "garbage", "http://cp-a:50051")
-        .expect("same-source snapshots are always accepted");
-    assert_eq!(kept, Some(applied));
+    assert_eq!(accepted, newer);
 }
 
 #[test]

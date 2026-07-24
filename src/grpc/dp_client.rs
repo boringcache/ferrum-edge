@@ -39,8 +39,11 @@ use super::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
     CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, FullSnapshotStreamDisposition,
-    MultiCpBackoffState, advance_multi_cp_backoff, full_snapshot_stream_disposition,
-    grow_backoff_after_failure_sleep,
+    MultiCpBackoffState, SnapshotFailureStreamDisposition, advance_authority_from_committed,
+    advance_multi_cp_backoff, evaluate_delta_against_subscription_base,
+    full_snapshot_stream_disposition, grow_backoff_after_failure_sleep,
+    reconcile_snapshot_version, resource_delta_advances_authority,
+    snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
@@ -528,6 +531,20 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                 update_state_disconnected(&connection_state, cp_url, is_primary);
                 ConfigSyncAttemptOutcome::StaleSnapshotFenced
             }
+            Ok(DpStreamEnd::InvalidSubscriptionBase) => {
+                // No valid FULL_SNAPSHOT base was established (or a pre-snapshot
+                // DELTA arrived first). Fail over with accumulating backoff so a
+                // later delta cannot apply against an unrelated old base.
+                warn!(
+                    "ConfigSync subscription from CP [{}/{}] ({}) failed to establish a valid \
+                     FULL_SNAPSHOT base; failing over without applying",
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                    cp_url
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::InvalidSubscriptionBase
+            }
             Err(e) => {
                 error!(
                     "CP [{}/{}] connection error ({}): {}",
@@ -551,6 +568,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             ConfigSyncAttemptOutcome::ConnectionError
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 | ConfigSyncAttemptOutcome::StaleSnapshotFenced
+                | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
         ) && backoff.current_cp_index == 0
             && backoff.full_cycle_count > 0
             && cp_count > 1
@@ -617,6 +635,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             ConfigSyncAttemptOutcome::ConnectionError
                 | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 | ConfigSyncAttemptOutcome::StaleSnapshotFenced
+                | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
         ) {
             grow_backoff_after_failure_sleep(&mut backoff);
         }
@@ -639,6 +658,10 @@ enum DpStreamEnd {
     /// the newer active config. The outer loop treats this as a
     /// failover-with-backoff failure — never as delivered config (issue #2970).
     StaleSnapshotFenced,
+    /// This subscription never committed a valid FULL_SNAPSHOT base (invalid /
+    /// unparseable / rejected initial snapshot, inconsistent version/`loaded_at`,
+    /// or a pre-snapshot DELTA). Fail over with accumulating backoff.
+    InvalidSubscriptionBase,
 }
 
 async fn wait_for_readiness_then_primary_retry(
@@ -961,7 +984,7 @@ pub async fn connect_and_subscribe(
     {
         DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
         DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
-        DpStreamEnd::StaleSnapshotFenced => Ok(()),
+        DpStreamEnd::StaleSnapshotFenced | DpStreamEnd::InvalidSubscriptionBase => Ok(()),
     }
 }
 
@@ -1009,7 +1032,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
     {
         DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
         DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
-        DpStreamEnd::StaleSnapshotFenced => Ok(()),
+        DpStreamEnd::StaleSnapshotFenced | DpStreamEnd::InvalidSubscriptionBase => Ok(()),
     }
 }
 
@@ -1209,22 +1232,205 @@ async fn connect_and_subscribe_with_startup_ready_inner(
 
         match update.update_type {
             0 => {
-                // FULL_SNAPSHOT — replace the entire config, subject to
-                // cross-CP failover fencing on the snapshot version so a stale
-                // fallback CP cache cannot silently roll config back.
-                //
-                // A fenced snapshot must TERMINATE this stream, not `continue`:
-                // continuing would leave us reading from the same stale fallback
-                // CP, whose next DELTA (removals and trust-only updates included)
-                // would apply against the newer active config — the persistent
-                // stale-base-delta failure of issue #2970. Returning here hands
-                // the outer loop a failover-with-backoff outcome and structurally
-                // guarantees no later message from this refused stream is read.
-                // We do not mark the snapshot received, do not touch
-                // `last_config_received_at`, and do not update snapshot authority.
-                let incoming_version = match full_snapshot_stream_disposition(
+                // FULL_SNAPSHOT — parse and validate the body first so freshness
+                // describes the committed GatewayConfig (`loaded_at`), not an
+                // inconsistent envelope string. Cross-CP fencing then runs on
+                // the reconciled committed stamp. A fenced or inconsistent
+                // snapshot must TERMINATE this stream (issue #2970). An invalid
+                // initial snapshot must also terminate so a later DELTA cannot
+                // apply against an unrelated old base.
+                let mut config = match serde_json::from_str::<GatewayConfig>(&update.config_json) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        error!("Failed to parse full config update: {}", e);
+                        if let Some(end) =
+                            react_to_unusable_snapshot(initial_snapshot_applied)
+                        {
+                            return Ok(end);
+                        }
+                        continue;
+                    }
+                };
+                let gateway_trust_bundle_update =
+                    match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
+                        Ok(update) => update,
+                        Err(msg) => {
+                            error!("CP config rejected — {}", msg);
+                            error!("Ignoring config update with invalid gateway trust bundles");
+                            if let Some(end) =
+                                react_to_unusable_snapshot(initial_snapshot_applied)
+                            {
+                                return Ok(end);
+                            }
+                            continue;
+                        }
+                    };
+                // Gateway trust material is delivered via the ConfigUpdate
+                // side-channel. Do not retain any legacy/config-file copy in
+                // the DP's regular GatewayConfig snapshot.
+                config.trust_bundles = None;
+                // Defense in depth: even though the CP-side
+                // namespace check should prevent any
+                // cross-namespace resources from reaching this
+                // DP, filter again locally so a CP regression or
+                // buggy/malicious snapshot can't leak resources
+                // from another tenant into this DP's
+                // GatewayConfig. See `filter_config_to_namespace`.
+                let filtered = filter_config_to_namespace(&mut config, namespace);
+                if filtered > 0 {
+                    warn!(
+                        "DP namespace filter '{}' excluded {} cross-namespace resources from CP snapshot — \
+                         the CP should have filtered these (verify CP namespace matches DP)",
+                        namespace, filtered
+                    );
+                }
+                if frontend_tls_slot.is_none() && clear_frontend_tls_material(&mut config) {
+                    warn!(
+                        "Ignoring CP-delivered frontend TLS material because this DP has no HTTPS listener"
+                    );
+                }
+                config.normalize_fields();
+                config.resolve_upstream_tls();
+                if let Err(errors) = config.validate_all_fields_with_ip_policy(
+                    proxy_state.env_config.tls_cert_expiry_warning_days,
+                    &proxy_state.env_config.backend_allow_ips,
+                ) {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid field values");
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                if let Err(errors) = config.validate_hosts() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid hosts");
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                if let Err(errors) = config.validate_regex_listen_paths() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid regex listen_paths");
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                if let Err(errors) = config.validate_listen_path_encodings() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with encoded-slash listen_paths");
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                if let Err(errors) = config.validate_unique_listen_paths() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with conflicting listen paths");
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                if let Err(errors) = config.validate_stream_proxies() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid stream proxy config");
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                if let Err(errors) = config.validate_upstream_references() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid upstream references");
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                if let Err(errors) = config.validate_plugin_references() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid plugin references");
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                if let Err(errors) =
+                    crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
+                {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!(
+                        "Ignoring config update with invalid mesh_route_dispatch upstream references"
+                    );
+                    if let Some(end) = react_to_unusable_snapshot(initial_snapshot_applied) {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                let frontend_tls_update = match stage_frontend_tls_snapshot(
+                    &config,
+                    proxy_state,
+                    frontend_tls_slot,
+                    frontend_tls_runtime,
+                    cp_frontend_tls_materialized.as_ref(),
+                    frontend_tls_restore_slot.as_ref(),
+                ) {
+                    Ok(update) => update,
+                    Err(error) => {
+                        error!("CP config rejected — {}", error);
+                        error!("Ignoring config update with unusable frontend TLS material");
+                        if let Some(end) =
+                            react_to_unusable_snapshot(initial_snapshot_applied)
+                        {
+                            return Ok(end);
+                        }
+                        continue;
+                    }
+                };
+
+                // Freshness describes the committed body: envelope version must
+                // agree with GatewayConfig.loaded_at. Fail closed otherwise —
+                // never fabricate a timestamp.
+                let committed = match reconcile_snapshot_version(&update.version, config.loaded_at)
+                {
+                    Ok(committed) => committed,
+                    Err(err) => {
+                        let reason = stale_reject_from_reconcile(err);
+                        warn!(
+                            ?reason,
+                            cp_url,
+                            version = %update.version,
+                            loaded_at = %config.loaded_at,
+                            "Refusing FULL_SNAPSHOT with inconsistent or unorderable version \
+                             and terminating this ConfigSync stream"
+                        );
+                        return Ok(DpStreamEnd::StaleSnapshotFenced);
+                    }
+                };
+                let watermark = match full_snapshot_stream_disposition(
                     snapshot_authority.as_ref(),
-                    &update.version,
+                    committed,
                     cp_url,
                 ) {
                     FullSnapshotStreamDisposition::Apply { version } => version,
@@ -1240,204 +1446,94 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         return Ok(DpStreamEnd::StaleSnapshotFenced);
                     }
                 };
-                match serde_json::from_str::<GatewayConfig>(&update.config_json) {
-                    Ok(mut config) => {
-                        let gateway_trust_bundle_update =
-                            match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
-                                Ok(update) => update,
-                                Err(msg) => {
-                                    error!("CP config rejected — {}", msg);
-                                    error!(
-                                        "Ignoring config update with invalid gateway trust bundles"
-                                    );
-                                    continue;
-                                }
-                            };
-                        // Gateway trust material is delivered via the ConfigUpdate
-                        // side-channel. Do not retain any legacy/config-file copy in
-                        // the DP's regular GatewayConfig snapshot.
-                        config.trust_bundles = None;
-                        // Defense in depth: even though the CP-side
-                        // namespace check should prevent any
-                        // cross-namespace resources from reaching this
-                        // DP, filter again locally so a CP regression or
-                        // buggy/malicious snapshot can't leak resources
-                        // from another tenant into this DP's
-                        // GatewayConfig. See `filter_config_to_namespace`.
-                        let filtered = filter_config_to_namespace(&mut config, namespace);
-                        if filtered > 0 {
-                            warn!(
-                                "DP namespace filter '{}' excluded {} cross-namespace resources from CP snapshot — \
-                                 the CP should have filtered these (verify CP namespace matches DP)",
-                                namespace, filtered
-                            );
-                        }
-                        if frontend_tls_slot.is_none() && clear_frontend_tls_material(&mut config) {
-                            warn!(
-                                "Ignoring CP-delivered frontend TLS material because this DP has no HTTPS listener"
-                            );
-                        }
-                        config.normalize_fields();
-                        config.resolve_upstream_tls();
-                        if let Err(errors) = config.validate_all_fields_with_ip_policy(
-                            proxy_state.env_config.tls_cert_expiry_warning_days,
-                            &proxy_state.env_config.backend_allow_ips,
-                        ) {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid field values");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_hosts() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid hosts");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_regex_listen_paths() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid regex listen_paths");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_listen_path_encodings() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with encoded-slash listen_paths");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_unique_listen_paths() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with conflicting listen paths");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_stream_proxies() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid stream proxy config");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_upstream_references() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid upstream references");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_plugin_references() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid plugin references");
-                            continue;
-                        }
-                        if let Err(errors) =
-                            crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
-                        {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!(
-                                "Ignoring config update with invalid mesh_route_dispatch upstream references"
-                            );
-                            continue;
-                        }
-                        let frontend_tls_update = match stage_frontend_tls_snapshot(
-                            &config,
+
+                // Await apply to completion before returning to the
+                // select! above so primary-retry / TLS / shutdown arms
+                // cannot cancel a detached spawn_blocking mid-apply.
+                match proxy_state.update_config_off_thread(config).await {
+                    ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
+                        commit_frontend_tls_snapshot(
+                            frontend_tls_update,
                             proxy_state,
                             frontend_tls_slot,
                             frontend_tls_runtime,
                             cp_frontend_tls_materialized.as_ref(),
-                            frontend_tls_restore_slot.as_ref(),
-                        ) {
-                            Ok(update) => update,
-                            Err(error) => {
-                                error!("CP config rejected — {}", error);
-                                error!(
-                                    "Ignoring config update with unusable frontend TLS material"
-                                );
-                                continue;
-                            }
-                        };
-                        // Await apply to completion before returning to the
-                        // select! above so primary-retry / TLS / shutdown arms
-                        // cannot cancel a detached spawn_blocking mid-apply.
-                        match proxy_state.update_config_off_thread(config).await {
-                            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
-                                commit_frontend_tls_snapshot(
-                                    frontend_tls_update,
-                                    proxy_state,
-                                    frontend_tls_slot,
-                                    frontend_tls_runtime,
-                                    cp_frontend_tls_materialized.as_ref(),
-                                )
-                                .await;
-                                apply_gateway_trust_bundle_update(
-                                    proxy_state,
-                                    gateway_trust_bundle_update,
-                                );
-                                update_state_config_received(connection_state);
-                                received_config = true;
-                                *snapshot_authority = Some(AppliedSnapshotAuthority {
-                                    version: incoming_version,
-                                    source_cp_url: cp_url.to_string(),
-                                });
-                                if !initial_snapshot_applied {
-                                    // Bind failures are non-fatal in DP mode —
-                                    // do not tear down a healthy ConfigSync
-                                    // stream or misclassify this as a CP error.
-                                    if let Err(error) = proxy_state
-                                        .stream_listener_manager
-                                        .wait_until_started(Duration::from_secs(10))
-                                        .await
-                                    {
-                                        warn!(
-                                            error = %error,
-                                            "Stream listener startup wait timed out after CP snapshot; continuing (bind failures are non-fatal in DP mode)"
-                                        );
-                                    }
-                                    // Block DP readiness on the first capability
-                                    // classification. Without this the `/health`
-                                    // endpoint would flip to ready while the
-                                    // registry is still empty, so an L4 LB could
-                                    // route traffic to an H3-only HTTPS backend
-                                    // and the cross-protocol bridge would 502
-                                    // until the background refresh landed.
-                                    // Subsequent CP snapshots don't take this
-                                    // path — `update_config` already spawns a
-                                    // coalesced background refresh for them.
-                                    proxy_state.refresh_backend_capabilities().await;
-                                    if let Some(ref startup_ready) = startup_ready {
-                                        startup_ready.store(true, Ordering::Release);
-                                    }
-                                    initial_snapshot_applied = true;
-                                    info!(
-                                        "DP startup complete; backend capabilities classified; /health now reports ready"
-                                    );
-                                }
-                                info!("Full configuration snapshot accepted from CP");
-                            }
-                            ConfigApplyOutcome::Rejected { .. } => {
-                                error!(
-                                    "Full configuration snapshot rejected during apply; keeping previous config"
+                        )
+                        .await;
+                        apply_gateway_trust_bundle_update(
+                            proxy_state,
+                            gateway_trust_bundle_update,
+                        );
+                        update_state_config_received(connection_state);
+                        received_config = true;
+                        // Watermark is the monotonic value from fencing policy
+                        // (max of prior authority and committed loaded_at).
+                        *snapshot_authority = Some(AppliedSnapshotAuthority {
+                            version: Some(watermark),
+                            source_cp_url: cp_url.to_string(),
+                        });
+                        if !initial_snapshot_applied {
+                            // Bind failures are non-fatal in DP mode —
+                            // do not tear down a healthy ConfigSync
+                            // stream or misclassify this as a CP error.
+                            if let Err(error) = proxy_state
+                                .stream_listener_manager
+                                .wait_until_started(Duration::from_secs(10))
+                                .await
+                            {
+                                warn!(
+                                    error = %error,
+                                    "Stream listener startup wait timed out after CP snapshot; continuing (bind failures are non-fatal in DP mode)"
                                 );
                             }
+                            // Block DP readiness on the first capability
+                            // classification. Without this the `/health`
+                            // endpoint would flip to ready while the
+                            // registry is still empty, so an L4 LB could
+                            // route traffic to an H3-only HTTPS backend
+                            // and the cross-protocol bridge would 502
+                            // until the background refresh landed.
+                            // Subsequent CP snapshots don't take this
+                            // path — `update_config` already spawns a
+                            // coalesced background refresh for them.
+                            proxy_state.refresh_backend_capabilities().await;
+                            if let Some(ref startup_ready) = startup_ready {
+                                startup_ready.store(true, Ordering::Release);
+                            }
+                            initial_snapshot_applied = true;
+                            info!(
+                                "DP startup complete; backend capabilities classified; /health now reports ready"
+                            );
                         }
+                        info!("Full configuration snapshot accepted from CP");
                     }
-                    Err(e) => {
-                        error!("Failed to parse full config update: {}", e);
+                    ConfigApplyOutcome::Rejected { .. } => {
+                        error!(
+                            "Full configuration snapshot rejected during apply; keeping previous config"
+                        );
+                        if let Some(end) =
+                            react_to_unusable_snapshot(initial_snapshot_applied)
+                        {
+                            return Ok(end);
+                        }
                     }
                 }
             }
             1 => {
-                // DELTA — apply incremental changes only
+                // DELTA — require a valid FULL_SNAPSHOT base on this subscription
+                // first. A buggy/adversarial CP that sends DELTA first must not
+                // apply against an unrelated old base.
+                if let Err(reason) =
+                    evaluate_delta_against_subscription_base(initial_snapshot_applied)
+                {
+                    warn!(
+                        ?reason,
+                        cp_url,
+                        "Refusing DELTA before a valid FULL_SNAPSHOT base on this \
+                         subscription; terminating stream without applying"
+                    );
+                    return Ok(DpStreamEnd::InvalidSubscriptionBase);
+                }
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
                     Ok(mut result) => {
                         let gateway_trust_bundle_update =
@@ -1465,6 +1561,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         // but a custom CP or test could still emit one. Treat as
                         // benign so we don't trip the divergence log below.
                         let was_empty = result.is_empty();
+                        let poll_timestamp = result.poll_timestamp;
 
                         // Capture summary BEFORE moving `result` into apply_incremental
                         // so the rejection log can identify the divergent CP push.
@@ -1503,6 +1600,17 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 );
                                 update_state_config_received(connection_state);
                                 received_config = true;
+                                // Advance freshness from the committed delta
+                                // timestamp so a later cross-source snapshot
+                                // cannot roll back past accepted deltas.
+                                if resource_delta_advances_authority(true, was_empty) {
+                                    let committed = proxy_state.config.load().loaded_at;
+                                    advance_authority_from_committed(
+                                        snapshot_authority,
+                                        cp_url,
+                                        committed,
+                                    );
+                                }
                                 info!("Incremental config delta applied from CP");
                             }
                             ConfigApplyOutcome::Unchanged => {
@@ -1515,6 +1623,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     // config delivery even though the gateway object
                                     // is unchanged — keep `received_config` in step
                                     // with the connection-state timestamp.
+                                    // Do NOT advance snapshot authority: trust-only
+                                    // side-channels are not resource-config freshness.
                                     received_config = true;
                                     info!("Gateway trust bundle update applied from CP");
                                     continue;
@@ -1522,6 +1632,16 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 if !was_empty {
                                     update_state_config_received(connection_state);
                                     received_config = true;
+                                    // Valid unchanged resource candidate still
+                                    // advances freshness (poll_timestamp) so the
+                                    // watermark tracks accepted resource deltas.
+                                    if resource_delta_advances_authority(true, was_empty) {
+                                        advance_authority_from_committed(
+                                            snapshot_authority,
+                                            cp_url,
+                                            poll_timestamp,
+                                        );
+                                    }
                                     debug!(
                                         "Incremental config delta from CP was valid but unchanged"
                                     );
@@ -1530,12 +1650,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 // Empty delta — preserve original behavior of not
                                 // touching `last_config_received_at` so cluster
                                 // observability still reflects only deltas that
-                                // carried real changes.
-                                if was_empty {
-                                    tracing::debug!(
-                                        "Ignoring empty delta from CP (no resource changes)"
-                                    );
-                                }
+                                // carried real changes. Do not advance authority.
+                                tracing::debug!(
+                                    "Ignoring empty delta from CP (no resource changes)"
+                                );
                             }
                             ConfigApplyOutcome::Rejected { errors } => {
                                 if apply_gateway_trust_bundle_update(
@@ -1548,6 +1666,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         "Gateway trust bundle update applied from CP despite rejected resource delta"
                                     );
                                 }
+                                // Rejected resource deltas must not advance
+                                // freshness authority.
                                 if was_empty {
                                     tracing::debug!(
                                         "Ignoring rejected empty delta from CP (no resource changes)"
@@ -1584,6 +1704,17 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 warn!("Unknown config update type {}, ignoring", other);
             }
         }
+    }
+}
+
+/// Terminate the subscription when the first FULL_SNAPSHOT is unusable; after a
+/// valid base exists, keep serving it and continue the stream.
+fn react_to_unusable_snapshot(subscription_base_applied: bool) -> Option<DpStreamEnd> {
+    match snapshot_failure_stream_disposition(subscription_base_applied) {
+        SnapshotFailureStreamDisposition::TerminateAndFailover => {
+            Some(DpStreamEnd::InvalidSubscriptionBase)
+        }
+        SnapshotFailureStreamDisposition::ContinueKeepingBase => None,
     }
 }
 

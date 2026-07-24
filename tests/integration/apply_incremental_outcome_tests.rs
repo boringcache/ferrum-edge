@@ -2204,6 +2204,137 @@ async fn apply_incremental_consumer_keys_include_namespace() {
     }));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_proxy_upsert_keys_include_namespace() {
+    let mut prod = test_proxy("shared", "/prod");
+    prod.namespace = "prod".to_string();
+    let mut staging = test_proxy("shared", "/staging");
+    staging.namespace = "staging".to_string();
+    let state = proxy_state_with_config(GatewayConfig {
+        proxies: vec![prod, staging],
+        ..GatewayConfig::default()
+    });
+
+    let mut updated_staging = test_proxy("shared", "/staging-updated");
+    updated_staging.namespace = "staging".to_string();
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![updated_staging],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 1,
+        poll_timestamp: Utc::now(),
+    };
+
+    assert_eq!(
+        state.apply_incremental(delta).await,
+        ConfigApplyOutcome::Applied
+    );
+    let config = state.config.load();
+    assert_eq!(config.proxies.len(), 2);
+    assert!(config.proxies.iter().any(|p| {
+        p.namespace == "prod" && p.id == "shared" && p.listen_path.as_deref() == Some("/prod")
+    }));
+    assert!(config.proxies.iter().any(|p| {
+        p.namespace == "staging"
+            && p.id == "shared"
+            && p.listen_path.as_deref() == Some("/staging-updated")
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_plugin_config_upsert_keys_include_namespace() {
+    let mut prod = test_plugin_config("shared-pc", true);
+    prod.namespace = "prod".to_string();
+    let mut staging = test_plugin_config("shared-pc", true);
+    staging.namespace = "staging".to_string();
+    let state = proxy_state_with_config(GatewayConfig {
+        plugin_configs: vec![prod, staging],
+        ..GatewayConfig::default()
+    });
+
+    let mut updated_staging = test_plugin_config("shared-pc", false);
+    updated_staging.namespace = "staging".to_string();
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![updated_staging],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 1,
+        poll_timestamp: Utc::now(),
+    };
+
+    assert_eq!(
+        state.apply_incremental(delta).await,
+        ConfigApplyOutcome::Applied
+    );
+    let config = state.config.load();
+    assert_eq!(config.plugin_configs.len(), 2);
+    assert!(
+        config
+            .plugin_configs
+            .iter()
+            .any(|pc| pc.namespace == "prod" && pc.id == "shared-pc" && pc.enabled)
+    );
+    assert!(config.plugin_configs.iter().any(|pc| {
+        pc.namespace == "staging" && pc.id == "shared-pc" && !pc.enabled
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_upstream_upsert_keys_include_namespace() {
+    let mut prod = test_upstream("shared-u", "prod.example.test", 8080);
+    prod.namespace = "prod".to_string();
+    let mut staging = test_upstream("shared-u", "staging.example.test", 8080);
+    staging.namespace = "staging".to_string();
+    let state = proxy_state_with_config(GatewayConfig {
+        upstreams: vec![prod, staging],
+        ..GatewayConfig::default()
+    });
+
+    let mut updated_staging = test_upstream("shared-u", "staging-updated.example.test", 9090);
+    updated_staging.namespace = "staging".to_string();
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![updated_staging],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 1,
+        poll_timestamp: Utc::now(),
+    };
+
+    assert_eq!(
+        state.apply_incremental(delta).await,
+        ConfigApplyOutcome::Applied
+    );
+    let config = state.config.load();
+    assert_eq!(config.upstreams.len(), 2);
+    assert!(config.upstreams.iter().any(|u| {
+        u.namespace == "prod"
+            && u.id == "shared-u"
+            && u.targets[0].host == "prod.example.test"
+            && u.targets[0].port == 8080
+    }));
+    assert!(config.upstreams.iter().any(|u| {
+        u.namespace == "staging"
+            && u.id == "shared-u"
+            && u.targets[0].host == "staging-updated.example.test"
+            && u.targets[0].port == 9090
+    }));
+}
+
 /// Two proxies sharing a non-regex `listen_path` violate
 /// `validate_unique_listen_paths` and the patch is rejected. The returned
 /// outcome must be `Rejected` so the polling loop can leave `last_poll_at`

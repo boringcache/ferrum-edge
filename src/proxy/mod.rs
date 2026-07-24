@@ -8369,17 +8369,18 @@ impl ProxyState {
         // instead of O(n) linear scan per resource. Move values to avoid cloning.
 
         if !result.added_or_modified_proxies.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .proxies
                 .iter()
                 .enumerate()
-                .map(|(i, p)| (p.id.clone(), i))
+                .map(|(i, p)| ((p.namespace.clone(), p.id.clone()), i))
                 .collect();
             for proxy in result.added_or_modified_proxies {
-                if let Some(&pos) = idx.get(&proxy.id) {
+                let key = (proxy.namespace.clone(), proxy.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.proxies[pos] = proxy;
                 } else {
-                    idx.insert(proxy.id.clone(), new_config.proxies.len());
+                    idx.insert(key, new_config.proxies.len());
                     new_config.proxies.push(proxy);
                 }
             }
@@ -8404,34 +8405,36 @@ impl ProxyState {
         }
 
         if !result.added_or_modified_plugin_configs.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .plugin_configs
                 .iter()
                 .enumerate()
-                .map(|(i, pc)| (pc.id.clone(), i))
+                .map(|(i, pc)| ((pc.namespace.clone(), pc.id.clone()), i))
                 .collect();
             for pc in result.added_or_modified_plugin_configs {
-                if let Some(&pos) = idx.get(&pc.id) {
+                let key = (pc.namespace.clone(), pc.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.plugin_configs[pos] = pc;
                 } else {
-                    idx.insert(pc.id.clone(), new_config.plugin_configs.len());
+                    idx.insert(key, new_config.plugin_configs.len());
                     new_config.plugin_configs.push(pc);
                 }
             }
         }
 
         if !result.added_or_modified_upstreams.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .upstreams
                 .iter()
                 .enumerate()
-                .map(|(i, u)| (u.id.clone(), i))
+                .map(|(i, u)| ((u.namespace.clone(), u.id.clone()), i))
                 .collect();
             for upstream in result.added_or_modified_upstreams {
-                if let Some(&pos) = idx.get(&upstream.id) {
+                let key = (upstream.namespace.clone(), upstream.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.upstreams[pos] = upstream;
                 } else {
-                    idx.insert(upstream.id.clone(), new_config.upstreams.len());
+                    idx.insert(key, new_config.upstreams.len());
                     new_config.upstreams.push(upstream);
                 }
             }

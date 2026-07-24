@@ -1,8 +1,9 @@
 //! Pure helpers for DP ConfigSync stream lifecycle policy.
 //!
 //! Kept free of gRPC/runtime I/O so unit tests can exercise silent-partition
-//! thresholds, multi-CP backoff continuity, FULL_SNAPSHOT fencing, and
-//! connection-state staleness preservation without standing up a CP.
+//! thresholds, multi-CP backoff continuity, FULL_SNAPSHOT fencing, freshness
+//! watermark monotonicity, subscription base gating, and connection-state
+//! staleness preservation without standing up a CP.
 
 use chrono::{DateTime, Utc};
 
@@ -21,125 +22,247 @@ pub const CONFIGSYNC_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// are not treated as dead.
 pub const CONFIGSYNC_MAX_SILENCE_SECS: u64 = 150;
 
-/// Authoritative FULL_SNAPSHOT already applied by this DP.
+/// Authoritative freshness watermark already established by this DP.
 ///
-/// `version` is `None` when the applied snapshot carried a non-RFC3339 version
-/// string: we still record the source, but we deliberately do not invent a
-/// timestamp, because a fabricated "now" would fence out every later — and
-/// genuinely newer — failover snapshot forever.
+/// `version` is the monotonic high-water mark used to fence cross-source
+/// FULL_SNAPSHOTs. It tracks committed GatewayConfig / accepted resource-delta
+/// timestamps and never decreases on same-source recovery. It is `None` only
+/// when an older authority was recorded without a comparable timestamp (should
+/// not arise for newly committed applies that always carry `loaded_at`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedSnapshotAuthority {
     pub version: Option<DateTime<Utc>>,
     pub source_cp_url: String,
 }
 
+/// Why an envelope version failed to reconcile with committed config freshness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionReconcileError {
+    /// `ConfigUpdate.version` was not a parseable RFC3339 timestamp.
+    UnparseableEnvelope,
+    /// Envelope timestamp disagrees with the parsed snapshot's `loaded_at`.
+    Inconsistent {
+        envelope: DateTime<Utc>,
+        loaded_at: DateTime<Utc>,
+    },
+}
+
 /// Why a FULL_SNAPSHOT was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StaleSnapshotReject {
-    /// A failover snapshot's version could not be parsed, so freshness against
-    /// a known-good applied authority cannot be proven; fail closed.
+    /// Envelope/`loaded_at` could not be ordered safely; fail closed.
     UnparseableVersion,
+    /// Envelope version disagreed with the snapshot body's `loaded_at`.
+    InconsistentVersion {
+        envelope: DateTime<Utc>,
+        loaded_at: DateTime<Utc>,
+    },
     /// A failover snapshot is older than the applied authority.
-    OlderThanApplied { applied: DateTime<Utc>, incoming: DateTime<Utc> },
+    OlderThanApplied {
+        applied: DateTime<Utc>,
+        incoming: DateTime<Utc>,
+    },
+}
+
+/// Reconcile `ConfigUpdate.version` against the parsed snapshot's `loaded_at`.
+///
+/// Freshness must describe the committed GatewayConfig body, not an arbitrary
+/// envelope string. On success returns the committed `loaded_at` (never a
+/// fabricated timestamp). Inconsistent or unparseable inputs fail closed.
+pub fn reconcile_snapshot_version(
+    envelope_version: &str,
+    loaded_at: DateTime<Utc>,
+) -> Result<DateTime<Utc>, VersionReconcileError> {
+    // Prefer exact CP stamp parity (`loaded_at.to_rfc3339()`), then accept
+    // equivalent RFC3339 encodings of the same instant.
+    if envelope_version == loaded_at.to_rfc3339() {
+        return Ok(loaded_at);
+    }
+    let Some(envelope) = DateTime::parse_from_rfc3339(envelope_version)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+    else {
+        return Err(VersionReconcileError::UnparseableEnvelope);
+    };
+    if envelope != loaded_at {
+        return Err(VersionReconcileError::Inconsistent {
+            envelope,
+            loaded_at,
+        });
+    }
+    Ok(loaded_at)
+}
+
+/// Monotonic max of an optional prior watermark and a newly committed stamp.
+pub fn monotonic_watermark(
+    prior: Option<DateTime<Utc>>,
+    committed: DateTime<Utc>,
+) -> DateTime<Utc> {
+    match prior {
+        Some(prev) if prev > committed => prev,
+        _ => committed,
+    }
+}
+
+/// Advance (or establish) freshness authority from a timestamp actually
+/// committed into active config (full snapshot `loaded_at` or accepted
+/// resource-delta `poll_timestamp` / resulting `loaded_at`).
+///
+/// The watermark is monotonic: same-source recovery that intentionally applies
+/// an older body still keeps the highest known ordering for later cross-source
+/// fencing. Source URL is always updated to the committing CP.
+pub fn advance_authority_from_committed(
+    authority: &mut Option<AppliedSnapshotAuthority>,
+    source_cp_url: &str,
+    committed: DateTime<Utc>,
+) {
+    match authority {
+        Some(existing) => {
+            existing.version = Some(monotonic_watermark(existing.version, committed));
+            existing.source_cp_url = source_cp_url.to_string();
+        }
+        None => {
+            *authority = Some(AppliedSnapshotAuthority {
+                version: Some(committed),
+                source_cp_url: source_cp_url.to_string(),
+            });
+        }
+    }
+}
+
+/// True when an accepted non-empty resource delta should advance freshness.
+///
+/// Rejected deltas and empty / trust-only side-channel updates must not.
+pub fn resource_delta_advances_authority(accepted: bool, was_empty: bool) -> bool {
+    accepted && !was_empty
 }
 
 /// Decide whether an incoming FULL_SNAPSHOT may replace the active config.
 ///
-/// Returns the version to record as the new applied authority on accept
-/// (`None` when the accepted snapshot's version was unparseable — never a
-/// fabricated timestamp).
+/// `incoming_committed` must already be the reconciled snapshot `loaded_at`
+/// (see [`reconcile_snapshot_version`]). Returns the watermark to record after
+/// a successful apply (monotonic vs any prior authority).
 ///
 /// Rules:
 /// - Same-source snapshots are always accepted (reconnect / recovery). The
-///   recorded version keeps the newest known ordering; an unparseable resend
-///   does not erase a prior parseable authority.
-/// - Cross-source failover snapshots are fenced only when there is a parseable
-///   applied authority to compare against and the incoming version is strictly
-///   older. An unparseable incoming version against a known-good authority
-///   fails closed ([`StaleSnapshotReject::UnparseableVersion`]) rather than
-///   inventing a timestamp.
+///   recorded watermark stays monotonic even when the recovery body is older.
+/// - Cross-source failover snapshots are fenced when a parseable applied
+///   authority exists and the incoming committed stamp is strictly older.
 /// - With no applied authority (first snapshot) or an authority whose own
 ///   version is unknown, there is nothing to fence against, so the snapshot is
-///   accepted and its (possibly unknown) version adopted.
+///   accepted and its committed stamp adopted.
 pub fn evaluate_full_snapshot_authority(
     authority: Option<&AppliedSnapshotAuthority>,
-    incoming_version: &str,
+    incoming_committed: DateTime<Utc>,
     source_cp_url: &str,
-) -> Result<Option<DateTime<Utc>>, StaleSnapshotReject> {
-    let parsed = DateTime::parse_from_rfc3339(incoming_version)
-        .map(|dt| dt.with_timezone(&Utc))
-        .ok();
-
+) -> Result<DateTime<Utc>, StaleSnapshotReject> {
     let Some(authority) = authority else {
-        // First applied snapshot establishes the authority. Record only a real
-        // parsed version; never fabricate `Utc::now()`.
-        return Ok(parsed);
+        return Ok(incoming_committed);
     };
 
     if authority.source_cp_url == source_cp_url {
-        // Same source: always accept. Prefer the newly parsed version but keep
-        // the prior authority version if this resend was unparseable, so we do
-        // not lose ordering that later cross-source fencing depends on.
-        return Ok(parsed.or(authority.version));
+        return Ok(monotonic_watermark(
+            authority.version,
+            incoming_committed,
+        ));
     }
 
-    // Cross-source failover: fence only when a comparable applied authority
-    // version exists.
     let Some(applied) = authority.version else {
-        // No parseable ordering authority to fence against — we cannot prove
-        // the incoming snapshot is stale, so accept and adopt its version.
-        return Ok(parsed);
+        return Ok(incoming_committed);
     };
 
-    let Some(incoming) = parsed else {
-        // Known-good authority vs. unparseable failover version: fail closed
-        // instead of inventing a timestamp that could roll config back or
-        // fence forever.
-        return Err(StaleSnapshotReject::UnparseableVersion);
-    };
-
-    if incoming < applied {
-        return Err(StaleSnapshotReject::OlderThanApplied { applied, incoming });
+    if incoming_committed < applied {
+        return Err(StaleSnapshotReject::OlderThanApplied {
+            applied,
+            incoming: incoming_committed,
+        });
     }
 
-    Ok(Some(incoming))
+    Ok(incoming_committed)
 }
 
 /// How the ConfigSync stream must react to an incoming FULL_SNAPSHOT.
 ///
-/// The distinction this type makes load-bearing: a fenced (older or unorderable
-/// cross-source) snapshot must **terminate** the stream, not merely be skipped
-/// on a stream that keeps reading. If the stream continued, the same stale
-/// fallback CP's next DELTA — removals and trust-only updates included — would
-/// apply against the newer active config, which is exactly the persistent
-/// stale-base-delta regression described in issue #2970. Terminating hands the
-/// outer reconnect loop a failure outcome so it fails over with bounded backoff.
+/// A fenced (older or unorderable cross-source) snapshot must **terminate** the
+/// stream, not merely be skipped on a stream that keeps reading. Continuing
+/// would let the same stale fallback CP's next DELTA apply against newer
+/// config (issue #2970).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FullSnapshotStreamDisposition {
-    /// Apply the snapshot; adopt `version` as the new applied authority once the
-    /// apply succeeds (`None` preserves "unparseable version, no fabricated
-    /// timestamp"). See [`evaluate_full_snapshot_authority`].
-    Apply { version: Option<DateTime<Utc>> },
-    /// Refuse the snapshot and terminate the stream so no later message from the
-    /// same source can apply; the outer loop fails over with bounded backoff.
+    /// Apply the snapshot; adopt `version` as the new applied watermark once
+    /// the apply succeeds.
+    Apply { version: DateTime<Utc> },
+    /// Refuse the snapshot and terminate the stream so no later message from
+    /// the same source can apply; the outer loop fails over with backoff.
     RefuseAndTerminate(StaleSnapshotReject),
 }
 
-/// Decide how the ConfigSync stream must react to an incoming FULL_SNAPSHOT.
-///
-/// Thin wrapper over [`evaluate_full_snapshot_authority`] that keeps the
-/// accept-vs-refuse policy in one place while making the *stream* consequence
-/// explicit and unit-testable: an `Err` from the policy is never a skippable
-/// message — it is a stream-terminating refusal
-/// ([`FullSnapshotStreamDisposition::RefuseAndTerminate`]).
+/// Decide how the ConfigSync stream must react after version reconciliation.
 pub fn full_snapshot_stream_disposition(
     authority: Option<&AppliedSnapshotAuthority>,
-    incoming_version: &str,
+    incoming_committed: DateTime<Utc>,
     source_cp_url: &str,
 ) -> FullSnapshotStreamDisposition {
-    match evaluate_full_snapshot_authority(authority, incoming_version, source_cp_url) {
+    match evaluate_full_snapshot_authority(authority, incoming_committed, source_cp_url) {
         Ok(version) => FullSnapshotStreamDisposition::Apply { version },
         Err(reject) => FullSnapshotStreamDisposition::RefuseAndTerminate(reject),
+    }
+}
+
+/// Map a reconcile failure onto the stream-terminating refusal enum.
+pub fn stale_reject_from_reconcile(err: VersionReconcileError) -> StaleSnapshotReject {
+    match err {
+        VersionReconcileError::UnparseableEnvelope => StaleSnapshotReject::UnparseableVersion,
+        VersionReconcileError::Inconsistent {
+            envelope,
+            loaded_at,
+        } => StaleSnapshotReject::InconsistentVersion {
+            envelope,
+            loaded_at,
+        },
+    }
+}
+
+/// How the stream must react when a FULL_SNAPSHOT fails parse/validate/apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotFailureStreamDisposition {
+    /// No valid base yet on this subscription — terminate and fail over with
+    /// accumulating backoff so a later DELTA cannot apply against an unrelated
+    /// old base.
+    TerminateAndFailover,
+    /// A valid base was already committed on this subscription — keep serving
+    /// it and continue reading (e.g. a mid-stream recovery snapshot that fails
+    /// validation does not tear down the healthy stream).
+    ContinueKeepingBase,
+}
+
+/// Decide stream reaction for a refused/invalid/unusable FULL_SNAPSHOT.
+pub fn snapshot_failure_stream_disposition(
+    subscription_base_applied: bool,
+) -> SnapshotFailureStreamDisposition {
+    if subscription_base_applied {
+        SnapshotFailureStreamDisposition::ContinueKeepingBase
+    } else {
+        SnapshotFailureStreamDisposition::TerminateAndFailover
+    }
+}
+
+/// Why a DELTA was refused before any apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaRefuse {
+    /// No valid FULL_SNAPSHOT base has been committed on this subscription yet.
+    BeforeSnapshotBase,
+}
+
+/// Each new subscription must accept exactly a valid FULL_SNAPSHOT base before
+/// any DELTA can apply. A pre-snapshot DELTA must terminate without applying.
+pub fn evaluate_delta_against_subscription_base(
+    subscription_base_applied: bool,
+) -> Result<(), DeltaRefuse> {
+    if subscription_base_applied {
+        Ok(())
+    } else {
+        Err(DeltaRefuse::BeforeSnapshotBase)
     }
 }
 
@@ -185,6 +308,10 @@ pub enum ConfigSyncAttemptOutcome {
     /// next CP and keep accumulating backoff. It must never reset backoff — a
     /// stale fallback CP is not healthy progress (issue #2970).
     StaleSnapshotFenced,
+    /// The subscription never established a valid FULL_SNAPSHOT base (malformed,
+    /// inconsistent, rejected, or a pre-snapshot DELTA). Fail over with
+    /// accumulating backoff; never treat as delivered config.
+    InvalidSubscriptionBase,
 }
 
 /// Advance multi-CP index/backoff after one attempt.
@@ -206,7 +333,8 @@ pub fn advance_multi_cp_backoff(
         }
         ConfigSyncAttemptOutcome::ConnectionError
         | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
-        | ConfigSyncAttemptOutcome::StaleSnapshotFenced => {
+        | ConfigSyncAttemptOutcome::StaleSnapshotFenced
+        | ConfigSyncAttemptOutcome::InvalidSubscriptionBase => {
             if cp_count > 1 {
                 let next_index = (state.current_cp_index + 1) % cp_count;
                 if next_index == 0 {
