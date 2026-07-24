@@ -2015,6 +2015,46 @@ pub mod _test_support {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
     }
 
+    /// MongoDB timeout precedence (issue #2988): URI-parsed
+    /// `serverSelectionTimeoutMS`/`connectTimeoutMS` survive when the env
+    /// override is `None`, and are replaced only when explicitly set.
+    pub fn apply_mongo_timeout_overrides(
+        client_options: &mut mongodb::options::ClientOptions,
+        server_selection_timeout_secs: Option<u64>,
+        connect_timeout_secs: Option<u64>,
+    ) {
+        crate::config::mongo_store::apply_mongo_timeout_overrides(
+            client_options,
+            server_selection_timeout_secs,
+            connect_timeout_secs,
+        )
+    }
+
+    /// Consumer-identity ordered-insert prefix attribution (issue #2987): only
+    /// the prefix before the E11000 write-error index was inserted by this
+    /// attempt; `None` means attribution is unknown (retain everything).
+    pub fn ordered_insert_newly_inserted_prefix<T>(
+        values: &[T],
+        first_error_index: Option<usize>,
+    ) -> &[T] {
+        crate::config::mongo_store::ordered_insert_newly_inserted_prefix(values, first_error_index)
+    }
+
+    /// Consumer-identity adoption-failure release set (issue #2987): the
+    /// verifiable ordered-insert prefix plus vacant reservations this adoption
+    /// attempt inserted before failing — never pre-existing same-owner docs.
+    pub fn consumer_identity_adoption_failure_release_values(
+        ordered_values: &[String],
+        ordered_first_error_index: Option<usize>,
+        adoption_newly_inserted: &[String],
+    ) -> Vec<String> {
+        crate::config::mongo_store::consumer_identity_adoption_failure_release_values(
+            ordered_values,
+            ordered_first_error_index,
+            adoption_newly_inserted,
+        )
+    }
+
     // ── plugins/grpc_web ─────────────────────────────────────────────────────
     pub const GRPC_FRAME_DATA: u8 = crate::plugins::grpc_web::GRPC_FRAME_DATA;
     pub const GRPC_FRAME_TRAILER: u8 = crate::plugins::grpc_web::GRPC_FRAME_TRAILER;
