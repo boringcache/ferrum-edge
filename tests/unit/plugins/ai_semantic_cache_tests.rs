@@ -4670,7 +4670,7 @@ fn redis_mode_requires_integrity_key_and_rejects_over_hard_caps() {
         AiSemanticCache::new(
             &json!({
                 "max_entry_size_bytes": 2 * 1024 * 1024,
-                "max_total_size_bytes": 1 * 1024 * 1024,
+                "max_total_size_bytes": 1024 * 1024,
             }),
             PluginHttpClient::default(),
         )
@@ -5054,12 +5054,14 @@ async fn route_rewrite_and_effective_upstream_isolate_cache_entries() {
 fn priority_is_after_route_dispatch_plugins() {
     let plugin = make_plugin(json!({}));
     assert_eq!(plugin.priority(), priority::AI_SEMANTIC_CACHE);
-    assert!(
-        priority::AI_SEMANTIC_CACHE > priority::MESH_ROUTE_DISPATCH,
-        "cache lookup must observe mesh_route_dispatch overrides"
-    );
-    assert!(
-        priority::AI_SEMANTIC_CACHE > priority::AI_STREAM_ROUTER,
-        "cache lookup must observe ai_stream_router destination overrides"
-    );
+    const {
+        assert!(
+            priority::AI_SEMANTIC_CACHE > priority::MESH_ROUTE_DISPATCH,
+            "cache lookup must observe mesh_route_dispatch overrides"
+        );
+        assert!(
+            priority::AI_SEMANTIC_CACHE > priority::AI_STREAM_ROUTER,
+            "cache lookup must observe ai_stream_router destination overrides"
+        );
+    }
 }
