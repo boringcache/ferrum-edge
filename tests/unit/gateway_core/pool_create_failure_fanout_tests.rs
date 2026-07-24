@@ -35,11 +35,7 @@ impl PoolManager for FanoutTestManager {
         let _ = write!(buf, "{host}|{port}|{shard}");
     }
 
-    async fn create(
-        &self,
-        key: &str,
-        _proxy: &Proxy,
-    ) -> anyhow::Result<Self::Connection> {
+    async fn create(&self, key: &str, _proxy: &Proxy) -> anyhow::Result<Self::Connection> {
         if !self.create_delay.is_zero() {
             tokio::time::sleep(self.create_delay).await;
         }
@@ -196,9 +192,7 @@ async fn external_generic_pool_fans_out_one_create_failure_to_all_waiters() {
         "one creator must retain its original error while every waiter receives the shared error"
     );
     assert!(
-        shared_generations
-            .windows(2)
-            .all(|pair| pair[0] == pair[1]),
+        shared_generations.windows(2).all(|pair| pair[0] == pair[1]),
         "all waiters must share the same failure generation: {shared_generations:?}"
     );
     assert_ne!(shared_generations[0], 0);

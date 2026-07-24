@@ -6,9 +6,7 @@
 
 use ferrum_edge::http3::client::classify_http3_error;
 use ferrum_edge::pool::{ShareablePoolCreateError, SharedPoolCreateError, SharedPoolCreateKind};
-use ferrum_edge::proxy::grpc_proxy::{
-    GrpcBackendUnavailableKind, GrpcProxyError, GrpcTimeoutKind,
-};
+use ferrum_edge::proxy::grpc_proxy::{GrpcBackendUnavailableKind, GrpcProxyError, GrpcTimeoutKind};
 use ferrum_edge::proxy::http2_pool::{
     BackendUnavailableSource, Http2PoolError, classify_http2_pool_error,
 };

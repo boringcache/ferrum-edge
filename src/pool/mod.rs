@@ -155,10 +155,7 @@ impl SharedPoolCreateError {
     /// `generation`. Uses the canonical boxed setup classifier rather than
     /// substring heuristics so H3/anyhow GenericPool waiters retain typed
     /// shared classification.
-    pub fn capture(
-        err: &(dyn std::error::Error + Send + Sync + 'static),
-        generation: u64,
-    ) -> Self {
+    pub fn capture(err: &(dyn std::error::Error + Send + Sync + 'static), generation: u64) -> Self {
         let error_class = crate::retry::classify_boxed_setup_error(err);
         Self::from_classified(err.to_string(), error_class, generation, None)
     }
@@ -350,8 +347,7 @@ impl PendingCreation {
     }
 
     fn finish_failed(&self, err: SharedPoolCreateError) {
-        self.outcome_tx
-            .send_replace(CreationNotify::Failed(err));
+        self.outcome_tx.send_replace(CreationNotify::Failed(err));
     }
 }
 
@@ -1108,9 +1104,7 @@ mod tests {
             "one creator must retain its original error while every waiter receives the shared error"
         );
         assert!(
-            shared_generations
-                .windows(2)
-                .all(|pair| pair[0] == pair[1]),
+            shared_generations.windows(2).all(|pair| pair[0] == pair[1]),
             "all waiters must share the same failure generation: {shared_generations:?}"
         );
         assert_ne!(shared_generations[0], 0);

@@ -1336,10 +1336,7 @@ impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
         match err.kind() {
             SharedPoolCreateKind::TimedOut => Self::BackendTimeout {
                 message: message.clone(),
-                source: Some(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    message,
-                )),
+                source: Some(std::io::Error::new(std::io::ErrorKind::TimedOut, message)),
             },
             SharedPoolCreateKind::Internal => Self::Internal {
                 message: message.clone(),
