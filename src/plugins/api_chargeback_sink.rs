@@ -1387,15 +1387,14 @@ impl ApiChargebackSink {
         let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
         let overflow_metrics = Arc::clone(&metrics);
         let (commit_tx, commit_rx) = watch::channel(false);
-        let spool_enqueue = match spool.as_ref() {
-            Some(spool_manager) => Some(start_spool_delivery(
+        let spool_enqueue = spool.as_ref().map(|spool_manager| {
+            start_spool_delivery(
                 Arc::clone(spool_manager),
                 Arc::clone(&metrics),
                 self.config.spool.delivery_queue_capacity,
                 commit_tx.subscribe(),
-            )),
-            None => None,
-        };
+            )
+        });
         let failed_enqueue = spool_enqueue.clone();
         let overflow_enqueue = spool_enqueue.clone();
         let hooks = LoggerHooks {
