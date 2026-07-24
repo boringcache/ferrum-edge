@@ -776,6 +776,657 @@ async fn xml_request_validation_honors_xml_metadata() {
 }
 
 #[tokio::test]
+async fn xml_preserves_additional_properties_and_leaf_attributes() {
+    // #3020: additionalProperties subschema must see unknown XML members.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/extra",
+            "path_regex": "^/extra$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {
+                            "known": {"type": "string"}
+                        },
+                        "additionalProperties": {"type": "integer"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/xml");
+    let mut ctx = post_ctx("/extra");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><known>x</known><extra>not-an-integer</extra></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/extra");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><known>x</known><extra>7</extra></root>"#,
+            )
+            .await,
+    );
+
+    // Omitted additionalProperties still preserves members for object-wide keywords.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/max",
+            "path_regex": "^/max$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "maxProperties": 1,
+                        "properties": {
+                            "known": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/max");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><known>x</known><extra>1</extra></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/pattern",
+            "path_regex": "^/pattern$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {
+                            "known": {"type": "string"}
+                        },
+                        "patternProperties": {
+                            "^x_": {"type": "integer"}
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/pattern");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><known>x</known><x_count>3</x_count></root>"#,
+            )
+            .await,
+    );
+    let mut ctx = post_ctx("/pattern");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><known>x</known><x_count>nope</x_count></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/names",
+            "path_regex": "^/names$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "propertyNames": {"pattern": "^[a-z]+$"},
+                        "additionalProperties": {"type": "string"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/names");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><BadName>x</BadName></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+
+    // Leaf attributes must survive generic conversion for empty property maps.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/leaf",
+            "path_regex": "^/leaf$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["flag"],
+                        "properties": {},
+                        "additionalProperties": {"type": "string"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/leaf");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, br#"<root flag="on"/>"#)
+            .await,
+    );
+
+    // Repeated unknown elements preserve multiplicity for schema evaluation.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/multi",
+            "path_regex": "^/multi$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {
+                            "known": {"type": "string"}
+                        },
+                        "additionalProperties": {"type": "integer"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/multi");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><known>x</known><extra>1</extra><extra>2</extra></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn xml_rejects_repeated_scalar_elements_fail_closed() {
+    // #3021: duplicate scalar elements must not first-win.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/role",
+            "path_regex": "^/role$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["role"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "role": {"type": "string", "const": "user"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/xml");
+
+    // First-win style hostile document: first is valid, second would escalate.
+    let mut ctx = post_ctx("/role");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><role>user</role><role>admin</role></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    // Last-win style hostile document: last is valid, first would be ignored.
+    let mut ctx = post_ctx("/role");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><role>admin</role><role>user</role></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/role");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><role>user</role></root>"#,
+            )
+            .await,
+    );
+
+    // Arrays continue to preserve ordered repeated elements.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/tags",
+            "path_regex": "^/tags$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["tags"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "tags": {
+                                "type": "array",
+                                "minItems": 2,
+                                "items": {"type": "string", "xml": {"name": "tag"}}
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/tags");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><tag>a</tag><tag>b</tag></root>"#,
+            )
+            .await,
+    );
+
+    // Wrapped arrays reject repeated wrappers.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/wrapped",
+            "path_regex": "^/wrapped$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {
+                            "tags": {
+                                "type": "array",
+                                "xml": {"name": "tags", "wrapped": true},
+                                "items": {"type": "string", "xml": {"name": "tag"}}
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/wrapped");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><tags><tag>a</tag></tags><tags><tag>b</tag></tags></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/wrapped");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><tags><tag>a</tag><tag>b</tag></tags></root>"#,
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn xml_namespace_and_prefix_metadata_fail_closed() {
+    // #3022: honor xml.namespace / xml.prefix via expanded-name matching.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/ns",
+            "path_regex": "^/ns$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["name"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "const": "approved",
+                                "xml": {
+                                    "name": "name",
+                                    "namespace": "https://trusted.example/schema",
+                                    "prefix": "trusted"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/xml");
+
+    // Wrong namespace, matching local name + const: must reject.
+    let mut ctx = post_ctx("/ns");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:evil="https://attacker.example/schema"><evil:name>approved</evil:name></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    // Unqualified element when a namespace is required: reject.
+    let mut ctx = post_ctx("/ns");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><name>approved</name></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    // Prefix alias bound to the required URI: accept.
+    let mut ctx = post_ctx("/ns");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:other="https://trusted.example/schema"><other:name>approved</other:name></root>"#,
+            )
+            .await,
+    );
+    // Default namespace with the required URI: accept.
+    let mut ctx = post_ctx("/ns");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns="https://trusted.example/schema"><name>approved</name></root>"#,
+            )
+            .await,
+    );
+
+    // Attribute namespaces.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/attr",
+            "path_regex": "^/attr$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["id"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "const": "A-1",
+                                "xml": {
+                                    "name": "id",
+                                    "attribute": true,
+                                    "namespace": "https://trusted.example/schema",
+                                    "prefix": "trusted"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/attr");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:evil="https://attacker.example/schema" evil:id="A-1"/>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/attr");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:trusted="https://trusted.example/schema" trusted:id="A-1"/>"#,
+            )
+            .await,
+    );
+
+    // Array item / wrapper namespaces.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "required": ["items"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "minItems": 1,
+                                "xml": {
+                                    "name": "items",
+                                    "wrapped": true,
+                                    "namespace": "https://trusted.example/schema",
+                                    "prefix": "trusted"
+                                },
+                                "items": {
+                                    "type": "string",
+                                    "xml": {
+                                        "name": "item",
+                                        "namespace": "https://trusted.example/schema",
+                                        "prefix": "trusted"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/items");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:evil="https://attacker.example/schema"><evil:items><evil:item>a</evil:item></evil:items></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+    let mut ctx = post_ctx("/items");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root xmlns:trusted="https://trusted.example/schema"><trusted:items><trusted:item>a</trusted:item></trusted:items></root>"#,
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn xml_hardening_preserves_draft7_and_draft202012() {
+    for draft in ["draft7", "draft2020-12"] {
+        let plugin = OpenapiValidator::new(&json!({
+            "schema_draft": draft,
+            "operations": [{
+                "method": "POST",
+                "path_template": "/draft",
+                "path_regex": "^/draft$",
+                "request_body": {
+                    "content": {
+                        "application/xml": {
+                            "type": "object",
+                            "xml": {"name": "root"},
+                            "required": ["role"],
+                            "additionalProperties": {"type": "integer"},
+                            "properties": {
+                                "role": {
+                                    "type": "string",
+                                    "const": "user",
+                                    "xml": {
+                                        "name": "role",
+                                        "namespace": "https://trusted.example/schema",
+                                        "prefix": "trusted"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }))
+        .unwrap_or_else(|error| panic!("draft {draft} must admit XML schemas: {error}"));
+        let headers = content_type_headers("application/xml");
+
+        let mut ctx = post_ctx("/draft");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:trusted="https://trusted.example/schema"><trusted:role>user</trusted:role><extra>9</extra></root>"#,
+                )
+                .await,
+        );
+        let mut ctx = post_ctx("/draft");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:trusted="https://trusted.example/schema"><trusted:role>user</trusted:role><trusted:role>admin</trusted:role></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        let mut ctx = post_ctx("/draft");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:evil="https://attacker.example/schema"><evil:role>user</evil:role></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+    }
+}
+
+#[tokio::test]
 async fn urlencoded_request_validation_converts_fields_to_schema_types() {
     let plugin = OpenapiValidator::new(&json!({
         "operations": [{

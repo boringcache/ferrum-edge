@@ -1582,14 +1582,24 @@ fn xml_body_to_value(
     let doc =
         roxmltree::Document::parse(body).map_err(|error| format!("Invalid XML body: {error}"))?;
     let root = doc.root_element();
-    if let Some(expected_root) = xml_name(schema, None)
-        && root.tag_name().name() != expected_root
-    {
-        return Err(format!(
-            "XML root element '{}' does not match schema xml.name '{}'",
-            root.tag_name().name(),
-            expected_root
-        ));
+    if let Some(expected_root) = xml_name(schema, None) {
+        let expected_namespace = xml_namespace(schema);
+        if !xml_expanded_name_matches(root.tag_name(), expected_namespace, expected_root) {
+            return Err(match expected_namespace {
+                Some(namespace) => format!(
+                    "XML root element '{}{}' does not match schema xml.name '{}' in namespace '{}'",
+                    xml_namespace_display(root.tag_name().namespace()),
+                    root.tag_name().name(),
+                    expected_root,
+                    namespace
+                ),
+                None => format!(
+                    "XML root element '{}' does not match schema xml.name '{}'",
+                    root.tag_name().name(),
+                    expected_root
+                ),
+            });
+        }
     }
     xml_node_to_value(root, schema, conversion)
 }
@@ -1617,14 +1627,14 @@ fn xml_node_to_value(
             return Ok(generic_xml_node_to_value(node));
         }
         let mut out = serde_json::Map::new();
-        let mut modeled_children = HashSet::new();
-        let mut modeled_attributes = HashSet::new();
+        let mut modeled_names = ModeledXmlNames::default();
         for (property_name, property_schema) in properties {
             if xml_attribute(property_schema) {
-                let attr_name = xml_name(property_schema, Some(property_name.as_str()))
+                let attr_local = xml_name(property_schema, Some(property_name.as_str()))
                     .unwrap_or(property_name.as_str());
-                modeled_attributes.insert(attr_name.to_string());
-                if let Some(value) = node.attribute(attr_name) {
+                let attr_namespace = xml_namespace(property_schema);
+                modeled_names.insert_attribute(attr_namespace, attr_local);
+                if let Some(value) = xml_attribute_value(node, attr_namespace, attr_local) {
                     out.insert(
                         property_name.clone(),
                         scalar_to_schema_value(value, property_schema, conversion)?,
@@ -1633,37 +1643,71 @@ fn xml_node_to_value(
                 continue;
             }
             if schema_accepts_array(property_schema) {
+                mark_xml_array_modeled_names(
+                    property_name,
+                    property_schema,
+                    conversion,
+                    &mut modeled_names,
+                );
                 let values = xml_array_values(node, property_name, property_schema, conversion)?;
                 if !values.is_empty() {
                     out.insert(property_name.clone(), Value::Array(values));
                 }
                 continue;
             }
-            let child_name = xml_name(property_schema, Some(property_name.as_str()))
+            let child_local = xml_name(property_schema, Some(property_name.as_str()))
                 .unwrap_or(property_name.as_str());
-            modeled_children.insert(child_name.to_string());
-            if let Some(child) = first_child_element(node, child_name) {
-                out.insert(
-                    property_name.clone(),
-                    xml_node_to_value(child, property_schema, conversion)?,
-                );
-            }
-        }
-        if object_schema
-            .get("additionalProperties")
-            .and_then(Value::as_bool)
-            == Some(false)
-        {
-            for attr in node.attributes() {
-                let name = attr.name();
-                if !modeled_attributes.contains(name) && !out.contains_key(name) {
-                    out.insert(name.to_string(), Value::String(attr.value().to_string()));
+            let child_namespace = xml_namespace(property_schema);
+            modeled_names.insert_element(child_namespace, child_local);
+            let matches = child_elements_matching(node, child_namespace, child_local);
+            match matches.as_slice() {
+                [] => {}
+                [child] => {
+                    out.insert(
+                        property_name.clone(),
+                        xml_node_to_value(*child, property_schema, conversion)?,
+                    );
+                }
+                _ => {
+                    return Err(format!(
+                        "XML property '{property_name}' must not repeat for a non-array schema"
+                    ));
                 }
             }
-            for child in node.children().filter(roxmltree::Node::is_element) {
-                let name = child.tag_name().name();
-                if !modeled_children.contains(name) && !out.contains_key(name) {
-                    out.insert(name.to_string(), generic_xml_node_to_value(child));
+        }
+        // Always materialize undeclared members so JSON Schema keywords such as
+        // additionalProperties, maxProperties, patternProperties, and propertyNames
+        // observe the full XML payload instead of a filtered projection.
+        let additional_schema = additional_property_schema_for_conversion(object_schema);
+        for attr in node.attributes() {
+            if modeled_names.contains_attribute(attr) || out.contains_key(attr.name()) {
+                continue;
+            }
+            let value = match additional_schema {
+                Some(Some(schema)) => {
+                    scalar_to_schema_value(attr.value(), schema, conversion)?
+                }
+                _ => Value::String(attr.value().to_string()),
+            };
+            out.insert(attr.name().to_string(), value);
+        }
+        for child in node.children().filter(roxmltree::Node::is_element) {
+            if modeled_names.contains_element(child) {
+                continue;
+            }
+            let name = child.tag_name().name();
+            let value = match additional_schema {
+                Some(Some(schema)) => xml_node_to_value(child, schema, conversion)?,
+                _ => generic_xml_node_to_value(child),
+            };
+            match out.get_mut(name) {
+                Some(Value::Array(values)) => values.push(value),
+                Some(existing) => {
+                    let first = std::mem::take(existing);
+                    *existing = Value::Array(vec![first, value]);
+                }
+                None => {
+                    out.insert(name.to_string(), value);
                 }
             }
         }
@@ -1680,23 +1724,69 @@ fn xml_array_values(
     conversion: &ConversionPlan,
 ) -> Result<Vec<Value>, String> {
     let item_schema = array_item_schema_for_conversion(property_schema, conversion);
-    let item_name = xml_name(item_schema, None)
-        .or_else(|| xml_name(property_schema, Some(property_name)))
-        .unwrap_or(property_name);
+    let (item_namespace, item_local) =
+        xml_array_item_name(property_name, property_schema, item_schema);
     let mut values = Vec::new();
     if xml_wrapped(property_schema) {
-        let wrapper_name = xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
-        for wrapper in child_elements(node, wrapper_name) {
-            for child in child_elements(wrapper, item_name) {
+        let wrapper_local =
+            xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
+        let wrapper_namespace = xml_namespace(property_schema);
+        let wrappers = child_elements_matching(node, wrapper_namespace, wrapper_local);
+        if wrappers.len() > 1 {
+            return Err(format!(
+                "XML wrapped array '{property_name}' must not repeat its wrapper element"
+            ));
+        }
+        for wrapper in wrappers {
+            for child in child_elements_matching(wrapper, item_namespace, item_local) {
                 values.push(xml_node_to_value(child, item_schema, conversion)?);
             }
         }
     } else {
-        for child in child_elements(node, item_name) {
+        for child in child_elements_matching(node, item_namespace, item_local) {
             values.push(xml_node_to_value(child, item_schema, conversion)?);
         }
     }
     Ok(values)
+}
+
+fn mark_xml_array_modeled_names(
+    property_name: &str,
+    property_schema: &Value,
+    conversion: &ConversionPlan,
+    modeled_names: &mut ModeledXmlNames,
+) {
+    let item_schema = array_item_schema_for_conversion(property_schema, conversion);
+    let (item_namespace, item_local) =
+        xml_array_item_name(property_name, property_schema, item_schema);
+    if xml_wrapped(property_schema) {
+        let wrapper_local =
+            xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
+        let wrapper_namespace = xml_namespace(property_schema);
+        modeled_names.insert_element(wrapper_namespace, wrapper_local);
+    } else {
+        modeled_names.insert_element(item_namespace, item_local);
+    }
+}
+
+fn xml_array_item_name<'a>(
+    property_name: &'a str,
+    property_schema: &'a Value,
+    item_schema: &'a Value,
+) -> (Option<&'a str>, &'a str) {
+    if let Some(local) = xml_name(item_schema, None) {
+        return (xml_namespace(item_schema), local);
+    }
+    if let Some(local) = xml_name(property_schema, Some(property_name)) {
+        // Prefer item-level namespace when present; otherwise inherit the
+        // property XML Object namespace used for unwrapped array items.
+        let namespace = xml_namespace(item_schema).or_else(|| xml_namespace(property_schema));
+        return (namespace, local);
+    }
+    (
+        xml_namespace(item_schema).or_else(|| xml_namespace(property_schema)),
+        property_name,
+    )
 }
 
 fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Value {
@@ -1712,7 +1802,14 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Value {
         .filter(roxmltree::Node::is_element)
         .collect();
     if children.is_empty() {
-        return Value::String(node.text().unwrap_or("").trim().to_string());
+        let text = node.text().unwrap_or("").trim().to_string();
+        if out.is_empty() {
+            return Value::String(text);
+        }
+        if !text.is_empty() {
+            out.insert("#text".to_string(), Value::String(text));
+        }
+        return Value::Object(out);
     }
     for child in children {
         let value = generic_xml_node_to_value(child);
@@ -3668,6 +3765,14 @@ fn xml_name<'a>(schema: &'a Value, default: Option<&'a str>) -> Option<&'a str> 
         .or(default)
 }
 
+fn xml_namespace(schema: &Value) -> Option<&str> {
+    schema
+        .get("xml")
+        .and_then(|value| value.get("namespace"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
 fn xml_attribute(schema: &Value) -> bool {
     schema
         .get("xml")
@@ -3684,21 +3789,114 @@ fn xml_wrapped(schema: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn first_child_element<'a>(
-    node: roxmltree::Node<'a, 'a>,
-    local_name: &str,
-) -> Option<roxmltree::Node<'a, 'a>> {
-    node.children()
-        .find(|child| child.is_element() && child.tag_name().name() == local_name)
+#[derive(Debug, Default)]
+struct ModeledXmlNames {
+    /// Exact expanded names when the schema declares `xml.namespace`.
+    exact_elements: HashSet<(String, String)>,
+    /// Local names that match any namespace when the schema omits `xml.namespace`.
+    any_namespace_elements: HashSet<String>,
+    exact_attributes: HashSet<(String, String)>,
+    /// Unqualified attribute locals when the schema omits `xml.namespace`.
+    unqualified_attributes: HashSet<String>,
 }
 
-fn child_elements<'a>(
+impl ModeledXmlNames {
+    fn insert_element(&mut self, namespace: Option<&str>, local: &str) {
+        match namespace {
+            Some(namespace) => {
+                self.exact_elements
+                    .insert((namespace.to_string(), local.to_string()));
+            }
+            None => {
+                self.any_namespace_elements.insert(local.to_string());
+            }
+        }
+    }
+
+    fn insert_attribute(&mut self, namespace: Option<&str>, local: &str) {
+        match namespace {
+            Some(namespace) => {
+                self.exact_attributes
+                    .insert((namespace.to_string(), local.to_string()));
+            }
+            None => {
+                self.unqualified_attributes.insert(local.to_string());
+            }
+        }
+    }
+
+    fn contains_element(&self, node: roxmltree::Node<'_, '_>) -> bool {
+        let local = node.tag_name().name();
+        if self.any_namespace_elements.contains(local) {
+            return true;
+        }
+        let Some(namespace) = node.tag_name().namespace() else {
+            return false;
+        };
+        self.exact_elements
+            .iter()
+            .any(|(ns, name)| ns == namespace && name == local)
+    }
+
+    fn contains_attribute(&self, attr: roxmltree::Attribute<'_, '_>) -> bool {
+        let local = attr.name();
+        match attr.namespace() {
+            Some(namespace) => self
+                .exact_attributes
+                .iter()
+                .any(|(ns, name)| ns == namespace && name == local),
+            None => self.unqualified_attributes.contains(local),
+        }
+    }
+}
+
+fn xml_expanded_name_matches(
+    actual: roxmltree::ExpandedName<'_, '_>,
+    expected_namespace: Option<&str>,
+    expected_local: &str,
+) -> bool {
+    if actual.name() != expected_local {
+        return false;
+    }
+    match expected_namespace {
+        // Fail closed: a declared namespace URI must match exactly. Prefix text is
+        // ignored; only the expanded name (URI + local) participates.
+        Some(namespace) => actual.namespace() == Some(namespace),
+        // When the schema omits `xml.namespace`, preserve local-name matching.
+        None => true,
+    }
+}
+
+fn xml_attribute_value<'a>(
     node: roxmltree::Node<'a, 'a>,
+    namespace: Option<&str>,
+    local: &str,
+) -> Option<&'a str> {
+    match namespace {
+        Some(namespace) => node.attribute((namespace, local)),
+        // Attributes do not inherit default namespaces; omit => unqualified only.
+        None => node.attribute(local),
+    }
+}
+
+fn child_elements_matching<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    namespace: Option<&str>,
     local_name: &str,
 ) -> Vec<roxmltree::Node<'a, 'a>> {
     node.children()
-        .filter(move |child| child.is_element() && child.tag_name().name() == local_name)
+        .filter(|child| {
+            child.is_element()
+                && xml_expanded_name_matches(child.tag_name(), namespace, local_name)
+        })
         .collect()
+}
+
+fn xml_namespace_display(namespace: Option<&str>) -> String {
+    match namespace {
+        Some(namespace) => format!("{{{namespace}}}"),
+        None => String::new(),
+    }
 }
 
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
