@@ -200,8 +200,10 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
+| `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted log record (1024–1048576). Oversized records are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`; hard max 268435456). Admission reserves before serialization. |
 
-Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first.
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before serializing attacker-shaped summary fields, then shrinks that lease to the exact retained JSON size.
 
 Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget.
 
@@ -611,6 +613,8 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
+| `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted NDJSON record (1024–1048576). Oversized records are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`). |
 | `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
 | `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
 | `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
@@ -670,6 +674,8 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `max_retries` | Integer | `1` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
+| `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted JSON record (1024–1048576). Oversized records are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`). |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 

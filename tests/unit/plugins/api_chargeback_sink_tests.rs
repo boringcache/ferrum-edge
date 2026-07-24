@@ -1082,6 +1082,7 @@ fn spool_write_round_trip_and_oldest_eviction() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1119,6 +1120,7 @@ fn spool_rejects_empty_spool_oversized_batch() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len.saturating_sub(1).max(1),
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1150,6 +1152,7 @@ fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1188,6 +1191,7 @@ fn spool_quota_uses_compressed_encoded_size() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::Zstd,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1206,6 +1210,7 @@ fn spool_quota_uses_compressed_encoded_size() {
         dir: temp.path().join("over"),
         max_bytes: encoded_len.saturating_sub(1).max(1),
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::Zstd,
     };
     let over_spool = SpoolManager::for_tests(over, "node-a").unwrap();
@@ -1230,6 +1235,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1262,6 +1268,7 @@ fn spool_reconciles_stale_tmp_files_at_startup() {
         dir: temp.path().to_path_buf(),
         max_bytes: 1024 * 1024,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1294,6 +1301,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1329,6 +1337,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = Arc::new(SpoolManager::for_tests(settings, "node-a").unwrap());
@@ -1529,6 +1538,7 @@ fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
         dir: temp.path().to_path_buf(),
         max_bytes: 1024 * 1024,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let err = match SpoolManager::for_tests(settings, "node-a") {
@@ -1589,6 +1599,7 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
         dir: temp.path().to_path_buf(),
         max_bytes: 1024 * 1024,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -2275,6 +2286,7 @@ fn test_spool(temp: &tempfile::TempDir) -> SpoolManager {
         dir: temp.path().to_path_buf(),
         max_bytes: 1024 * 1024,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     SpoolManager::for_tests(settings, "node-a").unwrap()
@@ -2743,4 +2755,27 @@ async fn replay_retries_after_ambiguous_acknowledgement_without_double_billing_i
         bodies[0], bodies[1],
         "retry payload bytes must stay identical"
     );
+}
+#[tokio::test]
+async fn config_validation_rejects_buffer_max_bytes_and_spool_delivery_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut too_small = valid_config(temp.path());
+    too_small["batch"]["buffer_max_bytes"] = json!(1);
+    assert!(
+        ApiChargebackSink::new(&too_small, PluginHttpClient::default(), "ferrum").is_err(),
+        "tiny buffer_max_bytes must fail"
+    );
+
+    let mut bad_queue = valid_config(temp.path());
+    bad_queue["spool"]["delivery_queue_capacity"] = json!(0);
+    assert!(
+        ApiChargebackSink::new(&bad_queue, PluginHttpClient::default(), "ferrum").is_err(),
+        "zero delivery_queue_capacity must fail"
+    );
+
+    let mut ok = valid_config(temp.path());
+    ok["batch"]["buffer_max_bytes"] = json!(16_777_216);
+    ok["spool"]["delivery_queue_capacity"] = json!(128);
+    ApiChargebackSink::new(&ok, PluginHttpClient::default(), "ferrum")
+        .expect("valid byte-budget and delivery queue knobs must admit");
 }

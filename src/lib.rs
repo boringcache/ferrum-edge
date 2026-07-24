@@ -3161,8 +3161,20 @@ pub mod _test_support {
         max_plaintext: usize,
     ) -> Result<(&'static str, usize), String> {
         use crate::plugins::udp_logging::DtlsBatchSizeDecision;
-        let entries: Vec<crate::plugins::utils::SummaryLogEntry> =
-            summaries.iter().map(Into::into).collect();
+        use crate::plugins::utils::ByteBudget;
+        use crate::plugins::utils::byte_budget::accounted_summary_bytes;
+        use crate::plugins::utils::summary_log_budget::serialize_under_byte_budget;
+        const HARD_MAX: usize = 16 * 1024 * 1024;
+        let aggregate_budget =
+            accounted_summary_bytes(HARD_MAX).saturating_mul(summaries.len().max(1));
+        let budget = ByteBudget::new("udp_logging_test", aggregate_budget);
+        let mut entries = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            let Some(payload) = serialize_under_byte_budget(&budget, HARD_MAX, summary) else {
+                return Err("udp_logging test helper failed to serialize summary".to_string());
+            };
+            entries.push(payload);
+        }
         let (decision, payload_len) =
             crate::plugins::udp_logging::classify_serialized_dtls_batch_for_test(
                 &entries,
