@@ -1147,6 +1147,17 @@ async fn xml_preserves_additional_properties_and_leaf_attributes() {
             .await,
         Some(400),
     );
+    let mut ctx = post_ctx("/ambiguous-additional");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><extra><item>one</item><item>two</item></extra></root>"#,
+            )
+            .await,
+    );
 }
 
 #[tokio::test]
