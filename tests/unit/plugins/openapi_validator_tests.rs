@@ -1925,6 +1925,167 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
 }
 
 #[tokio::test]
+async fn xml_cross_construct_members_cannot_fill_modeled_slot() {
+    // #3020 "attributes versus elements" / "without key rebinding": always
+    // materializing undeclared members must not let an attribute fill a slot
+    // modeled as an element (or an element fill a slot modeled as an attribute).
+    // Otherwise a required/const property supplied via the wrong XML construct
+    // passes validation while the backend, which binds by construct, sees it
+    // absent: a validator/backend differential. Covers additionalProperties
+    // omitted, true, and a permissive subschema.
+    let headers = content_type_headers("application/xml");
+
+    for additional in [Value::Null, json!(true), json!({"type": "string"})] {
+        // Element-modeled property supplied as an attribute must fail closed.
+        let mut element_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "required": ["role"],
+            "properties": {
+                "role": {"type": "string", "const": "user", "xml": {"name": "role"}}
+            }
+        });
+        if !additional.is_null() {
+            element_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/construct-element",
+                "path_regex": "^/construct-element$",
+                "request_body": {"content": {"application/xml": element_schema}}
+            }]
+        }))
+        .unwrap_or_else(|error| {
+            panic!("element schema with additionalProperties={additional} must admit: {error}")
+        });
+
+        let mut ctx = post_ctx("/construct-element");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, br#"<root role="user"/>"#)
+                .await,
+            Some(400),
+        );
+        // The correct construct still validates.
+        let mut ctx = post_ctx("/construct-element");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root><role>user</role></root>"#,
+                )
+                .await,
+        );
+
+        // Attribute-modeled property supplied as an element must fail closed.
+        let mut attribute_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "required": ["id"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "const": "A-1",
+                    "xml": {"name": "id", "attribute": true}
+                }
+            }
+        });
+        if !additional.is_null() {
+            attribute_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/construct-attribute",
+                "path_regex": "^/construct-attribute$",
+                "request_body": {"content": {"application/xml": attribute_schema}}
+            }]
+        }))
+        .unwrap_or_else(|error| {
+            panic!("attribute schema with additionalProperties={additional} must admit: {error}")
+        });
+
+        let mut ctx = post_ctx("/construct-attribute");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root><id>A-1</id></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        let mut ctx = post_ctx("/construct-attribute");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, br#"<root id="A-1"/>"#)
+                .await,
+        );
+    }
+
+    // Distinct additional members (a different name) still materialize and are
+    // evaluated normally: the collision guard is scoped to modeled names only.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/construct-additional",
+            "path_regex": "^/construct-additional$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {
+                            "role": {"type": "string", "const": "user", "xml": {"name": "role"}}
+                        },
+                        "additionalProperties": {"type": "string"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/construct-additional");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root note="ok"><role>user</role></root>"#,
+            )
+            .await,
+    );
+    // A same-named attribute alongside the correct element still fails closed:
+    // the modeled slot is already filled, but the attribute collides by name.
+    let mut ctx = post_ctx("/construct-additional");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root role="user"><role>user</role></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
 async fn urlencoded_request_validation_converts_fields_to_schema_types() {
     let plugin = OpenapiValidator::new(&json!({
         "operations": [{

@@ -1678,9 +1678,11 @@ fn xml_node_to_value(
         // Always materialize undeclared members so JSON Schema keywords such as
         // additionalProperties, maxProperties, patternProperties, and propertyNames
         // observe the full XML payload instead of a filtered projection.
-        // Fail closed: a wrong-namespace member whose local name equals a
-        // namespace-qualified modeled JSON key / XML local must not rebind that
-        // property or be silently dropped — return a conversion error.
+        // Fail closed: a member that collides with a modeled JSON key / XML local
+        // but not the property's modeled XML construct or namespace (a
+        // wrong-namespace peer, or an attribute where an element is modeled and
+        // vice versa) must not rebind that property or be silently dropped;
+        // return a conversion error.
         let additional_schema = additional_property_schema_for_conversion(object_schema);
         for attr in node.attributes() {
             if modeled_names.contains_attribute(attr) {
@@ -1688,7 +1690,7 @@ fn xml_node_to_value(
             }
             if modeled_names.reserves_json_key(attr.name()) {
                 return Err(format!(
-                    "XML attribute '{}' uses a local name reserved for a namespace-qualified modeled property but does not match the required expanded name",
+                    "XML attribute '{}' collides with a modeled property name but does not match its modeled XML construct or namespace",
                     attr.name()
                 ));
             }
@@ -1696,9 +1698,7 @@ fn xml_node_to_value(
                 continue;
             }
             let value = match additional_schema {
-                Some(Some(schema)) => {
-                    scalar_to_schema_value(attr.value(), schema, conversion)?
-                }
+                Some(Some(schema)) => scalar_to_schema_value(attr.value(), schema, conversion)?,
                 _ => Value::String(attr.value().to_string()),
             };
             out.insert(attr.name().to_string(), value);
@@ -1710,7 +1710,7 @@ fn xml_node_to_value(
             let name = child.tag_name().name();
             if modeled_names.reserves_json_key(name) {
                 return Err(format!(
-                    "XML element '{name}' uses a local name reserved for a namespace-qualified modeled property but does not match the required expanded name"
+                    "XML element '{name}' collides with a modeled property name but does not match its modeled XML construct or namespace"
                 ));
             }
             let value = match additional_schema {
@@ -1745,8 +1745,7 @@ fn xml_array_values(
         xml_array_item_name(property_name, property_schema, item_schema);
     let mut values = Vec::new();
     if xml_wrapped(property_schema) {
-        let wrapper_local =
-            xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
+        let wrapper_local = xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
         let wrapper_namespace = xml_namespace(property_schema);
         let wrappers = child_elements_matching(node, wrapper_namespace, wrapper_local);
         if wrappers.len() > 1 {
@@ -1790,8 +1789,7 @@ fn mark_xml_array_modeled_names(
     let (item_namespace, item_local) =
         xml_array_item_name(property_name, property_schema, item_schema);
     if xml_wrapped(property_schema) {
-        let wrapper_local =
-            xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
+        let wrapper_local = xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
         let wrapper_namespace = xml_namespace(property_schema);
         modeled_names.insert_element(wrapper_namespace, wrapper_local, property_name);
         // Reserve namespace-qualified item locals (and the array JSON key when the
@@ -3855,16 +3853,22 @@ impl ModeledXmlNames {
     }
 
     fn insert_element(&mut self, namespace: Option<&str>, local: &str, json_key: &str) {
+        // Reserve the modeled JSON key unconditionally. Attributes and elements
+        // share the intermediate object's keyspace, so an additional member of the
+        // opposite XML construct (an attribute where this property is modeled as an
+        // element, or vice versa) could otherwise fill an unfilled modeled slot and
+        // pass validation the backend would reject: a validator/backend
+        // differential. Correct-construct members are consumed before the
+        // reserved-key check, so this only rejects cross-construct collisions.
+        self.reserve_json_key(json_key);
         match namespace {
             Some(namespace) => {
                 self.exact_elements
                     .insert((namespace.to_string(), local.to_string()));
-                // Reserve the modeled JSON key so a non-matching expanded name
-                // with the same local name cannot rebind the property.
-                self.reserve_json_key(json_key);
                 if local != json_key {
-                    // Also reserve the XML local when it differs: additional
-                    // materialization keys off the local name.
+                    // Also reserve the XML local when it differs so a non-matching
+                    // expanded name with the same local name fails closed rather
+                    // than rematerializing under the local as an additional member.
                     self.reserve_json_key(local);
                 }
             }
@@ -3875,11 +3879,12 @@ impl ModeledXmlNames {
     }
 
     fn insert_attribute(&mut self, namespace: Option<&str>, local: &str, json_key: &str) {
+        // Reserve the modeled JSON key unconditionally (see insert_element).
+        self.reserve_json_key(json_key);
         match namespace {
             Some(namespace) => {
                 self.exact_attributes
                     .insert((namespace.to_string(), local.to_string()));
-                self.reserve_json_key(json_key);
                 if local != json_key {
                     self.reserve_json_key(local);
                 }
@@ -3950,10 +3955,8 @@ fn child_elements_matching<'a>(
     local_name: &str,
 ) -> Vec<roxmltree::Node<'a, 'a>> {
     node.children()
-        .filter(|child| {
-            child.is_element()
-                && xml_expanded_name_matches(child.tag_name(), namespace, local_name)
-        })
+        .filter(roxmltree::Node::is_element)
+        .filter(|child| xml_expanded_name_matches(child.tag_name(), namespace, local_name))
         .collect()
 }
 
