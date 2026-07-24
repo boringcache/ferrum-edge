@@ -776,6 +776,65 @@ async fn xml_request_validation_honors_xml_metadata() {
 }
 
 #[tokio::test]
+async fn xml_request_validation_rejects_wrong_root_and_accepts_top_level_arrays() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/expected-root",
+            "path_regex": "^/expected-root$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "expected"},
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/xml");
+    let mut ctx = post_ctx("/expected-root");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, br#"<wrong/>"#)
+            .await,
+        Some(400),
+    );
+
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/values",
+            "path_regex": "^/values$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "array",
+                        "xml": {"name": "values"},
+                        "items": {"type": "integer"}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/values");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<values><value>1</value><value>2</value></values>"#,
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
 async fn xml_preserves_additional_properties_and_leaf_attributes() {
     // #3020: additionalProperties subschema must see unknown XML members.
     let plugin = OpenapiValidator::new(&json!({
