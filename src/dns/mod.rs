@@ -11,8 +11,8 @@
 //! implementation that plugs into every `reqwest::Client` so all HTTP clients
 //! automatically use the shared cache.
 
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use futures_util::stream::{self, StreamExt};
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{
@@ -2642,7 +2642,9 @@ mod tests {
         assert!(entry.is_error, "expected error generation for {hostname}");
         FailedRetryGeneration {
             consecutive_failures: entry.consecutive_failures,
-            first_failed_at: entry.first_failed_at.expect("error entries record first_failed_at"),
+            first_failed_at: entry
+                .first_failed_at
+                .expect("error entries record first_failed_at"),
             expires_at: entry.expires_at,
         }
     }
@@ -2758,7 +2760,10 @@ mod tests {
             "stale retry must not advance a newer error generation's backoff"
         );
         {
-            let entry = cache.cache.get("svc.example").expect("newer error retained");
+            let entry = cache
+                .cache
+                .get("svc.example")
+                .expect("newer error retained");
             assert!(entry.is_error);
             assert_eq!(entry.consecutive_failures, 1);
             assert_eq!(entry.applied_ttl, Duration::from_secs(10));
@@ -2926,7 +2931,10 @@ mod tests {
         // Simulate the cycle's Err(policy) branch: apply_failed_retry_error.
         assert!(cache.apply_failed_retry_error("metadata.internal", &generation, None));
         {
-            let entry = cache.cache.get("metadata.internal").expect("error retained");
+            let entry = cache
+                .cache
+                .get("metadata.internal")
+                .expect("error retained");
             assert_eq!(entry.consecutive_failures, 1);
             assert_eq!(entry.applied_ttl, Duration::from_secs(10));
             assert!(entry.expires_at > Instant::now());
