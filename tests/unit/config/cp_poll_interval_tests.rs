@@ -19,9 +19,8 @@ fn cp_db_poll_interval_uses_missed_tick_delay() {
         "CP poll loop must construct a tokio interval from FERRUM_DB_POLL_INTERVAL"
     );
     assert!(
-        poll_section.contains(
-            "interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);"
-        ),
+        poll_section
+            .contains("interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);"),
         "CP poll interval must Delay missed ticks (not default Burst) to avoid catch-up full polls"
     );
 
@@ -35,9 +34,8 @@ fn cp_db_poll_interval_uses_missed_tick_delay() {
         .expect("database poll task must be pushed onto background handles");
     let db_poll_section = &database[db_poll_start..db_poll_start + db_poll_end];
     assert!(
-        db_poll_section.contains(
-            "interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);"
-        ),
+        db_poll_section
+            .contains("interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);"),
         "database mode must retain Delay missed-tick behavior as the CP parity reference"
     );
 }
