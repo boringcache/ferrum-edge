@@ -1679,13 +1679,20 @@ fn xml_node_to_value(
         // additionalProperties, maxProperties, patternProperties, and propertyNames
         // observe the full XML payload instead of a filtered projection.
         // Fail closed: a wrong-namespace member whose local name equals a
-        // namespace-qualified modeled JSON key must not rebind that property.
+        // namespace-qualified modeled JSON key / XML local must not rebind that
+        // property or be silently dropped — return a conversion error.
         let additional_schema = additional_property_schema_for_conversion(object_schema);
         for attr in node.attributes() {
-            if modeled_names.contains_attribute(attr)
-                || modeled_names.reserves_json_key(attr.name())
-                || out.contains_key(attr.name())
-            {
+            if modeled_names.contains_attribute(attr) {
+                continue;
+            }
+            if modeled_names.reserves_json_key(attr.name()) {
+                return Err(format!(
+                    "XML attribute '{}' uses a local name reserved for a namespace-qualified modeled property but does not match the required expanded name",
+                    attr.name()
+                ));
+            }
+            if out.contains_key(attr.name()) {
                 continue;
             }
             let value = match additional_schema {
@@ -1702,7 +1709,9 @@ fn xml_node_to_value(
             }
             let name = child.tag_name().name();
             if modeled_names.reserves_json_key(name) {
-                continue;
+                return Err(format!(
+                    "XML element '{name}' uses a local name reserved for a namespace-qualified modeled property but does not match the required expanded name"
+                ));
             }
             let value = match additional_schema {
                 Some(Some(schema)) => xml_node_to_value(child, schema, conversion)?,
@@ -1772,11 +1781,14 @@ fn mark_xml_array_modeled_names(
             xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
         let wrapper_namespace = xml_namespace(property_schema);
         modeled_names.insert_element(wrapper_namespace, wrapper_local, property_name);
-        // When only items declare a namespace, still reserve the array JSON key
-        // and item local so a wrong-namespace peer cannot rebind them.
-        if wrapper_namespace.is_none() && item_namespace.is_some() {
-            modeled_names.reserve_json_key(property_name);
-            if item_local != property_name {
+        // Reserve namespace-qualified item locals (and the array JSON key when the
+        // wrapper itself omits xml.namespace) so a wrong-namespace peer cannot
+        // rebind them via additional-member insertion or silent drop.
+        if item_namespace.is_some() {
+            if wrapper_namespace.is_none() {
+                modeled_names.reserve_json_key(property_name);
+            }
+            if item_local != property_name && item_local != wrapper_local {
                 modeled_names.reserve_json_key(item_local);
             }
         }
@@ -3814,9 +3826,9 @@ struct ModeledXmlNames {
     exact_attributes: HashSet<(String, String)>,
     /// Unqualified attribute locals when the schema omits `xml.namespace`.
     unqualified_attributes: HashSet<String>,
-    /// JSON property keys claimed by namespace-qualified modeled properties.
-    /// Wrong-namespace members must not materialize under these keys via
-    /// local-name-only additional-member insertion.
+    /// JSON property keys / XML locals claimed by namespace-qualified modeled
+    /// properties. Wrong-namespace members with these locals are rejected
+    /// fail-closed rather than dropped or rematerialized as additional members.
     reserved_json_keys: HashSet<String>,
 }
 

@@ -1428,16 +1428,16 @@ async fn xml_hardening_preserves_draft7_and_draft202012() {
 
 #[tokio::test]
 async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
-    // Wrong-namespace members that share a modeled local name must not fall
-    // through as additional members under the modeled JSON key when
-    // additionalProperties is omitted or true (#3022 collision follow-up).
+    // Optional modeled properties: rejection must come from the wrong-namespace
+    // collision itself, not from a missing required member (#3022). Covers
+    // additionalProperties omitted and true for scalar elements, attributes,
+    // wrapped arrays, and unwrapped arrays.
     let headers = content_type_headers("application/xml");
 
     for additional in [Value::Null, json!(true)] {
         let mut body_schema = json!({
             "type": "object",
             "xml": {"name": "root"},
-            "required": ["role"],
             "properties": {
                 "role": {
                     "type": "string",
@@ -1472,7 +1472,7 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
             panic!("schema with additionalProperties={additional} must admit: {error}")
         });
 
-        // Wrong namespace + matching local/const must not bind `role`.
+        // Wrong-namespace local alone must fail closed (property is optional).
         let mut ctx = post_ctx("/rebind");
         ctx.headers = headers.clone();
         assert_reject(
@@ -1484,6 +1484,14 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
                 )
                 .await,
             Some(400),
+        );
+        // Empty root is accepted when the modeled property is optional.
+        let mut ctx = post_ctx("/rebind");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, br#"<root/>"#)
+                .await,
         );
         // Correct URI under an arbitrary prefix still accepted; unrelated
         // additional members still materialize when allowed.
@@ -1500,12 +1508,11 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
         );
     }
 
-    // Wrong-namespace attribute with additionalProperties omitted/true.
+    // Optional wrong-namespace attribute with additionalProperties omitted/true.
     for additional in [Value::Null, json!(true)] {
         let mut body_schema = json!({
             "type": "object",
             "xml": {"name": "root"},
-            "required": ["id"],
             "properties": {
                 "id": {
                     "type": "string",
@@ -1555,6 +1562,13 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
         ctx.headers = headers.clone();
         assert_continue(
             plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, br#"<root/>"#)
+                .await,
+        );
+        let mut ctx = post_ctx("/attr-rebind");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
                 .on_final_request_body_with_context(
                     &mut ctx,
                     &headers,
@@ -1564,129 +1578,159 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
         );
     }
 
-    // Namespace-qualified wrapped array: wrong-namespace wrapper must not
-    // rebind the modeled array key when additionalProperties is omitted.
-    let plugin = OpenapiValidator::new(&json!({
-        "operations": [{
-            "method": "POST",
-            "path_template": "/wrapped-rebind",
-            "path_regex": "^/wrapped-rebind$",
-            "request_body": {
-                "content": {
-                    "application/xml": {
-                        "type": "object",
-                        "xml": {"name": "root"},
-                        "required": ["items"],
-                        "properties": {
-                            "items": {
-                                "type": "array",
-                                "minItems": 1,
-                                "xml": {
-                                    "name": "items",
-                                    "wrapped": true,
-                                    "namespace": "https://trusted.example/schema",
-                                    "prefix": "trusted"
-                                },
-                                "items": {
-                                    "type": "string",
-                                    "xml": {
-                                        "name": "item",
-                                        "namespace": "https://trusted.example/schema",
-                                        "prefix": "trusted"
-                                    }
-                                }
-                            }
+    // Optional wrapped array: wrong-namespace wrapper must reject on its own
+    // for additionalProperties omitted and true.
+    for additional in [Value::Null, json!(true)] {
+        let mut body_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "xml": {
+                        "name": "items",
+                        "wrapped": true,
+                        "namespace": "https://trusted.example/schema",
+                        "prefix": "trusted"
+                    },
+                    "items": {
+                        "type": "string",
+                        "xml": {
+                            "name": "item",
+                            "namespace": "https://trusted.example/schema",
+                            "prefix": "trusted"
                         }
                     }
                 }
             }
-        }]
-    }))
-    .unwrap();
-    let mut ctx = post_ctx("/wrapped-rebind");
-    ctx.headers = headers.clone();
-    assert_reject(
-        plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &headers,
-                br#"<root xmlns:evil="https://attacker.example/schema"><evil:items><evil:item>a</evil:item></evil:items></root>"#,
-            )
-            .await,
-        Some(400),
-    );
-    let mut ctx = post_ctx("/wrapped-rebind");
-    ctx.headers = headers.clone();
-    assert_continue(
-        plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &headers,
-                br#"<root xmlns:x="https://trusted.example/schema"><x:items><x:item>a</x:item></x:items><note>ok</note></root>"#,
-            )
-            .await,
-    );
+        });
+        if !additional.is_null() {
+            body_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/wrapped-rebind",
+                "path_regex": "^/wrapped-rebind$",
+                "request_body": {
+                    "content": {
+                        "application/xml": body_schema
+                    }
+                }
+            }]
+        }))
+        .unwrap_or_else(|error| {
+            panic!("wrapped schema with additionalProperties={additional} must admit: {error}")
+        });
+        let mut ctx = post_ctx("/wrapped-rebind");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:evil="https://attacker.example/schema"><evil:items><evil:item>a</evil:item></evil:items></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        // Wrong-namespace item local at the object level also fails closed.
+        let mut ctx = post_ctx("/wrapped-rebind");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:evil="https://attacker.example/schema"><evil:item>a</evil:item></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        let mut ctx = post_ctx("/wrapped-rebind");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:x="https://trusted.example/schema"><x:items><x:item>a</x:item></x:items><note>ok</note></root>"#,
+                )
+                .await,
+        );
+    }
 
-    // Namespace-qualified unwrapped array with additionalProperties true.
-    let plugin = OpenapiValidator::new(&json!({
-        "operations": [{
-            "method": "POST",
-            "path_template": "/unwrapped-rebind",
-            "path_regex": "^/unwrapped-rebind$",
-            "request_body": {
-                "content": {
-                    "application/xml": {
-                        "type": "object",
-                        "xml": {"name": "root"},
-                        "required": ["tags"],
-                        "additionalProperties": true,
-                        "properties": {
-                            "tags": {
-                                "type": "array",
-                                "minItems": 1,
-                                "xml": {
-                                    "namespace": "https://trusted.example/schema",
-                                    "prefix": "trusted"
-                                },
-                                "items": {
-                                    "type": "string",
-                                    "xml": {
-                                        "name": "tags",
-                                        "namespace": "https://trusted.example/schema",
-                                        "prefix": "trusted"
-                                    }
-                                }
-                            }
+    // Optional unwrapped array with additionalProperties omitted and true.
+    for additional in [Value::Null, json!(true)] {
+        let mut body_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "xml": {
+                        "namespace": "https://trusted.example/schema",
+                        "prefix": "trusted"
+                    },
+                    "items": {
+                        "type": "string",
+                        "xml": {
+                            "name": "tags",
+                            "namespace": "https://trusted.example/schema",
+                            "prefix": "trusted"
                         }
                     }
                 }
             }
-        }]
-    }))
-    .unwrap();
-    let mut ctx = post_ctx("/unwrapped-rebind");
-    ctx.headers = headers.clone();
-    assert_reject(
-        plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &headers,
-                br#"<root xmlns:evil="https://attacker.example/schema"><evil:tags>a</evil:tags></root>"#,
-            )
-            .await,
-        Some(400),
-    );
-    let mut ctx = post_ctx("/unwrapped-rebind");
-    ctx.headers = headers.clone();
-    assert_continue(
-        plugin
-            .on_final_request_body_with_context(
-                &mut ctx,
-                &headers,
-                br#"<root xmlns:trusted="https://trusted.example/schema"><trusted:tags>a</trusted:tags><note>ok</note></root>"#,
-            )
-            .await,
-    );
+        });
+        if !additional.is_null() {
+            body_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/unwrapped-rebind",
+                "path_regex": "^/unwrapped-rebind$",
+                "request_body": {
+                    "content": {
+                        "application/xml": body_schema
+                    }
+                }
+            }]
+        }))
+        .unwrap_or_else(|error| {
+            panic!("unwrapped schema with additionalProperties={additional} must admit: {error}")
+        });
+        let mut ctx = post_ctx("/unwrapped-rebind");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:evil="https://attacker.example/schema"><evil:tags>a</evil:tags></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        let mut ctx = post_ctx("/unwrapped-rebind");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:trusted="https://trusted.example/schema"><trusted:tags>a</trusted:tags><note>ok</note></root>"#,
+                )
+                .await,
+        );
+    }
 
     // Properties that omit xml.namespace still match by local name only.
     let plugin = OpenapiValidator::new(&json!({
@@ -1699,7 +1743,6 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
                     "application/xml": {
                         "type": "object",
                         "xml": {"name": "root"},
-                        "required": ["role"],
                         "properties": {
                             "role": {
                                 "type": "string",
@@ -1741,7 +1784,6 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
                             "namespace": "https://trusted.example/schema",
                             "prefix": "trusted"
                         },
-                        "required": ["role"],
                         "properties": {
                             "role": {"type": "string", "const": "user"}
                         }
