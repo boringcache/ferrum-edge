@@ -2415,6 +2415,7 @@ async fn test_mirror_strips_hostile_h1_connection_trailer_and_internal_markers()
         "x-forwarded-proto",
         "x-forwarded-host",
         "x-loadtesting-key",
+        "authorization",
     ] {
         assert!(
             !observed.contains_key(stripped),
@@ -2429,10 +2430,6 @@ async fn test_mirror_strips_hostile_h1_connection_trailer_and_internal_markers()
     assert_eq!(
         observed.get("x-custom").map(String::as_str),
         Some("keep-me")
-    );
-    assert_eq!(
-        observed.get("authorization").map(String::as_str),
-        Some("Bearer keep")
     );
     match observed.get("content-length").map(String::as_str) {
         None | Some("0") => {}
@@ -3142,7 +3139,7 @@ fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
         "expected allowlist count bound, got {allow_count}"
     );
 
-    let long_allow = format!("x-{}", "a".repeat(250));
+    let long_allow = format!("x-{}", "a".repeat(255));
     assert!(long_allow.len() > 256);
     let allow_len = RequestMirror::new(
         &json!({
