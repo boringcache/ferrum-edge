@@ -120,24 +120,21 @@ impl std::fmt::Display for SharedPoolCreateError {
 
 impl std::error::Error for SharedPoolCreateError {}
 
-impl From<SharedPoolCreateError> for anyhow::Error {
-    fn from(err: SharedPoolCreateError) -> Self {
-        anyhow::Error::new(err)
-    }
-}
-
 /// Error types that can be broadcast to coalesced create waiters.
 ///
-/// Default capture walks the std error chain. Typed pool errors override this
-/// when they need to preserve classification-critical variants (for example
-/// direct-H2 `BackendSelectedHttp1`) without cloning non-`Clone` sources.
-pub trait ShareablePoolCreateError: std::error::Error + 'static {
+/// Implementations capture the std error chain or preserve
+/// classification-critical typed variants (for example direct-H2
+/// `BackendSelectedHttp1`) without cloning non-`Clone` sources.
+pub trait ShareablePoolCreateError: 'static {
+    fn to_shared(&self, generation: u64) -> SharedPoolCreateError;
+}
+
+impl ShareablePoolCreateError for anyhow::Error {
     fn to_shared(&self, generation: u64) -> SharedPoolCreateError {
-        SharedPoolCreateError::capture(self, generation)
+        SharedPoolCreateError::capture(self.as_ref(), generation)
     }
 }
 
-impl ShareablePoolCreateError for anyhow::Error {}
 impl ShareablePoolCreateError for SharedPoolCreateError {
     fn to_shared(&self, generation: u64) -> SharedPoolCreateError {
         // Preserve kind/detail; refresh generation for a new broadcast.
@@ -539,11 +536,10 @@ impl<M: PoolManager> GenericPool<M> {
                         .fetch_add(1, Ordering::Relaxed)
                         .saturating_add(1);
                     let shared = err.to_shared(generation);
-                    pending_guard.fail(shared.clone());
-                    // Creator returns the same shared representation waiters
-                    // observe, so classification stays consistent without
-                    // requiring the original error to be `Clone`.
-                    return Err(E::from(shared));
+                    pending_guard.fail(shared);
+                    // Preserve the creator's full typed/source error. Only
+                    // coalesced waiters need the cloneable reconstruction.
+                    return Err(err);
                 }
             }
         }
@@ -1026,20 +1022,26 @@ mod tests {
             "waiters should wait for the single in-flight create (elapsed {elapsed:?})"
         );
 
-        let generations: Vec<u64> = results
+        let shared_generations: Vec<u64> = results
             .iter()
-            .map(|result| {
+            .filter_map(|result| {
                 let err = result.as_ref().unwrap_err();
                 err.downcast_ref::<SharedPoolCreateError>()
-                    .unwrap_or_else(|| panic!("expected SharedPoolCreateError, got {err:?}"))
-                    .generation()
+                    .map(SharedPoolCreateError::generation)
             })
             .collect();
-        assert!(
-            generations.windows(2).all(|pair| pair[0] == pair[1]),
-            "all waiters must share the same failure generation: {generations:?}"
+        assert_eq!(
+            shared_generations.len(),
+            waiter_count - 1,
+            "one creator must retain its original error while every waiter receives the shared error"
         );
-        assert_ne!(generations[0], 0);
+        assert!(
+            shared_generations
+                .windows(2)
+                .all(|pair| pair[0] == pair[1]),
+            "all waiters must share the same failure generation: {shared_generations:?}"
+        );
+        assert_ne!(shared_generations[0], 0);
 
         // Later independent request / generation can succeed (no durable negative cache).
         let recovered = pool
