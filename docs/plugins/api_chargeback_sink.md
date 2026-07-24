@@ -285,11 +285,23 @@ handed to the spool (when enabled) instead of being dropped.
 
 ## Spool And Replay
 
-Spool files are written under:
+Spool files are written under a **managed namespace** that partitions by stable
+node identity, plugin-config identity, and ClickHouse destination/schema
+identity:
 
 ```text
-<spool.dir>/<node_id>/<YYYYMMDD>/<ULID>.ndjson.zst
+<spool.dir>/<safe_node>/<plugin_seg>/<dest_seg>/spool.meta.json
+<spool.dir>/<safe_node>/<plugin_seg>/<dest_seg>/<YYYYMMDD>/<ULID>.ndjson.zst
 ```
+
+`safe_node` / `plugin_seg` are single safe path components derived from
+`FERRUM_NODE_ID` (and the plugin-config id). Absolute paths, parent segments,
+separators, NUL, drive letters, UNC, and Windows device prefixes are rejected or
+hashed so they cannot escape `spool.dir`. `dest_seg` is a hash of the sanitized
+ClickHouse endpoint plus database and table. Versioned `spool.meta.json` is
+persisted at prepare time and validated before every replay listing so one sink
+instance cannot replay, delete, or quarantine another destination's billing
+files.
 
 The sink writes failed batches and queue high-water overflow to an async spool
 delivery worker (bounded by `spool.delivery_queue_capacity`). Request and body
@@ -297,9 +309,25 @@ terminal hooks only enqueue to that worker; compression, directory scans, writes
 and fsync never run inline on those hooks. Saturation of the delivery queue is
 counted (`chargeback_sink_spool_jobs_lost_total` /
 `chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
-created with private permissions, written as `*.tmp`, fsynced, and renamed into
-place. The background replayer scans durable data files (`*.ndjson` /
-`*.ndjson.zst`) in lexicographic order.
+created with private permissions, written as generation-owned `*.g<generation>.tmp`
+temps, fsynced, renamed into place, then directory-fsynced on Unix. A Unix
+parent-directory open/fsync failure is a write failure (the publish is rolled
+back) before any snapshot baseline commit. On platforms that cannot fsync
+directories (notably Windows), successful file sync + rename is the documented
+portability durability boundary—there is no silent “best-effort” success after a
+failed directory sync on Unix.
+
+Spool enumeration never follows symlinks (scan, replay, eviction, quarantine,
+and stale-temp cleanup use non-following metadata), enforces path containment
+under the managed namespace, bounds traversal depth/file count, and skips
+directory cycles.
+
+The background replayer scans durable data files (`*.ndjson` / `*.ndjson.zst`)
+in lexicographic order, then **atomically claims** each candidate by renaming it
+to `*.inflight` before ClickHouse delivery. In-flight files count toward
+`spool.max_bytes` but are excluded from eviction. Retryable delivery releases the
+claim back to the durable name; crash recovery renames leftover `*.inflight`
+files back during live prepare.
 
 Queued export and spool-delivery events retain the same byte leases under
 `batch.buffer_max_bytes`; transferring an event to the spool worker does not
@@ -335,11 +363,16 @@ fields are never logged.
   payload, response bodies, credentials, or charge-record PII. If the metadata
   write fails, the original file remains replayable; successfully inserted
   rows may be retried with their unchanged `event_id` idempotency identity.
-- Stale `*.tmp` files left by an interrupted atomic write are deleted at spool
-  startup and after a failed write/rename so they cannot accumulate indefinitely.
+- Stale generation-owned `*.g<generation>.tmp` files left by an interrupted
+  atomic write are reconciled only when demonstrably stale and not leased by a
+  live generation sharing the managed root. A reloaded generation must not
+  delete another live generation's active temp.
+- In-flight replay claims (`*.inflight`) are recovered to durable replayable
+  names during live prepare after crash/restart.
 
-Dead-letter metadata and corrupt files remain under the node spool tree and
-count toward `spool.max_bytes` until eviction drops the oldest owned file.
+Dead-letter metadata, corrupt files, temps, and in-flight claims remain under
+the managed namespace and count toward `spool.max_bytes` until eviction drops the
+oldest **evictable** owned file (in-flight claims are skipped).
 
 Offline validation and candidate-generation staging do not create, chmod, or
 probe `spool.dir`. After cache publication, the committed replayer prepares and
@@ -349,12 +382,13 @@ probe is persistent operational evidence: status reports `spool.available=false`
 `chargeback_sink_spool_prepare_failures_total` increments until storage recovers.
 
 `spool.max_bytes` is a hard ceiling on **encoded** on-disk bytes owned by this
-sink under `<spool.dir>/<node_id>/` (after compression when `compression` is
+sink under its managed namespace (after compression when `compression` is
 `zstd`). The budget and status/metrics count every retained file class:
 
 - active data files (`*.ndjson` / `*.ndjson.zst`)
-- in-progress atomic-write temps (`*.ndjson.tmp`, `*.ndjson.zst.tmp`, and
+- in-progress atomic-write temps (generation-owned `*.g<generation>.tmp` and
   dead-letter metadata `*.rejected.meta.tmp` files)
+- in-flight replay claims (`*.inflight`)
 - corrupt quarantine (`*.ndjson.corrupt` / `*.ndjson.zst.corrupt`)
 - metadata-only dead letters (`*.ndjson.rejected.meta` /
   `*.ndjson.zst.rejected.meta`)
@@ -378,11 +412,12 @@ max_bytes >= peak_events_per_second * average_encoded_event_bytes * outage_secon
 
 When `spool.dir` is backed by persistent storage, set `FERRUM_NODE_ID` to a
 stable identity such as a StatefulSet ordinal (see
-[configuration.md](../configuration.md) and `ferrum.conf`). Accepted values
-are any non-empty trimmed string; whitespace-only is ignored and values longer
-than 512 characters are truncated. Resolution order is `FERRUM_NODE_ID`, then
-`HOSTNAME`, then `/etc/hostname`, then `unknown`. If the node ID changes
-across restarts, the sink logs a warning when it finds sibling spool
+[configuration.md](../configuration.md) and `ferrum.conf`). The value is
+length-bounded for charge-event provenance and encoded into a single safe path
+component for the managed namespace (hostile absolute/parent/separator/NUL/drive
+forms are hashed rather than joined raw). Resolution order is `FERRUM_NODE_ID`,
+then `HOSTNAME`, then `/etc/hostname`, then `unknown`. If the node component
+changes across restarts, the sink logs a warning when it finds sibling spool
 directories that may contain events from an older identity.
 
 ## Reconciliation Queries

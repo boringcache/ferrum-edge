@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, classify_clickhouse_acknowledgement_for_tests,
-    classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
-    decode_spool_file_for_tests, encode_spool_bytes_for_tests, new_ulid, render_prometheus,
-    render_status_json, replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
-    serialize_json_each_row, write_private_file_atomically_for_tests,
+    SpoolFsFault, SpoolManager, SpoolSettings, classify_clickhouse_acknowledgement_for_tests,
+    classify_clickhouse_http_status_for_tests, clear_spool_fs_fault_for_tests,
+    clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
+    new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
+    replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
+    set_spool_fs_fault_for_tests, write_private_file_atomically_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
@@ -1027,6 +1028,37 @@ fn encoded_event_len(event: &ChargeEvent, compression: SpoolCompression) -> u64 
         .len() as u64
 }
 
+fn default_test_namespace_root(spool_dir: &Path) -> std::path::PathBuf {
+    SpoolManager::namespace_root_path_for_tests(
+        spool_dir,
+        "node-a",
+        "test-plugin",
+        "http://127.0.0.1:8123",
+        "ferrum",
+        "charges_raw",
+    )
+    .unwrap()
+}
+
+fn find_spool_namespace_root(spool_dir: &Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![spool_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()) == Some("spool.meta.json") {
+                return path.parent().map(|p| p.to_path_buf());
+            }
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    None
+}
+
 fn disk_owned_bytes(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
@@ -1036,9 +1068,12 @@ fn disk_owned_bytes(root: &Path) -> u64 {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(meta) = entry.metadata() else {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_dir() {
                 stack.push(path);
                 continue;
@@ -1046,8 +1081,14 @@ fn disk_owned_bytes(root: &Path) -> u64 {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            let owned = name.ends_with(".ndjson.tmp")
+            if name == "spool.meta.json" {
+                continue;
+            }
+            let owned = name.ends_with(".inflight")
+                || name.ends_with(".ndjson.tmp")
                 || name.ends_with(".ndjson.zst.tmp")
+                || (name.contains(".ndjson.g") && name.ends_with(".tmp"))
+                || (name.contains(".ndjson.zst.g") && name.ends_with(".tmp"))
                 || name.ends_with(".ndjson.rejected.meta.tmp")
                 || name.ends_with(".ndjson.zst.rejected.meta.tmp")
                 || name.ends_with(".ndjson.corrupt")
@@ -1058,7 +1099,8 @@ fn disk_owned_bytes(root: &Path) -> u64 {
                     && !name.ends_with(".tmp")
                     && !name.ends_with(".corrupt")
                     && !name.ends_with(".rejected")
-                    && !name.ends_with(".meta"));
+                    && !name.ends_with(".meta")
+                    && !name.ends_with(".inflight"));
             if owned {
                 total = total.saturating_add(meta.len());
             }
@@ -1105,7 +1147,7 @@ fn spool_write_round_trip_and_oldest_eviction() {
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
         stats.bytes,
-        disk_owned_bytes(&temp.path().join("node-a")),
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
         "status bytes must match on-disk owned usage"
     );
 }
@@ -1135,7 +1177,7 @@ fn spool_rejects_empty_spool_oversized_batch() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 0);
     assert_eq!(stats.bytes, 0);
-    assert_eq!(disk_owned_bytes(&temp.path().join("node-a")), 0);
+    assert_eq!(disk_owned_bytes(&default_test_namespace_root(temp.path())), 0);
 }
 
 #[test]
@@ -1161,7 +1203,7 @@ fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+    assert_eq!(stats.bytes, disk_owned_bytes(&default_test_namespace_root(temp.path())));
 
     // With the resident file still present, a second write of the same size must
     // evict first (exact fit after eviction), not exceed the ceiling.
@@ -1200,7 +1242,7 @@ fn spool_quota_uses_compressed_encoded_size() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+    assert_eq!(stats.bytes, disk_owned_bytes(&default_test_namespace_root(temp.path())));
 
     // Using the uncompressed length as the ceiling must not be how admission
     // decides: when compressed size exceeds an artificially smaller budget,
@@ -1225,7 +1267,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
     let temp = tempfile::tempdir().unwrap();
     let event = sample_event("evt-after-corrupt");
     let encoded_len = encoded_event_len(&event, SpoolCompression::None);
-    let corrupt_dir = temp.path().join("node-a").join("20260524");
+    let corrupt_dir = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&corrupt_dir).unwrap();
     let corrupt = corrupt_dir.join("00000000000000000000000000.ndjson.corrupt");
     fs::write(&corrupt, vec![0u8; encoded_len as usize]).unwrap();
@@ -1242,7 +1284,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
     let before = spool.scan_stats().unwrap();
     assert_eq!(before.files, 1);
     assert_eq!(before.bytes, encoded_len);
-    assert_eq!(before.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+    assert_eq!(before.bytes, disk_owned_bytes(&default_test_namespace_root(temp.path())));
 
     let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
     assert!(written.exists());
@@ -1258,7 +1300,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
 #[test]
 fn spool_reconciles_stale_tmp_files_at_startup() {
     let temp = tempfile::tempdir().unwrap();
-    let day = temp.path().join("node-a").join("20260524");
+    let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
     let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
     fs::write(&stale_tmp, vec![0u8; 4096]).unwrap();
@@ -1279,7 +1321,7 @@ fn spool_reconciles_stale_tmp_files_at_startup() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 0);
     assert_eq!(stats.bytes, 0);
-    assert_eq!(disk_owned_bytes(&temp.path().join("node-a")), 0);
+    assert_eq!(disk_owned_bytes(&default_test_namespace_root(temp.path())), 0);
 }
 
 #[test]
@@ -1287,7 +1329,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let event = sample_event("evt-tmp-budget");
     let encoded_len = encoded_event_len(&event, SpoolCompression::None);
-    let day = temp.path().join("node-a").join("20260524");
+    let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
     let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
     fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
@@ -1314,7 +1356,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+    assert_eq!(stats.bytes, disk_owned_bytes(&default_test_namespace_root(temp.path())));
 
     let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
     assert!(written.exists());
@@ -1357,7 +1399,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
         stats.bytes,
-        disk_owned_bytes(&temp.path().join("node-a")),
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
         "status bytes must match on-disk owned usage after concurrent writes"
     );
 }
@@ -1390,25 +1432,18 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
         // replayer wakes on the publication gate and creates/probes live
         // storage on its first tick. Validation and pre-commit staging must
         // not create this directory.
-        let mut node_dirs = Vec::new();
+        let mut namespace_root = None;
         for _ in 0..200 {
-            node_dirs = fs::read_dir(temp.path())
-                .unwrap()
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir())
-                .collect();
-            if node_dirs.len() == 1 {
+            namespace_root = find_spool_namespace_root(temp.path());
+            if namespace_root.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(
-            node_dirs.len(),
-            1,
-            "committed spool should create exactly one node directory"
+        let namespace_root = namespace_root.expect(
+            "committed spool should create a managed namespace with spool.meta.json",
         );
-        let day = node_dirs[0].join("20260524");
+        let day = namespace_root.join("20260524");
         fs::create_dir_all(&day).unwrap();
         let corrupt = day.join("00000000000000000000000000.ndjson.corrupt");
         fs::write(&corrupt, vec![0u8; corrupt_bytes as usize]).unwrap();
@@ -1522,7 +1557,7 @@ fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
-    let day = temp.path().join("node-a").join("20260524");
+    let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
     let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
     fs::write(&stale_tmp, vec![0u8; 128]).unwrap();
@@ -1603,7 +1638,7 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
-    let corrupt_dir = temp.path().join("node-a").join("20260524");
+    let corrupt_dir = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&corrupt_dir).unwrap();
     let corrupt = corrupt_dir.join("00000000000000000000000000.ndjson");
     fs::write(&corrupt, [0xff, 0xfe, 0xfd]).unwrap();
@@ -2778,4 +2813,310 @@ async fn config_validation_rejects_buffer_max_bytes_and_spool_delivery_queue() {
     ok["spool"]["delivery_queue_capacity"] = json!(128);
     ApiChargebackSink::new(&ok, PluginHttpClient::default(), "ferrum")
         .expect("valid byte-budget and delivery queue knobs must admit");
+}
+
+#[test]
+fn spool_path_component_rejects_or_encodes_escape_forms() {
+    let hashed = [
+        "../escape",
+        "..\\escape",
+        "/abs",
+        "C:\\windows",
+        "C:/windows",
+        r"\\?\C:\windows",
+        r"\\.\pipe\x",
+        "//unc/share",
+        "\\\\server\\share",
+        "has/slash",
+        "has\\slash",
+        ".",
+        "..",
+    ];
+    for raw in hashed {
+        let encoded = SpoolManager::encode_spool_path_component_for_tests(raw)
+            .unwrap_or_else(|err| panic!("hostile component {raw:?} should encode: {err}"));
+        assert!(
+            encoded.starts_with("n_"),
+            "hostile {raw:?} must be hashed, got {encoded}"
+        );
+        assert!(!encoded.contains('/') && !encoded.contains('\\') && !encoded.contains('\0'));
+    }
+    let nul_err = SpoolManager::encode_spool_path_component_for_tests("x\0y")
+        .expect_err("NUL must be rejected");
+    assert!(nul_err.contains("NUL"));
+    assert_eq!(
+        SpoolManager::encode_spool_path_component_for_tests("edge-0").unwrap(),
+        "edge-0"
+    );
+}
+
+#[test]
+fn spool_namespaces_partition_by_plugin_and_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
+        compression: SpoolCompression::None,
+    };
+    let a = SpoolManager::for_tests_with_identity(
+        settings.clone(),
+        "node-a",
+        "plugin-a",
+        "http://ch-a:8123",
+        "ferrum",
+        "charges_a",
+        1,
+    )
+    .unwrap();
+    let b = SpoolManager::for_tests_with_identity(
+        settings,
+        "node-a",
+        "plugin-b",
+        "http://ch-b:8123",
+        "ferrum",
+        "charges_b",
+        2,
+    )
+    .unwrap();
+    let path_a = a.write_events(&[sample_event("evt-a")]).unwrap();
+    let path_b = b.write_events(&[sample_event("evt-b")]).unwrap();
+    assert_ne!(
+        a.namespace_root_for_tests(),
+        b.namespace_root_for_tests(),
+        "distinct plugin/destination identities must not share a namespace"
+    );
+    assert!(path_a.starts_with(a.namespace_root_for_tests()));
+    assert!(path_b.starts_with(b.namespace_root_for_tests()));
+    assert!(
+        !path_a.starts_with(b.namespace_root_for_tests()),
+        "sink B must not own sink A files"
+    );
+
+    // Replay metadata validation: B must refuse A's namespace files even if planted.
+    let foreign = b.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&foreign).unwrap();
+    let planted = foreign.join("00000000000000000000000000.ndjson");
+    fs::copy(&path_a, &planted).unwrap();
+    // Swap meta to A's identity under B's root should fail closed on list/replay.
+    let meta_path = b.namespace_root_for_tests().join("spool.meta.json");
+    let mut meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["plugin_config_id"] = json!("plugin-a");
+    fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+    let err = b
+        .list_replayable_spool_files_for_tests()
+        .expect_err("mismatched namespace metadata must fail closed");
+    assert!(
+        err.contains("does not match this sink identity"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn spool_scan_ignores_symlinks_and_stays_in_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("secret.ndjson");
+    fs::write(&outside_file, b"{\"event_id\":\"leaked\"}\n").unwrap();
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let link = spool.namespace_root_for_tests().join("escape-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
+
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(
+        owned.iter().all(|path| path.starts_with(spool.namespace_root_for_tests())),
+        "owned listing must stay inside the managed namespace"
+    );
+    assert!(
+        owned.iter().all(|path| path != &outside_file),
+        "symlink targets outside the namespace must not be collected"
+    );
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(replayable.is_empty());
+}
+
+#[test]
+fn reload_generation_does_not_delete_active_temp_of_live_peer() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
+        compression: SpoolCompression::None,
+    };
+    let gen1 = Arc::new(
+        SpoolManager::for_tests_with_identity(
+            settings.clone(),
+            "node-a",
+            "plugin-race",
+            "http://127.0.0.1:8123",
+            "ferrum",
+            "charges_raw",
+            11,
+        )
+        .unwrap(),
+    );
+    let day = gen1.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let active_tmp = day.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.ndjson.g11.tmp");
+    fs::write(&active_tmp, b"partial").unwrap();
+    gen1.set_active_write_tmp_for_tests(Some(active_tmp.clone()))
+        .unwrap();
+
+    let gen2 = SpoolManager::for_tests_with_identity(
+        settings,
+        "node-a",
+        "plugin-race",
+        "http://127.0.0.1:8123",
+        "ferrum",
+        "charges_raw",
+        12,
+    )
+    .unwrap();
+    gen2.prepare_live_storage_for_tests().unwrap();
+    assert!(
+        active_tmp.exists(),
+        "replacement generation must not delete another live generation's active temp"
+    );
+    gen1.set_active_write_tmp_for_tests(None).unwrap();
+    drop(gen2);
+    drop(gen1);
+}
+
+#[test]
+fn atomic_spool_write_fault_injection_surfaces_before_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join("batch.ndjson");
+    let tmp_path = temp.path().join("batch.ndjson.tmp");
+    for fault in [
+        SpoolFsFault::FileSync,
+        SpoolFsFault::Rename,
+        SpoolFsFault::DirOpen,
+        SpoolFsFault::DirSync,
+    ] {
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&final_path);
+        set_spool_fs_fault_for_tests(fault);
+        let err = write_private_file_atomically_for_tests(&tmp_path, &final_path, b"{\"ok\":true}\n")
+            .expect_err("injected fault must fail the durable write");
+        clear_spool_fs_fault_for_tests();
+        assert!(
+            err.contains("injected failure") || err.contains("failed to"),
+            "unexpected error for {fault:?}: {err}"
+        );
+        assert!(!final_path.exists(), "faulted write must not publish {fault:?}");
+        assert!(
+            !tmp_path.exists(),
+            "faulted write must clean leftover temp for {fault:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_inflight_claim_survives_eviction_for_retryable_and_recovers() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[503]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let probe = sample_event("evt-00");
+    let encoded_len = encoded_event_len(&probe, SpoolCompression::None);
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len.saturating_mul(2),
+        replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
+        compression: SpoolCompression::None,
+    };
+    let spool = Arc::new(SpoolManager::for_tests(settings, "node-a").unwrap());
+    let oldest = spool.write_events(&[sample_event("evt-old")]).unwrap();
+    let newer = spool.write_events(&[sample_event("evt-new")]).unwrap();
+    assert!(oldest.exists());
+    assert!(newer.exists());
+
+    let claimed = spool.claim_replay_file_for_tests(&oldest).unwrap();
+    assert!(claimed.exists());
+    assert!(!oldest.exists());
+    assert!(
+        claimed
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .ends_with(".inflight")
+    );
+
+    // Quota pressure while the oldest file is claimed must not delete it.
+    let overflow = spool
+        .write_events(&[sample_event("evt-overflow")])
+        .unwrap();
+    assert!(
+        claimed.exists(),
+        "in-flight claim must be excluded from eviction"
+    );
+    assert!(
+        !newer.exists() || overflow.exists(),
+        "eviction may drop a non-inflight owned file under pressure"
+    );
+
+    let err = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("503 must remain retryable");
+    assert!(err.contains("503") || err.to_lowercase().contains("retry") || !err.is_empty());
+
+    // Crash-recovery path: leave an inflight, drop manager state via prepare.
+    let recovered_src = spool.write_events(&[sample_event("evt-recover")]).unwrap();
+    let recovered_inflight = spool.claim_replay_file_for_tests(&recovered_src).unwrap();
+    spool.prepare_live_storage_for_tests().unwrap();
+    assert!(
+        !recovered_inflight.exists(),
+        "prepare must recover inflight files"
+    );
+    assert!(
+        recovered_src.exists(),
+        "recovered inflight must return to the durable replayable name"
+    );
+}
+
+#[tokio::test]
+async fn replay_inflight_delivered_and_permanent_outcomes() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+
+    let server_ok = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server_ok)
+        .await;
+    let delivered = spool.write_events(&[sample_event("evt-delivered")]).unwrap();
+    replay_spool_once_for_tests(&spool, &server_ok.uri())
+        .await
+        .unwrap();
+    assert!(!delivered.exists(), "delivered claim must be removed");
+
+    let server_perm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server_perm)
+        .await;
+    let poison = spool.write_events(&[sample_event("evt-permanent")]).unwrap();
+    replay_spool_once_for_tests(&spool, &server_perm.uri())
+        .await
+        .unwrap();
+    assert_rejected_sidecar(&poison, 400, "permanent_http");
 }

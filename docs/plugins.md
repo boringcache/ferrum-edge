@@ -1529,7 +1529,7 @@ status with aggregate totals), and process-wide aggregate Prometheus metrics
 under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
-reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
+reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool namespace ownership on
 persistent storage. Ordinary HTTP is priced by wire status. Native gRPC and
 translated gRPC-Web use the same canonical effective-status mapping documented
 for `api_chargeback`; durable events retain the billable `status_code`, raw
