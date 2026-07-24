@@ -2281,11 +2281,7 @@ async fn xml_renamed_local_cross_construct_collisions_fail_closed() {
         ctx.headers = headers.clone();
         assert_continue(
             plugin
-                .on_final_request_body_with_context(
-                    &mut ctx,
-                    &headers,
-                    br#"<root wireId="A-1"/>"#,
-                )
+                .on_final_request_body_with_context(&mut ctx, &headers, br#"<root wireId="A-1"/>"#)
                 .await,
         );
         let mut ctx = post_ctx("/rename-attribute");
