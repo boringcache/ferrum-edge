@@ -919,6 +919,19 @@ async fn enqueue_sendmmsg_or_direct(
     match send_batch.push_with_local(data, client_addr, local_ip) {
         SendMmsgPushResult::Queued => {}
         SendMmsgPushResult::Oversized => {
+            // Preserve backend reply order: an oversized direct send must not
+            // overtake ordinary datagrams already queued in sendmmsg.
+            while !send_batch.is_empty() {
+                if flush_sendmmsg_best_effort(
+                    send_batch,
+                    frontend.as_raw_fd(),
+                    send_drops,
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
             direct_send_reply_or_drop(
                 frontend,
                 data,
