@@ -14,8 +14,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
