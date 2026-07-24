@@ -1,5 +1,5 @@
 use ferrum_edge::_test_support::{
-    RedisConfig, redis_client_credentials, redis_config_url_with_ip,
+    MAX_REDIS_POOL_SIZE, RedisConfig, redis_client_credentials, redis_config_url_with_ip,
     redis_rate_limit_client_for_test,
 };
 use serde_json::json;
@@ -173,6 +173,8 @@ fn test_from_plugin_config_rejects_invalid_redis_mode() {
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_tls": "true"}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_key_prefix": ""}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_pool_size": 0}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_pool_size": (MAX_REDIS_POOL_SIZE as u64) + 1}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_pool_size": u64::MAX}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_connect_timeout_seconds": 0}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_health_check_interval_seconds": 0}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_username": false}),

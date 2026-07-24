@@ -8585,8 +8585,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -8659,8 +8660,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -16191,8 +16193,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL-based authentication (Redis 6+)
@@ -17943,8 +17946,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -18058,8 +18062,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -18821,8 +18826,9 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_connect_timeout_seconds:
           type: integer
           format: uint64
@@ -19064,8 +19070,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -21123,8 +21130,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1
