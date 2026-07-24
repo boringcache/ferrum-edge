@@ -2003,16 +2003,13 @@ pub mod _test_support {
         crate::plugin_cache::validate_tcp_connection_throttle_attachments(config)
     }
 
-    pub use crate::config::mongo_store::{
-        ConsumerIdentityEnsureFold, ConsumerIdentityEnsureObservation,
-        ConsumerIdentityEnsureOwnedError, ConsumerIdentityReconcileObservation,
-        ConsumerIdentityReservationDisposition,
-    };
-
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
     }
 
+    /// MongoDB timeout precedence (issue #2988): URI-parsed
+    /// `serverSelectionTimeoutMS`/`connectTimeoutMS` survive when the env
+    /// override is `None`, and are replaced only when explicitly set.
     pub fn apply_mongo_timeout_overrides(
         client_options: &mut mongodb::options::ClientOptions,
         server_selection_timeout_secs: Option<u64>,
@@ -2025,32 +2022,9 @@ pub mod _test_support {
         )
     }
 
-    pub fn classify_consumer_identity_reservation(
-        existing_owner: Option<&str>,
-        claimant_consumer_id: &str,
-    ) -> ConsumerIdentityReservationDisposition {
-        crate::config::mongo_store::classify_consumer_identity_reservation(
-            existing_owner,
-            claimant_consumer_id,
-        )
-    }
-
-    pub fn consumer_identity_reservation_is_same_owner(
-        existing_owner: &str,
-        claimant_consumer_id: &str,
-    ) -> bool {
-        crate::config::mongo_store::consumer_identity_reservation_is_same_owner(
-            existing_owner,
-            claimant_consumer_id,
-        )
-    }
-
-    pub fn automatic_consumer_identity_orphan_reclaim_permitted(
-        observation: ConsumerIdentityReconcileObservation,
-    ) -> bool {
-        crate::config::mongo_store::automatic_consumer_identity_orphan_reclaim_permitted(observation)
-    }
-
+    /// Consumer-identity ordered-insert prefix attribution (issue #2987): only
+    /// the prefix before the E11000 write-error index was inserted by this
+    /// attempt; `None` means attribution is unknown (retain everything).
     pub fn ordered_insert_newly_inserted_prefix<'a, T>(
         values: &'a [T],
         first_error_index: Option<usize>,
@@ -2058,20 +2032,9 @@ pub mod _test_support {
         crate::config::mongo_store::ordered_insert_newly_inserted_prefix(values, first_error_index)
     }
 
-    pub fn consumer_identity_values_safe_to_rollback_release<'a>(
-        newly_inserted_by_this_attempt: &'a [String],
-    ) -> &'a [String] {
-        crate::config::mongo_store::consumer_identity_values_safe_to_rollback_release(
-            newly_inserted_by_this_attempt,
-        )
-    }
-
-    pub fn fold_consumer_identity_ensure_observations(
-        observations: &[ConsumerIdentityEnsureObservation],
-    ) -> ConsumerIdentityEnsureFold {
-        crate::config::mongo_store::fold_consumer_identity_ensure_observations(observations)
-    }
-
+    /// Consumer-identity adoption-failure release set (issue #2987): the
+    /// verifiable ordered-insert prefix plus vacant reservations this adoption
+    /// attempt inserted before failing — never pre-existing same-owner docs.
     pub fn consumer_identity_adoption_failure_release_values(
         ordered_values: &[String],
         ordered_first_error_index: Option<usize>,
@@ -2082,17 +2045,6 @@ pub mod _test_support {
             ordered_first_error_index,
             adoption_newly_inserted,
         )
-    }
-
-    pub fn consumer_identity_ensure_owned_error_for_test(
-        newly_inserted: Vec<String>,
-        message: &str,
-    ) -> ConsumerIdentityEnsureOwnedError {
-        ConsumerIdentityEnsureOwnedError::new(newly_inserted, anyhow::anyhow!("{message}"))
-    }
-
-    pub fn mongo_replace_one_matched_exactly_one(matched_count: u64) -> bool {
-        crate::config::mongo_store::mongo_replace_one_matched_exactly_one(matched_count)
     }
 
     // ── plugins/grpc_web ─────────────────────────────────────────────────────

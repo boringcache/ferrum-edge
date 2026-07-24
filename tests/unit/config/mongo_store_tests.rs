@@ -303,59 +303,8 @@ fn classic_renew_update_refreshes_expiry_without_touching_ownership() {
 }
 
 #[test]
-fn same_owner_orphan_reservation_is_adoptable_cross_owner_is_conflict() {
-    use ferrum_edge::_test_support::{
-        ConsumerIdentityReservationDisposition, classify_consumer_identity_reservation,
-        consumer_identity_reservation_is_same_owner,
-    };
-
-    assert_eq!(
-        classify_consumer_identity_reservation(None, "alice"),
-        ConsumerIdentityReservationDisposition::Vacant
-    );
-    assert_eq!(
-        classify_consumer_identity_reservation(Some("alice"), "alice"),
-        ConsumerIdentityReservationDisposition::Adopted,
-        "orphaned same-owner reservation must be adoptable on retry"
-    );
-    assert_eq!(
-        classify_consumer_identity_reservation(Some("bob"), "alice"),
-        ConsumerIdentityReservationDisposition::Conflict,
-        "a different owner must never steal a live reservation"
-    );
-    assert!(consumer_identity_reservation_is_same_owner("alice", "alice"));
-    assert!(!consumer_identity_reservation_is_same_owner("bob", "alice"));
-}
-
-#[test]
-fn live_reservation_cannot_be_reclaimed_from_point_read_absence() {
-    use ferrum_edge::_test_support::{
-        ConsumerIdentityReconcileObservation, automatic_consumer_identity_orphan_reclaim_permitted,
-        consumer_identity_values_safe_to_rollback_release, ordered_insert_newly_inserted_prefix,
-    };
-
-    // Dangerous interleaving: node A reserved identity, consumer insert still
-    // in flight; node B sees consumer absent. Reclaim must be refused — proving
-    // absence is not `!consumer_exists` alone.
-    assert!(
-        !automatic_consumer_identity_orphan_reclaim_permitted(
-            ConsumerIdentityReconcileObservation::ConsumerAbsentSameOwnerCreateInFlight
-        ),
-        "in-flight same-owner reserve-first create must keep its reservation"
-    );
-    assert!(
-        !automatic_consumer_identity_orphan_reclaim_permitted(
-            ConsumerIdentityReconcileObservation::ConsumerAbsentNoKnownWriter
-        ),
-        "point-read consumer absence without a known writer is still not reclaim-safe \
-         across serving nodes (migration lease does not serialize CRUD)"
-    );
-    assert!(
-        !automatic_consumer_identity_orphan_reclaim_permitted(
-            ConsumerIdentityReconcileObservation::ConsumerPresent
-        ),
-        "present consumer means the reservation is live"
-    );
+fn ordered_insert_prefix_attributes_only_this_attempts_inserts() {
+    use ferrum_edge::_test_support::ordered_insert_newly_inserted_prefix;
 
     // Rollback may release only this attempt's newly inserted prefix; adopted
     // same-owner docs (provenance unknown) stay out of the release set.
@@ -365,57 +314,38 @@ fn live_reservation_cannot_be_reclaimed_from_point_read_absence() {
         &values[..1],
         "ordered E11000 at index 1 means only the leading value was inserted here"
     );
+    assert_eq!(
+        ordered_insert_newly_inserted_prefix(&values, Some(0)),
+        &[] as &[String],
+        "a conflict on the first ordered doc attributes nothing to this attempt"
+    );
+    assert_eq!(
+        ordered_insert_newly_inserted_prefix(&values, Some(values.len())),
+        &values[..],
+        "an index equal to len means every ordered value was inserted here"
+    );
     assert!(
         ordered_insert_newly_inserted_prefix(&values, None).is_empty(),
         "unknown write-error index ⇒ retain all (empty rollback-safe set)"
     );
-    let adopted_only: [String; 0] = [];
-    assert_eq!(
-        consumer_identity_values_safe_to_rollback_release(&adopted_only),
-        &[] as &[String],
-        "pure same-owner adoption must not roll back pre-existing reservations"
+    assert!(
+        ordered_insert_newly_inserted_prefix(&values, Some(values.len() + 1)).is_empty(),
+        "an out-of-range index is not a verifiable prefix ⇒ retain all"
     );
 }
 
 #[test]
-fn adoption_failure_preserves_vacant_insert_provenance_for_rollback() {
-    use ferrum_edge::_test_support::{
-        ConsumerIdentityEnsureFold, ConsumerIdentityEnsureObservation,
-        consumer_identity_adoption_failure_release_values,
-        consumer_identity_ensure_owned_error_for_test, fold_consumer_identity_ensure_observations,
-    };
-
-    // Single-consumer ensure: vacant insert, then different-owner conflict.
-    // Failure provenance must retain the vacant insert for rollback.
-    let fold = fold_consumer_identity_ensure_observations(&[
-        ConsumerIdentityEnsureObservation::InsertedVacant("alice".to_string()),
-        ConsumerIdentityEnsureObservation::Conflict,
-    ]);
-    assert_eq!(
-        fold,
-        ConsumerIdentityEnsureFold::Failed {
-            newly_inserted_before_failure: vec!["alice".to_string()],
-        },
-        "vacant insert before conflict must remain in failure provenance"
-    );
-
-    let err = consumer_identity_ensure_owned_error_for_test(
-        vec!["alice".to_string()],
-        "E11000 duplicate key error: identity value 'bob' reserved by other",
-    );
-    assert_eq!(
-        err.newly_inserted,
-        vec!["alice".to_string()],
-        "ensure-owned error must carry exact vacant inserts committed before failure"
-    );
+fn adoption_failure_release_combines_ordered_prefix_and_adoption_inserts() {
+    use ferrum_edge::_test_support::consumer_identity_adoption_failure_release_values;
 
     let ordered = [
         "alice".to_string(),
         "alice@example.com".to_string(),
         "bob".to_string(),
     ];
-    // Ordered insert failed at index 1 (only "alice" from ordered path); adoption
-    // then inserted alice@example.com before conflicting on bob.
+    // Ordered insert failed at index 1 (only "alice" from the ordered path);
+    // adoption then inserted alice@example.com before conflicting on bob. The
+    // failure release set is the ordered prefix plus the adoption vacant insert.
     let release = consumer_identity_adoption_failure_release_values(
         &ordered,
         Some(1),
@@ -426,86 +356,57 @@ fn adoption_failure_preserves_vacant_insert_provenance_for_rollback() {
         vec!["alice".to_string(), "alice@example.com".to_string()],
         "failure release must include ordered prefix plus adoption vacant inserts"
     );
+
+    // Dedup: an adoption insert that is also inside the ordered prefix appears once.
+    let dedup = consumer_identity_adoption_failure_release_values(
+        &ordered,
+        Some(1),
+        &["alice".to_string(), "alice@example.com".to_string()],
+    );
+    assert_eq!(
+        dedup,
+        vec!["alice".to_string(), "alice@example.com".to_string()],
+        "values in both the ordered prefix and adoption inserts must not double-release"
+    );
 }
 
 #[test]
-fn batch_adoption_failure_identifies_earlier_vacant_inserts_for_rollback() {
-    use ferrum_edge::_test_support::{
-        ConsumerIdentityEnsureFold, ConsumerIdentityEnsureObservation,
-        consumer_identity_adoption_failure_release_values, fold_consumer_identity_ensure_observations,
-    };
+fn batch_adoption_failure_release_is_exactly_adoption_inserts_without_ordered_prefix() {
+    use ferrum_edge::_test_support::consumer_identity_adoption_failure_release_values;
 
-    // Batch-style per-doc adoption: earlier vacant docs succeed, later conflict.
-    let fold = fold_consumer_identity_ensure_observations(&[
-        ConsumerIdentityEnsureObservation::InsertedVacant("ns:alice".to_string()),
-        ConsumerIdentityEnsureObservation::InsertedVacant("ns:alice@example.com".to_string()),
-        ConsumerIdentityEnsureObservation::Conflict,
-    ]);
-    let ConsumerIdentityEnsureFold::Failed {
-        newly_inserted_before_failure,
-    } = fold
-    else {
-        panic!("expected failure provenance after later conflict");
-    };
-    assert_eq!(
-        newly_inserted_before_failure,
-        vec!["ns:alice".to_string(), "ns:alice@example.com".to_string()],
-        "earlier vacant batch adoption inserts must be identified for rollback"
-    );
-
+    // Batch-style adoption where earlier vacant docs were inserted before a later
+    // conflict, and the ordered insert conflicted on its first doc (no verifiable
+    // prefix). Release must be exactly the earlier adoption inserts.
     let ordered_batch = [
         "ns:alice".to_string(),
         "ns:alice@example.com".to_string(),
         "ns:stolen".to_string(),
     ];
-    // No verifiable ordered prefix (conflict on first ordered doc) — still release
-    // adoption inserts from earlier successful ensure steps.
+    let adoption_inserts = ["ns:alice".to_string(), "ns:alice@example.com".to_string()];
     let release = consumer_identity_adoption_failure_release_values(
         &ordered_batch,
         Some(0),
-        &newly_inserted_before_failure,
+        &adoption_inserts,
     );
     assert_eq!(
         release,
-        newly_inserted_before_failure,
+        adoption_inserts.to_vec(),
         "with empty ordered prefix, release set is exactly earlier adoption inserts"
     );
 }
 
 #[test]
-fn pre_existing_same_owner_docs_never_enter_rollback_safe_set() {
-    use ferrum_edge::_test_support::{
-        ConsumerIdentityEnsureFold, ConsumerIdentityEnsureObservation,
-        consumer_identity_adoption_failure_release_values,
-        consumer_identity_values_safe_to_rollback_release, fold_consumer_identity_ensure_observations,
-    };
+fn pre_existing_same_owner_docs_stay_out_of_adoption_failure_release() {
+    use ferrum_edge::_test_support::consumer_identity_adoption_failure_release_values;
 
-    let fold = fold_consumer_identity_ensure_observations(&[
-        ConsumerIdentityEnsureObservation::AdoptedExisting,
-        ConsumerIdentityEnsureObservation::AdoptedExisting,
-    ]);
-    assert_eq!(
-        fold,
-        ConsumerIdentityEnsureFold::Complete {
-            newly_inserted: vec![],
-        },
-        "pure same-owner adoption must yield an empty newly-inserted set"
-    );
-
-    let fold_then_conflict = fold_consumer_identity_ensure_observations(&[
-        ConsumerIdentityEnsureObservation::AdoptedExisting,
-        ConsumerIdentityEnsureObservation::InsertedVacant("new-value".to_string()),
-        ConsumerIdentityEnsureObservation::Conflict,
-    ]);
-    assert_eq!(
-        fold_then_conflict,
-        ConsumerIdentityEnsureFold::Failed {
-            newly_inserted_before_failure: vec!["new-value".to_string()],
-        },
-        "adopted pre-existing docs must not appear in failure provenance"
-    );
-
-    let ordered = ["pre-existing".to_string(), "new-value".to_string(), "conflict".to_string()];
+    // "pre-existing" was an adopted same-owner doc (never in the adoption-inserts
+    // set); "new-value" was inserted by this adoption attempt. Only "new-value"
+    // is rollback-safe — a pre-existing reservation must never be released.
+    let ordered = [
+        "pre-existing".to_string(),
+        "new-value".to_string(),
+        "conflict".to_string(),
+    ];
     let release = consumer_identity_adoption_failure_release_values(
         &ordered,
         Some(0), // ordered inserted nothing verifiable
@@ -515,10 +416,6 @@ fn pre_existing_same_owner_docs_never_enter_rollback_safe_set() {
     assert!(
         !release.contains(&"pre-existing".to_string()),
         "pre-existing same-owner reservation must stay out of the release set"
-    );
-    assert_eq!(
-        consumer_identity_values_safe_to_rollback_release(&[]),
-        &[] as &[String]
     );
 }
 
@@ -594,26 +491,16 @@ fn mongo_timeout_overrides_preserve_uri_unless_env_explicit() {
 }
 
 #[test]
-fn metadata_replace_one_requires_exactly_one_match() {
-    use ferrum_edge::_test_support::mongo_replace_one_matched_exactly_one;
-
-    assert!(mongo_replace_one_matched_exactly_one(1));
-    assert!(
-        !mongo_replace_one_matched_exactly_one(0),
-        "zero-match replace must not be reported as a successful metadata update"
-    );
-    assert!(!mongo_replace_one_matched_exactly_one(2));
-}
-
-#[test]
 fn replace_api_spec_metadata_shortcut_checks_matched_count() {
+    // Issue #2989: the hash-unchanged metadata-only shortcut must verify the
+    // `replace_one` (no upsert) matched a document before reporting success, so
+    // a spec raced away by a concurrent DELETE surfaces an error, not a 200.
     let replace = mongo_method("replace_api_spec_bundle(");
     let shortcut = replace
         .find("Only update metadata fields on the spec doc")
         .expect("metadata-only shortcut marker");
     let matched = replace[shortcut..]
-        .find("mongo_replace_one_matched_exactly_one")
-        .or_else(|| replace[shortcut..].find("matched_count"))
+        .find("matched_count")
         .expect("metadata shortcut must verify matched_count");
     let release = replace[shortcut..]
         .find("release_mtls_dns_admission_leases")
@@ -636,8 +523,7 @@ fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
         "standalone reserve must classify duplicate-key before adopting"
     );
     assert!(
-        standalone.contains("newly_inserted")
-            || standalone.contains("consumer_identity_values_safe_to_rollback_release"),
+        standalone.contains("newly_inserted"),
         "standalone reserve must expose newly-inserted values for safe rollback"
     );
     assert!(
@@ -650,6 +536,10 @@ fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
         ensure.contains("ConsumerIdentityEnsureOwnedError"),
         "ensure must return an error type that preserves failure provenance"
     );
+    assert!(
+        ensure.contains("owner != consumer_id") && ensure.contains("duplicate key error"),
+        "ensure must fail closed (409 duplicate-key) when a different owner holds the reservation"
+    );
 
     let session = mongo_method("insert_consumer_identity_docs_in_session(");
     assert!(
@@ -659,8 +549,7 @@ fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
 
     let create = mongo_method("create_consumer(");
     assert!(
-        create.contains("consumer_identity_values_safe_to_rollback_release")
-            || create.contains("newly_inserted_identity_values"),
+        create.contains("newly_inserted_identity_values"),
         "create_consumer rollback must release only newly-inserted reservations"
     );
 
@@ -685,8 +574,7 @@ fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
         "startup migrations must not reclaim reservations from point-read consumer absence"
     );
     assert!(
-        migrations.contains("automatic_consumer_identity_orphan_reclaim_permitted")
-            || migrations.contains("Intentionally no automatic orphan reconcile"),
+        migrations.contains("Intentionally no automatic orphan reconcile"),
         "migrations must document why automatic orphan reclaim is omitted"
     );
 }

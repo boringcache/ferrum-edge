@@ -3481,21 +3481,21 @@ mod inner {
                                 ));
                             }
                         };
-                        match classify_consumer_identity_reservation(Some(owner), consumer_id) {
-                            ConsumerIdentityReservationDisposition::Adopted => {}
-                            ConsumerIdentityReservationDisposition::Conflict
-                            | ConsumerIdentityReservationDisposition::Vacant => {
-                                return Err(ConsumerIdentityEnsureOwnedError::new(
-                                    newly_inserted,
-                                    anyhow::anyhow!(
-                                        "E11000 duplicate key error: identity value '{}' in \
-                                         namespace '{}' is reserved by consumer '{}'",
-                                        value,
-                                        namespace,
-                                        owner
-                                    ),
-                                ));
-                            }
+                        // Same owner ⇒ adopt the existing reservation (orphaned
+                        // retry / stale release). A different owner is a conflict;
+                        // the "duplicate key" text maps to HTTP 409. Live
+                        // reservations are never stolen.
+                        if owner != consumer_id {
+                            return Err(ConsumerIdentityEnsureOwnedError::new(
+                                newly_inserted,
+                                anyhow::anyhow!(
+                                    "E11000 duplicate key error: identity value '{}' in \
+                                     namespace '{}' is reserved by consumer '{}'",
+                                    value,
+                                    namespace,
+                                    owner
+                                ),
+                            ));
                         }
                     }
                     None => {
@@ -3540,7 +3540,7 @@ mod inner {
                                     ));
                                 }
                             };
-                            if !consumer_identity_reservation_is_same_owner(owner, consumer_id) {
+                            if owner != consumer_id {
                                 return Err(ConsumerIdentityEnsureOwnedError::new(
                                     newly_inserted,
                                     anyhow::anyhow!(
@@ -3585,7 +3585,7 @@ mod inner {
                                 "consumer_identity_index doc '{doc_id}' missing consumer_id"
                             ))
                         })?;
-                        if !consumer_identity_reservation_is_same_owner(owner, consumer_id) {
+                        if owner != consumer_id {
                             return Err(mongodb::error::Error::custom(format!(
                                 "E11000 duplicate key error: identity value '{value}' in namespace \
                                  '{namespace}' is reserved by consumer '{owner}'"
@@ -3616,7 +3616,7 @@ mod inner {
                                     "consumer_identity_index doc '{doc_id}' missing consumer_id"
                                 ))
                             })?;
-                            if !consumer_identity_reservation_is_same_owner(owner, consumer_id) {
+                            if owner != consumer_id {
                                 return Err(mongodb::error::Error::custom(format!(
                                     "E11000 duplicate key error: identity value '{value}' in \
                                      namespace '{namespace}' is reserved by consumer '{owner}'"
@@ -3640,8 +3640,7 @@ mod inner {
         // bounded leases, atomic conditional takeover, and writer-side
         // verify/rollback; without that protocol, permanent conservative lockout
         // (healed by same-owner E11000 adoption or manual mongosh surgery) is
-        // preferred over corrupting uniqueness. See
-        // `automatic_consumer_identity_orphan_reclaim_permitted`.
+        // preferred over corrupting uniqueness.
 
         /// Best-effort compensation: delete identity reservations this call
         /// inserted. Filtered by `consumer_id` so reservations owned by other
@@ -4150,34 +4149,25 @@ mod inner {
             .collect()
     }
 
-    /// Disposition of an existing identity-index reservation relative to a
-    /// claimant consumer. Same-owner reservations are adoptable (orphaned
-    /// retry / stale release); a different owner is always a conflict — live
-    /// reservations are never stolen.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ConsumerIdentityReservationDisposition {
-        /// No reservation document exists for the identity value.
-        Vacant,
-        /// Reservation exists and is owned by the claimant.
-        Adopted,
-        /// Reservation exists and is owned by a different consumer.
-        Conflict,
-    }
-
     /// Failure from [`MongoStore::ensure_consumer_identity_docs_owned`] that
     /// preserves vacant reservations this adoption attempt inserted before the
     /// failure. Callers must best-effort release `newly_inserted` (in addition
     /// to any verifiable ordered-insert prefix) and must never treat adopted
     /// pre-existing same-owner reservations as rollback-safe.
+    ///
+    /// Crate-internal only: the type is not exposed through any public or
+    /// `_test_support` surface; failure provenance is exercised through the
+    /// `consumer_identity_adoption_failure_release_values` helper and the
+    /// standalone/batch reserve paths.
     #[derive(Debug)]
-    pub struct ConsumerIdentityEnsureOwnedError {
+    struct ConsumerIdentityEnsureOwnedError {
         /// Exact identity values this ensure call newly inserted before failing.
-        pub newly_inserted: Vec<String>,
+        newly_inserted: Vec<String>,
         source: anyhow::Error,
     }
 
     impl ConsumerIdentityEnsureOwnedError {
-        pub(crate) fn new(newly_inserted: Vec<String>, source: anyhow::Error) -> Self {
+        fn new(newly_inserted: Vec<String>, source: anyhow::Error) -> Self {
             Self {
                 newly_inserted,
                 source,
@@ -4185,7 +4175,7 @@ mod inner {
         }
 
         /// Consume the error, returning the underlying source for propagation.
-        pub(crate) fn into_source(self) -> anyhow::Error {
+        fn into_source(self) -> anyhow::Error {
             self.source
         }
     }
@@ -4202,113 +4192,6 @@ mod inner {
         }
     }
 
-    /// Pure observation of one ensure-loop step, used to specify failure
-    /// provenance without a live MongoDB. Matches production accounting:
-    /// vacant inserts are rollback-safe; adopted existing same-owner docs are
-    /// not; the first conflict ends the attempt retaining prior vacant inserts.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum ConsumerIdentityEnsureObservation {
-        /// Pre-existing same-owner reservation — never rollback-safe.
-        AdoptedExisting,
-        /// Vacant reservation inserted by this attempt — rollback-safe.
-        InsertedVacant(String),
-        /// Different-owner conflict (or equivalent fail-closed conflict).
-        Conflict,
-    }
-
-    /// Folded ensure-loop outcome with explicit failure provenance.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum ConsumerIdentityEnsureFold {
-        Complete {
-            newly_inserted: Vec<String>,
-        },
-        Failed {
-            newly_inserted_before_failure: Vec<String>,
-        },
-    }
-
-    /// Fold ensure-loop observations into success newly-inserted values or
-    /// failure provenance. The first [`ConsumerIdentityEnsureObservation::Conflict`]
-    /// ends the attempt; subsequent observations are ignored.
-    pub(crate) fn fold_consumer_identity_ensure_observations(
-        observations: &[ConsumerIdentityEnsureObservation],
-    ) -> ConsumerIdentityEnsureFold {
-        let mut newly_inserted = Vec::new();
-        for observation in observations {
-            match observation {
-                ConsumerIdentityEnsureObservation::AdoptedExisting => {}
-                ConsumerIdentityEnsureObservation::InsertedVacant(value) => {
-                    newly_inserted.push(value.clone());
-                }
-                ConsumerIdentityEnsureObservation::Conflict => {
-                    return ConsumerIdentityEnsureFold::Failed {
-                        newly_inserted_before_failure: newly_inserted,
-                    };
-                }
-            }
-        }
-        ConsumerIdentityEnsureFold::Complete { newly_inserted }
-    }
-
-    /// Classify an identity reservation against a claimant `consumer_id`.
-    pub(crate) fn classify_consumer_identity_reservation(
-        existing_owner: Option<&str>,
-        claimant_consumer_id: &str,
-    ) -> ConsumerIdentityReservationDisposition {
-        match existing_owner {
-            None => ConsumerIdentityReservationDisposition::Vacant,
-            Some(owner) if owner == claimant_consumer_id => {
-                ConsumerIdentityReservationDisposition::Adopted
-            }
-            Some(_) => ConsumerIdentityReservationDisposition::Conflict,
-        }
-    }
-
-    /// Same-owner adoption predicate used by reservation recovery paths.
-    pub(crate) fn consumer_identity_reservation_is_same_owner(
-        existing_owner: &str,
-        claimant_consumer_id: &str,
-    ) -> bool {
-        existing_owner == claimant_consumer_id
-    }
-
-    /// Observed state used to decide automatic orphan reclaim of a
-    /// `consumer_identity_index` reservation. Point-read consumer absence is
-    /// never proof of orphanhood across serving nodes.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ConsumerIdentityReconcileObservation {
-        /// Consumer document present on a point read — reservation is live.
-        ConsumerPresent,
-        /// Consumer document absent on a point read, with no evidence of an
-        /// in-flight same-owner writer. Still insufficient: another node may
-        /// have reserved and not yet inserted the consumer.
-        ConsumerAbsentNoKnownWriter,
-        /// Dangerous interleaving: reservation already committed by a live
-        /// same-owner create that is still awaiting `consumers.insert_one`.
-        /// Ownership-qualified delete by `consumer_id` does not help — the
-        /// in-flight writer holds that same owner.
-        ConsumerAbsentSameOwnerCreateInFlight,
-    }
-
-    /// Automatic orphan reclaim of consumer-identity reservations is never
-    /// permitted from point-read observations alone.
-    ///
-    /// The migration lease does not serialize normal consumer CRUD. Deleting a
-    /// reservation because the consumer doc appears absent can race a live
-    /// reserve-first create and leave that create unguarded. A generation/lease
-    /// takeover protocol is required for safe different-owner reclamation; until
-    /// one exists, prefer permanent lockout healed by same-owner E11000 adoption
-    /// (or manual operator surgery).
-    pub(crate) fn automatic_consumer_identity_orphan_reclaim_permitted(
-        observation: ConsumerIdentityReconcileObservation,
-    ) -> bool {
-        match observation {
-            ConsumerIdentityReconcileObservation::ConsumerPresent => false,
-            ConsumerIdentityReconcileObservation::ConsumerAbsentNoKnownWriter => false,
-            ConsumerIdentityReconcileObservation::ConsumerAbsentSameOwnerCreateInFlight => false,
-        }
-    }
-
     /// Ordered `insert_many` E11000: only the prefix before `first_error_index`
     /// was inserted by this attempt. `None` means attribution is unknown —
     /// retain everything (return an empty rollback-safe slice).
@@ -4320,14 +4203,6 @@ mod inner {
             Some(i) if i <= values.len() => &values[..i],
             _ => &[],
         }
-    }
-
-    /// Rollback may release only reservations this attempt newly inserted.
-    /// Adopted same-owner docs of unknown provenance must be retained.
-    pub(crate) fn consumer_identity_values_safe_to_rollback_release<'a>(
-        newly_inserted_by_this_attempt: &'a [String],
-    ) -> &'a [String] {
-        newly_inserted_by_this_attempt
     }
 
     /// Failure-path release set after a partial ordered insert entered
@@ -4352,13 +4227,6 @@ mod inner {
             }
         }
         out
-    }
-
-    /// Metadata-only `replace_one` (no upsert) succeeded only when exactly one
-    /// document matched. Zero matches means the spec disappeared or the
-    /// namespace predicate missed — must not be reported as a successful update.
-    pub(crate) fn mongo_replace_one_matched_exactly_one(matched_count: u64) -> bool {
-        matched_count == 1
     }
 
     /// Convert a domain `Consumer` into a BSON `Document`.
@@ -6439,9 +6307,9 @@ mod inner {
                         &identity_values,
                     )
                     .await?;
-                let rollback_identity_values = consumer_identity_values_safe_to_rollback_release(
-                    &newly_inserted_identity_values,
-                );
+                // Release only values this attempt newly inserted — never adopted
+                // same-owner reservations, whose provenance is unknown.
+                let rollback_identity_values: &[String] = &newly_inserted_identity_values;
                 if let Err(err) = self.consumers().insert_one(doc).await {
                     self.release_consumer_identity_values_best_effort(
                         &consumer.namespace,
@@ -6646,10 +6514,9 @@ mod inner {
                                 &added,
                             )
                             .await?;
-                        let rollback_identity_values =
-                            consumer_identity_values_safe_to_rollback_release(
-                                &newly_inserted_identity_values,
-                            );
+                        // Release only values this attempt newly inserted — never
+                        // adopted same-owner reservations of unknown provenance.
+                        let rollback_identity_values: &[String] = &newly_inserted_identity_values;
                         let replace_result = match self
                             .consumers()
                             .replace_one(doc! { "_id": &composite_id }, doc)
@@ -9399,8 +9266,7 @@ mod inner {
                 // reserve-first create would drop the durable uniqueness
                 // guard. Crash orphans stay locked until same-owner E11000
                 // adoption heals a retry of the same consumer id, or an
-                // operator removes the reservation manually. See
-                // `automatic_consumer_identity_orphan_reclaim_permitted`.
+                // operator removes the reservation manually.
 
                 // The guard collections are keyed purely by `_id`
                 // (`{namespace}:{route_key_hash}`, `{namespace}:{upstream_id}`,
@@ -10310,7 +10176,11 @@ mod inner {
                             spec_doc_check,
                         )
                         .await?;
-                    if !mongo_replace_one_matched_exactly_one(replace_result.matched_count) {
+                    // `replace_one` (no upsert) on the unique `{_id, namespace}`
+                    // filter matches 0 or 1 doc. Zero means the spec was deleted
+                    // (or the namespace predicate missed) between the hash check
+                    // and this guarded write — never report that as a success.
+                    if replace_result.matched_count != 1 {
                         anyhow::bail!(
                             "API spec document not found for id '{}' in namespace '{}' during \
                              metadata-only replace (matched_count={})",
@@ -13759,15 +13629,11 @@ mod inner {
     }
 }
 
-pub use inner::{
-    ConsumerIdentityEnsureFold, ConsumerIdentityEnsureObservation,
-    ConsumerIdentityEnsureOwnedError, ConsumerIdentityReconcileObservation,
-    ConsumerIdentityReservationDisposition, MongoStore,
-};
+pub use inner::MongoStore;
+// Narrow crate-internal test seams (exposed only through `_test_support`): the
+// timeout-precedence application and the identity reservation rollback/release
+// accounting. Everything else stays module-private in `inner`.
 pub(crate) use inner::{
-    apply_mongo_timeout_overrides, automatic_consumer_identity_orphan_reclaim_permitted,
-    classify_consumer_identity_reservation, consumer_identity_adoption_failure_release_values,
-    consumer_identity_reservation_is_same_owner,
-    consumer_identity_values_safe_to_rollback_release, fold_consumer_identity_ensure_observations,
-    mongo_replace_one_matched_exactly_one, ordered_insert_newly_inserted_prefix,
+    apply_mongo_timeout_overrides, consumer_identity_adoption_failure_release_values,
+    ordered_insert_newly_inserted_prefix,
 };
