@@ -38,8 +38,10 @@ const H3_SLOW_CLIENT_STREAM_WINDOW_BYTES: u32 = 16 * 1024;
 /// buffering — not stream windows — is the backpressure mechanism there.
 const SLOW_CLIENT_PAYLOAD_BYTES: usize = 512 * 1024;
 /// H1-only: must exceed hosted loopback/gateway TCP send buffering even with
-/// a capped client SO_RCVBUF. 512 KiB was fully absorbed (~3 ms totals) in CI.
-const H1_SLOW_CLIENT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// a capped client SO_RCVBUF. 512 KiB was fully absorbed (~3 ms totals) in CI;
+/// 16 MiB repeatedly truncated around ~7 MiB under the 60s backend timeouts
+/// when post-stall SO_RCVBUF restore did not yield full loopback throughput.
+const H1_SLOW_CLIENT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// Bounded gRPC DATA frames that together exceed the 256 KiB H2 stream window
 /// without one oversized message (which triggered internal stream errors).
 const GRPC_SLOW_CLIENT_MESSAGE_BYTES: usize = 64 * 1024;
@@ -362,10 +364,10 @@ fn spawn_http1_scripted(
         }
         Pace::SlowClient => {
             // Emit many bounded chunks instead of one giant write_all. A single
-            // 16 MiB write blocks the scripted backend for the whole pipe fill
-            // and interacts badly with gateway read timeouts under an 8 KiB
-            // client SO_RCVBUF; chunked writes resume cleanly once the client
-            // drains after the intentional stall.
+            // multi-MiB write blocks the scripted backend for the whole pipe
+            // fill and interacts badly with gateway read timeouts under an
+            // 8 KiB client SO_RCVBUF; chunked writes resume cleanly once the
+            // client drains after the intentional stall.
             const CHUNK_BYTES: usize = 256 * 1024;
             let body = large_payload(slow_client_payload_bytes);
             for chunk in body.chunks(CHUNK_BYTES) {
@@ -497,8 +499,8 @@ async fn h1_slow_client_raw(url: &str, outcome: Outcome) {
         }
         Outcome::Complete => {
             // Restore a normal receive buffer before draining. Keeping the 8 KiB
-            // SO_RCVBUF for the full 16 MiB body made hosted CI truncate around
-            // ~3.6 MiB under the 15s backend read timeout.
+            // SO_RCVBUF through the full multi-MiB body made hosted CI truncate
+            // well short of completion under backend read/write timeouts.
             socket2::SockRef::from(&stream)
                 .set_recv_buffer_size(1024 * 1024)
                 .expect("restore slow-client receive buffer for drain");
@@ -509,6 +511,8 @@ async fn h1_slow_client_raw(url: &str, outcome: Outcome) {
                 }
                 collected.extend_from_slice(&buf[..n]);
             }
+            // Headers + chunk framing inflate wire size above the raw payload;
+            // require a clear majority so partial timeout truncations fail.
             assert!(
                 collected.len() > H1_SLOW_CLIENT_PAYLOAD_BYTES / 2,
                 "expected large streamed body, got {} bytes",
@@ -784,7 +788,7 @@ async fn run_http_family(protocol: &str, pace: Pace, outcome: Outcome) {
     let _backend = spawn_http1_scripted(listener, pace, outcome, slow_client_payload_bytes);
 
     let proxy_id = format!("stream-latency-{marker}");
-    let mut builder = GatewayHarness::builder()
+    let harness = GatewayHarness::builder()
         .file_config(logging_proxy_config(
             backend_port,
             &proxy_id,
@@ -794,13 +798,10 @@ async fn run_http_family(protocol: &str, pace: Pace, outcome: Outcome) {
         .log_level("info")
         .env("RUST_LOG", "info")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .capture_output();
-    // H1 slow-client bodies exceed the default 10 MiB response cap so TCP
-    // send buffering can fill; disable the size limit for this fixture only.
-    if protocol == "h1" {
-        builder = builder.env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0");
-    }
-    let harness = builder.spawn().await.expect("spawn gateway");
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
 
     match protocol {
         "h1" => h1_drive(&harness, &path, pace, outcome).await,
