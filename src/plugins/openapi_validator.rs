@@ -1755,12 +1755,25 @@ fn xml_array_values(
             ));
         }
         for wrapper in wrappers {
-            for child in child_elements_matching(wrapper, item_namespace, item_local) {
+            // Fail closed inside the wrapper: same-local wrong-namespace children
+            // must not be filtered away (an optional wrapped array would otherwise
+            // silently become empty and pass).
+            for child in child_elements_matching_fail_closed(
+                wrapper,
+                item_namespace,
+                item_local,
+                "array item",
+            )? {
                 values.push(xml_node_to_value(child, item_schema, conversion)?);
             }
         }
     } else {
-        for child in child_elements_matching(node, item_namespace, item_local) {
+        for child in child_elements_matching_fail_closed(
+            node,
+            item_namespace,
+            item_local,
+            "array item",
+        )? {
             values.push(xml_node_to_value(child, item_schema, conversion)?);
         }
     }
@@ -3942,6 +3955,36 @@ fn child_elements_matching<'a>(
                 && xml_expanded_name_matches(child.tag_name(), namespace, local_name)
         })
         .collect()
+}
+
+/// Like [`child_elements_matching`], but when the schema declares a namespace URI
+/// and a child shares the modeled local name under a different URI, return a
+/// conversion error instead of silently dropping the child.
+fn child_elements_matching_fail_closed<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    namespace: Option<&str>,
+    local_name: &str,
+    role: &str,
+) -> Result<Vec<roxmltree::Node<'a, 'a>>, String> {
+    let mut matched = Vec::new();
+    for child in node.children().filter(roxmltree::Node::is_element) {
+        let local = child.tag_name().name();
+        if local != local_name {
+            // Unrelated locals stay non-colliding (ignored here; object-level
+            // additional-member materialization may still observe them).
+            continue;
+        }
+        if xml_expanded_name_matches(child.tag_name(), namespace, local_name) {
+            matched.push(child);
+            continue;
+        }
+        // Reachable only when `namespace` is Some and the URI differs (or is
+        // absent): local-name-only schemas accept any URI via the match above.
+        return Err(format!(
+            "XML element '{local}' uses a local name reserved for a namespace-qualified modeled {role} but does not match the required expanded name"
+        ));
+    }
+    Ok(matched)
 }
 
 fn xml_namespace_display(namespace: Option<&str>) -> String {

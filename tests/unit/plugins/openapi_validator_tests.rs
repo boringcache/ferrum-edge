@@ -1579,7 +1579,8 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
     }
 
     // Optional wrapped array: wrong-namespace wrapper must reject on its own
-    // for additionalProperties omitted and true.
+    // for additionalProperties omitted and true. Correct wrapper + wrong-
+    // namespace item local must also reject (not silently drop the item).
     for additional in [Value::Null, json!(true)] {
         let mut body_schema = json!({
             "type": "object",
@@ -1650,6 +1651,35 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
                 .await,
             Some(400),
         );
+        // Correct wrapper + wrong-namespace modeled item local must reject
+        // (optional array must not silently become empty / pass).
+        let mut ctx = post_ctx("/wrapped-rebind");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:t="https://trusted.example/schema" xmlns:e="https://attacker.example/schema"><t:items><e:item>a</e:item></t:items></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        // Mixed correct + wrong-namespace item under the wrapper still rejects.
+        let mut ctx = post_ctx("/wrapped-rebind");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:t="https://trusted.example/schema" xmlns:e="https://attacker.example/schema"><t:items><t:item>a</t:item><e:item>b</e:item></t:items></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        // Correct URI under an arbitrary prefix accepted; unrelated non-colliding
+        // children (object-level and under the wrapper) remain non-fatal.
         let mut ctx = post_ctx("/wrapped-rebind");
         ctx.headers = headers.clone();
         assert_continue(
@@ -1657,7 +1687,83 @@ async fn xml_wrong_namespace_cannot_rebind_modeled_json_key() {
                 .on_final_request_body_with_context(
                     &mut ctx,
                     &headers,
-                    br#"<root xmlns:x="https://trusted.example/schema"><x:items><x:item>a</x:item></x:items><note>ok</note></root>"#,
+                    br#"<root xmlns:x="https://trusted.example/schema"><x:items><x:item>a</x:item><note>ignored</note></x:items><note>ok</note></root>"#,
+                )
+                .await,
+        );
+    }
+
+    // Nested/composed array item schema: xml.namespace on items resolved through
+    // allOf must still reject wrong-namespace children inside a correct wrapper.
+    for additional in [Value::Null, json!(true)] {
+        let mut body_schema = json!({
+            "type": "object",
+            "xml": {"name": "root"},
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "xml": {
+                        "name": "items",
+                        "wrapped": true,
+                        "namespace": "https://trusted.example/schema",
+                        "prefix": "trusted"
+                    },
+                    "allOf": [{
+                        "items": {
+                            "type": "string",
+                            "xml": {
+                                "name": "item",
+                                "namespace": "https://trusted.example/schema",
+                                "prefix": "trusted"
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        if !additional.is_null() {
+            body_schema
+                .as_object_mut()
+                .unwrap()
+                .insert("additionalProperties".to_string(), additional.clone());
+        }
+        let plugin = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/wrapped-composed-rebind",
+                "path_regex": "^/wrapped-composed-rebind$",
+                "request_body": {
+                    "content": {
+                        "application/xml": body_schema
+                    }
+                }
+            }]
+        }))
+        .unwrap_or_else(|error| {
+            panic!(
+                "composed wrapped schema with additionalProperties={additional} must admit: {error}"
+            )
+        });
+        let mut ctx = post_ctx("/wrapped-composed-rebind");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:t="https://trusted.example/schema" xmlns:e="https://attacker.example/schema"><t:items><e:item>a</e:item></t:items></root>"#,
+                )
+                .await,
+            Some(400),
+        );
+        let mut ctx = post_ctx("/wrapped-composed-rebind");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &headers,
+                    br#"<root xmlns:t="https://trusted.example/schema"><t:items><t:item>a</t:item></t:items><note>ok</note></root>"#,
                 )
                 .await,
         );
