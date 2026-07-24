@@ -2004,7 +2004,9 @@ pub mod _test_support {
     }
 
     pub use crate::config::mongo_store::{
-        ConsumerIdentityReconcileObservation, ConsumerIdentityReservationDisposition,
+        ConsumerIdentityEnsureFold, ConsumerIdentityEnsureObservation,
+        ConsumerIdentityEnsureOwnedError, ConsumerIdentityReconcileObservation,
+        ConsumerIdentityReservationDisposition,
     };
 
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
@@ -2062,6 +2064,31 @@ pub mod _test_support {
         crate::config::mongo_store::consumer_identity_values_safe_to_rollback_release(
             newly_inserted_by_this_attempt,
         )
+    }
+
+    pub fn fold_consumer_identity_ensure_observations(
+        observations: &[ConsumerIdentityEnsureObservation],
+    ) -> ConsumerIdentityEnsureFold {
+        crate::config::mongo_store::fold_consumer_identity_ensure_observations(observations)
+    }
+
+    pub fn consumer_identity_adoption_failure_release_values(
+        ordered_values: &[String],
+        ordered_first_error_index: Option<usize>,
+        adoption_newly_inserted: &[String],
+    ) -> Vec<String> {
+        crate::config::mongo_store::consumer_identity_adoption_failure_release_values(
+            ordered_values,
+            ordered_first_error_index,
+            adoption_newly_inserted,
+        )
+    }
+
+    pub fn consumer_identity_ensure_owned_error_for_test(
+        newly_inserted: Vec<String>,
+        message: &str,
+    ) -> ConsumerIdentityEnsureOwnedError {
+        ConsumerIdentityEnsureOwnedError::new(newly_inserted, anyhow::anyhow!("{message}"))
     }
 
     pub fn mongo_replace_one_matched_exactly_one(matched_count: u64) -> bool {

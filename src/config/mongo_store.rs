@@ -3333,8 +3333,10 @@ mod inner {
         /// writing the consumer document. A duplicate-key error is treated as
         /// success when every conflicting reservation is already owned by this
         /// consumer (orphaned same-owner retry / stale release). A different
-        /// owner still bails after best-effort deleting only the documents this
-        /// call inserted (the prefix before the failed index).
+        /// owner still bails after best-effort deleting (1) the verifiable
+        /// ordered-insert prefix and (2) vacant reservations this adoption
+        /// attempt inserted before failing — never pre-existing same-owner
+        /// adoptions.
         ///
         /// On success, returns only the identity values **this attempt newly
         /// inserted**. Later write-path rollback must release that set alone —
@@ -3385,22 +3387,29 @@ mod inner {
                             return Ok(newly_inserted);
                         }
                         Err(adopt_err) => {
-                            if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
-                                self.release_consumer_identity_values_best_effort(
-                                    namespace,
-                                    consumer_id,
-                                    &values[..inserted],
-                                )
-                                .await;
-                            } else {
+                            let inserted_prefix =
+                                Self::ordered_insert_inserted_prefix_len(&err);
+                            if inserted_prefix.is_none() {
                                 warn!(
                                     "Retaining MongoDB consumer identity reservations for '{}' in \
                                      namespace '{}' because the failed ordered insert did not report \
-                                     a verifiable write-error index",
+                                     a verifiable write-error index; still releasing vacant \
+                                     reservations inserted during this adoption attempt",
                                     consumer_id, namespace
                                 );
                             }
-                            return Err(adopt_err);
+                            let to_release = consumer_identity_adoption_failure_release_values(
+                                values,
+                                inserted_prefix,
+                                &adopt_err.newly_inserted,
+                            );
+                            self.release_consumer_identity_values_best_effort(
+                                namespace,
+                                consumer_id,
+                                &to_release,
+                            )
+                            .await;
+                            return Err(adopt_err.into_source());
                         }
                     }
                 }
@@ -3430,41 +3439,62 @@ mod inner {
         /// vacant docs are inserted; a different owner is a conflict (message
         /// retains "duplicate key" so the admin layer maps to HTTP 409).
         ///
-        /// Returns identity values this call newly inserted (safe to roll back).
-        /// Adopted existing docs are omitted — their provenance is unknown.
+        /// On success, returns identity values this call newly inserted (safe
+        /// to roll back). Adopted existing docs are omitted — their provenance
+        /// is unknown. On failure, [`ConsumerIdentityEnsureOwnedError`] still
+        /// carries the exact vacant inserts committed before the failure so
+        /// callers can release that provenance.
         async fn ensure_consumer_identity_docs_owned(
             &self,
             namespace: &str,
             consumer_id: &str,
             values: &[String],
-        ) -> Result<Vec<String>, anyhow::Error> {
+        ) -> Result<Vec<String>, ConsumerIdentityEnsureOwnedError> {
             let mut newly_inserted = Vec::new();
             for value in values {
                 let doc_id = consumer_identity_doc_id(namespace, value);
-                match self
+                let existing = match self
                     .consumer_identity_index()
                     .find_one(doc! { "_id": &doc_id })
-                    .await?
+                    .await
                 {
+                    Ok(existing) => existing,
+                    Err(err) => {
+                        return Err(ConsumerIdentityEnsureOwnedError::new(
+                            newly_inserted,
+                            err.into(),
+                        ));
+                    }
+                };
+                match existing {
                     Some(existing) => {
-                        let owner = existing.get_str("consumer_id").map_err(|e| {
-                            anyhow::anyhow!(
-                                "consumer_identity_index doc '{}' missing consumer_id: {}",
-                                doc_id,
-                                e
-                            )
-                        })?;
+                        let owner = match existing.get_str("consumer_id") {
+                            Ok(owner) => owner,
+                            Err(e) => {
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    anyhow::anyhow!(
+                                        "consumer_identity_index doc '{}' missing consumer_id: {}",
+                                        doc_id,
+                                        e
+                                    ),
+                                ));
+                            }
+                        };
                         match classify_consumer_identity_reservation(Some(owner), consumer_id) {
                             ConsumerIdentityReservationDisposition::Adopted => {}
                             ConsumerIdentityReservationDisposition::Conflict
                             | ConsumerIdentityReservationDisposition::Vacant => {
-                                anyhow::bail!(
-                                    "E11000 duplicate key error: identity value '{}' in namespace \
-                                     '{}' is reserved by consumer '{}'",
-                                    value,
-                                    namespace,
-                                    owner
-                                );
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    anyhow::anyhow!(
+                                        "E11000 duplicate key error: identity value '{}' in \
+                                         namespace '{}' is reserved by consumer '{}'",
+                                        value,
+                                        namespace,
+                                        owner
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -3472,30 +3502,55 @@ mod inner {
                         let doc = consumer_identity_index_doc(namespace, value, consumer_id);
                         if let Err(err) = self.consumer_identity_index().insert_one(doc).await {
                             if !is_duplicate_key(&err) {
-                                return Err(err.into());
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    err.into(),
+                                ));
                             }
-                            let Some(existing) = self
+                            let existing = match self
                                 .consumer_identity_index()
                                 .find_one(doc! { "_id": &doc_id })
-                                .await?
-                            else {
-                                return Err(err.into());
+                                .await
+                            {
+                                Ok(existing) => existing,
+                                Err(find_err) => {
+                                    return Err(ConsumerIdentityEnsureOwnedError::new(
+                                        newly_inserted,
+                                        find_err.into(),
+                                    ));
+                                }
                             };
-                            let owner = existing.get_str("consumer_id").map_err(|e| {
-                                anyhow::anyhow!(
-                                    "consumer_identity_index doc '{}' missing consumer_id: {}",
-                                    doc_id,
-                                    e
-                                )
-                            })?;
+                            let Some(existing) = existing else {
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    err.into(),
+                                ));
+                            };
+                            let owner = match existing.get_str("consumer_id") {
+                                Ok(owner) => owner,
+                                Err(e) => {
+                                    return Err(ConsumerIdentityEnsureOwnedError::new(
+                                        newly_inserted,
+                                        anyhow::anyhow!(
+                                            "consumer_identity_index doc '{}' missing \
+                                             consumer_id: {}",
+                                            doc_id,
+                                            e
+                                        ),
+                                    ));
+                                }
+                            };
                             if !consumer_identity_reservation_is_same_owner(owner, consumer_id) {
-                                anyhow::bail!(
-                                    "E11000 duplicate key error: identity value '{}' in namespace \
-                                     '{}' is reserved by consumer '{}'",
-                                    value,
-                                    namespace,
-                                    owner
-                                );
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    anyhow::anyhow!(
+                                        "E11000 duplicate key error: identity value '{}' in \
+                                         namespace '{}' is reserved by consumer '{}'",
+                                        value,
+                                        namespace,
+                                        owner
+                                    ),
+                                ));
                             }
                             // Lost the insert race to another same-owner writer —
                             // provenance unknown; do not mark rollback-safe.
@@ -4109,6 +4164,92 @@ mod inner {
         Conflict,
     }
 
+    /// Failure from [`MongoStore::ensure_consumer_identity_docs_owned`] that
+    /// preserves vacant reservations this adoption attempt inserted before the
+    /// failure. Callers must best-effort release `newly_inserted` (in addition
+    /// to any verifiable ordered-insert prefix) and must never treat adopted
+    /// pre-existing same-owner reservations as rollback-safe.
+    #[derive(Debug)]
+    pub struct ConsumerIdentityEnsureOwnedError {
+        /// Exact identity values this ensure call newly inserted before failing.
+        pub newly_inserted: Vec<String>,
+        source: anyhow::Error,
+    }
+
+    impl ConsumerIdentityEnsureOwnedError {
+        pub(crate) fn new(newly_inserted: Vec<String>, source: anyhow::Error) -> Self {
+            Self {
+                newly_inserted,
+                source,
+            }
+        }
+
+        /// Consume the error, returning the underlying source for propagation.
+        pub(crate) fn into_source(self) -> anyhow::Error {
+            self.source
+        }
+    }
+
+    impl std::fmt::Display for ConsumerIdentityEnsureOwnedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.source)
+        }
+    }
+
+    impl std::error::Error for ConsumerIdentityEnsureOwnedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.source()
+        }
+    }
+
+    /// Pure observation of one ensure-loop step, used to specify failure
+    /// provenance without a live MongoDB. Matches production accounting:
+    /// vacant inserts are rollback-safe; adopted existing same-owner docs are
+    /// not; the first conflict ends the attempt retaining prior vacant inserts.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ConsumerIdentityEnsureObservation {
+        /// Pre-existing same-owner reservation — never rollback-safe.
+        AdoptedExisting,
+        /// Vacant reservation inserted by this attempt — rollback-safe.
+        InsertedVacant(String),
+        /// Different-owner conflict (or equivalent fail-closed conflict).
+        Conflict,
+    }
+
+    /// Folded ensure-loop outcome with explicit failure provenance.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ConsumerIdentityEnsureFold {
+        Complete {
+            newly_inserted: Vec<String>,
+        },
+        Failed {
+            newly_inserted_before_failure: Vec<String>,
+        },
+    }
+
+    /// Fold ensure-loop observations into success newly-inserted values or
+    /// failure provenance. The first [`ConsumerIdentityEnsureObservation::Conflict`]
+    /// ends the attempt; subsequent observations are ignored.
+    pub(crate) fn fold_consumer_identity_ensure_observations(
+        observations: &[ConsumerIdentityEnsureObservation],
+    ) -> ConsumerIdentityEnsureFold {
+        let mut newly_inserted = Vec::new();
+        for observation in observations {
+            match observation {
+                ConsumerIdentityEnsureObservation::AdoptedExisting => {}
+                ConsumerIdentityEnsureObservation::InsertedVacant(value) => {
+                    newly_inserted.push(value.clone());
+                }
+                ConsumerIdentityEnsureObservation::Conflict => {
+                    return ConsumerIdentityEnsureFold::Failed {
+                        newly_inserted_before_failure: newly_inserted,
+                    };
+                }
+            }
+        }
+        ConsumerIdentityEnsureFold::Complete { newly_inserted }
+    }
+
     /// Classify an identity reservation against a claimant `consumer_id`.
     pub(crate) fn classify_consumer_identity_reservation(
         existing_owner: Option<&str>,
@@ -4187,6 +4328,30 @@ mod inner {
         newly_inserted_by_this_attempt: &'a [String],
     ) -> &'a [String] {
         newly_inserted_by_this_attempt
+    }
+
+    /// Failure-path release set after a partial ordered insert entered
+    /// same-owner adoption and then failed.
+    ///
+    /// Includes (1) the verifiable ordered-insert prefix and (2) vacant
+    /// reservations this adoption attempt inserted before failing. Unknown
+    /// ordered-insert provenance (`None`) contributes nothing — those
+    /// reservations are retained. Pre-existing same-owner adoptions must not
+    /// appear in `adoption_newly_inserted`.
+    pub(crate) fn consumer_identity_adoption_failure_release_values(
+        ordered_values: &[String],
+        ordered_first_error_index: Option<usize>,
+        adoption_newly_inserted: &[String],
+    ) -> Vec<String> {
+        let mut out =
+            ordered_insert_newly_inserted_prefix(ordered_values, ordered_first_error_index)
+                .to_vec();
+        for value in adoption_newly_inserted {
+            if !out.contains(value) {
+                out.push(value.clone());
+            }
+        }
+        out
     }
 
     /// Metadata-only `replace_one` (no upsert) succeeded only when exactly one
@@ -8200,13 +8365,12 @@ mod inner {
             } else {
                 // Standalone RESERVE FIRST: insert identity reservations for
                 // the whole batch (ordered) before any consumer document. On
-                // failure, best-effort delete exactly the documents this call
-                // inserted (the prefix before the failed index) — releasing
-                // the full set could remove reservations a pre-existing
-                // consumer with the same id legitimately owns. After a
-                // successful reserve (including same-owner adoption), later
-                // consumer-write rollback releases only that newly-inserted
-                // set — never adopted docs of unknown provenance.
+                // failure, best-effort delete (1) the verifiable ordered-insert
+                // prefix and (2) vacant reservations this adoption attempt
+                // inserted before failing — never pre-existing same-owner
+                // adoptions. After a successful reserve (including same-owner
+                // adoption), later consumer-write rollback releases only that
+                // newly-inserted set — never adopted docs of unknown provenance.
                 let mut newly_inserted_identity_docs: Vec<Document> = Vec::new();
                 if let Err(err) = self
                     .consumer_identity_index()
@@ -8217,7 +8381,8 @@ mod inner {
                         // Same-owner adoption across the batch: every doc must
                         // already be owned by its intended consumer_id (or be
                         // insertable). Cross-owner conflict still fails after
-                        // releasing only this call's inserted prefix.
+                        // releasing this call's ordered prefix plus vacant
+                        // adoption inserts committed before the conflict.
                         let mut adopt_ok = true;
                         let mut adopt_err: Option<anyhow::Error> = None;
                         let mut ensured_new_docs: Vec<Document> = Vec::new();
@@ -8267,24 +8432,53 @@ mod inner {
                                     }
                                 }
                                 Err(e) => {
+                                    // Single-value ensure: any vacant insert
+                                    // committed inside this call before failure
+                                    // is still on e.newly_inserted.
+                                    for value in &e.newly_inserted {
+                                        if value == identity_value {
+                                            let already = ensured_new_docs.iter().any(|existing| {
+                                                existing.get_str("_id").ok()
+                                                    == doc.get_str("_id").ok()
+                                            });
+                                            if !already {
+                                                ensured_new_docs.push(doc.clone());
+                                            }
+                                        }
+                                    }
                                     adopt_ok = false;
-                                    adopt_err = Some(e);
+                                    adopt_err = Some(e.into_source());
                                     break;
                                 }
                             }
                         }
                         if !adopt_ok {
-                            if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
-                                self.release_consumer_identity_docs_best_effort(
-                                    &identity_docs[..inserted],
-                                )
-                                .await;
-                            } else {
+                            let inserted_prefix =
+                                Self::ordered_insert_inserted_prefix_len(&err);
+                            if inserted_prefix.is_none() {
                                 warn!(
                                     "Retaining MongoDB batch consumer identity reservations because the \
-                                     failed ordered insert did not report a verifiable write-error index"
+                                     failed ordered insert did not report a verifiable write-error index; \
+                                     still releasing vacant reservations inserted during this adoption \
+                                     attempt"
                                 );
                             }
+                            let mut to_release: Vec<Document> =
+                                ordered_insert_newly_inserted_prefix(
+                                    &identity_docs,
+                                    inserted_prefix,
+                                )
+                                .to_vec();
+                            for doc in &ensured_new_docs {
+                                let already = to_release.iter().any(|existing| {
+                                    existing.get_str("_id").ok() == doc.get_str("_id").ok()
+                                });
+                                if !already {
+                                    to_release.push(doc.clone());
+                                }
+                            }
+                            self.release_consumer_identity_docs_best_effort(&to_release)
+                                .await;
                             return Err(adopt_err.unwrap_or_else(|| err.into()));
                         }
                         let inserted_prefix = Self::ordered_insert_inserted_prefix_len(&err);
@@ -13566,11 +13760,14 @@ mod inner {
 }
 
 pub use inner::{
-    ConsumerIdentityReconcileObservation, ConsumerIdentityReservationDisposition, MongoStore,
+    ConsumerIdentityEnsureFold, ConsumerIdentityEnsureObservation,
+    ConsumerIdentityEnsureOwnedError, ConsumerIdentityReconcileObservation,
+    ConsumerIdentityReservationDisposition, MongoStore,
 };
 pub(crate) use inner::{
     apply_mongo_timeout_overrides, automatic_consumer_identity_orphan_reclaim_permitted,
-    classify_consumer_identity_reservation, consumer_identity_reservation_is_same_owner,
-    consumer_identity_values_safe_to_rollback_release, mongo_replace_one_matched_exactly_one,
-    ordered_insert_newly_inserted_prefix,
+    classify_consumer_identity_reservation, consumer_identity_adoption_failure_release_values,
+    consumer_identity_reservation_is_same_owner,
+    consumer_identity_values_safe_to_rollback_release, fold_consumer_identity_ensure_observations,
+    mongo_replace_one_matched_exactly_one, ordered_insert_newly_inserted_prefix,
 };
