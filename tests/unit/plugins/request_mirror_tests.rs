@@ -805,7 +805,8 @@ fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
             .as_ref()
             .err()
             .is_some_and(|e| e.contains("max_in_flight")),
-        "above-cap value must be rejected, got {above_cap:?}"
+        "above-cap value must be rejected, got {:?}",
+        above_cap.as_ref().err()
     );
 
     // A value past Tokio's MAX_PERMITS (usize::MAX >> 3 on 64-bit) would panic
@@ -820,7 +821,8 @@ fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
             .as_ref()
             .err()
             .is_some_and(|e| e.contains("max_in_flight")),
-        "value at/above Tokio MAX_PERMITS must be rejected, got {past_tokio_cap:?}"
+        "value at/above Tokio MAX_PERMITS must be rejected, got {:?}",
+        past_tokio_cap.as_ref().err()
     );
 
     // A value that overflows u64's usable range but still parses as u64.
@@ -832,7 +834,8 @@ fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
         huge.as_ref()
             .err()
             .is_some_and(|e| e.contains("max_in_flight")),
-        "u64::MAX must be rejected without panic, got {huge:?}"
+        "u64::MAX must be rejected without panic, got {:?}",
+        huge.as_ref().err()
     );
 }
 
@@ -3181,7 +3184,11 @@ fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
         }),
         PluginHttpClient::default(),
     );
-    assert!(ok.is_ok(), "exact max bounds must be accepted: {ok:?}");
+    assert!(
+        ok.is_ok(),
+        "exact max bounds must be accepted: {:?}",
+        ok.as_ref().err()
+    );
 }
 
 #[tokio::test]
