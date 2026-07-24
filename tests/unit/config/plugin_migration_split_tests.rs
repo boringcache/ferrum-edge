@@ -402,6 +402,16 @@ fn delimiter_is_ordinary_sql_on_sqlite() {
 }
 
 #[test]
+fn mysql_scanner_handles_non_ascii_text_without_byte_boundary_panics() {
+    assert_split("mysql", "表名; SELECT 1;", &["表名", "SELECT 1"]);
+    assert_split(
+        "mysql",
+        "DELIMITER //\nCREATE PROCEDURE π() BEGIN SELECT 1; END //\nDELIMITER ;",
+        &["CREATE PROCEDURE π() BEGIN SELECT 1; END"],
+    );
+}
+
+#[test]
 fn skips_comment_only_segments() {
     assert_split(
         "sqlite",

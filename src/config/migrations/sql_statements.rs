@@ -312,7 +312,10 @@ impl CowDelim {
     fn matches_at(&self, sql: &str, i: usize) -> bool {
         match self {
             Self::Semicolon => sql.as_bytes().get(i) == Some(&b';'),
-            Self::Custom(d) => sql[i..].starts_with(d.as_str()),
+            Self::Custom(d) => sql
+                .as_bytes()
+                .get(i..i.saturating_add(d.len()))
+                .is_some_and(|candidate| candidate == d.as_bytes()),
         }
     }
 }
@@ -383,8 +386,10 @@ fn try_parse_delimiter_directive(
     }
     let from = &sql[after_ws..];
     let keyword = "DELIMITER";
-    if from.len() < keyword.len()
-        || !from[..keyword.len()].eq_ignore_ascii_case(keyword)
+    if !from
+        .as_bytes()
+        .get(..keyword.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword.as_bytes()))
         || from
             .as_bytes()
             .get(keyword.len())
