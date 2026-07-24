@@ -53,18 +53,6 @@ catastrophic regression in the cached client-IP or constant-time hook overhead.
 | 1 000 | _TBD_ | |
 | 5 000 | _TBD_ | |
 
-## ai_semantic_cache_cleanup
-
-Exact local misses after populating the cache to each required cardinality.
-Hosted CI derives p99 from Criterion's per-iteration sample distribution and
-requires the 100,000-entry p99 to remain within 12x of the 10,000-entry
-same-run reference.
-
-| Retained entries | p99 per request | Notes |
-|---:|---|---|
-| 10 000 | _TBD_ | Same-run reference. |
-| 100 000 | _TBD_ | Audit-required large-cache fixture. |
-
 ## xds_translation
 
 `xds::translator::translate_mesh_slice_to_snapshot(&MeshSlice)` over a slice with N workloads + 1 service each.
@@ -80,6 +68,5 @@ same-run reference.
 - These are **single-threaded** micro-benches. Production paths can amortise across cores; the numbers below are a per-CPU upper bound, not aggregate throughput.
 - `authz_match` measures the worst-case linear scan. The plugin layer caches PolicyScope filter results per-request; that cache is _not_ exercised here.
 - `ip_restriction` measures the compiled O(log n) lookup after canonical client-IP caching; policy construction and rule parsing are outside the timed loop.
-- `ai_semantic_cache_cleanup` measures the exact-miss request hook; cache population is outside the timed samples.
 - `slice_apply` measures the cold rebuild. The ArcSwap swap itself is ~constant time and is not included in the bench window.
 - `xds_translation` runs on the CP side; the DP fingerprint-dedup downstream means most translations get reused, so production hit rate is high.

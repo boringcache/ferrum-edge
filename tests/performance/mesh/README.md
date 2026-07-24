@@ -17,7 +17,6 @@ cargo bench
 # Run a single bench
 cargo bench --bench authz_match
 cargo bench --bench ip_restriction
-cargo bench --bench ai_semantic_cache_cleanup
 
 # Filter inside a bench
 cargo bench --bench slice_apply -- "workloads/1000"
@@ -35,7 +34,6 @@ cargo bench --bench slice_apply -- "workloads/1000"
 |---|---|---|
 | `authz_match` | `policy::evaluate_mesh_authorization_policies` over N policies | Mesh authz runs on every request through `mesh_authz`. Scaling characteristics of the linear policy scan matter when fleets ship thousands of `AuthorizationPolicy` resources. |
 | `ip_restriction` | One or four `ip_restriction` instances evaluating a 10,000-rule miss or final-interval match | Guards the allocation-free indexed lookup promised by issue #2322 across supported multiple-instance composition. |
-| `ai_semantic_cache_cleanup` | Exact local misses with 10,000 and 100,000 retained entries | Records Criterion sample p99 and guards against returning full-map cleanup or oldest-entry selection to the request hot path (issue #3075). |
 | `slice_apply` | `MeshSlice::from_gateway_config(&GatewayConfig, MeshSliceRequest)` over N workloads | Slice build cost dominates the latency budget when an xDS / native CP pushes a fresh slice; this is the cold-path that runs under the ArcSwap apply. |
 | `xds_translation` | `xds::translator::translate_mesh_slice_to_snapshot(&MeshSlice)` over N workloads | Control-plane translation cost shared by every connected DP; the snapshot cache dedupes by content fingerprint downstream of this call. |
 
@@ -43,8 +41,6 @@ Most benches parameterise over input size: typically `[10, 100, 1_000, 10_000]`
 for in-process traversals and `[100, 1_000, 5_000]` for slice / translation
 paths. `ip_restriction` fixes the representative rule count at 10,000 and
 parameterises over worst-case decision shape and attached instance count.
-`ai_semantic_cache_cleanup` uses the two audit-required cardinalities, 10,000
-and 100,000 retained entries.
 
 ## Benches deferred (not yet implemented)
 

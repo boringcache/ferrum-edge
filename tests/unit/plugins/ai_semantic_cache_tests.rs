@@ -5061,8 +5061,10 @@ async fn embedding_semaphore_admission_wait_is_bounded() {
                 "/v1/chat/completions".to_string(),
             );
             ctx.matched_proxy = Some(proxy);
-            ctx.metadata
-                .insert("request_body".to_string(), serde_json::to_string(&body).unwrap());
+            ctx.metadata.insert(
+                "request_body".to_string(),
+                serde_json::to_string(&body).unwrap(),
+            );
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
             plugin.before_proxy(&mut ctx, &mut headers).await
