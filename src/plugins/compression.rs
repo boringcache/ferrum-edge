@@ -28,6 +28,9 @@
 //! body onto the compression-only buffered path; `after_proxy` consumes the
 //! reserved permit and never reacquires once a streaming/identity path is
 //! chosen, failing closed with 406 only when identity is prohibited.
+//! Response compression is also disabled when the gateway response-body limit is
+//! unlimited or exceeds the 32 MiB compression safety ceiling, so every body
+//! admitted to compression buffering has a hard per-response byte bound.
 //!
 //! Multiple effective instances compose with first-wins ownership: one instance
 //! owns request decode and one owns response encode per request so Content-
@@ -81,6 +84,12 @@ pub const HARD_MAX_DECOMPRESSED_REQUEST_SIZE: usize = 32 * 1024 * 1024;
 
 /// Default `max_decompressed_request_size` (10 MiB).
 const DEFAULT_MAX_DECOMPRESSED_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+
+/// Hard ceiling for a response that compression may force onto the buffered
+/// path. The shared response collector enforces the configured gateway limit;
+/// compression is disabled when that limit is `0` (unlimited) or above this
+/// ceiling so the plugin cannot introduce an unbounded full-body allocation.
+pub const HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE: usize = 32 * 1024 * 1024;
 
 /// Maximum stacked request content-coding layers decoded for one upload.
 const REQUEST_DECODE_MAX_CODINGS: usize = 4;
@@ -786,6 +795,10 @@ impl CompressionPlugin {
             .or_else(|| ctx.headers.get("accept-encoding").map(String::as_str))
     }
 
+    fn response_body_limit_allows_compression(ctx: &RequestContext) -> bool {
+        (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE).contains(&ctx.max_response_body_size_bytes)
+    }
+
     /// Reserve one response-compression codec permit for this request when this
     /// instance can select a supported nonzero coding for the client's
     /// `Accept-Encoding`. Runs in `before_proxy`, ahead of the response-buffer
@@ -808,6 +821,10 @@ impl CompressionPlugin {
         let selects_coding = Self::negotiated_accept_encoding(ctx)
             .is_some_and(|ae| matches!(self.select_algorithm(ae), CodingSelection::Compress(_)));
         if !selects_coding {
+            return;
+        }
+        if !Self::response_body_limit_allows_compression(ctx) {
+            ctx.mark_compression_response_admission_declined();
             return;
         }
         match try_acquire_codec_permit() {
@@ -1448,6 +1465,7 @@ impl Plugin for CompressionPlugin {
             || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
+            || !Self::response_body_limit_allows_compression(ctx)
         {
             return false;
         }
@@ -1712,6 +1730,7 @@ impl Plugin for CompressionPlugin {
                 let can_encode = !on_rejection
                     && !range_or_delta
                     && !ctx.has_compression_response_encode_owner()
+                    && Self::response_body_limit_allows_compression(ctx)
                     && !Self::response_forbids_transform(ctx, response_headers)
                     && self.is_compression_eligible(response_headers);
                 if can_encode {

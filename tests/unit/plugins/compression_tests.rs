@@ -66,6 +66,7 @@ fn make_ctx(accept_encoding: Option<&str>) -> RequestContext {
         "GET".to_string(),
         "/test".to_string(),
     );
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     if let Some(ae) = accept_encoding {
         ctx.headers
             .insert("accept-encoding".to_string(), ae.to_string());
@@ -5456,6 +5457,83 @@ async fn test_before_proxy_does_not_reserve_for_unnegotiable_encodings() {
             "no reservation was attempted for {ae:?}, so it must not be marked declined"
         );
     }
+}
+
+#[tokio::test]
+async fn test_unsafe_global_response_limits_decline_compression_before_buffering() {
+    use ferrum_edge::_test_support::{
+        compression_response_admission_declined_for_test,
+        compression_response_admission_reserved_for_test,
+    };
+    use ferrum_edge::plugins::compression::HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE;
+
+    let plugin = make_plugin(json!({}));
+    for limit in [0, HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE + 1] {
+        let mut ctx = make_ctx(Some("gzip"));
+        ctx.max_response_body_size_bytes = limit;
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        assert!(
+            compression_response_admission_declined_for_test(&ctx),
+            "unsafe response limit {limit} must decline compression admission"
+        );
+        assert!(!compression_response_admission_reserved_for_test(&ctx));
+        assert!(
+            !plugin.should_buffer_response_body(&ctx),
+            "unsafe response limit {limit} must stream identity"
+        );
+
+        let mut response_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "1000".to_string()),
+        ]);
+        assert!(matches!(
+            plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !response_headers.contains_key("content-encoding"),
+            "unsafe response limit {limit} must not commit compression"
+        );
+
+        let accept_encoding = "gzip, identity;q=0";
+        let mut identity_barred_ctx = make_ctx(Some(accept_encoding));
+        identity_barred_ctx.max_response_body_size_bytes = limit;
+        before_proxy_with_accept_encoding(
+            &plugin,
+            &mut identity_barred_ctx,
+            Some(accept_encoding),
+        )
+        .await;
+        assert!(
+            !plugin.should_buffer_response_body(&identity_barred_ctx),
+            "unsafe response limit {limit} must not buffer when identity is prohibited"
+        );
+        let mut identity_barred_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "1000".to_string()),
+        ]);
+        match plugin
+            .after_proxy(&mut identity_barred_ctx, 200, &mut identity_barred_headers)
+            .await
+        {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 406),
+            other => panic!(
+                "expected 406 when identity is barred under unsafe response limit {limit}, got {other:?}"
+            ),
+        }
+        assert!(!identity_barred_headers.contains_key("content-encoding"));
+    }
+
+    let mut ceiling_ctx = make_ctx(Some("gzip"));
+    ceiling_ctx.max_response_body_size_bytes = HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE;
+    before_proxy_with_accept_encoding(&plugin, &mut ceiling_ctx, Some("gzip")).await;
+    assert!(
+        compression_response_admission_reserved_for_test(&ceiling_ctx),
+        "the exact compression safety ceiling must remain admissible"
+    );
+    assert!(plugin.should_buffer_response_body(&ceiling_ctx));
 }
 
 #[tokio::test]
