@@ -452,7 +452,7 @@ fn test_proxy_ids_needing_plugin_rebuild_from_proxy_change() {
     };
     let delta = ConfigDelta::compute(&old, &new);
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
 }
 
 #[test]
@@ -485,7 +485,7 @@ fn test_proxy_ids_needing_plugin_rebuild_from_global_plugin_change() {
     let delta = ConfigDelta::compute(&old, &new);
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
     // Global plugin change should trigger rebuild for ALL proxies
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
 }
 
 #[test]
@@ -521,9 +521,9 @@ fn test_proxy_ids_needing_plugin_rebuild_when_global_plugin_changes_scope() {
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
     assert!(delta.global_plugin_configs_changed);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
     assert!(
-        ids.contains("p2"),
+        ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")),
         "a plugin moving away from global scope must rebuild proxies that only saw it via globals"
     );
 }
@@ -554,9 +554,9 @@ fn test_proxy_ids_needing_plugin_rebuild_from_removed_proxy_plugin_config() {
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
     assert!(!delta.global_plugin_configs_changed);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
     assert!(
-        ids.contains("p2"),
+        ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")),
         "plugin config deletion conservatively rebuilds all proxies because associations may cascade without proxy timestamps"
     );
 }
@@ -803,7 +803,7 @@ fn test_plugin_rebuild_proxy_scoped_plugin_change() {
     };
     let delta = ConfigDelta::compute(&old, &new);
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
 }
 
 #[test]
@@ -837,9 +837,9 @@ fn test_plugin_rebuild_unrelated_proxy_not_affected() {
     };
     let delta = ConfigDelta::compute(&old, &new);
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
     // p2 should NOT need rebuild since its plugin didn't change
-    assert!(!ids.contains("p2"));
+    assert!(!ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")));
 }
 
 // --- Same timestamp not treated as modification ---

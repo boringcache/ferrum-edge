@@ -256,7 +256,8 @@ pub mod _test_support {
         namespace: &str,
         proxy_id: &str,
     ) -> bool {
-        cache.contains_proxy_plugins_key(namespace, proxy_id)
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, proxy_id);
+        cache.load_inner().proxy_plugins.contains_key(&key)
     }
 
     /// Whether the service-discovery loop would prune `proxy`'s passive-health

@@ -2,8 +2,8 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, GatewayConfig, HealthCheckConfig, HealthProbeType, LoadBalancerAlgorithm,
-    PassiveHealthCheck, Upstream, UpstreamTarget, default_namespace,
+    ActiveHealthCheck, DEFAULT_NAMESPACE, GatewayConfig, HealthCheckConfig, HealthProbeType,
+    LoadBalancerAlgorithm, PassiveHealthCheck, Upstream, UpstreamTarget, default_namespace,
 };
 use ferrum_edge::health_check::HealthChecker;
 use std::collections::HashMap;
@@ -61,7 +61,7 @@ fn test_passive_health_marks_unhealthy() {
 
     for _ in 0..3 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target,
             500,
@@ -89,7 +89,7 @@ fn test_passive_health_recovers() {
 
     for _ in 0..2 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target,
             500,
@@ -100,7 +100,7 @@ fn test_passive_health_recovers() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         200,
@@ -126,7 +126,7 @@ fn test_success_does_not_mark_unhealthy() {
 
     for _ in 0..100 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target,
             200,
@@ -154,7 +154,7 @@ fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
 
     for _ in 0..2 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target,
             502,
@@ -185,7 +185,7 @@ fn test_connection_error_recovery_on_success() {
 
     for _ in 0..2 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target,
             502,
@@ -196,7 +196,7 @@ fn test_connection_error_recovery_on_success() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         200,
@@ -223,7 +223,7 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
 
     for _ in 0..2 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target1,
             500,
@@ -231,7 +231,7 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
             Some(&config),
         );
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target2,
             500,
@@ -244,7 +244,7 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
 
     // Remove backend2 from the upstream for this proxy.
     checker.remove_stale_passive_targets_for_proxy(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         std::slice::from_ref(&target1),
     );
@@ -269,7 +269,7 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
 
     for _ in 0..2 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target,
             500,
@@ -279,7 +279,7 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.remove_stale_passive_targets_for_proxy(default_namespace(), TEST_PROXY, &[]);
+    checker.remove_stale_passive_targets_for_proxy(DEFAULT_NAMESPACE, TEST_PROXY, &[]);
     assert_eq!(passive_unhealthy_count(&checker), 0);
 }
 
@@ -300,7 +300,7 @@ fn test_remove_stale_targets_no_op_when_all_present() {
 
     for _ in 0..2 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target1,
             500,
@@ -308,7 +308,7 @@ fn test_remove_stale_targets_no_op_when_all_present() {
             Some(&config),
         );
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target2,
             500,
@@ -318,7 +318,7 @@ fn test_remove_stale_targets_no_op_when_all_present() {
     }
 
     checker.remove_stale_passive_targets_for_proxy(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &[target1, target2],
     );
@@ -497,7 +497,7 @@ fn test_passive_window_only_counts_recent_failures() {
 
     // Record 2 failures (under threshold)
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -505,7 +505,7 @@ fn test_passive_window_only_counts_recent_failures() {
         Some(&config),
     );
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -522,7 +522,7 @@ fn test_passive_window_only_counts_recent_failures() {
 
     // Record 1 more failure — the old 2 should have expired from the window
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -551,7 +551,7 @@ fn test_passive_window_failures_within_window_accumulate() {
 
     // All 3 failures within the 60s window
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -559,7 +559,7 @@ fn test_passive_window_failures_within_window_accumulate() {
         Some(&config),
     );
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -569,7 +569,7 @@ fn test_passive_window_failures_within_window_accumulate() {
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -597,7 +597,7 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
     };
 
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         502,
@@ -628,7 +628,7 @@ fn test_connection_error_ignores_status_code_list() {
 
     // Status code 200 with connection_error=true should still count as failure
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         200,
@@ -660,7 +660,7 @@ fn test_passive_health_per_target_isolation() {
 
     // Fail target_a only
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target_a,
         500,
@@ -668,7 +668,7 @@ fn test_passive_health_per_target_isolation() {
         Some(&config),
     );
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target_a,
         500,
@@ -702,7 +702,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
     // Mark unhealthy
     for _ in 0..3 {
         checker.report_response(
-            default_namespace(),
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             &target,
             500,
@@ -714,7 +714,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
 
     // Recover with a success
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         200,
@@ -726,7 +726,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
     // Now it should take a full 3 failures again to mark unhealthy
     // (failure history was cleared on recovery)
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -734,7 +734,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
         Some(&config),
     );
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -747,7 +747,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
     );
 
     checker.report_response(
-        default_namespace(),
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         &target,
         500,
@@ -766,7 +766,7 @@ fn test_no_passive_config_is_noop() {
 
     // Report with no passive config
     for _ in 0..100 {
-        checker.report_response(default_namespace(), TEST_PROXY, &target, 500, false, None);
+        checker.report_response(DEFAULT_NAMESPACE, TEST_PROXY, &target, 500, false, None);
     }
 
     assert_eq!(

@@ -291,9 +291,14 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
         );
     }
 
-    // Eject the local endpoint (active unhealthy, keyed `upstream_id::host:port`).
+    // Eject the local endpoint (active unhealthy, keyed
+    // `namespace|upstream_id::host:port` to match production identity).
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
-    active_unhealthy.insert(format!("{upstream_id}::10.1.0.1:8080"), 1);
+    let local_active_key = format!(
+        "{}::10.1.0.1:8080",
+        ferrum_edge::config::db_backend::namespaced_runtime_key("default", upstream_id)
+    );
+    active_unhealthy.insert(local_active_key, 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,

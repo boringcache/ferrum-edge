@@ -3190,7 +3190,10 @@ thread_local! {
 
 pub(crate) struct PluginCacheInner {
     /// proxy_id -> pre-resolved plugin list (global + proxy-scoped, merged).
-    proxy_plugins: ProxyPluginMap,
+    ///
+    /// `pub(crate)` so external namespace-prune coverage can assert key presence
+    /// through [`crate::_test_support`] without a binary-only dead helper.
+    pub(crate) proxy_plugins: ProxyPluginMap,
     /// Fallback: global plugins only (for proxies with no scoped overrides).
     global_plugins: PluginList,
     /// Pre-computed: does any plugin for this proxy require response body buffering?
@@ -4009,13 +4012,6 @@ impl PluginCache {
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
         self.inner.load_full()
-    }
-
-    /// Test/support helper: whether a namespace-qualified proxy key is present in
-    /// the published proxy plugin map.
-    pub(crate) fn contains_proxy_plugins_key(&self, namespace: &str, proxy_id: &str) -> bool {
-        let key = namespaced_runtime_key(namespace, proxy_id);
-        self.inner.load().proxy_plugins.contains_key(&key)
     }
 
     /// Current-generation `__mesh_bpf_metrics` scrape exporter, if the plugin

@@ -10769,11 +10769,19 @@ components:
         Direct-backend proxies (no upstream) emit one per-proxy entry without
         `target`. Proxies with upstream targets emit one independent breaker per
         target and include `target` as `host:port`.
-      required: [proxy_id, state, failure_count, success_count]
+
+        Runtime cache keys are namespace-qualified; authenticated admin output
+        keeps the original resource id in `proxy_id` and exposes `namespace`
+        separately so same-id tenants remain distinguishable.
+      required: [namespace, proxy_id, state, failure_count, success_count]
       properties:
+        namespace:
+          type: string
+          description: Namespace that owns this proxy
+          example: ferrum
         proxy_id:
           type: string
-          description: ID of the proxy this circuit breaker protects
+          description: ID of the proxy this circuit breaker protects (not namespace-qualified)
         target:
           type: string
           description: |
@@ -10799,15 +10807,26 @@ components:
       type: object
       description: |
         One unhealthy target excluded from load balancing. Active health checks
-        are upstream-scoped (`type=active`, no `proxy_id`). Passive health checks
-        are proxy-scoped (`type=passive` and always include `proxy_id`).
-      required: [target, type, since_epoch_ms]
+        are upstream-scoped (`type=active`, `upstream_id` present, no `proxy_id`).
+        Passive health checks are proxy-scoped (`type=passive`, `proxy_id` present,
+        no `upstream_id`). Namespace is always explicit so same-id resources in
+        different tenants remain distinguishable.
+      required: [namespace, target, type, since_epoch_ms]
       properties:
+        namespace:
+          type: string
+          description: Namespace that owns this health entry
+          example: ferrum
         proxy_id:
           type: string
           description: |
             Proxy that owns this passive health entry. Required when
             `type` is `passive`; omitted when `type` is `active`.
+        upstream_id:
+          type: string
+          description: |
+            Upstream that owns this active health entry. Required when
+            `type` is `active`; omitted when `type` is `passive`.
         target:
           type: string
           description: "Target in host:port format"
@@ -10830,12 +10849,15 @@ components:
             required: [type]
           then:
             required: [proxy_id]
+            not:
+              required: [upstream_id]
         - if:
             properties:
               type:
                 const: active
             required: [type]
           then:
+            required: [upstream_id]
             not:
               required: [proxy_id]
 
@@ -10854,6 +10876,29 @@ components:
           items:
             $ref: "#/components/schemas/AdminMetricsUnhealthyTarget"
 
+    AdminMetricsUpstreamConnections:
+      type: object
+      description: |
+        Active connection counts for one upstream. Namespace and upstream_id are
+        separate fields so same-id upstreams in different tenants stay distinct.
+      required: [namespace, upstream_id, targets]
+      properties:
+        namespace:
+          type: string
+          description: Namespace that owns this upstream
+          example: ferrum
+        upstream_id:
+          type: string
+          description: Upstream ID (not namespace-qualified)
+          example: upstream-users
+        targets:
+          type: object
+          additionalProperties:
+            type: integer
+          description: |
+            Map of `host:port` → active_connection_count. Only targets with
+            count > 0 are included.
+
     AdminMetricsLoadBalancers:
       type: object
       description: |
@@ -10862,14 +10907,12 @@ components:
         distribution across targets and spotting hot targets.
       properties:
         active_connections:
-          type: object
-          additionalProperties:
-            type: object
-            additionalProperties:
-              type: integer
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminMetricsUpstreamConnections"
           description: |
-            Nested map: upstream_id → { "host:port" → active_connection_count }.
-            Only targets with count > 0 are included.
+            One entry per upstream that currently has active connections.
+            Identity is `(namespace, upstream_id)`; target keys remain `host:port`.
 
     AdminMetricsCaches:
       type: object
