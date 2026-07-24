@@ -100,6 +100,30 @@ pub mod _test_support {
         ctx.compression_ownership_for_test()
     }
 
+    pub fn take_compression_response_codec_permit_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        ctx.take_compression_response_codec_permit()
+    }
+
+    pub fn gateway_response_compression_algorithm_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<&'static str> {
+        ctx.gateway_response_compression_algorithm()
+    }
+
+    pub fn reconcile_aborted_gateway_response_encoding_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_headers: &mut std::collections::HashMap<String, String>,
+        body_len: usize,
+    ) {
+        crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+            ctx,
+            response_headers,
+            body_len,
+        );
+    }
+
     pub fn validate_correlation_id_composition_for_test(
         plugins: &[Arc<dyn Plugin>],
     ) -> Result<(), String> {
