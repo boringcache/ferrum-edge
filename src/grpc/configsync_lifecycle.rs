@@ -697,7 +697,7 @@ impl ConfigSyncDivergenceMetrics {
         self.diverged.store(true, Ordering::Release);
     }
 
-    /// Record a cross-source FULL_SNAPSHOT the DP fenced without applying
+    /// Record a FULL_SNAPSHOT the DP fenced without applying
     /// (stale/older, unorderable/inconsistent, or an implausibly-future clock
     /// stamp). Fixed-cardinality operator signal for skew/hostile-CP fencing.
     /// Does not touch sticky `diverged`: fencing keeps last-known-good config

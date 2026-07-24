@@ -854,7 +854,7 @@ fn update_state_config_diverged(
     }
 }
 
-/// Record a fenced (refused-without-applying) cross-source FULL_SNAPSHOT and
+/// Record a fenced (refused-without-applying) FULL_SNAPSHOT and
 /// invalidate the cached `/metrics` render so the fixed-cardinality fenced
 /// counter surfaces promptly. Fencing keeps last-known-good config and does not
 /// raise sticky `config_diverged` — it is a failover/skew signal, not a
