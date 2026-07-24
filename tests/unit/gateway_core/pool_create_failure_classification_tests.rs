@@ -24,8 +24,7 @@ fn assert_wire_parity(creator_class: ErrorClass, waiter_class: ErrorClass) {
 
 fn assert_grpc_waiter_parity(creator: GrpcProxyError) {
     let expected = classify_grpc_proxy_error(&creator);
-    let shared = creator.to_shared(42);
-    assert_eq!(shared.generation(), 42);
+    let shared = creator.to_shared();
     assert_eq!(
         shared.error_class(),
         expected,
@@ -43,8 +42,7 @@ fn assert_grpc_waiter_parity(creator: GrpcProxyError) {
 
 fn assert_h2_waiter_parity(creator: Http2PoolError) {
     let expected = classify_http2_pool_error(&creator);
-    let shared = creator.to_shared(7);
-    assert_eq!(shared.generation(), 7);
+    let shared = creator.to_shared();
     assert_eq!(shared.error_class(), expected);
 
     let waiter = Http2PoolError::from(shared);
@@ -116,7 +114,7 @@ fn grpc_egress_policy_denial_preserves_classification_for_waiters() {
         classify_grpc_proxy_error(&creator),
         ErrorClass::DispatchPolicyRejected
     );
-    let shared = creator.to_shared(1);
+    let shared = creator.to_shared();
     assert_grpc_waiter_parity(creator);
 
     // Structural kind must stay DnsResolution so proxy retry/CB guards that
@@ -145,7 +143,7 @@ fn grpc_creator_retains_typed_unavailable_kind_not_only_shared_payload() {
         GrpcBackendUnavailableKind::DnsResolution,
         "dns resolution failed".into(),
     );
-    let shared = creator.to_shared(1);
+    let shared = creator.to_shared();
     assert_eq!(shared.kind(), SharedPoolCreateKind::Dns);
 
     match &creator {
@@ -180,8 +178,7 @@ fn h2_dns_failure_preserves_classification_for_waiters() {
 fn h2_tls_failure_preserves_classification_for_waiters() {
     let creator = Http2PoolError::BackendUnavailable {
         message: "tls handshake failed".into(),
-        source: Some(BackendUnavailableSource::Tls(io::Error::new(
-            io::ErrorKind::Other,
+        source: Some(BackendUnavailableSource::Tls(io::Error::other(
             "certificate verify failed",
         ))),
     };
@@ -226,7 +223,7 @@ fn h2_negotiated_http1_preserves_protocol_class_and_pool_key() {
         classify_http2_pool_error(&creator),
         ErrorClass::ProtocolError
     );
-    let shared = creator.to_shared(3);
+    let shared = creator.to_shared();
     assert_eq!(shared.kind(), SharedPoolCreateKind::NegotiatedHttp1);
     assert_eq!(shared.detail(), Some("host|443||||||sni||true"));
     let waiter = Http2PoolError::from(shared);
@@ -279,7 +276,7 @@ fn anyhow_h3_timeout_waiter_keeps_typed_shared_classification() {
     let expected = classify_http3_error(creator.as_ref());
     assert_eq!(expected, ErrorClass::ConnectionTimeout);
 
-    let shared = ShareablePoolCreateError::to_shared(&creator, 11);
+    let shared = ShareablePoolCreateError::to_shared(&creator);
     assert_eq!(shared.kind(), SharedPoolCreateKind::TimedOut);
     assert_eq!(shared.error_class(), ErrorClass::ConnectionTimeout);
 
@@ -305,7 +302,7 @@ fn anyhow_dns_style_setup_failure_preserves_classification_for_waiters() {
     // re-deriving from the message alone.
     let creator: anyhow::Error =
         anyhow::anyhow!("failed to lookup address information: Name or service not known");
-    let shared = ShareablePoolCreateError::to_shared(&creator, 5);
+    let shared = ShareablePoolCreateError::to_shared(&creator);
     assert_eq!(
         shared.error_class(),
         ErrorClass::DnsLookupError,
@@ -326,12 +323,10 @@ fn shared_pool_create_error_from_classified_round_trips_error_class() {
     let shared = SharedPoolCreateError::from_classified(
         "denied by backend egress policy",
         ErrorClass::DispatchPolicyRejected,
-        9,
         None,
     );
     assert_eq!(shared.kind(), SharedPoolCreateKind::DispatchPolicyRejected);
     assert_eq!(shared.error_class(), ErrorClass::DispatchPolicyRejected);
-    assert_eq!(shared.generation(), 9);
 
     let waiter = anyhow::Error::new(shared);
     let waiter_class = classify_http3_error(waiter.as_ref());
@@ -348,7 +343,7 @@ fn h2_waiter_backend_unavailable_attaches_shared_source_for_classification() {
         message: "dns resolution failed".into(),
         source: Some(BackendUnavailableSource::Dns),
     };
-    let waiter = Http2PoolError::from(creator.to_shared(2));
+    let waiter = Http2PoolError::from(creator.to_shared());
     match waiter {
         Http2PoolError::BackendUnavailable {
             source: Some(BackendUnavailableSource::Shared(shared)),

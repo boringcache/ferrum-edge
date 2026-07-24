@@ -1394,7 +1394,7 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
 }
 
 impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
-    fn to_shared(&self, generation: u64) -> crate::pool::SharedPoolCreateError {
+    fn to_shared(&self) -> crate::pool::SharedPoolCreateError {
         use crate::pool::{SharedPoolCreateError, SharedPoolCreateKind};
         use crate::retry::ErrorClass;
 
@@ -1406,14 +1406,12 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
                 message.clone(),
                 SharedPoolCreateKind::TimedOut,
                 error_class,
-                generation,
                 None,
             ),
             Self::Internal(message) => SharedPoolCreateError::new(
                 message.clone(),
                 SharedPoolCreateKind::Internal,
                 error_class,
-                generation,
                 None,
             ),
             Self::BackendUnavailable { message, .. }
@@ -1436,7 +1434,7 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
                     ErrorClass::ConnectionPoolError => SharedPoolCreateKind::Unavailable,
                     _ => SharedPoolCreateKind::from_error_class(error_class),
                 };
-                SharedPoolCreateError::new(message.clone(), kind, error_class, generation, None)
+                SharedPoolCreateError::new(message.clone(), kind, error_class, None)
             }
         }
     }

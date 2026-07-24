@@ -98,10 +98,6 @@ struct SharedPoolCreateErrorInner {
     /// source-chain classifiers must prefer this over re-deriving from the
     /// reconstructed message alone.
     error_class: crate::retry::ErrorClass,
-    /// Monotonic id for this failed creation generation. Waiters that share a
-    /// coalesced create observe the same value; a later independent request
-    /// starts a new generation.
-    generation: u64,
     /// Optional reconstruction detail (e.g. pool key for [`SharedPoolCreateKind::NegotiatedHttp1`]).
     /// Not included in [`Display`]; pool-key TLS material must be redacted by
     /// the typed error's own Display if logged.
@@ -109,13 +105,16 @@ struct SharedPoolCreateErrorInner {
 }
 
 /// Cloneable create-failure payload shared with every waiter for one coalesced
-/// creation generation.
+/// creation attempt.
 ///
 /// The original creator error often carries non-`Clone` typed sources. Rather
 /// than requiring those errors to be cloneable (or retaining secrets embedded
 /// in source chains), the pool captures a sanitized message plus
 /// [`SharedPoolCreateKind`] / [`crate::retry::ErrorClass`] and fans that out.
 /// Callers reconstruct their error type via `From<SharedPoolCreateError>`.
+///
+/// Coalescing scope is the `PendingCreation` entry itself (Arc identity + map
+/// removal), not an id stamped on this payload.
 #[derive(Debug, Clone)]
 pub struct SharedPoolCreateError {
     inner: Arc<SharedPoolCreateErrorInner>,
@@ -126,7 +125,6 @@ impl SharedPoolCreateError {
         message: impl Into<String>,
         kind: SharedPoolCreateKind,
         error_class: crate::retry::ErrorClass,
-        generation: u64,
         detail: Option<String>,
     ) -> Self {
         Self {
@@ -134,7 +132,6 @@ impl SharedPoolCreateError {
                 message: message.into(),
                 kind,
                 error_class,
-                generation,
                 detail,
             }),
         }
@@ -144,20 +141,18 @@ impl SharedPoolCreateError {
     pub fn from_classified(
         message: impl Into<String>,
         error_class: crate::retry::ErrorClass,
-        generation: u64,
         detail: Option<String>,
     ) -> Self {
         let kind = SharedPoolCreateKind::from_error_class(error_class);
-        Self::new(message, kind, error_class, generation, detail)
+        Self::new(message, kind, error_class, detail)
     }
 
-    /// Capture a broadcastable failure from a setup-phase std error, assigning
-    /// `generation`. Uses the canonical boxed setup classifier rather than
-    /// substring heuristics so H3/anyhow GenericPool waiters retain typed
-    /// shared classification.
-    pub fn capture(err: &(dyn std::error::Error + Send + Sync + 'static), generation: u64) -> Self {
+    /// Capture a broadcastable failure from a setup-phase std error. Uses the
+    /// canonical boxed setup classifier rather than substring heuristics so
+    /// H3/anyhow GenericPool waiters retain typed shared classification.
+    pub fn capture(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Self {
         let error_class = crate::retry::classify_boxed_setup_error(err);
-        Self::from_classified(err.to_string(), error_class, generation, None)
+        Self::from_classified(err.to_string(), error_class, None)
     }
 
     pub fn message(&self) -> &str {
@@ -171,10 +166,6 @@ impl SharedPoolCreateError {
     /// Canonical ErrorClass captured when the creator failed.
     pub fn error_class(&self) -> crate::retry::ErrorClass {
         self.inner.error_class
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.inner.generation
     }
 
     pub fn detail(&self) -> Option<&str> {
@@ -197,27 +188,26 @@ impl std::error::Error for SharedPoolCreateError {}
 /// non-`Clone` sources. Direct-H2 also preserves the
 /// `BackendSelectedHttp1` structural signal.
 pub trait ShareablePoolCreateError: 'static {
-    fn to_shared(&self, generation: u64) -> SharedPoolCreateError;
+    fn to_shared(&self) -> SharedPoolCreateError;
 }
 
 impl ShareablePoolCreateError for anyhow::Error {
-    fn to_shared(&self, generation: u64) -> SharedPoolCreateError {
+    fn to_shared(&self) -> SharedPoolCreateError {
         // H3 and reqwest GenericPool creates both surface `anyhow::Error`.
         // `classify_boxed_setup_error` is the shared setup-phase classifier
         // (typed chain + anchored fallback) and avoids a pool→http3 import
         // cycle while still preserving timeout/DNS/TLS/refused/port-exhaustion.
-        SharedPoolCreateError::capture(self.as_ref(), generation)
+        SharedPoolCreateError::capture(self.as_ref())
     }
 }
 
 impl ShareablePoolCreateError for SharedPoolCreateError {
-    fn to_shared(&self, generation: u64) -> SharedPoolCreateError {
-        // Preserve kind/class/detail; refresh generation for a new broadcast.
+    fn to_shared(&self) -> SharedPoolCreateError {
+        // Preserve kind/class/detail for a re-broadcast of the same payload.
         SharedPoolCreateError::new(
             self.message().to_string(),
             self.kind(),
             self.error_class(),
-            generation,
             self.detail().map(str::to_string),
         )
     }
@@ -285,11 +275,11 @@ enum LookupOutcome<C> {
     Unhealthy(String),
 }
 
-/// Outcome published to coalesced waiters for one creation generation.
+/// Outcome published to coalesced waiters for one pending creation entry.
 ///
 /// `Finished` covers both successful insertion and creator cancellation: waiters
 /// re-check the cache / re-elect. `Failed` is the broadcast path that prevents
-/// serial redials of a hard-down backend within the same generation.
+/// serial redials of a hard-down backend among waiters on this entry.
 #[derive(Debug, Clone)]
 enum CreationNotify {
     Pending,
@@ -384,7 +374,7 @@ impl<M: PoolManager> Drop for PendingCreationGuard<'_, M> {
     fn drop(&mut self) {
         if let Some(pending) = self.pending.take() {
             // Cancellation / panic: wake waiters without broadcasting a failure
-            // so a later waiter can elect a new creator for a fresh generation.
+            // so a later waiter can elect a new creator for a fresh attempt.
             self.pool.finish_pending_creation(&self.key, pending);
         }
     }
@@ -397,8 +387,6 @@ pub struct GenericPool<M: PoolManager> {
     cleanup_interval: Duration,
     inflight: Arc<Semaphore>,
     pending_creations: Arc<DashMap<String, Arc<PendingCreation>>>,
-    /// Monotonic counter assigned to each coalesced create-failure broadcast.
-    failure_generation: AtomicU64,
 }
 
 impl<M: PoolManager> GenericPool<M> {
@@ -424,7 +412,6 @@ impl<M: PoolManager> GenericPool<M> {
             cleanup_interval,
             inflight: Arc::new(Semaphore::new(inflight_limit)),
             pending_creations: Arc::new(DashMap::with_shard_amount(shards)),
-            failure_generation: AtomicU64::new(0),
         });
         pool.clone().spawn_cleanup();
         pool
@@ -547,11 +534,11 @@ impl<M: PoolManager> GenericPool<M> {
     ///
     /// Concurrent callers for the same key coalesce onto one creator. On
     /// success, waiters re-check the cache. On failure, the creator's error is
-    /// captured as [`SharedPoolCreateError`] and broadcast to every waiter for
-    /// that generation so a burst against a hard-down backend fails fast
+    /// captured as [`SharedPoolCreateError`] and broadcast to every waiter on
+    /// that pending entry so a burst against a hard-down backend fails fast
     /// instead of serially redialing. Cancellation (creator drop) does not
     /// broadcast a failure — waiters re-elect. There is no durable negative
-    /// cache: a later independent request starts a new generation.
+    /// cache: a later independent request registers a fresh pending entry.
     pub async fn create_or_get_existing_owned<C, Fut, E>(
         &self,
         key: String,
@@ -595,11 +582,7 @@ impl<M: PoolManager> GenericPool<M> {
                     return Ok(conn);
                 }
                 Err(err) => {
-                    let generation = self
-                        .failure_generation
-                        .fetch_add(1, Ordering::Relaxed)
-                        .saturating_add(1);
-                    let shared = err.to_shared(generation);
+                    let shared = err.to_shared();
                     pending_guard.fail(shared);
                     // Preserve the creator's full typed/source error. Only
                     // coalesced waiters need the cloneable reconstruction.
@@ -622,7 +605,7 @@ impl<M: PoolManager> GenericPool<M> {
 
     fn finish_pending_creation(&self, key: &str, pending: Arc<PendingCreation>) {
         // Remove before notifying so a request that arrives after this
-        // generation completes cannot join the retired pending entry.
+        // attempt completes cannot join the retired pending entry.
         self.pending_creations
             .remove_if(key, |_, current| Arc::ptr_eq(current, &pending));
         pending.finish();
@@ -915,10 +898,10 @@ mod tests {
     #[tokio::test]
     async fn pending_creation_wait_fans_out_shared_failure() {
         let pending = PendingCreation::new();
-        let shared = SharedPoolCreateError::capture(
-            &std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"),
-            7,
-        );
+        let shared = SharedPoolCreateError::capture(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connect timed out",
+        ));
         pending.finish_failed(shared.clone());
 
         let outcome = tokio::time::timeout(Duration::from_millis(50), pending.wait())
@@ -926,7 +909,6 @@ mod tests {
             .expect("failed pending creation should not block late waiters");
         match outcome {
             CreationNotify::Failed(err) => {
-                assert_eq!(err.generation(), 7);
                 assert_eq!(err.kind(), SharedPoolCreateKind::TimedOut);
                 assert_eq!(
                     err.error_class(),
@@ -1077,7 +1059,7 @@ mod tests {
         assert_eq!(
             manager.attempts.load(Ordering::Relaxed),
             1,
-            "only one create attempt should run for the failed generation"
+            "only one create attempt should run for the failed coalesced create"
         );
         assert_eq!(manager.creates.load(Ordering::Relaxed), 0);
         assert!(pool.pending_creations.is_empty());
@@ -1090,30 +1072,33 @@ mod tests {
             "waiters should wait for the single in-flight create (elapsed {elapsed:?})"
         );
 
-        let shared_generations: Vec<u64> = results
+        let shared_messages: Vec<&str> = results
             .iter()
             .filter_map(|result| {
                 let err = result.as_ref().unwrap_err();
                 err.downcast_ref::<SharedPoolCreateError>()
-                    .map(SharedPoolCreateError::generation)
+                    .map(SharedPoolCreateError::message)
             })
             .collect();
         assert_eq!(
-            shared_generations.len(),
+            shared_messages.len(),
             waiter_count - 1,
             "one creator must retain its original error while every waiter receives the shared error"
         );
         assert!(
-            shared_generations.windows(2).all(|pair| pair[0] == pair[1]),
-            "all waiters must share the same failure generation: {shared_generations:?}"
+            shared_messages.windows(2).all(|pair| pair[0] == pair[1]),
+            "all waiters must receive the same shared failure payload: {shared_messages:?}"
         );
-        assert_ne!(shared_generations[0], 0);
+        assert!(
+            !shared_messages[0].is_empty(),
+            "shared failure message must be non-empty"
+        );
 
-        // Later independent request / generation can succeed (no durable negative cache).
+        // Later independent request can succeed (no durable negative cache).
         let recovered = pool
             .get(&proxy, "backend.example.com", 443, 0)
             .await
-            .expect("independent request after failed generation should retry create");
+            .expect("independent request after failed coalesced create should retry create");
         assert!(recovered.contains("gen=1"));
         assert_eq!(manager.attempts.load(Ordering::Relaxed), 2);
         assert_eq!(manager.creates.load(Ordering::Relaxed), 1);
@@ -1154,7 +1139,7 @@ mod tests {
         assert_eq!(manager.attempts.load(Ordering::Relaxed), 1);
         assert!(pool.pending_creations.is_empty());
 
-        // Distinct pool key must not inherit the prior generation's failure.
+        // Distinct pool key must not inherit the prior attempt's failure.
         let other = pool
             .get(&proxy, "backend.example.com", 443, 1)
             .await

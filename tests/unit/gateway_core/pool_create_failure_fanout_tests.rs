@@ -166,7 +166,7 @@ async fn external_generic_pool_fans_out_one_create_failure_to_all_waiters() {
     assert_eq!(
         manager.attempts.load(Ordering::Relaxed),
         1,
-        "only one create attempt should run for the failed generation"
+        "only one create attempt should run for the failed coalesced create"
     );
     assert_eq!(manager.creates.load(Ordering::Relaxed), 0);
     assert!(
@@ -178,30 +178,33 @@ async fn external_generic_pool_fans_out_one_create_failure_to_all_waiters() {
         "waiters should wait for the single in-flight create (elapsed {elapsed:?})"
     );
 
-    let shared_generations: Vec<u64> = results
+    let shared_messages: Vec<&str> = results
         .iter()
         .filter_map(|result| {
             let err = result.as_ref().unwrap_err();
             err.downcast_ref::<SharedPoolCreateError>()
-                .map(SharedPoolCreateError::generation)
+                .map(SharedPoolCreateError::message)
         })
         .collect();
     assert_eq!(
-        shared_generations.len(),
+        shared_messages.len(),
         waiter_count - 1,
         "one creator must retain its original error while every waiter receives the shared error"
     );
     assert!(
-        shared_generations.windows(2).all(|pair| pair[0] == pair[1]),
-        "all waiters must share the same failure generation: {shared_generations:?}"
+        shared_messages.windows(2).all(|pair| pair[0] == pair[1]),
+        "all waiters must receive the same shared failure payload: {shared_messages:?}"
     );
-    assert_ne!(shared_generations[0], 0);
+    assert!(
+        !shared_messages[0].is_empty(),
+        "shared failure message must be non-empty"
+    );
 
-    // Later independent request / generation can succeed (no durable negative cache).
+    // Later independent request can succeed (no durable negative cache).
     let recovered = pool
         .get(&proxy, "backend.example.com", 443, 0)
         .await
-        .expect("independent request after failed generation should retry create");
+        .expect("independent request after failed coalesced create should retry create");
     assert!(recovered.contains("gen=1"));
     assert_eq!(manager.attempts.load(Ordering::Relaxed), 2);
     assert_eq!(manager.creates.load(Ordering::Relaxed), 1);
