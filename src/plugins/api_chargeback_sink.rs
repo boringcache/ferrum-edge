@@ -5275,8 +5275,7 @@ impl SnapshotAccumulator {
     }
 
     fn overflow_deliveries_in_flight(&self) -> usize {
-        self.overflow_deliveries_in_flight
-            .load(Ordering::Acquire)
+        self.overflow_deliveries_in_flight.load(Ordering::Acquire)
     }
 
     // External adversarial tests assert the hard byte ceiling is never crossed;

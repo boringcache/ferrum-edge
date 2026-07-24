@@ -3345,11 +3345,8 @@ async fn compaction_refuses_while_overflow_delivery_can_stage_back() {
 
     let temp = tempfile::tempdir().unwrap();
     let spool_dir = temp.path().join("spool");
-    let plugin = make_snapshot_sink(
-        &spool_dir,
-        Some("compaction-delivery-quiescence"),
-    )
-    .expect("construct snapshot sink");
+    let plugin = make_snapshot_sink(&spool_dir, Some("compaction-delivery-quiescence"))
+        .expect("construct snapshot sink");
     plugin
         .start_background_tasks()
         .expect("start snapshot sink");
