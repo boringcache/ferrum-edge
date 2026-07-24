@@ -1603,6 +1603,7 @@ fn decode_body<'a>(
             max_decoded_bytes: max_body_bytes,
             max_cumulative_bytes,
             max_codings: MAX_CONTENT_CODINGS,
+            max_amplification_ratio: 0,
         },
     )
 }

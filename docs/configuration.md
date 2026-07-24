@@ -289,8 +289,8 @@ These settings only apply when `FERRUM_DB_TYPE=mongodb`. `FERRUM_DB_POOL_*` sett
 | `FERRUM_MONGO_APP_NAME` | No | — | App name for server-side connection tracking |
 | `FERRUM_MONGO_REPLICA_SET` | No | — | Replica set name. Required for transactions and change streams |
 | `FERRUM_MONGO_AUTH_MECHANISM` | No | (auto) | Auth mechanism override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
-| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | `30` | Server selection timeout |
-| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | `10` | TCP connection timeout |
+| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | — | Explicit server selection timeout. When unset, preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
+| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | — | Explicit TCP connect timeout. When unset, preserves `connectTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
 
 See [mongodb.md](mongodb.md) for the full deployment guide including read preference, replica sets, Atlas, and Kubernetes examples.
 

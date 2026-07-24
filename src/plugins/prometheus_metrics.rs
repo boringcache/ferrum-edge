@@ -1758,6 +1758,35 @@ impl MetricsRegistry {
             ));
         }
 
+        // Compression codec admission / worker outcomes (process-wide).
+        let compression_codec = crate::plugins::compression::compression_codec_metrics();
+        for (name, help, value) in [
+            (
+                "ferrum_compression_codec_admitted_total",
+                "Compression codec jobs admitted to the bounded spawn_blocking pool.",
+                compression_codec.admitted,
+            ),
+            (
+                "ferrum_compression_codec_saturated_total",
+                "Compression codec admission refusals when the bounded pool is saturated.",
+                compression_codec.saturated,
+            ),
+            (
+                "ferrum_compression_codec_join_failures_total",
+                "Compression codec spawn_blocking tasks that failed to join.",
+                compression_codec.join_failures,
+            ),
+            (
+                "ferrum_compression_codec_worker_failures_total",
+                "Compression codec worker errors (encode/decode failures inside spawn_blocking).",
+                compression_codec.worker_failures,
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
+
         output.push_str(
             "# HELP ferrum_ai_federation_circuits_open Current ai_federation provider circuits in open or half-open recovery state.\n",
         );
