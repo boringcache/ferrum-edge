@@ -66,9 +66,15 @@ since the last snapshot. Use this when event volume dominates ingest cost and
 aggregate reconciliation is sufficient. Snapshot mode requires
 `spool.enabled: true` because the accumulator advances only after a delta is
 written to the spool; the queue is an additional low-latency delivery attempt,
-not the durability boundary. Idle snapshot keys are evicted after
-`snapshot.stale_entry_ttl_secs` and checked every
-`snapshot.cleanup_interval_secs`.
+not the durability boundary. Idle snapshot keys are eligible for eviction after
+`snapshot.stale_entry_ttl_secs` (which must be `>= snapshot.interval_secs`) and
+are checked every `snapshot.cleanup_interval_secs`, but cleanup never removes a
+key whose current totals still exceed its last durable baseline. Pending or
+never-emitted charges therefore survive first-tick races and prolonged spool
+outages. Hard `snapshot.max_entries` and `snapshot.max_retained_bytes` budgets
+bound accumulator memory; new identities beyond those budgets are immediately
+spooled as per-event rows (or staged for the next durable emission) rather than
+dropped or merged into unrelated keys.
 
 ### Snapshot concurrency contract
 
@@ -79,9 +85,11 @@ only):
 - Each accumulator slot has a stable **generation** (assigned at insert) and a
   **revision** that bumps on every refresh. Stale cleanup may scan candidates
   first, but eviction is a single conditional `remove_if`: the entry is removed
-  only when generation, revision, and `last_seen_at` still match the stale
-  observation. A same-key refresh that races after the stale check wins and
-  remains available for the next snapshot.
+  only when generation, revision, `last_seen_at`, and a zero pending delta
+  (current totals equal the last durable baseline for that generation) still
+  match the stale observation. A same-key refresh that races after the stale
+  check wins and remains available for the next snapshot. Unemitted or
+  uncommitted totals are never TTL-evicted.
 - `last_emitted` baselines are tagged with the entry generation. Cleanup drops a
   baseline only for the generation that was actually evicted, so a concurrent
   reinsert cannot lose a newer baseline. Delta emission ignores a baseline whose
@@ -121,11 +129,20 @@ delta and successful duplicate delivery cannot double-charge it. Repeated
 finalization is idempotent, and record hooks arriving after admission closes
 are ignored.
 
-Spool write failure leaves the generation unfinalized and retains its
-accumulator in the process-wide lifecycle registry. Every later multi-threaded
-reload retries all older retained generations concurrently with the generation
-being retired, and graceful shutdown retries the complete registry. Each retry
-is bounded. The failure is reported through the sink
+Spool write failure leaves the generation unfinalized. After the bounded
+finalization deadline the sink reduces failed generations to a compact recovery
+payload (pending terminal deltas plus a spool handle) instead of retaining the
+full accumulator/runtime indefinitely. Once mapped, Compact owns that
+generation's recovery: later Full finalize/Drop paths must follow the registry
+mapping and must not treat a cleared accumulator as an empty successful
+finalization that unregisters Compact. Every later multi-threaded reload retries
+all older retained full and compact recoveries concurrently with the generation
+being retired, and graceful shutdown retries the complete registry. Pending
+recovery count/bytes and oldest age are exposed on
+`GET /charges/sink/status` and Prometheus, together with an explicit recovery
+policy: restore spool writability; compact recoveries retry on reload/shutdown;
+new snapshot generations fail closed while the pending recovery budget is
+exhausted. The failure is also reported through the sink
 failure/spool-availability metrics and status. Because snapshot mode requires
 the spool, operators should treat an unwritable or exhausted spool as a
 billing-durability incident and restore it before terminating the process.
@@ -188,11 +205,12 @@ clickhouse-client < migrations/clickhouse/0001_charges.sql
 
 The DDL creates `ferrum.charges_raw` with `ReplacingMergeTree` idempotency on
 `event_id`, plus hourly, daily, and monthly views that read from
-`charges_raw FINAL`. The views trade query cost for correctness: duplicate raw
-events are deduplicated before rollup aggregation. Monetary `charge` columns in
-those views are grouped by `currency` and `pricing_version` (in addition to
-namespace/consumer/proxy/time) so mixed-currency or multi-generation sinks never
-produce unitless rollups.
+`charges_raw FINAL`. `call_count` is `UInt64` so snapshot deltas that exceed
+`UInt32` capacity remain lossless. The views trade query cost for correctness:
+duplicate raw events are deduplicated before rollup aggregation. Monetary
+`charge` columns in those views are grouped by `currency` and `pricing_version`
+(in addition to namespace/consumer/proxy/time) so mixed-currency or
+multi-generation sinks never produce unitless rollups.
 
 For HTTP-family events, `status_code` is the billable status used for pricing
 and rollups. `http_status_code` preserves the transport status, and
@@ -240,6 +258,8 @@ bucket.
       "interval_secs": 30,
       "cleanup_interval_secs": 300,
       "stale_entry_ttl_secs": 3600,
+      "max_entries": 100000,
+      "max_retained_bytes": 67108864,
       "emit_zero_deltas": false
     },
     "pricing_version": "2026-01-rev3",

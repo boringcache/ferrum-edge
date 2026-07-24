@@ -652,6 +652,18 @@ pub mod _test_support {
         plugin.snapshot_generation_registered_for_tests()
     }
 
+    pub fn api_chargeback_sink_force_compact_snapshot_finalization_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> bool {
+        plugin.force_compact_snapshot_finalization_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_compact_recovery_registered_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.snapshot_compact_recovery_registered_for_tests()
+    }
+
     pub fn api_chargeback_sink_emit_snapshot_tick_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
     ) -> Option<Result<usize, String>> {

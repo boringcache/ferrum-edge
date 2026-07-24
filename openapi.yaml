@@ -20559,6 +20559,7 @@ components:
         worst-case cumulative inter-attempt delay
         (`retry.max_attempts` / `retry.initial_delay_ms` / `retry.max_delay_ms`)
         must not exceed 600000 ms;
+        `snapshot.stale_entry_ttl_secs >= snapshot.interval_secs`;
         nonempty `password_ref` must name a set `FERRUM_*` process environment
         variable; spool directory privacy/permissions
         (`ensure_private_dir`); ClickHouse URL egress IP screening;
@@ -20958,7 +20959,33 @@ components:
               type: integer
               minimum: 1
               default: 3600
-              description: How long a snapshot accumulator key may remain idle before entries and last-emitted state are removed.
+              description: |
+                How long a snapshot accumulator key may remain idle before
+                entries and last-emitted state are removed. Runtime requires
+                `stale_entry_ttl_secs >= interval_secs`. Cleanup also refuses to
+                evict keys whose current totals still exceed their last durable
+                baseline (pending/uncommitted deltas survive TTL).
+            max_entries:
+              type: integer
+              minimum: 1
+              maximum: 1000000
+              default: 100000
+              description: |
+                Hard ceiling on distinct snapshot accumulator identities.
+                New identities beyond this budget are immediately spooled as
+                per-event rows (or staged for the next durable emission) rather
+                than dropped or merged into unrelated keys.
+            max_retained_bytes:
+              type: integer
+              minimum: 1
+              maximum: 268435456
+              default: 67108864
+              description: |
+                Hard ceiling on estimated retained bytes for snapshot
+                accumulator identities and staged overflow events. Overflow
+                uses the same durable immediate-spool strategy as max_entries.
+                Runtime additionally requires the value to be at least one
+                bounded charge-event size.
 
     ChargebackResponse:
       type: object
@@ -21133,7 +21160,7 @@ components:
         ID plus process-wide totals. Instances are ordered by ascending
         `plugin_config_id`. Validation throwaways, uncommitted staged reloads,
         and superseded generations are excluded.
-      required: [enabled, instance_count, snapshot_finalizations_pending, totals, instances]
+      required: [enabled, instance_count, snapshot_finalizations_pending, snapshot_finalizations_pending_bytes, snapshot_finalizations_oldest_age_secs, snapshot_finalization_recovery_policy, totals, instances]
       properties:
         enabled:
           type: boolean
@@ -21146,6 +21173,21 @@ components:
           type: integer
           minimum: 0
           description: Retired snapshot generations retaining an unspooled terminal delta for bounded retry.
+        snapshot_finalizations_pending_bytes:
+          type: integer
+          minimum: 0
+          description: Estimated retained bytes across pending full and compact snapshot finalization recovery state.
+        snapshot_finalizations_oldest_age_secs:
+          type: integer
+          minimum: 0
+          description: Age in seconds of the oldest pending snapshot finalization recovery entry.
+        snapshot_finalization_recovery_policy:
+          type: string
+          description: |
+            Explicit operator recovery policy for pending snapshot finalizations.
+            Restore spool writability; compact recoveries retry on reload and
+            shutdown; new snapshot generations fail closed while pending recovery
+            count or bytes exceed budget.
         totals:
           type: object
           description: Aggregates across every accepted live instance.

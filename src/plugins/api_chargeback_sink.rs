@@ -105,7 +105,7 @@ const DEFAULT_PLUGIN_CONFIG_ID: &str = "__standalone__";
 /// generation atomically replaces the prior generation for the same ID. Drop
 /// removes an entry only when it still points at that exact runtime.
 static ACTIVE_SINKS: OnceLock<ArcSwap<BTreeMap<String, Arc<SinkRuntime>>>> = OnceLock::new();
-static ACTIVE_SNAPSHOT_GENERATIONS: OnceLock<Mutex<BTreeMap<u64, Arc<SnapshotLifecycle>>>> =
+static ACTIVE_SNAPSHOT_FINALIZATIONS: OnceLock<Mutex<BTreeMap<u64, PendingSnapshotFinalization>>> =
     OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
 static NEXT_SINK_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -124,39 +124,213 @@ fn invalidate_status_cache() {
     status_cache().store(Arc::new(None));
 }
 
-fn active_snapshot_generations() -> &'static Mutex<BTreeMap<u64, Arc<SnapshotLifecycle>>> {
-    ACTIVE_SNAPSHOT_GENERATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn active_snapshot_finalizations() -> &'static Mutex<BTreeMap<u64, PendingSnapshotFinalization>> {
+    ACTIVE_SNAPSHOT_FINALIZATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Failed or in-progress snapshot finalization retained for bounded retry.
+#[derive(Clone)]
+enum PendingSnapshotFinalization {
+    /// Full sink generation still owning accumulator/runtime state.
+    Full(Arc<SnapshotLifecycle>),
+    /// Compact durable-recovery payload after the heavy generation was released.
+    Compact(Arc<CompactSnapshotRecovery>),
+}
+
+impl PendingSnapshotFinalization {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Full(lifecycle) => lifecycle.generation,
+            Self::Compact(recovery) => recovery.generation,
+        }
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Full(lifecycle) => lifecycle.retained_finalization_bytes(),
+            Self::Compact(recovery) => recovery.retained_bytes as u64,
+        }
+    }
+
+    fn age_secs(&self, now: Instant) -> u64 {
+        match self {
+            Self::Full(lifecycle) => lifecycle.closed_age_secs(now),
+            Self::Compact(recovery) => {
+                now.saturating_duration_since(recovery.closed_at).as_secs()
+            }
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        match self {
+            Self::Full(lifecycle) => {
+                lifecycle.committed.load(Ordering::Acquire)
+                    && !lifecycle.accepting.load(Ordering::Acquire)
+                    && !lifecycle.finalized.load(Ordering::Acquire)
+            }
+            Self::Compact(_) => true,
+        }
+    }
+}
+
+/// Compact recovery state for a failed snapshot finalization.
+///
+/// Retains only the pending terminal deltas and the spool handle needed to
+/// retry durable handoff, instead of the full accumulator/runtime generation.
+struct CompactSnapshotRecovery {
+    generation: u64,
+    plugin_config_id: Arc<str>,
+    events: Mutex<Vec<ChargeEvent>>,
+    retained_bytes: usize,
+    closed_at: Instant,
+    spool: Option<Arc<SpoolManager>>,
+    metrics: Arc<SinkMetrics>,
+}
+
+impl CompactSnapshotRecovery {
+    fn try_spool(&self) -> bool {
+        let events = {
+            let guard = match self.events.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.clone()
+        };
+        if events.is_empty() {
+            return true;
+        }
+        let Some(spool) = self.spool.as_ref() else {
+            self.metrics.record_failure(
+                FailureReason::Serialize,
+                "compact snapshot recovery requires an available spool",
+            );
+            return false;
+        };
+        if let Err(error) = spool.write_events(&events) {
+            self.metrics
+                .spool_available
+                .store(false, Ordering::Release);
+            self.metrics.record_failure(
+                FailureReason::Serialize,
+                format!("compact snapshot recovery spool handoff failed: {error}"),
+            );
+            warn!(
+                plugin = PLUGIN_NAME,
+                generation = self.generation,
+                plugin_config_id = %self.plugin_config_id,
+                error = %error,
+                "Chargeback sink compact snapshot recovery could not spool pending deltas"
+            );
+            return false;
+        }
+        self.metrics
+            .snapshot_emits_total
+            .fetch_add(events.len() as u64, Ordering::Relaxed);
+        true
+    }
 }
 
 fn register_snapshot_generation(lifecycle: Arc<SnapshotLifecycle>) {
-    let mut generations = match active_snapshot_generations().lock() {
-        Ok(generations) => generations,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    generations.entry(lifecycle.generation).or_insert(lifecycle);
-}
-
-fn unregister_snapshot_generation(generation: u64) {
-    let mut generations = match active_snapshot_generations().lock() {
-        Ok(generations) => generations,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    generations.remove(&generation);
-}
-
-fn pending_snapshot_finalizations() -> usize {
-    let generations = match active_snapshot_generations().lock() {
+    let mut generations = match active_snapshot_finalizations().lock() {
         Ok(generations) => generations,
         Err(poisoned) => poisoned.into_inner(),
     };
     generations
-        .values()
-        .filter(|lifecycle| {
-            lifecycle.committed.load(Ordering::Acquire)
-                && !lifecycle.accepting.load(Ordering::Acquire)
-                && !lifecycle.finalized.load(Ordering::Acquire)
-        })
-        .count()
+        .entry(lifecycle.generation)
+        .or_insert(PendingSnapshotFinalization::Full(lifecycle));
+}
+
+fn unregister_full_snapshot_generation(generation: u64) {
+    let mut generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Full finalizers must never remove a Compact recovery that now owns the
+    // generation's pending deltas after compaction.
+    if matches!(
+        generations.get(&generation),
+        Some(PendingSnapshotFinalization::Full(_))
+    ) {
+        generations.remove(&generation);
+    }
+}
+
+fn unregister_compact_snapshot_generation(generation: u64) {
+    let mut generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if matches!(
+        generations.get(&generation),
+        Some(PendingSnapshotFinalization::Compact(_))
+    ) {
+        generations.remove(&generation);
+    }
+}
+
+fn compact_recovery_for_generation(generation: u64) -> Option<Arc<CompactSnapshotRecovery>> {
+    let generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match generations.get(&generation) {
+        Some(PendingSnapshotFinalization::Compact(recovery)) => Some(Arc::clone(recovery)),
+        _ => None,
+    }
+}
+
+/// Retry compact recovery for a generation that already released Full state.
+fn try_finalize_compact_recovery(generation: u64) -> bool {
+    let Some(recovery) = compact_recovery_for_generation(generation) else {
+        // Compact already drained or never published.
+        return true;
+    };
+    if recovery.try_spool() {
+        unregister_compact_snapshot_generation(generation);
+        invalidate_status_cache();
+        true
+    } else {
+        false
+    }
+}
+
+fn pending_snapshot_finalization_stats() -> (usize, u64, u64, usize, u64) {
+    let generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    let mut pending = 0usize;
+    let mut bytes = 0u64;
+    let mut oldest_age = 0u64;
+    let mut full = 0usize;
+    let mut compact_bytes = 0u64;
+    for entry in generations.values() {
+        if !entry.is_pending() {
+            continue;
+        }
+        pending = pending.saturating_add(1);
+        let retained = entry.retained_bytes();
+        bytes = bytes.saturating_add(retained);
+        oldest_age = oldest_age.max(entry.age_secs(now));
+        match entry {
+            PendingSnapshotFinalization::Full(_) => full = full.saturating_add(1),
+            PendingSnapshotFinalization::Compact(_) => {
+                compact_bytes = compact_bytes.saturating_add(retained);
+            }
+        }
+    }
+    (pending, bytes, oldest_age, full, compact_bytes)
+}
+
+fn pending_snapshot_finalizations() -> usize {
+    pending_snapshot_finalization_stats().0
+}
+
+fn pending_finalization_budget_exceeded() -> bool {
+    let (pending, _bytes, _age, _full, compact_bytes) = pending_snapshot_finalization_stats();
+    pending >= MAX_PENDING_SNAPSHOT_FINALIZATIONS
+        || compact_bytes >= MAX_COMPACT_SNAPSHOT_RECOVERY_BYTES as u64
 }
 
 /// Stop snapshot admission and durably spool every generation's final delta.
@@ -164,19 +338,14 @@ fn pending_snapshot_finalizations() -> usize {
 /// Serving modes call this after request/connection drain. Reload disposal
 /// follows the same exact-once lifecycle from [`Drop for ApiChargebackSink`].
 pub async fn finalize_all_snapshot_generations() {
-    let generations: Vec<Arc<SnapshotLifecycle>> = {
-        let generations = match active_snapshot_generations().lock() {
+    let generations: Vec<PendingSnapshotFinalization> = {
+        let generations = match active_snapshot_finalizations().lock() {
             Ok(generations) => generations,
             Err(poisoned) => poisoned.into_inner(),
         };
         generations.values().cloned().collect()
     };
-    futures_util::future::join_all(
-        generations
-            .iter()
-            .map(|generation| generation.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT)),
-    )
-    .await;
+    futures_util::future::join_all(generations.iter().map(finalize_pending_snapshot)).await;
 }
 
 /// Finalize the generation being retired and retry every older generation
@@ -184,30 +353,154 @@ pub async fn finalize_all_snapshot_generations() {
 /// later reload prevents a persistent spool outage from accumulating
 /// never-revisited generations until process shutdown.
 async fn finalize_snapshot_generation_and_pending(current: Arc<SnapshotLifecycle>) {
-    let mut generations = vec![Arc::clone(&current)];
+    let mut pending = Vec::new();
     {
-        let registered = match active_snapshot_generations().lock() {
+        let registered = match active_snapshot_finalizations().lock() {
             Ok(generations) => generations,
             Err(poisoned) => poisoned.into_inner(),
         };
-        generations.extend(
+        // Prefer the registry mapping: a prior failed finalization may already
+        // have compacted this generation to Compact recovery state. Always
+        // wrapping as Full would skip Compact and can later clear it.
+        match registered.get(&current.generation) {
+            Some(entry) => pending.push(entry.clone()),
+            None
+                if !current.compacted.load(Ordering::Acquire)
+                    && !current.finalized.load(Ordering::Acquire) =>
+            {
+                pending.push(PendingSnapshotFinalization::Full(Arc::clone(&current)));
+            }
+            None => {}
+        }
+        pending.extend(
             registered
                 .values()
-                .filter(|lifecycle| {
-                    lifecycle.generation != current.generation
-                        && lifecycle.committed.load(Ordering::Acquire)
-                        && !lifecycle.accepting.load(Ordering::Acquire)
-                        && !lifecycle.finalized.load(Ordering::Acquire)
-                })
+                .filter(|entry| entry.generation() != current.generation && entry.is_pending())
                 .cloned(),
         );
     }
-    futures_util::future::join_all(
-        generations
-            .iter()
-            .map(|generation| generation.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT)),
-    )
-    .await;
+    futures_util::future::join_all(pending.iter().map(finalize_pending_snapshot)).await;
+
+    // Full→Compact can occur while we still hold a Full handle from the local
+    // pending snapshot taken above. Retry Compact ownership for this generation.
+    if current.compacted.load(Ordering::Acquire)
+        || compact_recovery_for_generation(current.generation).is_some()
+    {
+        let _ = try_finalize_compact_recovery(current.generation);
+    }
+}
+
+async fn finalize_pending_snapshot(pending: &PendingSnapshotFinalization) -> bool {
+    match pending {
+        PendingSnapshotFinalization::Full(lifecycle) => {
+            lifecycle.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT).await
+        }
+        PendingSnapshotFinalization::Compact(recovery) => {
+            let durable = tokio::task::spawn_blocking({
+                let recovery = Arc::clone(recovery);
+                move || recovery.try_spool()
+            })
+            .await
+            .unwrap_or(false);
+            if durable {
+                unregister_compact_snapshot_generation(recovery.generation);
+                invalidate_status_cache();
+            }
+            durable
+        }
+    }
+}
+
+fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle, events: Vec<ChargeEvent>) -> bool {
+    let retained_bytes = events
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add);
+    let (pending, _bytes, _age, full, compact_bytes) = pending_snapshot_finalization_stats();
+    if (compact_bytes.saturating_add(retained_bytes as u64)
+        > MAX_COMPACT_SNAPSHOT_RECOVERY_BYTES as u64
+        || pending >= MAX_PENDING_SNAPSHOT_FINALIZATIONS)
+        && full <= 1
+    {
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = lifecycle.generation,
+            retained_bytes,
+            "Chargeback sink cannot compact failed finalization; pending recovery budget exhausted"
+        );
+        return false;
+    }
+    let recovery = Arc::new(CompactSnapshotRecovery {
+        generation: lifecycle.generation,
+        plugin_config_id: Arc::clone(&lifecycle.runtime.plugin_config_id),
+        events: Mutex::new(events),
+        retained_bytes,
+        closed_at: Instant::now(),
+        spool: lifecycle.runtime.spool.clone(),
+        metrics: Arc::clone(&lifecycle.runtime.metrics),
+    });
+    // Publish Compact ownership before clearing Full state so a concurrent Full
+    // finalizer cannot observe an empty accumulator and unregister the generation
+    // while pending deltas exist only in this stack frame.
+    {
+        let mut generations = match active_snapshot_finalizations().lock() {
+            Ok(generations) => generations,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        generations.insert(
+            lifecycle.generation,
+            PendingSnapshotFinalization::Compact(Arc::clone(&recovery)),
+        );
+    }
+    lifecycle.compacted.store(true, Ordering::Release);
+    lifecycle.accepting.store(false, Ordering::Release);
+    let _ = lifecycle.shutdown_tx.send(true);
+    {
+        let mut task = match lifecycle.task.lock() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = task.take() {
+            task.abort();
+        }
+    }
+    lifecycle.accumulator.clear_for_compaction();
+    enforce_full_pending_finalization_bound(lifecycle.generation);
+    invalidate_status_cache();
+    true
+}
+
+fn enforce_full_pending_finalization_bound(keep_generation: u64) {
+    let overflow: Vec<Arc<SnapshotLifecycle>> = {
+        let generations = match active_snapshot_finalizations().lock() {
+            Ok(generations) => generations,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut full: Vec<Arc<SnapshotLifecycle>> = generations
+            .values()
+            .filter_map(|entry| match entry {
+                PendingSnapshotFinalization::Full(lifecycle)
+                    if entry.is_pending() && lifecycle.generation != keep_generation =>
+                {
+                    Some(Arc::clone(lifecycle))
+                }
+                _ => None,
+            })
+            .collect();
+        if full.len() < MAX_FULL_PENDING_SNAPSHOT_FINALIZATIONS {
+            return;
+        }
+        full.sort_by_key(|lifecycle| lifecycle.generation);
+        let remove_count = full
+            .len()
+            .saturating_add(1)
+            .saturating_sub(MAX_FULL_PENDING_SNAPSHOT_FINALIZATIONS);
+        full.into_iter().take(remove_count).collect()
+    };
+    for lifecycle in overflow {
+        let events = lifecycle.prepare_compaction_events();
+        let _ = compact_snapshot_lifecycle(&lifecycle, events);
+    }
 }
 
 fn register_active_sink(runtime: Arc<SinkRuntime>) {
@@ -338,6 +631,24 @@ fn default_snapshot_cleanup_interval_secs() -> u64 {
 fn default_snapshot_stale_entry_ttl_secs() -> u64 {
     3_600
 }
+
+fn default_snapshot_max_entries() -> usize {
+    100_000
+}
+
+fn default_snapshot_max_retained_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+/// Ceiling on full failed-finalization generations retained in memory.
+/// Additional failures compact to [`CompactSnapshotRecovery`] instead.
+const MAX_FULL_PENDING_SNAPSHOT_FINALIZATIONS: usize = 2;
+/// Ceiling on compact + full pending finalizations retained for retry.
+const MAX_PENDING_SNAPSHOT_FINALIZATIONS: usize = 64;
+/// Aggregate retained-byte budget for compact recovery payloads.
+const MAX_COMPACT_SNAPSHOT_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
+/// Operator-facing recovery policy for pending snapshot finalizations.
+const SNAPSHOT_FINALIZATION_RECOVERY_POLICY: &str = "restore_spool_writability; compact recoveries retry on reload and shutdown; new snapshot generations fail closed while pending recovery count or bytes exceed budget";
 
 fn default_clickhouse_database() -> String {
     "ferrum".to_string()
@@ -511,6 +822,12 @@ pub struct SnapshotSettings {
     pub cleanup_interval_secs: u64,
     #[serde(default = "default_snapshot_stale_entry_ttl_secs")]
     pub stale_entry_ttl_secs: u64,
+    /// Hard ceiling on distinct accumulator identities retained in memory.
+    #[serde(default = "default_snapshot_max_entries")]
+    pub max_entries: usize,
+    /// Hard ceiling on estimated retained bytes for accumulator identities.
+    #[serde(default = "default_snapshot_max_retained_bytes")]
+    pub max_retained_bytes: usize,
 }
 
 impl Default for SnapshotSettings {
@@ -520,6 +837,8 @@ impl Default for SnapshotSettings {
             emit_zero_deltas: false,
             cleanup_interval_secs: default_snapshot_cleanup_interval_secs(),
             stale_entry_ttl_secs: default_snapshot_stale_entry_ttl_secs(),
+            max_entries: default_snapshot_max_entries(),
+            max_retained_bytes: default_snapshot_max_retained_bytes(),
         }
     }
 }
@@ -586,7 +905,9 @@ pub struct ChargeEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grpc_status: Option<u32>,
     pub protocol: String,
-    pub call_count: u32,
+    /// Lossless call/session count. Snapshot deltas and ClickHouse DDL use u64
+    /// so intervals that exceed `u32::MAX` never clamp while the baseline advances.
+    pub call_count: u64,
     pub charge_call: f64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -865,6 +1186,11 @@ struct SnapshotLifecycle {
     in_flight: AtomicUsize,
     committed: AtomicBool,
     finalized: AtomicBool,
+    /// Set when this generation's pending deltas were transferred to
+    /// [`PendingSnapshotFinalization::Compact`]. Full finalize paths must not
+    /// treat the cleared accumulator as an empty successful finalization.
+    compacted: AtomicBool,
+    closed_at_secs: AtomicI64,
     shutdown_tx: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<bool>>>,
     emission_lock: Arc<Mutex<()>>,
@@ -900,6 +1226,59 @@ impl SnapshotLifecycle {
         self.committed.store(true, Ordering::Release);
     }
 
+    fn mark_admission_closed(&self) {
+        if self.accepting.swap(false, Ordering::AcqRel) {
+            self.closed_at_secs
+                .store(unix_timestamp_seconds(), Ordering::Release);
+            invalidate_status_cache();
+        }
+    }
+
+    fn closed_age_secs(&self, _now: Instant) -> u64 {
+        let closed = self.closed_at_secs.load(Ordering::Acquire);
+        if closed <= 0 {
+            return 0;
+        }
+        unix_timestamp_seconds().saturating_sub(closed) as u64
+    }
+
+    fn retained_finalization_bytes(&self) -> u64 {
+        self.accumulator.retained_bytes() as u64
+    }
+
+    fn prepare_compaction_events(&self) -> Vec<ChargeEvent> {
+        let _emission_guard = match self.emission_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let snapshot_id = new_ulid();
+        let received_at = unix_timestamp_nanos();
+        let mut events = self.accumulator.peek_overflow_pending();
+        match self.accumulator.prepare_deltas(
+            &self.config,
+            &self.node_id,
+            received_at,
+            &snapshot_id,
+        ) {
+            Ok(prepared) => {
+                events.extend(prepared.events);
+                // Compaction owns these events going forward; drop staged
+                // overflow so they are not double-emitted if a later compact
+                // retry races a resurrected full lifecycle.
+                if !self.accumulator.peek_overflow_pending().is_empty() {
+                    let _ = self.accumulator.take_overflow_pending();
+                }
+                events
+            }
+            Err(error) => {
+                self.runtime
+                    .metrics
+                    .record_failure(FailureReason::Serialize, error);
+                events
+            }
+        }
+    }
+
     async fn finalize_attempt(&self, deadline: Instant) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -909,12 +1288,18 @@ impl SnapshotLifecycle {
             Ok(guard) => guard,
             Err(_) => return false,
         };
+        if self.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(self.generation).is_some()
+        {
+            self.compacted.store(true, Ordering::Release);
+            return try_finalize_compact_recovery(self.generation);
+        }
         if self.finalized.load(Ordering::Acquire) {
-            unregister_snapshot_generation(self.generation);
+            unregister_full_snapshot_generation(self.generation);
             return true;
         }
 
-        self.accepting.store(false, Ordering::Release);
+        self.mark_admission_closed();
         while self.in_flight.load(Ordering::Acquire) > 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -984,8 +1369,15 @@ impl SnapshotLifecycle {
             None => true,
         };
         if durable {
+            // A concurrent compaction may have published Compact while this Full
+            // path observed an emptied accumulator. Never finalize away Compact.
+            if compact_recovery_for_generation(self.generation).is_some() {
+                self.compacted.store(true, Ordering::Release);
+                invalidate_status_cache();
+                return try_finalize_compact_recovery(self.generation);
+            }
             self.finalized.store(true, Ordering::Release);
-            unregister_snapshot_generation(self.generation);
+            unregister_full_snapshot_generation(self.generation);
         }
         invalidate_status_cache();
         durable
@@ -1003,20 +1395,60 @@ impl SnapshotLifecycle {
                     plugin = PLUGIN_NAME,
                     generation = self.generation,
                     timeout_ms = timeout.as_millis(),
-                    "Chargeback sink final snapshot handoff timed out; generation state retained"
+                    "Chargeback sink final snapshot handoff timed out; compacting generation state"
                 );
-                return false;
+                self.compact_failed_finalization();
+                // Ownership may now be Compact; retry that recovery once here so
+                // a single finalize_within call does not leave Compact untouched.
+                return try_finalize_compact_recovery(self.generation);
             }
             tokio::time::sleep(remaining.min(SNAPSHOT_FINALIZE_RETRY_INTERVAL)).await;
         }
     }
 
-    fn finalize_without_await(&self) {
-        if self.finalized.load(Ordering::Acquire) {
-            unregister_snapshot_generation(self.generation);
+    fn compact_failed_finalization(&self) {
+        if self.finalized.load(Ordering::Acquire)
+            || self.compacted.load(Ordering::Acquire)
+            || !self.committed.load(Ordering::Acquire)
+        {
             return;
         }
-        self.accepting.store(false, Ordering::Release);
+        // Already compacted by a concurrent finalizer.
+        {
+            let generations = match active_snapshot_finalizations().lock() {
+                Ok(generations) => generations,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if matches!(
+                generations.get(&self.generation),
+                Some(PendingSnapshotFinalization::Compact(_))
+            ) {
+                self.compacted.store(true, Ordering::Release);
+                return;
+            }
+        }
+        let events = self.prepare_compaction_events();
+        if !events.is_empty() {
+            let _ = compact_snapshot_lifecycle(self, events);
+        } else {
+            enforce_full_pending_finalization_bound(self.generation);
+            invalidate_status_cache();
+        }
+    }
+
+    fn finalize_without_await(&self) {
+        if self.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(self.generation).is_some()
+        {
+            self.compacted.store(true, Ordering::Release);
+            let _ = try_finalize_compact_recovery(self.generation);
+            return;
+        }
+        if self.finalized.load(Ordering::Acquire) {
+            unregister_full_snapshot_generation(self.generation);
+            return;
+        }
+        self.mark_admission_closed();
         let _ = self.shutdown_tx.send(true);
         let task = {
             let mut task = match self.task.lock() {
@@ -1040,8 +1472,16 @@ impl SnapshotLifecycle {
             true
         };
         if durable {
-            self.finalized.store(true, Ordering::Release);
-            unregister_snapshot_generation(self.generation);
+            if compact_recovery_for_generation(self.generation).is_some() {
+                self.compacted.store(true, Ordering::Release);
+                let _ = try_finalize_compact_recovery(self.generation);
+            } else {
+                self.finalized.store(true, Ordering::Release);
+                unregister_full_snapshot_generation(self.generation);
+            }
+        } else if self.committed.load(Ordering::Acquire) {
+            self.compact_failed_finalization();
+            let _ = try_finalize_compact_recovery(self.generation);
         }
         invalidate_status_cache();
     }
@@ -1074,6 +1514,10 @@ struct SinkMetrics {
     spool_jobs_lost_total: AtomicU64,
     spool_events_lost_total: AtomicU64,
     snapshot_emits_total: AtomicU64,
+    snapshot_overflow_spooled_total: AtomicU64,
+    snapshot_overflow_pending_total: AtomicU64,
+    snapshot_cardinality_rejections_total: AtomicU64,
+    snapshot_call_count_overflow_total: AtomicU64,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
@@ -1099,6 +1543,10 @@ impl Default for SinkMetrics {
             spool_jobs_lost_total: AtomicU64::new(0),
             spool_events_lost_total: AtomicU64::new(0),
             snapshot_emits_total: AtomicU64::new(0),
+            snapshot_overflow_spooled_total: AtomicU64::new(0),
+            snapshot_overflow_pending_total: AtomicU64::new(0),
+            snapshot_cardinality_rejections_total: AtomicU64::new(0),
+            snapshot_call_count_overflow_total: AtomicU64::new(0),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
@@ -1522,7 +1970,15 @@ impl ApiChargebackSink {
         }
 
         let snapshot_lifecycle = if self.config.mode == SinkMode::Snapshot {
-            let accumulator = Arc::new(SnapshotAccumulator::new());
+            if pending_finalization_budget_exceeded() {
+                return Err(format!(
+                    "{PLUGIN_NAME}: refusing new snapshot generation while pending finalization recovery budget is exhausted ({SNAPSHOT_FINALIZATION_RECOVERY_POLICY})"
+                ));
+            }
+            let accumulator = Arc::new(SnapshotAccumulator::with_limits(
+                self.config.snapshot.max_entries,
+                self.config.snapshot.max_retained_bytes,
+            ));
             let emission_lock = Arc::new(Mutex::new(()));
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let task = start_snapshot_task(
@@ -1548,6 +2004,8 @@ impl ApiChargebackSink {
                 in_flight: AtomicUsize::new(0),
                 committed: AtomicBool::new(false),
                 finalized: AtomicBool::new(false),
+                compacted: AtomicBool::new(false),
+                closed_at_secs: AtomicI64::new(0),
                 shutdown_tx,
                 task: Mutex::new(Some(task)),
                 emission_lock,
@@ -1690,15 +2148,35 @@ impl ApiChargebackSink {
     #[allow(dead_code)]
     pub(crate) fn snapshot_generation_registered_for_tests(&self) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
-        let generations = match active_snapshot_generations().lock() {
+        let generations = match active_snapshot_finalizations().lock() {
             Ok(generations) => generations,
             Err(poisoned) => poisoned.into_inner(),
         };
-        Some(
-            generations
-                .get(&lifecycle.generation)
-                .is_some_and(|registered| Arc::ptr_eq(registered, lifecycle)),
-        )
+        Some(match generations.get(&lifecycle.generation) {
+            Some(PendingSnapshotFinalization::Full(registered)) => {
+                Arc::ptr_eq(registered, lifecycle)
+            }
+            Some(PendingSnapshotFinalization::Compact(_)) => false,
+            None => false,
+        })
+    }
+
+    /// Force Full→Compact transfer for adversarial recovery tests.
+    #[allow(dead_code)]
+    pub(crate) fn force_compact_snapshot_finalization_for_tests(&self) -> bool {
+        let Some(lifecycle) = self.snapshot_lifecycle.get() else {
+            return false;
+        };
+        lifecycle.compact_failed_finalization();
+        lifecycle.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(lifecycle.generation).is_some()
+    }
+
+    /// True when this generation is retained as compact durable recovery.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_compact_recovery_registered_for_tests(&self) -> Option<bool> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        Some(compact_recovery_for_generation(lifecycle.generation).is_some())
     }
 
     #[allow(dead_code)]
@@ -1826,9 +2304,26 @@ impl Plugin for ApiChargebackSink {
             if let Some(lifecycle) = self.snapshot_lifecycle.get()
                 && let Some(_admission) = lifecycle.admit()
             {
-                lifecycle
+                match lifecycle
                     .accumulator
-                    .record_http(summary, consumer, outcome, charge);
+                    .record_http(summary, consumer, outcome, charge)
+                {
+                    SnapshotRecordOutcome::Accumulated => {}
+                    SnapshotRecordOutcome::OverflowImmediate => {
+                        spool_snapshot_overflow_event(
+                            lifecycle,
+                            event_from_http_summary(
+                                summary,
+                                consumer,
+                                outcome,
+                                charge,
+                                &self.config,
+                                &self.node_id,
+                                None,
+                            ),
+                        );
+                    }
+                }
             }
             return;
         }
@@ -1858,9 +2353,25 @@ impl Plugin for ApiChargebackSink {
             if let Some(lifecycle) = self.snapshot_lifecycle.get()
                 && let Some(_admission) = lifecycle.admit()
             {
-                lifecycle
+                match lifecycle
                     .accumulator
-                    .record_stream(summary, consumer, charge);
+                    .record_stream(summary, consumer, charge)
+                {
+                    SnapshotRecordOutcome::Accumulated => {}
+                    SnapshotRecordOutcome::OverflowImmediate => {
+                        spool_snapshot_overflow_event(
+                            lifecycle,
+                            event_from_stream_summary(
+                                summary,
+                                consumer,
+                                charge,
+                                &self.config,
+                                &self.node_id,
+                                None,
+                            ),
+                        );
+                    }
+                }
             }
             return;
         }
@@ -1893,9 +2404,25 @@ impl Plugin for ApiChargebackSink {
             if let Some(lifecycle) = self.snapshot_lifecycle.get()
                 && let Some(_admission) = lifecycle.admit()
             {
-                lifecycle
+                match lifecycle
                     .accumulator
-                    .record_websocket(summary, consumer, charge);
+                    .record_websocket(summary, consumer, charge)
+                {
+                    SnapshotRecordOutcome::Accumulated => {}
+                    SnapshotRecordOutcome::OverflowImmediate => {
+                        spool_snapshot_overflow_event(
+                            lifecycle,
+                            event_from_ws_summary(
+                                summary,
+                                consumer,
+                                charge,
+                                &self.config,
+                                &self.node_id,
+                                None,
+                            ),
+                        );
+                    }
+                }
             }
             return;
         }
@@ -1929,7 +2456,7 @@ pub fn render_status_json() -> String {
 
     let body = serde_json::to_string(&aggregate_status_snapshot(&active_sinks().load_full()))
         .unwrap_or_else(|_| {
-            "{\"enabled\":false,\"instance_count\":0,\"snapshot_finalizations_pending\":0,\"totals\":{},\"instances\":[]}".to_string()
+            "{\"enabled\":false,\"instance_count\":0,\"snapshot_finalizations_pending\":0,\"snapshot_finalizations_pending_bytes\":0,\"snapshot_finalizations_oldest_age_secs\":0,\"snapshot_finalization_recovery_policy\":\"restore_spool_writability\",\"totals\":{},\"instances\":[]}".to_string()
         });
 
     cache.store(Arc::new(Some((Instant::now(), body.clone()))));
@@ -1938,18 +2465,29 @@ pub fn render_status_json() -> String {
 
 pub fn render_prometheus() -> String {
     let sinks = active_sinks().load_full();
-    let pending_finalizations = pending_snapshot_finalizations();
+    let (pending_finalizations, pending_bytes, oldest_age, _full, _compact) =
+        pending_snapshot_finalization_stats();
     if sinks.is_empty() && pending_finalizations == 0 {
         return String::new();
     }
-    render_prometheus_for_sinks(sinks.as_ref(), pending_finalizations)
+    render_prometheus_for_sinks(
+        sinks.as_ref(),
+        pending_finalizations,
+        pending_bytes,
+        oldest_age,
+    )
 }
 
 fn disabled_status_snapshot() -> Value {
+    let (pending, pending_bytes, oldest_age, _full, _compact) =
+        pending_snapshot_finalization_stats();
     serde_json::json!({
         "enabled": false,
         "instance_count": 0,
-        "snapshot_finalizations_pending": pending_snapshot_finalizations(),
+        "snapshot_finalizations_pending": pending,
+        "snapshot_finalizations_pending_bytes": pending_bytes,
+        "snapshot_finalizations_oldest_age_secs": oldest_age,
+        "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
             "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
             "spool": {
@@ -2033,10 +2571,15 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
         }
     }
 
+    let (pending, pending_bytes, oldest_age, _full, _compact) =
+        pending_snapshot_finalization_stats();
     serde_json::json!({
         "enabled": true,
         "instance_count": sinks.len(),
-        "snapshot_finalizations_pending": pending_snapshot_finalizations(),
+        "snapshot_finalizations_pending": pending,
+        "snapshot_finalizations_pending_bytes": pending_bytes,
+        "snapshot_finalizations_oldest_age_secs": oldest_age,
+        "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
             "queue": {
                 "depth": queue_depth,
@@ -2075,6 +2618,7 @@ impl SinkRuntime {
             .read()
             .ok()
             .and_then(|guard| guard.clone());
+        let snapshot = snapshot_accumulator_status(self.generation);
         serde_json::json!({
             "plugin_config_id": self.plugin_config_id.as_ref(),
             "generation": self.generation,
@@ -2106,6 +2650,7 @@ impl SinkRuntime {
                     .queue_byte_budget_exhausted_total
                     .load(Ordering::Relaxed),
             },
+            "snapshot": snapshot,
             "spool": {
                 "enabled": spool_enabled,
                 "available": spool_enabled && self.metrics.spool_available.load(Ordering::Acquire),
@@ -2136,9 +2681,65 @@ impl SinkRuntime {
     }
 }
 
+fn snapshot_accumulator_gauges(generation: u64) -> Option<(u64, u64)> {
+    let generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match generations.get(&generation) {
+        Some(PendingSnapshotFinalization::Full(lifecycle)) => Some((
+            lifecycle.accumulator.entry_count() as u64,
+            lifecycle.accumulator.retained_bytes() as u64,
+        )),
+        Some(PendingSnapshotFinalization::Compact(recovery)) => {
+            Some((0, recovery.retained_bytes as u64))
+        }
+        None => None,
+    }
+}
+
+fn snapshot_accumulator_status(generation: u64) -> Value {
+    let generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match generations.get(&generation) {
+        Some(PendingSnapshotFinalization::Full(lifecycle)) => serde_json::json!({
+            "entries": lifecycle.accumulator.entry_count(),
+            "retained_bytes": lifecycle.accumulator.retained_bytes(),
+            "max_entries": lifecycle.accumulator.max_entries,
+            "max_retained_bytes": lifecycle.accumulator.max_retained_bytes,
+            "overflow_spooled_total": lifecycle.runtime.metrics.snapshot_overflow_spooled_total.load(Ordering::Relaxed),
+            "overflow_pending_total": lifecycle.runtime.metrics.snapshot_overflow_pending_total.load(Ordering::Relaxed),
+            "cardinality_rejections_total": lifecycle.runtime.metrics.snapshot_cardinality_rejections_total.load(Ordering::Relaxed),
+        }),
+        Some(PendingSnapshotFinalization::Compact(recovery)) => serde_json::json!({
+            "entries": 0,
+            "retained_bytes": recovery.retained_bytes,
+            "max_entries": 0,
+            "max_retained_bytes": 0,
+            "overflow_spooled_total": recovery.metrics.snapshot_overflow_spooled_total.load(Ordering::Relaxed),
+            "overflow_pending_total": recovery.metrics.snapshot_overflow_pending_total.load(Ordering::Relaxed),
+            "cardinality_rejections_total": recovery.metrics.snapshot_cardinality_rejections_total.load(Ordering::Relaxed),
+            "recovery": "compact",
+        }),
+        None => serde_json::json!({
+            "entries": 0,
+            "retained_bytes": 0,
+            "max_entries": 0,
+            "max_retained_bytes": 0,
+            "overflow_spooled_total": 0,
+            "overflow_pending_total": 0,
+            "cardinality_rejections_total": 0,
+        }),
+    }
+}
+
 fn render_prometheus_for_sinks(
     sinks: &BTreeMap<String, Arc<SinkRuntime>>,
     pending_finalizations: usize,
+    pending_finalization_bytes: u64,
+    pending_finalization_oldest_age_secs: u64,
 ) -> String {
     let mut output = String::with_capacity(4096 * sinks.len().max(1));
 
@@ -2169,6 +2770,11 @@ fn render_prometheus_for_sinks(
     let mut queue_retained_bytes = 0u64;
     let mut queue_byte_budget_exhausted = 0u64;
     let mut snapshot_emits = 0u64;
+    let mut snapshot_entries = 0u64;
+    let mut snapshot_retained_bytes = 0u64;
+    let mut snapshot_overflow_spooled = 0u64;
+    let mut snapshot_overflow_pending = 0u64;
+    let mut snapshot_cardinality_rejections = 0u64;
     let mut any_snapshot = false;
     let mut latency_counts: Vec<u64> = Vec::new();
     let mut latency_sum = 0.0f64;
@@ -2229,6 +2835,25 @@ fn render_prometheus_for_sinks(
             any_snapshot = true;
             snapshot_emits =
                 snapshot_emits.saturating_add(metrics.snapshot_emits_total.load(Ordering::Relaxed));
+            snapshot_overflow_spooled = snapshot_overflow_spooled.saturating_add(
+                metrics
+                    .snapshot_overflow_spooled_total
+                    .load(Ordering::Relaxed),
+            );
+            snapshot_overflow_pending = snapshot_overflow_pending.saturating_add(
+                metrics
+                    .snapshot_overflow_pending_total
+                    .load(Ordering::Relaxed),
+            );
+            snapshot_cardinality_rejections = snapshot_cardinality_rejections.saturating_add(
+                metrics
+                    .snapshot_cardinality_rejections_total
+                    .load(Ordering::Relaxed),
+            );
+            if let Some(status) = snapshot_accumulator_gauges(runtime.generation) {
+                snapshot_entries = snapshot_entries.saturating_add(status.0);
+                snapshot_retained_bytes = snapshot_retained_bytes.saturating_add(status.1);
+            }
         }
         if latency_buckets.is_empty() {
             latency_buckets = metrics.latency.buckets;
@@ -2277,6 +2902,50 @@ fn render_prometheus_for_sinks(
         "chargeback_sink_snapshot_finalizations_pending {}\n",
         pending_finalizations
     ));
+    output.push_str("# HELP chargeback_sink_snapshot_finalizations_pending_bytes Estimated retained bytes for pending snapshot finalization recovery state.\n");
+    output.push_str("# TYPE chargeback_sink_snapshot_finalizations_pending_bytes gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_snapshot_finalizations_pending_bytes {}\n",
+        pending_finalization_bytes
+    ));
+    output.push_str("# HELP chargeback_sink_snapshot_finalizations_oldest_age_seconds Age in seconds of the oldest pending snapshot finalization recovery.\n");
+    output.push_str("# TYPE chargeback_sink_snapshot_finalizations_oldest_age_seconds gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_snapshot_finalizations_oldest_age_seconds {}\n",
+        pending_finalization_oldest_age_secs
+    ));
+    if any_snapshot || pending_finalizations > 0 {
+        output.push_str("# HELP chargeback_sink_snapshot_entries Snapshot accumulator identities retained in memory.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_entries gauge\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_entries {}\n",
+            snapshot_entries
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_retained_bytes Estimated snapshot accumulator retained bytes under configured max_retained_bytes.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_retained_bytes gauge\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_retained_bytes {}\n",
+            snapshot_retained_bytes
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_overflow_spooled_total Snapshot charges immediately spooled after accumulator cardinality or byte budget overflow.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_overflow_spooled_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_overflow_spooled_total {}\n",
+            snapshot_overflow_spooled
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_overflow_pending_total Snapshot overflow charges staged for the next durable emission after immediate spool failure.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_overflow_pending_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_overflow_pending_total {}\n",
+            snapshot_overflow_pending
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_cardinality_rejections_total Snapshot charges that could not be accumulated or overflow-spooled under hard budgets.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_cardinality_rejections_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_cardinality_rejections_total {}\n",
+            snapshot_cardinality_rejections
+        ));
+    }
     output.push_str(
         "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).\n",
     );
@@ -2837,6 +3506,23 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     if config.snapshot.stale_entry_ttl_secs == 0 {
         return Err(format!(
             "{PLUGIN_NAME}: snapshot.stale_entry_ttl_secs must be at least 1"
+        ));
+    }
+    if config.snapshot.stale_entry_ttl_secs < config.snapshot.interval_secs {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot.stale_entry_ttl_secs must be >= snapshot.interval_secs so idle keys cannot expire before their first durable emission window"
+        ));
+    }
+    if config.snapshot.max_entries == 0 || config.snapshot.max_entries > MAX_BUFFER_CAPACITY {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot.max_entries must be between 1 and {MAX_BUFFER_CAPACITY}"
+        ));
+    }
+    if config.snapshot.max_retained_bytes < MAX_CHARGE_EVENT_BYTES
+        || config.snapshot.max_retained_bytes > HARD_MAX_BUFFER_MAX_BYTES
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot.max_retained_bytes must be between {MAX_CHARGE_EVENT_BYTES} and {HARD_MAX_BUFFER_MAX_BYTES}"
         ));
     }
     if config
@@ -4183,9 +4869,18 @@ impl Default for SnapshotAtomicTotals {
 }
 
 impl SnapshotAtomicTotals {
-    fn add(&self, charge: ChargeComputation) {
-        self.call_count
-            .fetch_add(charge.call_count as u64, Ordering::Relaxed);
+    fn try_add(&self, charge: ChargeComputation) -> Result<(), String> {
+        let added_calls = charge.call_count as u64;
+        let previous = self
+            .call_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(added_calls)
+            });
+        if previous.is_err() {
+            return Err(format!(
+                "{PLUGIN_NAME}: snapshot call_count overflowed u64 while accumulating"
+            ));
+        }
         add_f64_atomic(&self.charge_call_bits, charge.charge_call);
         self.bytes_sent
             .fetch_add(charge.bytes_sent, Ordering::Relaxed);
@@ -4197,6 +4892,7 @@ impl SnapshotAtomicTotals {
             charge.charge_bytes_received,
         );
         add_f64_atomic(&self.charge_total_bits, charge.charge_total);
+        Ok(())
     }
 
     fn snapshot(&self) -> SnapshotTotals {
@@ -4226,6 +4922,8 @@ struct SnapshotEntry {
     /// revision and only evicts when that exact revision is still present, so a
     /// same-key refresh that races after the stale check cannot be deleted.
     revision: AtomicU64,
+    /// Estimated retained bytes charged against `max_retained_bytes` at insert.
+    retained_bytes: usize,
 }
 
 /// Baseline emitted for one accumulator generation of a snapshot identity.
@@ -4242,10 +4940,23 @@ struct PreparedSnapshot {
 #[cfg(test)]
 type CleanupAfterStaleCheckHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// Outcome of attempting to accumulate one charge under cardinality/byte budgets.
+#[derive(Debug)]
+enum SnapshotRecordOutcome {
+    Accumulated,
+    /// New identity exceeded the hard budget; caller must durably spool this event.
+    OverflowImmediate,
+}
+
 pub struct SnapshotAccumulator {
     entries: DashMap<SnapshotMetadata, SnapshotEntry>,
     last_emitted: DashMap<SnapshotMetadata, LastEmitted>,
     next_generation: AtomicU64,
+    max_entries: usize,
+    max_retained_bytes: usize,
+    retained_bytes: AtomicUsize,
+    overflow_pending: Mutex<Vec<ChargeEvent>>,
+    overflow_pending_bytes: AtomicUsize,
     /// Test-only callback invoked after a key is selected as a stale candidate
     /// and before conditional eviction. Production leaves this unset.
     #[cfg(test)]
@@ -4254,13 +4965,45 @@ pub struct SnapshotAccumulator {
 
 impl SnapshotAccumulator {
     pub fn new() -> Self {
+        Self::with_limits(
+            default_snapshot_max_entries(),
+            default_snapshot_max_retained_bytes(),
+        )
+    }
+
+    pub fn with_limits(max_entries: usize, max_retained_bytes: usize) -> Self {
         Self {
             entries: DashMap::new(),
             last_emitted: DashMap::new(),
             next_generation: AtomicU64::new(1),
+            max_entries: max_entries.max(1),
+            max_retained_bytes: max_retained_bytes.max(1),
+            retained_bytes: AtomicUsize::new(0),
+            overflow_pending: Mutex::new(Vec::new()),
+            overflow_pending_bytes: AtomicUsize::new(0),
             #[cfg(test)]
             cleanup_after_stale_check_hook: Mutex::new(None),
         }
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(self.overflow_pending_bytes.load(Ordering::Acquire))
+    }
+
+    fn clear_for_compaction(&self) {
+        self.entries.clear();
+        self.last_emitted.clear();
+        self.retained_bytes.store(0, Ordering::Release);
+        if let Ok(mut pending) = self.overflow_pending.lock() {
+            pending.clear();
+        }
+        self.overflow_pending_bytes.store(0, Ordering::Release);
     }
 
     fn record_http(
@@ -4269,7 +5012,7 @@ impl SnapshotAccumulator {
         consumer: &str,
         outcome: HttpBillingOutcome,
         charge: ChargeComputation,
-    ) {
+    ) -> SnapshotRecordOutcome {
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
         let meta = SnapshotMetadata {
@@ -4284,7 +5027,7 @@ impl SnapshotAccumulator {
             grpc_status: outcome.grpc_status.map(normalize_snapshot_grpc_status),
             protocol: infer_http_protocol(summary),
         };
-        self.record(meta, charge);
+        self.record(meta, charge)
     }
 
     fn record_stream(
@@ -4292,7 +5035,7 @@ impl SnapshotAccumulator {
         summary: &StreamTransactionSummary,
         consumer: &str,
         charge: ChargeComputation,
-    ) {
+    ) -> SnapshotRecordOutcome {
         let meta = SnapshotMetadata {
             namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
             consumer_id: bound_string(consumer, MAX_FIELD_LEN),
@@ -4308,7 +5051,7 @@ impl SnapshotAccumulator {
             grpc_status: None,
             protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
         };
-        self.record(meta, charge);
+        self.record(meta, charge)
     }
 
     fn record_websocket(
@@ -4316,7 +5059,7 @@ impl SnapshotAccumulator {
         summary: &WsDisconnectContext,
         consumer: &str,
         charge: ChargeComputation,
-    ) {
+    ) -> SnapshotRecordOutcome {
         let meta = SnapshotMetadata {
             namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
             consumer_id: bound_string(consumer, MAX_FIELD_LEN),
@@ -4332,31 +5075,137 @@ impl SnapshotAccumulator {
             grpc_status: None,
             protocol: "ws".to_string(),
         };
-        self.record(meta, charge);
+        self.record(meta, charge)
     }
 
-    fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) {
-        self.record_at(meta, charge, unix_timestamp_seconds());
+    fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) -> SnapshotRecordOutcome {
+        self.record_at(meta, charge, unix_timestamp_seconds())
     }
 
-    fn record_at(&self, meta: SnapshotMetadata, charge: ChargeComputation, now: i64) {
-        // Use the typed metadata value itself as the key. A delimiter-encoded
-        // string would allow hostile or ordinary `|` characters in route/name
-        // dimensions to collide and recreate mixed attribution.
+    fn record_at(
+        &self,
+        meta: SnapshotMetadata,
+        charge: ChargeComputation,
+        now: i64,
+    ) -> SnapshotRecordOutcome {
         let key = meta.clone();
-        let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
-            meta,
-            totals: SnapshotAtomicTotals::default(),
-            last_seen_at: AtomicI64::new(now),
-            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
-            revision: AtomicU64::new(0),
-        });
-        // Refresh under the DashMap entry guard so a concurrent same-key
-        // `remove_if` either observes the bumped revision or runs entirely
-        // before this refresh (in which case this `entry` insert recreates).
-        entry.last_seen_at.store(now, Ordering::Relaxed);
-        entry.revision.fetch_add(1, Ordering::Relaxed);
-        entry.totals.add(charge);
+        if let Some(entry) = self.entries.get(&key) {
+            entry.last_seen_at.store(now, Ordering::Relaxed);
+            entry.revision.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = entry.totals.try_add(charge) {
+                warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+            }
+            return SnapshotRecordOutcome::Accumulated;
+        }
+
+        let entry_bytes = snapshot_metadata_retained_bytes(&meta);
+        let current_entries = self.entries.len();
+        let current_bytes = self.retained_bytes.load(Ordering::Acquire);
+        if current_entries >= self.max_entries
+            || current_bytes.saturating_add(entry_bytes) > self.max_retained_bytes
+        {
+            return SnapshotRecordOutcome::OverflowImmediate;
+        }
+
+        // Race-safe insert: only the first creator pays the budget. A losing
+        // inserter refreshes the winner in place without a second cardinality charge.
+        let mut created = false;
+        {
+            let entry = self.entries.entry(key.clone()).or_insert_with(|| {
+                created = true;
+                SnapshotEntry {
+                    meta,
+                    totals: SnapshotAtomicTotals::default(),
+                    last_seen_at: AtomicI64::new(now),
+                    generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+                    revision: AtomicU64::new(0),
+                    retained_bytes: entry_bytes,
+                }
+            });
+            if created {
+                // Re-check after winning the insert slot. If we overshot under
+                // concurrency, immediately spill this identity to durable overflow
+                // rather than retaining an over-budget map entry.
+                let next_entries = self.entries.len();
+                let next_bytes = self
+                    .retained_bytes
+                    .fetch_add(entry_bytes, Ordering::AcqRel)
+                    .saturating_add(entry_bytes);
+                if next_entries > self.max_entries || next_bytes > self.max_retained_bytes {
+                    let generation = entry.generation;
+                    drop(entry);
+                    if let Some((_, evicted)) = self.entries.remove_if(&key, |_, live| {
+                        live.generation == generation
+                            && live.totals.snapshot().is_zero()
+                            && live.revision.load(Ordering::Relaxed) == 0
+                    }) {
+                        self.retained_bytes
+                            .fetch_sub(evicted.retained_bytes, Ordering::AcqRel);
+                        return SnapshotRecordOutcome::OverflowImmediate;
+                    }
+                    // A concurrent refresh already attached totals; keep the entry.
+                } else {
+                    entry.last_seen_at.store(now, Ordering::Relaxed);
+                    entry.revision.fetch_add(1, Ordering::Relaxed);
+                    if let Err(error) = entry.totals.try_add(charge) {
+                        warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+                    }
+                    return SnapshotRecordOutcome::Accumulated;
+                }
+            } else {
+                entry.last_seen_at.store(now, Ordering::Relaxed);
+                entry.revision.fetch_add(1, Ordering::Relaxed);
+                if let Err(error) = entry.totals.try_add(charge) {
+                    warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+                }
+                return SnapshotRecordOutcome::Accumulated;
+            }
+        }
+        if let Some(entry) = self.entries.get(&key) {
+            entry.last_seen_at.store(now, Ordering::Relaxed);
+            entry.revision.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = entry.totals.try_add(charge) {
+                warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+            }
+        }
+        SnapshotRecordOutcome::Accumulated
+    }
+
+    fn stage_overflow_event(&self, event: ChargeEvent) -> bool {
+        let bytes = charge_event_retained_bytes(&event);
+        let current = self.retained_bytes();
+        if current.saturating_add(bytes) > self.max_retained_bytes {
+            return false;
+        }
+        let mut pending = match self.overflow_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Re-check under the lock so concurrent overflow staging cannot exceed
+        // the retained-byte hard budget.
+        let locked_bytes = self.retained_bytes();
+        if locked_bytes.saturating_add(bytes) > self.max_retained_bytes {
+            return false;
+        }
+        pending.push(event);
+        self.overflow_pending_bytes
+            .fetch_add(bytes, Ordering::AcqRel);
+        true
+    }
+
+    #[allow(dead_code)]
+    pub fn stage_overflow_event_for_tests(&self, event: ChargeEvent) -> bool {
+        self.stage_overflow_event(event)
+    }
+
+    fn take_overflow_pending(&self) -> Vec<ChargeEvent> {
+        let mut pending = match self.overflow_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let drained = std::mem::take(&mut *pending);
+        self.overflow_pending_bytes.store(0, Ordering::Release);
+        drained
     }
 
     // External integration tests exercise the public accumulator contract;
@@ -4416,6 +5265,14 @@ impl SnapshotAccumulator {
         })
     }
 
+    fn peek_overflow_pending(&self) -> Vec<ChargeEvent> {
+        let pending = match self.overflow_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.clone()
+    }
+
     fn commit_prepared(&self, prepared: &PreparedSnapshot) {
         for (key, generation, current) in &prepared.emitted_totals {
             // Publish the baseline only while this generation is still live so
@@ -4436,6 +5293,21 @@ impl SnapshotAccumulator {
                     },
                 );
             }
+        }
+    }
+
+    fn entry_has_uncommitted_delta(&self, entry: &SnapshotEntry) -> bool {
+        let current = entry.totals.snapshot();
+        let last = self
+            .last_emitted
+            .get(&entry.meta)
+            .filter(|value| value.generation == entry.generation)
+            .map(|value| value.totals)
+            .unwrap_or_default();
+        match current.delta_since(last) {
+            Ok(delta) => !delta.is_zero(),
+            // Fail closed: non-finite/regressed state must not be deleted.
+            Err(_) => true,
         }
     }
 
@@ -4466,13 +5338,16 @@ impl SnapshotAccumulator {
     fn cleanup_stale(&self, now: i64, stale_entry_ttl_secs: u64) -> usize {
         let cutoff = now.saturating_sub(stale_entry_ttl_secs.min(i64::MAX as u64) as i64);
         // Candidate scan is best-effort. Eviction re-validates generation,
-        // revision, and staleness atomically under the DashMap shard lock so a
-        // same-key refresh cannot be deleted, and unrelated keys stay
-        // non-blocking (no global request-path lock).
+        // revision, staleness, and pending-delta state atomically under the
+        // DashMap shard lock so a same-key refresh cannot be deleted, unemitted
+        // totals survive TTL, and unrelated keys stay non-blocking.
         let candidates: Vec<(SnapshotMetadata, u64, u64)> = self
             .entries
             .iter()
-            .filter(|entry| entry.value().last_seen_at.load(Ordering::Relaxed) <= cutoff)
+            .filter(|entry| {
+                entry.value().last_seen_at.load(Ordering::Relaxed) <= cutoff
+                    && !self.entry_has_uncommitted_delta(entry.value())
+            })
             .map(|entry| {
                 (
                     entry.key().clone(),
@@ -4489,6 +5364,7 @@ impl SnapshotAccumulator {
                 entry.generation == observed_generation
                     && entry.revision.load(Ordering::Relaxed) == observed_revision
                     && entry.last_seen_at.load(Ordering::Relaxed) <= cutoff
+                    && !self.entry_has_uncommitted_delta(entry)
             }) {
                 // Drop the baseline only for the generation that was actually
                 // evicted. A concurrent reinsert+emit for a newer generation
@@ -4496,6 +5372,8 @@ impl SnapshotAccumulator {
                 self.last_emitted.remove_if(&key, |_, baseline| {
                     baseline.generation == evicted.generation
                 });
+                self.retained_bytes
+                    .fetch_sub(evicted.retained_bytes, Ordering::AcqRel);
                 removed += 1;
             }
         }
@@ -4514,7 +5392,7 @@ impl SnapshotAccumulator {
         protocol: &str,
         charge: ChargeComputation,
     ) {
-        self.record_at(
+        let _ = self.record_at(
             SnapshotMetadata {
                 namespace: namespace.to_string(),
                 consumer_id: consumer.to_string(),
@@ -4540,7 +5418,58 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) {
-        self.record_http(summary, consumer, http_billing_outcome(summary), charge);
+        let _ = self.record_http(summary, consumer, http_billing_outcome(summary), charge);
+    }
+
+    /// Seed a single identity with an arbitrary `call_count` for boundary tests.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn seed_call_count_for_test(
+        &self,
+        namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        status_code: u16,
+        protocol: &str,
+        call_count: u64,
+    ) {
+        let meta = SnapshotMetadata {
+            namespace: namespace.to_string(),
+            consumer_id: consumer.to_string(),
+            consumer_name: None,
+            proxy_id: proxy_id.to_string(),
+            proxy_name: proxy_name.to_string(),
+            route_id: None,
+            status_code,
+            http_status_code: (protocol == "http").then_some(status_code),
+            grpc_status: None,
+            protocol: protocol.to_string(),
+        };
+        let entry_bytes = snapshot_metadata_retained_bytes(&meta);
+        let key = meta.clone();
+        let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
+            meta,
+            totals: SnapshotAtomicTotals::default(),
+            last_seen_at: AtomicI64::new(unix_timestamp_seconds()),
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            revision: AtomicU64::new(0),
+            retained_bytes: entry_bytes,
+        });
+        if entry.totals.call_count.load(Ordering::Relaxed) == 0
+            && entry.revision.load(Ordering::Relaxed) == 0
+        {
+            self.retained_bytes
+                .fetch_add(entry_bytes, Ordering::AcqRel);
+        }
+        entry
+            .totals
+            .call_count
+            .store(call_count, Ordering::Relaxed);
+        entry.revision.fetch_add(1, Ordering::Relaxed);
+        entry
+            .last_seen_at
+            .store(unix_timestamp_seconds(), Ordering::Relaxed);
     }
 }
 
@@ -4727,7 +5656,10 @@ fn emit_periodic_snapshot(
             return Err(error);
         }
     };
-    let event_count = prepared.events.len();
+    let mut events = accumulator.peek_overflow_pending();
+    let overflow_count = events.len();
+    events.extend(prepared.events.iter().cloned());
+    let event_count = events.len();
     if event_count == 0 {
         return Ok(0);
     }
@@ -4738,7 +5670,7 @@ fn emit_periodic_snapshot(
             .record_failure(FailureReason::Serialize, error.clone());
         return Err(error);
     };
-    if let Err(error) = spool.write_events(&prepared.events) {
+    if let Err(error) = spool.write_events(&events) {
         runtime
             .metrics
             .spool_available
@@ -4760,12 +5692,15 @@ fn emit_periodic_snapshot(
     // as a low-latency delivery attempt. A reload racing this point can abort the
     // queue worker without losing or double-charging the snapshot: replay is
     // idempotent on event_id.
+    if overflow_count > 0 {
+        let _ = accumulator.take_overflow_pending();
+    }
     accumulator.commit_prepared(&prepared);
     runtime
         .metrics
         .snapshot_emits_total
         .fetch_add(event_count as u64, Ordering::Relaxed);
-    for event in prepared.events {
+    for event in events {
         enqueue_charge_event(runtime, event);
     }
     invalidate_status_cache();
@@ -4808,7 +5743,10 @@ fn emit_final_snapshot_to_spool(
             return false;
         }
     };
-    if prepared.events.is_empty() {
+    let mut events = accumulator.peek_overflow_pending();
+    let overflow_count = events.len();
+    events.extend(prepared.events.iter().cloned());
+    if events.is_empty() {
         return true;
     }
     let Some(spool) = runtime.spool.as_ref() else {
@@ -4818,7 +5756,7 @@ fn emit_final_snapshot_to_spool(
         );
         return false;
     };
-    if let Err(error) = spool.write_events(&prepared.events) {
+    if let Err(error) = spool.write_events(&events) {
         runtime
             .metrics
             .spool_available
@@ -4835,11 +5773,14 @@ fn emit_final_snapshot_to_spool(
         );
         return false;
     }
+    if overflow_count > 0 {
+        let _ = accumulator.take_overflow_pending();
+    }
     accumulator.commit_prepared(&prepared);
     runtime
         .metrics
         .snapshot_emits_total
-        .fetch_add(prepared.events.len() as u64, Ordering::Relaxed);
+        .fetch_add(events.len() as u64, Ordering::Relaxed);
     invalidate_status_cache();
     true
 }
@@ -4874,7 +5815,7 @@ fn event_from_http_summary(
         http_status_code: Some(outcome.http_status_code),
         grpc_status: outcome.grpc_status,
         protocol: infer_http_protocol(summary),
-        call_count: charge.call_count,
+        call_count: u64::from(charge.call_count),
         charge_call: charge.charge_call,
         bytes_sent: charge.bytes_sent,
         bytes_received: charge.bytes_received,
@@ -4930,7 +5871,7 @@ fn event_from_stream_summary(
         http_status_code: None,
         grpc_status: None,
         protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
-        call_count: charge.call_count,
+        call_count: u64::from(charge.call_count),
         charge_call: charge.charge_call,
         bytes_sent: charge.bytes_sent,
         bytes_received: charge.bytes_received,
@@ -4986,7 +5927,7 @@ fn event_from_ws_summary(
         http_status_code: None,
         grpc_status: None,
         protocol: "ws".to_string(),
-        call_count: charge.call_count,
+        call_count: u64::from(charge.call_count),
         charge_call: charge.charge_call,
         bytes_sent: charge.bytes_sent,
         bytes_received: charge.bytes_received,
@@ -5038,7 +5979,7 @@ fn event_from_snapshot(
         http_status_code: meta.http_status_code,
         grpc_status: meta.grpc_status,
         protocol: meta.protocol.clone(),
-        call_count: saturating_u64_to_u32(totals.call_count),
+        call_count: totals.call_count,
         charge_call: totals.charge_call,
         bytes_sent: totals.bytes_sent,
         bytes_received: totals.bytes_received,
@@ -5073,6 +6014,59 @@ fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<S
         .find_map(|key| metadata.get(*key))
         .map(|value| bound_string(value, MAX_METADATA_FIELD_LEN))
         .filter(|value| !value.is_empty())
+}
+
+fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEvent) {
+    let metrics = &lifecycle.runtime.metrics;
+    if let Some(spool) = lifecycle.runtime.spool.as_ref() {
+        match spool.write_events(std::slice::from_ref(&event)) {
+            Ok(_) => {
+                metrics
+                    .snapshot_overflow_spooled_total
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .snapshot_emits_total
+                    .fetch_add(1, Ordering::Relaxed);
+                invalidate_status_cache();
+                return;
+            }
+            Err(error) => {
+                metrics.spool_available.store(false, Ordering::Release);
+                metrics.record_failure(
+                    FailureReason::Serialize,
+                    format!("snapshot cardinality overflow spool handoff failed: {error}"),
+                );
+            }
+        }
+    }
+    if lifecycle.accumulator.stage_overflow_event(event) {
+        metrics
+            .snapshot_overflow_pending_total
+            .fetch_add(1, Ordering::Relaxed);
+        invalidate_status_cache();
+        return;
+    }
+    metrics
+        .snapshot_cardinality_rejections_total
+        .fetch_add(1, Ordering::Relaxed);
+    warn!(
+        plugin = PLUGIN_NAME,
+        generation = lifecycle.generation,
+        "Chargeback sink snapshot cardinality budget exhausted and overflow could not be staged; restore spool capacity"
+    );
+    invalidate_status_cache();
+}
+
+fn snapshot_metadata_retained_bytes(meta: &SnapshotMetadata) -> usize {
+    let mut total = 128usize;
+    total = total.saturating_add(meta.namespace.len());
+    total = total.saturating_add(meta.consumer_id.len());
+    total = total.saturating_add(meta.consumer_name.as_ref().map(String::len).unwrap_or(0));
+    total = total.saturating_add(meta.proxy_id.len());
+    total = total.saturating_add(meta.proxy_name.len());
+    total = total.saturating_add(meta.route_id.as_ref().map(String::len).unwrap_or(0));
+    total = total.saturating_add(meta.protocol.len());
+    total
 }
 
 fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
@@ -5150,14 +6144,6 @@ fn non_negative_delta(current: f64, last: f64, field: &str) -> Result<f64, Strin
         ));
     }
     Ok(current - last)
-}
-
-fn saturating_u64_to_u32(value: u64) -> u32 {
-    if value > u32::MAX as u64 {
-        u32::MAX
-    } else {
-        value as u32
-    }
 }
 
 fn add_f64_atomic(slot: &AtomicU64, delta: f64) {
