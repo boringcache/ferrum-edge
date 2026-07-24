@@ -26,8 +26,8 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
     evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew, failure_backoff_sequence,
     full_snapshot_stream_disposition, gateway_config_content_matches,
-    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, monotonic_watermark,
-    reconcile_snapshot_version, record_applied_gateway_trust,
+    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
+    monotonic_watermark, reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
     silence_exceeds_liveness, silence_watchdog_armed, snapshot_failure_stream_disposition,
     snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
@@ -1282,6 +1282,14 @@ fn silence_watchdog_arms_only_when_silence_is_actually_anomalous() {
     // on a blackholed reconnect and never reach a fallback CP.
     assert!(silence_watchdog_armed(false, false));
     assert!(silence_watchdog_armed(true, false));
+}
+
+#[test]
+fn heartbeat_frames_require_an_accepted_negotiated_snapshot_base() {
+    assert!(!heartbeat_frame_admissible(false, false));
+    assert!(!heartbeat_frame_admissible(false, true));
+    assert!(!heartbeat_frame_admissible(true, false));
+    assert!(heartbeat_frame_admissible(true, true));
 }
 
 #[test]

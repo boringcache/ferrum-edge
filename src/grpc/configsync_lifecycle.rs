@@ -977,6 +977,16 @@ pub fn silence_watchdog_armed(heartbeats_negotiated: bool, received_any_message:
     heartbeats_negotiated || !received_any_message
 }
 
+/// A heartbeat frame is admissible only after this subscription has accepted
+/// its authoritative FULL_SNAPSHOT base and that snapshot negotiated heartbeat
+/// support. Heartbeats are liveness-only and must never establish either state.
+pub fn heartbeat_frame_admissible(
+    subscription_base_applied: bool,
+    heartbeats_negotiated: bool,
+) -> bool {
+    subscription_base_applied && heartbeats_negotiated
+}
+
 /// True when a silence interval exceeds the ConfigSync liveness bound.
 #[allow(dead_code)] // external unit-test contract for the liveness boundary
 pub fn silence_exceeds_liveness(silence_secs: u64) -> bool {

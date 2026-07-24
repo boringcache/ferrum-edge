@@ -47,9 +47,9 @@ use super::configsync_lifecycle::{
     check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, evaluate_snapshot_clock_skew,
     full_snapshot_stream_disposition, gateway_trust_equivalence_state,
-    grow_backoff_after_failure_sleep, reconcile_snapshot_version, record_applied_gateway_trust,
-    resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
-    silence_watchdog_armed, snapshot_failure_stream_disposition,
+    grow_backoff_after_failure_sleep, heartbeat_frame_admissible, reconcile_snapshot_version,
+    record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
+    resource_delta_advances_authority, silence_watchdog_armed, snapshot_failure_stream_disposition,
     snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
@@ -1490,6 +1490,48 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         last_stream_activity = Instant::now();
         received_any_message = true;
 
+        // Every envelope, including a heartbeat, must come from a compatible
+        // peer. Otherwise an incompatible or malformed-version CP could keep a
+        // stream alive indefinitely while bypassing the config-update gate.
+        if let Err(err) = check_cp_version_compatibility(&update.ferrum_version) {
+            error!("{}", err);
+            return Ok(DpStreamEnd::TransportFailure { received_config });
+        }
+
+        if update.heartbeat {
+            // Heartbeats are valid only after this subscription accepted its
+            // authoritative base and the initial FULL_SNAPSHOT negotiated the
+            // capability. A heartbeat cannot bootstrap either state: accepting
+            // it would let a buggy/adversarial CP keep an unready DP connected
+            // forever without ever supplying usable configuration.
+            if !heartbeat_frame_admissible(subscription.base_applied, heartbeats_negotiated) {
+                warn!(
+                    base_applied = subscription.base_applied,
+                    heartbeats_negotiated,
+                    cp_url,
+                    "Refusing ConfigSync heartbeat before an accepted, negotiated \
+                     FULL_SNAPSHOT base; terminating stream"
+                );
+                return Ok(react_to_unusable_snapshot(subscription.base_applied));
+            }
+            debug!(
+                version = %update.version,
+                "Received ConfigSync heartbeat"
+            );
+            continue;
+        }
+
+        // The CP confirms heartbeat support only on a real FULL_SNAPSHOT.
+        // Rejecting a confirmation on DELTA prevents a partial update from
+        // changing lifecycle policy before establishing an authoritative base.
+        if update.heartbeat_negotiated && update.update_type != 0 {
+            warn!(
+                update_type = update.update_type,
+                cp_url,
+                "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
+            );
+            return Ok(react_to_unusable_snapshot(subscription.base_applied));
+        }
         if update.heartbeat_negotiated && !heartbeats_negotiated {
             heartbeats_negotiated = true;
             debug!(
@@ -1498,26 +1540,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
             );
         }
 
-        if update.heartbeat {
-            debug!(
-                version = %update.version,
-                "Received ConfigSync heartbeat"
-            );
-            continue;
-        }
-
         info!(
             "Received config update (type={}, version={}, cp_version={})",
             update.update_type, update.version, update.ferrum_version
         );
-
-        // Validate CP version compatibility before applying any config.
-        // Heartbeats already continued above; every FULL_SNAPSHOT/DELTA must
-        // carry a valid compatible CP version (issue #2395).
-        if let Err(err) = check_cp_version_compatibility(&update.ferrum_version) {
-            error!("{}", err);
-            return Ok(DpStreamEnd::TransportFailure { received_config });
-        }
 
         match update.update_type {
             0 => {
@@ -1640,22 +1666,6 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     );
                     return Ok(react_to_unusable_snapshot(subscription.base_applied));
                 }
-                let frontend_tls_update = match stage_frontend_tls_snapshot(
-                    &config,
-                    proxy_state,
-                    frontend_tls_slot,
-                    frontend_tls_runtime,
-                    cp_frontend_tls_materialized.as_ref(),
-                    frontend_tls_restore_slot.as_ref(),
-                ) {
-                    Ok(update) => update,
-                    Err(error) => {
-                        error!("CP config rejected — {}", error);
-                        error!("Ignoring config update with unusable frontend TLS material");
-                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
-                    }
-                };
-
                 // Freshness describes the committed body: envelope version must
                 // agree with GatewayConfig.loaded_at. Fail closed otherwise —
                 // never fabricate a timestamp.
@@ -1741,6 +1751,26 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                              config; keeping applied config and failing over"
                         );
                         return Ok(DpStreamEnd::StaleSnapshotFenced);
+                    }
+                };
+
+                // Materialize external/file-backed TLS sources only after the
+                // snapshot passes freshness authorization. A stale/fenced CP
+                // must not trigger secret-provider access or mutate the local
+                // operator-TLS restore slot before the snapshot is refused.
+                let frontend_tls_update = match stage_frontend_tls_snapshot(
+                    &config,
+                    proxy_state,
+                    frontend_tls_slot,
+                    frontend_tls_runtime,
+                    cp_frontend_tls_materialized.as_ref(),
+                    frontend_tls_restore_slot.as_ref(),
+                ) {
+                    Ok(update) => update,
+                    Err(error) => {
+                        error!("CP config rejected — {}", error);
+                        error!("Ignoring config update with unusable frontend TLS material");
+                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
                     }
                 };
 
