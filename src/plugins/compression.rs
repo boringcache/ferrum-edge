@@ -44,7 +44,9 @@ use tracing::{debug, error, warn};
 use crate::util::http_headers::{headers_have_cache_control_directive, headers_have_strong_etag};
 use crate::util::unknown_keys::reject_unknown_keys;
 
-use super::utils::content_encoding::{DecodeLimits, decode_content_encoding, parse_content_codings};
+use super::utils::content_encoding::{
+    DecodeLimits, decode_content_encoding, parse_content_codings,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Accepted top-level `compression` config keys.
@@ -457,7 +459,9 @@ impl CompressionPlugin {
             return Ok(RequestCodingPlan::IdentityOnly);
         }
         if codings.iter().any(|coding| coding == "identity") {
-            return Err("identity content-encoding cannot be combined with other codings".to_string());
+            return Err(
+                "identity content-encoding cannot be combined with other codings".to_string(),
+            );
         }
         for coding in &codings {
             match coding.as_str() {
@@ -577,8 +581,12 @@ impl CompressionPlugin {
                 let header_for_decode = ce.clone();
                 let decode_result = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    decode_content_encoding(Some(header_for_decode.as_str()), &decode_source, limits)
-                        .map(|decoded| decoded.into_owned())
+                    decode_content_encoding(
+                        Some(header_for_decode.as_str()),
+                        &decode_source,
+                        limits,
+                    )
+                    .map(|decoded| decoded.into_owned())
                 })
                 .await;
 
@@ -611,10 +619,8 @@ impl CompressionPlugin {
                     claimed,
                     "request decode owner changed within a sequential hook chain"
                 );
-                ctx.metadata.insert(
-                    "compression:request_encoding".to_string(),
-                    marker.clone(),
-                );
+                ctx.metadata
+                    .insert("compression:request_encoding".to_string(), marker.clone());
                 headers.remove("content-encoding");
                 headers.insert(
                     "x-ferrum-original-content-encoding".to_string(),
@@ -640,10 +646,8 @@ impl CompressionPlugin {
                     );
                     ctx.set_compression_staged_request_plaintext(decompressed);
                 }
-                ctx.metadata.insert(
-                    REQUEST_DECODED_METADATA_KEY.to_string(),
-                    marker,
-                );
+                ctx.metadata
+                    .insert(REQUEST_DECODED_METADATA_KEY.to_string(), marker);
 
                 PluginResult::Continue
             }
@@ -1600,9 +1604,7 @@ impl Plugin for CompressionPlugin {
                     let Ok(permit) = try_acquire_codec_permit() else {
                         // Saturation: do not commit Content-Encoding. Fall through
                         // to identity (or 406 when identity is unacceptable).
-                        warn!(
-                            "compression: codec admission saturated; serving identity response"
-                        );
+                        warn!("compression: codec admission saturated; serving identity response");
                         if accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0)
                             && Self::should_fail_closed_not_acceptable(ctx, on_rejection)
                         {

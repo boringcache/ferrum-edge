@@ -5064,10 +5064,7 @@ fn test_max_decompressed_request_size_hard_maximum_rejected() {
         "max_decompressed_request_size": over
     }))
     .expect_err("values above the hard maximum must fail admission");
-    assert!(
-        err.contains("hard maximum"),
-        "got: {err}"
-    );
+    assert!(err.contains("hard maximum"), "got: {err}");
 }
 
 #[test]
@@ -5131,7 +5128,13 @@ async fn test_high_ratio_amplification_aborts_early() {
         .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
         .await;
     assert!(
-        matches!(result, PluginResult::Reject { status_code: 400, .. }),
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 400,
+                ..
+            }
+        ),
         "high-ratio zip bombs must fail closed, got {result:?}"
     );
 }
@@ -5263,7 +5266,13 @@ async fn test_content_encoding_malformed_and_unsupported_fail_closed() {
         headers.insert("content-encoding".to_string(), ce.to_string());
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(
-            matches!(result, PluginResult::Reject { status_code: 400, .. }),
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 400,
+                    ..
+                }
+            ),
             "Content-Encoding '{ce}' must fail closed, got {result:?}"
         );
     }
@@ -5292,7 +5301,13 @@ async fn test_codec_admission_saturation_rejects_request_decode() {
             .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
             .await;
         assert!(
-            matches!(result, PluginResult::Reject { status_code: 503, .. }),
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 503,
+                    ..
+                }
+            ),
             "saturated codec budget must reject request decode, got {result:?}"
         );
         let after = compression_codec_metrics();
@@ -5343,10 +5358,7 @@ async fn test_request_fallback_stages_plaintext_before_header_strip() {
     ctx.request_body_bytes = Some(Bytes::from(compressed.clone()));
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
-    headers.insert(
-        "content-length".to_string(),
-        compressed.len().to_string(),
-    );
+    headers.insert("content-length".to_string(), compressed.len().to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue), "got {result:?}");
@@ -5355,8 +5367,7 @@ async fn test_request_fallback_stages_plaintext_before_header_strip() {
         "successful fallback decode must strip Content-Encoding"
     );
     assert!(
-        ctx.metadata
-            .contains_key("compression:request_decoded"),
+        ctx.metadata.contains_key("compression:request_decoded"),
         "fallback must mark the request as decoded"
     );
 
@@ -5389,7 +5400,10 @@ async fn test_response_encode_abort_restores_identity_representation() {
         plugin.after_proxy(&mut ctx, 200, &mut resp).await,
         PluginResult::Continue
     ));
-    assert_eq!(resp.get("content-encoding").map(String::as_str), Some("gzip"));
+    assert_eq!(
+        resp.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
 
     // Simulate a missing permit / encoder abort after Content-Encoding commit.
     let _ = take_compression_response_codec_permit_for_test(&mut ctx);
@@ -5413,8 +5427,8 @@ async fn test_response_encode_abort_restores_identity_representation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_codec_offload_allows_unrelated_async_progress() {
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     let plugin = make_plugin(json!({"min_content_length": 10, "gzip_level": 9}));
     let body = vec![b'a'; 64 * 1024];
@@ -5435,12 +5449,7 @@ async fn test_codec_offload_allows_unrelated_async_progress() {
 
     let encode = tokio::spawn(async move {
         plugin
-            .transform_response_body_with_context(
-                &mut ctx,
-                &body,
-                Some("application/json"),
-                &resp,
-            )
+            .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &resp)
             .await
     });
 
@@ -5501,11 +5510,16 @@ fn test_shared_paths_reconcile_aborted_gateway_encoding() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
     let h3 = include_str!("../../../src/http3/cross_protocol.rs");
     assert!(
-        proxy.matches("reconcile_aborted_gateway_response_encoding").count() >= 2,
+        proxy
+            .matches("reconcile_aborted_gateway_response_encoding")
+            .count()
+            >= 2,
         "H1/H2 shared transform helpers must reconcile aborted gateway encodings"
     );
     assert!(
-        h3.matches("reconcile_aborted_gateway_response_encoding").count() >= 2,
+        h3.matches("reconcile_aborted_gateway_response_encoding")
+            .count()
+            >= 2,
         "H3 cross-protocol buffered transforms must reconcile aborted gateway encodings"
     );
 }

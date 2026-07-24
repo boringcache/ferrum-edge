@@ -137,7 +137,11 @@ pub fn decode_content_encoding<'a>(
             )?,
             _ => return Err(format!("unsupported content-encoding '{coding}'")),
         };
-        enforce_amplification(layer_input_len, decoded.len(), limits.max_amplification_ratio)?;
+        enforce_amplification(
+            layer_input_len,
+            decoded.len(),
+            limits.max_amplification_ratio,
+        )?;
         cumulative = cumulative
             .checked_add(decoded.len())
             .ok_or_else(|| "decoded content-encoding work overflowed".to_string())?;
