@@ -4644,7 +4644,9 @@ async fn large_finite_embedding_components_normalize_without_zero_collapse() {
     );
     let unit_norm = embedding
         .iter()
-        .fold(0.0_f64, |acc, value| acc + f64::from(*value) * f64::from(*value))
+        .fold(0.0_f64, |acc, value| {
+            acc + f64::from(*value) * f64::from(*value)
+        })
         .sqrt();
     assert!(
         (unit_norm - 1.0).abs() < 1.0e-4,
