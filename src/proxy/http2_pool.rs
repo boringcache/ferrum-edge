@@ -1311,6 +1311,68 @@ impl Http2PoolError {
     }
 }
 
+impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
+    fn from(err: crate::pool::SharedPoolCreateError) -> Self {
+        let message = err.message().to_string();
+        match err.kind() {
+            crate::pool::SharedPoolCreateKind::TimedOut => Self::BackendTimeout {
+                message: message.clone(),
+                source: Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    message,
+                )),
+            },
+            crate::pool::SharedPoolCreateKind::Internal => Self::Internal {
+                message: message.clone(),
+                source: Some(InternalSource::Message(message)),
+            },
+            crate::pool::SharedPoolCreateKind::NegotiatedHttp1 => Self::BackendSelectedHttp1 {
+                pool_key: err
+                    .detail()
+                    .unwrap_or(err.message())
+                    .to_string(),
+            },
+            crate::pool::SharedPoolCreateKind::Unavailable
+            | crate::pool::SharedPoolCreateKind::Other => Self::BackendUnavailable {
+                message,
+                source: None,
+            },
+        }
+    }
+}
+
+impl crate::pool::ShareablePoolCreateError for Http2PoolError {
+    fn to_shared(&self, generation: u64) -> crate::pool::SharedPoolCreateError {
+        use crate::pool::{SharedPoolCreateError, SharedPoolCreateKind};
+        match self {
+            Self::BackendSelectedHttp1 { pool_key } => SharedPoolCreateError::new(
+                self.message().to_string(),
+                SharedPoolCreateKind::NegotiatedHttp1,
+                generation,
+                Some(pool_key.clone()),
+            ),
+            Self::BackendTimeout { message, .. } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::TimedOut,
+                generation,
+                None,
+            ),
+            Self::Internal { message, .. } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::Internal,
+                generation,
+                None,
+            ),
+            Self::BackendUnavailable { message, .. } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::Unavailable,
+                generation,
+                None,
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Inline tests for private internals of the HTTP/2 connection pool.

@@ -1325,6 +1325,56 @@ impl std::error::Error for GrpcProxyError {
     }
 }
 
+impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
+    fn from(err: crate::pool::SharedPoolCreateError) -> Self {
+        let message = err.message().to_string();
+        match err.kind() {
+            crate::pool::SharedPoolCreateKind::TimedOut => Self::BackendTimeout {
+                // Pool create failures are connect-phase.
+                kind: GrpcTimeoutKind::Connect,
+                message,
+            },
+            crate::pool::SharedPoolCreateKind::Internal => Self::Internal(message),
+            // NegotiatedHttp1 is an H2-pool signal; gRPC create never emits it.
+            // Map conservatively to connect-unavailable so waiters still fail.
+            crate::pool::SharedPoolCreateKind::NegotiatedHttp1
+            | crate::pool::SharedPoolCreateKind::Unavailable
+            | crate::pool::SharedPoolCreateKind::Other => {
+                Self::backend_unavailable(GrpcBackendUnavailableKind::Connect, message)
+            }
+        }
+    }
+}
+
+impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
+    fn to_shared(&self, generation: u64) -> crate::pool::SharedPoolCreateError {
+        use crate::pool::{SharedPoolCreateError, SharedPoolCreateKind};
+        match self {
+            Self::BackendTimeout { message, .. } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::TimedOut,
+                generation,
+                None,
+            ),
+            Self::Internal(message) => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::Internal,
+                generation,
+                None,
+            ),
+            Self::BackendUnavailable { message, .. }
+            | Self::ClientDeadlineExceeded(message)
+            | Self::ResourceExhausted(message)
+            | Self::ResponseTooLarge(message) => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::Unavailable,
+                generation,
+                None,
+            ),
+        }
+    }
+}
+
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
     pub const UNKNOWN: u32 = 2;
