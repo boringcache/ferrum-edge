@@ -3255,11 +3255,12 @@ mod inner {
         // Consumer identity index maintenance
         // -------------------------------------------------------------------
 
-        /// Insert identity reservations for `values` inside a transaction.
-        /// A duplicate-key error is same-owner-adoptable when every conflicting
-        /// reservation already belongs to `consumer_id`; a different owner still
-        /// aborts the transaction. The E11000 message contains "duplicate key",
-        /// which the admin layer maps to HTTP 409.
+        /// Reserve identity docs for `values` inside a transaction using a
+        /// preflight read-then-insert protocol: every requested value is read
+        /// and validated BEFORE any potentially-aborting write, so stale
+        /// same-owner reservations are adopted without ever relying on reads or
+        /// repair writes after an E11000 in an already-failed transaction. See
+        /// [`Self::preflight_reserve_consumer_identity_docs_in_session`].
         async fn insert_consumer_identity_docs_in_session(
             &self,
             session: &mut ClientSession,
@@ -3270,21 +3271,95 @@ mod inner {
             if values.is_empty() {
                 return Ok(());
             }
-            match self
-                .consumer_identity_index()
-                .insert_many(consumer_identity_index_docs(namespace, consumer_id, values))
-                .session(&mut *session)
-                .await
-            {
-                Ok(_) => Ok(()),
-                Err(err) if is_duplicate_key(&err) => {
-                    self.ensure_consumer_identity_docs_owned_in_session(
-                        session, namespace, consumer_id, values,
-                    )
-                    .await
-                }
-                Err(err) => Err(err),
+            self.preflight_reserve_consumer_identity_docs_in_session(
+                session,
+                &consumer_identity_index_docs(namespace, consumer_id, values),
+            )
+            .await
+        }
+
+        /// Preflight-reserve a set of `consumer_identity_index` candidate docs
+        /// inside a transaction. Every candidate is read first — one batched
+        /// `_id` `$in` read using the transaction's own read concern — and
+        /// classified BEFORE any write:
+        ///   - a same-owner reservation is adopted (skipped);
+        ///   - a different-owner or malformed reservation fails closed as a
+        ///     duplicate-key conflict — the "duplicate key" text maps to HTTP
+        ///     409;
+        ///   - only preflight-absent candidates are inserted.
+        ///
+        /// A duplicate key on the insert of a preflight-absent candidate means
+        /// a concurrent writer committed the same reservation in the read→write
+        /// window (or two candidates in this batch collide on one identity
+        /// value). That aborts the transaction; the error is propagated WITHOUT
+        /// any further reads or repair writes — the session is no longer usable
+        /// and must never be treated as if it were. The convenient-transaction
+        /// runner retries the whole closure on the resulting transient write
+        /// conflict, and the retry's preflight then observes the now-committed
+        /// reservation and either adopts it or fails closed. There is
+        /// intentionally no post-E11000 recovery read/write in this
+        /// already-failed transaction.
+        async fn preflight_reserve_consumer_identity_docs_in_session(
+            &self,
+            session: &mut ClientSession,
+            candidates: &[Document],
+        ) -> mongodb::error::Result<()> {
+            if candidates.is_empty() {
+                return Ok(());
             }
+            // Batched preflight read of every candidate reservation's current
+            // owner, inside the transaction, before any write.
+            let mut ids: Vec<Bson> = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let doc_id = consumer_identity_field(candidate, "_id")?;
+                ids.push(Bson::String(doc_id.to_string()));
+            }
+            let mut existing_owners = std::collections::HashMap::<String, String>::new();
+            let mut cursor = self
+                .consumer_identity_index()
+                .find(doc! { "_id": { "$in": ids } })
+                .session(&mut *session)
+                .await?;
+            while cursor.advance(&mut *session).await? {
+                let existing = cursor.deserialize_current()?;
+                let doc_id = consumer_identity_field(&existing, "_id")?;
+                let owner = consumer_identity_field(&existing, "consumer_id")?;
+                existing_owners.insert(doc_id.to_string(), owner.to_string());
+            }
+            drop(cursor);
+
+            // Classify every candidate against the preflight snapshot. Only
+            // preflight-absent candidates are inserted; a different owner or a
+            // malformed reservation fails closed (409) with no write attempted.
+            let mut to_insert: Vec<Document> = Vec::new();
+            for candidate in candidates {
+                let doc_id = consumer_identity_field(candidate, "_id")?;
+                let consumer_id = consumer_identity_field(candidate, "consumer_id")?;
+                match existing_owners.get(doc_id) {
+                    Some(owner) => {
+                        if owner.as_str() != consumer_id {
+                            return Err(mongodb::error::Error::custom(format!(
+                                "E11000 duplicate key error: consumer identity reservation \
+                                 '{doc_id}' is reserved by consumer '{owner}'"
+                            )));
+                        }
+                        // Same owner ⇒ adopt the existing reservation.
+                    }
+                    None => to_insert.push(candidate.clone()),
+                }
+            }
+            if to_insert.is_empty() {
+                return Ok(());
+            }
+            // Insert ONLY preflight-absent reservations. A duplicate key here is
+            // a concurrent race in the read→write window (or an intra-batch
+            // collision): it aborts the transaction and is propagated as-is. Do
+            // not follow it with any session operation.
+            self.consumer_identity_index()
+                .insert_many(to_insert)
+                .session(&mut *session)
+                .await?;
+            Ok(())
         }
 
         /// Delete this consumer's reservations for specific identity values
@@ -3561,72 +3636,6 @@ mod inner {
                 }
             }
             Ok(newly_inserted)
-        }
-
-        /// Session/transaction variant of [`Self::ensure_consumer_identity_docs_owned`].
-        async fn ensure_consumer_identity_docs_owned_in_session(
-            &self,
-            session: &mut ClientSession,
-            namespace: &str,
-            consumer_id: &str,
-            values: &[String],
-        ) -> mongodb::error::Result<()> {
-            for value in values {
-                let doc_id = consumer_identity_doc_id(namespace, value);
-                match self
-                    .consumer_identity_index()
-                    .find_one(doc! { "_id": &doc_id })
-                    .session(&mut *session)
-                    .await?
-                {
-                    Some(existing) => {
-                        let owner = existing.get_str("consumer_id").map_err(|_| {
-                            mongodb::error::Error::custom(format!(
-                                "consumer_identity_index doc '{doc_id}' missing consumer_id"
-                            ))
-                        })?;
-                        if owner != consumer_id {
-                            return Err(mongodb::error::Error::custom(format!(
-                                "E11000 duplicate key error: identity value '{value}' in namespace \
-                                 '{namespace}' is reserved by consumer '{owner}'"
-                            )));
-                        }
-                    }
-                    None => {
-                        let doc = consumer_identity_index_doc(namespace, value, consumer_id);
-                        if let Err(err) = self
-                            .consumer_identity_index()
-                            .insert_one(doc)
-                            .session(&mut *session)
-                            .await
-                        {
-                            if !is_duplicate_key(&err) {
-                                return Err(err);
-                            }
-                            let Some(existing) = self
-                                .consumer_identity_index()
-                                .find_one(doc! { "_id": &doc_id })
-                                .session(&mut *session)
-                                .await?
-                            else {
-                                return Err(err);
-                            };
-                            let owner = existing.get_str("consumer_id").map_err(|_| {
-                                mongodb::error::Error::custom(format!(
-                                    "consumer_identity_index doc '{doc_id}' missing consumer_id"
-                                ))
-                            })?;
-                            if owner != consumer_id {
-                                return Err(mongodb::error::Error::custom(format!(
-                                    "E11000 duplicate key error: identity value '{value}' in \
-                                     namespace '{namespace}' is reserved by consumer '{owner}'"
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
         }
 
         // NOTE: There is intentionally NO startup/orphan reconcile that deletes
@@ -4147,6 +4156,21 @@ mod inner {
             .iter()
             .map(|value| consumer_identity_index_doc(namespace, value, consumer_id))
             .collect()
+    }
+
+    /// Extract a required string field from a `consumer_identity_index`
+    /// reservation candidate or stored document, mapping a missing or mistyped
+    /// field to a transaction error instead of panicking. Used by the
+    /// preflight replica-set reservation path.
+    fn consumer_identity_field<'a>(
+        doc: &'a Document,
+        field: &str,
+    ) -> mongodb::error::Result<&'a str> {
+        doc.get_str(field).map_err(|_| {
+            mongodb::error::Error::custom(format!(
+                "consumer_identity_index reservation doc missing field '{field}'"
+            ))
+        })
     }
 
     /// Failure from [`MongoStore::ensure_consumer_identity_docs_owned`] that
@@ -8152,52 +8176,22 @@ mod inner {
                         (self, docs, changes, identity_docs),
                         |s, (this, docs, changes, identity_docs)| {
                             Box::pin(async move {
-                                // Reserve the merged identity keyspace first.
-                                // Same-owner E11000 is adoptable; a different
-                                // owner aborts the transaction (409).
-                                if !identity_docs.is_empty() {
-                                    match this
-                                        .consumer_identity_index()
-                                        .insert_many(identity_docs.clone())
-                                        .session(&mut *s)
-                                        .await
-                                    {
-                                        Ok(_) => {}
-                                        Err(err) if is_duplicate_key(&err) => {
-                                            for doc in &identity_docs {
-                                                let namespace = doc.get_str("namespace").map_err(
-                                                    |_| {
-                                                        mongodb::error::Error::custom(
-                                                            "batch consumer identity reservation missing namespace",
-                                                        )
-                                                    },
-                                                )?;
-                                                let consumer_id = doc.get_str("consumer_id").map_err(
-                                                    |_| {
-                                                        mongodb::error::Error::custom(
-                                                            "batch consumer identity reservation missing consumer_id",
-                                                        )
-                                                    },
-                                                )?;
-                                                let identity_value = doc
-                                                    .get_str("identity_value")
-                                                    .map_err(|_| {
-                                                        mongodb::error::Error::custom(
-                                                            "batch consumer identity reservation missing identity_value",
-                                                        )
-                                                    })?;
-                                                this.ensure_consumer_identity_docs_owned_in_session(
-                                                    &mut *s,
-                                                    namespace,
-                                                    consumer_id,
-                                                    &[identity_value.to_string()],
-                                                )
-                                                .await?;
-                                            }
-                                        }
-                                        Err(err) => return Err(err),
-                                    }
-                                }
+                                // Reserve the merged identity keyspace with a
+                                // preflight read-then-insert (see
+                                // preflight_reserve_consumer_identity_docs_in_session):
+                                // every reservation is read and classified
+                                // BEFORE any write. Same-owner reservations are
+                                // adopted, a different owner or an intra-batch
+                                // collision fails closed (409), and only
+                                // preflight-absent reservations are inserted.
+                                // No post-E11000 recovery runs in this
+                                // transaction — a duplicate on the insert aborts
+                                // it and the runner retries the closure.
+                                this.preflight_reserve_consumer_identity_docs_in_session(
+                                    &mut *s,
+                                    identity_docs.as_slice(),
+                                )
+                                .await?;
                                 let result = this
                                     .consumers()
                                     .insert_many(docs.clone())

@@ -541,10 +541,52 @@ fn consumer_identity_reserve_paths_adopt_same_owner_on_duplicate_key() {
         "ensure must fail closed (409 duplicate-key) when a different owner holds the reservation"
     );
 
+    // Replica-set reserve is preflight-first: the in-session wrapper delegates
+    // to the preflight helper and never inserts-then-recovers after an E11000.
     let session = mongo_method("insert_consumer_identity_docs_in_session(");
     assert!(
-        session.contains("ensure_consumer_identity_docs_owned_in_session"),
-        "replica-set reserve must same-owner-adopt on E11000"
+        session.contains("preflight_reserve_consumer_identity_docs_in_session"),
+        "replica-set reserve must delegate to the preflight read-then-insert helper"
+    );
+    assert!(
+        !session.contains("ensure_consumer_identity_docs_owned_in_session")
+            && !session.contains(".insert_many("),
+        "replica-set reserve wrapper must not insert-then-recover inside the transaction"
+    );
+
+    // The preflight helper reads and classifies every candidate BEFORE any
+    // write, fails closed on a different owner, and never recovers after an
+    // in-transaction E11000 (the aborted session is not reused).
+    let preflight = mongo_method("preflight_reserve_consumer_identity_docs_in_session(");
+    let read = preflight
+        .find("\"$in\": ids")
+        .expect("preflight must batch-read candidate reservations first");
+    let insert = preflight
+        .find("insert_many(to_insert)")
+        .expect("preflight must insert only preflight-absent candidates");
+    assert!(
+        read < insert,
+        "preflight read must precede the reservation insert (read-then-insert)"
+    );
+    assert!(
+        preflight.contains("!= consumer_id") && preflight.contains("duplicate key error"),
+        "preflight must fail closed (409 duplicate-key) for a different-owner reservation"
+    );
+    assert!(
+        !preflight.contains("ensure_consumer_identity_docs_owned"),
+        "preflight must not run post-E11000 session recovery"
+    );
+
+    // The replica-set batch create must also preflight-reserve — no
+    // insert-then-recover inside the transaction.
+    let batch_method = mongo_method("batch_create_consumers(");
+    assert!(
+        batch_method.contains("preflight_reserve_consumer_identity_docs_in_session"),
+        "replica-set batch create must preflight-reserve the identity keyspace"
+    );
+    assert!(
+        !batch_method.contains("ensure_consumer_identity_docs_owned_in_session"),
+        "replica-set batch create must not recover after an in-transaction E11000"
     );
 
     let create = mongo_method("create_consumer(");
