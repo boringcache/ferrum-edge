@@ -957,6 +957,15 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
     }
 
+    /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
+    /// request-time fallback computes)`. Cached nodes are filled once per
+    /// registered schema during ConversionPlan compile (#3024).
+    pub fn openapi_validator_schema_type_cache_stats_for_test(
+        plugin: &crate::plugins::openapi_validator::OpenapiValidator,
+    ) -> (usize, usize) {
+        plugin.schema_type_cache_stats_for_test()
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
