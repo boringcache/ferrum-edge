@@ -46,10 +46,10 @@ use super::configsync_lifecycle::{
     authoritative_snapshot_payload_matches, check_peer_version_compatibility,
     connection_error_outcome, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, full_snapshot_stream_disposition,
-    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep,
-    reconcile_snapshot_version, record_applied_gateway_trust,
-    resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
-    snapshot_failure_stream_disposition, stale_reject_from_reconcile,
+    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, reconcile_snapshot_version,
+    record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
+    resource_delta_advances_authority, snapshot_failure_stream_disposition,
+    stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
@@ -2232,10 +2232,7 @@ mod tests {
     fn parse_gateway_trust_bundle_update_rejects_unparseable_json_fail_closed() {
         let err = parse_gateway_trust_bundle_update("{not-json")
             .expect_err("malformed trust side-channel must fail closed");
-        assert!(
-            err.contains("not valid JSON"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("not valid JSON"), "unexpected error: {err}");
     }
 
     fn proxy_in_namespace(id: &str, ns: &str) -> crate::config::types::Proxy {

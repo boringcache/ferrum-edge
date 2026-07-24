@@ -26,9 +26,9 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     evaluate_delta_against_subscription_base, evaluate_full_snapshot_authority,
     failure_backoff_sequence, full_snapshot_stream_disposition, gateway_config_content_matches,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, monotonic_watermark,
-    reconcile_snapshot_version, record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
-    resource_delta_advances_authority, silence_exceeds_liveness, snapshot_failure_stream_disposition,
-    stale_reject_from_reconcile,
+    reconcile_snapshot_version, record_applied_gateway_trust,
+    resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
+    silence_exceeds_liveness, snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, check_cp_version_compatibility, configure_configsync_endpoint,
