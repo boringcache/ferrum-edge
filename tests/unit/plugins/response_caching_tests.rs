@@ -184,7 +184,7 @@ async fn replace_cached_response(
 /// Serialize against RTDS runtime-overlay publications.
 ///
 /// `response_caching` stamps every stored entry with the live response-side
-/// runtime-overlay gate fingerprint and retires entries whose stamp no longer
+/// runtime-overlay gate publication and retires entries whose stamp no longer
 /// matches, so an overlay publication in a concurrently running test would
 /// legitimately turn a HIT into a MISS. Every test that stores an entry and
 /// then asserts a HIT/REVALIDATED replay takes this process-wide lock, which

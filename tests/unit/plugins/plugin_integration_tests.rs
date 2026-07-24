@@ -176,7 +176,7 @@ async fn run_buffered_request_lifecycle(
 /// Serialize against RTDS runtime-overlay publications.
 ///
 /// `response_caching` stamps every stored entry with the live response-side
-/// runtime-overlay gate fingerprint and retires entries whose stamp no longer
+/// runtime-overlay gate publication and retires entries whose stamp no longer
 /// matches, so an overlay publication in a concurrently running test would
 /// legitimately turn a HIT into a MISS. Every test that stores an entry and
 /// then asserts a HIT/REVALIDATED replay takes this process-wide lock, which
@@ -750,6 +750,71 @@ mod runtime_overlay_cache_provenance {
             .expect("expected a finalized rejection")
     }
 
+    /// Complete the buffered response phases after [`lookup`] already ran.
+    ///
+    /// Used to place a real RTDS publication between request-side cache lookup
+    /// and response-side transforms/store without invoking `before_proxy`
+    /// twice.
+    pub(super) async fn finish_origin_after_lookup(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut RequestContext,
+        response_status: u16,
+        mut response_headers: HashMap<String, String>,
+        mut response_body: Vec<u8>,
+    ) -> (HashMap<String, String>, Vec<u8>) {
+        for plugin in plugins {
+            assert!(matches!(
+                plugin
+                    .after_proxy(ctx, response_status, &mut response_headers)
+                    .await,
+                PluginResult::Continue
+            ));
+        }
+        for plugin in plugins {
+            assert!(matches!(
+                plugin
+                    .on_response_body(
+                        ctx,
+                        response_status,
+                        &mut response_headers,
+                        &response_body,
+                    )
+                    .await,
+                PluginResult::Continue
+            ));
+        }
+        let content_type = response_headers.get("content-type").cloned();
+        for plugin in plugins {
+            if let Some(transformed) = plugin
+                .transform_response_body_with_context(
+                    ctx,
+                    &response_body,
+                    content_type.as_deref(),
+                    &response_headers,
+                )
+                .await
+            {
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                response_body = transformed;
+            }
+        }
+        for plugin in plugins {
+            assert!(matches!(
+                plugin
+                    .on_final_response_body(
+                        ctx,
+                        response_status,
+                        &response_headers,
+                        &response_body,
+                    )
+                    .await,
+                PluginResult::Continue
+            ));
+        }
+        (response_headers, response_body)
+    }
+
     pub(super) fn origin_headers(extra: &[(&str, &str)]) -> HashMap<String, String> {
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
@@ -904,8 +969,9 @@ async fn test_response_cache_hit_under_unchanged_gate_skips_non_idempotent_trans
         r#"{"b":"origin","a":"second"}"#
     );
 
-    // No publication between store and replay: the gated rules must NOT run a
-    // second time over the finalized representation.
+    // Reapplying the identical live map is a publication no-op: the gated rules
+    // must NOT run a second time over the finalized representation.
+    harness::publish_gate(scope, true);
     let mut hit_ctx = create_response_context(path);
     let hit = harness::lookup(&plugins, &mut hit_ctx)
         .await
@@ -930,6 +996,55 @@ async fn test_response_cache_hit_under_unchanged_gate_skips_non_idempotent_trans
         headers.get("x-a").map(String::as_str),
         Some("second"),
         "a second `add` pass would have appended another `x-a` value"
+    );
+
+    harness::reset_gates();
+}
+
+/// A request that crosses a real gate publication can be transformed under a
+/// different policy than the one pinned at lookup. Those bytes have no stable
+/// replay provenance and must not be inserted into the cache.
+#[tokio::test]
+async fn test_response_cache_drops_store_when_gate_changes_mid_request() {
+    use self::runtime_overlay_cache_provenance as harness;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_mid_request";
+    let plugins = harness::plugins_with_gated_transformer(
+        scope,
+        json!([
+            {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"}
+        ]),
+    );
+    let path = "/cache-provenance-mid-request";
+
+    let mut request_ctx = create_response_context(path);
+    assert!(
+        harness::lookup(&plugins, &mut request_ctx).await.is_none(),
+        "initial request must miss and pin the disabled gate publication"
+    );
+
+    harness::publish_gate(scope, true);
+    let (_, body) = harness::finish_origin_after_lookup(
+        &plugins,
+        &mut request_ctx,
+        200,
+        harness::origin_headers(&[]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"[redacted]"}"#,
+        "the in-flight response should still obey the newly live gate"
+    );
+
+    let mut next_ctx = create_response_context(path);
+    assert!(
+        harness::lookup(&plugins, &mut next_ctx).await.is_none(),
+        "a response that straddled a gate publication must not be cached"
     );
 
     harness::reset_gates();

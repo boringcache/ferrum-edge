@@ -127,6 +127,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use self::utils::runtime_bool_gate::GatePolicyStamp;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, Proxy,
     ResolvedPortOverride, RetryConfig, Upstream, UpstreamTarget,
@@ -1600,51 +1601,6 @@ pub(crate) struct WafInstanceScoreState {
     pub(crate) score: u32,
 }
 
-/// Provenance of the response-side runtime-overlay gate map, pinned once per
-/// request by `RequestContext::pin_response_policy_stamp`.
-///
-/// `response_transformer`'s `runtime_overlay_scope` gates decide whether
-/// client-visible header/body rules run, and they can flip without a config
-/// reload. A cached representation is therefore only replayable — with
-/// presentation transforms skipped, as `finalized_response_replay` requires —
-/// while the gate map that produced it is still live. Both fields are opaque
-/// counters: they carry no rule, header, or body content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResponsePolicyStamp {
-    /// Content digest of the live gate map. Equal digests mean equal gate
-    /// decisions, so an entry stamped with it was produced under exactly the
-    /// policy in force now — including after a disable/enable cycle that
-    /// restored an identical map.
-    fingerprint: u64,
-    /// Publication epoch observed while pinning, used only to detect a
-    /// publication landing mid-request (which a digest alone cannot see across
-    /// an A→B→A sequence).
-    epoch: u64,
-}
-
-impl ResponsePolicyStamp {
-    /// Read the live provenance.
-    ///
-    /// Epoch is read **before** the fingerprint on purpose. Publication stores
-    /// the fingerprint and then bumps the epoch, so this order can only skew
-    /// toward (old epoch, new fingerprint) — which makes a mid-request
-    /// publication look unstable and drops the store. The opposite order could
-    /// yield (new epoch, old fingerprint) and stamp a representation shaped by
-    /// the new policy as if it were the old one.
-    fn current() -> Self {
-        let epoch = response_transformer::runtime_overlay::publication_epoch();
-        Self {
-            fingerprint: response_transformer::runtime_overlay::policy_fingerprint(),
-            epoch,
-        }
-    }
-
-    /// Opaque digest suitable for stamping a stored representation.
-    pub(crate) fn fingerprint(self) -> u64 {
-        self.fingerprint
-    }
-}
-
 /// Exclusive compression codec admission permit held on a request context.
 ///
 /// Clones are empty so `RequestContext`'s derived `Clone` stays valid: the
@@ -1947,7 +1903,7 @@ pub struct RequestContext {
     /// and unrelated synthetic short-circuits cannot opt into the skip.
     pub(crate) finalized_response_replay: bool,
     /// Response-side runtime-overlay gate provenance, pinned once for this
-    /// request (see [`ResponsePolicyStamp`]).
+    /// request (see [`GatePolicyStamp`]).
     ///
     /// Plugins that persist a client-visible representation across requests
     /// (today `response_caching`) stamp this value onto the stored entry and
@@ -1956,7 +1912,7 @@ pub struct RequestContext {
     /// replayed under another. Pinning once per request — rather than reading
     /// the gates again at storage time — is what makes the stamp provenance
     /// rather than a guess. Kept private so request metadata cannot forge one.
-    pub(crate) response_policy_stamp: Option<ResponsePolicyStamp>,
+    pub(crate) response_policy_stamp: Option<GatePolicyStamp>,
     /// Deduplication instances whose in-flight ownership can be released after
     /// a serverless rejection proven to occur before external invocation. Each
     /// committed hook consumes only its own entry, preserving exactly-once
@@ -3183,7 +3139,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
             finalized_response_replay: self.finalized_response_replay,
-            response_policy_stamp: self.response_policy_stamp,
+            response_policy_stamp: self.response_policy_stamp.clone(),
             serverless_pre_invocation_rejection_owners: self
                 .serverless_pre_invocation_rejection_owners
                 .clone(),
@@ -3281,13 +3237,13 @@ impl RequestContext {
 
     /// Pin (once) and return this request's response-side policy stamp.
     ///
-    /// Two atomic loads on first call, then a memoized copy. Callers pin as
-    /// early as possible on the request path so the pinned value covers every
-    /// gate read the response pipeline will later perform.
-    pub(crate) fn pin_response_policy_stamp(&mut self) -> ResponsePolicyStamp {
-        *self
+    /// One ArcSwap load on first call, then a memoized opaque identity. Callers
+    /// pin as early as possible on the request path so the pinned value covers
+    /// every gate read the response pipeline will later perform.
+    pub(crate) fn pin_response_policy_stamp(&mut self) -> &GatePolicyStamp {
+        self
             .response_policy_stamp
-            .get_or_insert_with(ResponsePolicyStamp::current)
+            .get_or_insert_with(response_transformer::runtime_overlay::policy_stamp)
     }
 
     /// Whether no response-side gate publication happened since this request
@@ -3298,8 +3254,8 @@ impl RequestContext {
     /// representation produced by this request has unprovable provenance and
     /// must not be persisted for later replay.
     pub(crate) fn response_policy_stamp_stable(&mut self) -> bool {
-        self.pin_response_policy_stamp().epoch
-            == response_transformer::runtime_overlay::publication_epoch()
+        let current = response_transformer::runtime_overlay::policy_stamp();
+        self.pin_response_policy_stamp() == &current
     }
 
     pub(crate) fn ensure_waf_metadata_initialized(&mut self) {

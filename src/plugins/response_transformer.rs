@@ -46,10 +46,10 @@
 //! plugin does not try to detect that from the replay path: a finalized replay
 //! carries no evidence of which policy shaped it, and re-running rules on a
 //! guess would double-apply non-idempotent `add` sequences. Instead
-//! `response_caching` stamps every stored entry with the response-side gate
-//! fingerprint it observed (`runtime_overlay::policy_fingerprint`, pinned by
+//! `response_caching` stamps every stored entry with the opaque identity paired
+//! atomically with the response-side gate map (pinned by
 //! `RequestContext::pin_response_policy_stamp`) and refetches from the origin
-//! when that fingerprint no longer matches, so newly enabled redaction applies
+//! when that identity no longer matches, so newly enabled redaction applies
 //! exactly once. The unconditional `finalized_response_replay` skip below
 //! therefore stays intact.
 //!
