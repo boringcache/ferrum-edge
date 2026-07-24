@@ -7034,7 +7034,10 @@ async fn test_cluster_endpoint_dp_mode_connected() {
     assert!(body["control_plane"]["last_config_received_at"].is_string());
     assert_eq!(body["control_plane"]["config_diverged"], false);
     assert!(body["control_plane"]["config_diverged_since"].is_null());
-    assert_eq!(body["control_plane"]["config_divergence_recoveries_total"], 0);
+    assert_eq!(
+        body["control_plane"]["config_divergence_recoveries_total"],
+        0
+    );
 }
 
 #[tokio::test]
@@ -7085,7 +7088,10 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
     assert!(body["control_plane"]["connected_since"].is_null());
     assert!(body["control_plane"]["last_config_received_at"].is_null());
     assert_eq!(body["control_plane"]["config_diverged"], false);
-    assert_eq!(body["control_plane"]["config_divergence_recoveries_total"], 0);
+    assert_eq!(
+        body["control_plane"]["config_divergence_recoveries_total"],
+        0
+    );
 }
 
 #[tokio::test]

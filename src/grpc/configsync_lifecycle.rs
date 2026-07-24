@@ -6,11 +6,14 @@
 //! delta-rejection divergence, and connection-state staleness preservation
 //! without standing up a CP.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use semver::Version;
+use serde_json::Value;
 
+use crate::config::types::GatewayConfig;
 use crate::util::backoff::{BACKOFF_INITIAL_SECS, BACKOFF_MAX_SECS, next_backoff_secs};
 
 /// HTTP/2 PING interval on the DP→CP ConfigSync channel.
@@ -108,6 +111,49 @@ pub fn monotonic_watermark(
     }
 }
 
+/// Compare two gateway snapshots by their effective serialized content.
+///
+/// CP-local `loaded_at` stamps are deliberately excluded: independently
+/// polling CPs can produce identical snapshots with different timestamps.
+/// Object keys are canonicalized recursively so map insertion order cannot
+/// create a false mismatch; array order remains significant.
+pub fn gateway_config_content_matches(
+    current: &GatewayConfig,
+    incoming: &GatewayConfig,
+) -> bool {
+    let (Ok(mut current), Ok(mut incoming)) = (
+        serde_json::to_value(current),
+        serde_json::to_value(incoming),
+    ) else {
+        return false;
+    };
+    let Value::Object(current_object) = &mut current else {
+        return false;
+    };
+    let Value::Object(incoming_object) = &mut incoming else {
+        return false;
+    };
+    current_object.remove("loaded_at");
+    incoming_object.remove("loaded_at");
+    canonical_json_value(current) == canonical_json_value(incoming)
+}
+
+fn canonical_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: BTreeMap<String, Value> = map
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json_value(value)))
+                .collect();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(canonical_json_value).collect())
+        }
+        other => other,
+    }
+}
+
 /// Advance (or establish) freshness authority from a timestamp actually
 /// committed into active config (full snapshot `loaded_at` or accepted
 /// resource-delta `poll_timestamp` / resulting `loaded_at`).
@@ -151,7 +197,10 @@ pub fn resource_delta_advances_authority(accepted: bool, was_empty: bool) -> boo
 /// - Same-source snapshots are always accepted (reconnect / recovery). The
 ///   recorded watermark stays monotonic even when the recovery body is older.
 /// - Cross-source failover snapshots are fenced when a parseable applied
-///   authority exists and the incoming committed stamp is strictly older.
+///   authority exists and the incoming committed stamp is strictly older,
+///   unless the incoming snapshot's effective content matches the applied
+///   snapshot exactly. Equivalent content establishes a safe delta base while
+///   the recorded watermark stays monotonic.
 /// - With no applied authority (first snapshot) or an authority whose own
 ///   version is unknown, there is nothing to fence against, so the snapshot is
 ///   accepted and its committed stamp adopted.
@@ -159,30 +208,28 @@ pub fn evaluate_full_snapshot_authority(
     authority: Option<&AppliedSnapshotAuthority>,
     incoming_committed: DateTime<Utc>,
     source_cp_url: &str,
+    incoming_matches_applied_config: bool,
 ) -> Result<DateTime<Utc>, StaleSnapshotReject> {
     let Some(authority) = authority else {
         return Ok(incoming_committed);
     };
 
     if authority.source_cp_url == source_cp_url {
-        return Ok(monotonic_watermark(
-            authority.version,
-            incoming_committed,
-        ));
+        return Ok(monotonic_watermark(authority.version, incoming_committed));
     }
 
     let Some(applied) = authority.version else {
         return Ok(incoming_committed);
     };
 
-    if incoming_committed < applied {
+    if incoming_committed < applied && !incoming_matches_applied_config {
         return Err(StaleSnapshotReject::OlderThanApplied {
             applied,
             incoming: incoming_committed,
         });
     }
 
-    Ok(incoming_committed)
+    Ok(monotonic_watermark(Some(applied), incoming_committed))
 }
 
 /// How the ConfigSync stream must react to an incoming FULL_SNAPSHOT.
@@ -206,8 +253,14 @@ pub fn full_snapshot_stream_disposition(
     authority: Option<&AppliedSnapshotAuthority>,
     incoming_committed: DateTime<Utc>,
     source_cp_url: &str,
+    incoming_matches_applied_config: bool,
 ) -> FullSnapshotStreamDisposition {
-    match evaluate_full_snapshot_authority(authority, incoming_committed, source_cp_url) {
+    match evaluate_full_snapshot_authority(
+        authority,
+        incoming_committed,
+        source_cp_url,
+        incoming_matches_applied_config,
+    ) {
         Ok(version) => FullSnapshotStreamDisposition::Apply { version },
         Err(reject) => FullSnapshotStreamDisposition::RefuseAndTerminate(reject),
     }
@@ -265,7 +318,9 @@ pub struct SubscriptionApplyState {
 impl SubscriptionApplyState {
     /// Every new ConfigSync subscription starts without a committed base.
     pub fn new() -> Self {
-        Self { base_applied: false }
+        Self {
+            base_applied: false,
+        }
     }
 
     /// Record that a FULL_SNAPSHOT was successfully accepted on this stream.

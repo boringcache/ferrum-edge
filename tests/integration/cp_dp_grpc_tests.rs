@@ -21,9 +21,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
-use ferrum_edge::grpc::dp_client::{
-    self, DpCpConnectionState, DpGrpcTlsConfig, GrpcJwtSecret,
-};
+use ferrum_edge::grpc::dp_client::{self, DpCpConnectionState, DpGrpcTlsConfig, GrpcJwtSecret};
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{

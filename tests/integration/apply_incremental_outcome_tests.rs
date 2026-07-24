@@ -2284,9 +2284,12 @@ async fn apply_incremental_plugin_config_upsert_keys_include_namespace() {
             .iter()
             .any(|pc| pc.namespace == "prod" && pc.id == "shared-pc" && pc.enabled)
     );
-    assert!(config.plugin_configs.iter().any(|pc| {
-        pc.namespace == "staging" && pc.id == "shared-pc" && !pc.enabled
-    }));
+    assert!(
+        config
+            .plugin_configs
+            .iter()
+            .any(|pc| pc.namespace == "staging" && pc.id == "shared-pc" && !pc.enabled)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

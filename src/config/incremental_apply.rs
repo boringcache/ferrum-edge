@@ -45,9 +45,9 @@ fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalRe
         .map(|key| (key.namespace.as_str(), key.id.as_str()))
         .collect();
 
-    config.proxies.retain(|proxy| {
-        !removed_proxies.contains(&(proxy.namespace.as_str(), proxy.id.as_str()))
-    });
+    config
+        .proxies
+        .retain(|proxy| !removed_proxies.contains(&(proxy.namespace.as_str(), proxy.id.as_str())));
     config.consumers.retain(|consumer| {
         !removed_consumers.contains(&(consumer.namespace.as_str(), consumer.id.as_str()))
     });
@@ -115,10 +115,7 @@ fn upsert_by_namespace_and_id<T, FNs, FId>(
         .collect();
 
     for item in updates {
-        let key = (
-            get_namespace(&item).to_string(),
-            get_id(&item).to_string(),
-        );
+        let key = (get_namespace(&item).to_string(), get_id(&item).to_string());
         if let Some(&pos) = index.get(&key) {
             existing[pos] = item;
         } else {

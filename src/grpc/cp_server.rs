@@ -698,17 +698,14 @@ impl CpGrpcServer {
     pub(crate) fn check_version_compatibility(dp_version: &str) -> Result<(), Status> {
         use crate::grpc::configsync_lifecycle::check_peer_version_compatibility;
 
-        check_peer_version_compatibility(FERRUM_VERSION, dp_version).map_err(|err| {
-            Status::failed_precondition(err.message("CP", "DP", FERRUM_VERSION))
-        })?;
+        check_peer_version_compatibility(FERRUM_VERSION, dp_version)
+            .map_err(|err| Status::failed_precondition(err.message("CP", "DP", FERRUM_VERSION)))?;
 
         // Log patch-only differences for operators (still compatible).
         if let (Ok(local), Ok(peer)) = (
             semver::Version::parse(FERRUM_VERSION),
             semver::Version::parse(dp_version),
-        ) && (local.patch != peer.patch
-            || local.pre != peer.pre
-            || local.build != peer.build)
+        ) && (local.patch != peer.patch || local.pre != peer.pre || local.build != peer.build)
         {
             info!(
                 "DP v{} connected to CP v{} (patch/prerelease difference OK)",
@@ -2020,7 +2017,7 @@ mod tests {
     #[test]
     fn version_check_different_major_rejected() {
         let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
-        if parts.len() >= 1 {
+        if !parts.is_empty() {
             let major: u64 = parts[0].parse().unwrap_or(0);
             let modified = format!("{}.0.0", major + 1);
             let result = CpGrpcServer::check_version_compatibility(&modified);

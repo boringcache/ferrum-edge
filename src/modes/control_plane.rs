@@ -1201,9 +1201,7 @@ pub async fn run(
                 .http2_max_pending_accept_reset_streams(Some(
                     grpc_http2_max_pending_accept_reset_streams,
                 ))
-                .http2_max_local_error_reset_streams(Some(
-                    grpc_http2_max_local_error_reset_streams,
-                ))
+                .http2_max_local_error_reset_streams(Some(grpc_http2_max_local_error_reset_streams))
                 .http2_keepalive_interval(Some(std::time::Duration::from_secs(
                     crate::grpc::configsync_lifecycle::CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
                 )))

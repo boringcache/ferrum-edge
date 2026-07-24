@@ -44,8 +44,8 @@ use super::configsync_lifecycle::{
     SnapshotFailureStreamDisposition, SubscriptionApplyState, advance_authority_from_committed,
     advance_multi_cp_backoff, check_peer_version_compatibility, connection_error_outcome,
     delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
-    full_snapshot_stream_disposition, grow_backoff_after_failure_sleep,
-    reconcile_snapshot_version, resource_delta_advances_authority,
+    full_snapshot_stream_disposition, gateway_config_content_matches,
+    grow_backoff_after_failure_sleep, reconcile_snapshot_version, resource_delta_advances_authority,
     snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
@@ -1167,9 +1167,7 @@ pub fn configure_configsync_endpoint(endpoint: Endpoint) -> Endpoint {
         .http2_keep_alive_interval(Duration::from_secs(
             CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
         ))
-        .keep_alive_timeout(Duration::from_secs(
-            CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS,
-        ))
+        .keep_alive_timeout(Duration::from_secs(CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS))
         .keep_alive_while_idle(true)
         .tcp_keepalive(Some(Duration::from_secs(CONFIGSYNC_TCP_KEEPALIVE_SECS)))
 }
@@ -1531,6 +1529,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     snapshot_authority.as_ref(),
                     committed,
                     cp_url,
+                    gateway_config_content_matches(proxy_state.current_config().as_ref(), &config),
                 ) {
                     FullSnapshotStreamDisposition::Apply { version } => version,
                     FullSnapshotStreamDisposition::RefuseAndTerminate(reason) => {
@@ -1559,10 +1558,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             cp_frontend_tls_materialized.as_ref(),
                         )
                         .await;
-                        apply_gateway_trust_bundle_update(
-                            proxy_state,
-                            gateway_trust_bundle_update,
-                        );
+                        apply_gateway_trust_bundle_update(proxy_state, gateway_trust_bundle_update);
                         update_state_config_received(connection_state);
                         received_config = true;
                         // Watermark is the monotonic value from fencing policy
@@ -1811,9 +1807,8 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     Err(e) => {
                         // Parse failure is unclassifiable — fail closed (issue #2394).
                         error!("Failed to parse delta update: {}", e);
-                        let _ = delta_rejection_stream_disposition(
-                            DeltaRejectionKind::ParseFailure,
-                        );
+                        let _ =
+                            delta_rejection_stream_disposition(DeltaRejectionKind::ParseFailure);
                         update_state_config_diverged(connection_state, divergence_metrics);
                         return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
                     }
@@ -1983,9 +1978,8 @@ fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &s
 /// (issue #2395). See [`check_peer_version_compatibility`] for the prerelease
 /// policy.
 pub fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
-    check_peer_version_compatibility(FERRUM_VERSION, cp_version).map_err(|err| {
-        err.message("DP", "CP", FERRUM_VERSION)
-    })
+    check_peer_version_compatibility(FERRUM_VERSION, cp_version)
+        .map_err(|err| err.message("DP", "CP", FERRUM_VERSION))
 }
 
 #[cfg(test)]

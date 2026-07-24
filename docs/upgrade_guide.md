@@ -273,6 +273,16 @@ You can verify versions via the authenticated `GET /admin/metrics` endpoint on a
 
 Always upgrade in this order: **CP first, then DPs.** The CP manages the database and schema migrations. DPs are stateless proxies that receive config via gRPC. Version negotiation ensures that if you forget to upgrade a DP, it will refuse the incompatible config rather than silently applying a partial parse.
 
+During a patch-level mixed-version rollout, ConfigSync heartbeats are
+operationally safe but can be noisy because heartbeat capability is not
+negotiated separately. An older DP connected to a newer CP can reject and log
+the newer empty heartbeat envelope as an unusable snapshot. A newer DP
+connected to an older CP receives no application heartbeat and can reconnect
+after the 150-second silence bound even though transport keepalive remains
+healthy. In both directions the DP keeps serving its last-known-good config.
+Complete the CP-first, then DP rollout promptly rather than leaving patch
+versions mixed indefinitely.
+
 ### Step-by-Step
 
 #### 1. Backup the CP Database
