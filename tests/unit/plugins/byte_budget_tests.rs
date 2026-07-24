@@ -46,8 +46,8 @@ fn admit_byte_limits_defaults_and_bounds() {
 
 #[test]
 fn byte_budget_reserves_before_serialize_and_rejects_oversize() {
-    let budget = ByteBudget::new("probe", 64);
-    let held = budget.try_acquire(64).expect("fill budget");
+    let budget = ByteBudget::new("probe", 256);
+    let held = budget.try_acquire(256).expect("fill budget");
     let rejected = serialize_under_byte_budget(&budget, 64, &json!({"k": "v"}));
     assert!(rejected.is_none(), "saturated budget must reject before retain");
     assert!(budget.drops_total() > 0);
@@ -57,7 +57,7 @@ fn byte_budget_reserves_before_serialize_and_rejects_oversize() {
     let admitted = serialize_under_byte_budget(&budget, 64, &json!({"k": "v"}))
         .expect("admission after release");
     assert!(admitted.len() <= 64);
-    assert_eq!(budget.used(), admitted.len());
+    assert_eq!(budget.used(), (admitted.len() + 1) * 2);
     drop(admitted);
     assert_eq!(budget.used(), 0);
 }

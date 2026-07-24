@@ -683,29 +683,32 @@ struct QueuedChargeEvent {
 }
 
 enum SpoolJob {
-    Events(Vec<ChargeEvent>),
+    Events(Vec<QueuedChargeEvent>),
 }
 
 /// Bounded async handoff for spool compression/write/fsync work.
 struct SpoolDelivery {
     sender: mpsc::Sender<SpoolJob>,
     worker: Arc<DeliveryWorkerControl>,
-    pending: Arc<AtomicUsize>,
+    pending_jobs: Arc<AtomicUsize>,
+    pending_events: Arc<AtomicUsize>,
     metrics: Arc<SinkMetrics>,
 }
 
 impl SpoolDelivery {
-    fn try_enqueue(&self, events: Vec<ChargeEvent>, _reason: &'static str) -> bool {
+    fn try_enqueue(&self, events: Vec<QueuedChargeEvent>, _reason: &'static str) -> bool {
         if events.is_empty() {
             return true;
         }
-        let event_count = events.len() as u64;
+        let event_count = events.len();
         let Some(_admission) = self.worker.try_admit() else {
             self.metrics
-                .record_spool_job_loss(event_count, "worker unavailable during shutdown");
+                .record_spool_job_loss(event_count as u64, "worker unavailable during shutdown");
             return false;
         };
-        self.pending.fetch_add(1, Ordering::Relaxed);
+        self.pending_jobs.fetch_add(1, Ordering::Relaxed);
+        self.pending_events
+            .fetch_add(event_count, Ordering::Relaxed);
         match self.sender.try_send(SpoolJob::Events(events)) {
             Ok(()) => {
                 self.metrics
@@ -714,22 +717,26 @@ impl SpoolDelivery {
                 true
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.pending.fetch_sub(1, Ordering::Relaxed);
+                self.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+                self.pending_events
+                    .fetch_sub(event_count, Ordering::Relaxed);
                 self.metrics
-                    .record_spool_job_loss(event_count, "delivery queue full");
+                    .record_spool_job_loss(event_count as u64, "delivery queue full");
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.pending.fetch_sub(1, Ordering::Relaxed);
+                self.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+                self.pending_events
+                    .fetch_sub(event_count, Ordering::Relaxed);
                 self.metrics
-                    .record_spool_job_loss(event_count, "delivery queue closed");
+                    .record_spool_job_loss(event_count as u64, "delivery queue closed");
                 false
             }
         }
     }
 
     fn pending_jobs(&self) -> usize {
-        self.pending.load(Ordering::Relaxed)
+        self.pending_jobs.load(Ordering::Relaxed)
     }
 }
 
@@ -741,11 +748,13 @@ fn start_spool_delivery(
 ) -> Arc<SpoolDelivery> {
     let capacity = capacity.clamp(1, MAX_BUFFER_CAPACITY);
     let (sender, mut receiver) = mpsc::channel(capacity);
-    let pending = Arc::new(AtomicUsize::new(0));
-    let pending_for_control = Arc::clone(&pending);
-    let pending_for_loop = Arc::clone(&pending);
+    let pending_jobs = Arc::new(AtomicUsize::new(0));
+    let pending_events = Arc::new(AtomicUsize::new(0));
+    let pending_events_for_control = Arc::clone(&pending_events);
+    let pending_jobs_for_loop = Arc::clone(&pending_jobs);
+    let pending_events_for_loop = Arc::clone(&pending_events);
     let (worker_control, close_rx) = DeliveryWorkerControl::new(PLUGIN_NAME, move || {
-        pending_for_control.load(Ordering::Relaxed) as u64
+        pending_events_for_control.load(Ordering::Relaxed) as u64
     });
     let completion = worker_control.completion();
     let worker_drain = Arc::clone(&worker_control);
@@ -773,12 +782,21 @@ fn start_spool_delivery(
                 }
                 job = receiver.recv() => {
                     match job {
-                        Some(SpoolJob::Events(events)) => {
-                            let event_count = events.len() as u64;
+                        Some(SpoolJob::Events(queued_events)) => {
+                            let event_count = queued_events.len();
+                            let (events, leases): (Vec<_>, Vec<_>) = queued_events
+                                .into_iter()
+                                .map(|queued| (queued.event, queued.lease))
+                                .unzip();
                             let spool = Arc::clone(&spool);
                             let metrics = Arc::clone(&metrics_for_worker);
                             let write_result = tokio::task::spawn_blocking(move || {
-                                spool.write_events(&events)
+                                let result = spool.write_events(&events);
+                                // Keep retained bytes charged until the actual
+                                // blocking write finishes, even if its async
+                                // waiter is cancelled during a timed-out drain.
+                                drop(leases);
+                                result
                             })
                             .await;
                             match write_result {
@@ -794,7 +812,10 @@ fn start_spool_delivery(
                                         error = %error,
                                         "Chargeback sink async spool write failed"
                                     );
-                                    metrics.record_spool_job_loss(event_count, "spool write failed");
+                                    metrics.record_spool_job_loss(
+                                        event_count as u64,
+                                        "spool write failed",
+                                    );
                                 }
                                 Err(error) => {
                                     warn!(
@@ -802,10 +823,15 @@ fn start_spool_delivery(
                                         error = %error,
                                         "Chargeback sink async spool write task failed"
                                     );
-                                    metrics.record_spool_job_loss(event_count, "spool write task failed");
+                                    metrics.record_spool_job_loss(
+                                        event_count as u64,
+                                        "spool write task failed",
+                                    );
                                 }
                             }
-                            pending_for_loop.fetch_sub(1, Ordering::Relaxed);
+                            pending_jobs_for_loop.fetch_sub(1, Ordering::Relaxed);
+                            pending_events_for_loop
+                                .fetch_sub(event_count, Ordering::Relaxed);
                         }
                         None => break,
                     }
@@ -823,7 +849,8 @@ fn start_spool_delivery(
     Arc::new(SpoolDelivery {
         sender,
         worker: worker_control,
-        pending,
+        pending_jobs,
+        pending_events,
         metrics,
     })
 }
@@ -1376,10 +1403,8 @@ impl ApiChargebackSink {
                 if snapshot_events_are_pre_spooled {
                     return;
                 }
-                let events: Vec<ChargeEvent> =
-                    batch.into_iter().map(|queued| queued.event).collect();
                 if let Some(enqueue) = failed_enqueue.as_ref() {
-                    let _ = enqueue.try_enqueue(events, "export failure");
+                    let _ = enqueue.try_enqueue(batch, "export failure");
                 } else {
                     warn!(
                         plugin = PLUGIN_NAME,
@@ -1397,7 +1422,7 @@ impl ApiChargebackSink {
                     return;
                 }
                 if let Some(enqueue) = overflow_enqueue.as_ref() {
-                    let _ = enqueue.try_enqueue(vec![queued.event], reason);
+                    let _ = enqueue.try_enqueue(vec![queued], reason);
                 } else {
                     warn!(
                         plugin = PLUGIN_NAME,
@@ -2315,7 +2340,7 @@ fn render_prometheus_for_sinks(
         spool_events_lost
     ));
     output.push_str(
-        "# HELP chargeback_sink_queue_retained_bytes Chargeback sink retained export-queue bytes under the configured buffer_max_bytes budget.\n",
+        "# HELP chargeback_sink_queue_retained_bytes Chargeback sink retained export and spool-delivery bytes under the configured buffer_max_bytes budget.\n",
     );
     output.push_str("# TYPE chargeback_sink_queue_retained_bytes gauge\n");
     output.push_str(&format!(

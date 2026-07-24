@@ -22,6 +22,11 @@ pub const DEFAULT_BUFFER_MAX_BYTES: usize = 16_777_216;
 pub const HARD_MAX_BUFFER_MAX_BYTES: usize = 268_435_456;
 /// Minimum admitted `max_entry_bytes` (keeps truncating serializers useful).
 pub const MIN_MAX_ENTRY_BYTES: usize = 1_024;
+/// Retained copies charged for a queued summary and its contiguous delivery
+/// payload. Retries share the queued `Arc<str>` and run sequentially.
+pub const SUMMARY_ENTRY_RETAINED_COPIES: usize = 2;
+/// Per-record JSON array / NDJSON framing allowance.
+pub const SUMMARY_ENTRY_FRAMING_BYTES: usize = 1;
 
 const DROP_WARN_EVERY: u64 = 100;
 
@@ -186,6 +191,14 @@ pub struct AdmittedByteLimits {
     pub buffer_max_bytes: usize,
 }
 
+/// Conservative bytes charged for one serialized summary while it is queued
+/// and copied into a contiguous HTTP/TCP/UDP delivery payload.
+pub const fn accounted_summary_bytes(serialized_bytes: usize) -> usize {
+    serialized_bytes
+        .saturating_add(SUMMARY_ENTRY_FRAMING_BYTES)
+        .saturating_mul(SUMMARY_ENTRY_RETAINED_COPIES)
+}
+
 /// Parse shared per-entry and aggregate byte budgets from plugin config.
 pub fn admit_byte_limits(
     config: &Value,
@@ -224,9 +237,12 @@ pub fn admit_byte_limits(
             parsed
         }
     };
-    if buffer_max_bytes < max_entry_bytes {
+    let minimum_buffer_bytes = accounted_summary_bytes(max_entry_bytes as usize) as u64;
+    if buffer_max_bytes < minimum_buffer_bytes {
         return Err(format!(
-            "{plugin_name}: 'buffer_max_bytes' must be greater than or equal to 'max_entry_bytes'"
+            "{plugin_name}: 'buffer_max_bytes' must be greater than or equal to \
+             {SUMMARY_ENTRY_RETAINED_COPIES} * ('max_entry_bytes' + \
+             {SUMMARY_ENTRY_FRAMING_BYTES})"
         ));
     }
     if buffer_max_bytes > HARD_MAX_BUFFER_MAX_BYTES as u64 {

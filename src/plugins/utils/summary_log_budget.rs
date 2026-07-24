@@ -10,7 +10,9 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use super::batching_logger::{BatchingLoggerPermit, DeferredBatchingLogger};
-use super::byte_budget::{BoundedJsonWriter, ByteBudget, ByteLease};
+use super::byte_budget::{
+    BoundedJsonWriter, ByteBudget, ByteLease, accounted_summary_bytes,
+};
 use super::log_schema::{SchemaView, SummarySchema};
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
@@ -42,7 +44,7 @@ pub fn serialize_under_byte_budget<T: Serialize + ?Sized>(
     max_entry_bytes: usize,
     value: &T,
 ) -> Option<QueuedSummaryPayload> {
-    let lease = budget.try_acquire(max_entry_bytes)?;
+    let lease = budget.try_acquire(accounted_summary_bytes(max_entry_bytes))?;
     let mut writer = BoundedJsonWriter::new(max_entry_bytes);
     if let Err(error) = serde_json::to_writer(&mut writer, value) {
         if writer.limit_exceeded {
@@ -61,7 +63,7 @@ pub fn serialize_under_byte_budget<T: Serialize + ?Sized>(
         budget.record_drop("serialized entry exceeded max_entry_bytes");
         return None;
     }
-    lease.shrink_to(retained);
+    lease.shrink_to(accounted_summary_bytes(retained));
     let json = match String::from_utf8(writer.bytes) {
         Ok(line) => Arc::<str>::from(line),
         Err(_) => {
@@ -134,8 +136,10 @@ pub fn admit_stream_summary(
 
 /// Assemble a JSON array body from pre-serialized entries for HTTP/UDP sinks.
 pub fn assemble_json_array(batch: &[QueuedSummaryPayload]) -> String {
-    let mut body = String::with_capacity(batch.iter().map(QueuedSummaryPayload::len).sum::<usize>()
-        + batch.len().saturating_mul(1).saturating_add(2));
+    let capacity = batch.iter().fold(2usize, |total, entry| {
+        total.saturating_add(entry.len().saturating_add(1))
+    });
+    let mut body = String::with_capacity(capacity);
     body.push('[');
     for (idx, entry) in batch.iter().enumerate() {
         if idx > 0 {

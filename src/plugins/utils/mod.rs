@@ -54,6 +54,7 @@ pub use batching_logger::{
 pub use byte_budget::{
     AdmittedByteLimits, BoundedJsonWriter, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES, HARD_MAX_ENTRY_BYTES, MIN_MAX_ENTRY_BYTES,
+    SUMMARY_ENTRY_FRAMING_BYTES, SUMMARY_ENTRY_RETAINED_COPIES, accounted_summary_bytes,
     admit_byte_limits,
 };
 pub use http_client::PluginHttpClient;

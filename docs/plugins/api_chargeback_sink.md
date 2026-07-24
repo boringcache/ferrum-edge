@@ -301,6 +301,11 @@ created with private permissions, written as `*.tmp`, fsynced, and renamed into
 place. The background replayer scans durable data files (`*.ndjson` /
 `*.ndjson.zst`) in lexicographic order.
 
+Queued export and spool-delivery events retain the same byte leases under
+`batch.buffer_max_bytes`; transferring an event to the spool worker does not
+escape or double-count that budget. The minimum admitted budget is 9312 bytes,
+the conservative maximum retained size of one field-bounded charge event.
+
 ### Delivery outcomes
 
 Replay classifies each ClickHouse HTTP attempt before deciding whether to keep,

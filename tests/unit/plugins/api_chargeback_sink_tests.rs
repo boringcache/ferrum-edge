@@ -2756,8 +2756,6 @@ async fn replay_retries_after_ambiguous_acknowledgement_without_double_billing_i
         "retry payload bytes must stay identical"
     );
 }
-
-
 #[tokio::test]
 async fn config_validation_rejects_buffer_max_bytes_and_spool_delivery_queue() {
     let temp = tempfile::tempdir().unwrap();

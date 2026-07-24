@@ -11364,13 +11364,13 @@ components:
         buffer_max_bytes:
           type: integer
           default: 16777216
-          minimum: 1024
+          minimum: 2050
           maximum: 268435456
           description: >-
-            Aggregate retained serialized-content budget across queued and
-            retrying records. Admission reserves max_entry_bytes before
-            serialization and shrinks that lease to the exact retained size.
-            Must be at least max_entry_bytes.
+            Aggregate retained serialized-content budget across queued,
+            assembled, and retrying records. Admission reserves two copies plus
+            framing before serialization and shrinks that lease to the exact
+            retained size. Must be at least 2 * (max_entry_bytes + 1).
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -11470,11 +11470,12 @@ components:
         buffer_max_bytes:
           type: integer
           default: 16777216
-          minimum: 1024
+          minimum: 2050
           maximum: 268435456
           description: >-
-            Aggregate retained serialized-content budget across queued and
-            retrying records. Must be at least max_entry_bytes.
+            Aggregate retained serialized-content budget across queued,
+            assembled, and retrying records. Must be at least
+            2 * (max_entry_bytes + 1).
         connect_timeout_ms:
           type: integer
           default: 5000
@@ -11630,11 +11631,12 @@ components:
         buffer_max_bytes:
           type: integer
           default: 16777216
-          minimum: 1024
+          minimum: 2050
           maximum: 268435456
           description: >-
-            Aggregate retained serialized-content budget across queued and
-            retrying records. Must be at least max_entry_bytes.
+            Aggregate retained serialized-content budget across queued,
+            assembled, and retrying records. Must be at least
+            2 * (max_entry_bytes + 1).
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -20831,12 +20833,12 @@ components:
               default: 50000
             buffer_max_bytes:
               type: integer
-              minimum: 1
+              minimum: 9312
               maximum: 268435456
               default: 16777216
               description: >-
-                Aggregate retained-byte budget for queued ChargeEvent records
-                awaiting ClickHouse export.
+                Aggregate retained-byte budget for ChargeEvent records awaiting
+                ClickHouse export or async spool delivery.
         retry:
           type: object
           additionalProperties: false
