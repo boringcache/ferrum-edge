@@ -62,7 +62,7 @@ impl<F: Future> Future for LazyTimeout<F> {
     type Output = Result<F::Output, LazyTimeoutError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
+        let this = self.project();
 
         // Always poll the inner future first (fast path + tokio timeout parity).
         if let Poll::Ready(v) = this.future.poll(cx) {
