@@ -328,14 +328,16 @@ async fn mysql_cross_namespace_config_change_lock_avoids_deadlock() {
         }
     };
 
-    let mut pool_config = DbPoolConfig::default();
     // Two concurrent writers each need a connection; keep the pool small and
     // deterministic so the race stays on the shared lock row rather than pool
     // exhaustion.
-    pool_config.max_connections = 4;
-    pool_config.min_connections = 2;
-    pool_config.acquire_timeout_seconds = 10;
-    pool_config.statement_timeout_seconds = 0;
+    let pool_config = DbPoolConfig {
+        max_connections: 4,
+        min_connections: 2,
+        acquire_timeout_seconds: 10,
+        statement_timeout_seconds: 0,
+        ..DbPoolConfig::default()
+    };
 
     let store = Arc::new(
         DatabaseStore::connect_with_pool_config("mysql", &fixture.url, pool_config)
