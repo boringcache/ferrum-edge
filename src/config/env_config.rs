@@ -942,8 +942,8 @@ pub struct EnvConfig {
     /// Maximum serialized bytes in one process log record. Default: 64 KiB.
     #[allow(dead_code)]
     pub log_max_record_bytes: usize,
-    /// Bounded per-sink shutdown drain timeout. Default: 2000 ms.
-    #[allow(dead_code)]
+    /// Shared observability lifecycle and per-process-sink drain timeout.
+    /// Default: 2000 ms.
     pub log_shutdown_drain_timeout_ms: u64,
     /// Default poll interval in seconds for external TLS material sources
     /// (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `managed://`) when a source URI does not

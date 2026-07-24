@@ -286,30 +286,23 @@ impl DeferredTransactionLogger {
             summary.refresh_gateway_latencies();
         }
 
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    let response_status = summary.response_status_code;
-                    run_response_stream_termination_hooks(
-                        plugins.as_slice(),
-                        &mut ctx,
-                        response_status,
-                        &outcome,
-                    )
-                    .await;
-                    // The summary skeleton is captured when response headers
-                    // are committed, but streamed inspectors only know their
-                    // aggregate decision at body termination. Refresh metadata
-                    // after the mutable terminal hooks so every log sink sees
-                    // the finalized per-request values.
-                    summary.metadata = crate::proxy::clone_log_metadata(&ctx);
-                    log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
-                });
-            }
-            Err(_) => {
-                // Outside a tokio runtime — nothing we can do.
-            }
-        }
+        let _ = crate::observability_delivery::spawn_terminal(async move {
+            let response_status = summary.response_status_code;
+            run_response_stream_termination_hooks(
+                plugins.as_slice(),
+                &mut ctx,
+                response_status,
+                &outcome,
+            )
+            .await;
+            // The summary skeleton is captured when response headers are
+            // committed, but streamed inspectors only know their aggregate
+            // decision at body termination. Refresh metadata after the
+            // mutable terminal hooks so every log sink sees the finalized
+            // per-request values.
+            summary.metadata = crate::proxy::clone_log_metadata(&ctx);
+            log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
+        });
     }
 }
 

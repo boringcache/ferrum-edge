@@ -5013,11 +5013,12 @@ pub async fn log_with_mirror(
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
 
-    // Mirror completion and mirror-summary logging are fully detached from the
-    // primary transaction. Buffered response paths call `log_with_mirror`
-    // before handing the response to hyper, so awaiting mirror receivers
-    // here would make a stalled shadow target client-visible. Do not clone the
-    // summary or plugin list when this request was not mirrored.
+    // Mirror completion and mirror-summary logging stay detached from the
+    // primary transaction, but the structured delivery lifecycle owns each
+    // collector through shutdown. Buffered response paths call
+    // `log_with_mirror` before handing the response to hyper, so awaiting
+    // mirror receivers here would make a stalled shadow target client-visible.
+    // Do not clone the summary or plugin list when this request was not mirrored.
     if ctx.mirror_result_rxs.is_empty() {
         return;
     }
@@ -5027,7 +5028,7 @@ pub async fn log_with_mirror(
     for mirror_result_rx in ctx.mirror_result_rxs.iter().cloned() {
         let summary = summary.clone();
         let plugins = Arc::clone(&plugins);
-        tokio::spawn(async move {
+        let _ = crate::observability_delivery::spawn_mirror(async move {
             let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
                 return;
             };
@@ -5066,7 +5067,7 @@ pub async fn log_with_mirror_before_buffered_response(
 
     let plugins = plugins.to_vec();
     let ctx = ctx.clone();
-    tokio::spawn(async move {
+    let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
         if tokio::time::timeout(
             std::time::Duration::from_secs(5),
             log_with_mirror(&plugins, &summary, &ctx),
