@@ -39,6 +39,7 @@ pub mod logging;
 pub mod metrics;
 pub mod modes;
 pub mod notifications;
+pub mod observability_delivery;
 pub mod overload;
 pub mod plugin_cache;
 pub mod plugins;

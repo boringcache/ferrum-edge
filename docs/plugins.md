@@ -1102,6 +1102,32 @@ Terminal transaction logging is independent of ordinary request hooks:
 
 H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
 
+##### Delivery lifecycle, reload, and shutdown
+
+Ferrum owns deferred observability work in a process-wide structured lifecycle.
+Serving modes first stop new proxy admission and drain in-flight bodies, allowing
+streaming terminal hooks to produce their final summaries. Ferrum then closes
+external delivery-task admission, awaits already registered terminal and mirror
+tasks, closes every shared batching, WebSocket logging, and buffered trace
+export worker, and drains their admitted queues. The stdout/stderr process-log
+appenders drain last, after the Tokio delivery work has finished.
+
+Reloaded plugin generations close their sender admission when the last
+request-held plugin reference retires. Their worker completion remains owned by
+the process lifecycle, so a receiver-close final batch is not detached from
+runtime teardown. Registered-worker retries and response drains continue only
+inside the remaining lifecycle budget once shutdown begins;
+producer-specific finalizers retain their separately documented bounds.
+Delivery remains sink-specific at-least-once or best-effort as documented; a
+timeout after transport progress can still produce a duplicate on retry.
+
+`FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS` is the shared absolute budget for the
+deferred-task and remote-worker phases. On expiry Ferrum closes admission,
+cancels remaining tasks/workers deterministically, and accounts rejected or
+cancelled tasks and outstanding records through
+`ferrum_observability_delivery_*` metrics. A failed or unavailable sink cannot
+wedge process exit.
+
 #### Example: TCP Stream
 
 ```json
@@ -3877,7 +3903,7 @@ Duplicates live proxy traffic to a secondary destination for shadow testing, val
 **Priority:** 3075
 **Protocols:** HTTP, gRPC
 
-Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger, `api_chargeback`, `api_chargeback_sink`). Shadow summaries remain available for observability and correlation, but chargeback plugins never treat them as consumer-billable per-call or bandwidth charges — only the primary client-facing summary is priced. Every dispatched `request_mirror` instance owns an independent result receiver and emits its own entry, identified by `metadata.mirror_plugin_id` plus the query-stripped target URL. A later instance never replaces an earlier result, and collectors run independently so mixed completion order or one slow destination does not suppress another. An instance sampled out by `percentage` emits no entry because it sent no shadow request; a selected instance rejected by its own `max_in_flight` limit emits an attributable failure entry. Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the proxy's `backend_read_timeout_ms` is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream failure, and `max_in_flight` drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. The gateway runtime cancels outstanding detached mirror/logging tasks during shutdown; they never delay the client response or extend shutdown. The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
+Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger, `api_chargeback`, `api_chargeback_sink`). Shadow summaries remain available for observability and correlation, but chargeback plugins never treat them as consumer-billable per-call or bandwidth charges — only the primary client-facing summary is priced. Every dispatched `request_mirror` instance owns an independent result receiver and emits its own entry, identified by `metadata.mirror_plugin_id` plus the query-stripped target URL. A later instance never replaces an earlier result, and collectors run independently so mixed completion order or one slow destination does not suppress another. An instance sampled out by `percentage` emits no entry because it sent no shadow request; a selected instance rejected by its own `max_in_flight` limit emits an attributable failure entry. Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the proxy's `backend_read_timeout_ms` is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream failure, and `max_in_flight` drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. After request/body drain, the structured delivery lifecycle awaits admitted mirror-result collection and logging inside the shared observability shutdown budget; work still outstanding at the deadline is cancelled and counted. This never delays the client response or leaves shutdown unbounded. The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

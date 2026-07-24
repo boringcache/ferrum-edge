@@ -46,6 +46,7 @@ mod logging;
 mod metrics;
 mod modes;
 mod notifications;
+mod observability_delivery;
 mod overload;
 mod plugin_cache;
 mod plugins;
@@ -852,6 +853,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     };
 
+    observability_delivery::initialize(env_config.pool_shard_amount);
+    let observability_delivery_timeout =
+        std::time::Duration::from_millis(env_config.log_shutdown_drain_timeout_ms);
     let gateway_exit_code: i32 = rt.block_on(async {
         // Shutdown signal
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
@@ -901,6 +905,12 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             OperatingMode::NodeAgent => modes::node_agent::run(env_config, shutdown_tx).await,
             OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
         };
+
+        // Serving modes perform the ordered delivery drain before their
+        // producer-specific finalizers. This idempotent fallback covers early
+        // mode errors and non-serving modes after mode-owned state has dropped,
+        // before the Tokio runtime or process-log appenders can shut down.
+        let _ = observability_delivery::shutdown(observability_delivery_timeout).await;
 
         match result {
             Ok(()) => {
