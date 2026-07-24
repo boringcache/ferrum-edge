@@ -4,8 +4,15 @@
 //! extracting the SNI hostname for logging and routing decisions.
 
 /// Maximum bytes to peek from a TCP stream for ClientHello SNI extraction.
-/// A typical ClientHello is 200-600 bytes; 4096 covers large cipher suite lists.
-const MAX_CLIENT_HELLO_LEN: usize = 4096;
+///
+/// Typical ClientHellos are a few hundred bytes, but modern stacks with
+/// post-quantum `key_share` (e.g. X25519MLKEM768 ≈ 1.2 KiB), ECH payloads, and
+/// large ALPN/cert-compression lists routinely push past 4 KiB. Extension order
+/// is client-chosen, so SNI can land after those fat extensions. Cap at 16 KiB
+/// (one max TLS record) so valid oversized hellos still yield SNI for
+/// passthrough routing; the peek buffer is transient per connection. Hostile
+/// length fields cannot request more than this hard memory bound.
+const MAX_CLIENT_HELLO_LEN: usize = 16 * 1024;
 
 /// Polling interval between peeks while waiting for the rest of a partially
 /// arrived ClientHello (mirrors `STREAM_FIRST_BYTES_PEEK_RETRY_INTERVAL` in
