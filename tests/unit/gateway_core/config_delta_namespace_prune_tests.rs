@@ -480,3 +480,15 @@ fn discovery_passive_prune_targets_only_the_discovered_upstream_tenant() {
         )
     );
 }
+
+#[test]
+fn service_discovery_task_ownership_is_namespace_qualified() {
+    let prod =
+        ferrum_edge::_test_support::service_discovery_task_key_for_test("prod", "shared");
+    let staging =
+        ferrum_edge::_test_support::service_discovery_task_key_for_test("staging", "shared");
+
+    assert_eq!(prod, "prod|shared");
+    assert_eq!(staging, "staging|shared");
+    assert_ne!(prod, staging);
+}

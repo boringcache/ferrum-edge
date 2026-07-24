@@ -251,6 +251,11 @@ pub mod _test_support {
         )
     }
 
+    /// Service-discovery task ownership key for a namespace-scoped upstream.
+    pub fn service_discovery_task_key_for_test(namespace: &str, upstream_id: &str) -> String {
+        crate::service_discovery::service_discovery_task_key(namespace, upstream_id)
+    }
+
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
     pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
         duration: std::time::Duration,

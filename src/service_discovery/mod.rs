@@ -50,6 +50,7 @@ pub trait ServiceDiscoverer: Send + Sync {
 /// task that periodically polls its provider and updates the LoadBalancerCache
 /// when targets change.
 pub struct ServiceDiscoveryManager {
+    /// Running tasks keyed by `namespace|upstream_id`.
     tasks: DashMap<String, TaskEntry>,
     load_balancer_cache: Arc<LoadBalancerCache>,
     request_epoch: Option<Arc<RequestEpochStore>>,
@@ -104,21 +105,21 @@ impl ServiceDiscoveryManager {
         config: &GatewayConfig,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
-        // Collect upstream IDs that should have SD tasks
+        // Collect namespace-qualified upstream identities that should have SD tasks.
         let desired: std::collections::HashSet<String> = config
             .upstreams
             .iter()
             .filter(|u| u.service_discovery.is_some())
-            .map(|u| u.id.clone())
+            .map(|u| service_discovery_task_key(&u.namespace, &u.id))
             .collect();
 
         // Stop tasks for removed upstreams
-        let current_ids: Vec<String> = self.tasks.iter().map(|e| e.key().clone()).collect();
-        for id in &current_ids {
-            if !desired.contains(id)
-                && let Some((_, entry)) = self.tasks.remove(id)
+        let current_keys: Vec<String> = self.tasks.iter().map(|e| e.key().clone()).collect();
+        for key in &current_keys {
+            if !desired.contains(key)
+                && let Some((_, entry)) = self.tasks.remove(key)
             {
-                graceful_stop_task(entry, id);
+                graceful_stop_task(entry, key);
             }
         }
 
@@ -126,8 +127,9 @@ impl ServiceDiscoveryManager {
         for upstream in &config.upstreams {
             if let Some(sd_config) = &upstream.service_discovery {
                 // Stop existing task if any (config may have changed)
-                if let Some((_, entry)) = self.tasks.remove(&upstream.id) {
-                    graceful_stop_task(entry, &upstream.id);
+                let task_key = service_discovery_task_key(&upstream.namespace, &upstream.id);
+                if let Some((_, entry)) = self.tasks.remove(&task_key) {
+                    graceful_stop_task(entry, &task_key);
                 }
                 self.start_upstream_task(upstream, sd_config, shutdown_rx.clone());
             }
@@ -374,8 +376,9 @@ impl ServiceDiscoveryManager {
             .await;
         });
 
+        let task_key = service_discovery_task_key(upstream_namespace, upstream_id);
         self.tasks
-            .insert(upstream_id.to_string(), TaskEntry { cancel_tx, handle });
+            .insert(task_key, TaskEntry { cancel_tx, handle });
         info!(
             "Service discovery: started {} task for upstream {} (poll interval: {}s)",
             sd_config.provider.as_str(),
@@ -383,6 +386,15 @@ impl ServiceDiscoveryManager {
             poll_interval,
         );
     }
+}
+
+/// Namespace-qualified ownership key for a service-discovery task.
+///
+/// Upstream IDs are only unique within a namespace. Using the bare ID here
+/// would overwrite one tenant's task handle when another tenant configured the
+/// same ID, leaving the displaced poller unmanaged.
+pub(crate) fn service_discovery_task_key(namespace: &str, upstream_id: &str) -> String {
+    crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id)
 }
 
 impl Drop for ServiceDiscoveryManager {
