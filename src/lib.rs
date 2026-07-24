@@ -1930,6 +1930,16 @@ pub mod _test_support {
         crate::config::db_loader::await_pool_connect_with_timeout(timeout_seconds, connect).await
     }
 
+    pub fn effective_pool_connect_timeout_seconds(
+        db_type: &str,
+        configured_seconds: u64,
+    ) -> u64 {
+        crate::config::db_loader::effective_pool_connect_timeout_seconds(
+            db_type,
+            configured_seconds,
+        )
+    }
+
     pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
         known.difference(current).cloned().collect()
     }

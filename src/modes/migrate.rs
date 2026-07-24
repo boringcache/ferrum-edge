@@ -100,6 +100,7 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
     let pool = crate::config::db_loader::connect_any_pool_with_timeout(
         sql_migration_pool_options(db_type),
         &effective_url,
+        db_type,
         env_config.db_pool_connect_timeout_seconds,
     )
     .await?;
@@ -193,6 +194,7 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     let pool = crate::config::db_loader::connect_any_pool_with_timeout(
         sql_migration_pool_options(db_type),
         &effective_url,
+        db_type,
         env_config.db_pool_connect_timeout_seconds,
     )
     .await?;
@@ -310,6 +312,7 @@ mod tests {
         let pool = crate::config::db_loader::connect_any_pool_with_timeout(
             sql_migration_pool_options("sqlite"),
             "sqlite::memory:",
+            "sqlite",
             10,
         )
         .await

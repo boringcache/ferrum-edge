@@ -1,7 +1,8 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, await_pool_connect_with_timeout, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
-    db_wrap_mysql_isolation_read_error, is_config_validation_rejection,
+    db_wrap_mysql_isolation_read_error, effective_pool_connect_timeout_seconds,
+    is_config_validation_rejection,
     mysql_config_change_lock_insert_sql, mysql_mtls_dns_admission_lock_insert_sql,
     mysql_proxy_route_lock_insert_sql, parse_auth_mode, parse_scheme, statement_timeout_sql,
     validate_tcp_connection_throttle_attachments,
@@ -351,6 +352,14 @@ async fn pool_connect_timeout_error_stays_transient_for_failover() {
         ),
         "Io(TimedOut) connect bound must remain backup/failover eligible"
     );
+}
+
+#[test]
+fn pool_connect_timeout_only_applies_to_network_sql_backends() {
+    assert_eq!(effective_pool_connect_timeout_seconds("postgres", 10), 10);
+    assert_eq!(effective_pool_connect_timeout_seconds("mysql", 10), 10);
+    assert_eq!(effective_pool_connect_timeout_seconds("sqlite", 10), 0);
+    assert_eq!(effective_pool_connect_timeout_seconds("postgres", 0), 0);
 }
 
 // ── DbPoolConfig defaults ────────────────────────────────────────────────────

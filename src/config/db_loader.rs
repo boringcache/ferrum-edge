@@ -413,9 +413,30 @@ where
 pub(crate) async fn connect_any_pool_with_timeout(
     options: AnyPoolOptions,
     url: &str,
+    db_type: &str,
     connect_timeout_seconds: u64,
 ) -> Result<AnyPool, sqlx::Error> {
-    await_pool_connect_with_timeout(connect_timeout_seconds, options.connect(url)).await
+    await_pool_connect_with_timeout(
+        effective_pool_connect_timeout_seconds(db_type, connect_timeout_seconds),
+        options.connect(url),
+    )
+    .await
+}
+
+/// Keep the SQL pool knob scoped to network database connects.
+///
+/// SQLite is local file I/O and the previous implementation deliberately did
+/// not append a driver timeout for it. Preserve that contract while replacing
+/// the ineffective PostgreSQL/MySQL URL parameter with a real future bound.
+pub(crate) fn effective_pool_connect_timeout_seconds(
+    db_type: &str,
+    configured_seconds: u64,
+) -> u64 {
+    if db_type == "sqlite" {
+        0
+    } else {
+        configured_seconds
+    }
 }
 
 /// Build the `SET` SQL for per-statement timeouts, or `None` when disabled.
@@ -1528,6 +1549,7 @@ impl DatabaseStore {
         let pool = connect_any_pool_with_timeout(
             Self::build_pool_options_from_config(&pool_config, db_type),
             db_url,
+            db_type,
             pool_config.connect_timeout_seconds,
         )
         .await?;
@@ -6008,6 +6030,7 @@ impl DatabaseStore {
         let new_pool = connect_any_pool_with_timeout(
             self.build_pool_options(),
             db_url,
+            &self.db_type,
             self.pool_config.connect_timeout_seconds,
         )
         .await?;
@@ -6155,6 +6178,7 @@ impl DatabaseStore {
         let pool = connect_any_pool_with_timeout(
             self.build_pool_options(),
             replica_url,
+            &self.db_type,
             self.pool_config.connect_timeout_seconds,
         )
         .await?;
@@ -6264,6 +6288,7 @@ impl DatabaseStore {
         let new_pool = connect_any_pool_with_timeout(
             self.build_pool_options(),
             replica_url,
+            &self.db_type,
             self.pool_config.connect_timeout_seconds,
         )
         .await?;

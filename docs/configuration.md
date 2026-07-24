@@ -276,7 +276,7 @@ SQL pool settings apply to PostgreSQL, MySQL, and SQLite. MongoDB uses driver co
 | `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | No | `30` | Max wait for a pool connection |
 | `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | No | `600` | Max idle age before a SQL connection is closed |
 | `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | No | `300` | Max SQL connection lifetime |
-| `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | No | `10` | Max time for each SQL pool connect attempt (initial, failover, replica, reconnect, migrate); `0` disables. Enforced around sqlx pool creation — not a DSN query parameter |
+| `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | No | `10` | Max time for each PostgreSQL/MySQL pool connect attempt (initial, failover, replica, reconnect, migrate); `0` disables. Enforced around sqlx pool creation — not a DSN query parameter |
 | `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | No | `30` | Per-statement SQL timeout; `0` disables |
 
 ### MongoDB
