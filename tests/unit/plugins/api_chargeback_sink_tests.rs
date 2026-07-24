@@ -437,7 +437,7 @@ fn maximum_prices_remain_finite_in_per_event_and_snapshot_exports() {
     }
 
     let mut per_event = sample_event("maximum-price-per-event");
-    per_event.call_count = http_charge.call_count;
+    per_event.call_count = u64::from(http_charge.call_count);
     per_event.charge_call = http_charge.charge_call;
     per_event.bytes_sent = http_charge.bytes_sent;
     per_event.bytes_received = http_charge.bytes_received;
@@ -2893,8 +2893,10 @@ fn config_validation_rejects_stale_ttl_shorter_than_snapshot_interval() {
         "cleanup_interval_secs": 1,
         "stale_entry_ttl_secs": 2
     });
-    let err = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
-        .expect_err("ttl shorter than interval must fail");
+    let err = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("ttl shorter than interval must fail"),
+        Err(err) => err,
+    };
     assert!(
         err.contains("stale_entry_ttl_secs must be >= snapshot.interval_secs"),
         "unexpected error: {err}"
